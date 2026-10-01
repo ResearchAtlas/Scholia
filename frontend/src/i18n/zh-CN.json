@@ -1,0 +1,11 @@
+{
+  "common.cancel": "取消",
+  "sidebar.projects": "项目",
+  "sidebar.conversations": "对话",
+  "sidebar.newConversation": "新对话",
+  "library.materialCount": {
+    "other": "{count} 份材料"
+  },
+  "runs.started": "开始于 {date}",
+  "error.internal": "出现错误，请重试。"
+}
