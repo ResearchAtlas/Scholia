@@ -235,3 +235,24 @@ def test_dangling_or_escaping_symlink_fails(bundle, tmp_path):
         f"_internal/libavcodec.61.dylib: symlink to {outside.resolve()}, outside the bundle",
         "_internal/libgone.dylib: symlink to nothing",
     ]
+
+
+def test_only_expected_license_files_may_sit_in_the_licenses_folder(bundle):
+    _put(bundle, "_internal/licenses/CPython/libevil.dylib", MACHO)
+    _put(bundle, "_internal/licenses/FFmpeg/libavcodec.61.dylib", MACHO)
+    assert la.audit(bundle)[1] == [
+        "_internal/licenses/CPython/libevil.dylib: not an expected license file",
+        "_internal/licenses/FFmpeg/libavcodec.61.dylib: not an expected license file",
+    ]
+
+
+@pytest.mark.parametrize("where", ["outside the bundle", "inside the bundle"])
+def test_license_file_must_be_a_regular_file_in_the_bundle(bundle, tmp_path, where):
+    shipped = bundle / "_internal/licenses/CPython/LICENSE.txt"
+    copy = (tmp_path if where == "outside the bundle" else bundle / "_internal") / "LICENSE.txt"
+    copy.write_bytes(shipped.read_bytes())  # the right text, but reached through a symlink
+    shipped.unlink()
+    shipped.symlink_to(copy)
+    problems = la.audit(bundle)[1]
+    assert "CPython: license file LICENSE.txt is not shipped in licenses/CPython/" in problems
+    assert "_internal/licenses/CPython/LICENSE.txt: not an expected license file" not in problems

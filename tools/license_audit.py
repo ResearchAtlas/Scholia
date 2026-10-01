@@ -203,11 +203,16 @@ def component(name: str):
     return _dist_license(dist), _license_files(dist)
 
 
+def _shipped_by_default() -> list[str]:
+    """The fixed components whose license files every bundle ships."""
+    with_files = [name for name, (_, files) in LIBRARIES.items() if isinstance(files, list) and files]
+    return ["Scholia", "CPython", "PyInstaller", *with_files]
+
+
 def notice_datas(dists=()) -> list[tuple[str, str]]:
     """PyInstaller `datas` entries that ship the license files of the fixed components
     (Scholia, CPython, PyInstaller and the libraries with their own files) and of `dists`."""
-    with_files = [name for name, (_, files) in LIBRARIES.items() if isinstance(files, list) and files]
-    names = ["Scholia", "CPython", "PyInstaller", *with_files, *dists]
+    names = [*_shipped_by_default(), *dists]
     return [
         (str(source), str(Path(LICENSES, name, dest).parent))
         for name in names
@@ -322,9 +327,12 @@ def audit(bundle: Path) -> tuple[dict[str, set[str]], list[str]]:
     inventoried = 0
     owners_of: dict[str, list[str]] = {}
     links = []
+    notice_entries = set()  # everything in the licenses folder but its real subfolders
     for path in sorted(bundle.rglob("*")):
         rel = path.relative_to(bundle).as_posix()
         if rel.startswith(notices):
+            if path.is_symlink() or not path.is_dir():
+                notice_entries.add(rel)
             continue
         if path.is_symlink():
             links.append((rel, path))
@@ -370,6 +378,16 @@ def audit(bundle: Path) -> tuple[dict[str, set[str]], list[str]]:
             found[owner].add(rel)
     if not inventoried:
         problems.append(f"{bundle}: the bundle contains no files")
+    # Only the expected license files may sit in the licenses folder; _check requires
+    # each to be a regular file inside the bundle.
+    expected = {
+        f"{notices}{name}/{dest}"
+        for name in {*found, *_shipped_by_default()}
+        if isinstance(notice := component(name)[1], list)
+        for _, dest in notice
+    }
+    for rel in sorted(notice_entries - expected):
+        problems.append(f"{rel}: not an expected license file")
     for name in sorted(found):
         problems += _check(bundle, name)
     return found, problems
@@ -385,21 +403,29 @@ def _check(bundle: Path, name: str) -> list[str]:
             problems.append(f"{name}: license {license} is not allowed")
     except ValueError as error:
         problems.append(f"{name}: {error}")
-    shipped = bundle / CONTENTS / LICENSES
+    shipped = f"{CONTENTS}/{LICENSES}"
     if isinstance(notice, str):
-        doc = shipped / "CPython" / CPYTHON_DOC.name
-        if not doc.is_file() or notice not in doc.read_text(encoding="utf-8", errors="replace"):
+        doc = _regular_file(bundle, f"{shipped}/CPython/{CPYTHON_DOC.name}")
+        if not doc or notice not in doc.read_text(encoding="utf-8", errors="replace"):
             problems.append(f"{name}: not covered by CPython's shipped license document")
         return problems
     if not notice and name not in LIBRARIES:
         problems.append(f"{name}: the distribution has no license file to ship")
     for source, dest in notice:
-        copy = shipped / name / dest
+        copy = _regular_file(bundle, f"{shipped}/{name}/{dest}")
         if not source.is_file():
             problems.append(f"{name}: license file {source} not found in the build environment")
-        elif not copy.is_file() or copy.read_bytes() != source.read_bytes():
+        elif not copy or copy.read_bytes() != source.read_bytes():
             problems.append(f"{name}: license file {dest} is not shipped in {LICENSES}/{name}/")
     return problems
+
+
+def _regular_file(bundle: Path, rel: str) -> Path | None:
+    """The file at `rel`, if it is a regular file with no symlink anywhere on its path
+    inside the bundle; otherwise None."""
+    path = bundle / rel
+    inside = path.is_file() and path.resolve() == bundle.resolve() / rel
+    return path if inside else None
 
 
 def main(argv: list[str]) -> int:
