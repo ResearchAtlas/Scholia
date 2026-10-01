@@ -7,6 +7,7 @@ store, so that entry wins on reading; a later successful store save removes it.
 """
 
 import json
+import logging
 import threading
 from pathlib import Path
 
@@ -23,6 +24,11 @@ FALLBACK_WARNING = (
 )
 
 _lock = threading.Lock()  # ponytail: one lock for all keys; key saves are rare
+_log = logging.getLogger(__name__)
+
+
+class CredentialsFileError(Exception):
+    """credentials.json exists but cannot be read; it is left exactly as it is."""
 
 
 def _store(backend):
@@ -36,17 +42,29 @@ def _store(backend):
 
 
 def _fallback(data_root):
-    """Return (path, keys) for the owner-only fallback file; unreadable content counts as empty."""
+    """Return (path, keys) for the owner-only fallback file; a missing file holds no keys.
+
+    Raises CredentialsFileError if the file exists but cannot be read or is malformed,
+    so it is never replaced by a file that drops the keys it still holds.
+    """
     path = Path(data_root) / FALLBACK_FILE
     try:
         keys = json.loads(path.read_bytes())
-    except (FileNotFoundError, ValueError):
-        keys = {}
-    return path, keys if isinstance(keys, dict) else {}
+    except FileNotFoundError:
+        return path, {}
+    except (OSError, ValueError) as error:
+        raise CredentialsFileError(f"{FALLBACK_FILE} cannot be read; it was left unchanged") from error
+    if not (isinstance(keys, dict) and all(isinstance(v, str) for v in keys.values())):
+        raise CredentialsFileError(f"{FALLBACK_FILE} is malformed; it was left unchanged")
+    return path, keys
 
 
 def save_key(data_root, provider, key, backend=None):
-    """Store a provider's key. Returns a warning if it went to the fallback file, else None."""
+    """Store a provider's key. Returns a warning if it went to the fallback file, else None.
+
+    Raises CredentialsFileError, changing nothing, if the key needs the fallback
+    file and that file is unreadable or malformed.
+    """
     if not key:
         raise ValueError("the key is empty")
     store = _store(backend)
@@ -58,11 +76,15 @@ def save_key(data_root, provider, key, backend=None):
                 stored = store.get_password(SERVICE, provider) == key  # some stores drop keys silently
             except KeyringError:
                 pass
-        path, keys = _fallback(data_root)
         if stored:
+            try:
+                path, keys = _fallback(data_root)
+            except CredentialsFileError:
+                return None  # the key is safe in the store, and an unreadable file is never used
             if keys.pop(provider, None) is not None:
                 write_private(path, json.dumps(keys).encode())  # leave no plain copy behind
             return None
+        path, keys = _fallback(data_root)
         keys[provider] = key
         write_private(path, json.dumps(keys).encode())
         return FALLBACK_WARNING
@@ -71,8 +93,12 @@ def save_key(data_root, provider, key, backend=None):
 def load_key(data_root, provider, backend=None):
     """Return a provider's key from the fallback file, else the credential store, else None."""
     with _lock:
-        key = _fallback(data_root)[1].get(provider)
-    if not isinstance(key, str):
+        try:
+            key = _fallback(data_root)[1].get(provider)
+        except CredentialsFileError as error:
+            _log.warning("%s; its keys are not used", error)
+            key = None
+    if key is None:
         store = _store(backend)
         try:
             key = store.get_password(SERVICE, provider) if store is not None else None

@@ -101,10 +101,50 @@ def test_keys_never_enter_config_toml(tmp_path):
     assert files_containing(tmp_path, KEY) == ["credentials.json"]
 
 
-def test_unknown_or_unreadable_keys_are_none(tmp_path):
+def test_unknown_key_is_none(tmp_path):
     assert load_key(tmp_path, "openrouter", backend=MemoryKeyring()) is None
-    (tmp_path / "credentials.json").write_text("not json")
-    assert load_key(tmp_path, "openrouter", backend=MemoryKeyring()) is None
+
+
+MALFORMED = [
+    b'{"openrouter": "sk-or-saved", "local": "sk-lo',  # cut off mid-write
+    b"not json",
+    b'["sk-or-saved"]',
+    b'{"openrouter": 5}',
+    b"\xff\xfe",
+]
+
+
+@pytest.mark.parametrize("content", MALFORMED)
+def test_malformed_fallback_file_is_never_overwritten(tmp_path, content):
+    path = tmp_path / "credentials.json"
+    path.write_bytes(content)
+    with pytest.raises(credentials.CredentialsFileError) as error:
+        save_key(tmp_path, "other", KEY, backend=keyring.backends.fail.Keyring())
+    assert KEY not in str(error.value)
+    assert path.read_bytes() == content
+    # With the store working, the key is safe there and the file is still left alone.
+    store = MemoryKeyring()
+    assert save_key(tmp_path, "other", KEY, backend=store) is None
+    assert store.items == {(SERVICE, "other"): KEY}
+    assert path.read_bytes() == content
+
+
+@pytest.mark.parametrize("content", MALFORMED)
+def test_malformed_fallback_file_is_ignored_on_load_with_a_warning(tmp_path, content, caplog):
+    (tmp_path / "credentials.json").write_bytes(content)
+    assert load_key(tmp_path, "openrouter", backend=keyring.backends.fail.Keyring()) is None
+    assert "credentials.json" in caplog.text and "sk-" not in caplog.text
+    store = MemoryKeyring()
+    store.items[(SERVICE, "openrouter")] = KEY
+    assert load_key(tmp_path, "openrouter", backend=store) == KEY
+
+
+def test_unreadable_fallback_file_never_stops_loading(tmp_path, caplog):
+    (tmp_path / "credentials.json").mkdir()  # cannot be read as a file
+    assert load_key(tmp_path, "openrouter", backend=keyring.backends.fail.Keyring()) is None
+    assert "credentials.json" in caplog.text
+    with pytest.raises(credentials.CredentialsFileError):
+        save_key(tmp_path, "openrouter", KEY, backend=keyring.backends.fail.Keyring())
 
 
 def test_empty_key_is_refused(tmp_path):

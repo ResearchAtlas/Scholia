@@ -285,12 +285,24 @@ def test_warning_lines_skip_multiline_values(tmp_path):
         '"openai/gpt-5.1" = 3\n'
         "[providers.local]\n"
         "windows = { m = 100 }\n"
+        "[context]\n"
+        r'system_rules = """an escaped \""" does not close it' "\n"
+        "user_memory = 5\n"  # inside the string, not a key
+        '"""\n'
+        "user_memory = -1\n"
+        "[retrieval]\n"
+        r"keep = '''C:\'''" "\n"  # a literal string: the backslash escapes nothing
+        "rrf_k = 0\n"
     )
     loaded = load_settings(tmp_path)
     assert [w.split(":")[0] + ":" + w.split(":")[1].split()[0] for w in loaded.warnings] == [
         "config.toml line 6:subagents.models",
         "config.toml line 12:models.efforts.openai/gpt-5.1",
         "config.toml line 14:providers.local.windows.m",
+        "config.toml line 16:context.system_rules",
+        "config.toml line 19:context.user_memory",
+        "config.toml line 21:retrieval.keep",
+        "config.toml line 22:retrieval.rrf_k",
     ]
     assert loaded.values["helper"]["model_source"] == "idle_stop_minutes = 0\n"
 

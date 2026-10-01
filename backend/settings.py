@@ -330,7 +330,14 @@ def _scan_value(text, open_quote, depth):
     """Track whether a multi-line string or array is still open at the end of a line."""
     i = 0
     while i < len(text):
-        if open_quote:
+        if open_quote == '"""':  # a basic string: a backslash escapes the next character
+            while i < len(text) and not text.startswith('"""', i):
+                i += 2 if text[i] == "\\" else 1
+            if i >= len(text):
+                return open_quote, depth
+            i, open_quote = i + 3, None
+            continue
+        if open_quote:  # a literal string has no escapes
             end = text.find(open_quote, i)
             if end < 0:
                 return open_quote, depth
