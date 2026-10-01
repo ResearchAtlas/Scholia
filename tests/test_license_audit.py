@@ -1,3 +1,4 @@
+import sys
 import zipfile
 from importlib import metadata
 
@@ -78,6 +79,11 @@ def bundle(tmp_path, monkeypatch):
         _put(root, f"{DYNLOAD}/{module}.cpython-313-darwin.so", MACHO)
     _ship(root, "CPython")
     return root
+
+
+def test_cpython_files_are_looked_up_in_the_build_interpreter_not_the_venv():
+    for path in (la.CPYTHON_HOME, la.LIB_DYNLOAD, la.CPYTHON_DOC):
+        assert path.is_relative_to(sys.base_prefix), path
 
 
 def test_clean_bundle_passes(bundle):

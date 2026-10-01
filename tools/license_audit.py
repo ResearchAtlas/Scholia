@@ -30,7 +30,8 @@ CONTENTS = "_internal"  # PyInstaller's onedir contents folder
 LICENSES = "licenses"  # license texts ship in <contents>/licenses/<component>/
 # The build interpreter's installation, which every bundled CPython file must come from
 CPYTHON_HOME = Path(sys.base_prefix)
-LIB_DYNLOAD = Path(sysconfig.get_path("platstdlib"), "lib-dynload")
+# "stdlib", not "platstdlib": inside a venv, "platstdlib" names the venv
+LIB_DYNLOAD = Path(sysconfig.get_path("stdlib"), "lib-dynload")
 # CPython's license document, which covers the third-party code it incorporates
 CPYTHON_DOC = Path(sys.base_prefix, "Resources/English.lproj/Documentation/_sources",
                    "license.rst.txt")
