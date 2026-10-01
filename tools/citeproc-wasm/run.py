@@ -31,7 +31,7 @@ INPUT = {
 def run(engine: Engine, module: Module, folder: Path) -> tuple[int, str, str]:
     (folder / "in.json").write_text(json.dumps(INPUT, ensure_ascii=False), encoding="utf-8")
     wasi = WasiConfig()
-    wasi.argv = ["citeproc", "--format=json"]
+    wasi.argv = ["citeproc"]  # HTML output: each citation and entry is a string
     wasi.stdin_file = str(folder / "in.json")
     wasi.stdout_file = str(folder / "out.json")
     wasi.stderr_file = str(folder / "err.txt")
@@ -60,9 +60,12 @@ def main(path: str) -> int:
             started = time.perf_counter()
             code, out, err = run(engine, module, Path(folder))
             timings.append(round(time.perf_counter() - started, 3))
-    result = json.loads(out) if code == 0 else None
-    citation = result["citations"][0] if result else ""
-    bibliography = " ".join(entry for _, entry in result["bibliography"]) if result else ""
+    try:
+        result = json.loads(out)
+        citation = result["citations"][0]
+        bibliography = " ".join(entry for _, entry in result["bibliography"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        result, citation, bibliography = None, "", ""
     ok = code == 0 and "Garcia 2024" in citation and "张" in citation and "学术研究" in bibliography
     print(json.dumps({
         "ok": ok,
@@ -74,6 +77,7 @@ def main(path: str) -> int:
         "exit_code": code,
         "citation": citation,
         "bibliography": result["bibliography"] if result else None,
+        "stdout": "" if result else out[-2000:],
         "stderr": err[-2000:],
     }, ensure_ascii=False, indent=2))
     return 0 if ok else 1
