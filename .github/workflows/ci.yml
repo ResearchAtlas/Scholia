@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # uv uses the python.org interpreter that actions/setup-python installs, never its own.
+  UV_PYTHON_DOWNLOADS: never
+  UV_PYTHON_PREFERENCE: only-system
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+      - name: Check the lockfile
+        run: uv lock --check
+      - name: Install
+        run: uv sync --locked --python "${{ steps.python.outputs.python-path }}"
+      - name: Check the interpreter
+        run: |
+          uv run --no-sync python - <<'EOF'
+          import platform, sys
+          print(sys.version, platform.machine(), sys.base_prefix)
+          assert sys.version_info[:2] == (3, 13), sys.version
+          assert platform.machine() == "arm64", platform.machine()
+          assert sys._framework == "Python", "not the python.org framework build"
+          EOF
+      - name: Tests
+        # The runner passes every step two macOS kernel-control sockets (com.apple.netsrc).
+        # The test network block will not start beside a socket it cannot inspect, so
+        # pytest runs in a child process that inherits only stdin, stdout and stderr.
+        run: >
+          uv run --no-sync python -c
+          'import subprocess, sys; sys.exit(subprocess.call([sys.executable, "-m", "pytest", "-q"]))'
+
+  frontend:
+    name: Frontend tests
+    runs-on: macos-26
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Install
+        run: npm ci
+      - name: Tests
+        run: node --test
+
+  package:
+    name: Packaged build and license audit
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+      - name: Install
+        run: uv sync --locked --group packaging --python "${{ steps.python.outputs.python-path }}"
+      - name: Build
+        run: >
+          uv run --no-sync pyinstaller --noconfirm --clean
+          --distpath build/dist --workpath build/work tools/runtime_probe.spec
+      - name: Run the frozen program
+        env:
+          EXPECTED_PYTHON: ${{ steps.python.outputs.python-version }}
+        run: |
+          out=$(build/dist/scholia-probe/scholia-probe)
+          echo "$out"
+          uv run --no-sync python - "$out" <<'EOF'
+          import json, os, sys
+          r = json.loads(sys.argv[1])
+          assert r["frozen"] is True, r
+          assert r["python"] == os.environ["EXPECTED_PYTHON"] and r["python"].startswith("3.13."), r
+          assert r["implementation"] == "CPython" and r["machine"] == "arm64", r
+          assert r["framework"] == "Python", "not the python.org framework build"
+          EOF
+      - name: License audit
+        run: |
+          find build/dist -type f | sort
+          uv run --no-sync python tools/license_audit.py build/dist/scholia-probe
