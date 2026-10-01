@@ -19,9 +19,11 @@ Limits: uvloop, whose native event loop opens sockets without these audit events
 is refused (the session fails if it was loaded first). Calling the private C class
 `_socket.socket` directly can still resolve a host name (a DNS query) before the
 connection is refused. Native frameworks with their own networking (for example
-NSURLSession through PyObjC), other C extensions, and subprocesses a test starts
-are not covered. tests/test_network_guard.py fails if the repository's backend or
-test code names these APIs.
+Cocoa URL loading through PyObjC) and other C extensions are not covered; a source
+scan in tests/test_network_guard.py fails if backend or test code names the common
+ones. Starting a child process is refused unless the test wraps it in
+`allow_subprocess()`, because the child is outside the hook; an allowed child is
+not network-restricted.
 """
 
 import asyncio
@@ -48,6 +50,11 @@ class NetworkBlocked(RuntimeError):
 _LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
 _INET = (socket.AF_INET, socket.AF_INET6)
 _SEND_EVENTS = {"socket.connect", "socket.sendto", "socket.sendmsg"}
+# A child process is outside the audit hook, so starting one needs allow_subprocess().
+_LAUNCH_EVENTS = {
+    "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn",
+    "os.fork", "os.forkpty", "pty.spawn",
+}
 _LOOKUP_EVENTS = {
     "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr", "socket.getnameinfo",
 }
@@ -57,6 +64,7 @@ _allowed: dict[tuple[str, int], weakref.ref] = {}
 _listening: weakref.WeakSet = weakref.WeakSet()  # sockets that listen() in this process
 _lock = threading.Lock()
 _installed = False
+_subprocess_allowed = 0
 _real_listen = socket.socket.listen
 
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_API_TOKEN", "_ACCESS_TOKEN", "_SECRET_KEY")
@@ -94,6 +102,9 @@ def _audit(event: str, args: tuple) -> None:
         # sendmsg without an address sends on an already connected socket
         if address is not None and not _is_allowed(sock, address):
             raise NetworkBlocked(f"test network block: connection to {address!r} refused")
+    elif event in _LAUNCH_EVENTS:
+        if not _subprocess_allowed:
+            raise NetworkBlocked(f"test network block: {event} refused; use allow_subprocess()")
     elif event in _LOOKUP_EVENTS:
         _require_loopback(args[0][0] if event == "socket.getnameinfo" else args[0])
 
@@ -190,6 +201,22 @@ def register_server(sock: socket.socket) -> tuple[str, int]:
 def clear_registrations() -> None:
     with _lock:
         _allowed.clear()
+
+
+@contextmanager
+def allow_subprocess():
+    """Allow a test to start child processes, which the block cannot see into.
+
+    Use it only for programs that make no network connections.
+    """
+    global _subprocess_allowed
+    with _lock:
+        _subprocess_allowed += 1
+    try:
+        yield
+    finally:
+        with _lock:
+            _subprocess_allowed -= 1
 
 
 @contextmanager

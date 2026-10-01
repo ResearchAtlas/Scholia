@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 import network_guard
-from network_guard import NetworkBlocked, mock_http_server, register_server
+from network_guard import NetworkBlocked, allow_subprocess, mock_http_server, register_server
 
 PROVIDER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -238,7 +238,7 @@ def test_project_code_avoids_networking_outside_the_block():
 
     root = pathlib.Path(__file__).resolve().parents[1]
     exempt = {"tests/network_guard.py", "tests/test_network_guard.py"}
-    pattern = re.compile(r"\b(uvloop|_socket|NSURLSession|NSURLConnection|CFNetwork|CFStream|pycurl)\b")
+    pattern = re.compile(r"\b(uvloop|_socket|NSURL\w*|\w*ContentsOfURL\w*|CFNetwork|CFStream|pycurl)\b")
     offenders = [
         f"{path.relative_to(root)}:{n}"
         for folder in ("backend", "tests")
@@ -248,3 +248,16 @@ def test_project_code_avoids_networking_outside_the_block():
         if pattern.search(line)
     ]
     assert offenders == []
+
+
+def test_child_process_needs_an_explicit_allowance():
+    import subprocess
+
+    with pytest.raises(NetworkBlocked):
+        subprocess.run(["/usr/bin/true"], check=True)
+    with pytest.raises(NetworkBlocked):
+        os.system("/usr/bin/true")
+    with allow_subprocess():
+        subprocess.run(["/usr/bin/true"], check=True)
+    with pytest.raises(NetworkBlocked):
+        subprocess.run(["/usr/bin/true"], check=True)
