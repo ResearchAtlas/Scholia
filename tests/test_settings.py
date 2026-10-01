@@ -645,3 +645,47 @@ def test_moderately_nested_settings_load(tmp_path):
         for i in range(99):
             node = node[f"k{i}"]
     assert node == 1
+
+
+def test_secret_tables_and_env_names_are_refused_and_ignored(tmp_path):
+    personal = load_settings(tmp_path)
+    with pytest.raises(ValueError, match="looks like a secret"):
+        personal.save({"zotero.api_key": {"value": "sk-synthetic"}})
+    project = load_settings(tmp_path, "p1")
+    with pytest.raises(ValueError, match="looks like a secret"):
+        project.save({"mcp_server.env.GITHUB_TOKEN": "x"})
+    assert list(tmp_path.iterdir()) == []
+    (tmp_path / "config.toml").write_text('[zotero.api_key]\nvalue = "sk-synthetic"\n')
+    write_project_file(tmp_path, '[mcp_server.env]\nGITHUB_TOKEN = "x"\n')
+    personal, project = load_settings(tmp_path), load_settings(tmp_path, "p1")
+    assert "zotero" not in personal.values and "mcp_server" not in project.values
+    assert personal.warnings == [
+        "config.toml line 2: zotero.api_key.value looks like a secret; keys belong in the credential store; ignored"]
+    assert project.warnings == [
+        "project config.toml line 2: mcp_server.env.GITHUB_TOKEN looks like a secret; "
+        "keys belong in the credential store; ignored"]
+
+
+def test_nested_dotted_inline_tables_never_stop_loading(tmp_path):
+    # Twenty nested inline tables, each holding a fifty-part dotted key: about 2 KB of valid TOML.
+    dotted = ".".join("k" for _ in range(50))
+    text = "[zotero]\nx = " + f"{{{dotted} = " * 20 + "1" + "}" * 20 + "\n"
+    assert 1500 < len(text) < 2500
+    (tmp_path / "config.toml").write_text(text)
+    loaded = load_settings(tmp_path)
+    assert loaded.warnings == ["config.toml: nested too deeply to read; using the defaults"]
+    assert "zotero" not in loaded.values and loaded.values["ui"]["language"] == "system"
+
+
+def test_recursion_anywhere_in_reading_falls_back(tmp_path, monkeypatch):
+    (tmp_path / "config.toml").write_text('[ui]\nlanguage = "en"\n')
+
+    def too_deep(*args):
+        raise RecursionError
+
+    monkeypatch.setattr(settings, "_check", too_deep)  # the walk over the file's values
+    loaded = load_settings(tmp_path)
+    assert loaded.values["ui"]["language"] == "system"
+    assert loaded.warnings == ["config.toml: nested too deeply to read; using the defaults"]
+    with pytest.raises(ValueError):
+        loaded.save({"ui.language": "zh-CN"})

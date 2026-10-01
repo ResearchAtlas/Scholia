@@ -436,7 +436,16 @@ def _line(lines, path):
 
 
 def _parse(settings, raw):
-    """Fill settings.values and settings.warnings from the file's bytes."""
+    """Fill settings.values and settings.warnings from the file's bytes; never raises for content."""
+    try:
+        _fill(settings, raw)
+    except RecursionError:  # valid TOML can nest deeper than tomlkit's recursive parse and unwrap follow
+        _fill(settings, None)
+        settings._digest, settings._broken = _digest(raw), True
+        settings.warnings.append(f"{settings.label}: nested too deeply to read; using the defaults")
+
+
+def _fill(settings, raw):
     settings._digest = _digest(raw)
     settings.values = _defaults(settings.schema)
     settings.warnings = []
@@ -453,10 +462,6 @@ def _parse(settings, raw):
     except tomlkit.exceptions.ParseError as error:
         settings._broken = True
         settings.warnings.append(f"{settings.label} line {error.line}: not valid TOML; using the defaults")
-        return
-    except RecursionError:  # valid TOML can nest deeper than tomlkit's recursive unwrap can follow
-        settings._broken = True
-        settings.warnings.append(f"{settings.label}: nested too deeply to read; using the defaults")
         return
     lines = _key_lines(text)
     for path, value in _leaves(data):
