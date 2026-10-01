@@ -11,10 +11,17 @@ The checks run in a CPython audit hook, which the interpreter calls from inside
 its C socket code for every connect, connect_ex, sendto, sendmsg and name lookup,
 whichever Python class made the socket.
 
+Python sockets (including `socket.SocketType`) are also checked before a host
+name is resolved, because the C methods resolve names before raising their audit
+event.
+
 Limits: uvloop, whose native event loop opens sockets without these audit events,
-is refused (the session fails if it was loaded first). Other C extensions with
-their own networking, and subprocesses a test starts, are not covered; tests must
-not use them.
+is refused (the session fails if it was loaded first). Calling the private C class
+`_socket.socket` directly can still resolve a host name (a DNS query) before the
+connection is refused. Native frameworks with their own networking (for example
+NSURLSession through PyObjC), other C extensions, and subprocesses a test starts
+are not covered. tests/test_network_guard.py fails if the repository's backend or
+test code names these APIs.
 """
 
 import asyncio
@@ -80,7 +87,9 @@ def _require_loopback(name) -> None:
 
 
 def _audit(event: str, args: tuple) -> None:
-    if event in _SEND_EVENTS:
+    if event == "scholia.network_guard.probe":
+        args[0].append(True)
+    elif event in _SEND_EVENTS:
         sock, address = args
         # sendmsg without an address sends on an already connected socket
         if address is not None and not _is_allowed(sock, address):
@@ -126,22 +135,17 @@ def _refuse_open_connections() -> None:
         try:
             if not stat.S_ISSOCK(os.fstat(fd).st_mode):
                 continue
-            with socket.socket(fileno=os.dup(fd)) as sock:
-                if sock.family not in _INET:
-                    continue
-                try:
-                    peer = sock.getpeername()
-                except OSError:
-                    continue  # not connected
-                if not _is_allowed(sock, peer[:2]):
-                    raise RuntimeError(f"connection to {peer!r} was open before the test network block")
         except OSError:
-            continue
-
-
-def _probe(event, args):
-    if event == "scholia.network_guard.probe":
-        args[0].append(True)
+            continue  # closed since the listing
+        with socket.socket(fileno=os.dup(fd)) as sock:  # an error here fails the session
+            if sock.family not in _INET:
+                continue
+            try:
+                peer = sock.getpeername()
+            except OSError:
+                continue  # not connected
+            if not _is_allowed(sock, peer[:2]):
+                raise RuntimeError(f"connection to {peer!r} was open before the test network block")
 
 
 def install() -> None:
@@ -150,7 +154,6 @@ def install() -> None:
     _refuse_open_connections()
     if not _installed:  # audit hooks cannot be removed, so add them once
         sys.addaudithook(_audit)
-        sys.addaudithook(_probe)
         seen = []
         sys.audit("scholia.network_guard.probe", seen)
         if not seen:  # an existing hook can refuse new hooks silently
@@ -158,6 +161,8 @@ def install() -> None:
         socket.socket.listen = _recording_listen
         for name in ("connect", "connect_ex", "sendto", "sendmsg"):
             setattr(socket.socket, name, _checked(name))
+        # The public alias of the C class would skip the name check above.
+        socket.SocketType = socket.socket
         _installed = True
 
 

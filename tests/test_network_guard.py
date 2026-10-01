@@ -1,3 +1,4 @@
+import _socket
 import asyncio
 import os
 import socket
@@ -42,8 +43,8 @@ def test_unregistered_local_port_is_refused(local_listener):
 
 
 def test_raw_c_socket_class_is_guarded(local_listener):
-    # socket.SocketType is the C base class, below any Python-level patch.
-    sock = socket.SocketType()
+    # The C base class, below any Python-level patch, is checked by the audit hook.
+    sock = _socket.socket()
     try:
         with pytest.raises(NetworkBlocked):
             sock.connect(("127.0.0.1", local_listener))
@@ -85,6 +86,8 @@ def test_connect_by_name_is_refused_before_any_lookup():
         sock.connect(("scholia-test.invalid", 443))
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock, pytest.raises(NetworkBlocked):
         sock.sendto(b"x", ("scholia-test.invalid", 53))
+    with socket.SocketType() as sock, pytest.raises(NetworkBlocked):
+        sock.connect(("scholia-test.invalid", 443))
 
 
 def test_address_subclass_cannot_disguise_destination():
@@ -225,3 +228,23 @@ def test_provider_keys_and_proxies_absent_from_environment():
         or name.upper() in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}
     ]
     assert leaked == []
+
+
+def test_project_code_avoids_networking_outside_the_block():
+    # Native and private networking APIs bypass Python sockets, so the block's
+    # stated limits are enforced on the repository's own code.
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    exempt = {"tests/network_guard.py", "tests/test_network_guard.py"}
+    pattern = re.compile(r"\b(uvloop|_socket|NSURLSession|NSURLConnection|CFNetwork|CFStream|pycurl)\b")
+    offenders = [
+        f"{path.relative_to(root)}:{n}"
+        for folder in ("backend", "tests")
+        for path in (root / folder).rglob("*.py")
+        if str(path.relative_to(root)) not in exempt
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert offenders == []
