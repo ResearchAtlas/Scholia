@@ -15,9 +15,10 @@ const LETTER = /\p{L}/u;
 const VISIBLE_ATTRIBUTES = new Set(['title', 'placeholder', 'alt', 'label', 'aria-label']);
 
 // Reports the string text an expression can render: a string or template
-// literal, every branch of ?:, && and || however deeply nested, the last
-// expression of a sequence, and expressions inside a template literal.
-// Arguments of calls such as t('key') are not rendered, so they are not walked.
+// literal, every branch of ?:, &&, || and ?? and both sides of + however deeply
+// nested, array elements, the last expression of a sequence, and expressions
+// inside a template literal. Arguments of calls such as t('key') are not
+// rendered, so they are not walked.
 function reportRendered(context, node) {
   switch (node.type) {
     case 'Literal':
@@ -34,6 +35,15 @@ function reportRendered(context, node) {
     case 'LogicalExpression':
       reportRendered(context, node.left);
       reportRendered(context, node.right);
+      break;
+    case 'BinaryExpression':
+      if (node.operator === '+') {
+        reportRendered(context, node.left);
+        reportRendered(context, node.right);
+      }
+      break;
+    case 'ArrayExpression':
+      node.elements.forEach((element) => element && reportRendered(context, element));
       break;
     case 'SequenceExpression':
       reportRendered(context, node.expressions.at(-1));
@@ -106,6 +116,13 @@ test('the raw-string check flags each kind of raw UI string', () => {
     'raw-strings.jsx:16:35', // || nested in ?: nested in ?:
     'raw-strings.jsx:17:16', // last expression of a sequence
     'raw-strings.jsx:18:18', // ?: inside a template literal
+    'raw-strings.jsx:19:8', // + concatenation
+    'raw-strings.jsx:20:16', // ?? fallback
+    'raw-strings.jsx:21:9', // array element
+    'raw-strings.jsx:22:23', // + nested in ?:
+    'raw-strings.jsx:23:20', // + in title
+    'raw-strings.jsx:23:56', // ?? in aria-label
+    'raw-strings.jsx:23:76', // array in label
   ]);
 });
 

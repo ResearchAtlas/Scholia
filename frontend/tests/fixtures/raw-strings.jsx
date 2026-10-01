@@ -1,6 +1,6 @@
 // i18n: migrated
 // Fixture: every kind of raw UI string the raw-string check must flag.
-export function RawStrings({ busy, count, failed, ready, t }) {
+export function RawStrings({ busy, count, failed, name, ready, t }) {
   return (
     <div className="flex gap-2" title="Raw title">
       Raw text
@@ -16,6 +16,11 @@ export function RawStrings({ busy, count, failed, ready, t }) {
       {ready ? (failed ? (busy || 'Raw deep') : t('x')) : null}
       {(count, 'Raw sequence')}
       {`${busy ? 'Raw in template' : ''}`}
+      {'Hello, ' + name}
+      {name ?? 'Raw unnamed'}
+      {['Raw item', name]}
+      {ready ? name + ' (Raw draft)' : null}
+      <span title={'Open ' + name} aria-label={name ?? 'Raw name'} label={['Raw', name]} />
     </div>
   );
 }
