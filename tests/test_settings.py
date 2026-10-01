@@ -1,6 +1,7 @@
 import stat
 
 import pytest
+import tomlkit
 
 from backend import settings
 from backend.settings import load_instructions, load_settings
@@ -701,3 +702,44 @@ def test_every_known_setting_can_be_saved_at_its_default(tmp_path, project_id, s
     reread = load_settings(tmp_path, project_id)
     assert reread.warnings == []
     assert reread.values["context" if project_id is None else "project"]
+
+
+def _tomlkit_array_with_secret():
+    array = tomlkit.array()
+    table = tomlkit.inline_table()
+    table["api_key"] = "sk-test"
+    array.append(table)
+    return array
+
+
+def _tomlkit_table_with_secret():
+    table = tomlkit.table()
+    table["token"] = "sk-test"
+    return table
+
+
+@pytest.mark.parametrize("project_id, updates", [
+    (None, {"zotero.accounts": ({"api_key": "sk-test"},)}),
+    (None, {"integrations": (("ok", {"nested": ({"password": "sk-test"},)}),)}),
+    (None, {"zotero.accounts": _tomlkit_array_with_secret()}),
+    (None, {"zotero.login": _tomlkit_table_with_secret()}),
+    ("p1", {"mcp.servers": ({"env": {"GITHUB_TOKEN": "sk-test"}},)}),
+    ("p1", {"mcp_server.clients": _tomlkit_array_with_secret()}),
+])
+def test_save_scans_every_serializable_container_for_secrets(tmp_path, project_id, updates):
+    loaded = load_settings(tmp_path, project_id)
+    with pytest.raises(ValueError, match="looks like a secret"):
+        loaded.save(updates)
+    assert list(tmp_path.rglob("config.toml")) == []
+
+
+def test_save_writes_tuples_as_arrays(tmp_path):
+    load_settings(tmp_path).save({"subagents.models": ("a", "b"), "zotero.collections": ("x",)})
+    assert load_settings(tmp_path).values["subagents"]["models"] == ["a", "b"]
+    assert load_settings(tmp_path).values["zotero"] == {"collections": ["x"]}
+
+
+def test_save_refuses_values_toml_cannot_hold(tmp_path):
+    with pytest.raises(ValueError):
+        load_settings(tmp_path).save({"zotero.tags": {"a", "b"}})
+    assert not (tmp_path / "config.toml").exists()

@@ -61,15 +61,20 @@ def _fallback(data_root):
 def save_key(data_root, provider, key, backend=None):
     """Store a provider's key. Returns a warning if it went to the fallback file, else None.
 
-    Raises CredentialsFileError, changing nothing, if the key needs the fallback
-    file and that file is unreadable or malformed.
+    Raises CredentialsFileError if the key needs the fallback file and that file
+    cannot be read or written. The file is left unchanged, and a key the store
+    removed while failing is put back; the error says if that was impossible.
     """
     if not (isinstance(provider, str) and provider and isinstance(key, str) and key):
         raise ValueError("the provider and the key must be non-empty text")
     store = _store(backend)
     with _lock:
-        stored = False
+        stored, previous = False, None
         if store is not None:
+            try:
+                previous = store.get_password(SERVICE, provider)  # some stores delete it before adding
+            except Exception:
+                pass
             try:
                 store.set_password(SERVICE, provider, key)
                 stored = store.get_password(SERVICE, provider) == key  # some stores drop keys silently
@@ -83,10 +88,27 @@ def save_key(data_root, provider, key, backend=None):
             if keys.pop(provider, None) is not None:
                 write_private(path, json.dumps(keys).encode())  # leave no plain copy behind
             return None
-        path, keys = _fallback(data_root)
-        keys[provider] = key
-        write_private(path, json.dumps(keys).encode())
+        try:
+            path, keys = _fallback(data_root)
+            keys[provider] = key
+            write_private(path, json.dumps(keys).encode())
+        except (CredentialsFileError, OSError) as error:
+            lost = "" if _restore(store, provider, previous) else (
+                "; the previous key could not be put back in the credential store")
+            raise CredentialsFileError(f"the key was not saved: {error}{lost}") from error
         return FALLBACK_WARNING
+
+
+def _restore(store, provider, previous):
+    """Put back a key a failed store write removed. Returns False only if it is still missing."""
+    if store is None or previous is None:
+        return True
+    try:
+        if store.get_password(SERVICE, provider) != previous:
+            store.set_password(SERVICE, provider, previous)
+        return store.get_password(SERVICE, provider) == previous
+    except Exception:
+        return False
 
 
 def load_key(data_root, provider, backend=None):

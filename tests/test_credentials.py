@@ -255,3 +255,56 @@ def test_interrupts_from_the_store_are_not_swallowed(tmp_path, stop):
     with pytest.raises(stop):
         load_key(tmp_path, "openrouter", backend=FailingKeyring(stop()))
     assert list(tmp_path.iterdir()) == []
+
+
+class ReplacingKeyring(MemoryKeyring):
+    """Like the macOS Keychain backend: a new key deletes the old item, then adds."""
+
+    def __init__(self, failing_adds):
+        super().__init__()
+        self.failing_adds = failing_adds
+
+    def set_password(self, service, username, password):
+        self.items.pop((service, username), None)
+        if self.failing_adds:
+            self.failing_adds -= 1
+            raise keyring.errors.PasswordSetError("add failed")
+        self.items[(service, username)] = password
+
+
+def test_failed_rotation_with_an_unusable_file_keeps_the_old_key(tmp_path):
+    store = ReplacingKeyring(failing_adds=0)
+    save_key(tmp_path, "openrouter", "sk-old", backend=store)
+    path = tmp_path / "credentials.json"
+    path.write_bytes(MALFORMED[0])
+    store.failing_adds = 1  # the new key's add fails; putting the old one back works
+    with pytest.raises(credentials.CredentialsFileError) as error:
+        save_key(tmp_path, "openrouter", "sk-new", backend=store)
+    assert "could not be put back" not in str(error.value) and "sk-" not in str(error.value)
+    assert load_key(tmp_path, "openrouter", backend=store) == "sk-old"
+    assert path.read_bytes() == MALFORMED[0]
+
+
+def test_failed_rotation_says_when_the_old_key_could_not_be_restored(tmp_path):
+    store = ReplacingKeyring(failing_adds=0)
+    save_key(tmp_path, "openrouter", "sk-old", backend=store)
+    (tmp_path / "credentials.json").write_bytes(MALFORMED[0])
+    store.failing_adds = 99  # every add fails, the restore's too
+    with pytest.raises(credentials.CredentialsFileError, match="could not be put back"):
+        save_key(tmp_path, "openrouter", "sk-new", backend=store)
+    assert (tmp_path / "credentials.json").read_bytes() == MALFORMED[0]
+
+
+def test_failed_rotation_when_the_file_cannot_be_written_keeps_the_old_key(tmp_path, monkeypatch):
+    store = ReplacingKeyring(failing_adds=0)
+    save_key(tmp_path, "openrouter", "sk-old", backend=store)
+
+    def disk_full(path, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(credentials, "write_private", disk_full)
+    store.failing_adds = 1
+    with pytest.raises(credentials.CredentialsFileError):
+        save_key(tmp_path, "openrouter", "sk-new", backend=store)
+    assert load_key(tmp_path, "openrouter", backend=store) == "sk-old"
+    assert not (tmp_path / "credentials.json").exists()

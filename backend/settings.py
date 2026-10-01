@@ -212,6 +212,9 @@ class Settings:
             doc = tomlkit.parse(raw.decode("utf-8")) if raw else tomlkit.document()
             for dotted, value in updates.items():
                 path = _split_key(dotted)
+                # Checked as tomlkit will write it: tuples become arrays, tomlkit items plain values,
+                # and anything TOML cannot hold raises ValueError here.
+                value = tomlkit.item(value).unwrap()
                 # A dict is applied leaf by leaf, so the rest of an existing table and its comments stay.
                 for leaf, leaf_value in _leaves({path[-1]: value}, path[:-1]):
                     pattern, problem = _check(self.schema, leaf, leaf_value)
@@ -308,7 +311,7 @@ def _hides_secret(value):
             if any(_secret_name(k) for k in item):
                 return True
             stack.extend(item.values())
-        elif isinstance(item, list):
+        elif isinstance(item, (list, tuple)):
             stack.extend(item)
     return False
 
