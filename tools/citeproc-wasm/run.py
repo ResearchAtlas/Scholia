@@ -3,7 +3,8 @@
     python tools/citeproc-wasm/run.py build/citeproc-wasm/citeproc.wasm
 
 Prints JSON with the module's size, SHA-256, how many GMP symbol names appear in it, the
-compile and run times, and citeproc's output; exits non-zero if the output is wrong.
+compile and run times, and citeproc's output; exits non-zero if the output is wrong or
+the module shows GMP code.
 """
 
 import hashlib
@@ -66,14 +67,17 @@ def main(path: str) -> int:
         bibliography = " ".join(entry for _, entry in result["bibliography"])
     except (ValueError, KeyError, IndexError, TypeError):
         result, citation, bibliography = None, "", ""
-    ok = code == 0 and "Garcia 2024" in citation and "张" in citation and "学术研究" in bibliography
+    gmp, rts = data.count(b"__gmp"), data.count(b"stg_")
+    # Success needs the right output and no GMP code, judged by symbol names, which are
+    # there unless stripped (the GHC runtime's are the control).
+    output_ok = "Garcia 2024" in citation and "张" in citation and "学术研究" in bibliography
+    ok = code == 0 and output_ok and gmp == 0 and rts > 0
     print(json.dumps({
         "ok": ok,
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
-        "gmp_symbols": data.count(b"__gmp"),
-        # A control for the count above: GHC runtime symbol names, present unless names were stripped
-        "rts_symbols": data.count(b"stg_"),
+        "gmp_symbols": gmp,
+        "rts_symbols": rts,
         "compile_seconds": round(compiled, 3),
         "run_seconds": timings,
         "exit_code": code,
