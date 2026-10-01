@@ -28,13 +28,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CONTENTS = "_internal"  # PyInstaller's onedir contents folder
 LICENSES = "licenses"  # license texts ship in <contents>/licenses/<component>/
-CPYTHON_DOC = Path(sys.base_prefix, "Resources/English.lproj/Documentation/_sources/license.rst.txt")
+# CPython's license document, which covers the third-party code it incorporates
+CPYTHON_DOC = Path(sys.base_prefix, "Resources/English.lproj/Documentation/_sources",
+                   "license.rst.txt")
 
 # Licenses that ask only for attribution, a notice or a disclaimer, and public-domain terms.
 ALLOWED = {
     "MIT", "MIT-0", "BSD", "BSD-2-Clause", "BSD-3-Clause", "0BSD", "Apache-2.0", "ISC", "Zlib",
     "Libpng", "IJG", "FTL", "PSF-2.0", "BSL-1.0", "Unicode-3.0", "Unicode-DFS-2016",
-    "blessing", "CC0-1.0", "Unlicense", "LicenseRef-Public-Domain", "OpenSSL",
+    "blessing", "CC0-1.0", "Unlicense", "LicenseRef-Public-Domain",
 }
 # GPL is allowed only with these exceptions.
 ALLOWED_WITH = {
@@ -162,7 +164,8 @@ def _dist_license(dist) -> str | None:
         return meta["License-Expression"]
     if re.fullmatch(r"[\w.+-]+", (meta.get("License") or "").strip()):
         return meta["License"].strip()
-    labels = [c.split(" :: ")[-1] for c in meta.get_all("Classifier") or [] if c.startswith("License :: ")]
+    classifiers = meta.get_all("Classifier") or []
+    labels = [c.split(" :: ")[-1] for c in classifiers if c.startswith("License :: ")]
     # Several license classifiers do not say whether they are a choice, so all must pass.
     names = [CLASSIFIERS.get(label, "LicenseRef-" + re.sub(r"\W+", "-", label)) for label in labels]
     return " AND ".join(names) or None
@@ -189,7 +192,8 @@ def component(name: str):
 def notice_datas(dists=()) -> list[tuple[str, str]]:
     """PyInstaller `datas` entries that ship the license files of the fixed components
     (Scholia, CPython, PyInstaller and the libraries with their own files) and of `dists`."""
-    names = ["Scholia", "CPython", "PyInstaller", *(n for n, (_, v) in LIBRARIES.items() if isinstance(v, list) and v), *dists]
+    with_files = [name for name, (_, files) in LIBRARIES.items() if isinstance(files, list) and files]
+    names = ["Scholia", "CPython", "PyInstaller", *with_files, *dists]
     return [
         (str(source), str(Path(LICENSES, name, dest).parent))
         for name in names
@@ -200,7 +204,11 @@ def notice_datas(dists=()) -> list[tuple[str, str]]:
 @cache
 def _record_owners() -> dict[str, str]:
     """Installed file path (relative to site-packages) -> distribution name."""
-    return {f.as_posix(): dist.metadata["Name"] for dist in metadata.distributions() for f in dist.files or []}
+    return {
+        f.as_posix(): dist.metadata["Name"]
+        for dist in metadata.distributions()
+        for f in dist.files or []
+    }
 
 
 @cache
@@ -260,7 +268,9 @@ def assign_file(bundle: Path, rel: str, problems: list[str]):
     if not _is_macho(bundle / rel):
         return [owner]
     if owner not in REVIEWED_NATIVE:
-        problems.append(f"{rel}: native code from {owner} has not been reviewed for the libraries it embeds")
+        problems.append(
+            f"{rel}: native code from {owner} has not been reviewed for the libraries it embeds"
+        )
     return [owner, *REVIEWED_NATIVE.get(owner, [])]
 
 

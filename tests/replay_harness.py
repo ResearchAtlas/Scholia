@@ -59,7 +59,7 @@ def replay(name: str):
                 if response is None:
                     unrecorded.append(f"{self.command} {self.path}")
             if response is None:
-                response = {"status": 501, "body": {"error": "no recorded response for this request"}}
+                response = {"status": 501, "body": {"error": "no recorded response"}}
             data = json.dumps(response["body"]).encode()
             self.send_response(response["status"])
             self.send_header("Content-Type", "application/json")
