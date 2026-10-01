@@ -199,6 +199,8 @@ class Settings:
     def save(self, updates):
         """Write updates ({"section.key": value}) to the file, keeping comments and unknown keys.
 
+        A value of None removes the key, so the setting returns to its default.
+
         Re-reads the file first and raises SettingsChanged if it changed since it
         was loaded. Raises ValueError, writing nothing, for an invalid value, a
         secret, a personal setting in a project file, or a file that is not valid TOML.
@@ -212,6 +214,13 @@ class Settings:
             doc = tomlkit.parse(raw.decode("utf-8")) if raw else tomlkit.document()
             for dotted, value in updates.items():
                 path = _split_key(dotted)
+                if value is None:  # clear the key, back to its default; nothing else changes
+                    node = doc
+                    for part in path[:-1]:
+                        node = node.get(part) if isinstance(node, dict) else None
+                    if isinstance(node, dict) and path[-1] in node:
+                        del node[path[-1]]
+                    continue
                 # Checked as tomlkit will write it: tuples become arrays, tomlkit items plain values,
                 # and anything TOML cannot hold raises ValueError here.
                 value = tomlkit.item(value).unwrap()

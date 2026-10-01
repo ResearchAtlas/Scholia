@@ -26,6 +26,9 @@ class MemoryKeyring:
     def set_password(self, service, username, password):
         self.items[(service, username)] = password
 
+    def delete_password(self, service, username):
+        del self.items[(service, username)]
+
 
 @pytest.fixture(autouse=True)
 def no_system_keyring(monkeypatch):
@@ -72,12 +75,12 @@ def test_unavailable_store_falls_back_to_an_owner_only_file(tmp_path, unavailabl
     assert load_key(data_root, "openrouter", backend=unavailable()) == KEY
 
 
-def test_fallback_entry_wins_over_the_store(tmp_path):
+def test_loading_reads_the_store_first(tmp_path):
     save_key(tmp_path, "openrouter", KEY, backend=keyring.backends.fail.Keyring())
     store = MemoryKeyring()
     assert load_key(tmp_path, "openrouter", backend=store) == KEY  # not in the store: the file
-    store.items[(SERVICE, "openrouter")] = "sk-older"
-    assert load_key(tmp_path, "openrouter", backend=store) == KEY  # the file holds the latest save
+    store.items[(SERVICE, "openrouter")] = "sk-in-store"
+    assert load_key(tmp_path, "openrouter", backend=store) == "sk-in-store"  # the store comes first
     assert load_key(tmp_path, "other", backend=keyring.backends.fail.Keyring()) is None
 
 
@@ -182,6 +185,7 @@ def test_latest_save_wins_after_a_failed_rotation(tmp_path):
     locked = ReadOnlyKeyring()
     locked.items = store.items  # the same store, now refusing writes
     assert save_key(tmp_path, "openrouter", "sk-new", backend=locked)  # fell back, with a warning
+    assert store.items == {}  # the older key cannot shadow the new one
     assert load_key(tmp_path, "openrouter", backend=locked) == "sk-new"
     assert load_key(tmp_path, "openrouter", backend=store) == "sk-new"
     assert save_key(tmp_path, "openrouter", "sk-newest", backend=store) is None  # the store works again
@@ -260,51 +264,57 @@ def test_interrupts_from_the_store_are_not_swallowed(tmp_path, stop):
 class ReplacingKeyring(MemoryKeyring):
     """Like the macOS Keychain backend: a new key deletes the old item, then adds."""
 
-    def __init__(self, failing_adds):
-        super().__init__()
-        self.failing_adds = failing_adds
-
     def set_password(self, service, username, password):
         self.items.pop((service, username), None)
-        if self.failing_adds:
-            self.failing_adds -= 1
-            raise keyring.errors.PasswordSetError("add failed")
-        self.items[(service, username)] = password
+        raise keyring.errors.PasswordSetError("add failed")
 
 
-def test_failed_rotation_with_an_unusable_file_keeps_the_old_key(tmp_path):
-    store = ReplacingKeyring(failing_adds=0)
+def disk_full(path, data):
+    raise OSError("disk full")
+
+
+@pytest.mark.parametrize("unusable_file", ["malformed", "unwritable"])
+def test_failed_save_may_leave_no_key(tmp_path, monkeypatch, unusable_file):
+    # The documented limit: the store dropped the old key, and the file cannot take the new one.
+    store = MemoryKeyring()
     save_key(tmp_path, "openrouter", "sk-old", backend=store)
+    replacing = ReplacingKeyring()
+    replacing.items = store.items
     path = tmp_path / "credentials.json"
-    path.write_bytes(MALFORMED[0])
-    store.failing_adds = 1  # the new key's add fails; putting the old one back works
-    with pytest.raises(credentials.CredentialsFileError) as error:
-        save_key(tmp_path, "openrouter", "sk-new", backend=store)
-    assert "could not be put back" not in str(error.value) and "sk-" not in str(error.value)
-    assert load_key(tmp_path, "openrouter", backend=store) == "sk-old"
-    assert path.read_bytes() == MALFORMED[0]
+    if unusable_file == "malformed":
+        path.write_bytes(MALFORMED[0])
+    else:
+        monkeypatch.setattr(credentials, "write_private", disk_full)
+    with pytest.raises(credentials.CredentialsFileError, match="not saved") as error:
+        save_key(tmp_path, "openrouter", "sk-new", backend=replacing)
+    assert "sk-" not in str(error.value)
+    assert load_key(tmp_path, "openrouter", backend=store) is None  # the researcher enters it again
+    if unusable_file == "malformed":
+        assert path.read_bytes() == MALFORMED[0]
+    else:
+        assert not path.exists()
 
 
-def test_failed_rotation_says_when_the_old_key_could_not_be_restored(tmp_path):
-    store = ReplacingKeyring(failing_adds=0)
-    save_key(tmp_path, "openrouter", "sk-old", backend=store)
-    (tmp_path / "credentials.json").write_bytes(MALFORMED[0])
-    store.failing_adds = 99  # every add fails, the restore's too
-    with pytest.raises(credentials.CredentialsFileError, match="could not be put back"):
-        save_key(tmp_path, "openrouter", "sk-new", backend=store)
-    assert (tmp_path / "credentials.json").read_bytes() == MALFORMED[0]
-
-
-def test_failed_rotation_when_the_file_cannot_be_written_keeps_the_old_key(tmp_path, monkeypatch):
-    store = ReplacingKeyring(failing_adds=0)
-    save_key(tmp_path, "openrouter", "sk-old", backend=store)
-
-    def disk_full(path, data):
-        raise OSError("disk full")
-
+def test_failed_removal_of_the_old_copy_still_saves(tmp_path, monkeypatch, caplog):
+    save_key(tmp_path, "openrouter", "sk-old", backend=keyring.backends.fail.Keyring())  # in the file
+    content = (tmp_path / "credentials.json").read_bytes()
     monkeypatch.setattr(credentials, "write_private", disk_full)
-    store.failing_adds = 1
-    with pytest.raises(credentials.CredentialsFileError):
-        save_key(tmp_path, "openrouter", "sk-new", backend=store)
+    store = MemoryKeyring()
+    assert save_key(tmp_path, "openrouter", "sk-new", backend=store) is None
+    assert load_key(tmp_path, "openrouter", backend=store) == "sk-new"  # the store comes first
+    assert (tmp_path / "credentials.json").read_bytes() == content
+    assert "credentials.json" in caplog.text and "sk-" not in caplog.text
+
+
+class UndeletableKeyring(ReadOnlyKeyring):
+    def delete_password(self, service, username):
+        raise keyring.errors.PasswordDeleteError("locked")
+
+
+def test_older_store_key_that_cannot_be_cleared_is_logged(tmp_path, caplog):
+    # The documented limit: a store that refuses both the write and the delete keeps its older key.
+    store = UndeletableKeyring()
+    store.items[(SERVICE, "openrouter")] = "sk-old"
+    assert save_key(tmp_path, "openrouter", "sk-new", backend=store)  # fell back, with a warning
+    assert "credential store could not be cleared" in caplog.text and "sk-" not in caplog.text
     assert load_key(tmp_path, "openrouter", backend=store) == "sk-old"
-    assert not (tmp_path / "credentials.json").exists()

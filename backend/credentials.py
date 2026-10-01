@@ -1,9 +1,9 @@
 """Provider keys: the OS credential store through keyring, or an owner-only file.
 
-Keys never go into config.toml. When the credential store is unavailable, they
-go to credentials.json in the data folder (0600), and the caller shows a warning.
-A provider has a fallback entry only while its latest save could not use the
-store, so that entry wins on reading; a later successful store save removes it.
+Keys never go into config.toml. The credential store comes first. Only when it
+cannot be used does a key go to credentials.json in the data folder (0600), and
+the caller shows a warning. Reading takes the store's key when it has one, and
+the file's otherwise.
 """
 
 import json
@@ -27,7 +27,7 @@ _log = logging.getLogger(__name__)
 
 
 class CredentialsFileError(Exception):
-    """credentials.json exists but cannot be read; it is left exactly as it is."""
+    """The key could not be saved in the fallback file, which is left exactly as it was."""
 
 
 def _store(backend):
@@ -61,68 +61,62 @@ def _fallback(data_root):
 def save_key(data_root, provider, key, backend=None):
     """Store a provider's key. Returns a warning if it went to the fallback file, else None.
 
-    Raises CredentialsFileError if the key needs the fallback file and that file
-    cannot be read or written. The file is left unchanged, and a key the store
-    removed while failing is put back; the error says if that was impossible.
+    Raises CredentialsFileError if the store cannot be used and the fallback file
+    cannot be read or written; the file is left unchanged. A save that raises may
+    leave no key stored at all, because some stores (the macOS one among them)
+    replace a key by deleting it first; the researcher then enters the key again.
+    Interrupts such as KeyboardInterrupt propagate.
     """
     if not (isinstance(provider, str) and provider and isinstance(key, str) and key):
         raise ValueError("the provider and the key must be non-empty text")
     store = _store(backend)
     with _lock:
-        stored, previous = False, None
+        stored = False
         if store is not None:
-            try:
-                previous = store.get_password(SERVICE, provider)  # some stores delete it before adding
-            except Exception:
-                pass
             try:
                 store.set_password(SERVICE, provider, key)
                 stored = store.get_password(SERVICE, provider) == key  # some stores drop keys silently
-            except Exception:  # any ordinary failure means the store is unavailable; interrupts propagate
+            except Exception:  # any ordinary failure means the store is unavailable
                 pass
         if stored:
             try:
                 path, keys = _fallback(data_root)
-            except CredentialsFileError:
-                return None  # the key is safe in the store, and an unreadable file is never used
-            if keys.pop(provider, None) is not None:
-                write_private(path, json.dumps(keys).encode())  # leave no plain copy behind
+                if keys.pop(provider, None) is not None:
+                    write_private(path, json.dumps(keys).encode())  # leave no plain copy behind
+            except (CredentialsFileError, OSError):
+                # Harmless for reading, which prefers the store, but a plain copy remains.
+                _log.warning("an old copy of a key could not be removed from %s", FALLBACK_FILE)
             return None
         try:
             path, keys = _fallback(data_root)
             keys[provider] = key
             write_private(path, json.dumps(keys).encode())
         except (CredentialsFileError, OSError) as error:
-            lost = "" if _restore(store, provider, previous) else (
-                "; the previous key could not be put back in the credential store")
-            raise CredentialsFileError(f"the key was not saved: {error}{lost}") from error
+            raise CredentialsFileError(f"the key was not saved: {error}") from error
+        if store is not None:
+            try:  # an older key left in the store would be read before this one
+                if store.get_password(SERVICE, provider) is not None:
+                    store.delete_password(SERVICE, provider)
+            except Exception:
+                _log.warning("the credential store could not be cleared of an older key; it may be read "
+                             "instead of the one in %s", FALLBACK_FILE)
         return FALLBACK_WARNING
 
 
-def _restore(store, provider, previous):
-    """Put back a key a failed store write removed. Returns False only if it is still missing."""
-    if store is None or previous is None:
-        return True
-    try:
-        if store.get_password(SERVICE, provider) != previous:
-            store.set_password(SERVICE, provider, previous)
-        return store.get_password(SERVICE, provider) == previous
-    except Exception:
-        return False
-
-
 def load_key(data_root, provider, backend=None):
-    """Return a provider's key from the fallback file, else the credential store, else None."""
+    """Return a provider's key from the credential store, else the fallback file, else None."""
+    store = _store(backend)
+    if store is not None:
+        try:
+            key = store.get_password(SERVICE, provider)
+        except Exception:  # any ordinary failure means the store is unavailable
+            key = None
+        if isinstance(key, str):
+            return key
     with _lock:
         try:
             key = _fallback(data_root)[1].get(provider)
         except CredentialsFileError as error:
             _log.warning("%s; its keys are not used", error)
-            key = None
-    if key is None:
-        store = _store(backend)
-        try:
-            key = store.get_password(SERVICE, provider) if store is not None else None
-        except Exception:  # any ordinary failure means the store is unavailable; interrupts propagate
             key = None
     return key if isinstance(key, str) else None

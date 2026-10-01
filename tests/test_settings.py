@@ -743,3 +743,24 @@ def test_save_refuses_values_toml_cannot_hold(tmp_path):
     with pytest.raises(ValueError):
         load_settings(tmp_path).save({"zotero.tags": {"a", "b"}})
     assert not (tmp_path / "config.toml").exists()
+
+
+@pytest.mark.parametrize("project_id, dotted, value, default", [
+    (None, "models.router", "openai/gpt-5-mini", None),
+    ("p1", "project.target_venue", "Nature", None),
+    (None, "ui.language", "zh-CN", "system"),
+])
+def test_none_clears_a_setting_back_to_its_default(tmp_path, project_id, dotted, value, default):
+    loaded = load_settings(tmp_path, project_id)
+    loaded.path.parent.mkdir(parents=True, exist_ok=True)
+    section, key = dotted.split(".")
+    loaded.path.write_text(f"# mine\n[{section}]\nkeep = 1  # note\n")
+    loaded = load_settings(tmp_path, project_id)
+    loaded.save({dotted: value})
+    assert loaded.values[section][key] == value
+    loaded.save({dotted: None})
+    assert loaded.path.read_text() == f"# mine\n[{section}]\nkeep = 1  # note\n"
+    reread = load_settings(tmp_path, project_id)
+    assert reread.values[section].get(key) == default
+    reread.save({dotted: None, "absent.key": None})  # clearing what is not there changes nothing
+    assert reread.path.read_text() == f"# mine\n[{section}]\nkeep = 1  # note\n"
