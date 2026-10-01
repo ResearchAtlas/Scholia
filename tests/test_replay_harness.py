@@ -5,7 +5,7 @@ import pytest
 
 import replay_harness
 from network_guard import NetworkBlocked
-from replay_harness import FIXTURES, UnrecordedRequest, replay
+from replay_harness import FIXTURES, UnrecordedRequest, UnrequestedExchange, replay
 
 RECORDED = json.loads((FIXTURES / "chat_completion.json").read_text(encoding="utf-8"))[0]
 PATH = RECORDED["request"]["path"]
@@ -45,7 +45,7 @@ def test_each_recorded_exchange_is_served_once():
 
 def test_replay_server_is_unreachable_after_the_block():
     with replay("chat_completion") as base_url:
-        pass
+        httpx.post(base_url + PATH, json=BODY)
     with pytest.raises(NetworkBlocked):
         httpx.post(base_url + PATH, json=BODY)
 
@@ -105,3 +105,16 @@ def test_recorded_requests_of_other_methods_replay(record):
         assert httpx.head(base_url + "/models").status_code == 200
         assert httpx.options(base_url + "/models").json() == {"allow": ["GET", "POST"]}
         assert httpx.request("PROPFIND", base_url + "/models").json() == {"allow": ["GET", "POST"]}
+
+
+def test_recorded_exchange_never_requested_fails_the_test(two_turns):
+    first, _ = two_turns
+    with pytest.raises(UnrequestedExchange, match="POST /api/v1/chat/completions"):
+        with replay("two_turns") as base_url:
+            assert httpx.post(base_url + PATH, json=first["request"]["body"]).status_code == 200
+
+
+def test_an_error_in_the_block_is_reported_before_unrequested_exchanges(two_turns):
+    with pytest.raises(ValueError, match="raised by the code under test"):
+        with replay("two_turns"):
+            raise ValueError("raised by the code under test")

@@ -69,8 +69,10 @@ def bundle(tmp_path, monkeypatch):
     for module in ("_json", "_sqlite3", "_decimal", "pyexpat"):
         _put(home, f"lib/python3.13/lib-dynload/{module}.cpython-313-darwin.so")
     _put(home, "Python")
+    for library in ("libssl.3.dylib", "libgmp.10.dylib"):  # libgmp: one CPython never ships
+        _put(home, f"lib/{library}")
     doc = home / "license.rst.txt"
-    doc.write_text("... libmpdec ... mimalloc ...", encoding="utf-8")
+    doc.write_text("... OpenSSL ... libmpdec ... mimalloc ...", encoding="utf-8")
     monkeypatch.setattr(la, "CPYTHON_HOME", home)
     monkeypatch.setattr(la, "LIB_DYNLOAD", home / "lib/python3.13/lib-dynload")
     monkeypatch.setattr(la, "CPYTHON_DOC", doc)
@@ -200,3 +202,36 @@ def test_community_runtime_hooks_are_apache_but_the_rest_of_their_distribution_i
     problems = la.audit(bundle)[1]
     assert len(problems) == 1 and problems[0].startswith("pyinstaller-hooks-contrib: license ")
     assert "GPL" in problems[0] and "is not allowed" in problems[0]
+
+
+def test_libraries_in_the_framework_need_the_same_review_as_at_top_level(bundle):
+    framework_lib = "_internal/Python.framework/Versions/3.13/lib"
+    _put(bundle, f"{framework_lib}/libssl.3.dylib", MACHO)  # OpenSSL, reviewed
+    found, problems = la.audit(bundle)
+    assert problems == [] and f"{framework_lib}/libssl.3.dylib" in found["OpenSSL"]
+    _put(bundle, f"{framework_lib}/libgmp.10.dylib", MACHO)  # in the interpreter, not reviewed
+    _put(bundle, "_internal/libgmp.10.dylib", MACHO)
+    assert set(la.audit(bundle)[1]) == {
+        f"{framework_lib}/libgmp.10.dylib: belongs to no known component",
+        "_internal/libgmp.10.dylib: belongs to no known component",
+    }
+
+
+def test_symlinks_inside_the_bundle_share_their_targets_component(bundle):
+    _put(bundle, "_internal/Python.framework/Versions/3.13/Python", MACHO)
+    (bundle / "_internal/Python.framework/Versions/Current").symlink_to("3.13")
+    (bundle / "_internal/Python").symlink_to("Python.framework/Versions/Current/Python")
+    found, problems = la.audit(bundle)
+    assert problems == []
+    assert "_internal/Python" in found["CPython"] and "_internal/Python" in found["mimalloc"]
+
+
+def test_dangling_or_escaping_symlink_fails(bundle, tmp_path):
+    outside = tmp_path / "libavcodec.61.dylib"
+    outside.write_bytes(MACHO)
+    (bundle / "_internal/libavcodec.61.dylib").symlink_to(outside)
+    (bundle / "_internal/libgone.dylib").symlink_to("missing.dylib")
+    assert la.audit(bundle)[1] == [
+        f"_internal/libavcodec.61.dylib: symlink to {outside.resolve()}, outside the bundle",
+        "_internal/libgone.dylib: symlink to nothing",
+    ]

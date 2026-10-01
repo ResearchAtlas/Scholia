@@ -271,8 +271,14 @@ def assign_file(bundle: Path, rel: str, problems: list[str]):
     if inner.startswith(f"python{version}/lib-dynload/"):
         return cpython if len(parts) == 4 and (LIB_DYNLOAD / parts[-1]).is_file() else None
     if parts[1] == "Python.framework":  # Versions/<version>/ mirrors the installation
-        mirrored = parts[2:4] == ["Versions", version] and len(parts) > 4
-        return cpython if mirrored and (CPYTHON_HOME / "/".join(parts[4:])).is_file() else None
+        source = "/".join(parts[4:])
+        if parts[2:4] != ["Versions", version] or not source or not (CPYTHON_HOME / source).is_file():
+            return None
+        if source == "Python" or not _is_macho(bundle / rel):  # the interpreter, or a resource
+            return cpython
+        if len(parts) == 6 and parts[4] == "lib":  # a library the build ships, as at top level
+            return CPYTHON_EMBEDDED.get(stem)
+        return None
     if inner == "Python" and (CPYTHON_HOME / "Python").is_file():
         return cpython
     if len(parts) == 2 and parts[1].endswith(".dylib") and (CPYTHON_HOME / "lib" / parts[1]).is_file():
@@ -314,15 +320,23 @@ def audit(bundle: Path) -> tuple[dict[str, set[str]], list[str]]:
         return found, [f"{bundle}: not a directory"]
     notices = Path(CONTENTS, LICENSES).as_posix() + "/"
     inventoried = 0
-    for path in sorted(p for p in bundle.rglob("*") if p.is_file() and not p.is_symlink()):
+    owners_of: dict[str, list[str]] = {}
+    links = []
+    for path in sorted(bundle.rglob("*")):
         rel = path.relative_to(bundle).as_posix()
         if rel.startswith(notices):
+            continue
+        if path.is_symlink():
+            links.append((rel, path))
+            continue
+        if not path.is_file():
             continue
         inventoried += 1
         owners = assign_file(bundle, rel, problems)
         if owners is None:
             problems.append(f"{rel}: belongs to no known component")
             continue
+        owners_of[rel] = owners
         for owner in owners:
             found[owner].add(rel)
         members = []
@@ -341,6 +355,19 @@ def audit(bundle: Path) -> tuple[dict[str, set[str]], list[str]]:
                 problems.append(f"{rel}: {kind} {name} belongs to no known component")
             for owner in owners or []:
                 found[owner].add(rel)
+    # A symlink must resolve inside the bundle; one to a file shares that file's components.
+    root = bundle.resolve()
+    for rel, path in links:
+        try:
+            target = path.resolve(strict=True)
+        except (OSError, RuntimeError):  # missing target, or a loop
+            problems.append(f"{rel}: symlink to nothing")
+            continue
+        if not target.is_relative_to(root):
+            problems.append(f"{rel}: symlink to {target}, outside the bundle")
+            continue
+        for owner in owners_of.get(target.relative_to(root).as_posix(), []):
+            found[owner].add(rel)
     if not inventoried:
         problems.append(f"{bundle}: the bundle contains no files")
     for name in sorted(found):

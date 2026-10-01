@@ -8,7 +8,8 @@ of any HTTP method must match the next recorded exchange on method, path and
 JSON body (key order ignored). Headers are not matched, so no key is ever
 needed. A request that does not match the next exchange, out of order or
 unrecorded, gets a 501 response and fails the test when the block exits, even
-if the client swallowed the error.
+if the client swallowed the error. A recorded exchange that was never requested
+also fails the test when the block exits.
 
 Fixture format: a JSON list of
     {"request": {"method", "path", "body"}, "response": {"status", "body"}}
@@ -29,6 +30,10 @@ FIXTURES = Path(__file__).parent / "fixtures" / "replay"
 
 class UnrecordedRequest(AssertionError):
     """A request reached the replay server that was not the next recorded exchange."""
+
+
+class UnrequestedExchange(AssertionError):
+    """A recorded exchange was never requested before the replay block ended."""
 
 
 def _key(method: str, path: str, body) -> tuple:
@@ -80,5 +85,9 @@ def replay(name: str):
 
     with mock_http_server(Handler) as base_url:
         yield base_url
+    # Reached only when the block's body did not raise; its own error comes first.
     if unrecorded:
         raise UnrecordedRequest(f"requests that were not the next recorded exchange: {unrecorded}")
+    if pending:
+        missing = [f"{e['request']['method']} {e['request']['path']}" for e in pending]
+        raise UnrequestedExchange(f"recorded exchanges never requested: {missing}")
