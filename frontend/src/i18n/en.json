@@ -1,0 +1,12 @@
+{
+  "common.cancel": "Cancel",
+  "sidebar.projects": "Projects",
+  "sidebar.conversations": "Conversations",
+  "sidebar.newConversation": "New conversation",
+  "library.materialCount": {
+    "one": "{count} material",
+    "other": "{count} materials"
+  },
+  "runs.started": "Started {date}",
+  "error.internal": "Something went wrong. Try again."
+}
