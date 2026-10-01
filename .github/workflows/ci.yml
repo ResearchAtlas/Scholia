@@ -110,4 +110,6 @@ jobs:
           assert r["framework"] == "Python", "not the python.org framework build"
           EOF
       - name: License audit
-        run: uv run --no-sync python tools/license_audit.py build/dist/scholia-probe
+        run: |
+          find build/dist -type f | sort
+          uv run --no-sync python tools/license_audit.py build/dist/scholia-probe
