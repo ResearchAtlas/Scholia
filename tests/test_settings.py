@@ -529,7 +529,7 @@ def test_identifiers_are_not_mistaken_for_secrets(tmp_path):
         '[models.efforts]\n"vendor/secret" = "high"\n'
         '[extensions.aab-auth]\nstyle = "apa"\n'
     )
-    write_project_file(tmp_path, '[mcp.servers.github-token]\ncommand = "gh-mcp"\n')
+    write_project_file(tmp_path, '[mcp.servers.github]\ncommand = "gh-mcp"\n')
     personal = load_settings(tmp_path)
     assert personal.warnings == []
     assert personal.values["providers"] == {
@@ -541,8 +541,8 @@ def test_identifiers_are_not_mistaken_for_secrets(tmp_path):
     assert load_settings(tmp_path).values["providers"]["local-key"]["kind"] == "openrouter"
     project = load_settings(tmp_path, "p1")
     assert project.warnings == []
-    assert project.values["mcp"] == {"servers": {"github-token": {"command": "gh-mcp"}}}
-    project.save({"mcp.servers.github-token.command": "gh"})
+    assert project.values["mcp"] == {"servers": {"github": {"command": "gh-mcp"}}}
+    project.save({"mcp.servers.github.command": "gh"})
 
 
 def test_warning_lines_count_only_toml_line_endings(tmp_path):
@@ -591,3 +591,57 @@ def test_personal_only_settings_in_a_project_file_are_ignored_with_a_warning(tmp
         "project config.toml line 3: ui.language is a personal setting and cannot be set in a project file",
         "project config.toml line 5: budget.conversation_usd is a personal setting and cannot be set in a project file",
     ]
+
+
+@pytest.mark.parametrize("text, key", [
+    ('[zotero.api_key]\nvalue = "hidden"\n', "zotero.api_key.value"),
+    ('[extensions.foo.auth]\nvalue = "hidden"\n', "extensions.foo.auth.value"),
+    ('[discovery.sources.openalex.credentials]\nuser = "hidden"\n', "discovery.sources.openalex.credentials.user"),
+])
+def test_table_names_inside_open_sections_are_field_names(tmp_path, text, key):
+    (tmp_path / "config.toml").write_text(text)
+    loaded = load_settings(tmp_path)
+    assert loaded.warnings == [f"config.toml line 2: {key} looks like a secret; keys belong in the credential store; ignored"]
+    assert not {"zotero", "discovery"} & set(loaded.values) and "extensions" not in loaded.values
+    with pytest.raises(ValueError, match="looks like a secret"):
+        loaded.save({key: "hidden"})
+    assert loaded.path.read_text() == text
+
+
+def test_extension_ids_are_identifiers_even_with_secret_words(tmp_path):
+    (tmp_path / "config.toml").write_text('[extensions.my-key]\nstyle = "apa"\n[extensions.aab-auth.options]\nmode = 1\n')
+    loaded = load_settings(tmp_path)
+    assert loaded.warnings == []
+    assert loaded.values["extensions"] == {"my-key": {"style": "apa"}, "aab-auth": {"options": {"mode": 1}}}
+    loaded.save({"extensions.my-key.style": "mla", "extensions.aab-auth.options.mode": 2})
+    assert load_settings(tmp_path).values["extensions"]["aab-auth"] == {"options": {"mode": 2}}
+
+
+DOTTED = ".".join(f"k{i}" for i in range(99))  # near the parser's 100-level limit per key
+
+
+def nested(levels):
+    return "{" + f"{DOTTED} = " + (nested(levels - 1) if levels > 1 else "1") + "}"
+
+
+def test_deeply_nested_settings_never_stop_loading(tmp_path):
+    path = tmp_path / "config.toml"
+    text = f'[ui]\nlanguage = "en"\n[zotero]\nx = {nested(40)}\n'  # about 4,000 tables deep, still valid TOML
+    path.write_text(text)
+    loaded = load_settings(tmp_path)
+    assert loaded.values["ui"]["language"] == "system" and "zotero" not in loaded.values
+    assert loaded.warnings == ["config.toml: nested too deeply to read; using the defaults"]
+    with pytest.raises(ValueError):
+        loaded.save({"ui.follow_up": "queue"})
+    assert path.read_text() == text
+
+
+def test_moderately_nested_settings_load(tmp_path):
+    (tmp_path / "config.toml").write_text(f"[zotero]\nx = {nested(2)}\n")  # about 200 tables deep
+    loaded = load_settings(tmp_path)
+    assert loaded.warnings == []
+    node = loaded.values["zotero"]["x"]
+    for _ in range(2):
+        for i in range(99):
+            node = node[f"k{i}"]
+    assert node == 1

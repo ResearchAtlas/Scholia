@@ -254,12 +254,17 @@ def _read(path):
 
 
 def _leaves(node, prefix=()):
-    """Yield (key path, value) for every non-table value and every empty table under node."""
-    for key, value in node.items():
-        if isinstance(value, dict) and value:
-            yield from _leaves(value, prefix + (key,))
+    """Yield (key path, value) for every non-table value and every empty table under node, in order."""
+    stack = [(prefix, iter(node.items()))]  # a loop, not recursion: nesting depth is the file's choice
+    while stack:
+        path, items = stack[-1]
+        for key, value in items:
+            if isinstance(value, dict) and value:
+                stack.append((path + (key,), iter(value.items())))
+                break
+            yield path + (key,), value
         else:
-            yield prefix + (key,), value
+            stack.pop()
 
 
 def _match(schema, path):
@@ -296,31 +301,31 @@ def _secret_name(name):
 
 def _hides_secret(value):
     """True if a list or table value holds a secret-like field name at any depth."""
-    if isinstance(value, dict):
-        return any(_secret_name(k) or _hides_secret(v) for k, v in value.items())
-    if isinstance(value, list):
-        return any(_hides_secret(v) for v in value)
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if any(_secret_name(k) for k in item):
+                return True
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
     return False
 
 
 def _field_names(schema, path):
     """The parts of path that are field names, leaving out identifiers.
 
-    An identifier names a provider, model, extension or server: a "*" in the
-    schema, or a table below an open section's root.
+    Identifiers are the schema's "*" positions: provider names, model ids and
+    extension ids. Every other part, tables inside open sections included, is a field name.
     """
     identifiers = set()
     for pattern in schema:
-        open_ended = pattern[-1] == "**"
-        head = pattern[:-1] if open_ended else pattern
-        for i, (p, k) in enumerate(zip(head, path)):  # the part of path that follows this pattern
+        for i, (p, k) in enumerate(zip(pattern, path)):  # the part of path that follows this pattern
             if p not in ("*", k):
                 break
             if p == "*":
                 identifiers.add(i)
-        else:
-            if open_ended:
-                identifiers |= set(range(len(head), len(path) - 1))
     return [part for i, part in enumerate(path) if i not in identifiers]
 
 
@@ -448,6 +453,10 @@ def _parse(settings, raw):
     except tomlkit.exceptions.ParseError as error:
         settings._broken = True
         settings.warnings.append(f"{settings.label} line {error.line}: not valid TOML; using the defaults")
+        return
+    except RecursionError:  # valid TOML can nest deeper than tomlkit's recursive unwrap can follow
+        settings._broken = True
+        settings.warnings.append(f"{settings.label}: nested too deeply to read; using the defaults")
         return
     lines = _key_lines(text)
     for path, value in _leaves(data):
