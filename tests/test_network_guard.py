@@ -64,9 +64,25 @@ def test_direct_connect_by_name_is_refused():
         sock.connect(("openrouter.ai", 443))
 
 
-def test_dns_lookup_of_remote_name_is_refused():
+@pytest.mark.parametrize(
+    "lookup",
+    [
+        lambda: socket.getaddrinfo("openrouter.ai", 443),
+        lambda: socket.gethostbyname("openrouter.ai"),
+        lambda: socket.gethostbyname_ex("openrouter.ai"),
+        lambda: socket.gethostbyaddr("8.8.8.8"),
+        lambda: socket.getnameinfo(("8.8.8.8", 53), 0),
+    ],
+)
+def test_lookup_of_remote_name_is_refused(lookup):
     with pytest.raises(NetworkBlocked):
-        socket.getaddrinfo("openrouter.ai", 443)
+        lookup()
+
+
+def test_uvloop_cannot_be_imported():
+    # uvloop's native event loop opens sockets the guard cannot see.
+    with pytest.raises(ImportError):
+        import uvloop  # noqa: F401
 
 
 def test_udp_send_is_refused():
@@ -92,6 +108,30 @@ async def test_registered_mock_server_is_reachable_async():
     with mock_http_server(_Ok) as base_url:
         async with httpx.AsyncClient() as client:
             assert (await client.get(base_url + "/")).text == "ok"
+
+
+def test_registration_covers_tcp_only():
+    with mock_http_server(_Ok) as base_url:
+        port = int(base_url.rsplit(":", 1)[1])
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            with pytest.raises(NetworkBlocked):
+                udp.sendto(b"x", ("127.0.0.1", port))
+            with pytest.raises(NetworkBlocked):
+                udp.connect(("127.0.0.1", port))
+
+
+def test_ipv4_registration_does_not_allow_ipv6_localhost():
+    with mock_http_server(_Ok) as base_url:
+        port = int(base_url.rsplit(":", 1)[1])
+        with socket.socket(socket.AF_INET6) as sock, pytest.raises(NetworkBlocked):
+            sock.connect(("localhost", port))
+
+
+def test_registration_lapses_when_server_closes():
+    with mock_http_server(_Ok) as base_url:
+        port = int(base_url.rsplit(":", 1)[1])
+    with pytest.raises(NetworkBlocked):
+        socket.create_connection(("127.0.0.1", port), timeout=1)
 
 
 def test_register_refuses_non_listening_socket():
