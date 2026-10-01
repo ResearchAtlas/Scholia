@@ -139,6 +139,24 @@ def test_lookup_of_remote_name_is_refused(lookup):
         lookup()
 
 
+def test_lookup_name_subclass_cannot_pass_as_loopback():
+    class Disguised(str):
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return hash("localhost")
+
+    with pytest.raises(NetworkBlocked):
+        socket.getaddrinfo(Disguised("scholia-test.invalid"), 443)
+
+
+def test_plugins_load_only_by_name(pytestconfig):
+    # Auto-loaded plugins would import before the block installs.
+    assert pytestconfig.getoption("disable_plugin_autoload") is True
+    assert not pytestconfig.pluginmanager.has_plugin("anyio")
+
+
 def test_uvloop_cannot_be_imported():
     # uvloop's native event loop opens sockets the guard cannot see.
     with pytest.raises(ImportError):

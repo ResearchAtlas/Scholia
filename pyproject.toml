@@ -34,6 +34,8 @@ package = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = ["--strict-markers"]
+# Only named plugins load, so nothing imports before the network block installs
+# except pytest-asyncio, a pinned dev dependency.
+addopts = ["--disable-plugin-autoload", "-p", "pytest_asyncio.plugin", "--strict-markers"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"

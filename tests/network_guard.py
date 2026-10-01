@@ -1,11 +1,13 @@
 """Outbound network block for the test suite.
 
-Installed for every test session by tests/conftest.py. Every outbound connection
-is refused, including to other ports on this machine, because a local proxy could
-forward a request to a paid provider. The only reachable endpoints are TCP mock
-servers a test starts in this process and registers with `register_server`, for
-as long as they stay open. Name lookups resolve loopback names only. Provider
-keys and proxy settings are removed from the environment.
+Installed for every test session when pytest imports tests/conftest.py, before
+any project or test module; plugins load only by name (see pyproject.toml).
+Every outbound connection is refused, including to other ports on this machine,
+because a local proxy could forward a request to a paid provider. The only
+reachable endpoints are TCP mock servers a test starts in this process and
+registers with `register_server`, for as long as they stay open. Name lookups
+resolve loopback names only. Provider keys and proxy settings are removed from
+the environment.
 
 The checks run in a CPython audit hook, which the interpreter calls from inside
 its C socket code for every connect, connect_ex, sendto, sendmsg and name lookup,
@@ -89,9 +91,13 @@ def _is_allowed(sock, address) -> bool:
 
 
 def _require_loopback(name) -> None:
-    text = name.decode() if isinstance(name, bytes) else name
-    if text is not None and text not in _LOOPBACK_NAMES:
-        raise NetworkBlocked(f"test network block: lookup of {text!r} refused")
+    if name is None:
+        return
+    # Exact types only: a subclass could compare equal to a loopback name while
+    # the resolver receives its real value.
+    text = name.decode() if type(name) is bytes else name if type(name) is str else None
+    if text not in _LOOPBACK_NAMES:
+        raise NetworkBlocked(f"test network block: lookup of {name!r} refused")
 
 
 def _audit(event: str, args: tuple) -> None:
@@ -257,7 +263,8 @@ def _scrub_environment() -> None:
             del os.environ[name]
 
 
-def pytest_configure(config):
+def start() -> None:
+    """Scrub the environment and install the block. Called by tests/conftest.py."""
     _scrub_environment()
     install()
 
