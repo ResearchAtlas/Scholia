@@ -4,7 +4,7 @@
 
 ## English
 
-AAB Research runs on Macs with Apple silicon (M1 or later). It is in early development and not ready to use yet.
+AAB Research runs on Macs with Apple silicon (M1 or later) and macOS 14 Sonoma or later. It is in early development and not ready to use yet.
 
 ### Install
 
@@ -33,7 +33,7 @@ Quit AAB Research and drag it from the Applications folder to the Trash. How to 
 
 ## 中文
 
-AAB Research 适用于搭载 Apple 芯片（M1 或更新）的 Mac。它仍处于早期开发阶段，暂时还不能使用。
+AAB Research 适用于搭载 Apple 芯片（M1 或更新）、运行 macOS 14 Sonoma 或更新版本的 Mac。它仍处于早期开发阶段，暂时还不能使用。
 
 ### 安装
 

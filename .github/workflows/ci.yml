@@ -138,8 +138,3 @@ jobs:
       - name: Close the DMG
         if: always()
         run: if [ -e "build/mnt/AAB Research.app" ]; then hdiutil detach build/mnt; fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: AAB-Research-dmg
-          path: build/AAB-Research.dmg
-          retention-days: 14
