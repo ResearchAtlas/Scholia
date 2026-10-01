@@ -20,6 +20,7 @@ not use them.
 import asyncio
 import os
 import socket
+import stat
 import sys
 import threading
 import weakref
@@ -61,10 +62,13 @@ _PROXY_ENV = {
 def _is_allowed(sock, address) -> bool:
     if sock.family not in _INET or sock.type != socket.SOCK_STREAM:
         return False
-    if not (isinstance(address, tuple) and len(address) >= 2):
+    # Exact types only: a str or int subclass could show this check one value
+    # while the C socket code uses another.
+    if not (type(address) is tuple and len(address) >= 2
+            and type(address[0]) is str and type(address[1]) is int):
         return False
     with _lock:
-        ref = _allowed.get((str(address[0]), int(address[1])))
+        ref = _allowed.get((address[0], address[1]))
     server = ref() if ref else None
     return server is not None and server.fileno() != -1 and server.family == sock.family
 
@@ -85,6 +89,21 @@ def _audit(event: str, args: tuple) -> None:
         _require_loopback(args[0][0] if event == "socket.getnameinfo" else args[0])
 
 
+def _checked(name):
+    # The C methods resolve a host name before raising their audit event, so
+    # Python sockets are checked first, before any lookup can leave the machine.
+    real = getattr(socket.socket, name)
+
+    def method(self, *args):
+        address = args[-1] if name in ("connect", "connect_ex", "sendto") else (
+            args[3] if len(args) > 3 else None)
+        if address is not None and not _is_allowed(self, address):
+            raise NetworkBlocked(f"test network block: connection to {address!r} refused")
+        return real(self, *args)
+
+    return method
+
+
 def _recording_listen(self, *args):
     result = _real_listen(self, *args)
     with _lock:
@@ -101,12 +120,44 @@ def _refuse_uvloop() -> None:
     sys.modules["uvloop"] = None  # makes `import uvloop` raise ImportError
 
 
+def _refuse_open_connections() -> None:
+    """Fail if a network connection was opened before the block (send() has no audit event)."""
+    for fd in (int(name) for name in os.listdir("/dev/fd")):
+        try:
+            if not stat.S_ISSOCK(os.fstat(fd).st_mode):
+                continue
+            with socket.socket(fileno=os.dup(fd)) as sock:
+                if sock.family not in _INET:
+                    continue
+                try:
+                    peer = sock.getpeername()
+                except OSError:
+                    continue  # not connected
+                if not _is_allowed(sock, peer[:2]):
+                    raise RuntimeError(f"connection to {peer!r} was open before the test network block")
+        except OSError:
+            continue
+
+
+def _probe(event, args):
+    if event == "scholia.network_guard.probe":
+        args[0].append(True)
+
+
 def install() -> None:
     global _installed
     _refuse_uvloop()
-    if not _installed:  # audit hooks cannot be removed, so add it once
+    _refuse_open_connections()
+    if not _installed:  # audit hooks cannot be removed, so add them once
         sys.addaudithook(_audit)
+        sys.addaudithook(_probe)
+        seen = []
+        sys.audit("scholia.network_guard.probe", seen)
+        if not seen:  # an existing hook can refuse new hooks silently
+            raise RuntimeError("the test network block's audit hook was not installed")
         socket.socket.listen = _recording_listen
+        for name in ("connect", "connect_ex", "sendto", "sendmsg"):
+            setattr(socket.socket, name, _checked(name))
         _installed = True
 
 

@@ -78,6 +78,49 @@ def test_direct_connect_by_name_is_refused():
         sock.connect(("openrouter.ai", 443))
 
 
+def test_connect_by_name_is_refused_before_any_lookup():
+    # The C connect resolves names before its audit event. A name that cannot
+    # resolve shows the order: NetworkBlocked, not a resolver error.
+    with socket.socket() as sock, pytest.raises(NetworkBlocked):
+        sock.connect(("scholia-test.invalid", 443))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock, pytest.raises(NetworkBlocked):
+        sock.sendto(b"x", ("scholia-test.invalid", 53))
+
+
+def test_address_subclass_cannot_disguise_destination():
+    class Disguised(str):
+        def __str__(self):
+            return "127.0.0.1"
+
+    with mock_http_server(_Ok) as base_url:
+        port = int(base_url.rsplit(":", 1)[1])
+        with socket.socket() as sock, pytest.raises(NetworkBlocked):
+            sock.connect((Disguised("10.255.255.1"), port))
+        sock = socket.SocketType()
+        try:
+            with pytest.raises(NetworkBlocked):
+                sock.connect((Disguised("10.255.255.1"), port))
+        finally:
+            sock.close()
+
+
+def test_connection_opened_before_the_block_fails_the_session():
+    with mock_http_server(_Ok) as base_url:
+        port = int(base_url.rsplit(":", 1)[1])
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            network_guard.clear_registrations()  # as if it predated the block
+            with pytest.raises(RuntimeError, match="open before"):
+                network_guard._refuse_open_connections()
+
+
+def test_refused_audit_hook_fails_the_session(monkeypatch):
+    monkeypatch.setattr(network_guard, "_installed", False)
+    monkeypatch.setattr(sys, "addaudithook", lambda hook: None)  # refused silently
+    monkeypatch.setattr(sys, "audit", lambda *args: None)
+    with pytest.raises(RuntimeError, match="audit hook"):
+        network_guard.install()
+
+
 @pytest.mark.parametrize(
     "lookup",
     [
