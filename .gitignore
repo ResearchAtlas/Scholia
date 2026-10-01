@@ -5,3 +5,29 @@ dev docs/
 
 .env
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Build output
+build/
+dist/
+frontend/dist/
+frontend/.vite/
+*.dmg
+
+# Local data and logs
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
