@@ -216,20 +216,52 @@ def test_run_events_are_deleted_only_together_with_their_run(db):
     assert len(events(db, other)) == 2
 
 
-def test_an_artifact_version_document_cannot_change(db):
-    def add_version(conn):
-        artifact = new_id()
-        conn.execute(
-            "INSERT INTO artifacts (id, project_id, title, doc) VALUES (?, ?, 'Draft', '{}')",
-            (artifact, general_id(conn)))
-        conn.execute(
-            "INSERT INTO artifact_versions (id, artifact_id, seq, doc, reason) VALUES (?, ?, 0, '{}', 'named')",
-            (new_id(), artifact))
+def add_artifact_version(conn):
+    artifact, version = new_id(), new_id()
+    conn.execute(
+        "INSERT INTO artifacts (id, project_id, title, doc) VALUES (?, ?, 'Draft', '{}')", (artifact, general_id(conn)))
+    conn.execute(
+        "INSERT INTO artifact_versions (id, artifact_id, seq, doc, reason) VALUES (?, ?, 0, '{\"v\": 1}', 'named')",
+        (version, artifact))
+    return artifact, version
 
-    db.write(add_version)
+
+def artifact_versions(db):
+    return db.read(lambda conn: conn.execute(
+        "SELECT id, artifact_id, seq, doc FROM artifact_versions ORDER BY artifact_id").fetchall())
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE artifact_versions SET doc = '{\"v\": 2}' WHERE id = :version",
+    "INSERT OR REPLACE INTO artifact_versions (id, artifact_id, seq, doc, reason)"
+    " VALUES (:version, :artifact, 0, '{\"v\": 2}', 'named')",
+    "INSERT OR REPLACE INTO artifact_versions (id, artifact_id, seq, doc, reason)"
+    " VALUES (:new, :artifact, 0, '{\"v\": 2}', 'named')",
+    "DELETE FROM artifact_versions WHERE id = :version",
+], ids=["update", "replace-by-id", "replace-by-artifact-and-seq", "delete"])
+def test_an_artifact_version_document_cannot_change_while_its_artifact_exists(db, sql):
+    artifact, version = db.write(add_artifact_version)
+    before = artifact_versions(db)
     with pytest.raises(sqlite3.IntegrityError, match="immutable"):
-        db.write(lambda conn: conn.execute("UPDATE artifact_versions SET doc = '{\"changed\": 1}'"))
-    db.write(lambda conn: conn.execute("UPDATE artifact_versions SET label = 'v1'"))
+        db.write(lambda conn: conn.execute(sql, {"version": version, "artifact": artifact, "new": new_id()}))
+    assert artifact_versions(db) == before
+    db.write(lambda conn: conn.execute("UPDATE artifact_versions SET label = 'v1' WHERE id = ?", (version,)))
+
+
+def test_artifact_versions_are_deleted_only_together_with_their_artifact(db):
+    artifact, _ = db.write(add_artifact_version)
+    other, _ = db.write(add_artifact_version)
+
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):  # checked at commit
+        db.write(lambda conn: conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact,)))
+    assert len(artifact_versions(db)) == 2
+
+    def purge(conn):  # the deletion path: the artifact first, then its versions, in one transaction
+        conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact,))
+        conn.execute("DELETE FROM artifact_versions WHERE artifact_id = ?", (artifact,))
+
+    db.write(purge)
+    assert [row[1] for row in artifact_versions(db)] == [other]
 
 
 @pytest.mark.parametrize("sql", [

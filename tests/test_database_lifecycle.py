@@ -10,7 +10,15 @@ from pathlib import Path
 import pytest
 
 import backend.db.database as database_module
-from backend.db import DB_NAME, Database, DatabaseDamagedError, NewerDatabaseError, new_id
+from backend.db import (
+    APPLICATION_ID,
+    DB_NAME,
+    Database,
+    DatabaseDamagedError,
+    ForeignDatabaseError,
+    NewerDatabaseError,
+    new_id,
+)
 from backend.db.migrations import MIGRATIONS
 from network_guard import allow_subprocess
 
@@ -91,6 +99,45 @@ def test_a_newer_schema_is_refused_and_left_unchanged(tmp_path):
         Database(data)
     assert snapshot(data) == before
     assert not (data / "backups").exists()
+
+
+@pytest.mark.parametrize("application_id, version, has_table", [
+    (0, 1, True),
+    (0, 0, True),
+    (0x12345678, 1, False),
+], ids=["no-id-in-range-version", "no-id-no-version", "other-id"])
+def test_another_apps_database_is_refused_and_left_unchanged(tmp_path, application_id, version, has_table):
+    data = tmp_path / "data"
+    data.mkdir()
+    conn = sqlite3.connect(data / DB_NAME)
+    if has_table:
+        conn.execute("CREATE TABLE other (x)")
+    conn.execute(f"PRAGMA application_id = {application_id}")
+    conn.execute(f"PRAGMA user_version = {version}")
+    conn.close()
+    before = snapshot(data)
+
+    with pytest.raises(ForeignDatabaseError, match="not this app's database"):
+        Database(data)
+    assert snapshot(data) == before
+    assert not (data / "backups").exists()
+
+
+@pytest.mark.parametrize("content", ["zero bytes", "empty database"])
+def test_an_empty_existing_file_becomes_this_apps_database(tmp_path, content):
+    data = tmp_path / "data"
+    data.mkdir()
+    if content == "zero bytes":
+        (data / DB_NAME).touch()
+    else:
+        conn = sqlite3.connect(data / DB_NAME)
+        conn.execute("PRAGMA journal_mode = WAL")  # writes a header, but no schema
+        conn.close()
+
+    with Database(data) as db:
+        stamped = db.read(lambda conn: (
+            conn.execute("PRAGMA application_id").fetchone()[0], conn.execute("PRAGMA user_version").fetchone()[0]))
+    assert stamped == (APPLICATION_ID, len(MIGRATIONS))
 
 
 def test_a_backup_is_taken_before_each_migration_of_an_existing_database(tmp_path):
@@ -240,24 +287,39 @@ def test_a_backup_is_a_checked_generation_and_a_stale_temporary_one_is_removed(t
     conn = sqlite3.connect((generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+        assert conn.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
         assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
         assert conn.execute("SELECT event FROM audit_log").fetchall() == [("kept",)]
     finally:
         conn.close()
 
 
-def test_a_failed_backup_leaves_no_partial_generation_and_writes_continue(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failing", ["copy", "temporary folder", "daily folder"])
+def test_a_failed_backup_leaves_no_generation_and_is_retried(tmp_path, monkeypatch, failing):
+    """A sync failure, before or after the rename, leaves nothing that counts as a backup."""
+    real_fsync = database_module._fsync
+    targets = {
+        "copy": lambda path: path.name == DB_NAME,
+        "temporary folder": lambda path: path.name.endswith(".tmp"),
+        "daily folder": lambda path: path.name == "daily",  # synced after the rename
+    }
+
     def failing_sync(path):
-        raise OSError("disk failure")
+        if targets[failing](Path(path)):
+            raise OSError("disk failure")
+        real_fsync(path)
 
     data = tmp_path / "data"
     with Database(data) as db:
         monkeypatch.setattr(database_module, "_fsync", failing_sync)
         with pytest.raises(OSError, match="disk failure"):
-            db.backup()
+            db.backup_if_due(now=START)
         assert list((data / "backups" / "daily").iterdir()) == []
         db.write(add_audit_row)
         assert audit_events(db) == [("kept",)]
+
+        monkeypatch.setattr(database_module, "_fsync", real_fsync)
+        assert db.backup_if_due(now=START + timedelta(minutes=1)) is not None
 
 
 def test_rotation_keeps_seven_daily_and_four_weekly_generations(tmp_path):

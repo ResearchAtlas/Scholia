@@ -322,9 +322,13 @@ CREATE TABLE artifacts (
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (updated_at IS strftime('%Y-%m-%dT%H:%M:%fZ', updated_at))
 ) STRICT;
 
+-- A version's document never changes, and a version is deleted only together
+-- with its artifact: the foreign key is checked at commit, so a transaction may
+-- delete the artifact first and then its versions, and no other order is
+-- accepted. The delete trigger also stops REPLACE from swapping a version.
 CREATE TABLE artifact_versions (
     id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
-    artifact_id TEXT NOT NULL REFERENCES artifacts (id),
+    artifact_id TEXT NOT NULL REFERENCES artifacts (id) DEFERRABLE INITIALLY DEFERRED,
     seq INTEGER NOT NULL CHECK (seq >= 0),
     doc TEXT NOT NULL CHECK (json_valid(doc)),
     reason TEXT NOT NULL CHECK (reason IN ('named', 'before_run', 'after_run', 'export')),
@@ -337,6 +341,12 @@ CREATE TABLE artifact_versions (
 CREATE TRIGGER artifact_versions_keep_doc BEFORE UPDATE OF doc ON artifact_versions
 BEGIN
     SELECT RAISE(ABORT, 'an artifact version''s document is immutable');
+END;
+
+CREATE TRIGGER artifact_versions_no_delete BEFORE DELETE ON artifact_versions
+WHEN EXISTS (SELECT 1 FROM artifacts WHERE id = OLD.artifact_id)
+BEGIN
+    SELECT RAISE(ABORT, 'artifact versions are immutable; they are deleted only with their artifact');
 END;
 
 CREATE TABLE suggestion_sets (

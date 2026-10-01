@@ -40,6 +40,10 @@ class NewerDatabaseError(RuntimeError):
     """The database was written by a newer version of the app. It is left unchanged."""
 
 
+class ForeignDatabaseError(RuntimeError):
+    """The file is not this app's database. It is left unchanged."""
+
+
 class DatabaseDamagedError(RuntimeError):
     """An integrity check failed. Writing stops and the file is left as it is."""
 
@@ -72,7 +76,7 @@ class Database:
         self._readers_lock = threading.Lock()
         self._backup_lock = threading.Lock()
         _mkdir_private(self.data_dir)
-        if self.path.exists():  # refuse a newer or damaged file before anything writes to it
+        if self.path.exists():  # refuse another app's, a newer or a damaged file before anything writes to it
             _open_checked(self.path, "quick_check", latest=len(migrations)).close()
         else:
             # Created owner-only before SQLite opens it; the WAL and shared-memory
@@ -205,6 +209,7 @@ class Database:
             stamp = now.strftime(_STAMP)
             tmp = daily / f".{stamp}.tmp"
             os.mkdir(tmp, 0o700)
+            published = None
             try:
                 copy = tmp / DB_NAME
                 os.close(os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
@@ -217,9 +222,11 @@ class Database:
                 _fsync(tmp)
                 generation = daily / stamp
                 os.rename(tmp, generation)
+                published = generation
                 _fsync(daily)
             except BaseException:
-                shutil.rmtree(tmp, ignore_errors=True)
+                # A failed backup must not count as one, even after its rename.
+                shutil.rmtree(published or tmp, ignore_errors=True)
                 raise
         finally:
             source.close()
@@ -247,19 +254,28 @@ def _connect(path, *, readonly=False, check_same_thread=True):
 def _open_checked(path, check, latest=None):
     """Open path read-only and run PRAGMA check (quick_check or integrity_check).
 
-    Returns the open connection. Raises NewerDatabaseError when latest is given
-    and user_version is above it, and DatabaseDamagedError when the file is
-    corrupt or the check fails. Nothing is written to the file or its WAL.
+    Returns the open connection. Raises DatabaseDamagedError when the file is
+    corrupt or the check fails. When latest is given (the live database at
+    startup), also raises ForeignDatabaseError for a file that is not this app's
+    database, unless it is new and empty, and NewerDatabaseError when
+    user_version is above latest. Nothing is written to the file or its WAL.
     """
     conn = None
     try:
         conn = _connect(path, readonly=True)
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if latest is not None and version > latest:
-            raise NewerDatabaseError(
-                f"This database was written by a newer version of the app (schema {version}; "
-                f"this version knows up to {latest}). Update the app, or restore a backup."
-            )
+        if latest is not None:  # the live database at startup
+            app_id = conn.execute("PRAGMA application_id").fetchone()[0]
+            new_file = app_id == version == 0 and conn.execute("SELECT 1 FROM sqlite_schema").fetchone() is None
+            if app_id != APPLICATION_ID and not new_file:  # a new file is stamped by migration 0001
+                raise ForeignDatabaseError(
+                    f"This file is not this app's database (application id {app_id:#x}). It was left unchanged."
+                )
+            if version > latest:
+                raise NewerDatabaseError(
+                    f"This database was written by a newer version of the app (schema {version}; "
+                    f"this version knows up to {latest}). Update the app, or restore a backup."
+                )
         rows = conn.execute(f"PRAGMA {check}").fetchall()
         if rows != [("ok",)]:
             raise DatabaseDamagedError(f"{check} failed: {rows[0][0]}")
