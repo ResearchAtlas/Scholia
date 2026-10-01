@@ -1,0 +1,7 @@
+# Development docs live in their own private repository, beside this one on disk.
+dev docs/
+.scratch/
+.worktrees/
+
+.env
+.DS_Store
