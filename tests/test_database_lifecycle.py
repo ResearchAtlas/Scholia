@@ -63,13 +63,15 @@ def snapshot(data):
     }
 
 
-def leaf_page(path, table):
-    """A leaf page of table, read without writing: (page number, page size)."""
+def root_page(path, table):
+    """The root b-tree page of table, read without writing: (page number, page size).
+
+    Uses sqlite_schema, which every SQLite build has (dbstat is optional).
+    """
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
-        pages = [row[0] for row in conn.execute(
-            "SELECT pageno FROM dbstat WHERE name = ? AND pagetype = 'leaf' ORDER BY pageno", (table,))]
-        return pages[len(pages) // 2], conn.execute("PRAGMA page_size").fetchone()[0]
+        (page,) = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name = ?", (table,)).fetchone()
+        return page, conn.execute("PRAGMA page_size").fetchone()[0]
     finally:
         conn.close()
 
@@ -88,7 +90,7 @@ def mismatch_table_and_index(data):
     with Database(data) as db:
         db.write(lambda conn: conn.execute(
             "INSERT INTO projects (id, name, kind) VALUES (?, 'p', 'research')", (project,)))
-    page, size = leaf_page(data / DB_NAME, "projects")
+    page, size = root_page(data / DB_NAME, "projects")  # two rows: the root is the only page
     with open(data / DB_NAME, "r+b") as file:
         file.seek((page - 1) * size)
         content = file.read(size)
@@ -342,7 +344,7 @@ def test_a_corrupt_database_is_refused_at_startup_and_left_unchanged(tmp_path):
     data = tmp_path / "data"
     with Database(data) as db:
         db.write(lambda conn: conn.executemany("INSERT INTO audit_log (event) VALUES (?)", [("e",)] * 2000))
-    page, size = leaf_page(data / DB_NAME, "audit_log")
+    page, size = root_page(data / DB_NAME, "audit_log")
     with open(data / DB_NAME, "r+b") as file:
         file.seek((page - 1) * size)
         file.write(b"\xff" * 16)  # a b-tree page header no reader accepts
