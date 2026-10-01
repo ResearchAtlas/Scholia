@@ -49,29 +49,38 @@ def run(engine: Engine, module: Module, folder: Path) -> tuple[int, str, str]:
     return code, (folder / "out.json").read_text(encoding="utf-8"), (folder / "err.txt").read_text()
 
 
+def formatted(code: int, out: str) -> tuple[list | None, str]:
+    """citeproc's bibliography and citation if the run succeeded with the expected output."""
+    try:
+        result = json.loads(out)
+        citation = result["citations"][0]
+        bibliography = " ".join(entry for _, entry in result["bibliography"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None, ""
+    expected = "Garcia 2024" in citation and "张" in citation and "学术研究" in bibliography
+    return (result["bibliography"], citation) if code == 0 and expected else (None, "")
+
+
 def main(path: str) -> int:
     data = Path(path).read_bytes()
     engine = Engine()
     started = time.perf_counter()
     module = Module(engine, data)
     compiled = time.perf_counter() - started
-    timings = []
-    with tempfile.TemporaryDirectory() as folder:
-        for _ in range(3):
+    runs = []
+    for _ in range(3):  # every run must succeed, not just the last; each in a fresh folder
+        with tempfile.TemporaryDirectory() as folder:
             started = time.perf_counter()
             code, out, err = run(engine, module, Path(folder))
-            timings.append(round(time.perf_counter() - started, 3))
-    try:
-        result = json.loads(out)
-        citation = result["citations"][0]
-        bibliography = " ".join(entry for _, entry in result["bibliography"])
-    except (ValueError, KeyError, IndexError, TypeError):
-        result, citation, bibliography = None, "", ""
+            seconds = round(time.perf_counter() - started, 3)
+        bibliography, citation = formatted(code, out)
+        runs.append({"seconds": seconds, "exit_code": code, "ok": bibliography is not None,
+                     "citation": citation, "bibliography": bibliography,
+                     "stdout": "" if bibliography else out[-2000:], "stderr": err[-2000:]})
     gmp, rts = data.count(b"__gmp"), data.count(b"stg_")
-    # Success needs the right output and no GMP code, judged by symbol names, which are
+    # Success needs every run right and no GMP code, judged by symbol names, which are
     # there unless stripped (the GHC runtime's are the control).
-    output_ok = "Garcia 2024" in citation and "张" in citation and "学术研究" in bibliography
-    ok = code == 0 and output_ok and gmp == 0 and rts > 0
+    ok = all(r["ok"] for r in runs) and gmp == 0 and rts > 0
     print(json.dumps({
         "ok": ok,
         "bytes": len(data),
@@ -79,12 +88,7 @@ def main(path: str) -> int:
         "gmp_symbols": gmp,
         "rts_symbols": rts,
         "compile_seconds": round(compiled, 3),
-        "run_seconds": timings,
-        "exit_code": code,
-        "citation": citation,
-        "bibliography": result["bibliography"] if result else None,
-        "stdout": "" if result else out[-2000:],
-        "stderr": err[-2000:],
+        "runs": runs,
     }, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
