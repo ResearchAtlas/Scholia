@@ -41,6 +41,10 @@ index-state: $INDEX_STATE
 tests: False
 package citeproc
   flags: +executable
+-- The native flavour's GHC (from GHC's main branch) no longer re-exports ghc-bignum's
+-- modules from base, which some packages (hashable) still import through base.
+package *
+  ghc-options: -package ghc-bignum
 package aeson
   flags: -ordered-keymap
 package splitmix
