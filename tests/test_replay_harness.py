@@ -51,14 +51,24 @@ def test_replay_server_is_unreachable_after_the_block():
 
 
 @pytest.fixture
-def two_turns(tmp_path, monkeypatch):
+def record(tmp_path, monkeypatch):
+    """Writes a replay fixture of the given exchanges to a temporary fixtures folder."""
+    monkeypatch.setattr(replay_harness, "FIXTURES", tmp_path)
+
+    def write(name, exchanges):
+        (tmp_path / f"{name}.json").write_text(json.dumps(exchanges), encoding="utf-8")
+
+    return write
+
+
+@pytest.fixture
+def two_turns(record):
     """A fixture recording turn A, then turn B."""
     first = json.loads(json.dumps(RECORDED))
     second = json.loads(json.dumps(RECORDED))
     second["request"]["body"]["messages"].append({"role": "user", "content": "And another?"})
     second["response"]["body"]["id"] = "gen-replay-0002"
-    (tmp_path / "two_turns.json").write_text(json.dumps([first, second]), encoding="utf-8")
-    monkeypatch.setattr(replay_harness, "FIXTURES", tmp_path)
+    record("two_turns", [first, second])
     return first, second
 
 
@@ -75,3 +85,23 @@ def test_request_out_of_recorded_order_fails_the_test(two_turns):
         with replay("two_turns") as base_url:
             assert httpx.post(base_url + PATH, json=second["request"]["body"]).status_code == 501
             assert httpx.post(base_url + PATH, json=first["request"]["body"]).status_code == 200
+
+
+@pytest.mark.parametrize("method", ["HEAD", "OPTIONS", "PROPFIND"])
+def test_unrecorded_request_of_any_method_fails_the_test(method):
+    with pytest.raises(UnrecordedRequest, match=f"{method} /models"):
+        with replay("chat_completion") as base_url:
+            assert httpx.request(method, base_url + "/models").status_code == 501
+
+
+def test_recorded_requests_of_other_methods_replay(record):
+    exchanges = [
+        {"request": {"method": method, "path": "/models"},
+         "response": {"status": 200, "body": {"allow": ["GET", "POST"]}}}
+        for method in ("HEAD", "OPTIONS", "PROPFIND")
+    ]
+    record("other_methods", exchanges)
+    with replay("other_methods") as base_url:
+        assert httpx.head(base_url + "/models").status_code == 200
+        assert httpx.options(base_url + "/models").json() == {"allow": ["GET", "POST"]}
+        assert httpx.request("PROPFIND", base_url + "/models").json() == {"allow": ["GET", "POST"]}

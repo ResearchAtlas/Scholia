@@ -4,10 +4,11 @@
 from an in-process HTTP server registered with the test network block, and
 yields its base URL. Point a provider client at that URL instead of the real
 provider. The exchanges are served once each, in the recorded order: a request
-must match the next recorded exchange on method, path and JSON body (key order
-ignored). Headers are not matched, so no key is ever needed. A request that does
-not match the next exchange, out of order or unrecorded, gets a 501 response and
-fails the test when the block exits, even if the client swallowed the error.
+of any HTTP method must match the next recorded exchange on method, path and
+JSON body (key order ignored). Headers are not matched, so no key is ever
+needed. A request that does not match the next exchange, out of order or
+unrecorded, gets a 501 response and fails the test when the block exits, even
+if the client swallowed the error.
 
 Fixture format: a JSON list of
     {"request": {"method", "path", "body"}, "response": {"status", "body"}}
@@ -64,9 +65,15 @@ def replay(name: str):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            if self.command != "HEAD":
+                self.wfile.write(data)
 
-        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _serve
+        def __getattr__(self, name):
+            # Every method (GET, HEAD, OPTIONS or any other) goes through the same match, so
+            # none gets the base class's own 501 without being recorded as a failure.
+            if name.startswith("do_"):
+                return self._serve
+            raise AttributeError(name)
 
         def log_message(self, *args):
             pass
