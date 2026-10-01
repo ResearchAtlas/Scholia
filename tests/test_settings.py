@@ -554,3 +554,40 @@ def test_warning_lines_count_only_toml_line_endings(tmp_path):
     loaded = load_settings(tmp_path)
     assert loaded.values["helper"]["model_source"] == "a b\u0085c"
     assert [w.split(":")[0] for w in loaded.warnings] == ["config.toml line 3"]
+
+
+@pytest.mark.parametrize("dotted, value", [
+    ("ui.language", "en"),
+    ("budget.conversation_usd", 20),
+    ("privacy.trim_bodies_after_days", 30),
+    ("models.efforts.gpt", "high"),
+    ("zotero.enabled", True),
+])
+def test_project_save_refuses_personal_only_settings(tmp_path, dotted, value):
+    loaded = load_settings(tmp_path, "p1")
+    with pytest.raises(ValueError, match="personal setting"):
+        loaded.save({dotted: value})
+    assert not loaded.path.exists()
+
+
+def test_project_save_keeps_project_and_unknown_paths(tmp_path):
+    loaded = load_settings(tmp_path, "p1")
+    loaded.save({"project.target_venue": "Nature", "limits.agent_steps": 20, "ui.panel": "library",
+                 "future.option": 1})
+    reread = load_settings(tmp_path, "p1")
+    assert reread.warnings == []
+    assert reread.values["project"]["target_venue"] == "Nature"
+    assert reread.values["limits"] == {"agent_steps": 20}
+    assert reread.values["ui"] == {"panel": "library"}
+    assert "[future]\noption = 1\n" in loaded.path.read_text()  # in neither schema: kept as today
+
+
+def test_personal_only_settings_in_a_project_file_are_ignored_with_a_warning(tmp_path):
+    write_project_file(tmp_path, '[ui]\npanel = "library"\nlanguage = "en"\n[budget]\nconversation_usd = 20\n')
+    loaded = load_settings(tmp_path, "p1")
+    assert loaded.values["ui"] == {"panel": "library"}
+    assert "budget" not in loaded.values
+    assert [w.split(";")[0] for w in loaded.warnings] == [
+        "project config.toml line 3: ui.language is a personal setting and cannot be set in a project file",
+        "project config.toml line 5: budget.conversation_usd is a personal setting and cannot be set in a project file",
+    ]

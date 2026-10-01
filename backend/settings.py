@@ -332,7 +332,8 @@ def _check(schema, path, value):
     """
     # Secrets a researcher wrote by hand are ignored, with a warning, but kept in the
     # file on save like any other content of theirs; only the app's own writes are refused.
-    if schema is PROJECT and path[0] in ("providers", "keys", "subagents"):
+    if schema is PROJECT and (path[0] in ("providers", "keys", "subagents")
+                              or (_match(PROJECT, path)[0] is None and _match(PERSONAL, path)[0] is not None)):
         return path, "is a personal setting and cannot be set in a project file"
     if any(_secret_name(name) for name in _field_names(schema, path)) or _hides_secret(value):
         return path, "looks like a secret; keys belong in the credential store"
