@@ -1,6 +1,6 @@
 // i18n: migrated
 // Fixture: every kind of raw UI string the raw-string check must flag.
-export function RawStrings({ busy, count, t }) {
+export function RawStrings({ busy, count, failed, ready, t }) {
   return (
     <div className="flex gap-2" title="Raw title">
       Raw text
@@ -12,6 +12,10 @@ export function RawStrings({ busy, count, t }) {
       <img alt={`Raw alt`} src="/x.png" />
       <>原始文本</>
       {busy && `Raw template branch ${count}`}
+      {ready && (failed ? 'Retry' : null)}
+      {ready ? (failed ? (busy || 'Raw deep') : t('x')) : null}
+      {(count, 'Raw sequence')}
+      {`${busy ? 'Raw in template' : ''}`}
     </div>
   );
 }
