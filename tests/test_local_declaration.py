@@ -1,0 +1,215 @@
+"""Loopback is only transport: a local provider counts for Local only after the researcher's declaration.
+
+These tests send real requests to mock servers this process starts and
+registers with the test network block, and check what each server received.
+"""
+
+import asyncio
+import json
+from contextlib import ExitStack
+from http.server import BaseHTTPRequestHandler
+
+import httpx
+import pytest
+
+from backend.db import Database, new_id
+from backend.outbound_gate import GateInputs, OutboundDenied, OutboundGate
+from network_guard import mock_http_server
+
+
+def server(stack, redirect_to=None):
+    """Start a registered mock server; returns (base URL, the list of paths it received)."""
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _reply(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            received.append((self.command, self.path))
+            if redirect_to:
+                self.send_response(307)
+                self.send_header("Location", f"{redirect_to}{self.path}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _reply
+
+        def log_message(self, *args):
+            pass
+
+    return stack.enter_context(mock_http_server(Handler)), received
+
+
+@pytest.fixture
+def db(tmp_path):
+    database = Database(tmp_path / "data")
+    yield database
+    database.close()
+
+
+@pytest.fixture
+def stack():
+    with ExitStack() as stack:
+        yield stack
+
+
+def project(db, sensitivity):
+    project_id = new_id()
+    db.write(lambda conn: conn.execute(
+        "INSERT INTO projects (id, name, kind, sensitivity) VALUES (?, 'P', 'research', ?)",
+        (project_id, sensitivity)))
+    return project_id
+
+
+def declare(db, base_url):
+    db.write(lambda conn: conn.execute(
+        "INSERT INTO local_declarations (id, provider, base_url, statement) VALUES (?, 'ollama', ?, 'statement')",
+        (new_id(), base_url)))
+
+
+def reasons(db):
+    return db.read(lambda conn: [
+        json.loads(data)["reason"] for (data,) in
+        conn.execute("SELECT data FROM audit_log WHERE event = 'outbound' ORDER BY seq")])
+
+
+def gate_for(db, provider_urls=(), helper_url=None):
+    return OutboundGate(db, lambda: GateInputs(provider_urls=provider_urls, helper_url=helper_url))
+
+
+def test_loopback_provider_is_refused_for_local_only_until_declared(db, stack):
+    base, received = server(stack)
+    gate = gate_for(db, provider_urls=[f"{base}/v1"])
+    project_id = project(db, "local_only")
+    with gate.client(project_id) as client:
+        with pytest.raises(OutboundDenied, match="not_declared"):
+            client.post(f"{base}/v1/chat/completions", json={"messages": []})
+        assert received == []
+        declare(db, f"{base}/v1")
+        assert client.post(f"{base}/v1/chat/completions", json={"messages": []}).json() == {"ok": True}
+    assert received == [("POST", "/v1/chat/completions")]
+    assert reasons(db) == ["not_declared", None]
+
+
+def test_a_declaration_covers_only_its_exact_origin(db, stack):
+    base, received = server(stack)
+    port = base.rsplit(":", 1)[1]
+    gate = gate_for(db, provider_urls=[f"{base}/v1"])
+    project_id = project(db, "local_only")
+    for declared in (
+        f"http://localhost:{port}/v1",      # the same server under another name
+        f"http://127.0.0.1:{int(port) + 1}/v1",
+        f"https://127.0.0.1:{port}/v1",
+        "https://api.other-provider.example/v1",
+        "not a url",
+    ):
+        declare(db, declared)
+        with gate.client(project_id) as client, pytest.raises(OutboundDenied, match="not_declared"):
+            client.get(f"{base}/v1/models")
+    assert received == []
+
+
+def test_a_declaration_does_not_make_an_unconfigured_port_a_provider(db, stack):
+    base, received = server(stack)
+    declare(db, f"{base}/v1")
+    with gate_for(db).client(project(db, "local_only")) as client, \
+            pytest.raises(OutboundDenied, match="unknown_destination"):
+        client.get(f"{base}/v1/models")
+    assert received == []
+
+
+def test_a_declaration_does_not_open_remote_providers_for_local_only(db):
+    declare(db, "https://api.other-provider.example/v1")
+    gate = gate_for(db, provider_urls=["https://api.other-provider.example/v1"])
+    with gate.client(project(db, "local_only")) as client, \
+            pytest.raises(OutboundDenied, match="not_allowed_at_level"):
+        client.get("https://api.other-provider.example/v1/models")
+
+
+@pytest.mark.parametrize(("level", "reason"), [("normal", None), ("private", "not_allowed_at_level")])
+def test_other_levels_ignore_declarations(db, stack, level, reason):
+    base, received = server(stack)
+    gate = gate_for(db, provider_urls=[f"{base}/v1"])
+    with gate.client(project(db, level)) as client:  # Normal: any model route, declared or not
+        if reason:
+            with pytest.raises(OutboundDenied, match=reason):
+                client.get(f"{base}/v1/models")
+        else:
+            client.get(f"{base}/v1/models")
+        declare(db, f"{base}/v1")
+        if reason:
+            with pytest.raises(OutboundDenied, match=reason):
+                client.get(f"{base}/v1/models")
+        else:
+            client.get(f"{base}/v1/models")
+    assert len(received) == (0 if reason else 2)
+
+
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+def test_the_local_helper_is_allowed_at_every_level(db, stack, level):
+    helper, received = server(stack)
+    with gate_for(db, helper_url=helper).client(project(db, level)) as client:
+        client.get(f"{helper}/health")
+    assert received == [("GET", "/health")]
+
+
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+def test_the_gate_refuses_another_local_server_before_it_is_reached(db, stack, level):
+    # The other server is registered, so only the gate stands between them.
+    helper, _ = server(stack)
+    other, received = server(stack)
+    declare(db, other)
+    with gate_for(db, helper_url=helper).client(project(db, level)) as client, \
+            pytest.raises(OutboundDenied, match="unknown_destination"):
+        client.get(f"{other}/anything")
+    assert received == []
+
+
+@pytest.mark.parametrize("follow", [True, False])
+def test_a_declared_server_cannot_redirect_elsewhere(db, stack, follow):
+    target, target_received = server(stack)
+    base, received = server(stack, redirect_to=target)
+    declare(db, base)
+    declare(db, target)
+    gate = gate_for(db, provider_urls=[f"{base}/v1", f"{target}/v1"])
+    with gate.client(project(db, "local_only"), follow_redirects=follow) as client, \
+            pytest.raises(OutboundDenied, match="cross_origin_redirect"):
+        client.post(f"{base}/v1/chat/completions", json={"messages": []})
+    assert received == [("POST", "/v1/chat/completions")]
+    assert target_received == []
+    assert reasons(db) == [None, "cross_origin_redirect"]
+
+
+def test_proxy_settings_in_the_environment_are_ignored(db, stack, monkeypatch):
+    helper, received = server(stack)
+    proxy, proxy_received = server(stack)
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "all_proxy"):
+        monkeypatch.setenv(name, proxy)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    with httpx.Client() as plain:  # the premise: a default client would go through the proxy
+        plain.get(f"{helper}/health")
+    assert proxy_received == [("GET", f"{helper}/health")] and received == []
+    proxy_received.clear()
+    with gate_for(db, helper_url=helper).client(project(db, "normal")) as client:
+        client.get(f"{helper}/health")
+    assert received == [("GET", "/health")]
+    assert proxy_received == []
+
+
+@pytest.mark.asyncio
+async def test_async_client_over_real_sockets(db, stack):
+    base, received = server(stack)
+    project_id = await asyncio.to_thread(project, db, "local_only")
+    gate = gate_for(db, provider_urls=[f"{base}/v1"])
+    async with gate.async_client(project_id) as client:
+        with pytest.raises(OutboundDenied, match="not_declared"):
+            await client.post(f"{base}/v1/chat/completions", json={"messages": []})
+        await asyncio.to_thread(declare, db, f"{base}/v1")
+        assert (await client.post(f"{base}/v1/chat/completions", json={"messages": []})).status_code == 200
+    assert received == [("POST", "/v1/chat/completions")]
