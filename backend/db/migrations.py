@@ -323,10 +323,10 @@ CREATE TABLE artifacts (
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (updated_at IS strftime('%Y-%m-%dT%H:%M:%fZ', updated_at))
 ) STRICT;
 
--- A version's document never changes, and a version is deleted only together
--- with its artifact: the foreign key is checked at commit, so a transaction may
--- delete the artifact first and then its versions, and no other order is
--- accepted. The delete trigger also stops REPLACE from swapping a version.
+-- A version's document and artifact never change, and a version is deleted only
+-- together with its artifact: the foreign key is checked at commit, so a
+-- transaction may delete the artifact first and then its versions, and no other
+-- order is accepted. The delete trigger also stops REPLACE from swapping a version.
 CREATE TABLE artifact_versions (
     id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     artifact_id TEXT NOT NULL REFERENCES artifacts (id) DEFERRABLE INITIALLY DEFERRED,
@@ -339,9 +339,9 @@ CREATE TABLE artifact_versions (
     UNIQUE (artifact_id, seq)
 ) STRICT;
 
-CREATE TRIGGER artifact_versions_keep_doc BEFORE UPDATE OF doc ON artifact_versions
+CREATE TRIGGER artifact_versions_keep_doc BEFORE UPDATE OF artifact_id, doc ON artifact_versions
 BEGIN
-    SELECT RAISE(ABORT, 'an artifact version''s document is immutable');
+    SELECT RAISE(ABORT, 'an artifact version''s document and artifact are immutable');
 END;
 
 CREATE TRIGGER artifact_versions_no_delete BEFORE DELETE ON artifact_versions

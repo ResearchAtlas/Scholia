@@ -80,13 +80,13 @@ class Database:
         self._backup_lock = threading.Lock()
         self._commit_lock = threading.Lock()  # orders the damaged flag with commits
         _mkdir_private(self.data_dir)
-        if self.path.exists():  # refuse another app's, a newer or a damaged file before anything writes to it
-            _open_checked(self.path, "quick_check", latest=len(migrations)).close()
-        else:
-            # Created owner-only before SQLite opens it. SQLite gives the WAL and
-            # shared-memory files the database file's mode (and resets an empty
-            # one to it on every open), so they are owner-only too.
+        try:
+            # A new database is created owner-only before SQLite opens it. SQLite gives
+            # the WAL and shared-memory files the database file's mode (and resets an
+            # empty one to it on every open), so they are owner-only too.
             _create_private(self.path)
+        except FileExistsError:  # refuse another app's, a newer or a damaged file before anything writes to it
+            _open_checked(self.path, "quick_check", latest=len(migrations)).close()
         self._writer = ThreadPoolExecutor(1, thread_name_prefix="aab-db-writer")
         try:
             self._writer_ident = self._writer.submit(self._open_writer, migrations).result()
@@ -164,13 +164,23 @@ class Database:
         try:
             if conn.execute("PRAGMA journal_mode = WAL").fetchone()[0] != "wal":
                 raise RuntimeError("the database could not switch to WAL mode")
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            for number in range(version + 1, len(migrations) + 1):
-                if conn.execute("SELECT 1 FROM sqlite_schema").fetchone():  # skip only a new, empty database
+            while True:
+                # Decide under the write lock, so migrations another connection applied
+                # meanwhile are seen and not run again. The backup then copies exactly
+                # the state the migration starts from.
+                conn.execute("BEGIN IMMEDIATE")
+                version, has_schema = _usable_state(conn, len(migrations))
+                if version == len(migrations):
+                    conn.execute("ROLLBACK")
+                    break
+                if has_schema:  # skip only a new, empty database
                     with self._backup_lock:
                         self._backup(datetime.now(UTC))
-                _migrate(conn, number, migrations[number - 1])
+                # One transaction: the script, then the user_version bump, then COMMIT.
+                conn.executescript(f"{migrations[version]}\nPRAGMA user_version = {version + 1};\nCOMMIT;")
         except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             self._conn = conn
             self._close_writer()
             raise
@@ -274,24 +284,16 @@ def _open_checked(path, check, latest=None):
     corrupt or the check fails. When latest is given (the live database at
     startup), also raises ForeignDatabaseError for a file that is not this app's
     database, unless it is new and empty, and NewerDatabaseError when
-    user_version is above latest. Nothing is written to the file or its WAL.
+    user_version is above latest; and a database that will be migrated gets
+    integrity_check instead of check. Nothing is written to the file or its WAL.
     """
     conn = None
     try:
         conn = _connect(path, readonly=True)
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
         if latest is not None:  # the live database at startup
-            app_id = conn.execute("PRAGMA application_id").fetchone()[0]
-            new_file = app_id == version == 0 and conn.execute("SELECT 1 FROM sqlite_schema").fetchone() is None
-            if app_id != APPLICATION_ID and not new_file:  # a new file is stamped by migration 0001
-                raise ForeignDatabaseError(
-                    f"This file is not this app's database (application id {app_id:#x}). It was left unchanged."
-                )
-            if version > latest:
-                raise NewerDatabaseError(
-                    f"This database was written by a newer version of the app (schema {version}; "
-                    f"this version knows up to {latest}). Update the app, or restore a backup."
-                )
+            version, has_schema = _usable_state(conn, latest)
+            if has_schema and version < latest:
+                check = "integrity_check"  # it is about to be migrated: check it fully before anything changes it
         rows = conn.execute(f"PRAGMA {check}").fetchall()
         if rows != [("ok",)]:
             raise DatabaseDamagedError(f"{check} failed: {rows[0][0]}")
@@ -305,14 +307,28 @@ def _open_checked(path, check, latest=None):
         raise
 
 
-def _migrate(conn, number, script):
-    """Run one migration and advance user_version in a single transaction."""
-    try:
-        conn.executescript(f"BEGIN IMMEDIATE;\n{script}\nPRAGMA user_version = {number};\nCOMMIT;")
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
+def _usable_state(conn, latest):
+    """(user_version, whether it has any schema), if this app can open and migrate it.
+
+    Raises ForeignDatabaseError for another application's file (a new, empty file
+    is accepted; migration 0001 stamps it) and NewerDatabaseError for a schema
+    above latest.
+    """
+    version, app_id, has_schema = conn.execute(  # one statement, so one consistent snapshot
+        "SELECT user_version, application_id, EXISTS (SELECT 1 FROM sqlite_schema)"
+        " FROM pragma_user_version, pragma_application_id"
+    ).fetchone()
+    new_file = app_id == version == 0 and not has_schema
+    if app_id != APPLICATION_ID and not new_file:
+        raise ForeignDatabaseError(
+            f"This file is not this app's database (application id {app_id:#x}). It was left unchanged."
+        )
+    if version > latest:
+        raise NewerDatabaseError(
+            f"This database was written by a newer version of the app (schema {version}; "
+            f"this version knows up to {latest}). Update the app, or restore a backup."
+        )
+    return version, bool(has_schema)
 
 
 def _rotate(backups):

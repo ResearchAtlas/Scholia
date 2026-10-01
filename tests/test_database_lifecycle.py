@@ -6,6 +6,7 @@ import stat
 import subprocess
 import sys
 import threading
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -209,6 +210,89 @@ def test_a_failed_migration_keeps_the_previous_schema(tmp_path):
     assert len(generations(data)) == 1  # the backup taken before the attempt
 
 
+def open_together(data, migrations=MIGRATIONS):
+    """Open two Database instances on data from two threads at once."""
+    start = threading.Barrier(2)
+    opened, errors = [], []
+
+    def open_one():
+        start.wait()
+        try:
+            opened.append(Database(data, migrations=migrations))
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=open_one) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    for db in opened:
+        db.close()
+    return errors
+
+
+def test_two_instances_migrating_an_outdated_database_apply_each_migration_once(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    Database(data).close()
+    both_at_backup = threading.Barrier(2, timeout=1)
+    real_backup = Database._backup
+
+    def backup_together(self, now):
+        # Hold each instance at its pre-migration backup until the other arrives. An
+        # instance that chose its migration from a version read before taking the
+        # write lock would arrive too, and then run a migration already applied.
+        with suppress(threading.BrokenBarrierError):
+            both_at_backup.wait()
+        return real_backup(self, now)
+
+    monkeypatch.setattr(Database, "_backup", backup_together)
+    errors = open_together(data, MIGRATIONS + ("CREATE TABLE second (x INTEGER) STRICT;",))
+    assert errors == []
+    assert user_version(data / DB_NAME) == len(MIGRATIONS) + 1
+    assert len(generations(data)) == 1  # only the instance that migrated backed up
+
+
+def test_two_instances_starting_on_a_new_data_folder_both_open_it(tmp_path):
+    # The interleaving varies between attempts; repeating makes a regression likely to show.
+    for attempt in range(20):
+        data = tmp_path / f"data{attempt}"
+        assert open_together(data) == []
+        with Database(data) as db:
+            assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects").fetchone()) == (1,)
+
+
+def test_the_startup_check_reads_the_file_header_in_one_snapshot(tmp_path, monkeypatch):
+    """Another instance commits migration 0001 just before the startup check reads the schema list."""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / DB_NAME).touch()  # a new, empty file that another instance is setting up
+    real_connect = database_module._connect
+    hooked, other = [], []
+
+    def connect(path, **kwargs):
+        conn = real_connect(path, **kwargs)
+        if kwargs.get("readonly") and not hooked:  # this instance's startup check only
+            hooked.append(conn)
+
+            def before_each_statement(sql):
+                if "sqlite_schema" in sql and not other:
+                    other.append("started")
+                    try:
+                        Database(data).close()
+                        other[0] = "migrated"
+                    except Exception as error:  # a trace callback cannot raise; record it
+                        other[0] = error
+
+            conn.set_trace_callback(before_each_statement)
+        return conn
+
+    monkeypatch.setattr(database_module, "_connect", connect)
+    with Database(data) as db:
+        assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects").fetchone()) == (1,)
+    assert other == ["migrated"]
+
+
 KILLED_MIGRATION = r"""
 import os, signal, sqlite3, sys
 from backend.db import Database
@@ -297,6 +381,20 @@ def test_a_failed_integrity_check_stops_writes_and_leaves_the_file_unchanged(tmp
     assert (data / DB_NAME).read_bytes() == main_file  # the WAL was not checkpointed into it
     assert (data / f"{DB_NAME}-wal").stat().st_size > 0
     assert list((data / "backups" / "daily").iterdir()) == []
+
+
+def test_a_damaged_database_that_needs_migrating_is_refused_before_any_change(tmp_path):
+    data = tmp_path / "data"
+    mismatch_table_and_index(data)  # passes quick_check, fails integrity_check
+    conn = sqlite3.connect(data / DB_NAME)
+    conn.execute("PRAGMA journal_mode = DELETE")  # opening it in WAL mode would change its header
+    conn.close()
+    before = snapshot(data)
+
+    with pytest.raises(DatabaseDamagedError, match="integrity_check"):
+        Database(data, migrations=MIGRATIONS + ("CREATE TABLE second (x INTEGER) STRICT;",))
+    assert snapshot(data) == before
+    assert not (data / "backups").exists()
 
 
 def test_a_write_in_flight_when_damage_is_found_does_not_commit(tmp_path):

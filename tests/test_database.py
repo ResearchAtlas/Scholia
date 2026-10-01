@@ -252,6 +252,26 @@ def test_an_artifact_version_document_cannot_change_while_its_artifact_exists(db
     db.write(lambda conn: conn.execute("UPDATE artifact_versions SET label = 'v1' WHERE id = ?", (version,)))
 
 
+@pytest.mark.parametrize("move, delete", [
+    ("UPDATE run_events SET run_id = :new WHERE run_id = :run", "DELETE FROM run_events WHERE run_id = :new"),
+    ("UPDATE artifact_versions SET artifact_id = :new WHERE id = :version",
+     "DELETE FROM artifact_versions WHERE id = :version"),
+], ids=["run-event", "artifact-version"])
+def test_a_protected_row_cannot_be_moved_off_its_parent_and_then_deleted(db, move, delete):
+    run_id = db.write(add_run_with_events)
+    _, version = db.write(add_artifact_version)
+    before = (events(db, run_id), artifact_versions(db))
+
+    def move_then_delete(conn):  # the moved row's new parent does not exist, so the delete guard would pass
+        params = {"new": new_id(), "run": run_id, "version": version}
+        conn.execute(move, params)
+        conn.execute(delete, params)
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only|immutable"):
+        db.write(move_then_delete)
+    assert (events(db, run_id), artifact_versions(db)) == before
+
+
 def test_artifact_versions_are_deleted_only_together_with_their_artifact(db):
     artifact, _ = db.write(add_artifact_version)
     other, _ = db.write(add_artifact_version)
