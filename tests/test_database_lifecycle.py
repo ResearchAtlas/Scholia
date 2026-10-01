@@ -140,7 +140,8 @@ def test_an_existing_database_at_version_zero_is_backed_up_before_migrating(tmp_
     conn.close()
 
     Database(data).close()
-    [generation] = generations(data)
+    generation, *later_ones = generations(data)
+    assert len(later_ones) == len(MIGRATIONS) - 1  # one backup before each migration
     backup = sqlite3.connect((data / "backups" / "daily" / generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
     try:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 0
@@ -197,7 +198,7 @@ def test_a_backup_is_taken_before_each_migration_of_an_existing_database(tmp_pat
     with Database(data, migrations=MIGRATIONS + later) as db:
         assert {"second", "third"} <= table_names(db)
     daily = data / "backups" / "daily"
-    assert [user_version(daily / name / DB_NAME) for name in generations(data)] == [1, 2]
+    assert [user_version(daily / name / DB_NAME) for name in generations(data)] == [len(MIGRATIONS), len(MIGRATIONS) + 1]
 
 
 def test_a_failed_migration_keeps_the_previous_schema(tmp_path):
@@ -208,7 +209,7 @@ def test_a_failed_migration_keeps_the_previous_schema(tmp_path):
 
     with pytest.raises(sqlite3.OperationalError, match="missing"):
         Database(data, migrations=MIGRATIONS + (broken,))
-    assert user_version(data / DB_NAME) == 1
+    assert user_version(data / DB_NAME) == len(MIGRATIONS)
     with Database(data) as db:
         assert "extra" not in table_names(db)
         assert audit_events(db) == [("kept",)]
@@ -373,7 +374,7 @@ def test_a_process_killed_mid_migration_leaves_the_previous_schema(tmp_path):
     assert (data / f"{DB_NAME}-wal").stat().st_size > 0  # uncommitted pages reached the disk
 
     with Database(data) as db:  # passes quick_check
-        assert db.read(lambda conn: conn.execute("PRAGMA user_version").fetchone()) == (1,)
+        assert db.read(lambda conn: conn.execute("PRAGMA user_version").fetchone()) == (len(MIGRATIONS),)
         assert "extra" not in table_names(db)
         assert audit_events(db) == [("kept",)]
     with Database(data, migrations=MIGRATIONS + ("CREATE TABLE extra (x INTEGER) STRICT;",)) as db:

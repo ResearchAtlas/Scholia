@@ -4,14 +4,17 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import backend.db.database as database_module
 import backend.db.deletion as deletion_module
 from backend.db import DB_NAME, ContentStore, Database, delete, new_id
 from backend.db.deletion import DELETE, KINDS, NOT_DELETED, ON_DELETE
+from backend.db.migrations import MIGRATIONS
 from network_guard import allow_subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -487,6 +490,75 @@ def test_remove_all_trace_drops_the_titles(db, store):
     assert data["remove_all_trace"] is True
 
 
+# Tombstones guard deleted ids
+
+
+NEW_ROW = {  # kind: a row for that table, with id :id, in project :project where it needs one
+    "project": "INTO projects (id, name, kind) VALUES (:id, 'Back', 'research')",
+    "conversation": "INTO conversations (id, project_id) VALUES (:id, :project)",
+    "material": "INTO materials (id, project_id, source) VALUES (:id, :project, 'upload')",
+    "artifact": "INTO artifacts (id, project_id, title, doc) VALUES (:id, :project, 'Back', '{}')",
+    "memory": "INTO memory_records (id, scope, type, content, status) VALUES (:id, 'personal', 'fact', 'x', 'confirmed')",
+}
+FIXTURE_NAME = {"conversation": "c1", "material": "m1", "artifact": "a1", "memory": "mr1"}
+assert set(NEW_ROW) == set(KINDS) == set(FIXTURE_NAME) | {"project"}
+
+
+def deleted_object(db, store, kind, remove_all_trace=False):
+    """Delete an object of kind; returns its id and a project that still exists."""
+    project = add_project(db, "Thesis")
+    x = populate(db, store, project, "p")
+    object_id = project if kind == "project" else x[FIXTURE_NAME[kind]]
+    delete(db, store, kind, object_id, remove_all_trace=remove_all_trace)
+    return object_id, one(db, "SELECT id FROM projects WHERE kind = 'general'")[0]
+
+
+@pytest.mark.parametrize("statement", [
+    "INSERT {row}", "INSERT OR REPLACE {row}", "REPLACE {row}", "INSERT {row} ON CONFLICT DO NOTHING",
+], ids=["insert", "insert-or-replace", "replace", "upsert"])
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_a_deleted_id_cannot_be_inserted_again(db, store, kind, statement):
+    object_id, project = deleted_object(db, store, kind)
+    before = dump(db)
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be used again"):
+        db.write(lambda conn: conn.execute(statement.format(row=NEW_ROW[kind]), {"id": object_id, "project": project}))
+    assert dump(db) == before
+
+
+@pytest.mark.parametrize("kind", sorted(KINDS))
+def test_a_row_cannot_take_a_deleted_id(db, store, kind):
+    object_id, project = deleted_object(db, store, kind, remove_all_trace=True)  # the tombstone keeps its id
+    other = new_id()
+    table = KINDS[kind][0]
+    db.write(lambda conn: conn.execute(f"INSERT {NEW_ROW[kind]}", {"id": other, "project": project}))
+    before = dump(db)
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be used again"):
+        db.write(lambda conn: conn.execute(f"UPDATE {table} SET id = ? WHERE id = ?", (object_id, other)))
+    assert dump(db) == before
+
+
+def test_a_database_at_schema_1_gets_the_guard_for_its_earlier_deletions(tmp_path):
+    data = tmp_path / "data"
+    with Database(data, migrations=MIGRATIONS[:1]) as db:
+        store = ContentStore(db)
+        x = populate(db, store, add_project(db, "Thesis"), "p")
+        delete(db, store, "conversation", x["c1"])
+
+    with Database(data) as db:
+        assert one(db, "PRAGMA user_version") == (len(MIGRATIONS),)
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be used again"):
+            db.write(lambda conn: conn.execute(
+                "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (x["c1"], x["project"])))
+        db.write(lambda conn: conn.execute(
+            "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), x["project"])))
+    [generation] = sorted((data / "backups" / "daily").iterdir())  # taken before the migration
+    backup = sqlite3.connect(f"{(generation / DB_NAME).as_uri()}?mode=ro", uri=True)
+    try:
+        assert backup.execute("PRAGMA user_version").fetchone() == (1,)
+    finally:
+        backup.close()
+
+
 # Revocation
 
 
@@ -547,6 +619,38 @@ def test_failures_after_the_commit_keep_the_deletion_and_are_retried(db, store, 
     store.collect_garbage(now=later())
     with pytest.raises(FileNotFoundError):
         store.read(x["paper"])
+
+
+def test_a_truncation_blocked_by_a_reader_is_retried_after_the_next_write(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(database_module, "_PRAGMAS", tuple(
+        "busy_timeout = 1000" if pragma.startswith("busy_timeout") else pragma for pragma in database_module._PRAGMAS))
+    data = tmp_path / "data"
+    wal = data / f"{DB_NAME}-wal"
+
+    def add_audit_row(conn):
+        conn.execute("INSERT INTO audit_log (event) VALUES ('test')")
+
+    with Database(data) as db:
+        store = ContentStore(db)
+        x = populate(db, store, add_project(db, "Thesis"), "p")
+        reader = sqlite3.connect((data / DB_NAME).resolve().as_uri() + "?mode=ro", uri=True, autocommit=True)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM materials").fetchone()  # holds a snapshot that needs the WAL
+        with caplog.at_level(logging.WARNING, logger="backend.db.deletion"):
+            delete(db, store, "material", x["m1"])
+        assert "could not be truncated" in caplog.text
+        assert wal.stat().st_size > 0
+
+        started = time.monotonic()
+        db.write(add_audit_row)  # retried without waiting for the reader
+        assert time.monotonic() - started < 0.5
+        assert wal.stat().st_size > 0
+
+        reader.close()
+        db.write(add_audit_row)  # retried after this write, now that the reader is gone
+        assert wal.stat().st_size == 0
+        db.write(add_audit_row)  # done: later writes use the WAL as usual
+        assert wal.stat().st_size > 0
 
 
 KILLED_DELETION = r"""

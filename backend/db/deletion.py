@@ -8,7 +8,8 @@ includes a deleted record, queues search index removals, and writes tombstones
 and one audit record. Foreign keys are checked at commit, so a deletion either
 leaves no dangling reference or changes nothing. Rows are never reinserted, and
 a protected record (run events, artifact versions) is deleted only after its
-parent, in the same transaction.
+parent, in the same transaction. A tombstone keeps its id even under "remove all
+trace", and migration 0002 refuses any later row that would take that id.
 
 After the commit, the WAL is checkpointed and truncated, so deleted content does
 not stay in old WAL frames, and unreferenced content files are collected.

@@ -261,6 +261,39 @@ def test_a_slow_put_counts_as_just_written(store, db):
     assert [row[0] for row in rows(db)] == [sha256]
 
 
+class StalledStream(io.RawIOBase):
+    """A stream that stalls for longer than IDLE_AFTER, during which garbage collection runs."""
+
+    def __init__(self, store, data):
+        self.store, self.data, self.collected = store, data, None
+
+    def readable(self):
+        return True
+
+    def read(self, size=-1):
+        chunk, self.data = self.data, b""
+        if not chunk:
+            for tmp in self.store.root.glob(".put-*.tmp"):
+                age(tmp)
+            self.collected = self.store.collect_garbage(now=later())
+        return chunk
+
+
+def test_a_put_stalled_past_the_idle_time_survives_collection(store, db):
+    store.put(b"x")
+    abandoned = store.root / ".put-abandoned.tmp"
+    abandoned.write_bytes(b"partial")
+    age(abandoned)
+    data = b"stalled upload" * 10_000
+    stream = StalledStream(store, data)
+    sha256 = store.put(stream)
+    assert stream.collected is not None  # collection ran while the put was in progress
+    assert not abandoned.exists()  # an abandoned temporary file is still removed
+    assert store.read(sha256) == data
+    assert sha256 in [row[0] for row in rows(db)]
+    assert list(store.root.glob(".put-*.tmp")) == []
+
+
 def test_a_new_row_keeps_a_file_with_an_old_timestamp(store, db):
     sha256 = store.put(b"copied with its old time")
     age(store.root / sha256[:2] / sha256)

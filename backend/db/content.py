@@ -31,13 +31,14 @@ class ContentStore:
     """The content store of a Database's data folder.
 
     Create one per Database: its lock orders a write of a file against garbage
-    collection of the same file.
+    collection of the same file, and it knows which temporary files are in use.
     """
 
     def __init__(self, db):
         self.db = db
         self.root = db.data_dir / "content"
         self._lock = threading.Lock()
+        self._writing = set()  # temporary files of puts in progress, however long they take
 
     def put(self, data, media_type=None):
         """Store bytes, or a binary file object read to its end. Returns the SHA-256.
@@ -48,10 +49,11 @@ class ContentStore:
         recently added. Must not be called inside Database.write.
         """
         _refuse_event_loop()
+        tmp = self.root / f".put-{uuid.uuid4()}.tmp"
         with self._lock:
             if _mkdir_new(self.root):
                 _fsync(self.db.data_dir)
-        tmp = self.root / f".put-{uuid.uuid4()}.tmp"
+            self._writing.add(tmp)
         digest, size = hashlib.sha256(), 0
         try:
             with open(tmp, "xb", opener=lambda name, flags: os.open(name, flags, 0o600)) as file:
@@ -72,6 +74,9 @@ class ContentStore:
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
+        finally:
+            with self._lock:
+                self._writing.discard(tmp)
         self.db.write(lambda conn: conn.execute(
             "INSERT INTO content_files (sha256, size, media_type) VALUES (?, ?, ?)"
             " ON CONFLICT (sha256) DO NOTHING",
@@ -96,8 +101,9 @@ class ContentStore:
 
         A row is removed when no foreign key in the schema points at it and both
         it and its file are older than IDLE_AFTER. A file is removed when it has
-        no row and was last written more than IDLE_AFTER ago; files left by an
-        interrupted put are removed the same way. Names the store did not write
+        no row and was last written more than IDLE_AFTER ago; temporary files
+        left by an interrupted put are removed the same way, never those of a put
+        still in progress in this store. Names the store did not write
         are left alone. now, an aware UTC datetime, defaults to the current time.
         """
         _refuse_event_loop()
@@ -133,9 +139,10 @@ class ContentStore:
                 if _idle(path, cutoff):
                     path.unlink(missing_ok=True)
                     removed += 1
-        for path in self.root.glob(".put-*.tmp"):  # left by an interrupted put
-            if _idle(path, cutoff):
-                path.unlink(missing_ok=True)
+        for path in self.root.glob(".put-*.tmp"):  # left by an interrupted put, not one still running
+            with self._lock:
+                if path not in self._writing and _idle(path, cutoff):
+                    path.unlink(missing_ok=True)
         return removed
 
     def _path(self, sha256):
