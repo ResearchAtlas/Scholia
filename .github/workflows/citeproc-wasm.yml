@@ -18,6 +18,8 @@ jobs:
     name: citeproc.wasm spike (non-blocking)
     runs-on: ubuntu-24.04
     timeout-minutes: 150
+    outputs:
+      built: ${{ steps.build.outcome == 'success' }}
     defaults:
       run:
         shell: bash  # with pipefail, so a failure before `tee` fails the step
@@ -88,3 +90,53 @@ jobs:
             build/citeproc-wasm/build.log
           if-no-files-found: ignore
           retention-days: 14
+
+  # The same module on macOS arm64, through wasmtime frozen by PyInstaller the way the app
+  # would freeze it (wasmtime has no PyInstaller hook; its library is collected by hand).
+  macos:
+    name: citeproc.wasm through frozen wasmtime on macOS (non-blocking)
+    needs: spike
+    if: needs.spike.outputs.built == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      UV_PYTHON_DOWNLOADS: never
+      UV_PYTHON_PREFERENCE: only-system
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: citeproc-wasm-spike
+          path: build/citeproc-wasm
+      - id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+      - name: Freeze the runner and run citeproc.wasm
+        id: run
+        continue-on-error: true
+        run: |
+          uv sync --locked --group citeproc-spike --python "${{ steps.python.outputs.python-path }}"
+          uv run --no-sync pyinstaller --noconfirm --onedir --name citeproc-run \
+            --distpath build/dist --workpath build/work --collect-binaries wasmtime \
+            --add-data tools/citeproc-wasm/style.csl:. tools/citeproc-wasm/run.py
+          build/dist/citeproc-run/citeproc-run build/citeproc-wasm/citeproc.wasm \
+            | tee build/citeproc-wasm/run-macos.json
+      - name: Record the result
+        if: always()
+        run: |
+          {
+            echo "## citeproc.wasm on macOS arm64, frozen wasmtime"
+            echo "- Freeze and run: ${{ steps.run.outcome }}"
+            if [ -f build/citeproc-wasm/run-macos.json ]; then
+              echo '```'; cat build/citeproc-wasm/run-macos.json; echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

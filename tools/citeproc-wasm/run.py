@@ -2,7 +2,7 @@
 
     python tools/citeproc-wasm/run.py build/citeproc-wasm/citeproc.wasm
 
-Prints JSON with the module's size, SHA-256, whether GMP symbols appear in it, the
+Prints JSON with the module's size, SHA-256, how many GMP symbol names appear in it, the
 compile and run times, and citeproc's output; exits non-zero if the output is wrong.
 """
 
@@ -72,6 +72,8 @@ def main(path: str) -> int:
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
         "gmp_symbols": data.count(b"__gmp"),
+        # A control for the count above: GHC runtime symbol names, present unless names were stripped
+        "rts_symbols": data.count(b"stg_"),
         "compile_seconds": round(compiled, 3),
         "run_seconds": timings,
         "exit_code": code,
