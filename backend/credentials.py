@@ -111,7 +111,7 @@ def load_key(data_root, provider, backend=None):
             key = store.get_password(SERVICE, provider)
         except Exception:  # any ordinary failure means the store is unavailable
             key = None
-        if isinstance(key, str):
+        if isinstance(key, str) and key:  # an empty value is no key; save_key never stores one
             return key
     with _lock:
         try:
@@ -119,4 +119,4 @@ def load_key(data_root, provider, backend=None):
         except CredentialsFileError as error:
             _log.warning("%s; its keys are not used", error)
             key = None
-    return key if isinstance(key, str) else None
+    return key if isinstance(key, str) and key else None

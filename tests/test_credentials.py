@@ -335,3 +335,17 @@ def test_backups_carry_settings_and_instructions_but_never_keys(tmp_path):
     copied = {str(p.relative_to(generation)) for p in generation.rglob("*") if p.is_file()}
     assert {"config.toml", "AGENTS.md", f"projects/{project}/config.toml", f"projects/{project}/AGENTS.md"} <= copied
     assert files_containing(generation, KEY) == [] and "credentials.json" not in copied
+
+
+@pytest.mark.parametrize("in_file", [KEY, None])
+def test_an_empty_store_value_is_not_a_key(tmp_path, in_file):
+    if in_file:
+        save_key(tmp_path, "openrouter", in_file, backend=keyring.backends.fail.Keyring())
+    store = MemoryKeyring()
+    store.items[(SERVICE, "openrouter")] = ""
+    assert load_key(tmp_path, "openrouter", backend=store) == in_file
+
+
+def test_an_empty_fallback_entry_is_not_a_key(tmp_path):
+    (tmp_path / "credentials.json").write_text('{"openrouter": ""}')
+    assert load_key(tmp_path, "openrouter", backend=MemoryKeyring()) is None
