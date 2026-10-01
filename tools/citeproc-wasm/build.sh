@@ -49,9 +49,13 @@ package aeson
   flags: -ordered-keymap
 package splitmix
   cc-options: -include sys/random.h
-allow-newer: all:base, all:bytestring, all:containers, all:ghc-bignum, all:template-haskell, all:text, all:time, all:deepseq, all:ghc-prim
+-- Upper bounds do not know GHC's main branch yet; without this the solver falls back to
+-- ancient releases without bounds (aeson 0.9).
+allow-newer: all
+constraints: aeson >= 2.2
 PROJECT
 
+wasm32-wasi-cabal build --dry-run exe:citeproc | tee "$out/build-plan.txt"
 wasm32-wasi-cabal build exe:citeproc
 cp "$(wasm32-wasi-cabal list-bin exe:citeproc)" "$out/citeproc.wasm"
 ls -l "$out/citeproc.wasm"
