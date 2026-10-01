@@ -28,9 +28,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CONTENTS = "_internal"  # PyInstaller's onedir contents folder
 LICENSES = "licenses"  # license texts ship in <contents>/licenses/<component>/
+# The build interpreter's installation, which every bundled CPython file must come from
+CPYTHON_HOME = Path(sys.base_prefix)
+LIB_DYNLOAD = Path(sysconfig.get_path("platstdlib"), "lib-dynload")
 # CPython's license document, which covers the third-party code it incorporates
 CPYTHON_DOC = Path(sys.base_prefix, "Resources/English.lproj/Documentation/_sources",
                    "license.rst.txt")
+# pyinstaller-hooks-contrib's license file puts its run-time hooks, the only part of it
+# an app bundles, under Apache-2.0, and the rest of the distribution under the GPL.
+CONTRIB_RTHOOKS = "pyinstaller-hooks-contrib-rthooks"
 
 # Licenses that ask only for attribution, a notice or a disclaimer, and public-domain terms.
 ALLOWED = {
@@ -93,7 +99,12 @@ CLASSIFIERS = {
     "Public Domain": "LicenseRef-Public-Domain",
 }
 
-MACHO_MAGIC = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"}
+# Mach-O magic numbers in both byte orders: thin 32- and 64-bit, universal 32- and 64-bit
+MACHO_MAGIC = {
+    magic.to_bytes(4, order)
+    for magic in (0xFEEDFACE, 0xFEEDFACF, 0xCAFEBABE, 0xCAFEBABF)
+    for order in ("big", "little")
+}
 
 
 def allowed(expression: str) -> bool:
@@ -182,6 +193,8 @@ def component(name: str):
         # The bootloader and loader carry the bootloader exception; run-time hooks are Apache-2.0.
         return ("GPL-2.0-or-later WITH Bootloader-exception AND Apache-2.0",
                 _license_files(metadata.distribution("pyinstaller")))
+    if name == CONTRIB_RTHOOKS:
+        return "Apache-2.0", _license_files(metadata.distribution("pyinstaller-hooks-contrib"))
     if name in LIBRARIES:
         license, notice = LIBRARIES[name]
         return license, notice if isinstance(notice, str) else [(p, p.name) for p in notice]
@@ -211,25 +224,17 @@ def _record_owners() -> dict[str, str]:
     }
 
 
-@cache
-def _cpython_libraries() -> set[str]:
-    lib = Path(sys.base_prefix, "lib")
-    return {p.name for p in lib.glob("*.dylib")} if lib.is_dir() else set()
-
-
 def _is_macho(path: Path) -> bool:
     with open(path, "rb") as f:
         return f.read(4) in MACHO_MAGIC
 
 
 def _rthook_owner(name: str):
-    import _pyinstaller_hooks_contrib
-    import PyInstaller
-
-    if (Path(PyInstaller.__file__).parent / "hooks/rthooks" / f"{name}.py").exists():
+    owners = _record_owners()
+    if f"PyInstaller/hooks/rthooks/{name}.py" in owners:
         return ["PyInstaller"]
-    if (Path(_pyinstaller_hooks_contrib.__file__).parent / "rthooks" / f"{name}.py").exists():
-        return ["pyinstaller-hooks-contrib"]
+    if f"_pyinstaller_hooks_contrib/rthooks/{name}.py" in owners:
+        return [CONTRIB_RTHOOKS]
     return None
 
 
@@ -257,11 +262,20 @@ def assign_file(bundle: Path, rel: str, problems: list[str]):
         return None
     inner = "/".join(parts[1:])
     stem = parts[-1].split(".")[0]
-    dynload = f"python{sys.version_info.major}.{sys.version_info.minor}/lib-dynload/"
-    if parts[1] in ("Python", "Python.framework", "base_library.zip") or inner.startswith(dynload):
-        return ["CPython", *CPYTHON_EMBEDDED.get(stem, [])]
-    if len(parts) == 2 and parts[1] in _cpython_libraries():
-        return CPYTHON_EMBEDDED.get(stem)
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    cpython = ["CPython", *CPYTHON_EMBEDDED.get(stem, [])]
+    # CPython files are accepted only when the build interpreter has them, by name.
+    if inner == "base_library.zip":  # PyInstaller's archive of stdlib modules, checked by member
+        return ["CPython"]
+    if inner.startswith(f"python{version}/lib-dynload/"):
+        return cpython if len(parts) == 4 and (LIB_DYNLOAD / parts[-1]).is_file() else None
+    if parts[1] == "Python.framework":  # Versions/<version>/ mirrors the installation
+        mirrored = parts[2:4] == ["Versions", version] and len(parts) > 4
+        return cpython if mirrored and (CPYTHON_HOME / "/".join(parts[4:])).is_file() else None
+    if inner == "Python" and (CPYTHON_HOME / "Python").is_file():
+        return cpython
+    if len(parts) == 2 and parts[1].endswith(".dylib") and (CPYTHON_HOME / "lib" / parts[1]).is_file():
+        return CPYTHON_EMBEDDED.get(stem)  # a library the build ships; None if not reviewed
     owner = _record_owners().get(inner)
     if owner is None:
         return None
@@ -295,11 +309,15 @@ def audit(bundle: Path) -> tuple[dict[str, set[str]], list[str]]:
     """Components found in the bundle (with where), and the problems that fail the audit."""
     found: dict[str, set[str]] = defaultdict(set)
     problems: list[str] = []
+    if not bundle.is_dir():
+        return found, [f"{bundle}: not a directory"]
     notices = Path(CONTENTS, LICENSES).as_posix() + "/"
+    inventoried = 0
     for path in sorted(p for p in bundle.rglob("*") if p.is_file() and not p.is_symlink()):
         rel = path.relative_to(bundle).as_posix()
         if rel.startswith(notices):
             continue
+        inventoried += 1
         owners = assign_file(bundle, rel, problems)
         if owners is None:
             problems.append(f"{rel}: belongs to no known component")
@@ -311,14 +329,19 @@ def audit(bundle: Path) -> tuple[dict[str, set[str]], list[str]]:
             members = _archived(path, problems)
         elif rel == f"{CONTENTS}/base_library.zip":
             with zipfile.ZipFile(path) as archive:
-                members = [("module", n.removesuffix(".pyc").replace("/", "."))
-                           for n in archive.namelist() if n.endswith(".pyc")]
+                for member in archive.namelist():
+                    if member.endswith(".pyc"):
+                        members.append(("module", member.removesuffix(".pyc").replace("/", ".")))
+                    elif not member.endswith("/"):  # anything but compiled modules and folders
+                        problems.append(f"{rel}: member {member} belongs to no known component")
         for kind, name in members:
             owners = assign_module(kind, name)
             if owners is None:
                 problems.append(f"{rel}: {kind} {name} belongs to no known component")
             for owner in owners or []:
                 found[owner].add(rel)
+    if not inventoried:
+        problems.append(f"{bundle}: the bundle contains no files")
     for name in sorted(found):
         problems += _check(bundle, name)
     return found, problems

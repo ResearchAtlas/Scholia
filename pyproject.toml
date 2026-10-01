@@ -30,6 +30,8 @@ packaging = [
 
 [tool.uv]
 package = false
+# The tests cover the license audit, which reads PyInstaller's installed metadata.
+default-groups = ["dev", "packaging"]
 # The server stack is bounded to the release series CI tests (the locked versions).
 # Starlette comes through FastAPI.
 constraint-dependencies = ["starlette<0.51"]
