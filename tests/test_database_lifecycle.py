@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import shutil
 import signal
 import sqlite3
 import stat
@@ -493,7 +494,7 @@ def test_a_backup_whose_retention_fails_still_counts_and_retention_is_retried(tm
     data = tmp_path / "data"
     real_rotate = database_module._rotate
 
-    def failing_rotate(backups):
+    def failing_rotate(backups, keep):
         raise OSError(13, "Permission denied", str(backups))
 
     with Database(data) as db:
@@ -511,6 +512,62 @@ def test_a_backup_whose_retention_fails_still_counts_and_retention_is_retried(tm
         assert db.backup_if_due(now=START + timedelta(days=7, hours=1)) is None  # that backup counted
     assert len(generations(data, "daily")) == 7  # and retention ran on the next check
     assert generations(data, "weekly") == [START.strftime("%Y%m%dT%H%M%S%fZ")]
+
+
+def test_rotation_never_removes_the_generation_just_published(tmp_path):
+    """After the clock moves back, a new backup can sort before the kept ones."""
+    data = tmp_path / "data"
+    with Database(data) as db:
+        for day in range(40):  # dailies at days 33 to 39, weeklies at 7, 14, 21 and 28
+            db.backup(now=START + timedelta(days=day))
+        generation = db.backup(now=START + timedelta(days=32))
+        assert (generation / DB_NAME).is_file()
+    assert generation.name in generations(data, "daily")
+    assert len(generations(data, "daily")) == 7
+    assert len(generations(data, "weekly")) == 4
+
+
+def test_a_migration_does_not_run_without_its_backup(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    Database(data).close()
+
+    def losing_rotate(backups, keep):  # as if retention had removed the new generation
+        for generation in (backups / "daily").iterdir():
+            shutil.rmtree(generation)
+
+    monkeypatch.setattr(database_module, "_rotate", losing_rotate)
+    with pytest.raises(RuntimeError, match="backup"):
+        Database(data, migrations=MIGRATIONS + ("CREATE TABLE second (x INTEGER) STRICT;",))
+    assert user_version(data / DB_NAME) == len(MIGRATIONS)
+
+
+def test_a_backup_includes_the_settings_files_and_nothing_else(tmp_path, open_umask):
+    data = tmp_path / "data"
+    project, empty_project = new_id(), new_id()
+    settings = {
+        "config.toml": '[ui]\nlanguage = "en"\n',
+        "AGENTS.md": "Personal instructions\n",
+        f"projects/{project}/config.toml": "[project]\n",
+        f"projects/{project}/AGENTS.md": "Project instructions\n",
+    }
+    others = {
+        "credentials.json": '{"openrouter": "never copied"}',  # the key fallback file
+        f"projects/{project}/notes.txt": "not a settings file",
+        "logs/app.log": "not a settings file",
+    }
+    with Database(data) as db:
+        for name, text in {**settings, **others}.items():
+            (data / name).parent.mkdir(parents=True, exist_ok=True)
+            (data / name).write_text(text)
+        (data / "projects" / empty_project).mkdir()
+        generation = db.backup()
+
+    copied = {str(path.relative_to(generation)) for path in generation.rglob("*") if path.is_file()}
+    assert copied == {DB_NAME, "backup.json", *settings}
+    for name, text in settings.items():
+        assert (generation / name).read_text() == text
+    for path in generation.rglob("*"):
+        assert mode(path) == (0o700 if path.is_dir() else 0o600), path
 
 
 def test_rotation_keeps_seven_daily_and_four_weekly_generations(tmp_path):

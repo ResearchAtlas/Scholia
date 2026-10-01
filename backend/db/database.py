@@ -27,6 +27,7 @@ DB_NAME = "aab.sqlite3"
 APPLICATION_ID = 0x41414252  # "AABR", written by migration 0001
 DAILY_KEPT = 7
 WEEKLY_KEPT = 4
+SETTINGS_FILES = ("config.toml", "AGENTS.md")  # copied into each backup: personal and per project
 _STAMP = "%Y%m%dT%H%M%S%fZ"  # backup generation folder names, oldest sorts first
 
 _PRAGMAS = (
@@ -133,6 +134,10 @@ class Database:
     def backup(self, now=None):
         """Check the database, write a backup generation and rotate old ones.
 
+        A generation holds a copy of the database, backup.json (app, schema and
+        SQLite versions) and the settings files that exist (SETTINGS_FILES, at
+        the top of the data folder and in each projects/<id>/ folder).
+
         now, an aware UTC datetime, names the generation and defaults to the
         current time. Returns the new generation's folder. A failed integrity
         check stops all later writes and raises DatabaseDamagedError.
@@ -185,7 +190,9 @@ class Database:
                     break
                 if has_schema:  # skip only a new, empty database
                     with self._backup_lock:
-                        self._backup(datetime.now(UTC))
+                        generation = self._backup(datetime.now(UTC))
+                    if not (generation / DB_NAME).is_file():
+                        raise RuntimeError("the backup taken before this migration is missing, so it did not run")
                 # One transaction: the script, then the user_version bump, then COMMIT.
                 conn.executescript(f"{migrations[version]}\nPRAGMA user_version = {version + 1};\nCOMMIT;")
         except BaseException:
@@ -254,7 +261,8 @@ class Database:
                     "schema_version": schema_version,
                     "sqlite_version": sqlite3.sqlite_version,
                 }).encode())
-                for path in (copy, info, tmp):
+                settings = _copy_settings(self.data_dir, tmp)
+                for path in (copy, info, *reversed(settings), tmp):  # files before their folders
                     _fsync(path)
                 generation = daily / stamp
                 os.rename(tmp, generation)
@@ -266,14 +274,14 @@ class Database:
                 raise
         finally:
             source.close()
-        self._apply_retention()
+        self._apply_retention(keep=generation)
         return generation
 
-    def _apply_retention(self):
-        """Rotate old generations. A failure is logged, not raised: the backup itself
-        is already published, and the next backup or backup check retries this."""
+    def _apply_retention(self, keep=None):
+        """Rotate old generations, never keep. A failure is logged, not raised: the
+        backup itself is already published, and the next backup or check retries this."""
         try:
-            _rotate(self.backups_dir)
+            _rotate(self.backups_dir, keep)
         except Exception as error:
             log.warning(
                 "backup retention failed (%s, errno %s); it is retried at the next backup check",
@@ -352,10 +360,17 @@ def _usable_state(conn, latest):
     return version, bool(has_schema)
 
 
-def _rotate(backups):
-    """Keep the newest daily generations; promote one a week to weekly, keeping the newest of those."""
+def _rotate(backups, keep):
+    """Keep the newest daily generations; promote one a week to weekly, keeping the newest of those.
+
+    keep, a generation just published (or None), is never moved or removed and
+    counts as the newest daily one whatever its date, since the clock may have
+    moved back.
+    """
     daily, weekly = backups / "daily", backups / "weekly"
-    for old in _generations(daily)[:-DAILY_KEPT]:
+    others = [generation for generation in _generations(daily) if generation != keep]
+    kept_others = DAILY_KEPT - 1 if keep is not None else DAILY_KEPT
+    for old in others[:max(0, len(others) - kept_others)]:
         kept = _generations(weekly)
         if not kept or _stamp_of(old) - _stamp_of(kept[-1]) >= timedelta(days=7):
             _mkdir_private(weekly)
@@ -364,6 +379,37 @@ def _rotate(backups):
             shutil.rmtree(old)
     for old in _generations(weekly)[:-WEEKLY_KEPT]:
         shutil.rmtree(old)
+
+
+def _copy_settings(data_dir, target):
+    """Copy the settings files that exist into target at the same relative paths, owner-only.
+
+    Only SETTINGS_FILES, at the top of the data folder and in each projects/<id>/
+    folder; symbolic links are skipped. Returns the paths created, each folder
+    before the files in it.
+    """
+    folders = [data_dir]
+    projects = data_dir / "projects"
+    if projects.is_dir() and not projects.is_symlink():
+        folders += sorted(path for path in projects.iterdir() if path.is_dir() and not path.is_symlink())
+    created = []
+    for folder in folders:
+        for name in SETTINGS_FILES:
+            source = folder / name
+            if source.is_symlink() or not source.is_file():
+                continue
+            try:
+                content = source.read_bytes()
+            except FileNotFoundError:  # removed since the listing
+                continue
+            relative = source.relative_to(data_dir)
+            for parent in reversed(relative.parents[:-1]):  # e.g. projects, then projects/<id>
+                if not (target / parent).exists():
+                    _mkdir_private(target / parent)
+                    created.append(target / parent)
+            _create_private(target / relative, content)
+            created.append(target / relative)
+    return created
 
 
 def _generations(folder):
