@@ -255,9 +255,14 @@ def test_child_process_needs_an_explicit_allowance():
 
     with pytest.raises(NetworkBlocked):
         subprocess.run(["/usr/bin/true"], check=True)
-    with pytest.raises(NetworkBlocked):
-        os.system("/usr/bin/true")
-    with allow_subprocess():
+    with allow_subprocess("/usr/bin/true"):
         subprocess.run(["/usr/bin/true"], check=True)
+        with pytest.raises(NetworkBlocked):  # only the named program
+            subprocess.run(["/bin/echo"], check=True)
+        with pytest.raises(NetworkBlocked):  # a shell could run anything
+            os.system("/usr/bin/true")
     with pytest.raises(NetworkBlocked):
         subprocess.run(["/usr/bin/true"], check=True)
+    with pytest.raises(ValueError):
+        with allow_subprocess("true"):
+            pass

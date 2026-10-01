@@ -21,9 +21,9 @@ is refused (the session fails if it was loaded first). Calling the private C cla
 connection is refused. Native frameworks with their own networking (for example
 Cocoa URL loading through PyObjC) and other C extensions are not covered; a source
 scan in tests/test_network_guard.py fails if backend or test code names the common
-ones. Starting a child process is refused unless the test wraps it in
-`allow_subprocess()`, because the child is outside the hook; an allowed child is
-not network-restricted.
+ones. Starting a child process is refused unless the test names that program in
+`allow_subprocess()`, because the child is outside the hook; an allowed program
+must make no network connections.
 """
 
 import asyncio
@@ -64,7 +64,7 @@ _allowed: dict[tuple[str, int], weakref.ref] = {}
 _listening: weakref.WeakSet = weakref.WeakSet()  # sockets that listen() in this process
 _lock = threading.Lock()
 _installed = False
-_subprocess_allowed = 0
+_allowed_programs: list[str] = []  # stack of programs allow_subprocess() permits
 _real_listen = socket.socket.listen
 
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_API_TOKEN", "_ACCESS_TOKEN", "_SECRET_KEY")
@@ -103,7 +103,7 @@ def _audit(event: str, args: tuple) -> None:
         if address is not None and not _is_allowed(sock, address):
             raise NetworkBlocked(f"test network block: connection to {address!r} refused")
     elif event in _LAUNCH_EVENTS:
-        if not _subprocess_allowed:
+        if _launched_program(event, args) not in _allowed_programs:
             raise NetworkBlocked(f"test network block: {event} refused; use allow_subprocess()")
     elif event in _LOOKUP_EVENTS:
         _require_loopback(args[0][0] if event == "socket.getnameinfo" else args[0])
@@ -122,6 +122,21 @@ def _checked(name):
         return real(self, *args)
 
     return method
+
+
+def _launched_program(event: str, args: tuple):
+    """The program a launch event starts, as an absolute path, or None."""
+    if event == "subprocess.Popen":
+        executable, argv = args[0], args[1]
+        program = executable or (argv if isinstance(argv, (str, bytes)) else argv[0])
+    elif event in ("os.exec", "os.posix_spawn"):
+        program = args[0]
+    elif event == "os.spawn":  # (mode, path, argv, env)
+        program = args[1]
+    else:  # os.system and forks run no single named program
+        return None
+    program = os.fsdecode(program)
+    return program if os.path.isabs(program) else None
 
 
 def _recording_listen(self, *args):
@@ -204,19 +219,22 @@ def clear_registrations() -> None:
 
 
 @contextmanager
-def allow_subprocess():
-    """Allow a test to start child processes, which the block cannot see into.
+def allow_subprocess(*programs: str):
+    """Allow a test to start the named programs, given by absolute path.
 
-    Use it only for programs that make no network connections.
+    A child process is outside the block, so name only programs that make no
+    network connections. Shells (os.system) and bare forks stay refused.
     """
-    global _subprocess_allowed
+    if not programs or not all(os.path.isabs(p) for p in programs):
+        raise ValueError("name each allowed program by absolute path")
     with _lock:
-        _subprocess_allowed += 1
+        _allowed_programs.extend(programs)
     try:
         yield
     finally:
         with _lock:
-            _subprocess_allowed -= 1
+            for program in programs:
+                _allowed_programs.remove(program)
 
 
 @contextmanager
