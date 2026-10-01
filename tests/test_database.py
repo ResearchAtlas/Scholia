@@ -118,6 +118,13 @@ def test_write_inside_a_write_is_refused_instead_of_deadlocking(db):
         db.write(lambda conn: db.write(lambda inner: None))
 
 
+def test_close_inside_a_write_is_refused_instead_of_deadlocking(db):
+    with pytest.raises(RuntimeError, match="inside a write"):
+        db.write(lambda conn: db.close())
+    db.write(lambda conn: conn.execute("INSERT INTO audit_log (event) VALUES ('still open')"))
+    assert db.read(lambda conn: conn.execute("SELECT event FROM audit_log").fetchall()) == [("still open",)]
+
+
 @pytest.mark.asyncio
 async def test_database_calls_are_refused_on_the_event_loop(db):
     with pytest.raises(RuntimeError, match="event loop"):

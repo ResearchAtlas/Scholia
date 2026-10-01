@@ -7,6 +7,7 @@ asyncio event loop; async code uses asyncio.to_thread.
 import asyncio
 import fcntl
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -19,6 +20,8 @@ from pathlib import Path
 
 from backend import APP_VERSION
 from backend.db.migrations import MIGRATIONS
+
+log = logging.getLogger(__name__)
 
 DB_NAME = "aab.sqlite3"
 APPLICATION_ID = 0x41414252  # "AABR", written by migration 0001
@@ -139,17 +142,24 @@ class Database:
             return self._backup(now or datetime.now(UTC))
 
     def backup_if_due(self, now=None):
-        """Back up unless the latest backup is less than a day old. Returns the folder or None."""
+        """Back up unless the latest backup is less than a day old. Returns the folder or None.
+
+        Retention runs either way, so a rotation an earlier backup could not
+        finish is retried.
+        """
         _refuse_event_loop()
         now = now or datetime.now(UTC)
         with self._backup_lock:
             latest = _generations(self.backups_dir / "daily")[-1:]
             if latest and timedelta(0) <= now - _stamp_of(latest[0]) < timedelta(days=1):
+                self._apply_retention()
                 return None
             return self._backup(now)
 
     def close(self):
         _refuse_event_loop()
+        if threading.get_ident() == self._writer_ident:
+            raise RuntimeError("close() cannot be called from inside a write")
         with self._readers_lock:
             readers, self._readers = self._readers, []
         for conn in readers:
@@ -256,8 +266,19 @@ class Database:
                 raise
         finally:
             source.close()
-        _rotate(self.backups_dir)
+        self._apply_retention()
         return generation
+
+    def _apply_retention(self):
+        """Rotate old generations. A failure is logged, not raised: the backup itself
+        is already published, and the next backup or backup check retries this."""
+        try:
+            _rotate(self.backups_dir)
+        except Exception as error:
+            log.warning(
+                "backup retention failed (%s, errno %s); it is retried at the next backup check",
+                type(error).__name__, getattr(error, "errno", None),
+            )
 
 
 def _connect(path, *, readonly=False, check_same_thread=True):

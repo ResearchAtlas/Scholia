@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -486,6 +487,30 @@ def test_a_failed_backup_leaves_no_generation_and_is_retried(tmp_path, monkeypat
 
         monkeypatch.setattr(database_module, "_fsync", real_fsync)
         assert db.backup_if_due(now=START + timedelta(minutes=1)) is not None
+
+
+def test_a_backup_whose_retention_fails_still_counts_and_retention_is_retried(tmp_path, monkeypatch, caplog):
+    data = tmp_path / "data"
+    real_rotate = database_module._rotate
+
+    def failing_rotate(backups):
+        raise OSError(13, "Permission denied", str(backups))
+
+    with Database(data) as db:
+        for day in range(7):
+            db.backup(now=START + timedelta(days=day))
+        monkeypatch.setattr(database_module, "_rotate", failing_rotate)
+        with caplog.at_level(logging.WARNING, logger="backend.db.database"):
+            generation = db.backup(now=START + timedelta(days=7))  # published; retention then fails
+        assert generation.is_dir()
+        assert len(generations(data, "daily")) == 8
+        assert "retention" in caplog.text
+        assert str(data) not in caplog.text  # logs carry no file paths
+
+        monkeypatch.setattr(database_module, "_rotate", real_rotate)
+        assert db.backup_if_due(now=START + timedelta(days=7, hours=1)) is None  # that backup counted
+    assert len(generations(data, "daily")) == 7  # and retention ran on the next check
+    assert generations(data, "weekly") == [START.strftime("%Y%m%dT%H%M%S%fZ")]
 
 
 def test_rotation_keeps_seven_daily_and_four_weekly_generations(tmp_path):
