@@ -1,10 +1,13 @@
 import stat
+import threading
+import time
 
 import keyring
 import keyring.backends.fail
 import keyring.backends.null
 import pytest
 
+from backend import credentials
 from backend.credentials import SERVICE, load_key, save_key
 from backend.settings import load_settings
 
@@ -28,7 +31,8 @@ class MemoryKeyring:
 def no_system_keyring(monkeypatch):
     # Any use of the default backend (the real Keychain on macOS) fails the test.
     def refuse():
-        raise AssertionError("a test reached the system credential store")
+        # pytest.fail is a BaseException, so no "store unavailable" handler can swallow it.
+        pytest.fail("a test reached the system credential store")
 
     monkeypatch.setattr(keyring, "get_keyring", refuse)
 
@@ -68,12 +72,13 @@ def test_unavailable_store_falls_back_to_an_owner_only_file(tmp_path, unavailabl
     assert load_key(data_root, "openrouter", backend=unavailable()) == KEY
 
 
-def test_store_failing_on_read_uses_the_file(tmp_path):
+def test_fallback_entry_wins_over_the_store(tmp_path):
     save_key(tmp_path, "openrouter", KEY, backend=keyring.backends.fail.Keyring())
     store = MemoryKeyring()
     assert load_key(tmp_path, "openrouter", backend=store) == KEY  # not in the store: the file
-    store.items[(SERVICE, "openrouter")] = "sk-newer"
-    assert load_key(tmp_path, "openrouter", backend=store) == "sk-newer"  # the store comes first
+    store.items[(SERVICE, "openrouter")] = "sk-older"
+    assert load_key(tmp_path, "openrouter", backend=store) == KEY  # the file holds the latest save
+    assert load_key(tmp_path, "other", backend=keyring.backends.fail.Keyring()) is None
 
 
 def test_storing_in_the_store_removes_the_fallback_copy(tmp_path):
@@ -114,3 +119,54 @@ def test_legacy_configuration_is_never_read(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert load_key(tmp_path, "openrouter", backend=MemoryKeyring()) is None
     assert load_key(tmp_path, "openrouter", backend=keyring.backends.fail.Keyring()) is None
+
+
+class ReadOnlyKeyring(MemoryKeyring):
+    """A store that still returns what it holds but refuses new keys, as when it is locked."""
+
+    def set_password(self, service, username, password):
+        raise keyring.errors.PasswordSetError("locked")
+
+
+def test_latest_save_wins_after_a_failed_rotation(tmp_path):
+    store = MemoryKeyring()
+    save_key(tmp_path, "openrouter", "sk-old", backend=store)
+    locked = ReadOnlyKeyring()
+    locked.items = store.items  # the same store, now refusing writes
+    assert save_key(tmp_path, "openrouter", "sk-new", backend=locked)  # fell back, with a warning
+    assert load_key(tmp_path, "openrouter", backend=locked) == "sk-new"
+    assert load_key(tmp_path, "openrouter", backend=store) == "sk-new"
+    assert save_key(tmp_path, "openrouter", "sk-newest", backend=store) is None  # the store works again
+    assert load_key(tmp_path, "openrouter", backend=store) == "sk-newest"
+    assert files_containing(tmp_path, "sk-new") == []
+
+
+def test_store_that_cannot_start_falls_back(tmp_path, monkeypatch):
+    # What keyring does for a misconfigured PYTHON_KEYRING_BACKEND: the import fails.
+    monkeypatch.setattr(keyring, "get_keyring", lambda: keyring.core.load_keyring("no_such_module.Keyring"))
+    assert save_key(tmp_path, "openrouter", KEY)
+    assert load_key(tmp_path, "openrouter") == KEY
+    assert load_key(tmp_path, "other") is None
+
+
+def test_concurrent_fallback_saves_keep_every_key(tmp_path, monkeypatch):
+    real_write = credentials.write_private
+
+    def slow_write(path, data):
+        time.sleep(0.02)  # widens the window between reading and replacing the file
+        real_write(path, data)
+
+    monkeypatch.setattr(credentials, "write_private", slow_write)
+    providers = [f"provider{i}" for i in range(8)]
+    threads = [
+        threading.Thread(target=save_key, args=(tmp_path, name, f"sk-{name}"),
+                         kwargs={"backend": keyring.backends.fail.Keyring()})
+        for name in providers
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert {name: load_key(tmp_path, name, backend=MemoryKeyring()) for name in providers} == {
+        name: f"sk-{name}" for name in providers
+    }
