@@ -33,4 +33,7 @@ app = BUNDLE(
     name="AAB Research.app",
     bundle_identifier="io.github.researchatlas.aab-research",
     version=tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"],
+    # The highest minimum among the bundled binaries (sqlite-vec's library); build_app.sh
+    # checks that none needs a later macOS.
+    info_plist={"LSMinimumSystemVersion": "14.0"},
 )

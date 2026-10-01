@@ -30,6 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # In a .app, PyInstaller puts binaries in Contents/Frameworks and data files in
 # Contents/Resources, and links each folder's entries from the other.
 CONTENTS = ("Contents/Frameworks", "Contents/Resources")
+# PyInstaller's stand-in for a dot in a folder name under Contents/Frameworks, which codesign
+# allows only for frameworks (PyInstaller.building.osx.DOT_REPLACEMENT)
+DOT = "__dot__"
 LICENSES = "Contents/Resources/licenses"  # license texts ship in <LICENSES>/<component>/
 # The llama.cpp helper: build_app.sh puts the server beside the app's executable and the
 # libraries it links in their own Frameworks folder.
@@ -304,7 +307,8 @@ def _inner(rel: str) -> str | None:
     """A file's path inside PyInstaller's contents folders, or None if outside them."""
     for folder in CONTENTS:
         if rel.startswith(folder + "/"):
-            return rel[len(folder) + 1:]
+            *folders, name = rel[len(folder) + 1:].split("/")
+            return "/".join([*(f.replace(DOT, ".") for f in folders), name])
     return None
 
 

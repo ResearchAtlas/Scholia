@@ -40,6 +40,16 @@ codesign --force --sign - "$app/Contents/MacOS/llama-server"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
+# No binary may need a later macOS than the app declares.
+minimum=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$app/Contents/Info.plist")
+find "$app" -type f -print0 | while IFS= read -r -d "" file; do
+  minos=$(vtool -arch arm64 -show-build "$file" 2>/dev/null | awk '$1 == "minos" {print $2}' || true)
+  if [ -n "$minos" ] && [ "$(printf '%s\n' "$minos" "$minimum" | sort -V | tail -1)" != "$minimum" ]; then
+    echo "$file needs macOS $minos, later than the declared $minimum" >&2
+    exit 1
+  fi
+done
+
 # The disk image: the app and a link to Applications.
 rm -rf build/dmg build/AAB-Research.dmg && mkdir build/dmg
 ditto "$app" "build/dmg/AAB Research.app"

@@ -40,7 +40,9 @@ EMBEDDING_MODEL = {
     "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/"
     "370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf",
 }
-HELPER_START_SECONDS = 30
+# A bound for a cold start, not the app's start deadline, which is a separate setting: the
+# first start on a CI runner's virtual GPU spent about 35 s preparing Metal before the model loaded.
+HELPER_START_SECONDS = 120
 # Per helper process: context, physical batch and slots.
 HELPER_LIMITS = ["-c", "4096", "-ub", "2048", "-np", "2"]
 LISTENING = re.compile(r"listening on http://127\.0\.0\.1:(\d+)")

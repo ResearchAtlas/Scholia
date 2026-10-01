@@ -6,7 +6,7 @@ import pytest
 
 from tools import license_audit as la
 
-DYNLOAD = "Contents/Frameworks/python3.13/lib-dynload"
+DYNLOAD = "Contents/Frameworks/python3__dot__13/lib-dynload"  # as PyInstaller lays it out
 MACHO = b"\xcf\xfa\xed\xfe" + bytes(28)
 
 
@@ -328,3 +328,13 @@ def test_reviewed_licenses_and_supplied_notices():
     assert [p.read_bytes() for p in cocoa] == [
         (la.ROOT / "tools/notices/pyobjc/License.txt").read_bytes()
     ]
+
+
+def test_pyinstallers_stand_in_for_dots_in_folder_names():
+    from PyInstaller.building.osx import DOT_REPLACEMENT
+
+    assert la.DOT == DOT_REPLACEMENT
+    assert la._inner("Contents/Frameworks/python3__dot__13/lib-dynload/_json.so") == (
+        "python3.13/lib-dynload/_json.so"
+    )
+    assert la._inner("Contents/Frameworks/a/b__dot__c.dylib") == "a/b__dot__c.dylib"
