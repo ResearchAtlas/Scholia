@@ -12,7 +12,6 @@ import threading
 from pathlib import Path
 
 import keyring
-from keyring.errors import KeyringError
 
 from backend.settings import write_private
 
@@ -74,7 +73,7 @@ def save_key(data_root, provider, key, backend=None):
             try:
                 store.set_password(SERVICE, provider, key)
                 stored = store.get_password(SERVICE, provider) == key  # some stores drop keys silently
-            except KeyringError:
+            except Exception:  # any ordinary failure means the store is unavailable; interrupts propagate
                 pass
         if stored:
             try:
@@ -102,6 +101,6 @@ def load_key(data_root, provider, backend=None):
         store = _store(backend)
         try:
             key = store.get_password(SERVICE, provider) if store is not None else None
-        except KeyringError:
+        except Exception:  # any ordinary failure means the store is unavailable; interrupts propagate
             key = None
     return key if isinstance(key, str) else None

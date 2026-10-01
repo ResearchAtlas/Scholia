@@ -218,3 +218,40 @@ def test_concurrent_fallback_saves_keep_every_key(tmp_path, monkeypatch):
     assert {name: load_key(tmp_path, name, backend=MemoryKeyring()) for name in providers} == {
         name: f"sk-{name}" for name in providers
     }
+
+
+class FailingKeyring:
+    """A store whose calls fail with an ordinary error, as a native or plugin backend can."""
+
+    def __init__(self, error, on_get=True, on_set=True):
+        self.error, self.on_get, self.on_set, self.items = error, on_get, on_set, {}
+
+    def get_password(self, service, username):
+        if self.on_get:
+            raise self.error
+        return self.items.get((service, username))
+
+    def set_password(self, service, username, password):
+        if self.on_set:
+            raise self.error
+        self.items[(service, username)] = password
+
+
+@pytest.mark.parametrize("store", [
+    FailingKeyring(OSError("native failure")),
+    FailingKeyring(RuntimeError("plugin failure"), on_get=True, on_set=False),  # fails verifying
+])
+def test_ordinary_store_errors_fall_back_to_the_file(tmp_path, store):
+    assert save_key(tmp_path, "openrouter", KEY, backend=store)  # a warning: the file was used
+    assert files_containing(tmp_path, KEY) == ["credentials.json"]
+    assert load_key(tmp_path, "openrouter", backend=store) == KEY
+    assert load_key(tmp_path, "other", backend=store) is None
+
+
+@pytest.mark.parametrize("stop", [KeyboardInterrupt, SystemExit])
+def test_interrupts_from_the_store_are_not_swallowed(tmp_path, stop):
+    with pytest.raises(stop):
+        save_key(tmp_path, "openrouter", KEY, backend=FailingKeyring(stop()))
+    with pytest.raises(stop):
+        load_key(tmp_path, "openrouter", backend=FailingKeyring(stop()))
+    assert list(tmp_path.iterdir()) == []
