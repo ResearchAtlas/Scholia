@@ -85,10 +85,10 @@ def test_unparseable_file_gives_defaults_with_line(tmp_path):
 
 
 def test_unknown_keys_load_without_warning(tmp_path):
-    (tmp_path / "config.toml").write_text('[zotero]\nenabled = true\n[ui]\nfuture_option = 1\n')
+    (tmp_path / "config.toml").write_text('[future]\nenabled = true\n[ui]\nfuture_option = 1\n')
     loaded = load_settings(tmp_path)
     assert loaded.warnings == []
-    assert "zotero" not in loaded.values
+    assert "future" not in loaded.values and "future_option" not in loaded.values["ui"]
 
 
 def write_project_file(root, text, project_id="p1"):
@@ -348,3 +348,111 @@ def test_unreadable_files_never_stop_loading(tmp_path):
     assert text == "" and len(warnings) == 1 and "could not be read" in warnings[0]
     with pytest.raises(OSError):
         loaded.save({"ui.language": "en"})
+
+
+def test_empty_table_where_a_value_belongs_falls_back(tmp_path):
+    (tmp_path / "config.toml").write_text("[ui.language]\n[subagents.models]\n[ui.layout]\n[providers.openrouter]\n")
+    loaded = load_settings(tmp_path)
+    assert loaded.values["ui"]["language"] == "system"
+    assert loaded.values["subagents"]["models"] == []
+    assert loaded.values["ui"]["layout"]["sidebar_width"] == 248  # an empty table where a table belongs is fine
+    assert loaded.values["providers"] == {"openrouter": {}}
+    assert [w.split(";")[0] for w in loaded.warnings] == [
+        "config.toml line 1: ui.language is not valid",
+        "config.toml line 2: subagents.models is not valid",
+    ]
+
+
+@pytest.mark.parametrize("project_id, updates", [
+    (None, {"integrations": [{"api_key": "sk-test"}]}),
+    (None, {"zotero": {"accounts": [{"name": "x", "token": "sk-test"}]}}),
+    (None, {"keys.openrouter": "sk-test"}),
+    ("p1", {"keys.openrouter": "sk-test"}),
+    ("p1", {"keys": {}}),
+    ("p1", {"mcp_server": {"servers": [{"env": {"GITHUB_TOKEN": "sk-test"}}]}}),
+])
+def test_save_refuses_secrets_at_any_depth(tmp_path, project_id, updates):
+    loaded = load_settings(tmp_path, project_id)
+    with pytest.raises(ValueError) as error:
+        loaded.save(updates)
+    assert "sk-test" not in str(error.value)
+    assert not loaded.path.exists()
+
+
+def test_hand_written_secrets_are_ignored_but_kept(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[zotero]\nenabled = true\napi_key = "sk-hand"\n[[integrations]]\ntoken = "sk-hand"\n')
+    loaded = load_settings(tmp_path)
+    assert loaded.values["zotero"] == {"enabled": True}
+    assert [w.split(";")[0] for w in loaded.warnings] == [
+        "config.toml line 3: zotero.api_key looks like a secret",
+        "config.toml line 4: integrations looks like a secret",
+    ]
+    loaded.save({"ui.language": "en"})
+    assert path.read_text().count("sk-hand") == 2  # the researcher's own text is never deleted
+
+
+def test_dict_updates_apply_leaf_by_leaf(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('# mine\n[ui]\nlanguage = "en"  # note\nfollow_up = "queue"\ncustom = 1\n')
+    load_settings(tmp_path).save({"ui": {"follow_up": "steer", "layout": {"sidebar_open": False}}})
+    assert path.read_text() == (
+        '# mine\n[ui]\nlanguage = "en"  # note\nfollow_up = "steer"\ncustom = 1\n'
+        "\n[ui.layout]\nsidebar_open = false\n"
+    )
+
+
+def test_sections_without_a_defined_shape_are_exposed_as_given(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        '[zotero]\nenabled = true\nlibrary = 12\n[discovery]\nsources = ["openalex"]\n'
+        "[extensions.aab-cite]\nstyle = { name = \"apa\" }\n[mcp]\nenabled = [\"x\"]\n"
+    )
+    write_project_file(tmp_path, '[mcp]\nenabled = ["files"]\n[mcp_server]\nexpose = true\n[zotero]\nenabled = true\n')
+    personal = load_settings(tmp_path)
+    assert personal.warnings == []
+    assert personal.values["zotero"] == {"enabled": True, "library": 12}
+    assert personal.values["discovery"] == {"sources": ["openalex"]}
+    assert personal.values["extensions"] == {"aab-cite": {"style": {"name": "apa"}}}
+    assert "mcp" not in personal.values  # a project section
+    project = load_settings(tmp_path, "p1")
+    assert project.values["mcp"] == {"enabled": ["files"]}
+    assert project.values["mcp_server"] == {"expose": True}
+    assert "zotero" not in project.values  # a personal section
+    personal.save({"zotero.library": 13, "extensions.aab-cite.style.name": "mla"})
+    assert load_settings(tmp_path).values["extensions"] == {"aab-cite": {"style": {"name": "mla"}}}
+    assert load_settings(tmp_path).values["zotero"]["library"] == 13
+
+
+def test_out_of_range_numbers_fall_back(tmp_path):
+    huge = "9" * 400
+    (tmp_path / "config.toml").write_text(f"[budget]\nconversation_usd = {huge}\n[limits]\nagent_steps = {huge}\n")
+    loaded = load_settings(tmp_path)
+    assert loaded.values["budget"]["conversation_usd"] == 10
+    assert loaded.values["limits"]["agent_steps"] == 12
+    assert [w.split(";")[0] for w in loaded.warnings] == [
+        "config.toml line 2: budget.conversation_usd is not valid",
+        "config.toml line 4: limits.agent_steps is not valid",
+    ]
+    with pytest.raises(ValueError):
+        loaded.save({"limits.agent_steps": 2**63})
+
+
+def test_warning_lines_decode_quoted_keys(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        "[models.efforts]\n"
+        'ok = "high"\n'
+        '"a\\"b.c" = 3\n'
+        '"x\\u0041" = 4\n'
+        "'lit.eral' = 5\n"
+        '"has = sign" = 6\n'
+        '[providers."we\\"ird"]\n'
+        "default_window = 1\n"
+    )
+    loaded = load_settings(tmp_path)
+    assert [w.split(";")[0] for w in loaded.warnings] == [
+        'config.toml line 3: models.efforts.a"b.c is not valid',
+        "config.toml line 4: models.efforts.xA is not valid",
+        "config.toml line 5: models.efforts.lit.eral is not valid",
+        "config.toml line 6: models.efforts.has = sign is not valid",
+        'config.toml line 8: providers.we"ird.default_window is not valid',
+    ]

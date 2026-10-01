@@ -19,12 +19,15 @@ from pathlib import Path
 import tomlkit
 
 
+_INT64 = range(-2**63, 2**63)  # TOML integers are 64-bit; tomlkit reads larger ones too
+
+
 def _int(low, high=None):
-    return lambda v: type(v) is int and v >= low and (high is None or v <= high)
+    return lambda v: type(v) is int and v in _INT64 and v >= low and (high is None or v <= high)
 
 
 def _number(above, below=None):
-    return lambda v: (type(v) in (int, float) and math.isfinite(v)
+    return lambda v: (((type(v) is int and v in _INT64) or (type(v) is float and math.isfinite(v)))
                       and v > above and (below is None or v < below))
 
 
@@ -117,6 +120,10 @@ PERSONAL = {
     **{("limits", k): spec for k, spec in _LIMITS.items()},
     **{("context", k): spec for k, spec in _CONTEXT.items()},
     **{("retrieval", k): spec for k, spec in _RETRIEVAL.items()},
+    # No defined shape yet: returned as given. "**" matches the rest of the path.
+    ("zotero", "**"): (None, None),
+    ("discovery", "**"): (None, None),
+    ("extensions", "*", "**"): (None, None),  # each extension's schema validates its own table
 }
 
 PROJECT = {
@@ -128,6 +135,8 @@ PROJECT = {
     ("memory", "enabled"): (None, _flag),
     **{("tools", k): (None, _texts()) for k in ("allow", "ask", "deny")},
     ("extensions", "enabled"): (None, _texts()),
+    ("mcp", "**"): (None, None),
+    ("mcp_server", "**"): (None, None),
 }
 
 
@@ -203,18 +212,20 @@ class Settings:
             doc = tomlkit.parse(raw.decode("utf-8")) if raw else tomlkit.document()
             for dotted, value in updates.items():
                 path = _split_key(dotted)
-                for leaf, leaf_value in list(_leaves({path[-1]: value}, path[:-1])) or [(path, value)]:
+                # A dict is applied leaf by leaf, so the rest of an existing table and its comments stay.
+                for leaf, leaf_value in _leaves({path[-1]: value}, path[:-1]):
                     pattern, problem = _check(self.schema, leaf, leaf_value)
                     if problem:
                         raise ValueError(f"{'.'.join(leaf[:len(pattern)])} {problem}")
-                node = doc
-                for part in path[:-1]:
-                    if part not in node:
-                        node[part] = tomlkit.table()
-                    node = node[part]
-                    if not isinstance(node, dict):
-                        raise ValueError(f"{dotted}: {part} is not a table in {self.label}")
-                node[path[-1]] = value
+                    node = doc
+                    for part in leaf if isinstance(leaf_value, dict) else leaf[:-1]:
+                        if part not in node:
+                            node[part] = tomlkit.table()
+                        node = node[part]
+                        if not isinstance(node, dict):
+                            raise ValueError(f"{dotted}: {part} is not a table in {self.label}")
+                    if not isinstance(leaf_value, dict):
+                        node[leaf[-1]] = leaf_value
             data = doc.as_string().encode("utf-8")
             write_private(self.path, data)
             _parse(self, data)
@@ -243,28 +254,41 @@ def _read(path):
 
 
 def _leaves(node, prefix=()):
-    """Yield (key path, value) for every non-table value under node."""
+    """Yield (key path, value) for every non-table value and every empty table under node."""
     for key, value in node.items():
-        if isinstance(value, dict):
+        if isinstance(value, dict) and value:
             yield from _leaves(value, prefix + (key,))
         else:
             yield prefix + (key,), value
 
 
 def _match(schema, path):
-    """The schema entry for path, or a problem when the file's shape disagrees with the schema."""
+    """Return (pattern, spec) for path; the spec's check also catches a wrong shape."""
     for pattern, spec in schema.items():
-        n = min(len(pattern), len(path))
-        if all(p in ("*", k) for p, k in zip(pattern, path)):
+        if pattern[-1] == "**":
+            head = pattern[:-1]
+            if len(path) >= len(head) and all(p in ("*", k) for p, k in zip(head, path)):
+                return path, (None, lambda v: True)
+        elif all(p in ("*", k) for p, k in zip(pattern, path)):
             if len(pattern) == len(path):
                 return pattern, spec
-            # A table where a value belongs, or a value where a table belongs.
-            return pattern[:n], (None, lambda v: False)
+            if len(pattern) > len(path):  # an empty table where a table belongs is fine
+                return path, (None, lambda v: isinstance(v, dict))
+            return pattern, (None, lambda v: False)  # a table where a value belongs
     return None, None
 
 
 # Names that hold secrets; keys live in the credential store, never in config.toml.
-_SECRET = re.compile(r"(^|[_-])(api_?key|key|token|secret|password)$", re.IGNORECASE)
+_SECRET = re.compile(r"(^|[_-])(api_?keys?|keys?|token|secret|password)$", re.IGNORECASE)
+
+
+def _hides_secret(value):
+    """True if a list or table value holds a secret-like name at any depth."""
+    if isinstance(value, dict):
+        return any(_SECRET.search(str(k)) or _hides_secret(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_hides_secret(v) for v in value)
+    return False
 
 
 def _check(schema, path, value):
@@ -273,9 +297,11 @@ def _check(schema, path, value):
     pattern is the schema entry that path falls under (None for unknown keys),
     and problem says why the value cannot be used (None when it can).
     """
-    if schema is PROJECT and path[0] in ("providers", "subagents"):
+    # Secrets a researcher wrote by hand are ignored, with a warning, but kept in the
+    # file on save like any other content of theirs; only the app's own writes are refused.
+    if schema is PROJECT and path[0] in ("providers", "keys", "subagents"):
         return path, "is a personal setting and cannot be set in a project file"
-    if any(_SECRET.search(part) for part in path):
+    if any(_SECRET.search(part) for part in path) or _hides_secret(value):
         return path, "looks like a secret; keys belong in the credential store"
     pattern, spec = _match(schema, path)
     if spec is not None and not spec[1](value):
@@ -283,12 +309,21 @@ def _check(schema, path, value):
     return pattern, None
 
 
-_KEY_PART = re.compile(r'"((?:[^"\\]|\\.)*)"|\'([^\']*)\'|([^.\s]+)')
-_HEADER = re.compile(r"""\[\[?\s*((?:"[^"]*"|'[^']*'|[^\]"'])*)\]""")
+_QUOTED = r"""(?:"(?:[^"\\]|\\.)*"|'[^']*')"""
+_HEADER = re.compile(rf"\[\[?((?:{_QUOTED}|[^\]\"'])*)\]")
+_KEY = re.compile(rf"((?:{_QUOTED}|[^=#\"'])+)=")
 
 
 def _split_key(key):
-    return tuple(a or b or c for a, b, c in _KEY_PART.findall(key))
+    """Decode a dotted key, quoted parts and escapes included, exactly as tomlkit does.
+
+    Raises ValueError (tomlkit's ParseError) for text that is not a TOML key.
+    """
+    node, path = tomlkit.parse(f"{key} = 0").unwrap(), ()
+    while isinstance(node, dict):  # one name per level
+        (part, node), = node.items()
+        path += (part,)
+    return path
 
 
 def _scan_value(text, open_quote, depth):
@@ -334,14 +369,16 @@ def _key_lines(text):
             open_quote, depth = _scan_value(line, open_quote, depth)
             continue
         stripped = line.strip()
-        header = _HEADER.match(stripped)
-        if header:
-            table = _split_key(header.group(1))
-            lines.setdefault(table, number)
-        elif "=" in stripped and not stripped.startswith("#"):
-            key, _, rest = stripped.partition("=")
-            lines.setdefault(table + _split_key(key), number)
-            open_quote, depth = _scan_value(rest, None, 0)
+        header, key = _HEADER.match(stripped), _KEY.match(stripped)
+        try:
+            if header:
+                table = _split_key(header.group(1))
+                lines.setdefault(table, number)
+            elif key:
+                lines.setdefault(table + _split_key(key.group(1)), number)
+                open_quote, depth = _scan_value(stripped[key.end():], None, 0)
+        except ValueError:
+            continue  # not a key after all; its warnings fall back to the enclosing table's line
     return lines
 
 
@@ -383,7 +420,10 @@ def _parse(settings, raw):
             node = settings.values
             for part in path[:-1]:
                 node = node.setdefault(part, {})
-            node[path[-1]] = value
+            if isinstance(value, dict):  # an empty table: keep any defaults under it
+                node.setdefault(path[-1], {})
+            else:
+                node[path[-1]] = value
 
 
 def _project_folder(data_root, project_id):
