@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A minimal author-date style for the citeproc.wasm spike. -->
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <title>Scholia spike</title>
+    <id>scholia-spike</id>
+    <updated>2026-10-02T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout prefix="(" suffix=")" delimiter="; ">
+      <names variable="author"><name form="short"/></names>
+      <date variable="issued" prefix=" "><date-part name="year"/></date>
+    </layout>
+  </citation>
+  <bibliography>
+    <sort><key variable="title"/></sort>
+    <layout>
+      <names variable="author" suffix=". "><name/></names>
+      <date variable="issued" suffix=". "><date-part name="year"/></date>
+      <text variable="title"/>
+    </layout>
+  </bibliography>
+</style>

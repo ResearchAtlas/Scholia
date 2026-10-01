@@ -114,10 +114,27 @@ jobs:
           codesign --verify --deep --strict "build/mnt/AAB Research.app"
           codesign -dv "build/mnt/AAB Research.app" 2>&1 | grep -x "Signature=adhoc"
           codesign -dv "build/mnt/AAB Research.app/Contents/MacOS/llama-server" 2>&1 | grep -x "Signature=adhoc"
+      - name: Helper diagnostics (temporary)
+        run: |
+          helper="build/mnt/AAB Research.app/Contents/MacOS/llama-server"
+          for extra in "" "--device none"; do
+            echo "=== $extra"
+            LLAMA_API_KEY=x "$helper" -m build/models/Qwen3-Embedding-0.6B-Q8_0.gguf --offline \
+              --host 127.0.0.1 --port 0 --no-webui --embedding --pooling last -c 4096 -ub 2048 -np 2 \
+              $extra > build/helper.log 2>&1 &
+            pid=$!
+            for i in $(seq 1 90); do
+              grep -q "listening on" build/helper.log && { echo "ready after ${i}s"; break; }
+              sleep 1
+            done
+            kill $pid || true; wait $pid || true
+            cat build/helper.log
+          done
       - name: Self-test the app inside the DMG
         env:
           EXPECTED_PYTHON: ${{ steps.python.outputs.python-version }}
         run: |
+          set -o pipefail
           "build/mnt/AAB Research.app/Contents/MacOS/AAB Research" --self-test \
             --model build/models/Qwen3-Embedding-0.6B-Q8_0.gguf | tee build/self-test.json
           uv run --no-sync python - build/self-test.json <<'EOF'
