@@ -14,6 +14,8 @@ import httpx
 import pytest
 
 from backend.db import Database, new_id
+from backend.db.content import ContentStore
+from backend.db.deletion import delete
 from backend.outbound_gate import GateInputs, OutboundDenied, OutboundGate
 
 OPENROUTER_API = "https://openrouter.ai/api/v1"
@@ -254,6 +256,19 @@ def test_local_only_needs_the_researchers_approval_for_outside_sources(db, remot
         refused(client, *KINDS["model_download"][:2], "not_allowed_at_level")
         refused(client, "POST", CHAT, "not_allowed_at_level", json=chat(), headers=AUTH)
     assert len(remote.received) == 2
+
+
+def test_a_deleted_project_is_refused_and_its_audit_rows_remain(db, remote, setup):
+    project_id = project(db)
+    candidate_id = candidate(db, project_id)
+    with setup.gate.client(project_id, candidate_id=candidate_id) as client:
+        client.get(OA_LINK)
+        delete(db, ContentStore(db), "project", project_id)
+        refused(client, "GET", OA_LINK, "unknown_project")
+        refused(client, "GET", f"{HELPER}/health", "unknown_project")
+    assert len(remote.received) == 1
+    assert [(row_project, row["decision"], row["reason"]) for row_project, row in audit(db)] == [
+        (project_id, "allow", None), (project_id, "deny", "unknown_project"), (project_id, "deny", "unknown_project")]
 
 
 def test_tightening_a_project_applies_to_the_next_request(db, remote, setup):

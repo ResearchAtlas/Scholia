@@ -151,16 +151,18 @@ class OutboundGate:
         fetch. approved means the researcher approved these requests, which Local
         only projects need for scholarly APIs and open-access hosts. options are
         limited to base_url, follow_redirects, headers, max_redirects and timeout.
+        Proxy and certificate settings in the environment are ignored: TLS uses
+        certifi's CA bundle.
         """
         transport = _Transport(self, _Scope(project_id, candidate_id, approved),
-                               self._transport or httpx.HTTPTransport())
+                               self._transport or httpx.HTTPTransport(trust_env=False))
         return httpx.Client(transport=transport, trust_env=False, **_checked(options))
 
     def async_client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
                      **options) -> httpx.AsyncClient:
         """The async form of client()."""
         transport = _AsyncTransport(self, _Scope(project_id, candidate_id, approved),
-                                    self._transport or httpx.AsyncHTTPTransport())
+                                    self._transport or httpx.AsyncHTTPTransport(trust_env=False))
         return httpx.AsyncClient(transport=transport, trust_env=False, **_checked(options))
 
     def _check(self, request: httpx.Request, scope: _Scope) -> None:

@@ -202,6 +202,25 @@ def test_proxy_settings_in_the_environment_are_ignored(db, stack, monkeypatch):
     assert proxy_received == []
 
 
+def test_certificate_settings_in_the_environment_are_ignored(db, stack, monkeypatch):
+    helper, received = server(stack)
+    monkeypatch.setenv("SSL_CERT_FILE", "/nonexistent/scholia-test-ca.pem")
+    monkeypatch.setenv("SSL_CERT_DIR", "/nonexistent/scholia-test-certs")
+    with pytest.raises(OSError):  # the premise: httpx's default transport reads them
+        httpx.HTTPTransport()
+    gate = gate_for(db, helper_url=helper)
+    project_id = project(db, "normal")
+    with gate.client(project_id) as client:
+        client.get(f"{helper}/health")
+
+    async def fetch():
+        async with gate.async_client(project_id) as client:
+            await client.get(f"{helper}/health")
+
+    asyncio.run(fetch())
+    assert received == [("GET", "/health"), ("GET", "/health")]
+
+
 @pytest.mark.asyncio
 async def test_async_client_over_real_sockets(db, stack):
     base, received = server(stack)
