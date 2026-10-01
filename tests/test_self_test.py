@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import queue
 import sys
 from http.server import BaseHTTPRequestHandler
@@ -57,7 +58,7 @@ def test_helper_that_exits_or_stays_silent_is_not_ready():
         st.wait_for_port(_lines("loading\n"), [], st.time.monotonic() + 0.1)
 
 
-def _helper_stub(key):
+def _helper_stub(key, vector=(0.5,) * 4):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -65,7 +66,7 @@ def _helper_stub(key):
                 self.send_response(401)
                 self.end_headers()
                 return
-            data = json.dumps({"data": [{"embedding": [0.5] * 4, "input": body["input"]}]}).encode()
+            data = json.dumps({"data": [{"embedding": list(vector), "input": body["input"]}]}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -127,3 +128,28 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
 def test_self_test_mode_is_required():
     with pytest.raises(SystemExit):
         st.main(["--model", "m.gguf"])
+
+
+UNIT = [1 / math.sqrt(st.DIMENSIONS)] * st.DIMENSIONS
+
+
+@pytest.mark.parametrize(
+    "vector, error",
+    [
+        ([0.0] * st.DIMENSIONS, "norm is 0.0000"),  # a model that did not run
+        ([0.5] * st.DIMENSIONS, "norm is 16.0000"),  # not normalized
+        (UNIT[:-1], "1023 values"),
+        ([float("nan")] + UNIT[1:], "finite"),
+    ],
+)
+def test_helper_embeddings_must_be_unit_vectors(vector, error):
+    with mock_http_server(_helper_stub("k1", vector)) as url:
+        returned = st.embed(int(url.rsplit(":", 1)[1]), "k1", "text")
+    with pytest.raises(RuntimeError, match=error):
+        st.verify_embedding(returned)
+
+
+def test_a_unit_embedding_passes():
+    with mock_http_server(_helper_stub("k1", UNIT)) as url:
+        returned = st.embed(int(url.rsplit(":", 1)[1]), "k1", "text")
+    assert st.verify_embedding(returned) == pytest.approx(1.0)

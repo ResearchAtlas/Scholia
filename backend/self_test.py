@@ -179,6 +179,20 @@ def embed(port: int, key: str | None, text: str) -> list[float]:
         return json.load(response)["data"][0]["embedding"]
 
 
+def verify_embedding(vector: list[float]) -> float:
+    """The vector's norm, or an error unless it is a unit vector of DIMENSIONS finite values.
+
+    The helper's OpenAI-style endpoint returns normalized embeddings, so a zero or
+    non-unit vector means the model did not run as expected.
+    """
+    if len(vector) != DIMENSIONS or not all(math.isfinite(x) for x in vector):
+        raise RuntimeError(f"embedding has {len(vector)} values, expected {DIMENSIONS} finite")
+    norm = math.sqrt(sum(x * x for x in vector))
+    if abs(norm - 1) > 0.01:
+        raise RuntimeError(f"embedding norm is {norm:.4f}, expected 1")
+    return norm
+
+
 def refused_without_key(port: int) -> bool:
     try:
         embed(port, None, "no key")
@@ -209,9 +223,7 @@ def check_embedding(helper: Path, model: Path) -> dict:
         port = wait_for_port(lines, log, started + HELPER_START_SECONDS)
         ready = time.monotonic() - started
         vector = embed(port, key, "Scholia 学术 self-test")
-        if len(vector) != DIMENSIONS or not all(math.isfinite(x) for x in vector):
-            raise RuntimeError(f"embedding has {len(vector)} values, expected {DIMENSIONS} finite")
-        norm = math.sqrt(sum(x * x for x in vector))
+        norm = verify_embedding(vector)
         if not refused_without_key(port):
             raise RuntimeError("the helper answered a request without the API key")
         return {"dimensions": len(vector), "norm": round(norm, 4), "ready_seconds": round(ready, 2)}
