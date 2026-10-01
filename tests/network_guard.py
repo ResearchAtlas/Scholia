@@ -7,12 +7,17 @@ servers a test starts in this process and registers with `register_server`, for
 as long as they stay open. Name lookups resolve loopback names only. Provider
 keys and proxy settings are removed from the environment.
 
-Limits: this guards the Python socket API in the test process. uvloop, whose
-native event loop opens its own sockets, cannot be imported. Code that calls the
-private C base class `_socket.socket` directly, other C extensions with their own
-networking, and subprocesses a test starts are not covered; tests must not use them.
+The checks run in a CPython audit hook, which the interpreter calls from inside
+its C socket code for every connect, connect_ex, sendto, sendmsg and name lookup,
+whichever Python class made the socket.
+
+Limits: uvloop, whose native event loop opens sockets without these audit events,
+is refused (the session fails if it was loaded first). Other C extensions with
+their own networking, and subprocesses a test starts, are not covered; tests must
+not use them.
 """
 
+import asyncio
 import os
 import socket
 import sys
@@ -34,20 +39,17 @@ class NetworkBlocked(RuntimeError):
 
 _LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
 _INET = (socket.AF_INET, socket.AF_INET6)
+_SEND_EVENTS = {"socket.connect", "socket.sendto", "socket.sendmsg"}
+_LOOKUP_EVENTS = {
+    "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr", "socket.getnameinfo",
+}
 # endpoint -> the registered listening socket; allowed only while it stays open,
 # and only for client sockets of the same family and type
 _allowed: dict[tuple[str, int], weakref.ref] = {}
 _listening: weakref.WeakSet = weakref.WeakSet()  # sockets that listen() in this process
 _lock = threading.Lock()
-
-_real = {
-    name: getattr(socket.socket, name)
-    for name in ("listen", "connect", "connect_ex", "sendto", "sendmsg")
-}
-_real_lookups = {
-    name: getattr(socket, name)
-    for name in ("getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr", "getnameinfo")
-}
+_installed = False
+_real_listen = socket.socket.listen
 
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_API_TOKEN", "_ACCESS_TOKEN", "_SECRET_KEY")
 _PROXY_ENV = {
@@ -56,7 +58,7 @@ _PROXY_ENV = {
 }
 
 
-def _is_allowed(sock: socket.socket, address) -> bool:
+def _is_allowed(sock, address) -> bool:
     if sock.family not in _INET or sock.type != socket.SOCK_STREAM:
         return False
     if not (isinstance(address, tuple) and len(address) >= 2):
@@ -67,69 +69,45 @@ def _is_allowed(sock: socket.socket, address) -> bool:
     return server is not None and server.fileno() != -1 and server.family == sock.family
 
 
-def _check(sock: socket.socket, address) -> None:
-    if not _is_allowed(sock, address):
-        raise NetworkBlocked(f"test network block: connection to {address!r} refused")
-
-
-def _recording_listen(self, *args):
-    result = _real["listen"](self, *args)
-    with _lock:
-        _listening.add(self)
-    return result
-
-
-def _guarded_connect(self, address):
-    _check(self, address)
-    return _real["connect"](self, address)
-
-
-def _guarded_connect_ex(self, address):
-    _check(self, address)
-    return _real["connect_ex"](self, address)
-
-
-def _guarded_sendto(self, data, *args):
-    # sendto(data, address) or sendto(data, flags, address)
-    _check(self, args[-1])
-    return _real["sendto"](self, data, *args)
-
-
-def _guarded_sendmsg(self, buffers, ancdata=(), flags=0, address=None):
-    if address is None:
-        return _real["sendmsg"](self, buffers, ancdata, flags)
-    _check(self, address)
-    return _real["sendmsg"](self, buffers, ancdata, flags, address)
-
-
 def _require_loopback(name) -> None:
     text = name.decode() if isinstance(name, bytes) else name
     if text is not None and text not in _LOOPBACK_NAMES:
         raise NetworkBlocked(f"test network block: lookup of {text!r} refused")
 
 
-def _guarded_lookup(name):
-    real = _real_lookups[name]
-    if name == "getnameinfo":
-        def lookup(sockaddr, flags):
-            _require_loopback(sockaddr[0])
-            return real(sockaddr, flags)
-    else:
-        def lookup(host, *args, **kwargs):
-            _require_loopback(host)
-            return real(host, *args, **kwargs)
-    return lookup
+def _audit(event: str, args: tuple) -> None:
+    if event in _SEND_EVENTS:
+        sock, address = args
+        # sendmsg without an address sends on an already connected socket
+        if address is not None and not _is_allowed(sock, address):
+            raise NetworkBlocked(f"test network block: connection to {address!r} refused")
+    elif event in _LOOKUP_EVENTS:
+        _require_loopback(args[0][0] if event == "socket.getnameinfo" else args[0])
+
+
+def _recording_listen(self, *args):
+    result = _real_listen(self, *args)
+    with _lock:
+        _listening.add(self)
+    return result
+
+
+def _refuse_uvloop() -> None:
+    policy = asyncio.get_event_loop_policy()
+    if sys.modules.get("uvloop") is not None or type(policy).__module__.startswith("uvloop"):
+        raise RuntimeError(
+            "uvloop was loaded before the test network block; its native sockets bypass it"
+        )
+    sys.modules["uvloop"] = None  # makes `import uvloop` raise ImportError
 
 
 def install() -> None:
-    socket.socket.listen = _recording_listen
-    socket.socket.connect = _guarded_connect
-    socket.socket.connect_ex = _guarded_connect_ex
-    socket.socket.sendto = _guarded_sendto
-    socket.socket.sendmsg = _guarded_sendmsg
-    for name in _real_lookups:
-        setattr(socket, name, _guarded_lookup(name))
-    sys.modules["uvloop"] = None  # makes `import uvloop` raise ImportError
+    global _installed
+    _refuse_uvloop()
+    if not _installed:  # audit hooks cannot be removed, so add it once
+        sys.addaudithook(_audit)
+        socket.socket.listen = _recording_listen
+        _installed = True
 
 
 def register_server(sock: socket.socket) -> tuple[str, int]:

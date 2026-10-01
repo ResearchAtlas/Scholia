@@ -1,10 +1,14 @@
+import asyncio
 import os
 import socket
+import sys
+import types
 from http.server import BaseHTTPRequestHandler
 
 import httpx
 import pytest
 
+import network_guard
 from network_guard import NetworkBlocked, mock_http_server, register_server
 
 PROVIDER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -35,6 +39,16 @@ def test_unregistered_local_port_is_refused(local_listener):
         sock.connect_ex(("127.0.0.1", local_listener))
     with pytest.raises(NetworkBlocked):
         httpx.get(f"http://127.0.0.1:{local_listener}/")
+
+
+def test_raw_c_socket_class_is_guarded(local_listener):
+    # socket.SocketType is the C base class, below any Python-level patch.
+    sock = socket.SocketType()
+    try:
+        with pytest.raises(NetworkBlocked):
+            sock.connect(("127.0.0.1", local_listener))
+    finally:
+        sock.close()
 
 
 def test_provider_call_fails():
@@ -85,6 +99,19 @@ def test_uvloop_cannot_be_imported():
         import uvloop  # noqa: F401
 
 
+def test_uvloop_loaded_before_the_guard_fails_the_session(monkeypatch):
+    monkeypatch.setitem(sys.modules, "uvloop", types.ModuleType("uvloop"))
+    with pytest.raises(RuntimeError, match="uvloop"):
+        network_guard.install()
+
+
+def test_uvloop_policy_set_before_the_guard_fails_the_session(monkeypatch):
+    policy = type("EventLoopPolicy", (asyncio.DefaultEventLoopPolicy,), {"__module__": "uvloop"})()
+    monkeypatch.setattr(asyncio, "get_event_loop_policy", lambda: policy)
+    with pytest.raises(RuntimeError, match="uvloop"):
+        network_guard.install()
+
+
 def test_udp_send_is_refused():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         with pytest.raises(NetworkBlocked):
@@ -93,9 +120,10 @@ def test_udp_send_is_refused():
             sock.sendmsg([b"x"], [], 0, ("127.0.0.1", 53))
 
 
-def test_unix_socket_connect_is_refused(tmp_path):
+def test_unix_socket_connect_is_refused():
+    # A short relative path: macOS limits AF_UNIX paths to 104 bytes.
     with socket.socket(socket.AF_UNIX) as sock, pytest.raises(NetworkBlocked):
-        sock.connect(str(tmp_path / "proxy.sock"))
+        sock.connect("proxy.sock")
 
 
 def test_registered_mock_server_is_reachable():
