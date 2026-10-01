@@ -511,6 +511,7 @@ def test_save_refuses_scalars_at_open_section_roots(tmp_path, project_id, update
 @pytest.mark.parametrize("name", [
     "AUTHORIZATION", "auth", "basic-auth", "Bearer", "cookie", "session.cookies", "credential", "credentials",
     "passphrase", "private_key", "Private-Key", "access_key", "client_secret", "apiKey", "accessToken", "passwd",
+    "tokens", "passphrases", "authorizations", "bearers",
 ])
 def test_credential_field_names_are_secrets(tmp_path, name):
     key = ".".join(f'"{part}"' for part in name.split("."))
@@ -689,3 +690,14 @@ def test_recursion_anywhere_in_reading_falls_back(tmp_path, monkeypatch):
     assert loaded.warnings == ["config.toml: nested too deeply to read; using the defaults"]
     with pytest.raises(ValueError):
         loaded.save({"ui.language": "zh-CN"})
+
+
+@pytest.mark.parametrize("project_id, schema", [(None, settings.PERSONAL), ("p1", settings.PROJECT)])
+def test_every_known_setting_can_be_saved_at_its_default(tmp_path, project_id, schema):
+    # Guards the secret-name safeguard against catching the app's own setting names.
+    defaults = {".".join(path): default for path, (default, _) in schema.items()
+                if default is not None and "*" not in path and "**" not in path}
+    load_settings(tmp_path, project_id).save(defaults)
+    reread = load_settings(tmp_path, project_id)
+    assert reread.warnings == []
+    assert reread.values["context" if project_id is None else "project"]

@@ -71,7 +71,7 @@ _CONTEXT = {  # token budgets for a 128K window
     "history": (16000, _int(0)),
     "current_request": (8000, _int(0)),
     "conflicts": (500, _int(0)),
-    "output_tokens": (8000, _int(1024)),
+    "output_limit": (8000, _int(1024)),  # the step's output limit, in tokens
     "margin_percent": (5, _int(0, 100)),
     "compact_at_percent": (90, _int(1, 100)),
 }
@@ -289,8 +289,8 @@ def _match(schema, path):
 # ponytail: detection by name is a safeguard, not a guarantee; a secret under an
 # ordinary name passes.
 _SECRET = re.compile(
-    r"(^|[\s._-])(api_?keys?|keys?|token|secrets?|passwords?|passwd|passphrase|auth|authorization"
-    r"|bearer|cookies?|credentials?)$",
+    r"(^|[\s._-])(api_?key|key|token|secret|password|passwd|passphrase|auth|authorization"
+    r"|bearer|cookie|credential)s?$",  # each name, singular or plural
     re.IGNORECASE,
 )
 
