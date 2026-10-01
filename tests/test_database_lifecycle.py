@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -264,6 +265,46 @@ def test_two_instances_starting_on_a_new_data_folder_both_open_it(tmp_path):
         assert open_together(data) == []
         with Database(data) as db:
             assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects").fetchone()) == (1,)
+
+
+def hold_write_lock(path):
+    """A connection holding the write lock on path, as another instance's setup would."""
+    conn = sqlite3.connect(path, autocommit=True, check_same_thread=False)
+    conn.execute("BEGIN IMMEDIATE")
+    return conn
+
+
+def test_a_startup_waits_for_a_lock_held_while_it_switches_to_wal(tmp_path):
+    # Switching to WAL upgrades a read lock to a write lock, and SQLite reports busy
+    # for that at once, without calling the busy handler.
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / DB_NAME).touch()  # a new, empty file another instance is setting up
+    blocker = hold_write_lock(data / DB_NAME)
+    release = threading.Timer(0.3, blocker.execute, ("ROLLBACK",))
+    release.start()
+    try:
+        with Database(data) as db:
+            assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects").fetchone()) == (1,)
+    finally:
+        release.join()
+        blocker.close()
+
+
+def test_the_wal_switch_stops_waiting_after_the_busy_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(database_module, "BUSY_TIMEOUT_MS", 200)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / DB_NAME).touch()
+    blocker = hold_write_lock(data / DB_NAME)
+    try:
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            Database(data)
+        assert 0.2 <= time.monotonic() - started < 5
+    finally:
+        blocker.close()
+    assert (data / DB_NAME).stat().st_size == 0
 
 
 def test_the_startup_check_reads_the_file_header_in_one_snapshot(tmp_path, monkeypatch):
