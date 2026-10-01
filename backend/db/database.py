@@ -6,15 +6,18 @@ asyncio event loop; async code uses asyncio.to_thread.
 
 import asyncio
 import fcntl
+import json
 import os
 import shutil
 import sqlite3
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from backend import APP_VERSION
 from backend.db.migrations import MIGRATIONS
 
 DB_NAME = "aab.sqlite3"
@@ -62,7 +65,7 @@ class Database:
 
     Opening checks an existing file read-only (a newer schema is refused and
     quick_check must pass), then migrates it on the writer thread, taking a
-    backup before each migration of an existing database.
+    backup before each migration unless the database is new and empty.
     """
 
     def __init__(self, data_dir, *, migrations=MIGRATIONS):
@@ -75,13 +78,15 @@ class Database:
         self._readers = []
         self._readers_lock = threading.Lock()
         self._backup_lock = threading.Lock()
+        self._commit_lock = threading.Lock()  # orders the damaged flag with commits
         _mkdir_private(self.data_dir)
         if self.path.exists():  # refuse another app's, a newer or a damaged file before anything writes to it
             _open_checked(self.path, "quick_check", latest=len(migrations)).close()
         else:
-            # Created owner-only before SQLite opens it; the WAL and shared-memory
-            # files take this file's permissions.
-            os.close(os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+            # Created owner-only before SQLite opens it. SQLite gives the WAL and
+            # shared-memory files the database file's mode (and resets an empty
+            # one to it on every open), so they are owner-only too.
+            _create_private(self.path)
         self._writer = ThreadPoolExecutor(1, thread_name_prefix="aab-db-writer")
         try:
             self._writer_ident = self._writer.submit(self._open_writer, migrations).result()
@@ -161,7 +166,7 @@ class Database:
                 raise RuntimeError("the database could not switch to WAL mode")
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             for number in range(version + 1, len(migrations) + 1):
-                if number > 1:  # a new, empty database has nothing to back up
+                if conn.execute("SELECT 1 FROM sqlite_schema").fetchone():  # skip only a new, empty database
                     with self._backup_lock:
                         self._backup(datetime.now(UTC))
                 _migrate(conn, number, migrations[number - 1])
@@ -179,7 +184,10 @@ class Database:
         conn.execute("BEGIN IMMEDIATE")
         try:
             result = fn(conn)
-            conn.execute("COMMIT")
+            with self._commit_lock:  # damage found while fn ran stops this commit too
+                if self._damaged:
+                    raise DatabaseDamagedError(self._damaged)
+                conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -203,7 +211,8 @@ class Database:
         try:
             source = _open_checked(self.path, "integrity_check")
         except DatabaseDamagedError as error:
-            self._damaged = str(error)
+            with self._commit_lock:
+                self._damaged = str(error)
             raise
         try:
             stamp = now.strftime(_STAMP)
@@ -211,15 +220,22 @@ class Database:
             os.mkdir(tmp, 0o700)
             published = None
             try:
-                copy = tmp / DB_NAME
-                os.close(os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+                copy, info = tmp / DB_NAME, tmp / "backup.json"
+                _create_private(copy)
                 source.execute("VACUUM INTO ?", (str(copy),))
                 try:
-                    _open_checked(copy, "quick_check").close()
+                    check = _open_checked(copy, "quick_check")
                 except DatabaseDamagedError as error:
                     raise RuntimeError(f"the backup copy failed its check: {error}") from error
-                _fsync(copy)
-                _fsync(tmp)
+                with closing(check):
+                    schema_version = check.execute("PRAGMA user_version").fetchone()[0]
+                _create_private(info, json.dumps({
+                    "app_version": APP_VERSION,
+                    "schema_version": schema_version,
+                    "sqlite_version": sqlite3.sqlite_version,
+                }).encode())
+                for path in (copy, info, tmp):
+                    _fsync(path)
                 generation = daily / stamp
                 os.rename(tmp, generation)
                 published = generation
@@ -325,6 +341,12 @@ def _stamp_of(path):
         return datetime.strptime(path.name, _STAMP).replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def _create_private(path, content=b""):
+    """Create a new file owner-only (0600). Raises FileExistsError if it exists."""
+    with open(path, "xb", opener=lambda name, flags: os.open(name, flags, 0o600)) as file:
+        file.write(content)
 
 
 def _mkdir_private(path):

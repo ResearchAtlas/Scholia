@@ -135,6 +135,10 @@ def test_new_id_and_utc_now_match_the_schema(db):
             "INSERT INTO conversations (id, project_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (new_id(), general_id(conn), utc_now(), utc_now()),
         )
+        conn.execute(
+            "INSERT INTO conversations (id, project_id) VALUES ('0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e', ?)",
+            (general_id(conn),),
+        )
 
     db.write(insert)
 
@@ -270,6 +274,8 @@ def test_artifact_versions_are_deleted_only_together_with_their_artifact(db):
     "INSERT INTO conversations (id, project_id) VALUES ('not-a-uuid', :general)",
     "INSERT INTO conversations (id, project_id) VALUES (upper(:id), :general)",
     "INSERT INTO conversations (id, project_id) VALUES ('8b1d1e5a-bdce-11f1-8f22-718778ea685b', :general)",
+    "INSERT INTO conversations (id, project_id) VALUES ('--------------4----8----------------', :general)",
+    "INSERT INTO conversations (id, project_id) VALUES (substr(:id, 1, 2) || '-' || substr(:id, 4), :general)",
     "INSERT INTO audit_log (event, at) VALUES ('e', '2026-10-02 03:18:00.000')",
     "INSERT INTO audit_log (event, at) VALUES ('e', '2026-10-02T11:18:00.000+08:00')",
     "INSERT INTO audit_log (event, at) VALUES ('e', '2026-10-02T03:18:00Z')",
@@ -280,6 +286,7 @@ def test_artifact_versions_are_deleted_only_together_with_their_artifact(db):
     "INSERT INTO memory_records (id, scope, type, content, status) VALUES (:id, 'personal', 'progress', 'x', 'confirmed')",
 ], ids=[
     "invalid-json", "invalid-json-csl", "id-not-uuid", "id-uppercase", "id-not-version-4",
+    "id-only-hyphens", "id-hyphen-inside-a-group",
     "time-without-zone", "time-with-offset", "time-without-milliseconds",
     "unknown-enum", "strict-type", "missing-foreign-key", "background-attempts", "confirmed-progress",
 ])

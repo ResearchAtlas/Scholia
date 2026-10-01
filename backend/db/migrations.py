@@ -7,7 +7,8 @@ reorder a released one.
 
 Conventions in every table:
 - STRICT tables with foreign keys.
-- Ids are lowercase UUID4 text.
+- Ids are lowercase UUID4 text: lowercase hex digits in the 8-4-4-4-12
+  groups, version 4 and variant 8, 9, a or b.
 - Times are UTC ISO 8601 text with milliseconds, as SQLite's
   strftime('%Y-%m-%dT%H:%M:%fZ') writes them (e.g. 2026-10-02T03:18:00.123Z),
   so they compare correctly as text.
@@ -21,7 +22,7 @@ PRAGMA application_id = 1094795858;
 -- Projects
 
 CREATE TABLE projects (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     name TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('general', 'research')),
     sensitivity TEXT NOT NULL DEFAULT 'normal' CHECK (sensitivity IN ('normal', 'private', 'local_only')),
@@ -66,7 +67,7 @@ CREATE TABLE private_routes (
 ) STRICT;
 
 CREATE TABLE local_declarations (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     provider TEXT NOT NULL,
     base_url TEXT NOT NULL,
     declared_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (declared_at IS strftime('%Y-%m-%dT%H:%M:%fZ', declared_at)),
@@ -74,7 +75,7 @@ CREATE TABLE local_declarations (
 ) STRICT;
 
 CREATE TABLE key_attestations (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     provider TEXT NOT NULL,
     key_fingerprint TEXT NOT NULL,
     statement TEXT NOT NULL,
@@ -85,7 +86,7 @@ CREATE TABLE key_attestations (
 -- Runs
 
 CREATE TABLE conversations (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     project_id TEXT NOT NULL REFERENCES projects (id),
     title TEXT,
     title_source TEXT,
@@ -100,7 +101,7 @@ CREATE TABLE conversations (
 CREATE UNIQUE INDEX conversations_one_parent ON conversations (project_id) WHERE is_parent = 1;
 
 CREATE TABLE runs (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     project_id TEXT NOT NULL REFERENCES projects (id),
     conversation_id TEXT REFERENCES conversations (id),
     parent_run_id TEXT REFERENCES runs (id),
@@ -181,7 +182,7 @@ CREATE TABLE content_files (
 ) STRICT;
 
 CREATE TABLE materials (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     project_id TEXT NOT NULL REFERENCES projects (id),
     title TEXT,
     csl TEXT CHECK (json_valid(csl)),
@@ -199,7 +200,7 @@ CREATE TABLE materials (
 ) STRICT;
 
 CREATE TABLE material_versions (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     material_id TEXT NOT NULL REFERENCES materials (id),
     seq INTEGER NOT NULL CHECK (seq >= 0),
     file_sha256 TEXT REFERENCES content_files (sha256),
@@ -211,7 +212,7 @@ CREATE TABLE material_versions (
 CREATE UNIQUE INDEX material_versions_one_current ON material_versions (material_id) WHERE is_current = 1;
 
 CREATE TABLE extractions (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     file_sha256 TEXT NOT NULL REFERENCES content_files (sha256),
     extractor TEXT NOT NULL,
     extractor_version TEXT NOT NULL,
@@ -222,7 +223,7 @@ CREATE TABLE extractions (
 ) STRICT;
 
 CREATE TABLE passages (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     extraction_id TEXT NOT NULL REFERENCES extractions (id),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     page INTEGER,
@@ -236,7 +237,7 @@ CREATE TABLE passages (
 ) STRICT;
 
 CREATE TABLE candidates (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     run_id TEXT NOT NULL REFERENCES runs (id),
     project_id TEXT NOT NULL REFERENCES projects (id),
     source TEXT NOT NULL,
@@ -259,7 +260,7 @@ CREATE TABLE search_plans (
 ) STRICT;
 
 CREATE TABLE budget_reservations (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     run_id TEXT NOT NULL REFERENCES runs (id),
     step_seq INTEGER NOT NULL CHECK (step_seq >= 0),
     paying_conversation_id TEXT REFERENCES conversations (id),
@@ -286,7 +287,7 @@ CREATE TABLE index_queue (
 -- Citations
 
 CREATE TABLE citations (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     owner_kind TEXT NOT NULL CHECK (owner_kind IN ('answer', 'artifact')),
     owner_id TEXT NOT NULL,
     material_id TEXT REFERENCES materials (id),
@@ -306,7 +307,7 @@ CREATE TABLE citations (
 -- Artifacts
 
 CREATE TABLE artifacts (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     project_id TEXT NOT NULL REFERENCES projects (id),
     kind TEXT NOT NULL DEFAULT 'manuscript' CHECK (kind IN ('manuscript')),
     title TEXT NOT NULL,
@@ -327,7 +328,7 @@ CREATE TABLE artifacts (
 -- delete the artifact first and then its versions, and no other order is
 -- accepted. The delete trigger also stops REPLACE from swapping a version.
 CREATE TABLE artifact_versions (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     artifact_id TEXT NOT NULL REFERENCES artifacts (id) DEFERRABLE INITIALLY DEFERRED,
     seq INTEGER NOT NULL CHECK (seq >= 0),
     doc TEXT NOT NULL CHECK (json_valid(doc)),
@@ -350,7 +351,7 @@ BEGIN
 END;
 
 CREATE TABLE suggestion_sets (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     artifact_id TEXT NOT NULL REFERENCES artifacts (id),
     run_id TEXT REFERENCES runs (id),
     section_id TEXT NOT NULL,
@@ -369,7 +370,7 @@ CREATE TABLE section_leases (
 ) STRICT;
 
 CREATE TABLE comment_threads (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     artifact_id TEXT NOT NULL REFERENCES artifacts (id),
     anchor TEXT NOT NULL CHECK (json_valid(anchor)),
     run_id TEXT REFERENCES runs (id),
@@ -379,7 +380,7 @@ CREATE TABLE comment_threads (
 ) STRICT;
 
 CREATE TABLE comments (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     thread_id TEXT NOT NULL REFERENCES comment_threads (id),
     author TEXT NOT NULL,
     body TEXT NOT NULL,
@@ -389,7 +390,7 @@ CREATE TABLE comments (
 -- Memory
 
 CREATE TABLE memory_records (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     scope TEXT NOT NULL CHECK (scope IN ('personal', 'project')),
     project_id TEXT REFERENCES projects (id),
     type TEXT NOT NULL,
@@ -454,7 +455,7 @@ CREATE TABLE extensions (
 ) STRICT;
 
 CREATE TABLE mcp_servers (
-    id TEXT PRIMARY KEY CHECK (id GLOB '????????-????-4???-[89ab]???-????????????' AND NOT id GLOB '*[^0-9a-f-]*'),
+    id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
     name TEXT NOT NULL,
     command TEXT NOT NULL CHECK (json_valid(command)),
     env_allow TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(env_allow)),

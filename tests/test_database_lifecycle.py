@@ -1,15 +1,18 @@
+import json
 import os
 import signal
 import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 import backend.db.database as database_module
+from backend import APP_VERSION
 from backend.db import (
     APPLICATION_ID,
     DB_NAME,
@@ -74,6 +77,25 @@ def mode(path):
     return stat.S_IMODE(path.stat().st_mode)
 
 
+def mismatch_table_and_index(data):
+    """A database whose projects table disagrees with its primary key index.
+
+    quick_check does not compare tables with their indexes, so it still opens;
+    integrity_check fails.
+    """
+    project, renamed = new_id(), new_id()
+    with Database(data) as db:
+        db.write(lambda conn: conn.execute(
+            "INSERT INTO projects (id, name, kind) VALUES (?, 'p', 'research')", (project,)))
+    page, size = leaf_page(data / DB_NAME, "projects")
+    with open(data / DB_NAME, "r+b") as file:
+        file.seek((page - 1) * size)
+        content = file.read(size)
+        assert content.count(project.encode()) == 1
+        file.seek((page - 1) * size)
+        file.write(content.replace(project.encode(), renamed.encode()))
+
+
 @pytest.fixture
 def open_umask():
     """A permissive umask, so owner-only modes must come from the code."""
@@ -99,6 +121,26 @@ def test_a_newer_schema_is_refused_and_left_unchanged(tmp_path):
         Database(data)
     assert snapshot(data) == before
     assert not (data / "backups").exists()
+
+
+def test_an_existing_database_at_version_zero_is_backed_up_before_migrating(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    conn = sqlite3.connect(data / DB_NAME)
+    conn.execute("CREATE TABLE notes (text TEXT)")
+    conn.execute("INSERT INTO notes VALUES ('kept')")
+    conn.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+    conn.commit()
+    conn.close()
+
+    Database(data).close()
+    [generation] = generations(data)
+    backup = sqlite3.connect((data / "backups" / "daily" / generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    try:
+        assert backup.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert backup.execute("SELECT text FROM notes").fetchall() == [("kept",)]
+    finally:
+        backup.close()
 
 
 @pytest.mark.parametrize("application_id, version, has_table", [
@@ -240,19 +282,7 @@ def test_a_file_that_is_not_a_database_is_refused_and_left_unchanged(tmp_path):
 
 def test_a_failed_integrity_check_stops_writes_and_leaves_the_file_unchanged(tmp_path):
     data = tmp_path / "data"
-    project, renamed = new_id(), new_id()
-    with Database(data) as db:
-        db.write(lambda conn: conn.execute(
-            "INSERT INTO projects (id, name, kind) VALUES (?, 'p', 'research')", (project,)))
-    # Change the id in the table row only, so it disagrees with the primary key index:
-    # quick_check does not compare tables with their indexes, integrity_check does.
-    page, size = leaf_page(data / DB_NAME, "projects")
-    with open(data / DB_NAME, "r+b") as file:
-        file.seek((page - 1) * size)
-        content = file.read(size)
-        assert content.count(project.encode()) == 1
-        file.seek((page - 1) * size)
-        file.write(content.replace(project.encode(), renamed.encode()))
+    mismatch_table_and_index(data)
 
     db = Database(data)
     try:
@@ -269,6 +299,39 @@ def test_a_failed_integrity_check_stops_writes_and_leaves_the_file_unchanged(tmp
     assert list((data / "backups" / "daily").iterdir()) == []
 
 
+def test_a_write_in_flight_when_damage_is_found_does_not_commit(tmp_path):
+    data = tmp_path / "data"
+    mismatch_table_and_index(data)
+    db = Database(data)
+    started, proceed, outcome = threading.Event(), threading.Event(), []
+
+    def paused(conn):
+        conn.execute("INSERT INTO audit_log (event) VALUES ('in flight')")
+        started.set()
+        assert proceed.wait(10)
+
+    def run():
+        try:
+            db.write(paused)
+            outcome.append("committed")
+        except DatabaseDamagedError:
+            outcome.append("refused")
+
+    writer = threading.Thread(target=run)
+    try:
+        writer.start()
+        assert started.wait(10)
+        with pytest.raises(DatabaseDamagedError, match="integrity_check"):
+            db.backup()
+        proceed.set()
+        writer.join(10)
+        assert outcome == ["refused"]
+        assert audit_events(db) == []
+    finally:
+        proceed.set()
+        db.close()
+
+
 # Backups
 
 
@@ -283,7 +346,10 @@ def test_a_backup_is_a_checked_generation_and_a_stale_temporary_one_is_removed(t
 
     assert not stale.exists()
     assert generation.parent == data / "backups" / "daily"
-    assert list(generation.iterdir()) == [generation / DB_NAME]
+    assert {path.name for path in generation.iterdir()} == {DB_NAME, "backup.json"}
+    assert json.loads((generation / "backup.json").read_text()) == {
+        "app_version": APP_VERSION, "schema_version": len(MIGRATIONS), "sqlite_version": sqlite3.sqlite_version}
+    assert mode(generation / "backup.json") == 0o600
     conn = sqlite3.connect((generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
     try:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
@@ -372,5 +438,8 @@ def test_existing_permissions_are_left_as_they_are(tmp_path):
     with Database(data) as db:
         db.write(add_audit_row)
         db.backup()
-        assert mode(data / f"{DB_NAME}-wal") == 0o640  # SQLite gives it the database file's mode
+        # SQLite gives the WAL and shared-memory files the database file's mode, and
+        # resets an empty one to it on every open, so they are never broader than it.
+        sidecars = (mode(data / f"{DB_NAME}-wal"), mode(data / f"{DB_NAME}-shm"))
+    assert sidecars == (0o640, 0o640)
     assert (mode(data), mode(data / DB_NAME), mode(data / "backups")) == (0o750, 0o640, 0o750)
