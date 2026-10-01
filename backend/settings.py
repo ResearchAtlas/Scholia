@@ -120,7 +120,7 @@ PERSONAL = {
     **{("limits", k): spec for k, spec in _LIMITS.items()},
     **{("context", k): spec for k, spec in _CONTEXT.items()},
     **{("retrieval", k): spec for k, spec in _RETRIEVAL.items()},
-    # No defined shape yet: returned as given. "**" matches the rest of the path.
+    # No defined shape yet: a table at the root, returned as given. "**" matches below it.
     ("zotero", "**"): (None, None),
     ("discovery", "**"): (None, None),
     ("extensions", "*", "**"): (None, None),  # each extension's schema validates its own table
@@ -267,8 +267,10 @@ def _match(schema, path):
     for pattern, spec in schema.items():
         if pattern[-1] == "**":
             head = pattern[:-1]
-            if len(path) >= len(head) and all(p in ("*", k) for p, k in zip(head, path)):
-                return path, (None, lambda v: True)
+            if all(p in ("*", k) for p, k in zip(head, path)):
+                if len(path) > len(head):
+                    return path, (None, lambda v: True)  # anything below the section's root
+                return path, (None, lambda v: isinstance(v, dict))  # the root and above are tables
         elif all(p in ("*", k) for p, k in zip(pattern, path)):
             if len(pattern) == len(path):
                 return pattern, spec
@@ -278,17 +280,48 @@ def _match(schema, path):
     return None, None
 
 
-# Names that hold secrets; keys live in the credential store, never in config.toml.
-_SECRET = re.compile(r"(^|[_-])(api_?keys?|keys?|token|secret|password)$", re.IGNORECASE)
+# Field names that hold secrets; keys live in the credential store, never in config.toml.
+# ponytail: detection by name is a safeguard, not a guarantee; a secret under an
+# ordinary name passes.
+_SECRET = re.compile(
+    r"(^|[\s._-])(api_?keys?|keys?|token|secrets?|passwords?|passwd|passphrase|auth|authorization"
+    r"|bearer|cookies?|credentials?)$",
+    re.IGNORECASE,
+)
+
+
+def _secret_name(name):
+    return _SECRET.search(re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", str(name))) is not None  # apiKey -> api_Key
 
 
 def _hides_secret(value):
-    """True if a list or table value holds a secret-like name at any depth."""
+    """True if a list or table value holds a secret-like field name at any depth."""
     if isinstance(value, dict):
-        return any(_SECRET.search(str(k)) or _hides_secret(v) for k, v in value.items())
+        return any(_secret_name(k) or _hides_secret(v) for k, v in value.items())
     if isinstance(value, list):
         return any(_hides_secret(v) for v in value)
     return False
+
+
+def _field_names(schema, path):
+    """The parts of path that are field names, leaving out identifiers.
+
+    An identifier names a provider, model, extension or server: a "*" in the
+    schema, or a table below an open section's root.
+    """
+    identifiers = set()
+    for pattern in schema:
+        open_ended = pattern[-1] == "**"
+        head = pattern[:-1] if open_ended else pattern
+        for i, (p, k) in enumerate(zip(head, path)):  # the part of path that follows this pattern
+            if p not in ("*", k):
+                break
+            if p == "*":
+                identifiers.add(i)
+        else:
+            if open_ended:
+                identifiers |= set(range(len(head), len(path) - 1))
+    return [part for i, part in enumerate(path) if i not in identifiers]
 
 
 def _check(schema, path, value):
@@ -301,7 +334,7 @@ def _check(schema, path, value):
     # file on save like any other content of theirs; only the app's own writes are refused.
     if schema is PROJECT and path[0] in ("providers", "keys", "subagents"):
         return path, "is a personal setting and cannot be set in a project file"
-    if any(_SECRET.search(part) for part in path) or _hides_secret(value):
+    if any(_secret_name(name) for name in _field_names(schema, path)) or _hides_secret(value):
         return path, "looks like a secret; keys belong in the credential store"
     pattern, spec = _match(schema, path)
     if spec is not None and not spec[1](value):
@@ -371,7 +404,7 @@ def _key_lines(text):
     Keys inside inline tables take the line of their enclosing key.
     """
     lines, table, open_quote, depth = {}, (), None, 0
-    for number, line in enumerate(text.splitlines(), 1):
+    for number, line in enumerate(text.split("\n"), 1):  # TOML ends lines with \n or \r\n only
         if open_quote or depth > 0:
             open_quote, depth = _scan_value(line, open_quote, depth)
             continue

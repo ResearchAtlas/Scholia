@@ -52,7 +52,7 @@ def _fallback(data_root):
         keys = json.loads(path.read_bytes())
     except FileNotFoundError:
         return path, {}
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, RecursionError) as error:  # unreadable, not JSON, or nested too deep
         raise CredentialsFileError(f"{FALLBACK_FILE} cannot be read; it was left unchanged") from error
     if not (isinstance(keys, dict) and all(isinstance(v, str) for v in keys.values())):
         raise CredentialsFileError(f"{FALLBACK_FILE} is malformed; it was left unchanged")
@@ -65,8 +65,8 @@ def save_key(data_root, provider, key, backend=None):
     Raises CredentialsFileError, changing nothing, if the key needs the fallback
     file and that file is unreadable or malformed.
     """
-    if not key:
-        raise ValueError("the key is empty")
+    if not (isinstance(provider, str) and provider and isinstance(key, str) and key):
+        raise ValueError("the provider and the key must be non-empty text")
     store = _store(backend)
     with _lock:
         stored = False

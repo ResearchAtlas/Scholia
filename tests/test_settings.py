@@ -468,3 +468,89 @@ def test_warning_lines_decode_quoted_keys(tmp_path):
         "config.toml line 6: models.efforts.has = sign is not valid",
         'config.toml line 8: providers.we"ird.default_window is not valid',
     ]
+
+
+@pytest.mark.parametrize("project_id, text, key, line, left", [
+    (None, '# zotero settings\nzotero = 1\n', "zotero", 2, {}),
+    (None, 'discovery = "on"\n', "discovery", 1, {}),
+    (None, '# none yet\nextensions = 1\n', "extensions", 2, {}),
+    (None, '[extensions]\nfoo = "x"\n[extensions.bar]\nx = 1\n', "extensions.foo", 2, {"extensions": {"bar": {"x": 1}}}),
+    ("p1", '[project]\ntemplate = "t"\n', None, None, {}),  # control: nothing to warn about
+    ("p1", 'mcp = false\n', "mcp", 1, {}),
+    ("p1", '\nmcp_server = 1\n[mcp]\nenabled = ["files"]\n', "mcp_server", 2, {"mcp": {"enabled": ["files"]}}),
+])
+def test_open_sections_must_be_tables(tmp_path, project_id, text, key, line, left):
+    if project_id:
+        write_project_file(tmp_path, text)
+    else:
+        (tmp_path / "config.toml").write_text(text)
+    loaded = load_settings(tmp_path, project_id)
+    open_sections = {"zotero", "discovery", "extensions", "mcp", "mcp_server"}
+    assert {k: v for k, v in loaded.values.items() if k in open_sections} == left
+    expected = [] if key is None else [f"{loaded.label} line {line}: {key} is not valid; ignored"]
+    assert loaded.warnings == expected
+    assert loaded.path.read_text() == text  # the file's own bytes are never changed by loading
+
+
+@pytest.mark.parametrize("project_id, updates", [
+    (None, {"zotero": 1}),
+    (None, {"discovery": "on"}),
+    (None, {"extensions": 1}),
+    (None, {"extensions.foo": "x"}),
+    (None, {"extensions": {"foo": "x"}}),
+    ("p1", {"mcp": False}),
+    ("p1", {"mcp_server": 1}),
+])
+def test_save_refuses_scalars_at_open_section_roots(tmp_path, project_id, updates):
+    loaded = load_settings(tmp_path, project_id)
+    with pytest.raises(ValueError):
+        loaded.save(updates)
+    assert not loaded.path.exists()
+
+
+@pytest.mark.parametrize("name", [
+    "AUTHORIZATION", "auth", "basic-auth", "Bearer", "cookie", "session.cookies", "credential", "credentials",
+    "passphrase", "private_key", "Private-Key", "access_key", "client_secret", "apiKey", "accessToken", "passwd",
+])
+def test_credential_field_names_are_secrets(tmp_path, name):
+    key = ".".join(f'"{part}"' for part in name.split("."))
+    write_project_file(tmp_path, f'[mcp_server.env]\nPATH = "/bin"\n{key} = "Bearer hidden"\n')
+    loaded = load_settings(tmp_path, "p1")
+    assert loaded.values["mcp_server"] == {"env": {"PATH": "/bin"}}
+    assert len(loaded.warnings) == 1 and "line 3" in loaded.warnings[0] and "looks like a secret" in loaded.warnings[0]
+    with pytest.raises(ValueError):
+        loaded.save({f"mcp_server.env.{key}": "Bearer hidden"})
+
+
+def test_identifiers_are_not_mistaken_for_secrets(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        '[providers.local-key]\nkind = "openai-compatible"\ndefault_window = 8192\nnote = 1\n'
+        '[providers.local-key.windows]\n"my-token" = 16384\n'
+        '[models.efforts]\n"vendor/secret" = "high"\n'
+        '[extensions.aab-auth]\nstyle = "apa"\n'
+    )
+    write_project_file(tmp_path, '[mcp.servers.github-token]\ncommand = "gh-mcp"\n')
+    personal = load_settings(tmp_path)
+    assert personal.warnings == []
+    assert personal.values["providers"] == {
+        "local-key": {"kind": "openai-compatible", "default_window": 8192, "windows": {"my-token": 16384}},
+    }
+    assert personal.values["models"]["efforts"] == {"vendor/secret": "high"}
+    assert personal.values["extensions"] == {"aab-auth": {"style": "apa"}}
+    personal.save({"providers.local-key.kind": "openrouter", 'models.efforts."vendor/secret"': "low"})
+    assert load_settings(tmp_path).values["providers"]["local-key"]["kind"] == "openrouter"
+    project = load_settings(tmp_path, "p1")
+    assert project.warnings == []
+    assert project.values["mcp"] == {"servers": {"github-token": {"command": "gh-mcp"}}}
+    project.save({"mcp.servers.github-token.command": "gh"})
+
+
+def test_warning_lines_count_only_toml_line_endings(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        "[helper]\r\n"
+        'model_source = "a b\u0085c"  # comment   here\r\n'
+        "idle_stop_minutes = 0\n"
+    )
+    loaded = load_settings(tmp_path)
+    assert loaded.values["helper"]["model_source"] == "a b\u0085c"
+    assert [w.split(":")[0] for w in loaded.warnings] == ["config.toml line 3"]

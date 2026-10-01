@@ -111,6 +111,7 @@ MALFORMED = [
     b'["sk-or-saved"]',
     b'{"openrouter": 5}',
     b"\xff\xfe",
+    b"[" * 10_000 + b"]" * 10_000,  # nested deeper than the decoder can go
 ]
 
 
@@ -147,9 +148,16 @@ def test_unreadable_fallback_file_never_stops_loading(tmp_path, caplog):
         save_key(tmp_path, "openrouter", KEY, backend=keyring.backends.fail.Keyring())
 
 
-def test_empty_key_is_refused(tmp_path):
-    with pytest.raises(ValueError):
-        save_key(tmp_path, "openrouter", "", backend=MemoryKeyring())
+@pytest.mark.parametrize("provider, key", [
+    ("openrouter", ""), ("openrouter", 123), ("openrouter", None), ("openrouter", b"sk-bytes"), ("", KEY), (5, KEY),
+])
+def test_keys_and_providers_must_be_nonempty_text(tmp_path, provider, key):
+    store = MemoryKeyring()
+    for backend in (store, keyring.backends.fail.Keyring()):
+        with pytest.raises(ValueError):
+            save_key(tmp_path, provider, key, backend=backend)
+    assert store.items == {}
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_legacy_configuration_is_never_read(tmp_path, monkeypatch):
