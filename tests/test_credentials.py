@@ -349,3 +349,54 @@ def test_an_empty_store_value_is_not_a_key(tmp_path, in_file):
 def test_an_empty_fallback_entry_is_not_a_key(tmp_path):
     (tmp_path / "credentials.json").write_text('{"openrouter": ""}')
     assert load_key(tmp_path, "openrouter", backend=MemoryKeyring()) is None
+
+
+def test_a_load_racing_a_save_still_finds_a_key(tmp_path):
+    save_key(tmp_path, "openrouter", "sk-old", backend=keyring.backends.fail.Keyring())  # in the file
+    store_read = threading.Event()
+
+    class SlowFirstRead(MemoryKeyring):
+        def get_password(self, service, username):
+            value = super().get_password(service, username)
+            if not store_read.is_set():  # the load's read: the store is still empty
+                store_read.set()
+                time.sleep(0.1)  # a save may run here, unless loading holds the lock
+            return value
+
+    store = SlowFirstRead()
+    found = []
+    loader = threading.Thread(target=lambda: found.append(load_key(tmp_path, "openrouter", backend=store)))
+    loader.start()
+    store_read.wait(5)
+    save_key(tmp_path, "openrouter", "sk-new", backend=store)  # stores it and removes the file's copy
+    loader.join()
+    assert found in (["sk-old"], ["sk-new"])  # never None: a key existed throughout
+    assert load_key(tmp_path, "openrouter", backend=store) == "sk-new"
+
+
+class UnreadableKeyring(MemoryKeyring):
+    """Refuses writes and, while broken, reads too; deleting still works."""
+
+    broken = True
+
+    def get_password(self, service, username):
+        if self.broken:
+            raise keyring.errors.KeyringLocked("locked")
+        return super().get_password(service, username)
+
+    def set_password(self, service, username, password):
+        raise keyring.errors.PasswordSetError("locked")
+
+
+def test_an_older_store_key_is_deleted_even_when_the_store_cannot_be_read(tmp_path):
+    store = UnreadableKeyring()
+    store.items[(SERVICE, "openrouter")] = "sk-old"
+    assert save_key(tmp_path, "openrouter", "sk-new", backend=store)  # fell back, with a warning
+    assert store.items == {}
+    store.broken = False  # readable again later: the older key must not shadow the new one
+    assert load_key(tmp_path, "openrouter", backend=store) == "sk-new"
+
+
+def test_nothing_to_delete_in_the_store_is_not_a_warning(tmp_path, caplog):
+    assert save_key(tmp_path, "openrouter", KEY, backend=ReadOnlyKeyring())  # fell back; the store is empty
+    assert "credential store" not in caplog.text

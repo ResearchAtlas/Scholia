@@ -95,25 +95,29 @@ def save_key(data_root, provider, key, backend=None):
             raise CredentialsFileError(f"the key was not saved: {error}") from error
         if store is not None:
             try:  # an older key left in the store would be read before this one
-                if store.get_password(SERVICE, provider) is not None:
-                    store.delete_password(SERVICE, provider)
-            except Exception:
-                _log.warning("the credential store could not be cleared of an older key; it may be read "
-                             "instead of the one in %s", FALLBACK_FILE)
+                store.delete_password(SERVICE, provider)
+            except Exception:  # nothing to delete, or the store refused
+                try:
+                    lingering = store.get_password(SERVICE, provider)
+                except Exception:
+                    lingering = True  # cannot tell
+                if lingering:
+                    _log.warning("the credential store could not be cleared of an older key; it may be "
+                                 "read instead of the one in %s", FALLBACK_FILE)
         return FALLBACK_WARNING
 
 
 def load_key(data_root, provider, backend=None):
     """Return a provider's key from the credential store, else the fallback file, else None."""
     store = _store(backend)
-    if store is not None:
-        try:
-            key = store.get_password(SERVICE, provider)
-        except Exception:  # any ordinary failure means the store is unavailable
-            key = None
-        if isinstance(key, str) and key:  # an empty value is no key; save_key never stores one
-            return key
-    with _lock:
+    with _lock:  # both reads in one step, so a concurrent save cannot fall between them
+        if store is not None:
+            try:
+                key = store.get_password(SERVICE, provider)
+            except Exception:  # any ordinary failure means the store is unavailable
+                key = None
+            if isinstance(key, str) and key:  # an empty value is no key; save_key never stores one
+                return key
         try:
             key = _fallback(data_root)[1].get(provider)
         except CredentialsFileError as error:
