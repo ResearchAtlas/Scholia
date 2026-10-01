@@ -473,4 +473,69 @@ CREATE TABLE mcp_tool_pins (
 ) STRICT;
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001,)
+# A deleted project, conversation, material, artifact or memory record leaves a
+# tombstone, and its id is never used again: neither a new row (INSERT, REPLACE
+# or upsert) nor a changed id may take it.
+_0002 = r"""
+CREATE TRIGGER projects_not_after_deletion BEFORE INSERT ON projects
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER projects_id_not_after_deletion BEFORE UPDATE OF id ON projects
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER conversations_not_after_deletion BEFORE INSERT ON conversations
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER conversations_id_not_after_deletion BEFORE UPDATE OF id ON conversations
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER materials_not_after_deletion BEFORE INSERT ON materials
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER materials_id_not_after_deletion BEFORE UPDATE OF id ON materials
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER artifacts_not_after_deletion BEFORE INSERT ON artifacts
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER artifacts_id_not_after_deletion BEFORE UPDATE OF id ON artifacts
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER memory_records_not_after_deletion BEFORE INSERT ON memory_records
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+
+CREATE TRIGGER memory_records_id_not_after_deletion BEFORE UPDATE OF id ON memory_records
+WHEN EXISTS (SELECT 1 FROM tombstones WHERE object_id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'a deleted record''s id cannot be used again');
+END;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002)

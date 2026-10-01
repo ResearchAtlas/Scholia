@@ -12,6 +12,7 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -29,10 +30,11 @@ DAILY_KEPT = 7
 WEEKLY_KEPT = 4
 SETTINGS_FILES = ("config.toml", "AGENTS.md")  # copied into each backup: personal and per project
 _STAMP = "%Y%m%dT%H%M%S%fZ"  # backup generation folder names, oldest sorts first
+BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's lock
 
 _PRAGMAS = (
     "foreign_keys = ON",
-    "busy_timeout = 5000",
+    f"busy_timeout = {BUSY_TIMEOUT_MS}",
     "synchronous = FULL",
     "fullfsync = ON",  # macOS: F_FULLFSYNC on commit, not a plain fsync
     "checkpoint_fullfsync = ON",
@@ -83,6 +85,7 @@ class Database:
         self._readers_lock = threading.Lock()
         self._backup_lock = threading.Lock()
         self._commit_lock = threading.Lock()  # orders the damaged flag with commits
+        self._truncation_pending = False  # a WAL truncation a reader blocked, retried after each write
         _mkdir_private(self.data_dir)
         try:
             # A new database is created owner-only before SQLite opens it. SQLite gives
@@ -161,6 +164,19 @@ class Database:
                 return None
             return self._backup(now)
 
+    def checkpoint(self):
+        """Copy the WAL into the database file and truncate it to zero bytes.
+
+        Deleted content stays in old WAL frames until then. Waits up to the busy
+        timeout for readers, and returns False if one still needed the WAL. The
+        truncation is then retried, without waiting, after each later write until
+        it succeeds. Refused once writing has stopped.
+        """
+        _refuse_event_loop()
+        if threading.get_ident() == self._writer_ident:
+            raise RuntimeError("checkpoint() cannot be called from inside a write")
+        return self._writer.submit(self._truncate_wal, True).result()
+
     def close(self):
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
@@ -177,18 +193,21 @@ class Database:
     def _open_writer(self, migrations):
         conn = _connect(self.path)
         try:
-            if conn.execute("PRAGMA journal_mode = WAL").fetchone()[0] != "wal":
+            if _switch_to_wal(conn) != "wal":
                 raise RuntimeError("the database could not switch to WAL mode")
+            new = None  # whether this startup found a new, empty database
             while True:
                 # Decide under the write lock, so migrations another connection applied
                 # meanwhile are seen and not run again. The backup then copies exactly
                 # the state the migration starts from.
                 conn.execute("BEGIN IMMEDIATE")
                 version, has_schema = _usable_state(conn, len(migrations))
+                if new is None:
+                    new = not has_schema
                 if version == len(migrations):
                     conn.execute("ROLLBACK")
                     break
-                if has_schema:  # skip only a new, empty database
+                if not new:  # a database this startup created holds nothing to back up, before any migration
                     with self._backup_lock:
                         generation = self._backup(datetime.now(UTC))
                     if not (generation / DB_NAME).is_file():
@@ -219,7 +238,26 @@ class Database:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
+        if self._truncation_pending:
+            try:
+                self._truncate_wal(wait=False)
+            except Exception as error:  # the write is committed; the next one retries
+                log.warning("retrying the WAL truncation failed (%s)", type(error).__name__)
         return result
+
+    def _truncate_wal(self, wait):
+        if self._damaged:
+            raise DatabaseDamagedError(self._damaged)
+        conn = self._conn
+        (timeout,) = conn.execute("PRAGMA busy_timeout").fetchone()
+        if not wait:
+            conn.execute("PRAGMA busy_timeout = 0")
+        try:
+            (busy, _, _) = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            conn.execute(f"PRAGMA busy_timeout = {timeout}")
+        self._truncation_pending = busy != 0
+        return busy == 0
 
     def _close_writer(self):
         if self._damaged:
@@ -304,6 +342,24 @@ def _connect(path, *, readonly=False, check_same_thread=True):
         conn.close()
         raise
     return conn
+
+
+def _switch_to_wal(conn):
+    """Set WAL mode and return the journal mode, retrying while another connection holds a lock.
+
+    The switch upgrades a read lock to a write lock, and SQLite reports busy for
+    that at once instead of calling the busy handler, since waiting there could
+    deadlock. Two instances setting up a new data folder meet this, so the switch
+    is retried for up to the busy timeout.
+    """
+    deadline = time.monotonic() + BUSY_TIMEOUT_MS / 1000
+    while True:
+        try:
+            return conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        except sqlite3.OperationalError as error:
+            if error.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY or time.monotonic() >= deadline:
+                raise
+        time.sleep(0.01)
 
 
 def _open_checked(path, check, latest=None):
