@@ -21,7 +21,9 @@ wasm32-wasi-ghc-pkg field ghc-bignum exposed-modules | tr ' ' '\n' | grep -i bac
 work=build/citeproc-src
 rm -rf "$work" && mkdir -p "$work" && cd "$work"
 wasm32-wasi-cabal update "hackage.haskell.org,$INDEX_STATE"
-wasm32-wasi-cabal get citeproc-0.14 conduit-extra-1.3.8 streaming-commons-0.2.3.1 xml-conduit-1.10.1.0
+for package in citeproc-0.14 conduit-extra-1.3.8 streaming-commons-0.2.3.1 xml-conduit-1.10.1.0; do
+  curl -fsSL "https://hackage.haskell.org/package/$package/$package.tar.gz" | tar -xz
+done
 
 # WASI has no sockets: drop the network modules (and the network package) that
 # citeproc never uses from conduit-extra and streaming-commons.
