@@ -169,13 +169,11 @@ def test_each_destination_kind_at_each_level(db, remote, setup, kind, level):
     "https://telemetry.example.com/v1/events",
     "https://openrouter.ai.evil.example/api/v1/chat/completions",
     "https://openrouter.ai@evil.example/api/v1/chat/completions",
-    "https://openrouter.ai./api/v1/chat/completions",
     "http://openrouter.ai/api/v1/chat/completions",
     "https://openrouter.ai:8443/api/v1/chat/completions",
     "https://xn--penrouter-0ig.ai/api/v1/chat/completions",
     "http://127.0.0.1:9999/",
     "http://localhost:8765/health",
-    "http://127.1:8765/health",
     "http://[::1]:8765/health",
     "ws://127.0.0.1:8765/health",
 ])
@@ -361,10 +359,12 @@ THIS_HOST = [
 @pytest.mark.parametrize("level", ["normal", "private", "local_only"])
 @pytest.mark.parametrize("host", THIS_HOST)
 def test_every_spelling_of_this_machine_is_loopback(db, remote, setup, host, level):
+    # Nothing is configured or declared on this port, so a candidate's link there
+    # is refused however this machine is spelled.
     project_id = project(db, level)
-    link = f"http://{host}:11434/v1/chat/completions"
+    link = f"http://{host}:9999/v1/chat/completions"
     candidate_id = candidate(db, project_id, link)
-    declare(db, LOCAL_SERVER)  # declared as 127.0.0.1, which these spellings do not match
+    declare(db, "http://127.0.0.1:9999")  # a declaration alone does not make a provider
     with setup.gate.client(project_id, candidate_id=candidate_id, approved=True) as client:
         refused(client, "POST", link, "unknown_destination", json=chat())
         refused(client, "GET", link, "unknown_destination")
@@ -375,7 +375,7 @@ def test_every_spelling_of_this_machine_is_loopback(db, remote, setup, host, lev
 @pytest.mark.parametrize("host", ["127.1", "2130706433", "[::ffff:127.0.0.1]"])
 async def test_every_spelling_of_this_machine_is_loopback_async(db, remote, setup, host):
     project_id = await asyncio.to_thread(project, db, "local_only")
-    link = f"http://{host}:11434/v1/chat/completions"
+    link = f"http://{host}:9999/v1/chat/completions"
     candidate_id = await asyncio.to_thread(candidate, db, project_id, link)
     async with setup.gate.async_client(project_id, candidate_id=candidate_id, approved=True) as client:
         with pytest.raises(OutboundDenied, match="unknown_destination"):
@@ -383,15 +383,102 @@ async def test_every_spelling_of_this_machine_is_loopback_async(db, remote, setu
     assert remote.received == []
 
 
-def test_a_local_provider_is_matched_by_its_exact_spelling(db, remote, setup):
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_declaration_covers_every_spelling_of_its_address_but_not_a_name(db, remote, setup, asynchronous):
     project_id = project(db, "local_only")
-    setup.change(provider_urls=("http://127.1:11434/v1", LOCAL_SERVER))
-    declare(db, "http://127.1:11434/v1")
-    with setup.gate.client(project_id) as client:
-        client.post("http://127.1:11434/v1/chat/completions", json=chat())  # declared as spelled
-        refused(client, "POST", f"{LOCAL_SERVER}/chat/completions", "not_declared", json=chat())
-    assert [request.url.host for request in remote.received] == ["127.1"]
-    assert [row["kind"] for _, row in audit(db)] == ["local_provider", "local_provider"]
+    candidate_id = candidate(db, project_id, "http://0x7f.1:11434/v1/chat/completions")
+    setup.change(provider_urls=("http://127.1:11434/v1",))
+    declare(db, "http://2130706433:11434/v1")
+    for url in ("http://127.0.0.1:11434/v1/chat/completions", "http://[::ffff:7f00:1]:11434/v1/chat/completions",
+                "http://0x7f.1:11434/v1/chat/completions", "http://127.0.0.1.:11434/v1/chat/completions"):
+        send(setup.gate, project_id, candidate_id, "POST", url, asynchronous, json=chat())
+    with pytest.raises(OutboundDenied, match="unknown_destination"):  # a name is never resolved
+        send(setup.gate, project_id, candidate_id, "POST", "http://localhost:11434/v1/chat/completions",
+             asynchronous, json=chat())
+    assert len(remote.received) == 4
+    assert [(row["kind"], row["destination"]) for _, row in audit(db)] == (
+        [("local_provider", "http://127.0.0.1:11434")] * 4 + [(None, "http://localhost:11434")])
+
+
+def send(gate, project_id, candidate_id, method, url, asynchronous, **kwargs):
+    """One request through a sync or an async gated client."""
+    if not asynchronous:
+        with gate.client(project_id, candidate_id=candidate_id, approved=True) as client:
+            return client.request(method, url, **kwargs)
+
+    async def run():
+        async with gate.async_client(project_id, candidate_id=candidate_id, approved=True) as client:
+            return await client.request(method, url, **kwargs)
+
+    return asyncio.run(run())
+
+
+def at_every_level(reason):
+    return dict.fromkeys(("normal", "private", "local_only"), reason)
+
+
+PROVIDER_ELSEWHERE = {"normal": None, "private": "not_openrouter", "local_only": "not_allowed_at_level"}
+# case -> (provider_urls, candidate link, method, URL, kind, destination shown, reason by level)
+SPELLINGS = {
+    "openrouter trailing dot, unconfigured": (
+        (), "https://openrouter.ai./api/v1/models", "GET", "https://openrouter.ai./api/v1/models",
+        None, "https://openrouter.ai:443", at_every_level("unknown_destination")),
+    "openrouter trailing dot, configured": (
+        (OPENROUTER_API,), "https://openrouter.ai./api/v1/models", "GET", "https://openrouter.ai./api/v1/models",
+        "model_provider", "https://openrouter.ai:443",
+        {"normal": None, "private": "unchecked_request", "local_only": "not_allowed_at_level"}),
+    "integer form of a provider address": (
+        ("http://8.8.8.8/v1",), "http://134744072/v1/models", "GET", "http://134744072/v1/models",
+        "model_provider", "http://8.8.8.8:80", PROVIDER_ELSEWHERE),
+    "hex form of a provider host on another port": (
+        ("http://8.8.8.8/v1",), "http://0x8080808:9000/paper.pdf", "GET", "http://0x8080808:9000/paper.pdf",
+        None, "http://8.8.8.8:9000", at_every_level("unknown_destination")),
+    "provider configured with a trailing dot": (
+        ("https://api.openalex.org./v1",), None, "POST", "https://api.openalex.org/works",
+        "model_provider", "https://api.openalex.org:443", PROVIDER_ELSEWHERE),
+    "trailing dot on a scholarly host": (
+        (), "https://api.openalex.org./works?search=x", "GET", "https://api.openalex.org./works?search=x",
+        "scholarly_api", "https://api.openalex.org:443", at_every_level(None)),
+    "IPv6 spelled out": (
+        ("http://[2001:db8::1]:8000/v1",), "http://[2001:DB8:0:0:0:0:0:1]:8000/v1/models", "GET",
+        "http://[2001:DB8:0:0:0:0:0:1]:8000/v1/models", "model_provider", "http://[2001:db8::1]:8000",
+        PROVIDER_ELSEWHERE),
+    "IPv6 provider host on another port": (
+        ("http://[2001:db8::1]:8000/v1",), "http://[2001:0db8::0001]:9000/paper.pdf", "GET",
+        "http://[2001:0db8::0001]:9000/paper.pdf", None, "http://[2001:db8::1]:9000",
+        at_every_level("unknown_destination")),
+    "IDNA name and its punycode": (
+        ("https://bücher.example/v1",), "https://XN--BCHER-KVA.example/v1/models", "GET",
+        "https://XN--BCHER-KVA.example/v1/models", "model_provider", "https://xn--bcher-kva.example:443",
+        PROVIDER_ELSEWHERE),
+    "IPv4-mapped provider address": (
+        ("http://8.8.8.8/v1",), "http://[::ffff:8.8.8.8]/v1/models", "GET", "http://[::ffff:8.8.8.8]/v1/models",
+        "model_provider", "http://8.8.8.8:80", PROVIDER_ELSEWHERE),
+    "IPv4-mapped provider host on another port": (
+        ("http://8.8.8.8/v1",), "http://[::ffff:808:808]:9000/paper.pdf", "GET",
+        "http://[::ffff:808:808]:9000/paper.pdf", None, "http://8.8.8.8:9000", at_every_level("unknown_destination")),
+}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+@pytest.mark.parametrize("case", list(SPELLINGS))
+def test_equivalent_spellings_are_one_destination(db, remote, setup, case, level, asynchronous):
+    providers, link, method, url, kind, destination, reasons = SPELLINGS[case]
+    setup.change(provider_urls=providers)
+    project_id = project(db, level)
+    candidate_id = candidate(db, project_id, link) if link else None
+    kwargs = {"json": {"query": "SECRET"}} if method == "POST" else {}
+    if reasons[level] is None:
+        send(setup.gate, project_id, candidate_id, method, url, asynchronous, **kwargs)
+        assert len(remote.received) == 1
+    else:
+        with pytest.raises(OutboundDenied) as caught:
+            send(setup.gate, project_id, candidate_id, method, url, asynchronous, **kwargs)
+        assert caught.value.reason == reasons[level]
+        assert remote.received == []
+    [(_, row)] = audit(db)
+    assert (row["kind"], row["destination"]) == (kind, destination)  # never open_access
 
 
 @pytest.mark.parametrize("host", ["10.0.0.5", "192.168.1.20", "1.2.3.4", "[2001:db8::1]", "localhost.example.com"])

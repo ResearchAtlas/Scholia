@@ -11,10 +11,15 @@ Host header or TLS name differs from its URL's host.
 Destination kinds: a model provider (configured in settings), a scholarly API, an
 open-access host taken from a named candidate of the project (fetches only: GET
 or HEAD without a body, and never a model provider's host), the local helper,
-a local provider on loopback, and a model download source. A host on this
-machine, however it is spelled (127.0.0.0/8, ::1, IPv4-mapped forms, 0.0.0.0,
-short and integer IPv4 forms, localhost names), is loopback: only the helper's
-and configured providers' exact origins count there, and nothing else does.
+a local provider on loopback, and a model download source.
+
+Hosts are compared in one canonical spelling (see `_canonical_host`): lowercase
+IDNA names without a trailing dot, and IP addresses in their standard form, so
+`openrouter.ai.`, `134744072` (8.8.8.8) or `[::ffff:8.8.8.8]` are the hosts they
+name. A host on this machine (127.0.0.0/8, ::1, IPv4-compatible forms, 0.0.0.0,
+::, localhost names) is loopback: only the helper's and configured providers'
+exact origins count there, and nothing else does. Names are never resolved, so
+`localhost` and `127.0.0.1` are different origins.
 
 - Normal: every kind.
 - Private: model requests only to OpenRouter, on the Private allowlist, carrying
@@ -253,12 +258,42 @@ def _checked(options):
 
 
 def _origin(url: httpx.URL, scheme: str | None = None):
-    """(scheme, host, port) of an http or https URL, or None."""
+    """(scheme, canonical host, port) of an http or https URL, or None.
+
+    Every comparison the gate makes is between these, so two spellings of one
+    host are the same destination.
+    """
     scheme = scheme or url.scheme
     port = url.port or _DEFAULT_PORTS.get(scheme)
-    if scheme not in _DEFAULT_PORTS or not url.host:
+    host = _canonical_host(url.raw_host)
+    if scheme not in _DEFAULT_PORTS or not host:
         return None
-    return scheme, url.host, port
+    return scheme, host, port
+
+
+def _canonical_host(raw: bytes):
+    """The host a connection goes to, in one spelling, or None.
+
+    raw is what httpx connects to: lowercase IDNA for names (ASCII), or an IP
+    literal as written. One trailing dot is dropped. An IP literal, including the
+    short, integer, hex and octal IPv4 forms that resolvers read as addresses,
+    becomes its ipaddress form, with an IPv4-mapped IPv6 address as IPv4.
+    """
+    try:
+        # httpx already lowercases names; lowering again keeps this form independent of it.
+        host = raw.decode("ascii").lower().removesuffix(".")
+    except UnicodeDecodeError:
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(host))
+        except (OSError, ValueError):
+            return host or None  # a name
+    if address.version == 6 and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return str(address)
 
 
 def _origin_of(text):
@@ -269,24 +304,17 @@ def _origin_of(text):
 
 
 def _is_this_host(host: str) -> bool:
-    """Whether host names this machine, in any spelling a resolver accepts."""
-    name = host.lower().removesuffix(".")
-    if name == "localhost" or name.endswith(".localhost"):
+    """Whether a canonical host names this machine."""
+    if host == "localhost" or host.endswith(".localhost"):
         return True
     try:
-        address = ipaddress.ip_address(name)
+        address = ipaddress.ip_address(host)
     except ValueError:
-        try:  # the short, integer, hex and octal IPv4 forms, as resolvers read them
-            address = ipaddress.IPv4Address(socket.inet_aton(name))
-        except (OSError, ValueError):
-            return False
+        return False
     if address.version == 6:
-        if address.ipv4_mapped:
-            address = address.ipv4_mapped
-        elif int(address) >> 32 == 0:  # ::, ::1 and IPv4-compatible forms
-            address = ipaddress.IPv4Address(int(address))
-        else:
+        if int(address) >> 32 != 0:
             return address.is_loopback
+        address = ipaddress.IPv4Address(int(address))  # ::, ::1 and IPv4-compatible forms
     return any(address in network for network in _THIS_HOST)
 
 
