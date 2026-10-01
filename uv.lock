@@ -2,6 +2,9 @@ version = 1
 revision = 3
 requires-python = "==3.13.*"
 
+[manifest]
+constraints = [{ name = "starlette", specifier = "<0.51" }]
+
 [[package]]
 name = "altgraph"
 version = "0.17.5"
@@ -857,15 +860,15 @@ packaging = [
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
-    { name = "fastapi", specifier = ">=0.115.0" },
-    { name = "httpx", specifier = ">=0.27.0" },
+    { name = "fastapi", specifier = ">=0.115.0,<0.122" },
+    { name = "httpx", specifier = ">=0.27.0,<0.29" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = "==2.2.0" },
     { name = "platformdirs", specifier = ">=4.3.0" },
     { name = "pydantic", specifier = ">=2.9.0" },
     { name = "python-docx", specifier = ">=1.1.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
-    { name = "pywebview", specifier = ">=6.1" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
+    { name = "pywebview", specifier = ">=6.1,<7" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0,<0.39" },
 ]
 provides-extras = ["mcp"]
 
@@ -874,7 +877,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
-packaging = [{ name = "pyinstaller", specifier = ">=6.19.0" }]
+packaging = [{ name = "pyinstaller", specifier = ">=6.19.0,<7" }]
 
 [[package]]
 name = "setuptools"

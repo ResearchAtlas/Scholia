@@ -47,6 +47,22 @@ jobs:
           assert platform.machine() == "arm64", platform.machine()
           assert sys._framework == "Python", "not the python.org framework build"
           EOF
+      - name: Diagnose descriptors (temporary)
+        run: |
+          lsof -a -p $$ || true
+          uv run --no-sync python - <<'EOF'
+          import os, socket, stat
+          for fd in sorted(int(n) for n in os.listdir("/dev/fd")):
+              try:
+                  st = os.fstat(fd)
+              except OSError as e:
+                  print(fd, "fstat", e); continue
+              if stat.S_ISSOCK(st.st_mode):
+                  try:
+                      s = socket.socket(fileno=os.dup(fd)); print(fd, s); s.close()
+                  except OSError as e:
+                      print(fd, "socket()", e)
+          EOF
       - name: Tests
         run: uv run --no-sync pytest -q
 
@@ -113,4 +129,8 @@ jobs:
           ls -la "$base" "$base/lib" || true
           find "$base" -maxdepth 6 \( -iname '*licen*' -o -iname '*copying*' -o -iname '*notice*' \) | head -80
           ls "$base/Resources" "$base/Resources/English.lproj" 2>/dev/null | head -40 || true
-          otool -L build/dist/scholia-probe/_internal/*.dylib build/dist/scholia-probe/_internal/Python build/dist/scholia-probe/_internal/lib-dynload/*.so 2>/dev/null | grep -v '^\s*/usr/lib\|/System/' | head -100 || true
+          otool -L build/dist/scholia-probe/_internal/*.dylib build/dist/scholia-probe/_internal/Python build/dist/scholia-probe/_internal/python3.13/lib-dynload/*.so || true
+          ls -la build/dist/scholia-probe/_internal build/dist/scholia-probe/_internal/Python.framework build/dist/scholia-probe/_internal/Python.framework/Versions
+          ls "$base/lib/python3.13/lib-dynload" | head -100
+          strings build/dist/scholia-probe/_internal/python3.13/lib-dynload/_lzma.cpython-313-darwin.so | grep -i -m3 'liblzma\|xz utils' || true
+          strings build/dist/scholia-probe/_internal/python3.13/lib-dynload/_sqlite3.cpython-313-darwin.so | grep -m2 '3\.[0-9][0-9]\.[0-9]' || true

@@ -1,0 +1,32 @@
+[
+  {
+    "request": {
+      "method": "POST",
+      "path": "/api/v1/chat/completions",
+      "body": {
+        "model": "example/replay-model",
+        "messages": [
+          {"role": "user", "content": "Name one primary source for the history of printing."}
+        ],
+        "provider": {"zdr": true}
+      }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "id": "gen-replay-0001",
+        "object": "chat.completion",
+        "created": 1759363200,
+        "model": "example/replay-model",
+        "choices": [
+          {
+            "index": 0,
+            "message": {"role": "assistant", "content": "The Gutenberg Bible, printed in Mainz around 1455."},
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {"prompt_tokens": 18, "completion_tokens": 14, "total_tokens": 32, "cost": 0.0}
+      }
+    }
+  }
+]
