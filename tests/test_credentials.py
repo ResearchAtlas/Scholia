@@ -318,3 +318,20 @@ def test_older_store_key_that_cannot_be_cleared_is_logged(tmp_path, caplog):
     assert save_key(tmp_path, "openrouter", "sk-new", backend=store)  # fell back, with a warning
     assert "credential store could not be cleared" in caplog.text and "sk-" not in caplog.text
     assert load_key(tmp_path, "openrouter", backend=store) == "sk-old"
+
+
+def test_backups_carry_settings_and_instructions_but_never_keys(tmp_path):
+    # The file names and places used here are the ones the database's backups copy.
+    from backend.db import Database, new_id
+
+    data, project = tmp_path / "data", new_id()
+    load_settings(data).save({"ui.language": "en"})
+    load_settings(data, project).save({"project.target_venue": "Nature"})
+    (data / "AGENTS.md").write_text("Personal instructions\n")
+    (data / "projects" / project / "AGENTS.md").write_text("Project instructions\n")
+    assert save_key(data, "openrouter", KEY, backend=keyring.backends.fail.Keyring())  # in credentials.json
+    with Database(data) as db:
+        generation = db.backup()
+    copied = {str(p.relative_to(generation)) for p in generation.rglob("*") if p.is_file()}
+    assert {"config.toml", "AGENTS.md", f"projects/{project}/config.toml", f"projects/{project}/AGENTS.md"} <= copied
+    assert files_containing(generation, KEY) == [] and "credentials.json" not in copied
