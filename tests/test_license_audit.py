@@ -6,7 +6,7 @@ import pytest
 
 from tools import license_audit as la
 
-DYNLOAD = "_internal/python3.13/lib-dynload"
+DYNLOAD = "Contents/Frameworks/python3.13/lib-dynload"
 MACHO = b"\xcf\xfa\xed\xfe" + bytes(28)
 
 
@@ -46,7 +46,7 @@ def test_archived_modules_are_assigned():
     assert la.assign_module("module", "json.decoder") == ["CPython"]
     assert la.assign_module("module", "pyimod02_importers") == ["PyInstaller"]
     assert la.assign_module("module", "httpx._client") == ["httpx"]
-    assert la.assign_module("script", "runtime_probe") == ["Scholia"]
+    assert la.assign_module("script", "app") == ["Scholia"]
     assert la.assign_module("module", "scholia_unknown_module") is None
 
 
@@ -58,7 +58,7 @@ def _put(root, rel, data=b""):
 
 def _ship(root, name):
     for source, dest in la.component(name)[1]:
-        _put(root, f"_internal/licenses/{name}/{dest}", source.read_bytes())
+        _put(root, f"Contents/Resources/licenses/{name}/{dest}", source.read_bytes())
 
 
 @pytest.fixture
@@ -95,21 +95,21 @@ def test_clean_bundle_passes(bundle):
 
 
 def test_cpython_files_must_come_from_the_build_interpreter(bundle):
-    _put(bundle, "_internal/Python.framework/Versions/3.13/Python", MACHO)  # genuine
+    _put(bundle, "Contents/Frameworks/Python.framework/Versions/3.13/Python", MACHO)  # genuine
     found, problems = la.audit(bundle)
-    assert problems == [] and "_internal/Python.framework/Versions/3.13/Python" in found["CPython"]
+    assert problems == [] and "Contents/Frameworks/Python.framework/Versions/3.13/Python" in found["CPython"]
     _put(bundle, f"{DYNLOAD}/_evil.cpython-313-darwin.so", MACHO)
     _put(bundle, f"{DYNLOAD}/libavcodec.61.dylib", MACHO)
-    _put(bundle, "_internal/Python.framework/Versions/3.13/lib/libgmp.10.dylib", MACHO)
+    _put(bundle, "Contents/Frameworks/Python.framework/Versions/3.13/lib/libgmp.10.dylib", MACHO)
     assert set(la.audit(bundle)[1]) == {
         f"{DYNLOAD}/_evil.cpython-313-darwin.so: belongs to no known component",
         f"{DYNLOAD}/libavcodec.61.dylib: belongs to no known component",
-        "_internal/Python.framework/Versions/3.13/lib/libgmp.10.dylib: belongs to no known component",
+        "Contents/Frameworks/Python.framework/Versions/3.13/lib/libgmp.10.dylib: belongs to no known component",
     }
 
 
 def test_base_library_members_must_all_be_known(bundle):
-    archive = bundle / "_internal/base_library.zip"
+    archive = bundle / "Contents/Resources/base_library.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("json/__init__.pyc", b"")
     assert la.audit(bundle)[1] == []
@@ -117,8 +117,8 @@ def test_base_library_members_must_all_be_known(bundle):
         zf.writestr("unknownpkg/__init__.pyc", b"")
         zf.writestr("libfoo.dylib", MACHO)
     assert la.audit(bundle)[1] == [
-        "_internal/base_library.zip: member libfoo.dylib belongs to no known component",
-        "_internal/base_library.zip: module unknownpkg.__init__ belongs to no known component",
+        "Contents/Resources/base_library.zip: member libfoo.dylib belongs to no known component",
+        "Contents/Resources/base_library.zip: module unknownpkg.__init__ belongs to no known component",
     ]
 
 
@@ -133,26 +133,26 @@ def test_missing_or_empty_bundle_fails(tmp_path, capsys):
 
 
 def test_file_of_no_known_component_fails(bundle):
-    _put(bundle, "_internal/libavcodec.61.dylib", MACHO)
+    _put(bundle, "Contents/Frameworks/libavcodec.61.dylib", MACHO)
     _put(bundle, "README.txt")
     problems = la.audit(bundle)[1]
-    assert any(p.startswith("_internal/libavcodec.61.dylib: belongs to no known") for p in problems)
+    assert any(p.startswith("Contents/Frameworks/libavcodec.61.dylib: belongs to no known") for p in problems)
     assert any(p.startswith("README.txt: belongs to no known") for p in problems)
 
 
 def test_disallowed_license_fails(bundle):
-    _put(bundle, "_internal/certifi/cacert.pem")
+    _put(bundle, "Contents/Resources/certifi/cacert.pem")
     _ship(bundle, "certifi")
     assert la.audit(bundle)[1] == ["certifi: license MPL-2.0 is not allowed"]
 
 
 def test_missing_or_changed_license_text_fails(bundle):
-    shipped = bundle / "_internal/licenses/CPython/LICENSE.txt"
+    shipped = bundle / "Contents/Resources/licenses/CPython/LICENSE.txt"
     shipped.write_bytes(shipped.read_bytes() + b"changed")
-    (bundle / "_internal/licenses/CPython/license.rst.txt").unlink()
+    (bundle / "Contents/Resources/licenses/CPython/license.rst.txt").unlink()
     problems = la.audit(bundle)[1]
-    assert "CPython: license file LICENSE.txt is not shipped in licenses/CPython/" in problems
-    assert "CPython: license file license.rst.txt is not shipped in licenses/CPython/" in problems
+    assert "CPython: license file LICENSE.txt is not shipped in Contents/Resources/licenses/CPython/" in problems
+    assert "CPython: license file license.rst.txt is not shipped in Contents/Resources/licenses/CPython/" in problems
 
 
 def test_embedded_library_needs_cpythons_license_document(bundle):
@@ -172,14 +172,14 @@ MACHO_MAGICS = [
 
 @pytest.mark.parametrize("magic", MACHO_MAGICS, ids=lambda m: m.hex())
 def test_unreviewed_native_code_from_a_distribution_fails(bundle, magic):
-    _put(bundle, "_internal/pydantic_core/_pydantic_core.cpython-313-darwin.so", magic + bytes(28))
+    _put(bundle, "Contents/Frameworks/pydantic_core/_pydantic_core.cpython-313-darwin.so", magic + bytes(28))
     _ship(bundle, "pydantic_core")
     problems = la.audit(bundle)[1]
     assert len(problems) == 1 and "has not been reviewed" in problems[0]
 
 
 def test_data_file_from_a_distribution_is_not_native_code(bundle):
-    _put(bundle, "_internal/pydantic_core/__init__.py", b"# Python source")
+    _put(bundle, "Contents/Frameworks/pydantic_core/__init__.py", b"# Python source")
     _ship(bundle, "pydantic_core")
     assert la.audit(bundle)[1] == []
 
@@ -193,11 +193,11 @@ def test_runtime_hooks_are_assigned_to_their_own_licenses():
 def test_community_runtime_hooks_are_apache_but_the_rest_of_their_distribution_is_not(bundle):
     _ship(bundle, la.CONTRIB_RTHOOKS)
     assert la._check(bundle, la.CONTRIB_RTHOOKS) == []
-    (bundle / f"_internal/licenses/{la.CONTRIB_RTHOOKS}/LICENSE").unlink()
+    (bundle / f"Contents/Resources/licenses/{la.CONTRIB_RTHOOKS}/LICENSE").unlink()
     assert la._check(bundle, la.CONTRIB_RTHOOKS) == [
-        f"{la.CONTRIB_RTHOOKS}: license file LICENSE is not shipped in licenses/{la.CONTRIB_RTHOOKS}/"
+        f"{la.CONTRIB_RTHOOKS}: license file LICENSE is not shipped in Contents/Resources/licenses/{la.CONTRIB_RTHOOKS}/"
     ]
-    _put(bundle, "_internal/_pyinstaller_hooks_contrib/__init__.py")
+    _put(bundle, "Contents/Frameworks/_pyinstaller_hooks_contrib/__init__.py")
     _ship(bundle, "pyinstaller-hooks-contrib")
     problems = la.audit(bundle)[1]
     assert len(problems) == 1 and problems[0].startswith("pyinstaller-hooks-contrib: license ")
@@ -205,54 +205,126 @@ def test_community_runtime_hooks_are_apache_but_the_rest_of_their_distribution_i
 
 
 def test_libraries_in_the_framework_need_the_same_review_as_at_top_level(bundle):
-    framework_lib = "_internal/Python.framework/Versions/3.13/lib"
+    framework_lib = "Contents/Frameworks/Python.framework/Versions/3.13/lib"
     _put(bundle, f"{framework_lib}/libssl.3.dylib", MACHO)  # OpenSSL, reviewed
     found, problems = la.audit(bundle)
     assert problems == [] and f"{framework_lib}/libssl.3.dylib" in found["OpenSSL"]
     _put(bundle, f"{framework_lib}/libgmp.10.dylib", MACHO)  # in the interpreter, not reviewed
-    _put(bundle, "_internal/libgmp.10.dylib", MACHO)
+    _put(bundle, "Contents/Frameworks/libgmp.10.dylib", MACHO)
     assert set(la.audit(bundle)[1]) == {
         f"{framework_lib}/libgmp.10.dylib: belongs to no known component",
-        "_internal/libgmp.10.dylib: belongs to no known component",
+        "Contents/Frameworks/libgmp.10.dylib: belongs to no known component",
     }
 
 
 def test_symlinks_inside_the_bundle_share_their_targets_component(bundle):
-    _put(bundle, "_internal/Python.framework/Versions/3.13/Python", MACHO)
-    (bundle / "_internal/Python.framework/Versions/Current").symlink_to("3.13")
-    (bundle / "_internal/Python").symlink_to("Python.framework/Versions/Current/Python")
+    _put(bundle, "Contents/Frameworks/Python.framework/Versions/3.13/Python", MACHO)
+    (bundle / "Contents/Frameworks/Python.framework/Versions/Current").symlink_to("3.13")
+    (bundle / "Contents/Frameworks/Python").symlink_to("Python.framework/Versions/Current/Python")
     found, problems = la.audit(bundle)
     assert problems == []
-    assert "_internal/Python" in found["CPython"] and "_internal/Python" in found["mimalloc"]
+    assert "Contents/Frameworks/Python" in found["CPython"] and "Contents/Frameworks/Python" in found["mimalloc"]
 
 
 def test_dangling_or_escaping_symlink_fails(bundle, tmp_path):
     outside = tmp_path / "libavcodec.61.dylib"
     outside.write_bytes(MACHO)
-    (bundle / "_internal/libavcodec.61.dylib").symlink_to(outside)
-    (bundle / "_internal/libgone.dylib").symlink_to("missing.dylib")
+    (bundle / "Contents/Frameworks/libavcodec.61.dylib").symlink_to(outside)
+    (bundle / "Contents/Frameworks/libgone.dylib").symlink_to("missing.dylib")
     assert la.audit(bundle)[1] == [
-        f"_internal/libavcodec.61.dylib: symlink to {outside.resolve()}, outside the bundle",
-        "_internal/libgone.dylib: symlink to nothing",
+        f"Contents/Frameworks/libavcodec.61.dylib: symlink to {outside.resolve()}, outside the bundle",
+        "Contents/Frameworks/libgone.dylib: symlink to nothing",
     ]
 
 
 def test_only_expected_license_files_may_sit_in_the_licenses_folder(bundle):
-    _put(bundle, "_internal/licenses/CPython/libevil.dylib", MACHO)
-    _put(bundle, "_internal/licenses/FFmpeg/libavcodec.61.dylib", MACHO)
+    _put(bundle, "Contents/Resources/licenses/CPython/libevil.dylib", MACHO)
+    _put(bundle, "Contents/Resources/licenses/FFmpeg/libavcodec.61.dylib", MACHO)
     assert la.audit(bundle)[1] == [
-        "_internal/licenses/CPython/libevil.dylib: not an expected license file",
-        "_internal/licenses/FFmpeg/libavcodec.61.dylib: not an expected license file",
+        "Contents/Resources/licenses/CPython/libevil.dylib: not an expected license file",
+        "Contents/Resources/licenses/FFmpeg/libavcodec.61.dylib: not an expected license file",
     ]
 
 
 @pytest.mark.parametrize("where", ["outside the bundle", "inside the bundle"])
 def test_license_file_must_be_a_regular_file_in_the_bundle(bundle, tmp_path, where):
-    shipped = bundle / "_internal/licenses/CPython/LICENSE.txt"
-    copy = (tmp_path if where == "outside the bundle" else bundle / "_internal") / "LICENSE.txt"
+    shipped = bundle / "Contents/Resources/licenses/CPython/LICENSE.txt"
+    copy = (tmp_path if where == "outside the bundle" else bundle / "Contents/Frameworks") / "LICENSE.txt"
     copy.write_bytes(shipped.read_bytes())  # the right text, but reached through a symlink
     shipped.unlink()
     shipped.symlink_to(copy)
     problems = la.audit(bundle)[1]
-    assert "CPython: license file LICENSE.txt is not shipped in licenses/CPython/" in problems
-    assert "_internal/licenses/CPython/LICENSE.txt: not an expected license file" not in problems
+    assert "CPython: license file LICENSE.txt is not shipped in Contents/Resources/licenses/CPython/" in problems
+    assert "Contents/Resources/licenses/CPython/LICENSE.txt: not an expected license file" not in problems
+
+
+def test_helper_files_belong_to_llama_cpp_and_need_its_notices(bundle):
+    _put(bundle, la.HELPER_SERVER, MACHO)
+    _put(bundle, "Contents/Frameworks/llama-cpp/libggml-metal.0.dylib", MACHO)
+    found, problems = la.audit(bundle)
+    assert problems == [f"{la.HELPER}: license file LICENSES.txt is not shipped in "
+                        f"Contents/Resources/licenses/{la.HELPER}/"]
+    assert found[la.HELPER] == {la.HELPER_SERVER, "Contents/Frameworks/llama-cpp/libggml-metal.0.dylib"}
+    _ship(bundle, la.HELPER)
+    assert la.audit(bundle)[1] == []
+
+
+def test_only_the_helpers_own_files_are_accepted_as_llama_cpp(bundle):
+    _ship(bundle, la.HELPER)
+    _put(bundle, "Contents/Frameworks/llama-cpp/libavcodec.61.dylib", MACHO)
+    _put(bundle, "Contents/Frameworks/llama-cpp/libllama.0.dylib", b"not Mach-O")
+    _put(bundle, "Contents/MacOS/llama-server", b"#!/bin/sh")
+    assert set(la.audit(bundle)[1]) == {
+        "Contents/Frameworks/llama-cpp/libavcodec.61.dylib: belongs to no known component",
+        "Contents/Frameworks/llama-cpp/libllama.0.dylib: belongs to no known component",
+        "Contents/MacOS/llama-server: belongs to no known component",
+    }
+
+
+def test_llama_cpp_notices_cover_what_the_release_embeds():
+    text = (la.ROOT / "tools/notices/llama.cpp/LICENSES.txt").read_text()
+    for name in ("llama.cpp", "cpp-httplib", "BoringSSL", "jsonhpp"):
+        assert f"License for {name}\n" in text
+
+
+def test_app_metadata_and_pyinstallers_icon_are_known(bundle):
+    _put(bundle, "Contents/Info.plist")
+    _put(bundle, "Contents/_CodeSignature/CodeResources")
+    _put(bundle, "Contents/Resources/icon-windowed.icns", la._pyinstaller_icon().read_bytes())
+    _ship(bundle, "PyInstaller")
+    _ship(bundle, "Scholia")
+    found, problems = la.audit(bundle)
+    assert problems == []
+    assert "Contents/Resources/icon-windowed.icns" in found["PyInstaller"]
+    _put(bundle, "Contents/Resources/icon-windowed.icns", b"another icon")
+    _put(bundle, "Contents/PlugIns/evil.dylib", MACHO)
+    assert set(la.audit(bundle)[1]) == {
+        "Contents/Resources/icon-windowed.icns: belongs to no known component",
+        "Contents/PlugIns/evil.dylib: belongs to no known component",
+    }
+
+
+def test_native_code_is_reviewed_file_by_file(bundle):
+    _put(bundle, "Contents/Frameworks/apsw/__init__.cpython-313-darwin.so", MACHO)
+    _ship(bundle, "apsw")
+    found, problems = la.audit(bundle)
+    assert problems == [] and "SQLite" in found
+    # apsw's Unicode tables are a separate native file, not reviewed
+    _put(bundle, "Contents/Frameworks/apsw/_unicode.cpython-313-darwin.so", MACHO)
+    assert la.audit(bundle)[1] == [
+        "Contents/Frameworks/apsw/_unicode.cpython-313-darwin.so: native code from apsw "
+        "has not been reviewed for the libraries it embeds"
+    ]
+
+
+def test_reviewed_licenses_and_supplied_notices():
+    assert la.component("apsw")[0] == "Zlib"
+    assert la.allowed(la.component("sqlite-vec")[0])
+    for name in la.SUPPLIED_NOTICES:
+        files = la.component(name)[1]
+        assert files and all(source.is_file() for source, _ in files), name
+    # The supplied PyObjC text is the one the Cocoa wheel ships for the same release.
+    cocoa = [source for source, _ in la.component("pyobjc-framework-Cocoa")[1]]
+    assert [p.read_bytes() for p in cocoa] == [
+        (la.ROOT / "tools/notices/pyobjc/License.txt").read_bytes()
+    ]
