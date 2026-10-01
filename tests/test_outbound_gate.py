@@ -266,6 +266,127 @@ def test_tightening_a_project_applies_to_the_next_request(db, remote, setup):
     assert len(remote.received) == 1
 
 
+# A candidate's link cannot reach a model provider or this machine
+
+
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+@pytest.mark.parametrize("configured", [False, True])
+def test_a_candidate_link_never_makes_a_model_provider_an_open_access_host(db, remote, setup, level, configured):
+    setup.change(provider_urls=(OPENROUTER_API, OTHER_PROVIDER) if configured else ())
+    project_id = project(db, level)
+    links = [CHAT, f"{OPENROUTER_API}/models", "http://openrouter.ai/x.pdf", "https://openrouter.ai:8443/x.pdf"]
+    if configured:  # an unconfigured provider's host is just another host
+        links += ["http://api.other-provider.example/paper.pdf", "https://api.other-provider.example:8443/p.pdf"]
+    for link in links:
+        with setup.gate.client(project_id, candidate_id=candidate(db, project_id, link), approved=True) as client:
+            for method, kwargs in (("POST", {"json": chat(plugins=[{"id": "web"}], provider={"zdr": False})}),
+                                   ("GET", {})):
+                try:
+                    client.request(method, link, headers=AUTH, **kwargs)
+                except OutboundDenied:
+                    pass
+    rows = [row for _, row in audit(db)]
+    assert len(rows) == 2 * len(links)
+    # Only the configured origins are model providers; every other spelling is unknown.
+    assert {row["kind"] for row in rows} == ({"model_provider", None} if configured else {None})
+    sent = {(r.method, str(r.url)) for r in remote.received}
+    configured_urls = {(method, url) for method in ("POST", "GET") for url in (CHAT, f"{OPENROUTER_API}/models")}
+    assert sent == (configured_urls if configured and level == "normal" else set())
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_link_never_makes_openrouter_an_open_access_host_async(db, remote, setup):
+    setup.change(provider_urls=())
+    project_id = await asyncio.to_thread(project, db, "private")
+    candidate_id = await asyncio.to_thread(candidate, db, project_id, CHAT)
+    async with setup.gate.async_client(project_id, candidate_id=candidate_id, approved=True) as client:
+        with pytest.raises(OutboundDenied, match="unknown_destination"):
+            await client.post(CHAT, json=chat(plugins=[{"id": "web"}], provider={"zdr": False}))
+    assert remote.received == []
+
+
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+@pytest.mark.parametrize(("method", "kwargs"), [
+    ("POST", {"json": {"q": "SECRET"}}),
+    ("PUT", {"content": b"SECRET"}),
+    ("GET", {"content": b"SECRET"}),
+    ("GET", {"content": iter([b"SECRET"])}),
+    ("DELETE", {}),
+    ("OPTIONS", {}),
+])
+def test_open_access_requests_are_fetches_only(db, remote, setup, level, method, kwargs):
+    project_id = project(db, level)
+    with setup.gate.client(project_id, candidate_id=candidate(db, project_id), approved=True) as client:
+        refused(client, method, OA_LINK, "not_a_fetch", **kwargs)
+        assert remote.received == []
+        client.get(OA_LINK)
+        client.head(OA_LINK)
+    assert [request.method for request in remote.received] == ["GET", "HEAD"]
+
+
+@pytest.mark.asyncio
+async def test_open_access_requests_are_fetches_only_async(db, remote, setup):
+    project_id = await asyncio.to_thread(project, db, "local_only")
+    candidate_id = await asyncio.to_thread(candidate, db, project_id)
+    async with setup.gate.async_client(project_id, candidate_id=candidate_id, approved=True) as client:
+        with pytest.raises(OutboundDenied, match="not_a_fetch"):
+            await client.post(OA_LINK, json={"q": "SECRET"})
+        await client.get(OA_LINK)
+    assert [request.method for request in remote.received] == ["GET"]
+
+
+THIS_HOST = [
+    "127.0.0.2", "127.255.255.254", "127.1", "2130706433", "0x7f000001", "0x7f.1", "017700000001",
+    "0x7f.0x0.0x0.0x1", "[::ffff:127.0.0.1]", "[::ffff:7f00:1]", "[0:0:0:0:0:0:0:1]", "[::127.0.0.1]",
+    "[::1%25lo0]", "0.0.0.0", "0", "[::]", "[::ffff:0.0.0.0]", "localhost.", "LocalHost", "foo.localhost",
+    "127.0.0.1.",
+]
+
+
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+@pytest.mark.parametrize("host", THIS_HOST)
+def test_every_spelling_of_this_machine_is_loopback(db, remote, setup, host, level):
+    project_id = project(db, level)
+    link = f"http://{host}:11434/v1/chat/completions"
+    candidate_id = candidate(db, project_id, link)
+    declare(db, LOCAL_SERVER)  # declared as 127.0.0.1, which these spellings do not match
+    with setup.gate.client(project_id, candidate_id=candidate_id, approved=True) as client:
+        refused(client, "POST", link, "unknown_destination", json=chat())
+        refused(client, "GET", link, "unknown_destination")
+    assert remote.received == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["127.1", "2130706433", "[::ffff:127.0.0.1]"])
+async def test_every_spelling_of_this_machine_is_loopback_async(db, remote, setup, host):
+    project_id = await asyncio.to_thread(project, db, "local_only")
+    link = f"http://{host}:11434/v1/chat/completions"
+    candidate_id = await asyncio.to_thread(candidate, db, project_id, link)
+    async with setup.gate.async_client(project_id, candidate_id=candidate_id, approved=True) as client:
+        with pytest.raises(OutboundDenied, match="unknown_destination"):
+            await client.post(link, json=chat())
+    assert remote.received == []
+
+
+def test_a_local_provider_is_matched_by_its_exact_spelling(db, remote, setup):
+    project_id = project(db, "local_only")
+    setup.change(provider_urls=("http://127.1:11434/v1", LOCAL_SERVER))
+    declare(db, "http://127.1:11434/v1")
+    with setup.gate.client(project_id) as client:
+        client.post("http://127.1:11434/v1/chat/completions", json=chat())  # declared as spelled
+        refused(client, "POST", f"{LOCAL_SERVER}/chat/completions", "not_declared", json=chat())
+    assert [request.url.host for request in remote.received] == ["127.1"]
+    assert [row["kind"] for _, row in audit(db)] == ["local_provider", "local_provider"]
+
+
+@pytest.mark.parametrize("host", ["10.0.0.5", "192.168.1.20", "1.2.3.4", "[2001:db8::1]", "localhost.example.com"])
+def test_other_addresses_are_not_loopback(db, remote, setup, host):
+    setup.change(provider_urls=(f"http://{host}:8000/v1",))
+    with setup.gate.client(project(db, "local_only")) as client:
+        refused(client, "GET", f"http://{host}:8000/v1/models", "not_allowed_at_level")
+    assert audit(db)[0][1]["kind"] == "model_provider"
+
+
 # Private model requests
 
 
@@ -393,22 +514,102 @@ def test_private_without_its_inputs_refuses(db, remote, setup, missing):
     assert remote.received == []
 
 
-def test_an_input_that_fails_sends_nothing(db, remote, setup):
-    def broken(key):
-        raise RuntimeError("credential store unavailable")
+def _broken(*args):
+    raise RuntimeError("SECRET-DETAIL store unavailable")
 
-    setup.change(key_attested=broken)
-    with pytest.raises(RuntimeError, match="credential store"):
-        private_post(setup, db, chat())
+
+@pytest.mark.parametrize(("level", "failing"), [
+    ("normal", "inputs"), ("private", "inputs"), ("local_only", "inputs"),
+    ("normal", "malformed"), ("private", "private_route"), ("private", "key_attested"),
+])
+def test_failing_inputs_are_recorded_as_a_refusal(db, remote, setup, level, failing):
+    if failing == "inputs":
+        gate = OutboundGate(db, _broken, transport=httpx.MockTransport(remote))
+    else:
+        setup.change(**({"provider_urls": None} if failing == "malformed" else {failing: _broken}))
+        gate = setup.gate
+    project_id = project(db, level)
+    with gate.client(project_id) as client, pytest.raises(OutboundDenied) as caught:
+        client.post(CHAT, json=chat(), headers=AUTH)
+    assert caught.value.reason == "gate_inputs_unavailable"
+    assert isinstance(caught.value.__cause__, (RuntimeError, TypeError))
     assert remote.received == []
+    assert audit(db) == [(project_id, {
+        "decision": "deny", "reason": "gate_inputs_unavailable", "kind": None,
+        "destination": "https://openrouter.ai:443", "method": "POST", "sensitivity": level, "approved": False})]
 
-    def broken_inputs():
-        raise RuntimeError("settings unreadable")
 
-    gate = OutboundGate(db, broken_inputs, transport=httpx.MockTransport(remote))
-    with gate.client(project(db)) as client, pytest.raises(RuntimeError, match="settings unreadable"):
-        client.get(f"{HELPER}/health")
+@pytest.mark.asyncio
+async def test_failing_inputs_are_recorded_as_a_refusal_async(db, remote, setup):
+    setup.change(key_attested=_broken)
+    project_id = await asyncio.to_thread(project, db, "private")
+    async with setup.gate.async_client(project_id) as client:
+        with pytest.raises(OutboundDenied, match="gate_inputs_unavailable"):
+            await client.post(CHAT, json=chat(), headers=AUTH)
     assert remote.received == []
+    assert await asyncio.to_thread(decisions, db) == [("deny", "gate_inputs_unavailable")]
+
+
+def test_private_checks_run_only_for_private_projects(db, remote, setup):
+    calls = []
+
+    def route(model):
+        calls.append("route")
+        raise RuntimeError("allowlist unreadable")
+
+    setup.change(private_route=route, key_attested=_broken)
+    for level in ("normal", "local_only"):
+        with setup.gate.client(project(db, level)) as client:
+            if level == "normal":
+                client.post(CHAT, json=chat(), headers=AUTH)
+            else:
+                refused(client, "POST", CHAT, "not_allowed_at_level", json=chat(), headers=AUTH)
+    assert calls == [] and len(remote.received) == 1
+    with setup.gate.client(project(db, "private")) as client:
+        refused(client, "POST", CHAT, "gate_inputs_unavailable", json=chat(), headers=AUTH)
+    assert calls == ["route"] and len(remote.received) == 1
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_project_made_private_during_the_check_is_refused(db, remote, setup, asynchronous):
+    # The Private checks were skipped for a Normal project; if the project turns
+    # Private before the decision is recorded, the request must not go out.
+    project_id = project(db)
+    inputs = setup.gate._inputs
+
+    def tighten_then_load():
+        db.write(lambda conn: conn.execute("UPDATE projects SET sensitivity = 'private' WHERE id = ?", (project_id,)))
+        return inputs()
+
+    gate = OutboundGate(db, tighten_then_load, transport=httpx.MockTransport(remote))
+    body = chat(plugins=[{"id": "web"}], provider={"zdr": False})
+    if asynchronous:
+        async def send():
+            async with gate.async_client(project_id) as client:
+                await client.post(CHAT, json=body, headers=AUTH)
+
+        with pytest.raises(OutboundDenied, match="sensitivity_changed"):
+            asyncio.run(send())
+    else:
+        with gate.client(project_id) as client:
+            refused(client, "POST", CHAT, "sensitivity_changed", json=body, headers=AUTH)
+    assert remote.received == []
+    assert audit(db)[0][1]["sensitivity"] == "private"
+
+
+def test_a_project_loosened_during_the_check_follows_its_new_level(db, remote, setup):
+    project_id = project(db, "private")
+    inputs = setup.gate._inputs
+
+    def loosen_then_load():
+        db.write(lambda conn: conn.execute("UPDATE projects SET sensitivity = 'normal' WHERE id = ?", (project_id,)))
+        return inputs()
+
+    gate = OutboundGate(db, loosen_then_load, transport=httpx.MockTransport(remote))
+    with gate.client(project_id) as client:
+        client.post(CHAT, json=chat(plugins=[{"id": "web"}]), headers=AUTH)
+    assert len(remote.received) == 1
+    assert audit(db)[0][1]["sensitivity"] == "normal"
 
 
 def test_private_rules_do_not_apply_at_normal(db, remote, setup):

@@ -9,8 +9,12 @@ origin is refused. Anything not classified is refused, and so is a request whose
 Host header or TLS name differs from its URL's host.
 
 Destination kinds: a model provider (configured in settings), a scholarly API, an
-open-access host taken from a named candidate of the project, the local helper,
-a local provider on loopback, and a model download source.
+open-access host taken from a named candidate of the project (fetches only: GET
+or HEAD without a body, and never a model provider's host), the local helper,
+a local provider on loopback, and a model download source. A host on this
+machine, however it is spelled (127.0.0.0/8, ::1, IPv4-mapped forms, 0.0.0.0,
+short and integer IPv4 forms, localhost names), is loopback: only the helper's
+and configured providers' exact origins count there, and nothing else does.
 
 - Normal: every kind.
 - Private: model requests only to OpenRouter, on the Private allowlist, carrying
@@ -28,20 +32,24 @@ decision, not delivery: a crash after the commit leaves an allow row for a
 request that was never sent. If the row cannot be written, nothing is sent.
 
 Inputs that come from settings and the Private flows arrive through
-`GateInputs`; a missing one refuses. Code in this process is trusted: the gate
+`GateInputs`; a missing one refuses, and one that fails is recorded as a refusal
+("gate_inputs_unavailable"). The Private checks call those inputs only for a
+project that is Private. Code in this process is trusted: the gate
 guards against mistakes and model-driven requests, not against code that builds
 its own client or reaches into a client's private attributes.
 
-Limits: "localhost" is resolved by the system, so a hosts file that maps it
-elsewhere is not detected. An open-access link to a private network address is
-treated like any other host. Cross-origin redirects are refused even between
-allowed hosts, whether or not the client follows them, so a source that
-redirects to another host (a download CDN, say) needs a change here when it is
-wired in.
+Limits: names are resolved by the system, so a hosts file that maps "localhost"
+elsewhere, or a public name that resolves to this machine or a private network
+address, is not detected; only an open-access fetch can reach such a name.
+Cross-origin redirects are refused even between allowed hosts, whether or not
+the client follows them, so a source that redirects to another host (a download
+CDN, say) needs a change here when it is wired in.
 """
 
 import asyncio
+import ipaddress
 import json
+import socket
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -58,7 +66,6 @@ class Kind(StrEnum):
     MODEL_DOWNLOAD = "model_download"
 
 
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 OPENROUTER = ("https", "openrouter.ai", 443)
 SCHOLARLY_APIS = frozenset({
     ("https", "api.openalex.org", 443),
@@ -84,6 +91,7 @@ PRIVATE_FIELDS = frozenset({
 ZDR = {"provider": {"zdr": True}}  # every Private request carries it, whatever the allowlist says
 _CLIENT_OPTIONS = frozenset({"base_url", "follow_redirects", "headers", "max_redirects", "timeout"})
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+_THIS_HOST = (ipaddress.IPv4Network("127.0.0.0/8"), ipaddress.IPv4Network("0.0.0.0/8"))
 
 
 class OutboundDenied(Exception):
@@ -157,28 +165,45 @@ class OutboundGate:
 
     def _check(self, request: httpx.Request, scope: _Scope) -> None:
         """Decide one request and record the decision. Raises OutboundDenied."""
-        inputs = self._inputs()
         target = _origin(request.url)
-        # Worked out before the transaction because it calls the inputs' functions.
-        private_problem = _private_problem(request, inputs) if target == OPENROUTER else "not_openrouter"
         # A Host header or TLS name other than the URL's could reach another site
         # behind the same server or CDN.
         addressed = (request.headers.get("host") == request.url.netloc.decode("ascii")
                      and "sni_hostname" not in request.extensions)
+        fetch = request.method in ("GET", "HEAD") and _body(request) == b""
+        # The inputs are called outside the transaction, and the Private checks only
+        # when the project is Private now. The level is read again in the transaction.
+        seen = self._db.read(lambda conn: _level(conn, scope.project_id))
+        error = None
+        try:
+            inputs = self._inputs()
+            providers = frozenset(_origin_of(url) for url in inputs.provider_urls)
+            helper = _origin_of(inputs.helper_url)
+            if target != OPENROUTER:
+                private_problem = "not_openrouter"
+            elif seen == "private":
+                private_problem = _private_problem(request, inputs)
+            else:
+                private_problem = "sensitivity_changed"  # used only if it became Private since
+        except Exception as caught:  # recorded as a refusal below, and chained to it
+            error = caught
 
         def decide(conn):
             # The level is read in the transaction that records the decision, so a
             # change of level is ordered entirely before or after it.
             level = _level(conn, scope.project_id)
-            kind = _classify(conn, target, inputs, scope)
-            reason = _policy(conn, level, kind, target, scope, private_problem)
-            if reason is None and not addressed:
-                reason = "host_mismatch"
+            if error is not None:
+                kind, reason = None, "gate_inputs_unavailable"
+            else:
+                kind = _classify(conn, target, providers, helper, scope)
+                reason = _policy(conn, level, kind, target, scope, private_problem, fetch)
+                if reason is None and not addressed:
+                    reason = "host_mismatch"
             _record(conn, request, scope, level, kind, _show(target), reason)
             return reason
 
         if reason := self._db.write(decide):
-            raise OutboundDenied(reason, _show(target))
+            raise OutboundDenied(reason, _show(target)) from error
 
     def _refuse_redirect(self, request: httpx.Request, scope: _Scope, destination: str) -> None:
         self._db.write(lambda conn: _record(
@@ -241,6 +266,28 @@ def _origin_of(text):
         return None
 
 
+def _is_this_host(host: str) -> bool:
+    """Whether host names this machine, in any spelling a resolver accepts."""
+    name = host.lower().removesuffix(".")
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        try:  # the short, integer, hex and octal IPv4 forms, as resolvers read them
+            address = ipaddress.IPv4Address(socket.inet_aton(name))
+        except (OSError, ValueError):
+            return False
+    if address.version == 6:
+        if address.ipv4_mapped:
+            address = address.ipv4_mapped
+        elif int(address) >> 32 == 0:  # ::, ::1 and IPv4-compatible forms
+            address = ipaddress.IPv4Address(int(address))
+        else:
+            return address.is_loopback
+    return any(address in network for network in _THIS_HOST)
+
+
 def _show(origin):
     if origin is None:
         return None
@@ -253,17 +300,19 @@ def _level(conn, project_id):
     return row[0] if row else None
 
 
-def _classify(conn, target, inputs, scope):
+def _classify(conn, target, providers, helper, scope):
     if target is None:
         return None
-    providers = {_origin_of(url) for url in inputs.provider_urls}
-    if target[1] in LOOPBACK_HOSTS:
-        # Loopback is only transport: just the helper and configured providers count.
-        if target == _origin_of(inputs.helper_url):
+    if _is_this_host(target[1]):
+        # Loopback is only transport: just the helper and configured providers
+        # count, at their exact origins, never a candidate's link.
+        if target == helper:
             return Kind.LOCAL_HELPER
         return Kind.LOCAL_PROVIDER if target in providers else None
     if target in providers:
         return Kind.MODEL_PROVIDER
+    if target[1] in {origin[1] for origin in providers if origin} | {OPENROUTER[1]}:
+        return None  # a model provider's host is never anything else, whatever a candidate says
     if target in SCHOLARLY_APIS:
         return Kind.SCHOLARLY_API
     if target in MODEL_SOURCES:
@@ -278,12 +327,14 @@ def _classify(conn, target, inputs, scope):
     return None
 
 
-def _policy(conn, level, kind, target, scope, private_problem):
+def _policy(conn, level, kind, target, scope, private_problem, fetch):
     """None to allow, or the reason for refusing."""
     if level is None:
         return "unknown_project"
     if kind is None:
         return "unknown_destination"
+    if kind is Kind.OPEN_ACCESS and not fetch:
+        return "not_a_fetch"
     if level == "normal" or kind is Kind.LOCAL_HELPER:
         return None
     if level == "private":
@@ -306,12 +357,12 @@ def _private_problem(request: httpx.Request, inputs: GateInputs):
         return "private_inputs_missing"
     if request.method != "POST":
         return "unchecked_request"
+    content = _body(request)
+    if content is None:
+        return "unchecked_request"
     try:
-        # A redirect hop reuses its first request's body unread; a body already in
-        # memory is safe to read, and what is read is exactly what is sent.
-        content = request.read() if isinstance(request.stream, httpx.ByteStream) else request.content
         body = json.loads(content, object_pairs_hook=_unique_keys)
-    except (httpx.RequestNotRead, ValueError, RecursionError):
+    except (ValueError, RecursionError):
         return "unchecked_request"
     if not isinstance(body, dict):
         return "unchecked_request"
@@ -343,6 +394,15 @@ def _private_problem(request: httpx.Request, inputs: GateInputs):
     if scheme.lower() != "bearer" or not key.strip() or inputs.key_attested(key.strip()) is not True:
         return "key_not_confirmed"
     return None
+
+
+def _body(request: httpx.Request):
+    """The request's body if it is in memory, else None (a streamed body).
+
+    A redirect hop reuses its first request's body unread; a body in memory is
+    safe to read, and what is read is exactly what is sent.
+    """
+    return request.read() if isinstance(request.stream, httpx.ByteStream) else None
 
 
 def _unique_keys(pairs):
