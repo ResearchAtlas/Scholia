@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -139,7 +140,8 @@ def test_an_existing_database_at_version_zero_is_backed_up_before_migrating(tmp_
     conn.close()
 
     Database(data).close()
-    [generation] = generations(data)
+    generation, *later_ones = generations(data)
+    assert len(later_ones) == len(MIGRATIONS) - 1  # one backup before each migration
     backup = sqlite3.connect((data / "backups" / "daily" / generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
     try:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 0
@@ -196,7 +198,7 @@ def test_a_backup_is_taken_before_each_migration_of_an_existing_database(tmp_pat
     with Database(data, migrations=MIGRATIONS + later) as db:
         assert {"second", "third"} <= table_names(db)
     daily = data / "backups" / "daily"
-    assert [user_version(daily / name / DB_NAME) for name in generations(data)] == [1, 2]
+    assert [user_version(daily / name / DB_NAME) for name in generations(data)] == [len(MIGRATIONS), len(MIGRATIONS) + 1]
 
 
 def test_a_failed_migration_keeps_the_previous_schema(tmp_path):
@@ -207,7 +209,7 @@ def test_a_failed_migration_keeps_the_previous_schema(tmp_path):
 
     with pytest.raises(sqlite3.OperationalError, match="missing"):
         Database(data, migrations=MIGRATIONS + (broken,))
-    assert user_version(data / DB_NAME) == 1
+    assert user_version(data / DB_NAME) == len(MIGRATIONS)
     with Database(data) as db:
         assert "extra" not in table_names(db)
         assert audit_events(db) == [("kept",)]
@@ -264,6 +266,46 @@ def test_two_instances_starting_on_a_new_data_folder_both_open_it(tmp_path):
         assert open_together(data) == []
         with Database(data) as db:
             assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects").fetchone()) == (1,)
+
+
+def hold_write_lock(path):
+    """A connection holding the write lock on path, as another instance's setup would."""
+    conn = sqlite3.connect(path, autocommit=True, check_same_thread=False)
+    conn.execute("BEGIN IMMEDIATE")
+    return conn
+
+
+def test_a_startup_waits_for_a_lock_held_while_it_switches_to_wal(tmp_path):
+    # Switching to WAL upgrades a read lock to a write lock, and SQLite reports busy
+    # for that at once, without calling the busy handler.
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / DB_NAME).touch()  # a new, empty file another instance is setting up
+    blocker = hold_write_lock(data / DB_NAME)
+    release = threading.Timer(0.3, blocker.execute, ("ROLLBACK",))
+    release.start()
+    try:
+        with Database(data) as db:
+            assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects").fetchone()) == (1,)
+    finally:
+        release.join()
+        blocker.close()
+
+
+def test_the_wal_switch_stops_waiting_after_the_busy_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(database_module, "BUSY_TIMEOUT_MS", 200)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / DB_NAME).touch()
+    blocker = hold_write_lock(data / DB_NAME)
+    try:
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            Database(data)
+        assert 0.2 <= time.monotonic() - started < 5
+    finally:
+        blocker.close()
+    assert (data / DB_NAME).stat().st_size == 0
 
 
 def test_the_startup_check_reads_the_file_header_in_one_snapshot(tmp_path, monkeypatch):
@@ -332,7 +374,7 @@ def test_a_process_killed_mid_migration_leaves_the_previous_schema(tmp_path):
     assert (data / f"{DB_NAME}-wal").stat().st_size > 0  # uncommitted pages reached the disk
 
     with Database(data) as db:  # passes quick_check
-        assert db.read(lambda conn: conn.execute("PRAGMA user_version").fetchone()) == (1,)
+        assert db.read(lambda conn: conn.execute("PRAGMA user_version").fetchone()) == (len(MIGRATIONS),)
         assert "extra" not in table_names(db)
         assert audit_events(db) == [("kept",)]
     with Database(data, migrations=MIGRATIONS + ("CREATE TABLE extra (x INTEGER) STRICT;",)) as db:
