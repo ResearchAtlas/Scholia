@@ -275,9 +275,10 @@ def _wait_started(server, thread, state):
     while not server.started:
         if not thread.is_alive():
             return False
-        current = state.get("maintenance_started")  # read before the total: an end between counts twice, never not at all
-        now = time.monotonic()
-        maintained = state.get("maintenance_seconds", 0.0) + (now - current if current is not None else 0.0)
+        with state.get("maintenance_lock") or contextlib.nullcontext():  # the clock and the times, as one reading
+            now = time.monotonic()
+            current = state.get("maintenance_started")
+            maintained = state.get("maintenance_seconds", 0.0) + (now - current if current is not None else 0.0)
         if now - began - maintained > START_SECONDS:
             return False
         thread.join(0.05)

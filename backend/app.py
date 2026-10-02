@@ -12,6 +12,7 @@ import json
 import logging
 import shutil
 import stat
+import threading
 import time
 from functools import partial
 from pathlib import Path
@@ -180,7 +181,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     """
     data_dir = Path(data_dir)
     frontend_dir = Path(frontend_dir).resolve() if frontend_dir else None
-    state = {}
+    state = {"maintenance_lock": threading.Lock()}  # see maintenance
     # ponytail: one lock for every write to a project's folder and for deleting a project, so a
     # write can never recreate the folder of a project deleted meanwhile; such writes are rare.
     project_files = asyncio.Lock()
@@ -188,14 +189,17 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @contextlib.contextmanager
     def maintenance():
         """Mark local maintenance for the desktop entry's start deadline: state holds when the
-        current maintenance started and how long finished maintenance took."""
-        started = time.monotonic()
-        state["maintenance_started"] = started
+        current maintenance started and how long finished maintenance took, both changed with
+        the clock read under state["maintenance_lock"], which the deadline reads under too."""
+        lock = state.setdefault("maintenance_lock", threading.Lock())  # made with the app; again after a restart
+        with lock:
+            started = state["maintenance_started"] = time.monotonic()
         try:
             yield
         finally:
-            state["maintenance_seconds"] = state.get("maintenance_seconds", 0.0) + time.monotonic() - started
-            state.pop("maintenance_started", None)
+            with lock:
+                state["maintenance_seconds"] = state.get("maintenance_seconds", 0.0) + time.monotonic() - started
+                del state["maintenance_started"]
 
     @contextlib.asynccontextmanager
     async def lifespan(app):

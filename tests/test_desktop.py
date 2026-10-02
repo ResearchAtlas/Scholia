@@ -397,3 +397,26 @@ def test_a_slow_database_opening_does_not_count_against_the_start_deadline(tmp_p
     assert desktop.run(tmp_path / "data", _open_and_close(seen), keyring_backend=FakeKeyring(),
                        listening=register_server) == 0
     assert seen == [True]
+
+
+def test_the_start_deadline_reads_the_clock_and_the_maintenance_times_together(monkeypatch):
+    import threading
+    lock = threading.Lock()
+    server, state = type("Server", (), {"started": False})(), {"maintenance_lock": lock}
+    readings = []
+
+    def clock():
+        readings.append(lock.locked())
+        server.started = len(readings) > 2
+        return 0.0
+
+    class Thread:
+        def is_alive(self):
+            return True
+
+        def join(self, seconds):
+            pass
+
+    monkeypatch.setattr(desktop.time, "monotonic", clock)
+    assert desktop._wait_started(server, Thread(), state) is True
+    assert readings[1:] == [True] * (len(readings) - 1)  # every reading after the first, under the app's lock
