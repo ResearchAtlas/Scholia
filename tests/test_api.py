@@ -328,3 +328,15 @@ async def test_a_project_folder_left_by_a_failed_removal_is_reported_and_removed
             os.chmod(folder, 0o700)
     async with started(data, keyring=keyring, setup=False):
         assert not folder.exists()  # the tombstone named it; the next launch removed it
+
+
+async def test_a_quoted_providers_key_clears_what_was_learned_about_the_provider(tmp_path):
+    from backend import openrouter_client
+    async with started(tmp_path / "data") as client:
+        await client.get("/api/providers/openrouter/models")
+        assert openrouter_client._caches
+        settings = (await client.get("/api/settings")).json()
+        response = await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            '"providers".openrouter.kind': "openai-compatible"}})
+        assert response.status_code == 200
+        assert not openrouter_client._caches

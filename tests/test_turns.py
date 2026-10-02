@@ -659,3 +659,33 @@ async def test_a_forced_shutdown_never_closes_the_database_under_running_work(tm
         await closing
         with pytest.raises(DatabaseClosedError):
             await asyncio.to_thread(db.read, lambda conn: None)
+
+
+@pytest.mark.parametrize("first, second, settled", [
+    # Both attempts report their cost: the call settles at their sum, reported.
+    ((400, {"error": {}, "usage": {"prompt_tokens": 10, "completion_tokens": 0, "cost": 0.001}}),
+     {"prompt_tokens": 10, "completion_tokens": 10, "cost": 0.002}, (0.003, "reported")),
+    # Token counts and no cost: each is priced from its tokens (unknown price: $1 in, $5 out per
+    # million), marked estimated.
+    ((400, {"error": {}, "usage": {"prompt_tokens": 1000, "completion_tokens": 0}}),
+     {"prompt_tokens": 1000, "completion_tokens": 1000}, (0.007, "estimated")),
+    # A rejection that went out and reported nothing keeps the estimate (section 4.3).
+    ((400, {"error": {}}), {"prompt_tokens": 10, "completion_tokens": 10, "cost": 0.002}, ("estimate", "estimated")),
+])
+async def test_a_call_settles_from_every_attempt_it_made(tmp_path, monkeypatch, first, second, settled):
+    from backend import openrouter
+    monkeypatch.setattr(openrouter, "resolve_model_reasoning",
+                        lambda route, effort, **kw: ({"effort": "high"}, None))
+    provider = MockProvider(first, (200, {"choices": [{"message": {"content": "ok"}}], "usage": second}))
+    async with started(tmp_path / "data", provider) as client:
+        settings = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            "providers.lab.kind": "openai-compatible", "providers.lab.base_url": "http://127.0.0.1:9/v1"}})
+        await client.put("/api/keys/lab", json={"key": "k"})
+        conversation = await new_conversation(client, title="t")
+        assert (await send(client, conversation, provider="lab", model="m"))[-1]["status"] == "succeeded"
+        assert len(provider.answers) == 2  # the field was rejected once, then sent without it
+        [(estimate, amount, basis)] = await rows(
+            client, "SELECT estimate_usd, settled_usd, basis FROM budget_reservations")
+        assert estimate > 0.002
+        assert (round(amount, 9), basis) == ((estimate if settled[0] == "estimate" else settled[0]), settled[1])

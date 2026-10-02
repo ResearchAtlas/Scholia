@@ -306,3 +306,25 @@ async def test_a_title_run_that_ended_without_a_title_is_never_replaced(tmp_path
         await background_idle(client)
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'title'") == [(1,)]
         assert len(provider.titles) == 1
+
+
+async def test_a_cancel_that_arrives_before_the_title_is_written_wins(tmp_path):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+
+        def cancel_then_answer(body):  # the Stop arrives while the title is on its way back
+            [active] = [a for a in client.state["harness"].registry.runs.values() if a.kind == "background"]
+            active.cancel_reason = "researcher"
+            active.cancel_requested.set()
+            return provider.answer("Too late", cost=0.0003)
+
+        provider.title_replies.append(cancel_then_answer)
+        await send(client, conversation_id)
+        await background_idle(client)
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'title'") == [
+            ("cancelled", "researcher")]
+        assert (await conversation(client, conversation_id))["title"] is None
+        # Its call finished and reported its cost, which is kept, once.
+        [(basis,)] = await rows(client, "SELECT basis FROM budget_reservations WHERE paying_conversation_id IS NULL")
+        assert basis == "reported"

@@ -618,9 +618,7 @@ class Harness:
                                {"step": call.step, "route": route.key, **attempt.record()})
                     _event(conn, active.run_id, "step_finished", finished)
                 if result.dispatched:
-                    usage = result.attempts[-1].usage if result.attempts else {}
-                    spending.settle(conn, call.reservation_id, result.reported_cost,
-                                    budget_router.cost_from_usage(route, usage))
+                    _settle_attempts(conn, call.reservation_id, route, result.attempts)
                 else:
                     spending.release(conn, call.reservation_id)
 
@@ -666,7 +664,7 @@ class Harness:
                 await self._write(lambda conn: self._finish_background(conn, active.run_id, "interrupted", None, inputs))
                 return
             await self._write(lambda conn: self._finish_background(
-                conn, active.run_id, "succeeded" if output is not None else "failed", output, inputs))
+                conn, active.run_id, "succeeded" if output is not None else "failed", output, inputs, active=active))
         except asyncio.CancelledError:
             call, shutdown = active.call, active.cancel_reason == "shutdown"
             cancel_reason = "revoked" if active.cancel_reason == "revoked" else "researcher"
@@ -721,10 +719,14 @@ class Harness:
                                   output=lambda result: _clean_title(result.content))
         return _clean_title(result.content) if result.ok else None
 
-    def _finish_background(self, conn, run_id, status, output, inputs, cancel_reason=None):
-        """The run's effect, terminal status and settled cost, in one transaction."""
+    def _finish_background(self, conn, run_id, status, output, inputs, cancel_reason=None, active=None):
+        """The run's effect, terminal status and settled cost, in one transaction. A cancel
+        requested before this commits wins: the run ends cancelled, with no effect."""
         if not _running(conn, run_id):
             return
+        if active is not None and active.cancel_requested.is_set() and active.cancel_reason != "shutdown":
+            status, output = "cancelled", None
+            cancel_reason = "revoked" if active.cancel_reason == "revoked" else "researcher"
         if status == "succeeded" and output is not None:
             # The title is written only if nobody changed it since the run was queued.
             conn.execute(
@@ -748,6 +750,32 @@ async def _through(awaitable):
             if task.cancelled():
                 raise
             cancelled = True
+
+
+def _settle_attempts(conn, reservation_id, route, attempts):
+    """Settle a recorded call from all of its dispatched attempts: their reported costs, or
+    priced reported tokens where an attempt reported no cost (then marked estimated). An
+    attempt that went out and reported no usage keeps the estimate: the call settles at the
+    reservation's estimate, or at what the others cost when that is more, marked estimated."""
+    total, basis = 0.0, "reported"
+    for attempt in attempts:
+        if not attempt.dispatched:
+            continue
+        cost = attempt.reported_cost
+        if cost is None:
+            cost = budget_router.cost_from_usage(route, attempt.usage)
+            if cost is None:
+                basis = "unknown"
+                continue
+            basis = "estimated" if basis == "reported" else basis
+        total += cost
+    if basis == "reported":
+        spending.settle(conn, reservation_id, total)
+    elif basis == "estimated":
+        spending.settle(conn, reservation_id, None, estimated_usd=total)
+    else:
+        row = conn.execute("SELECT estimate_usd FROM budget_reservations WHERE id = ?", (reservation_id,)).fetchone()
+        spending.settle(conn, reservation_id, None, estimated_usd=max(total, row[0]) if row else None)
 
 
 def _close_call(conn, call):

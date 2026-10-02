@@ -276,14 +276,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         loaded = await settings_for(body.project_id)  # for a project: checked to exist under the lock
         if body.hash != loaded._digest:
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
-        refuse_if_busy(_providers_changed(body.updates, providers.configured(data_dir)))  # before any field is written
+        changed = _providers_changed(body.updates, providers.configured(data_dir))
+        refuse_if_busy(changed)  # before any field is written
         try:
             await asyncio.to_thread(loaded.save, body.updates)
         except SettingsChanged:
             raise ApiError(409, "settings_changed", "The settings changed since they were read") from None
         except ValueError:
             raise ApiError(400, "invalid_setting", "A setting is not valid") from None
-        if any(key.split(".")[0] == "providers" for key in body.updates):
+        if changed:  # a provider's kind, URL or name changed: what was learned about it no longer holds
             openrouter.clear_negotiation_cache()
             openrouter_client.clear_cache()
         return {"values": loaded.values, "warnings": loaded.warnings, "hash": loaded._digest}
