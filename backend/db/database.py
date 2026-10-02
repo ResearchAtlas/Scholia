@@ -340,38 +340,50 @@ class Database:
         try:
             stamp = now.strftime(_STAMP)
             tmp = daily / f".{stamp}.tmp"
-            os.mkdir(tmp, 0o700)
-            published = None
-            try:
-                copy, info = tmp / DB_NAME, tmp / "backup.json"
-                _create_private(copy)
-                source.execute("VACUUM INTO ?", (str(copy),))
+            for attempt in range(_BACKUP_ATTEMPTS):
+                os.mkdir(tmp, 0o700)
+                published = None
                 try:
-                    check = _open_checked(copy, "quick_check", opened=self._check_stopped)
-                except DatabaseDamagedError as error:
-                    raise RuntimeError(f"the backup copy failed its check: {error}") from error
-                with closing(check):
-                    schema_version = check.execute("PRAGMA user_version").fetchone()[0]
-                _create_private(info, json.dumps({
-                    "app_version": APP_VERSION,
-                    "schema_version": schema_version,
-                    "sqlite_version": sqlite3.sqlite_version,
-                }).encode())
-                self._check_stopped()
-                settings = _copy_settings(self.data_dir, tmp)
-                for path in (copy, info, *reversed(settings), tmp):  # files before their folders
-                    _fsync(path)
-                self._check_stopped()  # the last point before it is published
-                generation = daily / stamp
-                os.rename(tmp, generation)
-                published = generation
-                _fsync(daily)
-            except BaseException as error:
-                # A failed backup must not count as one, even after its rename.
-                shutil.rmtree(published or tmp, ignore_errors=True)
-                if isinstance(error, sqlite3.OperationalError) and self._backups_stopped:
-                    raise BackupStoppedError("the backup was stopped") from error
-                raise
+                    copy, info = tmp / DB_NAME, tmp / "backup.json"
+                    _create_private(copy)
+                    source.execute("VACUUM INTO ?", (str(copy),))
+                    try:
+                        check = _open_checked(copy, "quick_check", opened=self._check_stopped)
+                    except DatabaseDamagedError as error:
+                        raise RuntimeError(f"the backup copy failed its check: {error}") from error
+                    with closing(check):
+                        schema_version = check.execute("PRAGMA user_version").fetchone()[0]
+                        projects = _research_projects(check)
+                    _create_private(info, json.dumps({
+                        "app_version": APP_VERSION,
+                        "schema_version": schema_version,
+                        "sqlite_version": sqlite3.sqlite_version,
+                    }).encode())
+                    self._check_stopped()
+                    settings = _copy_settings(self.data_dir, tmp)
+                    # A project in the copy whose folder is gone was deleted after the copy was
+                    # taken: copy again, so the database and the project folders show one state.
+                    gone = [p for p in projects if not (self.data_dir / "projects" / p).is_dir()]
+                    if gone and attempt + 1 < _BACKUP_ATTEMPTS:
+                        raise _Overlapped()
+                    if gone:
+                        log.warning("a backup holds %d projects whose folders are missing", len(gone))
+                    for path in (copy, info, *reversed(settings), tmp):  # files before their folders
+                        _fsync(path)
+                    self._check_stopped()  # the last point before it is published
+                    generation = daily / stamp
+                    os.rename(tmp, generation)
+                    published = generation
+                    _fsync(daily)
+                    break
+                except _Overlapped:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                except BaseException as error:
+                    # A failed backup must not count as one, even after its rename.
+                    shutil.rmtree(published or tmp, ignore_errors=True)
+                    if isinstance(error, sqlite3.OperationalError) and self._backups_stopped:
+                        raise BackupStoppedError("the backup was stopped") from error
+                    raise
         finally:
             source.close()
         self._apply_retention(keep=generation)
@@ -500,6 +512,21 @@ def _rotate(backups, keep):
             shutil.rmtree(old)
     for old in _generations(weekly)[:-WEEKLY_KEPT]:
         shutil.rmtree(old)
+
+
+_BACKUP_ATTEMPTS = 3  # copies a backup takes when project deletions keep overlapping it
+
+
+class _Overlapped(Exception):
+    """A project was deleted while a backup copied it: the backup copies again."""
+
+
+def _research_projects(conn):
+    """The ids of the research projects (each has a folder) in a database copy."""
+    try:
+        return [row[0] for row in conn.execute("SELECT id FROM projects WHERE kind <> 'general'")]
+    except sqlite3.OperationalError:  # no projects table yet
+        return []
 
 
 def _copy_settings(data_dir, target):

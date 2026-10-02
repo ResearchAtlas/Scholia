@@ -187,14 +187,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     # write can never recreate the folder of a project deleted meanwhile; such writes are rare.
     project_files = asyncio.Lock()
 
-    async def daily_backup(db):
-        """The daily backup, under the project-files lock: the database it copies and the
-        project folders it copies show one state, since a project's deletion (which holds
-        the lock) waits for it. ponytail: in a daemon thread, so a backup stuck in a file
-        operation never holds the process open; its partial copy is removed by the next one."""
-        async with project_files:
-            await _in_daemon_thread(_daily_backup, db)
-
     @contextlib.asynccontextmanager
     async def lifespan(app):
         db = await asyncio.to_thread(Database, data_dir)
@@ -209,7 +201,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # The daily backup runs once the app is open, so a large folder never holds up its
             # start. Closing stops it (the next launch takes it) and waits for it at most
             # BACKUP_STOP_SECONDS, so the exit stays bounded.
-            backup = asyncio.ensure_future(daily_backup(db))
+            # ponytail: in a daemon thread, so a backup stuck in a file operation never holds
+            # the process open; its partial copy is removed by the next one. It takes no lock:
+            # a project deletion that overlaps it makes it copy again (Database._backup).
+            backup = asyncio.ensure_future(_in_daemon_thread(_daily_backup, db))
             yield
         finally:
             await harness.shutdown()
