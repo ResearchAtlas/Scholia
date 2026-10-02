@@ -74,6 +74,12 @@ class Message(BaseModel):
     effort: str | None = None
 
 
+class Continue(BaseModel):
+    model: str | None = Field(default=None, max_length=200)
+    provider: str | None = Field(default=None, max_length=100)
+    effort: str | None = None
+
+
 class Key(BaseModel):
     key: str = Field(min_length=1, max_length=1000)
 
@@ -384,7 +390,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
                                (conversation_id,)).fetchone()
             turns = conn.execute(
                 "SELECT t.run_id, t.seq, t.author, t.user_message, t.answer, t.result_saved, t.reason_code,"
-                " r.status, r.cancel_reason, r.settled_cost_usd, r.started_at, r.finished_at"
+                " r.status, r.cancel_reason, r.settled_cost_usd, r.started_at, r.finished_at, t.retry_of_run_id"
                 " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.conversation_id = ? ORDER BY t.seq",
                 (conversation_id,)).fetchall()
             return row, turns
@@ -396,8 +402,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             "run_id": run_id, "seq": seq, "author": author, "message": json.loads(message),
             "answer": json.loads(answer) if answer else None, "result_saved": bool(saved),
             "status": derived_status(status, run_id, registry), "reason_code": reason, "cancel_reason": cancel,
-            "cost_usd": cost, "started_at": started, "finished_at": finished,
-        } for run_id, seq, author, message, answer, saved, reason, status, cancel, cost, started, finished in turns]}
+            "cost_usd": cost, "started_at": started, "finished_at": finished, "continues": retry_of,
+        } for run_id, seq, author, message, answer, saved, reason, status, cancel, cost, started, finished, retry_of
+            in turns]}
 
     @app.put("/api/conversations/{conversation_id}")
     async def rename_conversation(conversation_id: str, body: Rename):
@@ -427,6 +434,16 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     async def send_message(conversation_id: str, body: Message):
         claim = await harness().admit_turn(conversation_id, body.content, model=body.model,
                                            provider=body.provider, effort=body.effort)
+
+        async def sse():
+            async for event in harness().events(claim):
+                yield f"data: {json.dumps(event)}\n\n"
+        return EventStream(sse())
+
+    @app.post("/api/runs/{run_id}/continue")
+    async def continue_run(run_id: str, body: Continue | None = None):
+        body = body or Continue()
+        claim = await harness().continue_turn(run_id, model=body.model, provider=body.provider, effort=body.effort)
 
         async def sse():
             async for event in harness().events(claim):

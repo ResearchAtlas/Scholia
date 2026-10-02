@@ -273,7 +273,26 @@ class Harness:
 
     # Turns
 
-    async def admit_turn(self, conversation_id: str, message, *, model=None, provider=None, effort=None) -> ActiveRun:
+    async def continue_turn(self, run_id: str, *, model=None, provider=None, effort=None) -> ActiveRun:
+        """Admit a new turn that continues an interrupted one, or one stopped at a limit or
+        revoked by a change to its project, from the conversation as it is now. It is the
+        conversation's latest turn; the new turn sends its message again and records
+        which run it continues. Its recorded steps are not reused."""
+        row = await self._read(lambda conn: conn.execute(
+            "SELECT t.conversation_id, t.user_message, r.status, r.cancel_reason,"
+            " t.seq = (SELECT max(seq) FROM turns WHERE conversation_id = t.conversation_id)"
+            " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.run_id = ?", (run_id,)).fetchone())
+        if row is None:
+            raise AdmissionError(404, "not_found", "No such turn")
+        conversation_id, message, status, cancel_reason, latest = row
+        status = derived_status(status, run_id, self.registry)
+        if not latest or not (status == "interrupted" or (status == "cancelled" and cancel_reason in ("limit", "revoked"))):
+            raise AdmissionError(409, "not_continuable", "Only the latest interrupted or stopped turn can be continued")
+        return await self.admit_turn(conversation_id, json.loads(message).get("text", ""), model=model,
+                                     provider=provider, effort=effort, retry_of=run_id)
+
+    async def admit_turn(self, conversation_id: str, message, *, model=None, provider=None, effort=None,
+                         retry_of=None) -> ActiveRun:
         """Validate a message and admit its turn, or raise AdmissionError having written nothing."""
         if not isinstance(message, str) or not message.strip():
             raise AdmissionError(400, "empty_message", "The message is empty")
@@ -284,12 +303,12 @@ class Harness:
         claim = self.registry.claim_turn(conversation_id)
         try:
             await self._record_dropped()
-            return await self._admit(claim, message, model=model, provider=provider, effort=effort)
+            return await self._admit(claim, message, model=model, provider=provider, effort=effort, retry_of=retry_of)
         except BaseException:
             self.registry.release(claim)
             raise
 
-    async def _admit(self, claim, message, *, model, provider, effort):
+    async def _admit(self, claim, message, *, model, provider, effort, retry_of):
         conversation = await self._read(lambda conn: conn.execute(
             "SELECT c.id, c.project_id, c.title, c.title_source, c.title_rev, c.budget_usd"
             " FROM conversations c WHERE c.id = ?", (claim.conversation_id,)).fetchone())
@@ -339,9 +358,13 @@ class Harness:
                 (claim.run_id, project_id, claim.conversation_id,
                  json.dumps({"model_call_seconds": MODEL_CALL_SECONDS}),
                  json.dumps({"route": route.key, "effort": effort})))
+            if retry_of is not None and conn.execute(
+                    "SELECT 1 FROM turns WHERE run_id = ? AND seq = ? - 1", (retry_of, seq)).fetchone() is None:
+                raise AdmissionError(409, "not_continuable", "A newer turn was sent meanwhile")
             conn.execute(
-                "INSERT INTO turns (run_id, conversation_id, seq, author, user_message) VALUES (?, ?, ?, 'researcher', ?)",
-                (claim.run_id, claim.conversation_id, seq, json.dumps({"text": message})))
+                "INSERT INTO turns (run_id, conversation_id, seq, author, user_message, retry_of_run_id)"
+                " VALUES (?, ?, ?, 'researcher', ?, ?)",
+                (claim.run_id, claim.conversation_id, seq, json.dumps({"text": message}), retry_of))
             _event(conn, claim.run_id, "route", {"route": route.key, "plan": plan.to_dict()})
             return seq, history[::-1]
 
