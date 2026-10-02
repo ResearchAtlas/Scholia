@@ -1,0 +1,239 @@
+"""Detached post-answer work: title runs, their guard, cancel, and the recovery rules.
+
+A title run is written in the turn's primary commit and runs outside the turn.
+It writes the title only if the conversation's title is unchanged since the run
+was queued (title_rev) and was not set by the researcher. On every start it
+finishes from a recorded step with no model call, restarts while it has made
+fewer than 2 attempts, or is marked interrupted; a finished run never re-runs.
+Crash kill points are in test_durability_kill.py.
+"""
+
+import asyncio
+import json
+
+import pytest
+
+from backend.db import new_id
+from scholia_app import FakeKeyring, MockProvider, background_idle, send, started
+
+pytestmark = pytest.mark.asyncio
+
+
+async def new_conversation(client, **body):
+    return (await client.post("/api/conversations", json=body)).json()["id"]
+
+
+async def rows(client, sql, *args):
+    return await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(sql, args).fetchall())
+
+
+async def title_run(client):
+    [(run_id,)] = await rows(client, "SELECT id FROM runs WHERE kind = 'background' AND workflow = 'title'")
+    return run_id
+
+
+async def wait_for(predicate, timeout=5.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() > deadline:
+            raise AssertionError("condition not reached")
+        await asyncio.sleep(0.01)
+
+
+def hold_titles(provider, text="A generated title"):
+    release = asyncio.Event()
+
+    async def reply(body):
+        await release.wait()
+        return provider.answer(text, cost=0.0003)
+
+    provider.title_replies.append(reply)
+    return release
+
+
+async def conversation(client, conversation_id):
+    return (await client.get(f"/api/conversations/{conversation_id}")).json()
+
+
+async def test_the_first_answer_queues_one_title_run_that_counts_toward_the_project_only(tmp_path):
+    provider = MockProvider()
+    provider.title_replies.append(provider.answer("Cohort studies explained", cost=0.0003))
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id)
+        await background_idle(client)
+        await send(client, conversation_id, "and a second question")
+        await background_idle(client)
+
+        found = await conversation(client, conversation_id)
+        assert (found["title"], found["title_source"], found["title_rev"]) == ("Cohort studies explained", "generated", 1)
+        assert len(provider.titles) == 1  # the second turn queued no title
+        assert provider.titles[0]["messages"][1]["content"] == "What is a cohort study?"  # the researcher's words only
+        run_id = await title_run(client)
+        assert await rows(client, "SELECT status, attempts, settled_cost_usd, conversation_id, source_turn_id IS NOT NULL"
+                                  " FROM runs WHERE id = ?", run_id) == [("succeeded", 1, 0.0003, None, 1)]
+        assert await rows(client, "SELECT paying_conversation_id, settled_usd, basis FROM budget_reservations"
+                                  " WHERE run_id = ?", run_id) == [(None, 0.0003, "reported")]
+        activity = (await client.get("/api/activity")).json()["runs"]
+        assert [(r["workflow"], r["status"], r["cost_usd"]) for r in activity] == [("title", "succeeded", 0.0003)]
+
+
+async def test_a_conversation_named_by_the_researcher_gets_no_title_run(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation_id = await new_conversation(client, title="My own name")
+        await send(client, conversation_id)
+        await background_idle(client)
+        assert await rows(client, "SELECT count(*) FROM runs WHERE kind = 'background'") == [(0,)]
+        assert (await conversation(client, conversation_id))["title"] == "My own name"
+
+
+@pytest.mark.parametrize("new_title", ["Renamed by me", "A generated title"])
+async def test_a_rename_while_the_title_run_waits_wins_even_with_the_same_text(tmp_path, new_title):
+    provider = MockProvider()
+    release = hold_titles(provider)
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id)
+        await wait_for(lambda: provider.titles)
+        renamed = (await client.put(f"/api/conversations/{conversation_id}", json={"title": new_title})).json()
+        assert (renamed["title_source"], renamed["title_rev"]) == ("researcher", 1)
+        release.set()
+        await background_idle(client)
+
+        found = await conversation(client, conversation_id)
+        assert (found["title"], found["title_source"], found["title_rev"]) == (new_title, "researcher", 1)
+        assert await rows(client, "SELECT status FROM runs WHERE kind = 'background'") == [("succeeded",)]
+
+
+async def test_the_next_message_is_accepted_while_the_title_runs(tmp_path):
+    provider = MockProvider()
+    release = hold_titles(provider)
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id)
+        await wait_for(lambda: provider.titles)
+        assert (await send(client, conversation_id, "next"))[-1]["status"] == "succeeded"
+        release.set()
+        await background_idle(client)
+        assert (await conversation(client, conversation_id))["title"] == "A generated title"
+
+
+async def test_stop_on_the_turn_leaves_its_title_run_and_cancel_in_the_list_stops_it(tmp_path):
+    provider = MockProvider()
+    hold_titles(provider)  # never released
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        turn = (await send(client, conversation_id))[0]["run_id"]
+        await wait_for(lambda: provider.titles)
+        title = await title_run(client)
+
+        assert (await client.post(f"/api/runs/{turn}/cancel")).json()["status"] == "succeeded"
+        assert client.state["harness"].registry.is_active(title)  # Stop on the turn left it running
+
+        assert (await client.post(f"/api/runs/{title}/cancel")).json()["status"] == "cancelling"
+        await background_idle(client)
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", title) == [
+            ("cancelled", "researcher")]
+        [(estimate, settled, basis)] = await rows(
+            client, "SELECT estimate_usd, settled_usd, basis FROM budget_reservations WHERE run_id = ?", title)
+        assert (settled, basis) == (estimate, "estimated")
+        assert (await conversation(client, conversation_id))["title"] is None
+
+
+async def test_deleting_the_conversation_while_its_title_run_waits_recreates_nothing(tmp_path):
+    provider = MockProvider()
+    release = hold_titles(provider)
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id)
+        await wait_for(lambda: provider.titles)
+        title = await title_run(client)
+        [(project,)] = await rows(client, "SELECT project_id FROM conversations")
+
+        assert (await client.delete(f"/api/conversations/{conversation_id}")).json() == {"ok": True}
+        release.set()
+        await background_idle(client)
+
+        assert await rows(client, "SELECT count(*) FROM conversations") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM runs") == [(0,)]
+        assert (await client.get(f"/api/conversations/{conversation_id}")).status_code == 404
+        # Both calls' spending stays in the project, without links, settled once.
+        spending = await rows(client, "SELECT run_id, paying_conversation_id, project_id, status FROM budget_reservations")
+        assert sorted(spending) == [(None, None, project, "settled")] * 2
+        assert not client.state["harness"].registry.is_active(title)
+
+
+async def test_a_failed_title_call_fails_only_the_title_run(tmp_path):
+    provider = MockProvider()
+    provider.title_replies.append((500, {"error": {"message": "boom"}}))
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        assert (await send(client, conversation_id))[-1]["status"] == "succeeded"
+        await background_idle(client)
+        assert await rows(client, "SELECT status FROM runs WHERE kind = 'background'") == [("failed",)]
+        found = await conversation(client, conversation_id)
+        assert (found["title"], found["turns"][0]["status"]) == (None, "succeeded")
+
+
+# The recovery rules, applied when the app starts
+
+
+async def seed_title_run(client, conversation_id, *, attempts, status="running", recorded=None):
+    """A title run as a crash would leave it; recorded is the output of a finished step."""
+    run_id = new_id()
+
+    def write(conn):
+        project, rev = conn.execute("SELECT project_id, title_rev FROM conversations WHERE id = ?",
+                                    (conversation_id,)).fetchone()
+        (turn,) = conn.execute("SELECT run_id FROM turns WHERE conversation_id = ?", (conversation_id,)).fetchone()
+        conn.execute(
+            "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, attempts, status, inputs)"
+            " VALUES (?, ?, 'background', 'title', ?, ?, ?, ?)",
+            (run_id, project, turn, attempts, status, json.dumps({
+                "conversation_id": conversation_id, "title_rev": rev, "route": "openrouter:test/model",
+                "message": "What is a cohort study?"})))
+        if recorded is not None:
+            conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'step_finished', ?)",
+                         (run_id, json.dumps({"step": 0, "outcome": "ok", "output": recorded})))
+    await asyncio.to_thread(client.state["db"].write, write)
+    return run_id
+
+
+@pytest.mark.parametrize("attempts, recorded, calls, status, title", [
+    (1, "Recorded title", 0, "succeeded", "Recorded title"),  # finished from the record, no model call
+    (2, "Recorded title", 0, "succeeded", "Recorded title"),
+    (0, None, 1, "succeeded", "A short title"),  # restarted
+    (1, None, 1, "succeeded", "A short title"),  # its second and last attempt
+    (2, None, 0, "interrupted", None),  # no attempt left
+])
+async def test_a_background_run_left_running_follows_the_recovery_rules(tmp_path, attempts, recorded, calls, status, title):
+    data, keyring = tmp_path / "data", FakeKeyring()
+    async with started(data, keyring=keyring) as client:
+        conversation_id = await new_conversation(client, title="Named first, so no title run is queued")
+        await send(client, conversation_id)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET title = NULL, title_source = NULL"))
+        run_id = await seed_title_run(client, conversation_id, attempts=attempts, recorded=recorded)
+
+    provider = MockProvider()
+    async with started(data, provider, keyring=keyring, setup=False) as client:
+        await background_idle(client)
+        assert len(provider.titles) == calls
+        assert await rows(client, "SELECT status, attempts FROM runs WHERE id = ?", run_id) == [
+            (status, attempts + calls)]
+        assert (await conversation(client, conversation_id))["title"] == title
+
+
+async def test_a_finished_background_run_never_runs_again(tmp_path):
+    data, keyring = tmp_path / "data", FakeKeyring()
+    async with started(data, keyring=keyring) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id)
+        await background_idle(client)
+        run_id = await title_run(client)
+    provider = MockProvider()
+    async with started(data, provider, keyring=keyring, setup=False) as client:
+        await background_idle(client)
+        assert provider.chats == []
+        assert await rows(client, "SELECT status, attempts FROM runs WHERE id = ?", run_id) == [("succeeded", 1)]

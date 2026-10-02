@@ -42,6 +42,7 @@ class MockProvider:
 
     def __init__(self, *replies, cost=0.002):
         self.replies = list(replies)
+        self.title_replies = []  # replies for title calls, which never take from `replies`
         self.requests = []
         self.cost = cost
         self.hold = None
@@ -60,9 +61,13 @@ class MockProvider:
             await self.hold.wait()
         if request.url.path.endswith("/models") or "/endpoints/" in request.url.path:
             return httpx.Response(200, json={"data": []})
-        reply = self.replies.pop(0) if self.replies else None
+        title = _is_title(body)
+        queue = self.title_replies if title else self.replies
+        reply = queue.pop(0) if queue else None
         if callable(reply):
             reply = reply(body)
+            if asyncio.iscoroutine(reply):
+                reply = await reply
         status, payload = reply if reply is not None else self.answer(_default_answer(body))
         return httpx.Response(status, json=payload)
 
@@ -70,10 +75,21 @@ class MockProvider:
     def chats(self):
         return [body for method, path, body in self.requests if path.endswith("/chat/completions")]
 
+    @property
+    def answers(self):
+        return [body for body in self.chats if not _is_title(body)]
+
+    @property
+    def titles(self):
+        return [body for body in self.chats if _is_title(body)]
+
+
+def _is_title(body):
+    return ((body or {}).get("messages") or [{}])[0].get("content", "").startswith("Write a title")
+
 
 def _default_answer(body):
-    system = (body or {}).get("messages", [{}])[0].get("content", "")
-    return "A short title" if system.startswith("Write a title") else "An answer."
+    return "A short title" if _is_title(body) else "An answer."
 
 
 def app_for(data_dir, provider, keyring=None, **options):
