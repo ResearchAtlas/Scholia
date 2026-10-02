@@ -315,8 +315,8 @@ class Harness:
         if conversation is None:
             raise AdmissionError(404, "not_found", "No such conversation")
         _, project_id, title, title_source, title_rev, conversation_budget = conversation
-        personal = load_settings(self.data_dir)
-        project_settings = load_settings(self.data_dir, project_id)
+        personal, project_settings = await asyncio.to_thread(
+            lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
         chosen = model or project_settings.values.get("models", {}).get("default") \
             or personal.values["models"]["default"]
         configured = providers.configured(self.data_dir, personal)
@@ -607,12 +607,12 @@ class Harness:
         """One model call for a background run. Returns its output, or None if it failed."""
         if workflow != "title":
             raise ValueError(f"unknown background workflow {workflow!r}")
-        route = providers.resolve_route(self.data_dir, *inputs["route"].split(":", 1))
+        route = await asyncio.to_thread(providers.resolve_route, self.data_dir, *inputs["route"].split(":", 1))
         key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
                                                 self.keyring_backend)
         if route is None or key is None:
             return None
-        budget = load_settings(self.data_dir, project_id).values["project"]["budget_usd"]
+        budget = (await asyncio.to_thread(load_settings, self.data_dir, project_id)).values["project"]["budget_usd"]
 
         def start(conn):
             if not _running(conn, active.run_id):
