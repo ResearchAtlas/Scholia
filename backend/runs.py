@@ -635,8 +635,9 @@ class Harness:
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         project_id = await self._read(lambda conn: conn.execute(
-            "SELECT project_id FROM budget_reservations WHERE id = ?", (call.reservation_id,)).fetchone())
-        if project_id is None:  # the project was deleted since admission
+            "SELECT b.project_id FROM budget_reservations b JOIN runs r ON r.id = b.run_id"
+            " WHERE b.id = ? AND r.status = 'running'", (call.reservation_id,)).fetchone())
+        if project_id is None:  # its run, conversation or project was deleted (or it ended) since admission
             raise asyncio.CancelledError()
         def dispatched():  # the gate let the request out: from here it may be billed
             call.dispatched = True

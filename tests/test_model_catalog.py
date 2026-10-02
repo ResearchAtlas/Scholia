@@ -259,3 +259,25 @@ async def test_connectivity_reports_an_unreachable_provider():
 
     assert await catalog.check_connectivity(client_for(serve), OPENROUTER, KEY) == {
         "reachable": False, "key_valid": None, "error_kind": "network"}
+
+
+def test_a_snapshot_older_than_a_cache_clear_lists_and_caches_nothing():
+    import asyncio
+
+    from backend import openrouter_client
+    from backend.providers import Provider
+    provider = Provider("openrouter", "openrouter", "https://openrouter.ai/api/v1")
+    calls = []
+
+    async def answer(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"data": [{"id": "a/b"}]})
+
+    async def go():
+        snapshot = openrouter_client.generation()  # read with the provider and its old key
+        openrouter_client.clear_cache()  # a key change lands meanwhile
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+            return await openrouter_client.models(client, provider, "old", generation=snapshot)
+
+    assert asyncio.run(go()) is None
+    assert calls == [] and not openrouter_client._caches

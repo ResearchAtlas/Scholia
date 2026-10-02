@@ -99,7 +99,8 @@ class Attempt:
         cost = self.reported_cost
         return {"outcome": self.outcome, "http_status": self.http_status, "elapsed_ms": self.elapsed_ms,
                 "dispatched": self.dispatched,
-                **tokens, "charge": "reported" if cost is not None else "unknown",
+                **tokens, "charge": "reported" if cost is not None else (
+                    "estimated" if "prompt_tokens" in tokens and "completion_tokens" in tokens else "unknown"),
                 **({"cost_usd": cost} if cost is not None else {})}
 
 

@@ -20,7 +20,7 @@ import anyio
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -99,6 +99,13 @@ class NewConversation(BaseModel):
 
 class Rename(BaseModel):
     title: str = Field(min_length=1, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def not_blank(cls, title):
+        if not title.strip():
+            raise ValueError("a title needs a visible character")
+        return title.strip()
 
 
 class Message(BaseModel):
@@ -261,12 +268,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
             return {"ok": True, "warning": await _to_end(set_up())}
 
-    learned = {"generation": 0}  # bumped whenever what was learned about providers is forgotten
+    def revoke_soon():
+        """For a deletion's on_committed: stop its runs on this loop as soon as it commits."""
+        loop, active = asyncio.get_running_loop(), harness()
+        return lambda revoked: loop.call_soon_threadsafe(active.revoke, revoked)
 
     def forget_providers():
         """Forget what was learned about providers (catalogs, reasoning negotiation), after a
-        provider's settings or key changed."""
-        learned["generation"] += 1
+        provider's settings or key changed. It starts a new catalog generation."""
         openrouter.clear_negotiation_cache()
         openrouter_client.clear_cache()
 
@@ -312,12 +321,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             if provider not in configured:
                 raise ApiError(404, "unknown_provider", "That provider is not set up")
             key = await asyncio.to_thread(credentials.load_key, data_dir, provider, keyring_backend)
-            generation = learned["generation"]
+            generation = openrouter_client.generation()
         general = await read(lambda conn: conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
         async with state["gate"].async_client(general) as client:
-            models = await openrouter_client.models(client, configured[provider], key, force=refresh)
-        if learned["generation"] != generation:  # the provider changed meanwhile: what this learned is stale
-            forget_providers()
+            # A snapshot older than a provider change caches nothing (its refresh is refused).
+            models = await openrouter_client.models(client, configured[provider], key, force=refresh,
+                                                    generation=generation)
+        if openrouter_client.generation() != generation:
             raise ApiError(409, "settings_changed", "The provider changed while its models were listed")
         status = openrouter_client.catalog_status(configured[provider], key)
         return {"models": sorted((models or {}).values(), key=lambda m: m["id"]), "status": status}
@@ -453,7 +463,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         if row[2] == "general":
             raise ApiError(400, "general_project", "The General project cannot be deleted")
         async def deleting():  # the record, the stopping of its runs and its folder, to their end
-            revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id)
+            revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id,
+                                              on_committed=revoke_soon())
             harness().revoke(revoked)
             return await asyncio.to_thread(_remove_folder, data_dir / "projects" / project_id)
 
@@ -541,7 +552,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @app.delete("/api/conversations/{conversation_id}")
     async def delete_conversation(conversation_id: str):
         async def deleting():  # the deletion and the stopping of its runs, together, to their end
-            revoked = await asyncio.to_thread(delete, db(), state["content"], "conversation", conversation_id)
+            revoked = await asyncio.to_thread(delete, db(), state["content"], "conversation", conversation_id,
+                                              on_committed=revoke_soon())
             harness().revoke(revoked)
 
         try:

@@ -563,7 +563,8 @@ async def test_an_invalid_reported_cost_neither_breaks_the_turn_nor_counts(tmp_p
         [(settled, basis)] = await rows(client, "SELECT settled_usd, basis FROM budget_reservations")
         assert basis == "estimated" and settled == pytest.approx(0.006)
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
-        assert turn["accounting"]["unknown_attempts"] == 1 and turn["accounting"]["reported_usd"] == 0
+        # Its tokens priced it, so it is estimated, not unknown.
+        assert turn["accounting"]["unknown_attempts"] == 0 and turn["accounting"]["reported_usd"] == 0
 
 
 async def test_a_providers_settings_and_key_do_not_change_while_a_run_uses_it(tmp_path):
@@ -690,6 +691,9 @@ async def test_a_call_settles_from_every_attempt_it_made(tmp_path, monkeypatch, 
             client, "SELECT estimate_usd, settled_usd, basis FROM budget_reservations")
         assert estimate > 0.002
         assert (round(amount, 9), basis) == ((estimate if settled[0] == "estimate" else settled[0]), settled[1])
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        # Only an attempt that went out and reported nothing usable counts as unknown.
+        assert turn["accounting"]["unknown_attempts"] == (1 if settled[0] == "estimate" else 0)
 
 
 async def test_a_claim_still_being_admitted_is_never_released_as_stale(tmp_path, monkeypatch):
@@ -799,10 +803,10 @@ async def test_a_cancelled_conversation_deletion_still_stops_its_running_turn(tm
         entered, release = threading.Event(), threading.Event()
         real = app_module.delete
 
-        def slow_delete(*args):
+        def slow_delete(*args, **kwargs):
             entered.set()
             release.wait(5)
-            return real(*args)
+            return real(*args, **kwargs)
 
         monkeypatch.setattr(app_module, "delete", slow_delete)
         deletion = asyncio.create_task(client.delete(f"/api/conversations/{conversation}"))
@@ -841,3 +845,30 @@ async def test_a_provider_change_waits_for_an_admission_snapshot_and_is_then_ref
         assert (await change).json()["code"] == "active_run"  # then the turn holds the provider
         assert [e async for e in harness.events(claim)][-1]["status"] == "succeeded"
         await background_idle(client)
+
+
+async def test_a_conversation_deleted_between_reservation_and_dispatch_sends_nothing(tmp_path, monkeypatch):
+    from backend.db import ContentStore
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "never sent")
+        stream = harness.events(claim)
+        assert (await anext(stream))["type"] == "run_started"
+        assert (await anext(stream))["type"] == "step"  # reserved; it dispatches on the next pull
+        cleaning, release = threading.Event(), threading.Event()
+        real = ContentStore.collect_garbage
+
+        def slow_cleanup(self, *args):  # the deletion has committed; its cleanup is slow
+            cleaning.set()
+            release.wait(5)
+            return real(self, *args)
+
+        monkeypatch.setattr(ContentStore, "collect_garbage", slow_cleanup)
+        deletion = asyncio.create_task(client.delete(f"/api/conversations/{conversation}"))
+        await asyncio.to_thread(cleaning.wait, 5)
+        rest = [event async for event in stream]  # revoked on commit, before the cleanup ends
+        release.set()
+        assert (await deletion).json() == {"ok": True}
+        assert client.provider.answers == []
+        assert rest[-1]["type"] == "run_finished"

@@ -616,3 +616,12 @@ async def test_a_key_for_a_provider_removed_meanwhile_is_not_stored(tmp_path):
         response = await saving
         assert (response.status_code, response.json()["code"]) == (404, "unknown_provider")
         assert not [name for _, name in client.keyring.keys if name == "lab"]
+
+
+async def test_a_blank_rename_is_refused_and_a_title_is_trimmed(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={"title": "First"})).json()["id"]
+        refused = await client.put(f"/api/conversations/{conversation}", json={"title": "   "})
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
+        renamed = await client.put(f"/api/conversations/{conversation}", json={"title": "  Second  "})
+        assert renamed.json()["title"] == "Second"

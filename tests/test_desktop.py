@@ -164,7 +164,7 @@ def test_a_folder_that_cannot_be_listed_is_closed_and_the_data_folder_refused(tm
     os.symlink(tmp_path / "elsewhere.md", data / "projects" / "p" / "AGENTS.md")  # hidden from the walk
     (data / "b" / "f").write_text("x")
     os.chmod(data / "b" / "f", 0o644)
-    os.chmod(data / "projects" / "p", 0o333)  # its owner cannot list it
+    os.chmod(data / "projects" / "p", 0o311)  # its owner cannot list it
     try:
         with pytest.raises(desktop.UnsafeDataFolderError):
             desktop.narrow_tree(data)
@@ -192,3 +192,39 @@ def test_a_data_folder_holding_a_link_is_refused_and_the_link_is_never_followed(
     windows = []
     assert desktop.run(data, windows.append) == 1  # the app does not open it
     assert windows == [] and not (data / "scholia.sqlite3").exists()
+
+
+@pytest.mark.parametrize("item, mode", [("config.toml", 0o666), ("projects", 0o777), ("credentials.json", 0o620)])
+def test_a_data_folder_others_could_write_is_refused_and_left_as_it_is(tmp_path, item, mode):
+    data = tmp_path / "data"
+    (data / "projects").mkdir(parents=True)
+    for name in ("config.toml", "credentials.json"):
+        (data / name).write_text("x")
+        os.chmod(data / name, 0o600)
+    os.chmod(data / item, mode)  # planted settings could be anyone's
+    with pytest.raises(desktop.UnsafeDataFolderError):
+        desktop.narrow_tree(data)
+    assert stat.S_IMODE((data / item).stat().st_mode) == mode  # refused until the researcher checks it
+    assert desktop.run(data, [].append) == 1
+    os.chmod(data / item, mode & ~0o022)  # once checked and narrowed, it opens
+    desktop.narrow_tree(data)
+
+
+def test_a_data_folder_with_an_access_rule_letting_others_in_is_refused(tmp_path):
+    from network_guard import allow_subprocess
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "config.toml").write_text("x")
+    os.chmod(data / "config.toml", 0o600)
+    with allow_subprocess("/bin/chmod"):
+        subprocess.run(["/bin/chmod", "+a", "everyone allow read", str(data / "config.toml")], check=True)
+        try:
+            with pytest.raises(desktop.UnsafeDataFolderError):
+                desktop.narrow_tree(data)
+        finally:
+            subprocess.run(["/bin/chmod", "-N", str(data / "config.toml")], check=True)
+        subprocess.run(["/bin/chmod", "+a", "everyone deny delete", str(data / "config.toml")], check=True)
+        try:
+            desktop.narrow_tree(data)  # a deny rule lets nobody in
+        finally:
+            subprocess.run(["/bin/chmod", "-N", str(data / "config.toml")], check=True)

@@ -13,7 +13,9 @@ is not supported: only this entry takes the lock.
 
 import asyncio
 import contextlib
+import ctypes
 import fcntl
+import functools
 import json
 import logging
 import os
@@ -68,60 +70,93 @@ def take_lock(data_dir) -> int | None:
 
 
 def narrow_tree(data_dir) -> None:
-    """Narrow an existing data folder to owner-only: folders to at most 0700 and files to at
-    most 0600, never broadening a mode. A folder copied or restored with wider modes is
-    closed to other accounts before anything is opened.
+    """Narrow an existing data folder to owner-only (folders to at most 0700, files to at
+    most 0600, never broadening a mode) before anything in it is opened, or refuse it.
 
     The walk starts at the data folder's real path (the folder itself may be a link the
-    researcher made; the app opens everything through it). The app never makes a link
-    inside it, so a folder holding one is refused (UnsafeDataFolderError) rather than
-    followed later by a reader of settings, keys or instructions; so is a folder holding
-    a folder that cannot be listed, since what it holds cannot be checked. Each folder is
-    narrowed before it is listed, and the walk narrows everything it can reach before it
-    refuses, so whatever the outcome nothing is left open to other accounts."""
-    pending, refused = [os.path.realpath(data_dir)], None
+    researcher made; the app opens everything through it). It refuses the folder
+    (UnsafeDataFolderError) when what it holds may have been changed by another account,
+    since a reader of settings, keys or instructions would trust it: a link (the app never
+    makes one there), an item another account owns, an item other accounts could write
+    (group or other write; left as it is, so the folder stays refused until the
+    researcher checks and narrows it), an access-control entry that allows someone in,
+    or a folder that cannot be listed, whose contents cannot be checked. The walk narrows
+    everything else it reaches before it refuses."""
+    pending, problem = [os.path.realpath(data_dir)], None
     while pending:
         folder = pending.pop()
+        found = _narrow(folder, 0o700)
+        problem = problem or found
+        if found == _LINK:  # put there meanwhile: never listed
+            continue
         try:
-            if not _narrow(folder, 0o700):
-                continue
             entries = list(os.scandir(folder))
         except FileNotFoundError:  # removed meanwhile
             continue
         except PermissionError:
-            refused = refused or UnsafeDataFolderError("a folder in the data folder cannot be listed")
-            continue
-        except UnsafeDataFolderError as error:
-            refused = refused or error
+            problem = problem or "a folder in it cannot be listed"
             continue
         for entry in entries:
-            if entry.is_symlink():
-                refused = refused or UnsafeDataFolderError("the data folder holds a link, which Scholia does not follow")
-            elif entry.is_dir(follow_symlinks=False):
+            if entry.is_dir(follow_symlinks=False):
                 pending.append(entry.path)
             else:
-                try:
-                    _narrow(entry.path, 0o600)
-                except UnsafeDataFolderError as error:
-                    refused = refused or error
-    if refused is not None:
-        raise refused
+                problem = problem or _narrow(entry.path, 0o600)
+    if problem:
+        raise UnsafeDataFolderError(f"Scholia will not open its data folder: {problem}")
 
 
-def _narrow(path, mask) -> bool:
-    """Narrow path's mode to mask, never broadening it. Returns whether path is a real
-    folder or file that is still there; a link (put there meanwhile) is refused.
-    ponytail: lstat, then chmod; the data folder is owner-only, so nobody else can swap
-    in a link between the two."""
+_LINK = "it holds a link"
+
+
+def _narrow(path, mask):
+    """Narrow path's mode to mask, unless another account may have changed it. Returns why
+    it is unsafe, or None. ponytail: lstat, then chmod; the folder above is checked first,
+    so nobody else can swap in a link between the two."""
     try:
         info = os.lstat(path)
-        if stat.S_ISLNK(info.st_mode):
-            raise UnsafeDataFolderError("the data folder holds a link, which Scholia does not follow")
-        if stat.S_IMODE(info.st_mode) & ~mask:
-            os.chmod(path, stat.S_IMODE(info.st_mode) & mask, follow_symlinks=False)
-        return True
     except FileNotFoundError:  # removed meanwhile
+        return None
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode):
+        return _LINK
+    if info.st_uid != os.getuid():
+        return "it holds an item another account owns"
+    if mode & 0o022:
+        return "other accounts could change what it holds"
+    if _acl_allows(path):
+        return "an access rule lets other accounts in"
+    if mode & ~mask:
+        os.chmod(path, mode & mask, follow_symlinks=False)
+    return None
+
+
+@functools.cache
+def _libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_get_link_np.restype = ctypes.c_void_p
+    libc.acl_get_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    libc.acl_to_text.restype = ctypes.c_void_p
+    libc.acl_to_text.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    return libc
+
+
+def _acl_allows(path) -> bool:
+    """Whether path carries a macOS access-control entry that allows something, which can
+    let another account in whatever its mode says (deny entries are harmless)."""
+    if sys.platform != "darwin":
         return False
+    acl = _libc().acl_get_link_np(os.fsencode(path), 0x100)  # ACL_TYPE_EXTENDED
+    if not acl:
+        return False
+    try:
+        text = _libc().acl_to_text(acl, None)
+        try:
+            return b":allow:" in ctypes.string_at(text)
+        finally:
+            _libc().acl_free(text)
+    finally:
+        _libc().acl_free(acl)
 
 
 def frontend_folder() -> Path:

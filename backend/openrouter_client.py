@@ -32,6 +32,12 @@ MAX_CATALOG_MODELS = 10000
 CATALOG_SECONDS = 20
 
 _caches: dict[tuple, dict] = {}
+_generation = 0  # bumped by clear_cache(); a snapshot taken before it lists nothing (Scholia)
+
+
+def generation():
+    """The cache's generation, to read with a provider and key snapshot (see models)."""
+    return _generation
 
 
 def _scope(provider, key):
@@ -174,8 +180,13 @@ async def _refresh(client, provider, key, state):
                  error="zdr_unverified" if provider.is_openrouter and zdr is None else None)
 
 
-async def models(client, provider, key, *, force=False):
-    """The provider's models by id, refreshed when stale, or None if never fetched."""
+async def models(client, provider, key, *, force=False, generation=None):
+    """The provider's models by id, refreshed when stale, or None if never fetched.
+    generation, if given, is generation() as read with provider and key: if the cache was
+    cleared since (their settings changed), the snapshot is stale and nothing is listed or
+    cached from it."""
+    if generation is not None and generation != _generation:
+        return None
     state = _cache_state(provider, key)
     age = time.time() - state["last_fetched"]
     if state["task"] is not None and not state["task"].done():
@@ -203,6 +214,8 @@ def get_model_metadata(route):
 
 
 def clear_cache():
+    global _generation
+    _generation += 1
     _caches.clear()
 
 
