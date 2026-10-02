@@ -191,7 +191,7 @@ async def seed_title_run(client, conversation_id, *, attempts, status="running",
             "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, attempts, status, inputs)"
             " VALUES (?, ?, 'background', 'title', ?, ?, ?, ?)",
             (run_id, project, turn, attempts, status, json.dumps({
-                "conversation_id": conversation_id, "title_rev": rev, "route": "openrouter:test/model",
+                "conversation_id": conversation_id, "title_rev": rev, "provider": "openrouter", "model": "test/model",
                 "message": "What is a cohort study?"})))
         if recorded is not None:
             step = {"step": 0, "outcome": outcome, **({"output": recorded} if outcome == "ok" else {})}
@@ -260,3 +260,33 @@ async def test_cancelling_a_title_run_twice_ends_it_once_and_it_never_restarts(t
         assert len(provider.titles) == 1
         assert await rows(client, "SELECT status, attempts FROM runs WHERE id = ?", title) == [("cancelled", 1)]
         assert (await client.post(f"/api/runs/{title}/cancel")).json()["status"] == "cancelled"
+
+
+async def test_a_second_message_while_the_title_is_pending_queues_no_second_title(tmp_path):
+    provider = MockProvider()
+    release = hold_titles(provider, text="The first title")
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id, "first")
+        await wait_for(lambda: provider.titles)
+        await send(client, conversation_id, "second")
+        release.set()
+        await background_idle(client)
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'title'") == [(1,)]
+        assert len(provider.titles) == 1
+        assert (await conversation(client, conversation_id))["title"] == "The first title"
+
+
+async def test_a_provider_named_with_a_colon_titles_its_conversations(tmp_path):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        settings = (await client.get("/api/settings")).json()
+        response = await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            '"providers"."lab:v2".kind': "openai-compatible", '"providers"."lab:v2".base_url': "http://127.0.0.1:9/v1"}})
+        assert response.status_code == 200, response.text
+        assert (await client.put("/api/keys/lab:v2", json={"key": "k"})).status_code == 200
+        conversation_id = await new_conversation(client)
+        assert (await send(client, conversation_id, provider="lab:v2", model="m:1"))[-1]["status"] == "succeeded"
+        await background_idle(client)
+        assert await rows(client, "SELECT status FROM runs WHERE workflow = 'title'") == [("succeeded",)]
+        assert provider.titles[0]["model"] == "m:1"

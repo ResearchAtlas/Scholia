@@ -91,3 +91,25 @@ async def test_log_files_rotate_daily_and_are_kept_fourteen_days(tmp_path):
         assert (handler.when, handler.backupCount) == ("MIDNIGHT", 14)
     finally:
         handler.close()
+
+
+async def test_an_existing_log_folder_and_file_are_narrowed_to_owner_only(tmp_path):
+    import os
+    folder = tmp_path / "logs"
+    folder.mkdir(mode=0o755)
+    os.chmod(folder, 0o755)
+    (folder / "scholia.log").write_text("earlier\n")
+    os.chmod(folder / "scholia.log", 0o644)
+    handler = logs.configure(tmp_path)
+    try:
+        logging.getLogger("backend.test").warning("a line")
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    assert stat.S_IMODE((folder / "scholia.log").stat().st_mode) == 0o600
+    os.chmod(folder / "scholia.log", 0o400)  # stricter than owner-only: never broadened
+    handler = logs.configure(tmp_path)
+    handler.close()
+    logging.getLogger().removeHandler(handler)
+    assert stat.S_IMODE((folder / "scholia.log").stat().st_mode) == 0o400

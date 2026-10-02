@@ -188,3 +188,34 @@ async def test_a_closed_connection_mid_turn_cancels_it_over_real_loopback_tcp(tm
         server.should_exit = True
         thread.join(15)
         sock.close()
+
+
+DEV = "http://127.0.0.1:5173"
+
+
+async def test_a_configured_development_origin_gets_its_preflight_and_cors_headers(tmp_path):
+    async with started(tmp_path / "data", dev_origins=[DEV]) as client:
+        preflight = await client.options("/api/projects", headers={
+            "Origin": DEV, "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type, x-scholia-client"})
+        assert preflight.status_code == 204
+        assert preflight.headers["access-control-allow-origin"] == DEV
+        assert "allow-credentials" not in " ".join(preflight.headers.keys())
+        response = await client.post("/api/projects", json={"name": "From dev"}, headers={"Origin": DEV})
+        assert response.status_code == 201 and response.headers["access-control-allow-origin"] == DEV
+        own = await client.post("/api/projects", json={"name": "Same origin"}, headers={"Origin": ORIGIN})
+        assert own.status_code == 201 and "access-control-allow-origin" not in own.headers
+
+
+@pytest.mark.parametrize("origin, method, asked", [
+    ("http://127.0.0.1:5174", "POST", "content-type"),  # not configured
+    (ORIGIN, "POST", "content-type"),  # the app's own pages never need one
+    (DEV, "TRACE", "content-type"),
+    (DEV, "POST", "content-type, authorization"),
+    ("null", "POST", "content-type"),
+])
+async def test_other_preflights_are_refused(tmp_path, origin, method, asked):
+    async with started(tmp_path / "data", dev_origins=[DEV]) as client:
+        response = await client.options("/api/projects", headers={
+            "Origin": origin, "Access-Control-Request-Method": method, "Access-Control-Request-Headers": asked})
+        assert response.status_code == 403 and "access-control-allow-origin" not in response.headers

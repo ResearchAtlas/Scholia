@@ -217,11 +217,19 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
                       model_entry=None, capability_records=None, on_dispatch=None) -> ModelResult:
     """One chat completion. Never raises for a provider failure: the result carries
     the failure kind and every attempt. Cancellation propagates (the caller settles
-    what the attempt in flight cost). on_dispatch, if given, is called when the
-    outbound gate lets a request go out, so a caller cancelled before that knows
-    nothing left.
+    what the attempt in flight cost). The client must be the outbound gate's: its
+    notice that a request went out is the only evidence that an attempt may be
+    billed. on_dispatch, if given, is called with that notice, so a caller cancelled
+    before it knows nothing left.
     """
-    extensions = {DISPATCHED: on_dispatch} if on_dispatch is not None else {}
+    sent = []  # the gate's notice that the current attempt's request went out
+
+    def dispatched():
+        sent.append(True)
+        if on_dispatch is not None:
+            on_dispatch()
+
+    extensions = {DISPATCHED: dispatched}
     payload = build_payload(route, messages, effort=effort, zdr_enabled=zdr_enabled, max_tokens=max_tokens,
                             model_entry=model_entry, capability_records=capability_records)
     if "reasoning" in payload and _skips_reasoning(route, key):
@@ -234,6 +242,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         if remaining <= 0:
             return _failed("timeout", attempts, route)
         started = time.monotonic()
+        sent.clear()
         try:
             response = await asyncio.wait_for(
                 client.post(route.provider.chat_url, headers=headers, json=payload, extensions=extensions,
@@ -241,9 +250,10 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
                 timeout=remaining,
             )
         except Exception as error:  # cancellation is not an Exception, and propagates
-            # Refused by the gate, or no connection made: the request never left.
-            sent = not isinstance(error, (OutboundDenied, httpx.ConnectError, httpx.ConnectTimeout))
-            attempts.append(Attempt(classify_error(error), None, _ms(started), dispatched=sent))
+            # The gate's notice decides whether the request left: refused, cut off by the time
+            # bound during the gate's check, or never connected, it did not.
+            left = bool(sent) and not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout))
+            attempts.append(Attempt(classify_error(error), None, _ms(started), dispatched=left))
             return _failed(attempts[-1].outcome, attempts, route)
         body = _json(response)
         usage = body.get("usage") if isinstance(body, dict) and isinstance(body.get("usage"), dict) else {}

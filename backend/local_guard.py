@@ -14,11 +14,13 @@ client's disconnect, and it decides before any route parses a body.
   header `X-Scholia-Client: local`, which a page on another site cannot send
   without a preflight. A read with no Origin must be same-origin by Fetch
   Metadata or carry that header. Fetch Metadata saying cross-site is refused.
-- A request body must be JSON. CORS preflights are refused and no CORS headers are
-  sent: the app's pages are same-origin with the API, so no other origin is ever
-  granted access. A development origin is one whose server forwards /api to this
-  one (Vite's proxy), so the browser sees same-origin requests and the backend sees
-  that origin in Origin; it is never a cross-origin caller either.
+- A request body must be JSON.
+- CORS: the app's own pages are same-origin with the API and never need it. An
+  explicitly configured development origin (a dev server on this machine) may call
+  the API across origins: its preflight is checked (origin, method, and only the
+  Content-Type and client headers) and answered, and its responses carry
+  Access-Control-Allow-Origin for that origin alone, without credentials. Any
+  other preflight is refused.
 - Anything outside /api is static navigation: GET or HEAD only.
 
 The client header is not authentication. This protects against web pages and
@@ -31,16 +33,20 @@ CLIENT_HEADER = b"x-scholia-client"
 CLIENT_VALUE = b"local"
 LOOPBACK = {"127.0.0.1", "::1"}
 _CHANGES = {"POST", "PUT", "PATCH", "DELETE"}
+_CORS_METHODS = b"GET, POST, PUT, PATCH, DELETE"
+_CORS_HEADERS = {b"content-type", CLIENT_HEADER}
 _JSON = {b"application/json", b"application/json; charset=utf-8"}
 
 
 class LocalRequestGuard:
-    """origins: the app's origin and any development origins, e.g. "http://127.0.0.1:53111"."""
+    """origin: the app's own origin, e.g. "http://127.0.0.1:53111"; dev_origins: development
+    servers allowed to call the API across origins."""
 
-    def __init__(self, app, *, origins):
+    def __init__(self, app, *, origin, dev_origins=()):
         self.app = app
-        self.origins = {origin.encode() for origin in origins}
-        self.hosts = {origin.split("://", 1)[1].encode() for origin in origins}
+        self.dev_origins = {o.encode() for o in dev_origins}
+        self.origins = {origin.encode(), *self.dev_origins}
+        self.hosts = {o.split(b"://", 1)[1] for o in self.origins}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
@@ -51,6 +57,11 @@ class LocalRequestGuard:
         if problem:
             status, code = problem
             return await _refuse(send, scope, status, code, "The request was refused")
+        origin = dict(scope["headers"]).get(b"origin")
+        if scope["method"] == "OPTIONS":  # a development origin's preflight, checked above
+            return await _preflight(send, origin)
+        if origin in self.dev_origins:  # the response is readable by that origin alone
+            return await self.app(scope, receive, _with_cors(send, origin))
         return await self.app(scope, receive, send)
 
     def problem(self, scope):
@@ -75,7 +86,13 @@ class LocalRequestGuard:
         if fetch_site == b"cross-site":
             return 403, "cross_site"
         if method == "OPTIONS":
-            return 403, "preflight_refused"
+            requested = headers.get(b"access-control-request-method", [b""])[-1]
+            asked = {h.strip().lower() for v in headers.get(b"access-control-request-headers", []) for h in v.split(b",")}
+            asked.discard(b"")
+            if (not origins or origins[0] not in self.dev_origins or requested not in _CORS_METHODS.split(b", ")
+                    or not asked <= _CORS_HEADERS):
+                return 403, "preflight_refused"
+            return None
         if not origins:
             if method in _CHANGES and not marked:
                 return 403, "client_header_missing"
@@ -88,6 +105,23 @@ class LocalRequestGuard:
                     t.replace(b" ", b"") for t in _JSON}:
                 return 415, "json_required"
         return None
+
+
+async def _preflight(send, origin):
+    await send({"type": "http.response.start", "status": 204, "headers": [
+        (b"access-control-allow-origin", origin), (b"access-control-allow-methods", _CORS_METHODS),
+        (b"access-control-allow-headers", b"content-type, x-scholia-client"),
+        (b"access-control-max-age", b"600"), (b"vary", b"origin"), (b"content-length", b"0")]})
+    await send({"type": "http.response.body", "body": b""})
+
+
+def _with_cors(send, origin):
+    async def send_with_cors(message):
+        if message["type"] == "http.response.start":
+            message = {**message, "headers": [*message.get("headers", []),
+                                              (b"access-control-allow-origin", origin), (b"vary", b"origin")]}
+        await send(message)
+    return send_with_cors
 
 
 async def _refuse(send, scope, status, code, message):

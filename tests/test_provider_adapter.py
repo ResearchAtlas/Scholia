@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from backend import openrouter
-from backend.outbound_gate import OutboundDenied
+from backend.outbound_gate import DISPATCHED, OutboundDenied
 from backend.providers import Provider, Route
 
 pytestmark = pytest.mark.asyncio
@@ -26,12 +26,15 @@ def ok(text="Hi.", **usage):
 
 
 def client_for(*responses):
-    """A client whose transport answers in turn with responses (or raises them)."""
+    """A client whose transport answers in turn with responses (or raises them), giving the
+    outbound gate's notice that each request went out unless the gate refused it."""
     sent = []
 
     async def handle(request):
         sent.append(request)
         item = responses[len(sent) - 1] if len(sent) <= len(responses) else ok()
+        if not isinstance(item, OutboundDenied):  # past the check, the gate tells the caller it went out
+            request.extensions[DISPATCHED]()
         if isinstance(item, BaseException):
             raise item
         if callable(item):
@@ -238,3 +241,16 @@ async def test_reasoning_text_comes_only_from_the_messages_own_fields():
     assert len(long) < 2100 and long.endswith("(reasoning truncated)")
     assert openrouter.reasoning_tokens_from_usage({"completion_tokens_details": {"reasoning_tokens": 0}}) is None
     assert openrouter.reasoning_tokens_from_usage({"completion_tokens_details": {"reasoning_tokens": 7}}) == 7
+
+
+async def test_a_time_bound_reached_during_the_gates_check_is_not_dispatched():
+    """Nothing went out: the gate never gave its notice before the bound cut the attempt off."""
+    async def checking_forever(request):
+        await asyncio.sleep(60)
+
+    async def handle(request):  # stands in for the gate still checking: no notice yet
+        await checking_forever(request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, timeout=0.2)
+    assert (result.error_kind, result.dispatched) == ("timeout", False)

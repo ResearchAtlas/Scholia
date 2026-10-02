@@ -79,6 +79,7 @@ class ActiveRun:
     cancel_requested: threading.Event = field(default_factory=threading.Event)  # read inside transactions
     cancel_reason: str | None = None  # "researcher", "revoked" or "shutdown"
     events: asyncio.Queue = field(default_factory=asyncio.Queue)
+    wanted: asyncio.Event = field(default_factory=asyncio.Event)  # the reader asked for the next event
     context: dict | None = None  # what an admitted turn needs to run
     call: "_Call | None" = None  # the model call admitted last, until it is settled or released
     provider: str | None = None  # the provider its model calls go to
@@ -205,6 +206,8 @@ class Harness:
         at startup, before serving requests."""
 
         def record(conn):
+            in_flight = {run_id for (run_id,) in conn.execute(
+                "SELECT DISTINCT run_id FROM budget_reservations WHERE status = 'open' AND run_id IS NOT NULL")}
             spending.settle_left_open(conn)
             now = utc_now()
             for (run_id,) in conn.execute(
@@ -214,8 +217,9 @@ class Harness:
                     "UPDATE runs SET status = 'interrupted', finished_at = ?, settled_cost_usd = ? WHERE id = ?",
                     (now, spending.run_cost(conn, run_id), run_id))
                 conn.execute(
-                    "UPDATE turns SET reason_code = 'interrupted', memory_status = coalesce(memory_status, 'skipped')"
-                    " WHERE run_id = ?", (run_id,))
+                    "UPDATE turns SET reason_code = 'interrupted', memory_status = coalesce(memory_status, 'skipped'),"
+                    " accounting = ? WHERE run_id = ?",
+                    (json.dumps(_accounting(conn, run_id, complete=run_id not in in_flight)), run_id))
 
         await self._write(record)
         await self.kick_background()
@@ -329,11 +333,10 @@ class Harness:
 
     async def _admit(self, claim, message, *, model, provider, effort, retry_of):
         conversation = await self._read(lambda conn: conn.execute(
-            "SELECT c.id, c.project_id, c.title, c.title_source, c.title_rev, c.budget_usd"
-            " FROM conversations c WHERE c.id = ?", (claim.conversation_id,)).fetchone())
+            "SELECT project_id, budget_usd FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone())
         if conversation is None:
             raise AdmissionError(404, "not_found", "No such conversation")
-        _, project_id, title, title_source, title_rev, conversation_budget = conversation
+        project_id, conversation_budget = conversation
         personal, project_settings = await asyncio.to_thread(
             lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
         chosen = model or project_settings.values.get("models", {}).get("default") \
@@ -397,7 +400,6 @@ class Harness:
         claim.context = {
             "project_id": project_id, "seq": seq, "route": route, "key": key, "messages": messages,
             "effort": effort, "estimate": plan.predicted_cost, "budgets": budgets,
-            "title": None if (title is not None or title_source is not None) else {"title_rev": title_rev},
             "message": message,
         }
         return claim
@@ -405,15 +407,20 @@ class Harness:
     async def events(self, claim: ActiveRun):
         """Start an admitted turn and yield its events until it ends.
 
-        The turn starts when its response starts streaming, so a response that is
-        dropped first never spends anything; its claim goes stale and is released.
-        Stopping early (a closed stream) cancels the turn, like Stop.
+        The turn is pulled by its stream: it starts when the response starts, and it
+        goes on to its next step (the reservation, then the model call) only when the
+        reader asks for the next event, so it never runs ahead of a reader that has
+        stalled. A response dropped before it starts spends nothing; its claim goes
+        stale and is released. Stopping early (a closed stream) cancels the turn, like
+        Stop. The turn runs in its own task only so that a cancellation is delivered
+        once and its cleanup always completes.
         """
         if claim.cancel_requested.is_set() or self.registry.runs.get(claim.run_id) is not claim:
             return  # cancelled before its response started
         claim.task = asyncio.create_task(self._turn(claim))
         try:
             while True:
+                claim.wanted.set()
                 event = await claim.events.get()
                 if event is None:
                     return
@@ -424,12 +431,18 @@ class Harness:
     async def _turn(self, claim: ActiveRun) -> None:
         ctx = claim.context
         emit = claim.events.put_nowait
+
+        async def handed(event):  # give the reader one event, then wait until it asks for the next
+            claim.wanted.clear()
+            emit(event)
+            await claim.wanted.wait()
+
         try:
-            emit({"type": "run_started", "run_id": claim.run_id, "conversation_id": claim.conversation_id,
-                  "seq": ctx["seq"]})
+            await handed({"type": "run_started", "run_id": claim.run_id, "conversation_id": claim.conversation_id,
+                          "seq": ctx["seq"]})
             call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, ctx["estimate"],
                                        ctx["budgets"], phase="answer")
-            emit({"type": "step", "seq": call.step, "phase": "answer"})
+            await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["messages"], effort=ctx["effort"])
             if not result.ok:
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
@@ -519,13 +532,21 @@ class Harness:
         conn.execute("UPDATE runs SET status = 'succeeded', finished_at = ?, settled_cost_usd = ? WHERE id = ?",
                      (utc_now(), cost, claim.run_id))
         conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (utc_now(), claim.conversation_id))
-        if ctx["title"] is not None:  # detached post-answer work, written with the answer so it is never lost
+        # Detached post-answer work, written with the answer so it is never lost: one title
+        # for a conversation that still has none and no title run pending or done.
+        untitled = conn.execute(
+            "SELECT c.title_rev FROM conversations c WHERE c.id = ? AND c.title IS NULL AND c.title_source IS NULL"
+            " AND NOT EXISTS (SELECT 1 FROM runs r JOIN turns t ON t.run_id = r.source_turn_id"
+            "                 WHERE r.workflow = 'title' AND t.conversation_id = c.id"
+            "                 AND r.status IN ('running', 'succeeded'))", (claim.conversation_id,)).fetchone()
+        if untitled is not None:
             conn.execute(
                 "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
                 " VALUES (?, ?, 'background', 'title', ?, ?)",
                 (new_id(), ctx["project_id"], claim.run_id, json.dumps({
-                    "conversation_id": claim.conversation_id, "title_rev": ctx["title"]["title_rev"],
-                    "route": ctx["route"].key, "message": ctx["message"][:4000],
+                    "conversation_id": claim.conversation_id, "title_rev": untitled[0],
+                    "provider": ctx["route"].provider.name, "model": ctx["route"].model,
+                    "message": ctx["message"][:4000],
                 })))
         return {"run_id": claim.run_id, "status": "succeeded", "cost_usd": cost,
                 "accounting": _accounting(conn, claim.run_id)}
@@ -622,7 +643,7 @@ class Harness:
                 return  # rule 1: finished (or deleted); never run again
             project_id, workflow, attempts, inputs, _ = row
             inputs = json.loads(inputs or "{}")
-            active.provider = inputs.get("route", "").split(":", 1)[0] or None
+            active.provider = inputs.get("provider")
             recorded = await self._read(lambda conn: conn.execute(
                 "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished' ORDER BY seq DESC LIMIT 1",
                 (active.run_id,)).fetchone())
@@ -656,7 +677,8 @@ class Harness:
         """One model call for a background run. Returns its output, or None if it failed."""
         if workflow != "title":
             raise ValueError(f"unknown background workflow {workflow!r}")
-        route = await asyncio.to_thread(providers.resolve_route, self.data_dir, *inputs["route"].split(":", 1))
+        route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),
+                                        inputs.get("model"))
         key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
                                                 self.keyring_backend)
         if route is None or key is None:
@@ -733,8 +755,10 @@ def _close_call(conn, call):
         spending.release(conn, call.reservation_id)
 
 
-def _accounting(conn, run_id):
-    """The run's spending by basis: reported, estimated, and attempts with no usable usage."""
+def _accounting(conn, run_id, complete=True):
+    """The run's spending by basis: reported, estimated, attempts with no usable usage, and
+    whether the record is complete (False when a call was in flight at a crash, whose
+    attempt left no record and whose cost is counted at its estimate)."""
     rows = conn.execute("SELECT basis, coalesce(sum(settled_usd), 0) FROM budget_reservations"
                         " WHERE run_id = ? AND status = 'settled' GROUP BY basis", (run_id,)).fetchall()
     totals = dict(rows)
@@ -742,7 +766,7 @@ def _accounting(conn, run_id):
         "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'", (run_id,))
         if json.loads(data).get("charge") == "unknown" and json.loads(data).get("dispatched"))
     return {"reported_usd": totals.get("reported", 0), "estimated_usd": totals.get("estimated", 0),
-            "unknown_attempts": unknown}
+            "unknown_attempts": unknown, "complete": complete}
 
 
 def _clean_title(text):

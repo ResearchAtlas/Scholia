@@ -68,7 +68,8 @@ async def test_a_message_runs_one_turn_through_its_commit_boundaries(tmp_path):
         run_id = stream[0]["run_id"]
         assert stream[2]["content"] == "An answer." and stream[2]["result_saved"] is True
         assert stream[3] == {"type": "run_finished", "run_id": run_id, "status": "succeeded", "cost_usd": 0.002,
-                             "accounting": {"reported_usd": 0.002, "estimated_usd": 0, "unknown_attempts": 0}}
+                             "accounting": {"reported_usd": 0.002, "estimated_usd": 0, "unknown_attempts": 0,
+                                            "complete": True}}
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert (turn["status"], turn["answer"], turn["result_saved"], turn["cost_usd"]) == (
             "succeeded", {"text": "An answer."}, True, 0.002)
@@ -203,7 +204,8 @@ async def test_cancel_during_the_model_call_ends_the_turn_and_settles_its_estima
         assert json.loads(attempt) == {"step": 0, "route": json.loads(attempt)["route"], "outcome": "cancelled",
                                        "http_status": None, "dispatched": True, "charge": "unknown"}
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
-        assert turn["accounting"] == {"reported_usd": 0, "estimated_usd": estimate, "unknown_attempts": 1}
+        assert turn["accounting"] == {"reported_usd": 0, "estimated_usd": estimate, "unknown_attempts": 1,
+                                      "complete": True}
         # Repeating is safe and reports the terminal status; an unknown run is 404.
         assert (await client.post(f"/api/runs/{run_id}/cancel")).json() == {"run_id": run_id, "status": "cancelled"}
         assert (await client.post(f"/api/runs/{new_id()}/cancel")).status_code == 404
@@ -350,6 +352,9 @@ async def test_startup_records_a_crashed_turn_as_interrupted_and_settles_its_res
             ("settled", 0.03, "estimated")]
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert (turn["status"], turn["reason_code"]) == ("interrupted", "interrupted")
+        # A call was in flight at the crash: its cost counts at the estimate and the record says it is incomplete.
+        assert turn["accounting"] == {"reported_usd": 0, "estimated_usd": 0.03, "unknown_attempts": 0,
+                                      "complete": False}
         # The conversation accepts a new message.
         assert (await send(client, conversation, "again"))[-1]["status"] == "succeeded"
         await background_idle(client)
@@ -538,7 +543,8 @@ async def test_an_answer_that_cannot_be_saved_is_still_shown_marked_unsaved(tmp_
         assert stream[-1]["status"] == "failed"
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert (turn["status"], turn["reason_code"], turn["answer"]) == ("failed", "save_failed", None)
-        assert turn["accounting"] == {"reported_usd": 0.002, "estimated_usd": 0, "unknown_attempts": 0}
+        assert turn["accounting"] == {"reported_usd": 0.002, "estimated_usd": 0, "unknown_attempts": 0,
+                                      "complete": True}
 
 
 @pytest.mark.parametrize("cost", [float("inf"), float("nan"), -0.5, "0.1", True])
@@ -574,6 +580,12 @@ async def test_a_providers_settings_and_key_do_not_change_while_a_run_uses_it(tm
             await client.post("/api/setup", json={"openrouter_key": "new"}),
             await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
                 "ui.language": "en", "providers.openrouter.base_url": "https://openrouter.ai/api/v2"}}),
+            await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+                "ui.language": "en", '"providers".openrouter.base_url': "https://openrouter.ai/api/v2"}}),
+            await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+                "ui.language": "en", "providers": None}}),
+            await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+                "providers": {"other": {"kind": "openrouter", "base_url": "https://example.org/v1"}}}}),
         ):
             assert (response.status_code, response.json()["code"]) == (409, "active_run")
         assert (data / "config.toml").read_text() == before  # a mixed update changed no field
@@ -584,3 +596,25 @@ async def test_a_providers_settings_and_key_do_not_change_while_a_run_uses_it(tm
         await stream
         await background_idle(client)
         assert (await client.put("/api/keys/openrouter", json={"key": "new"})).status_code == 200
+
+
+async def test_the_turn_waits_for_its_reader_before_each_step(tmp_path):
+    """Pull: a reader that has the first event and has not asked for the next holds the turn
+    before its reservation and its model call."""
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client, title="t")
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "hi")
+        events_ = harness.events(claim)
+        first = await anext(events_)
+        assert first["type"] == "run_started"
+        await asyncio.sleep(0.2)  # the reader is busy with the first event
+        assert (await counts(client))["budget_reservations"] == 0 and client.provider.chats == []
+        second = await anext(events_)
+        assert second["type"] == "step"
+        await asyncio.sleep(0.2)
+        assert (await counts(client))["budget_reservations"] == 1 and client.provider.chats == []
+        rest = [event async for event in events_]
+        assert [e["type"] for e in rest] == ["chat_response", "run_finished"]
+        assert len(client.provider.chats) == 1
+        await background_idle(client)

@@ -27,7 +27,8 @@ from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
 from backend.runs import AdmissionError, Harness, derived_status
-from backend.settings import INSTRUCTIONS_CAP, SettingsChanged, load_instructions, load_settings, write_private
+from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, load_instructions, load_settings,
+                              write_private)
 
 log = logging.getLogger(__name__)
 
@@ -267,7 +268,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         loaded = await settings_for(body.project_id)
         if body.hash != loaded._digest:
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
-        refuse_if_busy(_providers_changed(body.updates))  # before any field is written
+        refuse_if_busy(_providers_changed(body.updates, providers.configured(data_dir)))  # before any field is written
         try:
             await asyncio.to_thread(loaded.save, body.updates)
         except SettingsChanged:
@@ -507,7 +508,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             raise ApiError(404, "not_found", "Not found")
         return FileResponse(file, headers={"Cache-Control": "no-cache"})
 
-    return LocalRequestGuard(app, origins=[origin, *dev_origins])
+    return LocalRequestGuard(app, origin=origin, dev_origins=dev_origins)
 
 
 async def _committed(future) -> bool:
@@ -523,16 +524,21 @@ async def _committed(future) -> bool:
             return False
 
 
-def _providers_changed(updates) -> set:
-    """The providers a settings update would change."""
+def _providers_changed(updates, configured) -> set:
+    """The providers a settings update would change, reading each key as the settings file
+    does (quoted parts included). Changing the whole providers table changes every one."""
     names = set()
     for key, value in updates.items():
-        parts = key.split(".")
-        if parts[0] == "providers":
+        try:
+            parts = _split_key(key)
+        except Exception:  # not a TOML key: the save refuses it
+            continue
+        if parts[:1] == ("providers",):
             if len(parts) > 1:
                 names.add(parts[1])
-            elif isinstance(value, dict):
-                names.update(value)
+            else:
+                names.update(configured)
+                names.update(value if isinstance(value, dict) else ())
     return names
 
 

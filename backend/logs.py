@@ -7,6 +7,7 @@ provider's error body. Tests feed canaries through the app and check the log.
 
 import logging
 import os
+import stat
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -22,6 +23,7 @@ class PrivateRotatingHandler(TimedRotatingFileHandler):
 
     def _open(self):
         fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, stat.S_IMODE(os.fstat(fd).st_mode) & 0o600)  # an existing file is narrowed, never broadened
         return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
 
 
@@ -31,7 +33,7 @@ def configure(data_dir, level=logging.INFO) -> logging.Handler:
     try:
         os.mkdir(folder, 0o700)
     except FileExistsError:
-        pass
+        os.chmod(folder, stat.S_IMODE(folder.stat().st_mode) & 0o700)  # narrowed, never broadened
     handler = PrivateRotatingHandler(folder / "scholia.log")
     handler.setFormatter(logging.Formatter(FORMAT))
     root = logging.getLogger()
