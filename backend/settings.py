@@ -13,6 +13,7 @@ import re
 import stat
 import tempfile
 import threading
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,6 +42,22 @@ def _text(v):
 
 def _flag(v):
     return type(v) is bool
+
+
+def _base_url(v):
+    """An https URL, or plain http only to this machine (a local model server): keys go to
+    this address, so they never travel in clear text over a network. No user info,
+    query or fragment."""
+    if type(v) is not str:
+        return False
+    try:
+        parts = urllib.parse.urlsplit(v)
+        parts.port  # raises ValueError for a malformed port
+    except ValueError:
+        return False
+    if parts.username is not None or parts.password is not None or parts.query or parts.fragment or not parts.hostname:
+        return False
+    return parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1"))
 
 
 def _texts(max_items=None):
@@ -101,7 +118,7 @@ PERSONAL = {
     ("ui", "layout", "sidebar_open"): (True, _flag),
     ("ui", "layout", "panel_share"): (0.5, _number(0, 1)),
     ("providers", "*", "kind"): (None, _choice("openrouter", "openai-compatible")),
-    ("providers", "*", "base_url"): (None, _text),
+    ("providers", "*", "base_url"): (None, _base_url),
     ("providers", "*", "default_window"): (None, _WINDOW),
     ("providers", "*", "windows", "*"): (None, _WINDOW),
     ("models", "default"): ("auto", _text),

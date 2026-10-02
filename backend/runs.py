@@ -1,0 +1,658 @@
+"""Runs: turn admission, the turn's commit boundaries, cancel, recovery and detached work.
+
+A researcher's message starts one turn, a run of kind `turn`. Its life is a few
+separate transactions on the single writer (each BEGIN IMMEDIATE, full sync):
+
+1. Admission, before any paid work: the `turns` row with the message and the
+   `runs` row with status running, together. A request that fails validation, or
+   finds its conversation busy (`409 active_run`), writes nothing.
+2. For each model call: a budget reservation with a `step_started` event, then,
+   after the call, every HTTP attempt as a `model_attempt` event, the
+   `step_finished` event and the reservation's settlement, together.
+3. The primary commit: the answer, the turn's succeeded status and the run's
+   settled cost together, with the cancel flag checked inside the transaction.
+   The answer is streamed only after it. The same transaction writes the
+   detached post-answer work (a title for an untitled conversation) as a
+   background run keyed to the turn.
+
+A run's status never returns to running. Cancellation (Stop, a closed stream,
+deletion or shutdown) before the primary commit ends the run cancelled (or
+interrupted at shutdown), settling a call that may have gone out at its estimate
+and releasing a reservation whose call never left. A running turn that is not
+in this process's registry reads as interrupted, and startup records it so.
+
+Background runs (titles) run outside any turn, so the conversation accepts its
+next message at once. Each model call they start is counted in `attempts`, in its
+own transaction, before the call. On every start, including after a crash, a
+background run is finished from a recorded finished step with no model call, or
+restarted while it has made fewer than 2 attempts, or else marked interrupted.
+Its effects, terminal status and settled cost are written in one transaction.
+"""
+
+import asyncio
+import json
+import logging
+import threading
+import time
+import traceback
+from contextlib import suppress
+from dataclasses import dataclass, field
+
+from backend import budget_router, credentials, openrouter, providers, spending
+from backend.db import new_id, utc_now
+from backend.openrouter_client import get_model_metadata
+from backend.settings import load_instructions, load_settings
+
+log = logging.getLogger(__name__)
+
+STALE_CLAIM_SECONDS = 30  # an unstarted claim older than this is a dropped response
+MODEL_CALL_SECONDS = 120  # one call's total bound, both attempts included
+MAX_MESSAGE_CHARS = 100_000
+HISTORY_TURNS = 20  # ponytail: a fixed history window until the context assembler counts tokens
+BACKGROUND_ATTEMPTS = 2
+SYSTEM_RULES = (
+    "You are Scholia, a research assistant working inside the researcher's own project. "
+    "Answer in the language of the researcher's message unless they ask otherwise. "
+    "Say plainly when you do not know something."
+)
+TITLE_RULES = (
+    "Write a title of at most six words for a conversation that begins with the message below. "
+    "Use the language of the message. Reply with the title only, without quotation marks."
+)
+
+
+class AdmissionError(Exception):
+    """A request that cannot start. Nothing was written. code is stable for the interface."""
+
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status, self.code, self.message = status, code, message
+
+
+@dataclass
+class ActiveRun:
+    run_id: str
+    kind: str  # "turn" or "background"
+    conversation_id: str | None
+    created: float = field(default_factory=time.monotonic)
+    task: asyncio.Task | None = None
+    cancel_requested: threading.Event = field(default_factory=threading.Event)  # read inside transactions
+    cancel_reason: str | None = None  # "researcher", "revoked" or "shutdown"
+    events: asyncio.Queue = field(default_factory=asyncio.Queue)
+    context: dict | None = None  # what an admitted turn needs to run
+    call: "_Call | None" = None  # the model call admitted last, until it is settled or released
+
+
+class Registry:
+    """The runs this process is working on: at most one turn per conversation."""
+
+    def __init__(self):
+        self.runs: dict[str, ActiveRun] = {}
+        self.turns: dict[str, ActiveRun] = {}  # by conversation
+        self.closed = False
+        self.dropped: list[str] = []  # stale claims released, whose runs are still to be recorded
+
+    def claim_turn(self, conversation_id: str) -> ActiveRun:
+        if self.closed:
+            raise AdmissionError(503, "shutting_down", "The app is closing")
+        held = self.turns.get(conversation_id)
+        if held is not None:
+            if held.task is None and time.monotonic() - held.created > STALE_CLAIM_SECONDS:
+                # Its response was dropped before it started, so its turn never ran.
+                log.warning("released a stale claim on a conversation whose response never started")
+                self.release(held)
+                self.dropped.append(held.run_id)
+            else:
+                raise AdmissionError(409, "active_run", "This conversation is already running a turn")
+        claim = ActiveRun(new_id(), "turn", conversation_id)
+        self.turns[conversation_id] = claim
+        self.runs[claim.run_id] = claim
+        return claim
+
+    def add_background(self, run_id: str) -> ActiveRun | None:
+        if self.closed or run_id in self.runs:
+            return None
+        active = ActiveRun(run_id, "background", None)
+        self.runs[run_id] = active
+        return active
+
+    def release(self, active: ActiveRun) -> None:
+        if self.runs.get(active.run_id) is active:
+            del self.runs[active.run_id]
+        if active.conversation_id is not None and self.turns.get(active.conversation_id) is active:
+            del self.turns[active.conversation_id]
+
+    def is_active(self, run_id: str) -> bool:
+        return run_id in self.runs
+
+
+def derived_status(status: str, run_id: str, registry: Registry) -> str:
+    """A run's status as it reads now: a running run this process does not hold is interrupted."""
+    return "interrupted" if status == "running" and not registry.is_active(run_id) else status
+
+
+def _event(conn, run_id, event_type, data):
+    (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
+    conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)",
+                 (run_id, seq, event_type, json.dumps(data)))
+
+
+def _where(error: BaseException) -> str:
+    """Where an unexpected error was raised, as file:line, without its message (which may hold content)."""
+    frames = traceback.extract_tb(error.__traceback__)
+    return f"{frames[-1].filename.rsplit('/', 1)[-1]}:{frames[-1].lineno}" if frames else "unknown"
+
+
+class _Cancelled(Exception):
+    """Raised inside a transaction to roll it back because cancellation was requested."""
+
+
+def _running(conn, run_id) -> bool:
+    row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return row is not None and row[0] == "running"
+
+
+@dataclass
+class _Call:
+    """One admitted model call: its step, reservation and whether it may have left."""
+    step: int
+    reservation_id: str
+    dispatched: bool = False
+
+
+class Harness:
+    """Runs turns and background work against one data folder.
+
+    db and content are the folder's Database and ContentStore; gate is its
+    OutboundGate. keyring_backend selects the credential store (tests and
+    walkthroughs inject their own; None uses the system's).
+    """
+
+    def __init__(self, data_dir, db, gate, *, keyring_backend=None):
+        self.data_dir = data_dir
+        self.db = db
+        self.gate = gate
+        self.keyring_backend = keyring_backend
+        self.registry = Registry()
+        self._tasks = set()  # detached tasks, kept referenced until they finish
+
+    async def _write(self, fn):
+        return await asyncio.to_thread(self.db.write, fn)
+
+    async def _write_through(self, fn):
+        """Like _write, but a cancellation waits for the write to finish first, and comes
+        back as (result, True) instead of raising, so the caller can undo what it wrote."""
+        future = asyncio.ensure_future(self._write(fn))
+        try:
+            return await asyncio.shield(future), False
+        except asyncio.CancelledError:
+            return await future, True
+
+    def _detach(self, coroutine):
+        task = asyncio.get_running_loop().create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def _read(self, fn):
+        return await asyncio.to_thread(self.db.read, fn)
+
+    # Startup and shutdown
+
+    async def recover(self) -> None:
+        """Record what a crash left behind, then restart the background runs. Call once
+        at startup, before serving requests."""
+
+        def record(conn):
+            spending.settle_left_open(conn)
+            now = utc_now()
+            for (run_id,) in conn.execute(
+                    "SELECT id FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')").fetchall():
+                _event(conn, run_id, "run_finished", {"status": "interrupted"})
+                conn.execute(
+                    "UPDATE runs SET status = 'interrupted', finished_at = ?, settled_cost_usd = ? WHERE id = ?",
+                    (now, spending.run_cost(conn, run_id), run_id))
+                conn.execute(
+                    "UPDATE turns SET reason_code = 'interrupted', memory_status = coalesce(memory_status, 'skipped')"
+                    " WHERE run_id = ?", (run_id,))
+
+        await self._write(record)
+        await self.kick_background()
+
+    async def shutdown(self, timeout: float = 10.0) -> None:
+        """Stop admitting, cancel what is running and wait for it, up to timeout seconds."""
+        self.registry.closed = True
+        tasks = []
+        for active in list(self.registry.runs.values()):
+            self._request_cancel(active, "shutdown")
+            if active.task is not None:
+                tasks.append(active.task)
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:
+                log.warning("%d runs did not stop within %s s of shutdown", len(pending), timeout)
+
+    # Cancel
+
+    def _request_cancel(self, active: ActiveRun, reason: str) -> None:
+        active.cancel_reason = active.cancel_reason or reason
+        active.cancel_requested.set()
+        if active.task is not None:
+            active.task.cancel()
+        else:  # a claim whose response never started: nothing runs, so release it now
+            self.registry.release(active)
+
+    async def cancel(self, run_id: str, reason: str = "researcher") -> dict | None:
+        """Request cancellation. Returns the run's status as it reads, or None if no such run.
+        Repeating it is safe; a finished run is left as it is."""
+        await self._record_dropped()
+        active = self.registry.runs.get(run_id)
+        if active is not None:
+            self._request_cancel(active, reason)
+            if active.task is None and active.kind == "turn":  # its response never started: nothing ran
+                return await self._write(lambda conn: self._finish_turn(conn, run_id, "cancelled", "researcher",
+                                                                         "researcher"))
+            return {"run_id": run_id, "status": "cancelling"}
+        row = await self._read(lambda conn: conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone())
+        if row is None:
+            return None
+        return {"run_id": run_id, "status": derived_status(row[0], run_id, self.registry)}
+
+    async def _record_dropped(self):
+        """Record the turns of released stale claims, which never ran, as interrupted."""
+        while self.registry.dropped:
+            run_id = self.registry.dropped.pop()
+            await self._write(lambda conn: self._finish_turn(conn, run_id, "interrupted", None, "interrupted"))
+
+    def revoke(self, run_ids) -> None:
+        """Stop the active runs a deletion revoked."""
+        for run_id in run_ids:
+            active = self.registry.runs.get(run_id)
+            if active is not None:
+                self._request_cancel(active, "revoked")
+
+    # Turns
+
+    async def admit_turn(self, conversation_id: str, message, *, model=None, provider=None, effort=None) -> ActiveRun:
+        """Validate a message and admit its turn, or raise AdmissionError having written nothing."""
+        if not isinstance(message, str) or not message.strip():
+            raise AdmissionError(400, "empty_message", "The message is empty")
+        if len(message) > MAX_MESSAGE_CHARS:
+            raise AdmissionError(400, "message_too_long", "The message is too long")
+        if effort is not None and effort not in budget_router._REASONING_OUTPUT_TOKENS:
+            raise AdmissionError(400, "invalid_effort", "Unknown effort level")
+        claim = self.registry.claim_turn(conversation_id)
+        try:
+            await self._record_dropped()
+            return await self._admit(claim, message, model=model, provider=provider, effort=effort)
+        except BaseException:
+            self.registry.release(claim)
+            raise
+
+    async def _admit(self, claim, message, *, model, provider, effort):
+        conversation = await self._read(lambda conn: conn.execute(
+            "SELECT c.id, c.project_id, c.title, c.title_source, c.title_rev, c.budget_usd"
+            " FROM conversations c WHERE c.id = ?", (claim.conversation_id,)).fetchone())
+        if conversation is None:
+            raise AdmissionError(404, "not_found", "No such conversation")
+        _, project_id, title, title_source, title_rev, conversation_budget = conversation
+        personal = load_settings(self.data_dir)
+        project_settings = load_settings(self.data_dir, project_id)
+        chosen = model or project_settings.values.get("models", {}).get("default") \
+            or personal.values["models"]["default"]
+        configured = providers.configured(self.data_dir, personal)
+        if not configured:
+            raise AdmissionError(400, "no_provider", "No model provider is set up")
+        provider_name = provider or (providers.OPENROUTER if providers.OPENROUTER in configured or len(configured) != 1
+                                     else next(iter(configured)))
+        if provider_name not in configured:
+            raise AdmissionError(400, "unknown_provider", "That provider is not set up")
+        provider_config = configured[provider_name]
+        plan = budget_router.create_run_plan(
+            message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
+            is_openrouter=provider_config.is_openrouter)
+        if plan.model is None:
+            raise AdmissionError(400, "model_needed", "Choose a model for this provider")
+        route = providers.Route(provider_config, plan.model)
+        key = await asyncio.to_thread(credentials.load_key, self.data_dir, provider_name, self.keyring_backend)
+        if key is None:
+            raise AdmissionError(400, "provider_key_missing", "The provider has no key")
+        instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
+        budgets = {
+            "project_budget_usd": project_settings.values["project"]["budget_usd"],
+            "conversation_budget_usd": conversation_budget if conversation_budget is not None
+            else personal.values["budget"]["conversation_usd"],
+        }
+
+        def admit(conn):
+            if not conn.execute("SELECT 1 FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone():
+                raise AdmissionError(404, "not_found", "No such conversation")
+            (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM turns WHERE conversation_id = ?",
+                                  (claim.conversation_id,)).fetchone()
+            history = conn.execute(
+                "SELECT t.user_message, t.answer FROM turns t JOIN runs r ON r.id = t.run_id"
+                " WHERE t.conversation_id = ? AND r.status = 'succeeded' AND t.answer IS NOT NULL"
+                " ORDER BY t.seq DESC LIMIT ?", (claim.conversation_id, HISTORY_TURNS)).fetchall()
+            conn.execute(
+                "INSERT INTO runs (id, project_id, conversation_id, kind, workflow, limits, inputs)"
+                " VALUES (?, ?, ?, 'turn', 'agent', ?, ?)",
+                (claim.run_id, project_id, claim.conversation_id,
+                 json.dumps({"model_call_seconds": MODEL_CALL_SECONDS}),
+                 json.dumps({"route": route.key, "effort": effort})))
+            conn.execute(
+                "INSERT INTO turns (run_id, conversation_id, seq, author, user_message) VALUES (?, ?, ?, 'researcher', ?)",
+                (claim.run_id, claim.conversation_id, seq, json.dumps({"text": message})))
+            _event(conn, claim.run_id, "route", {"route": route.key, "plan": plan.to_dict()})
+            return seq, history[::-1]
+
+        seq, history = await self._write(admit)
+        messages = [{"role": "system", "content": SYSTEM_RULES + (f"\n\n{instructions}" if instructions else "")}]
+        for user_message, answer in history:
+            messages.append({"role": "user", "content": json.loads(user_message).get("text", "")})
+            messages.append({"role": "assistant", "content": json.loads(answer).get("text", "")})
+        messages.append({"role": "user", "content": message})
+        claim.context = {
+            "project_id": project_id, "seq": seq, "route": route, "key": key, "messages": messages,
+            "effort": effort, "estimate": plan.predicted_cost, "budgets": budgets,
+            "title": None if (title is not None or title_source is not None) else {"title_rev": title_rev},
+            "message": message,
+        }
+        return claim
+
+    async def events(self, claim: ActiveRun):
+        """Start an admitted turn and yield its events until it ends.
+
+        The turn starts when its response starts streaming, so a response that is
+        dropped first never spends anything; its claim goes stale and is released.
+        Stopping early (a closed stream) cancels the turn, like Stop.
+        """
+        if claim.cancel_requested.is_set() or self.registry.runs.get(claim.run_id) is not claim:
+            return  # cancelled before its response started
+        claim.task = asyncio.create_task(self._turn(claim))
+        try:
+            while True:
+                event = await claim.events.get()
+                if event is None:
+                    return
+                yield event
+        finally:
+            if self.registry.runs.get(claim.run_id) is claim:
+                self._request_cancel(claim, "researcher")
+
+    async def _turn(self, claim: ActiveRun) -> None:
+        ctx = claim.context
+        emit = claim.events.put_nowait
+        try:
+            emit({"type": "run_started", "run_id": claim.run_id, "conversation_id": claim.conversation_id,
+                  "seq": ctx["seq"]})
+            call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, ctx["estimate"],
+                                       ctx["budgets"], phase="answer")
+            emit({"type": "step", "seq": call.step, "phase": "answer"})
+            result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["messages"], effort=ctx["effort"])
+            if not result.ok:
+                final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
+                                                                          result.error_kind))
+                emit({"type": "error", "code": result.error_kind})
+                emit({"type": "run_finished", **final})
+                return
+            answer = {"text": result.content, **({"reasoning": result.reasoning} if result.reasoning else {})}
+            try:
+                final = await self._write(lambda conn: self._commit_answer(conn, claim, answer, ctx))
+            except _Cancelled:  # the Stop came first: no answer is published
+                raise asyncio.CancelledError() from None
+            emit({"type": "chat_response", "content": result.content, "reasoning": result.reasoning,
+                  "result_saved": True})
+            emit({"type": "run_finished", **final})
+        except asyncio.CancelledError:
+            final = await asyncio.shield(self._stop_turn(claim))
+            emit({"type": "run_finished", **final})
+        except spending.BudgetExceeded as exceeded:
+            final = await asyncio.shield(self._write(lambda conn: self._finish_turn(
+                conn, claim.run_id, "failed", None, "budget", limit={"budget": exceeded.budget})))
+            emit({"type": "limit_reached", "budget": exceeded.budget})
+            emit({"type": "run_finished", **final})
+        except Exception as error:  # a defect, not a provider failure; the turn ends failed
+            log.error("turn failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
+            with suppress(Exception):
+                final = await asyncio.shield(self._stop_turn(claim, status="failed", reason="internal"))
+                emit({"type": "run_finished", **final})
+        finally:
+            self.registry.release(claim)
+            claim.events.put_nowait(None)
+            if not self.registry.closed:
+                self._detach(self.kick_background())
+
+    async def _stop_turn(self, claim, *, status=None, reason=None):
+        """End a turn that did not reach its primary commit, settling its open call once."""
+        if status is None:
+            status = "interrupted" if claim.cancel_reason == "shutdown" else "cancelled"
+        cancel_reason = None if status != "cancelled" else ("revoked" if claim.cancel_reason == "revoked" else "researcher")
+        call = claim.call
+
+        def stop(conn):
+            _close_call(conn, call)
+            return self._finish_turn(conn, claim.run_id, status, cancel_reason, reason or status)
+
+        return await self._write(stop)
+
+    def _finish_turn(self, conn, run_id, status, cancel_reason, reason_code, limit=None):
+        """Write a terminal status for a turn that has no answer, if it is still running.
+        Returns the status the turn has afterwards."""
+        if _running(conn, run_id):
+            if limit is not None:
+                _event(conn, run_id, "limit_hit", limit)
+            cost = spending.run_cost(conn, run_id)
+            _event(conn, run_id, "run_finished", {"status": status, "reason": reason_code})
+            conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, finished_at = ?, settled_cost_usd = ?"
+                         " WHERE id = ?", (status, cancel_reason, utc_now(), cost, run_id))
+            conn.execute("UPDATE turns SET reason_code = ?, memory_status = 'skipped', result_saved = 0,"
+                         " accounting = ? WHERE run_id = ?",
+                         (reason_code, json.dumps(_accounting(conn, run_id)), run_id))
+        row = conn.execute("SELECT status, settled_cost_usd FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return {"run_id": run_id, "status": row[0], "cost_usd": row[1]} if row else {"run_id": run_id, "status": "deleted"}
+
+    def _commit_answer(self, conn, claim, answer, ctx):
+        """The primary commit. Refused if cancellation was requested, so no answer is
+        published after a Stop the turn saw first."""
+        if claim.cancel_requested.is_set():
+            raise _Cancelled()
+        if not _running(conn, claim.run_id):
+            return self._finish_turn(conn, claim.run_id, "cancelled", None, None)  # deleted or ended meanwhile
+        cost = spending.run_cost(conn, claim.run_id)
+        _event(conn, claim.run_id, "run_finished", {"status": "succeeded"})
+        conn.execute("UPDATE turns SET answer = ?, result_saved = 1, phase = 'answer', memory_status = 'skipped',"
+                     " accounting = ? WHERE run_id = ?",
+                     (json.dumps(answer), json.dumps(_accounting(conn, claim.run_id)), claim.run_id))
+        conn.execute("UPDATE runs SET status = 'succeeded', finished_at = ?, settled_cost_usd = ? WHERE id = ?",
+                     (utc_now(), cost, claim.run_id))
+        conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (utc_now(), claim.conversation_id))
+        if ctx["title"] is not None:  # detached post-answer work, written with the answer so it is never lost
+            conn.execute(
+                "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
+                " VALUES (?, ?, 'background', 'title', ?, ?)",
+                (new_id(), ctx["project_id"], claim.run_id, json.dumps({
+                    "conversation_id": claim.conversation_id, "title_rev": ctx["title"]["title_rev"],
+                    "route": ctx["route"].key, "message": ctx["message"][:4000],
+                })))
+        return {"run_id": claim.run_id, "status": "succeeded", "cost_usd": cost}
+
+    # Model calls
+
+    async def _reserve(self, active, project_id, paying_conversation_id, estimate, budgets, *, phase):
+        """Admit one model call: its reservation and step_started event. A cancellation
+        during the write releases the reservation once it is written."""
+        run_id = active.run_id
+
+        def reserve(conn):
+            (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
+                                   (run_id,)).fetchone()
+            reservation = spending.reserve(conn, run_id=run_id, step_seq=step, project_id=project_id,
+                                           paying_conversation_id=paying_conversation_id, estimate_usd=estimate,
+                                           **budgets)
+            _event(conn, run_id, "step_started", {"step": step, "phase": phase, "estimate_usd": estimate,
+                                                   "reservation_id": reservation})
+            return _Call(step, reservation)
+
+        call, cancelled = await self._write_through(reserve)
+        active.call = call
+        if cancelled or active.cancel_requested.is_set():
+            raise asyncio.CancelledError()
+        return call
+
+    async def _call(self, active, call, route, key, messages, *, effort=None, max_tokens=None, output=None):
+        """Dispatch one admitted call through the gate and record it, settling its
+        reservation. output(result), if given, is recorded on the finished step, so a
+        run can later finish from the record."""
+        if active.cancel_requested.is_set():
+            raise asyncio.CancelledError()
+        project_id = await self._read(lambda conn: conn.execute(
+            "SELECT project_id FROM budget_reservations WHERE id = ?", (call.reservation_id,)).fetchone())
+        if project_id is None:  # the project was deleted since admission
+            raise asyncio.CancelledError()
+        async with self.gate.async_client(project_id[0]) as client:
+            call.dispatched = True  # from here the request may leave, so it costs at least its estimate
+            result = await openrouter.query_model(
+                client, route, key, messages, timeout=MODEL_CALL_SECONDS, effort=effort, max_tokens=max_tokens,
+                model_entry=get_model_metadata(route))
+
+        finished = {"step": call.step, "outcome": result.error_kind or "ok"}
+        if output is not None and result.ok:
+            finished["output"] = output(result)
+
+        def record(conn):
+            for attempt in result.attempts:
+                _event(conn, active.run_id, "model_attempt", {"step": call.step, "route": route.key, **attempt.record()})
+            if result.dispatched:
+                usage = result.attempts[-1].usage if result.attempts else {}
+                spending.settle(conn, call.reservation_id, result.reported_cost,
+                                budget_router.cost_from_usage(route, usage))
+            else:
+                spending.release(conn, call.reservation_id)
+            _event(conn, active.run_id, "step_finished", finished)
+
+        await self._write(record)  # if cancelled meanwhile, the write still settles it, once
+        active.call = None
+        return result
+
+    # Background runs
+
+    async def kick_background(self) -> None:
+        """Start every background run that is running in the record but not in this process."""
+        rows = await self._read(lambda conn: conn.execute(
+            "SELECT id FROM runs WHERE kind = 'background' AND status = 'running' ORDER BY started_at").fetchall())
+        for (run_id,) in rows:
+            active = self.registry.add_background(run_id)
+            if active is not None:
+                active.task = asyncio.create_task(self._background(active))
+
+    async def _background(self, active: ActiveRun) -> None:
+        try:
+            row = await self._read(lambda conn: conn.execute(
+                "SELECT project_id, workflow, attempts, inputs, status FROM runs WHERE id = ?",
+                (active.run_id,)).fetchone())
+            if row is None or row[4] != "running":
+                return  # rule 1: finished (or deleted); never run again
+            project_id, workflow, attempts, inputs, _ = row
+            inputs = json.loads(inputs or "{}")
+            recorded = await self._read(lambda conn: conn.execute(
+                "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished' ORDER BY seq DESC LIMIT 1",
+                (active.run_id,)).fetchone())
+            if recorded is not None and json.loads(recorded[0]).get("outcome") == "ok":
+                output = json.loads(recorded[0]).get("output")  # rule 2: finish from the record, no model call
+            elif attempts < BACKGROUND_ATTEMPTS:  # rule 3: another model call
+                output = await self._background_call(active, project_id, workflow, inputs)
+            else:  # rule 4
+                await self._write(lambda conn: self._finish_background(conn, active.run_id, "interrupted", None, inputs))
+                return
+            await self._write(lambda conn: self._finish_background(
+                conn, active.run_id, "succeeded" if output is not None else "failed", output, inputs))
+        except asyncio.CancelledError:
+            call = active.call
+            await asyncio.shield(self._write(lambda conn: _close_call(conn, call)))
+            if active.cancel_reason != "shutdown":  # at shutdown it stays running and restarts next time
+                cancel_reason = "revoked" if active.cancel_reason == "revoked" else "researcher"
+                await asyncio.shield(self._write(lambda conn: self._finish_background(
+                    conn, active.run_id, "cancelled", None, None, cancel_reason=cancel_reason)))
+        except spending.BudgetExceeded:
+            await asyncio.shield(self._write(lambda conn: self._finish_background(conn, active.run_id, "failed", None, None)))
+        except Exception as error:
+            log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
+        finally:
+            self.registry.release(active)
+
+    async def _background_call(self, active, project_id, workflow, inputs):
+        """One model call for a background run. Returns its output, or None if it failed."""
+        if workflow != "title":
+            raise ValueError(f"unknown background workflow {workflow!r}")
+        route = providers.resolve_route(self.data_dir, *inputs["route"].split(":", 1))
+        key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
+                                                self.keyring_backend)
+        if route is None or key is None:
+            return None
+        budget = load_settings(self.data_dir, project_id).values["project"]["budget_usd"]
+
+        def start(conn):
+            if not _running(conn, active.run_id):
+                raise _Cancelled()
+            conn.execute("UPDATE runs SET attempts = attempts + 1 WHERE id = ?", (active.run_id,))  # before the call
+            (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
+                                   (active.run_id,)).fetchone()
+            estimate = budget_router.estimate_title_cost(route)
+            reservation = spending.reserve(conn, run_id=active.run_id, step_seq=step, project_id=project_id,
+                                           paying_conversation_id=None, estimate_usd=estimate,
+                                           project_budget_usd=budget, conversation_budget_usd=None)
+            _event(conn, active.run_id, "step_started", {"step": step, "phase": "title", "estimate_usd": estimate,
+                                                          "reservation_id": reservation})
+            return _Call(step, reservation)
+
+        try:
+            call, cancelled = await self._write_through(start)
+        except _Cancelled:
+            raise asyncio.CancelledError() from None
+        active.call = call
+        if cancelled:
+            raise asyncio.CancelledError()
+        messages = [{"role": "system", "content": TITLE_RULES}, {"role": "user", "content": inputs["message"]}]
+        result = await self._call(active, call, route, key, messages, max_tokens=60,
+                                  output=lambda result: _clean_title(result.content))
+        return _clean_title(result.content) if result.ok else None
+
+    def _finish_background(self, conn, run_id, status, output, inputs, cancel_reason=None):
+        """The run's effect, terminal status and settled cost, in one transaction."""
+        if not _running(conn, run_id):
+            return
+        if status == "succeeded" and output is not None:
+            # The title is written only if nobody changed it since the run was queued.
+            conn.execute(
+                "UPDATE conversations SET title = ?, title_source = 'generated', title_rev = title_rev + 1,"
+                " updated_at = ? WHERE id = ? AND title_rev = ? AND coalesce(title_source, '') <> 'researcher'",
+                (output, utc_now(), inputs["conversation_id"], inputs["title_rev"]))
+        _event(conn, run_id, "run_finished", {"status": status})
+        conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, finished_at = ?, settled_cost_usd = ? WHERE id = ?",
+                     (status, cancel_reason, utc_now(), spending.run_cost(conn, run_id), run_id))
+
+
+def _close_call(conn, call):
+    """Settle a call that may have gone out at its estimate, or release one that never
+    left. Either happens once; a call already recorded is left as it is."""
+    if call is not None:
+        (spending.settle if call.dispatched else spending.release)(conn, call.reservation_id)
+
+
+def _accounting(conn, run_id):
+    """The run's spending by basis: reported, estimated, and attempts with no usable usage."""
+    rows = conn.execute("SELECT basis, coalesce(sum(settled_usd), 0) FROM budget_reservations"
+                        " WHERE run_id = ? AND status = 'settled' GROUP BY basis", (run_id,)).fetchall()
+    totals = dict(rows)
+    unknown = sum(1 for (data,) in conn.execute(
+        "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'", (run_id,))
+        if json.loads(data).get("charge") == "unknown" and json.loads(data).get("dispatched"))
+    return {"reported_usd": totals.get("reported", 0), "estimated_usd": totals.get("estimated", 0),
+            "unknown_attempts": unknown}
+
+
+def _clean_title(text):
+    if not isinstance(text, str):
+        return None
+    title = " ".join(text.split()).strip("\"'“”‘’「」『』 ")
+    return title[:80] or None

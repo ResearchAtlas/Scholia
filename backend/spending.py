@@ -87,16 +87,17 @@ def reserve(conn, *, run_id: str, step_seq: int, project_id: str, paying_convers
     return reservation_id
 
 
-def settle(conn, reservation_id: str, reported_usd=None) -> bool:
-    """Settle an open reservation: at the reported cost when it is a valid amount,
-    otherwise at its estimate, marked estimated. Returns whether this call settled
-    it; a reservation already settled or released, or gone with its project, is
-    left as it is."""
-    reported = amount(reported_usd)
+def settle(conn, reservation_id: str, reported_usd=None, estimated_usd=None) -> bool:
+    """Settle an open reservation: at the reported cost when it is a valid amount;
+    otherwise, marked estimated, at estimated_usd (an estimate from reported token
+    counts) when valid, else at the reservation's own estimate. Returns whether this
+    call settled it; a reservation already settled or released, or gone with its
+    project, is left as it is."""
+    reported, estimated = amount(reported_usd), amount(estimated_usd)
     cursor = conn.execute(
-        "UPDATE budget_reservations SET status = 'settled', settled_usd = coalesce(?, estimate_usd),"
+        "UPDATE budget_reservations SET status = 'settled', settled_usd = coalesce(?, ?, estimate_usd),"
         " basis = ?, settled_at = ? WHERE id = ? AND status = 'open'",
-        (reported, "reported" if reported is not None else "estimated", utc_now(), reservation_id),
+        (reported, estimated, "reported" if reported is not None else "estimated", utc_now(), reservation_id),
     )
     return cursor.rowcount == 1
 

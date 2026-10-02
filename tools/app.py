@@ -1,9 +1,13 @@
-"""Entry point of the packaged app. Until the desktop app exists, its only mode is the
-self-test: `Scholia --self-test --model <embedding model>`."""
+"""Entry point of the packaged app: the desktop app, or its self-test with
+`Scholia --self-test --model <embedding model>`."""
 
 import sys
 
-from backend import self_test
-
 if __name__ == "__main__":
-    sys.exit(self_test.main(sys.argv[1:]))
+    if "--self-test" in sys.argv[1:]:
+        from backend import self_test
+
+        sys.exit(self_test.main(sys.argv[1:]))
+    from backend import desktop
+
+    sys.exit(desktop.main(sys.argv[1:]))

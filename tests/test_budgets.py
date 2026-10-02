@@ -153,6 +153,14 @@ def test_a_call_without_valid_usage_settles_at_its_estimate_never_zero(db, repor
     assert row(db, reservation)[2:] == ("settled", 0.5, "estimated")
 
 
+def test_reported_tokens_without_a_cost_settle_at_their_estimate(db):
+    project = add_project(db)
+    conversation, run = add_turn(db, project)
+    reservation = reserve(db, project, conversation, run, 0.5)
+    db.write(lambda conn: spending.settle(conn, reservation, None, estimated_usd=0.0042))
+    assert row(db, reservation)[2:] == ("settled", 0.0042, "estimated")
+
+
 def test_a_reported_zero_is_a_valid_cost(db):
     project = add_project(db)
     conversation, run = add_turn(db, project)
