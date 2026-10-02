@@ -618,3 +618,16 @@ async def test_the_turn_waits_for_its_reader_before_each_step(tmp_path):
         assert [e["type"] for e in rest] == ["chat_response", "run_finished"]
         assert len(client.provider.chats) == 1
         await background_idle(client)
+
+
+async def test_shutdown_waits_for_detached_work_before_the_database_closes(tmp_path):
+    """Detached work (starting background runs) uses the database: it is finished, not
+    left running, when the app stops and the database closes."""
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        await send(client, conversation)  # its end detaches the start of its title run
+        harness = client.state["harness"]
+        detached = set(harness._tasks)
+    assert detached and all(task.done() for task in detached)
+    assert all(task.done() for task in harness._tasks)
+    assert not harness.registry.runs

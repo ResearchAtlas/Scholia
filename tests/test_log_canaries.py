@@ -100,6 +100,8 @@ async def test_an_existing_log_folder_and_file_are_narrowed_to_owner_only(tmp_pa
     os.chmod(folder, 0o755)
     (folder / "scholia.log").write_text("earlier\n")
     os.chmod(folder / "scholia.log", 0o644)
+    (folder / "scholia.log.2026-10-01").write_text("older\n")  # a dated log from an earlier rotation
+    os.chmod(folder / "scholia.log.2026-10-01", 0o644)
     handler = logs.configure(tmp_path)
     try:
         logging.getLogger("backend.test").warning("a line")
@@ -108,6 +110,7 @@ async def test_an_existing_log_folder_and_file_are_narrowed_to_owner_only(tmp_pa
         handler.close()
     assert stat.S_IMODE(folder.stat().st_mode) == 0o700
     assert stat.S_IMODE((folder / "scholia.log").stat().st_mode) == 0o600
+    assert stat.S_IMODE((folder / "scholia.log.2026-10-01").stat().st_mode) == 0o600
     os.chmod(folder / "scholia.log", 0o400)  # stricter than owner-only: never broadened
     handler = logs.configure(tmp_path)
     handler.close()

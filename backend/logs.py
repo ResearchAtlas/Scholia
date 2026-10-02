@@ -33,7 +33,12 @@ def configure(data_dir, level=logging.INFO) -> logging.Handler:
     try:
         os.mkdir(folder, 0o700)
     except FileExistsError:
-        os.chmod(folder, stat.S_IMODE(folder.stat().st_mode) & 0o700)  # narrowed, never broadened
+        # An existing folder, its log and its older dated logs are narrowed to owner-only
+        # (never broadened) before anything is written or rotated.
+        os.chmod(folder, stat.S_IMODE(folder.stat().st_mode) & 0o700)
+        for path in folder.iterdir():
+            if path.is_file() and not path.is_symlink():
+                os.chmod(path, stat.S_IMODE(path.stat().st_mode) & 0o600)
     handler = PrivateRotatingHandler(folder / "scholia.log")
     handler.setFormatter(logging.Formatter(FORMAT))
     root = logging.getLogger()

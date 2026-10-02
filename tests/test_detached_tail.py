@@ -290,3 +290,19 @@ async def test_a_provider_named_with_a_colon_titles_its_conversations(tmp_path):
         await background_idle(client)
         assert await rows(client, "SELECT status FROM runs WHERE workflow = 'title'") == [("succeeded",)]
         assert provider.titles[0]["model"] == "m:1"
+
+
+@pytest.mark.parametrize("ended", ["failed", "cancelled", "interrupted"])
+async def test_a_title_run_that_ended_without_a_title_is_never_replaced(tmp_path, ended):
+    provider = MockProvider()
+    provider.title_replies.append((500, {"error": {"message": "boom"}}))
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id)
+        await background_idle(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = ? WHERE workflow = 'title'", (ended,)))
+        await send(client, conversation_id, "another message")
+        await background_idle(client)
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'title'") == [(1,)]
+        assert len(provider.titles) == 1

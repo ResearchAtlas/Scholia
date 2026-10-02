@@ -231,6 +231,9 @@ class Harness:
         for active in list(self.registry.runs.values()):
             self._request_cancel(active, "shutdown")
             tasks += [t for t in (active.task, active.closing) if t is not None]
+        # Detached work (starting background runs, recording stopped claims) reads and writes
+        # the database too: it must finish before the database closes.
+        tasks += [t for t in self._tasks if not t.done()]
         if tasks:
             done, pending = await asyncio.wait(tasks, timeout=timeout)
             if pending:
@@ -532,13 +535,14 @@ class Harness:
         conn.execute("UPDATE runs SET status = 'succeeded', finished_at = ?, settled_cost_usd = ? WHERE id = ?",
                      (utc_now(), cost, claim.run_id))
         conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (utc_now(), claim.conversation_id))
-        # Detached post-answer work, written with the answer so it is never lost: one title
-        # for a conversation that still has none and no title run pending or done.
+        # Detached post-answer work, written with the answer so it is never lost: one title run
+        # per conversation, ever, for a conversation that is still untitled. A title run that
+        # failed or was cancelled is not replaced by another paid one.
         untitled = conn.execute(
             "SELECT c.title_rev FROM conversations c WHERE c.id = ? AND c.title IS NULL AND c.title_source IS NULL"
             " AND NOT EXISTS (SELECT 1 FROM runs r JOIN turns t ON t.run_id = r.source_turn_id"
-            "                 WHERE r.workflow = 'title' AND t.conversation_id = c.id"
-            "                 AND r.status IN ('running', 'succeeded'))", (claim.conversation_id,)).fetchone()
+            "                 WHERE r.workflow = 'title' AND t.conversation_id = c.id)",
+            (claim.conversation_id,)).fetchone()
         if untitled is not None:
             conn.execute(
                 "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
@@ -627,6 +631,8 @@ class Harness:
 
     async def kick_background(self) -> None:
         """Start every background run that is running in the record but not in this process."""
+        if self.registry.closed:
+            return
         rows = await self._read(lambda conn: conn.execute(
             "SELECT id FROM runs WHERE kind = 'background' AND status = 'running' ORDER BY started_at").fetchall())
         for (run_id,) in rows:
