@@ -13,7 +13,6 @@ import logging
 import shutil
 import stat
 import threading
-import unicodedata
 from functools import partial
 from pathlib import Path
 
@@ -29,7 +28,7 @@ from backend import APP_VERSION, credentials, openrouter, openrouter_client, pro
 from backend.db import BackupStoppedError, ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
-from backend.runs import AdmissionError, Harness, _through, derived_status
+from backend.runs import AdmissionError, Harness, _through, derived_status, visible
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, load_instructions, load_settings,
                               write_private)
 
@@ -85,13 +84,12 @@ def _error(status, code, message):
 
 
 def _visible(text):
-    """A name or title, trimmed; one with no visible character (only spaces, or format and
-    control characters such as a zero-width space) is refused."""
+    """A name or title, trimmed; one with no visible character (see runs.visible) is refused."""
     if text is None:
         return None
-    if not any(unicodedata.category(c)[0] not in "CZ" for c in text):
+    if visible(text) is None:
         raise ValueError("it needs a visible character")
-    return text.strip()
+    return visible(text)
 
 
 class NewProject(BaseModel):
@@ -502,7 +500,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @app.post("/api/conversations", status_code=201)
     async def create_conversation(body: NewConversation):
         conversation_id = new_id()
-        title = (body.title or "").strip() or None  # an empty title is no title, so one is generated
+        title = visible(body.title)  # a title with nothing visible is no title, so one is generated
 
         def insert(conn):
             project_id = body.project_id or conn.execute(

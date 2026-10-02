@@ -35,6 +35,7 @@ import logging
 import threading
 import time
 import traceback
+import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass, field
 
@@ -538,12 +539,17 @@ class Harness:
 
     def _finish_turn(self, conn, run_id, status, cancel_reason, reason_code, limit=None, claim=None):
         """Write a terminal status for a turn that has no answer, if it is still running.
-        Returns the status the turn has afterwards. With claim, a Stop (or revocation)
-        requested before this transaction wins over any other ending, as at the primary
-        commit: the turn ends cancelled."""
-        if claim is not None and claim.cancel_requested.is_set() and claim.cancel_reason != "shutdown":
-            status, reason_code, limit = "cancelled", "cancelled", None
-            cancel_reason = "revoked" if claim.cancel_reason == "revoked" else "researcher"
+        Returns the status the turn has afterwards. With claim, a Stop, revocation or
+        shutdown requested before this transaction wins over any other ending, as at the
+        primary commit: the turn ends cancelled, or interrupted by the shutdown (so
+        Continue is offered)."""
+        if claim is not None and claim.cancel_requested.is_set():
+            limit = None
+            if claim.cancel_reason == "shutdown":
+                status, cancel_reason, reason_code = "interrupted", None, "interrupted"
+            else:
+                status, reason_code = "cancelled", "cancelled"
+                cancel_reason = "revoked" if claim.cancel_reason == "revoked" else "researcher"
         if _running(conn, run_id):
             if limit is not None:
                 _event(conn, run_id, "limit_hit", limit)
@@ -867,8 +873,15 @@ def _accounting(conn, run_id, complete=True):
             "unknown_attempts": unknown, "complete": complete}
 
 
+def visible(text):
+    """text trimmed, or None when it holds no visible character: only separators, or format
+    and control characters such as a zero-width space."""
+    if not isinstance(text, str) or not any(unicodedata.category(c)[0] not in "CZ" for c in text):
+        return None
+    return text.strip()
+
+
 def _clean_title(text):
     if not isinstance(text, str):
         return None
-    title = " ".join(text.split()).strip("\"'“”‘’「」『』 ")
-    return title[:80] or None
+    return visible(" ".join(text.split()).strip("\"'“”‘’「」『』 ")[:80])

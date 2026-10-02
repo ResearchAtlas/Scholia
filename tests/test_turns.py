@@ -874,16 +874,19 @@ async def test_a_conversation_deleted_between_reservation_and_dispatch_sends_not
         assert rest[-1]["type"] == "run_finished"
 
 
+@pytest.mark.parametrize("reason, outcome", [("researcher", ("cancelled", "researcher")),
+                                             ("shutdown", ("interrupted", None))])
 @pytest.mark.parametrize("ending", ["provider_error", "limit"])
-async def test_a_stop_that_comes_before_a_failed_or_limited_turn_commits_wins(tmp_path, monkeypatch, ending):
+async def test_a_stop_that_comes_before_a_failed_or_limited_turn_commits_wins(tmp_path, monkeypatch, ending,
+                                                                               reason, outcome):
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
         conversation = await new_conversation(client, title="t")
         harness = client.state["harness"]
         claim = await harness.admit_turn(conversation, "stopped")
 
-        def stop():  # the Stop is requested as the turn is about to end otherwise (only the flag, no task cancel)
-            claim.cancel_reason = "researcher"
+        def stop():  # the Stop (or shutdown) comes as the turn is about to end otherwise: only the flag
+            claim.cancel_reason = reason
             claim.cancel_requested.set()
 
         if ending == "provider_error":
@@ -900,6 +903,7 @@ async def test_a_stop_that_comes_before_a_failed_or_limited_turn_commits_wins(tm
             monkeypatch.setattr(runs_module.spending, "reserve", stop_then_refuse)
         stream = [event async for event in harness.events(claim)]
         assert [e["type"] for e in stream if e["type"] in ("error", "limit_reached")] == []
-        assert stream[-1]["status"] == "cancelled" and stream[-1]["cancel_reason"] == "researcher"
-        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id) == [
-            ("cancelled", "researcher")]
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == outcome
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id) == [outcome]
+        if reason == "shutdown":  # interrupted by closing the app: Continue is offered
+            assert (await client.post(f"/api/runs/{claim.run_id}/continue")).status_code == 200

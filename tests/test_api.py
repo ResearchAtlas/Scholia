@@ -663,3 +663,16 @@ async def test_a_blank_project_name_is_refused_and_names_are_trimmed(tmp_path, n
         assert project["name"] == "Interviews"
         changed = await client.patch(f"/api/projects/{project['id']}", json={"name": name})
         assert changed.status_code == 400
+
+
+@pytest.mark.parametrize("title", ["​", "  ﻿ "])
+async def test_a_new_conversation_titled_with_nothing_visible_has_no_title(tmp_path, title):
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={"title": title})).json()
+        assert (conversation["title"], conversation["title_source"]) == (None, None)
+
+
+async def test_a_generated_title_with_nothing_visible_is_no_title():
+    from backend.runs import _clean_title
+    assert _clean_title("​‍") is None
+    assert _clean_title(" “Cohort studies” ") == "Cohort studies"
