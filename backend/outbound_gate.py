@@ -12,9 +12,9 @@ Destination kinds: a model provider (configured in settings), a scholarly API, a
 open-access host taken from a named candidate of the project (never a model
 provider's host), the local helper, a local provider on loopback, and a model
 download source. Only model providers, local providers and the helper take a
-request body or credential headers (Authorization, Proxy-Authorization, Cookie,
-or any header named like a key or token). The others are public fetches: a GET
-or HEAD with no body and no credentials, whatever the level. Gated clients keep
+request body or credentials (Authorization, Proxy-Authorization, Cookie, any
+header named like a key or token, or user info in the URL). The others are
+public fetches: a GET or HEAD with no body and no credentials, whatever the level. Gated clients keep
 no cookies, so no response can make a later request carry one.
 
 Hosts are compared in one canonical spelling (see `_canonical_host`): lowercase
@@ -186,8 +186,10 @@ class OutboundGate:
         # behind the same server or CDN.
         addressed = (request.headers.get("host") == request.url.netloc.decode("ascii")
                      and "sni_hostname" not in request.extensions)
-        # What a scholarly, open-access or download request may not be.
-        if any(_CREDENTIAL_HEADER.search(name) for name in request.headers.keys()):
+        # What a scholarly, open-access or download request may not be. User info in
+        # the URL is a credential too: httpx turns it into Authorization only for a
+        # first request, never for a redirect hop.
+        if request.url.userinfo or any(_CREDENTIAL_HEADER.search(name) for name in request.headers.keys()):
             public_problem = "credential_to_non_provider"
         elif request.method not in ("GET", "HEAD") or _body(request) != b"":
             public_problem = "not_a_fetch"

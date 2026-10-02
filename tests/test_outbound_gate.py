@@ -428,6 +428,68 @@ def test_credentials_in_the_url_are_refused_to_public_hosts(db, remote, setup):
     assert remote.received == []
 
 
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("kind", list(PUBLIC))
+def test_a_redirect_hop_carrying_user_info_is_refused(db, remote, setup, kind, asynchronous):
+    # httpx keeps a redirect's user info in the URL without adding Authorization.
+    project_id = project(db)
+    url = httpx.URL(PUBLIC[kind])
+    location = str(url.copy_with(userinfo=b"user:SECRET", path="/elsewhere", query=None))
+    remote.redirects[str(url)] = (302, location)
+
+    async def run_async():
+        async with setup.gate.async_client(project_id, candidate_id=candidate_id, follow_redirects=True) as client:
+            await client.get(url)
+
+    candidate_id = candidate(db, project_id)
+    with pytest.raises(OutboundDenied) as caught:
+        if asynchronous:
+            asyncio.run(run_async())
+        else:
+            with setup.gate.client(project_id, candidate_id=candidate_id, follow_redirects=True) as client:
+                client.get(url)
+    assert caught.value.reason == "credential_to_non_provider"
+    assert [str(r.url) for r in remote.received] == [str(url)]
+    assert decisions(db) == [("allow", None), ("deny", "credential_to_non_provider")]
+    assert "SECRET" not in json.dumps(audit(db))
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("scheme", ["basic", "digest"])
+def test_an_auth_object_is_checked_like_a_header(db, setup, scheme, asynchronous):
+    received = []
+
+    def handler(request):  # challenges a request without credentials, as a Digest server does
+        received.append(request.headers.get("authorization"))
+        if scheme == "digest" and "authorization" not in request.headers:
+            return httpx.Response(401, headers={"WWW-Authenticate": 'Digest realm="r", nonce="n", qop="auth"'})
+        return httpx.Response(200)
+
+    gate = OutboundGate(db, setup.gate._inputs, transport=httpx.MockTransport(handler))
+    project_id = project(db)
+
+    def auth():
+        return httpx.BasicAuth("user", "SECRET") if scheme == "basic" else httpx.DigestAuth("user", "SECRET")
+
+    def send_with(url):
+        if not asynchronous:
+            with gate.client(project_id) as client:
+                return client.get(url, auth=auth())
+
+        async def run():
+            async with gate.async_client(project_id) as client:
+                return await client.get(url, auth=auth())
+
+        return asyncio.run(run())
+
+    with pytest.raises(OutboundDenied, match="credential_to_non_provider"):
+        send_with(PUBLIC["scholarly_api"])
+    # Basic sends nothing; Digest's first, credential-free request is a plain fetch.
+    assert received == ([] if scheme == "basic" else [None])
+    send_with(f"{OTHER_PROVIDER}/models")  # a provider may receive credentials
+    assert received[-1] is not None and received[-1].lower().startswith(scheme)
+
+
 def test_ordinary_headers_are_fine_for_public_hosts(db, remote, setup):
     headers = {"X-Title": "Scholia", "User-Agent": "Scholia/0.1", "Accept-Language": "zh-CN",
                "If-None-Match": '"abc"', "Range": "bytes=0-99"}
