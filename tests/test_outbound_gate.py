@@ -318,34 +318,164 @@ async def test_a_candidate_link_never_makes_openrouter_an_open_access_host_async
     assert remote.received == []
 
 
-@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
-@pytest.mark.parametrize(("method", "kwargs"), [
+# Scholarly APIs, open-access hosts and model download sources take public fetches only.
+PUBLIC = {
+    "open_access": OA_LINK,
+    "scholarly_api": "https://api.crossref.org/works?query=SECRET-QUERY",
+    "model_download": "https://huggingface.co/example/embedding/resolve/main/model.gguf",
+}
+NOT_FETCHES = [
     ("POST", {"json": {"q": "SECRET"}}),
     ("PUT", {"content": b"SECRET"}),
+    ("PATCH", {"content": b"SECRET"}),
     ("GET", {"content": b"SECRET"}),
-    ("GET", {"content": iter([b"SECRET"])}),
+    ("GET", "streamed"),
+    ("GET", {"data": {"q": "SECRET"}}),
     ("DELETE", {}),
     ("OPTIONS", {}),
-])
-def test_open_access_requests_are_fetches_only(db, remote, setup, level, method, kwargs):
+]
+
+
+async def streamed_body():
+    yield b"SECRET"
+
+
+def allowed_fetch(kind, level):
+    return not (kind == "model_download" and level == "local_only")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+@pytest.mark.parametrize("kind", list(PUBLIC))
+def test_public_destinations_take_fetches_only(db, remote, setup, kind, level, asynchronous):
     project_id = project(db, level)
-    with setup.gate.client(project_id, candidate_id=candidate(db, project_id), approved=True) as client:
-        refused(client, method, OA_LINK, "not_a_fetch", **kwargs)
-        assert remote.received == []
-        client.get(OA_LINK)
-        client.head(OA_LINK)
-    assert [request.method for request in remote.received] == ["GET", "HEAD"]
+    candidate_id = candidate(db, project_id)
+    url = PUBLIC[kind]
+    for method, kwargs in NOT_FETCHES:
+        if kwargs == "streamed":
+            kwargs = {"content": streamed_body() if asynchronous else iter([b"SECRET"])}
+        with pytest.raises(OutboundDenied) as caught:
+            send(setup.gate, project_id, candidate_id, method, url, asynchronous, **kwargs)
+        assert caught.value.reason == "not_a_fetch", method
+    assert remote.received == []
+    for method in ("GET", "HEAD"):
+        if allowed_fetch(kind, level):
+            send(setup.gate, project_id, candidate_id, method, url, asynchronous)
+        else:
+            with pytest.raises(OutboundDenied, match="not_allowed_at_level"):
+                send(setup.gate, project_id, candidate_id, method, url, asynchronous)
+    assert [r.method for r in remote.received] == (["GET", "HEAD"] if allowed_fetch(kind, level) else [])
+    rows = [row for _, row in audit(db)]
+    assert {row["kind"] for row in rows} == {kind}
+    assert [row["reason"] for row in rows[:len(NOT_FETCHES)]] == ["not_a_fetch"] * len(NOT_FETCHES)
 
 
-@pytest.mark.asyncio
-async def test_open_access_requests_are_fetches_only_async(db, remote, setup):
-    project_id = await asyncio.to_thread(project, db, "local_only")
-    candidate_id = await asyncio.to_thread(candidate, db, project_id)
-    async with setup.gate.async_client(project_id, candidate_id=candidate_id, approved=True) as client:
-        with pytest.raises(OutboundDenied, match="not_a_fetch"):
-            await client.post(OA_LINK, json={"q": "SECRET"})
-        await client.get(OA_LINK)
-    assert [request.method for request in remote.received] == ["GET"]
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+def test_a_client_holding_a_provider_key_cannot_send_it_to_public_hosts(db, remote, setup, level, asynchronous):
+    project_id = project(db, level)
+    candidate_id = candidate(db, project_id)
+    urls = list(PUBLIC.values())
+    provider = (f"{OTHER_PROVIDER}/chat/completions", chat())
+
+    def run(client_factory, call):
+        if not asynchronous:
+            with client_factory() as client:
+                return call(client)
+
+        async def go():
+            async with client_factory() as client:
+                return await call(client)
+
+        return asyncio.run(go())
+
+    def sync_or_async_factory():
+        make = setup.gate.async_client if asynchronous else setup.gate.client
+        return make(project_id, candidate_id=candidate_id, approved=True, headers=AUTH)
+
+    for url in urls:
+        with pytest.raises(OutboundDenied) as caught:
+            run(sync_or_async_factory, lambda client, url=url: client.get(url))
+        assert caught.value.reason == "credential_to_non_provider"
+    assert remote.received == []
+    rows = [row for _, row in audit(db)]
+    assert [(row["kind"], row["reason"]) for row in rows] == [
+        (kind, "credential_to_non_provider") for kind in PUBLIC]
+    if level == "normal":  # the same client's provider request still works
+        run(sync_or_async_factory, lambda client: client.post(provider[0], json=provider[1]))
+        assert [str(r.url) for r in remote.received] == [provider[0]]
+        assert remote.received[0].headers["authorization"] == AUTH["Authorization"]
+    assert KEY not in json.dumps(audit(db))
+
+
+@pytest.mark.parametrize("headers", [
+    {"Authorization": "Bearer x"}, {"Proxy-Authorization": "Basic eA=="}, {"Cookie": "sid=x"},
+    {"X-Api-Key": "x"}, {"api-key": "x"}, {"X-Auth-Token": "x"}, {"X-Goog-Api-Key": "x"},
+    {"Ocp-Apim-Subscription-Key": "x"}, {"X-Session-Id": "x"}, {"X-Client-Secret": "x"},
+    {"X-Access-Token": "x"}, {"X-Credential": "x"}, {"X-Password": "x"},
+])
+def test_any_credential_header_is_refused_to_public_hosts(db, remote, setup, headers):
+    project_id = project(db)
+    with setup.gate.client(project_id, candidate_id=candidate(db, project_id)) as client:
+        for url in PUBLIC.values():
+            refused(client, "GET", url, "credential_to_non_provider", headers=headers)
+    assert remote.received == []
+
+
+def test_credentials_in_the_url_are_refused_to_public_hosts(db, remote, setup):
+    with setup.gate.client(project(db)) as client:  # httpx turns user info into Basic authorization
+        refused(client, "GET", "https://user:SECRET@api.crossref.org/works", "credential_to_non_provider")
+    assert remote.received == []
+
+
+def test_ordinary_headers_are_fine_for_public_hosts(db, remote, setup):
+    headers = {"X-Title": "Scholia", "User-Agent": "Scholia/0.1", "Accept-Language": "zh-CN",
+               "If-None-Match": '"abc"', "Range": "bytes=0-99"}
+    project_id = project(db)
+    with setup.gate.client(project_id, candidate_id=candidate(db, project_id), headers=headers) as client:
+        for url in PUBLIC.values():
+            client.get(url)
+    assert len(remote.received) == 3
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_providers_and_the_helper_may_receive_credentials(db, remote, setup, asynchronous):
+    project_id = project(db, "local_only")
+    declare(db, LOCAL_SERVER)
+    for method, url, kwargs in (("GET", f"{HELPER}/health", {}),
+                                ("POST", f"{LOCAL_SERVER}/chat/completions", {"json": chat()})):
+        send(setup.gate, project_id, None, method, url, asynchronous,
+             headers={"Authorization": "Bearer local", "X-Api-Key": "local"}, **kwargs)
+    assert len(remote.received) == 2
+    private_id = project(db, "private")
+    send(setup.gate, private_id, None, "POST", CHAT, asynchronous, json=chat(), headers=AUTH)
+    assert len(remote.received) == 3
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_clients_keep_no_cookies(db, setup, asynchronous):
+    received = []
+
+    def handler(request):
+        received.append(request)
+        return httpx.Response(200, headers={"Set-Cookie": "sid=SECRET; Path=/"})
+
+    gate = OutboundGate(db, setup.gate._inputs, transport=httpx.MockTransport(handler))
+    project_id = project(db)
+    urls = (PUBLIC["scholarly_api"], PUBLIC["scholarly_api"], f"{OTHER_PROVIDER}/models", f"{OTHER_PROVIDER}/models")
+    if asynchronous:
+        async def go():
+            async with gate.async_client(project_id) as client:
+                for url in urls:
+                    await client.get(url)
+
+        asyncio.run(go())
+    else:
+        with gate.client(project_id) as client:
+            for url in urls:
+                client.get(url)
+    assert [r.headers.get("cookie") for r in received] == [None] * 4
+    assert decisions(db) == [("allow", None)] * 4
 
 
 THIS_HOST = [

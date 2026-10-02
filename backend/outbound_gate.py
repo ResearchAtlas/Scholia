@@ -9,9 +9,13 @@ origin is refused. Anything not classified is refused, and so is a request whose
 Host header or TLS name differs from its URL's host.
 
 Destination kinds: a model provider (configured in settings), a scholarly API, an
-open-access host taken from a named candidate of the project (fetches only: GET
-or HEAD without a body, and never a model provider's host), the local helper,
-a local provider on loopback, and a model download source.
+open-access host taken from a named candidate of the project (never a model
+provider's host), the local helper, a local provider on loopback, and a model
+download source. Only model providers, local providers and the helper take a
+request body or credential headers (Authorization, Proxy-Authorization, Cookie,
+or any header named like a key or token). The others are public fetches: a GET
+or HEAD with no body and no credentials, whatever the level. Gated clients keep
+no cookies, so no response can make a later request carry one.
 
 Hosts are compared in one canonical spelling (see `_canonical_host`): lowercase
 IDNA names without a trailing dot, and IP addresses in their standard form, so
@@ -54,8 +58,10 @@ CDN, say) needs a change here when it is wired in.
 import asyncio
 import ipaddress
 import json
+import re
 import socket
 from collections.abc import Callable, Collection, Mapping
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -95,6 +101,9 @@ PRIVATE_FIELDS = frozenset({
 })
 ZDR = {"provider": {"zdr": True}}  # every Private request carries it, whatever the allowlist says
 _CLIENT_OPTIONS = frozenset({"base_url", "follow_redirects", "headers", "max_redirects", "timeout"})
+# Destinations that may receive a body or credentials, each under its level's rules.
+_PRIVATE_PEERS = frozenset({Kind.MODEL_PROVIDER, Kind.LOCAL_PROVIDER, Kind.LOCAL_HELPER})
+_CREDENTIAL_HEADER = re.compile(r"auth|cookie|key|token|secret|session|passw|credential", re.IGNORECASE)
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _THIS_HOST = (ipaddress.IPv4Network("127.0.0.0/8"), ipaddress.IPv4Network("0.0.0.0/8"))
 
@@ -161,14 +170,14 @@ class OutboundGate:
         """
         transport = _Transport(self, _Scope(project_id, candidate_id, approved),
                                self._transport or httpx.HTTPTransport(trust_env=False))
-        return httpx.Client(transport=transport, trust_env=False, **_checked(options))
+        return httpx.Client(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
     def async_client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
                      **options) -> httpx.AsyncClient:
         """The async form of client()."""
         transport = _AsyncTransport(self, _Scope(project_id, candidate_id, approved),
                                     self._transport or httpx.AsyncHTTPTransport(trust_env=False))
-        return httpx.AsyncClient(transport=transport, trust_env=False, **_checked(options))
+        return httpx.AsyncClient(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
     def _check(self, request: httpx.Request, scope: _Scope) -> None:
         """Decide one request and record the decision. Raises OutboundDenied."""
@@ -177,7 +186,13 @@ class OutboundGate:
         # behind the same server or CDN.
         addressed = (request.headers.get("host") == request.url.netloc.decode("ascii")
                      and "sni_hostname" not in request.extensions)
-        fetch = request.method in ("GET", "HEAD") and _body(request) == b""
+        # What a scholarly, open-access or download request may not be.
+        if any(_CREDENTIAL_HEADER.search(name) for name in request.headers.keys()):
+            public_problem = "credential_to_non_provider"
+        elif request.method not in ("GET", "HEAD") or _body(request) != b"":
+            public_problem = "not_a_fetch"
+        else:
+            public_problem = None
         # The inputs are called outside the transaction, and the Private checks only
         # when the project is Private now. The level is read again in the transaction.
         seen = self._db.read(lambda conn: _level(conn, scope.project_id))
@@ -203,7 +218,7 @@ class OutboundGate:
                 kind, reason = None, "gate_inputs_unavailable"
             else:
                 kind = _classify(conn, target, providers, helper, scope)
-                reason = _policy(conn, level, kind, target, scope, private_problem, fetch)
+                reason = _policy(conn, level, kind, target, scope, private_problem, public_problem)
                 if reason is None and not addressed:
                     reason = "host_mismatch"
             _record(conn, request, scope, level, kind, _show(target), reason)
@@ -249,6 +264,11 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self):
         await self._inner.aclose()
+
+
+def _no_cookies():
+    """A cookie jar that stores nothing: a gated client never replays a cookie."""
+    return CookieJar(policy=DefaultCookiePolicy(allowed_domains=[]))
 
 
 def _checked(options):
@@ -357,14 +377,14 @@ def _classify(conn, target, providers, helper, scope):
     return None
 
 
-def _policy(conn, level, kind, target, scope, private_problem, fetch):
+def _policy(conn, level, kind, target, scope, private_problem, public_problem):
     """None to allow, or the reason for refusing."""
     if level is None:
         return "unknown_project"
     if kind is None:
         return "unknown_destination"
-    if kind is Kind.OPEN_ACCESS and not fetch:
-        return "not_a_fetch"
+    if kind not in _PRIVATE_PEERS and public_problem:
+        return public_problem
     if level == "normal" or kind is Kind.LOCAL_HELPER:
         return None
     if level == "private":
