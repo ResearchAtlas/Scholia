@@ -133,6 +133,10 @@ _KNOWN = SCHOLARLY_APIS | MODEL_SOURCES | {OPENROUTER}
 # value is a one-time token from _Scope.expect, bound to the next URL.
 _HOP = object()
 MAX_PENDING_HOPS = 16  # per client
+# A request extension holding a callable the gate calls once the request has passed its
+# check and is handed to the network, so a caller can tell a request that left from one
+# that was refused or cancelled before it left.
+DISPATCHED = "scholia.dispatched"
 
 
 class OutboundDenied(Exception):
@@ -315,6 +319,7 @@ class _Transport(httpx.BaseTransport):
 
     def handle_request(self, request):
         kind = self._gate._check(request, self._scope)
+        _dispatched(request)
         response = self._inner.handle_request(request)
         leaves, target = _redirect(request, response)
         if leaves:
@@ -335,6 +340,7 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
         # The database blocks, so it is reached off the event loop.
         kind = await asyncio.to_thread(self._gate._check, request, self._scope)
+        _dispatched(request)
         response = await self._inner.handle_async_request(request)
         leaves, target = _redirect(request, response)
         if leaves:
@@ -346,6 +352,12 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self):
         await self._inner.aclose()
+
+
+def _dispatched(request):
+    notify = request.extensions.get(DISPATCHED)
+    if callable(notify):
+        notify()
 
 
 def _project_id(project_id):

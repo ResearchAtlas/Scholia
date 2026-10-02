@@ -25,8 +25,9 @@ from dataclasses import dataclass, field
 import httpx
 
 from backend import reasoning_capability
-from backend.outbound_gate import OutboundDenied
+from backend.outbound_gate import DISPATCHED, OutboundDenied
 from backend.reasoning_control import resolve_reasoning_payload
+from backend.spending import amount
 
 log = logging.getLogger(__name__)
 
@@ -84,16 +85,16 @@ class Attempt:
 
     @property
     def reported_cost(self):
-        cost = self.usage.get("cost")
-        return cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+        """The cost the provider reported, if it is a valid amount (finite, not negative)."""
+        return amount(self.usage.get("cost"))
 
     def record(self) -> dict:
         """The run-event form: counts and codes only."""
         tokens = {k: self.usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-                  if isinstance(self.usage.get(k), int) and not isinstance(self.usage.get(k), bool)}
+                  if _count(self.usage.get(k))}
         details = self.usage.get("completion_tokens_details") or {}
         reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else None
-        if isinstance(reasoning, int) and not isinstance(reasoning, bool):
+        if _count(reasoning):
             tokens["reasoning_tokens"] = reasoning
         cost = self.reported_cost
         return {"outcome": self.outcome, "http_status": self.http_status, "elapsed_ms": self.elapsed_ms,
@@ -213,11 +214,14 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
 
 async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, timeout: float = 120.0,
                       effort: str | None = None, zdr_enabled: bool = False, max_tokens: int | None = None,
-                      model_entry=None, capability_records=None) -> ModelResult:
+                      model_entry=None, capability_records=None, on_dispatch=None) -> ModelResult:
     """One chat completion. Never raises for a provider failure: the result carries
     the failure kind and every attempt. Cancellation propagates (the caller settles
-    what the attempt in flight cost).
+    what the attempt in flight cost). on_dispatch, if given, is called when the
+    outbound gate lets a request go out, so a caller cancelled before that knows
+    nothing left.
     """
+    extensions = {DISPATCHED: on_dispatch} if on_dispatch is not None else {}
     payload = build_payload(route, messages, effort=effort, zdr_enabled=zdr_enabled, max_tokens=max_tokens,
                             model_entry=model_entry, capability_records=capability_records)
     if "reasoning" in payload and _skips_reasoning(route, key):
@@ -232,7 +236,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         started = time.monotonic()
         try:
             response = await asyncio.wait_for(
-                client.post(route.provider.chat_url, headers=headers, json=payload,
+                client.post(route.provider.chat_url, headers=headers, json=payload, extensions=extensions,
                             timeout=httpx.Timeout(remaining, connect=connect_timeout_for(remaining))),
                 timeout=remaining,
             )
@@ -261,6 +265,10 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         if len(attempts) > 1 and "reasoning" not in payload:
             _remember_no_reasoning(route, key)
         return ModelResult(content, reasoning, None, attempts)
+
+
+def _count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _failed(kind, attempts, route):

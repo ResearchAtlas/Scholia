@@ -179,7 +179,7 @@ async def test_a_failed_title_call_fails_only_the_title_run(tmp_path):
 # The recovery rules, applied when the app starts
 
 
-async def seed_title_run(client, conversation_id, *, attempts, status="running", recorded=None):
+async def seed_title_run(client, conversation_id, *, attempts, status="running", recorded=None, outcome="ok"):
     """A title run as a crash would leave it; recorded is the output of a finished step."""
     run_id = new_id()
 
@@ -194,8 +194,9 @@ async def seed_title_run(client, conversation_id, *, attempts, status="running",
                 "conversation_id": conversation_id, "title_rev": rev, "route": "openrouter:test/model",
                 "message": "What is a cohort study?"})))
         if recorded is not None:
+            step = {"step": 0, "outcome": outcome, **({"output": recorded} if outcome == "ok" else {})}
             conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'step_finished', ?)",
-                         (run_id, json.dumps({"step": 0, "outcome": "ok", "output": recorded})))
+                         (run_id, json.dumps(step)))
     await asyncio.to_thread(client.state["db"].write, write)
     return run_id
 
@@ -203,6 +204,7 @@ async def seed_title_run(client, conversation_id, *, attempts, status="running",
 @pytest.mark.parametrize("attempts, recorded, calls, status, title", [
     (1, "Recorded title", 0, "succeeded", "Recorded title"),  # finished from the record, no model call
     (2, "Recorded title", 0, "succeeded", "Recorded title"),
+    (1, "malformed", 0, "failed", None),  # a recorded failure is finished from the record too, never retried
     (0, None, 1, "succeeded", "A short title"),  # restarted
     (1, None, 1, "succeeded", "A short title"),  # its second and last attempt
     (2, None, 0, "interrupted", None),  # no attempt left
@@ -214,7 +216,9 @@ async def test_a_background_run_left_running_follows_the_recovery_rules(tmp_path
         await send(client, conversation_id)
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
             "UPDATE conversations SET title = NULL, title_source = NULL"))
-        run_id = await seed_title_run(client, conversation_id, attempts=attempts, recorded=recorded)
+        failed = recorded == "malformed"
+        run_id = await seed_title_run(client, conversation_id, attempts=attempts, recorded=recorded,
+                                      outcome="malformed" if failed else "ok")
 
     provider = MockProvider()
     async with started(data, provider, keyring=keyring, setup=False) as client:
@@ -237,3 +241,22 @@ async def test_a_finished_background_run_never_runs_again(tmp_path):
         await background_idle(client)
         assert provider.chats == []
         assert await rows(client, "SELECT status, attempts FROM runs WHERE id = ?", run_id) == [("succeeded", 1)]
+
+
+async def test_cancelling_a_title_run_twice_ends_it_once_and_it_never_restarts(tmp_path):
+    provider = MockProvider()
+    hold_titles(provider)  # never released
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id)
+        await wait_for(lambda: provider.titles)
+        title = await title_run(client)
+        first = (await client.post(f"/api/runs/{title}/cancel")).json()
+        second = (await client.post(f"/api/runs/{title}/cancel")).json()
+        assert first["status"] == "cancelling" and second["status"] in ("cancelling", "cancelled")
+        await background_idle(client)
+        await client.state["harness"].kick_background()  # nothing left to start
+        await background_idle(client)
+        assert len(provider.titles) == 1
+        assert await rows(client, "SELECT status, attempts FROM runs WHERE id = ?", title) == [("cancelled", 1)]
+        assert (await client.post(f"/api/runs/{title}/cancel")).json()["status"] == "cancelled"

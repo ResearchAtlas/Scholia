@@ -14,8 +14,11 @@ client's disconnect, and it decides before any route parses a body.
   header `X-Scholia-Client: local`, which a page on another site cannot send
   without a preflight. A read with no Origin must be same-origin by Fetch
   Metadata or carry that header. Fetch Metadata saying cross-site is refused.
-- A request body must be JSON. CORS preflights are refused: the app's pages are
-  same-origin with the API, so no other origin is ever granted access.
+- A request body must be JSON. CORS preflights are refused and no CORS headers are
+  sent: the app's pages are same-origin with the API, so no other origin is ever
+  granted access. A development origin is one whose server forwards /api to this
+  one (Vite's proxy), so the browser sees same-origin requests and the backend sees
+  that origin in Origin; it is never a cross-origin caller either.
 - Anything outside /api is static navigation: GET or HEAD only.
 
 The client header is not authentication. This protects against web pages and

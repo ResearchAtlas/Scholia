@@ -57,7 +57,16 @@ async def test_no_canary_reaches_the_log(tmp_path, caplog, monkeypatch):
                 raise ValueError(f"CANARY-EXCEPTION {answer['text']}")
 
             monkeypatch.setattr(runs.Harness, "_commit_answer", broken_commit)
+            unsaved = await send(client, named, "CANARY-PROMPT unsaved")
+            assert unsaved[-1]["status"] == "failed" and unsaved[-2]["result_saved"] is False
+            monkeypatch.undo()
+
+            def broken_reserve(conn, **kwargs):
+                raise ValueError("CANARY-EXCEPTION in admission")
+
+            monkeypatch.setattr(runs.spending, "reserve", broken_reserve)
             assert (await send(client, named, "CANARY-PROMPT last"))[-1]["status"] == "failed"
+            monkeypatch.undo()
             await client.delete(f"/api/conversations/{named}")
             await client.delete(f"/api/projects/{project}")
             await asyncio.sleep(0)
@@ -68,6 +77,7 @@ async def test_no_canary_reaches_the_log(tmp_path, caplog, monkeypatch):
     log_file = data / "logs" / "scholia.log"
     text = log_file.read_text()
     assert "model call failed" in text and "turn failed unexpectedly (ValueError at" in text
+    assert "the answer could not be saved (ValueError at" in text
     for canary in CANARIES:
         assert canary not in text, canary
         assert not any(canary in record.getMessage() for record in caplog.records), canary

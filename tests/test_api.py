@@ -221,3 +221,40 @@ async def test_instructions_are_saved_owner_only_and_warned_at_the_cap(tmp_path)
         assert any("32 KiB" in warning for warning in big.json()["warnings"])
         got = (await client.get("/api/instructions", params={"project_id": project})).json()
         assert got["text"] == "x" * 40_000 and got["cap_bytes"] == 32 * 1024
+
+
+async def test_key_changes_are_audited_without_the_key(tmp_path):
+    async with started(tmp_path / "data") as client:
+        await client.put("/api/keys/openrouter", json={"key": "sk-or-second-key"})
+        audited = await rows(client, "SELECT event, data FROM audit_log WHERE event = 'key_changed' ORDER BY seq")
+        assert [json.loads(data) for _, data in audited] == [
+            {"provider": "openrouter", "stored_in": "credential_store"}] * 2
+        everything = json.dumps(await rows(client, "SELECT * FROM audit_log"))
+        assert KEY not in everything and "sk-or-second-key" not in everything
+
+
+async def test_a_cancelled_project_creation_keeps_the_folder_of_a_project_that_was_written(tmp_path, monkeypatch):
+    import time
+    from backend.db import Database
+    data = tmp_path / "data"
+    async with started(data) as client:
+        real_write = Database.write
+        writing = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def slow_write(self, fn):
+            loop.call_soon_threadsafe(writing.set)
+            time.sleep(0.3)
+            return real_write(self, fn)
+
+        monkeypatch.setattr(Database, "write", slow_write)
+        request = asyncio.create_task(client.post("/api/projects", json={"name": "Raced"}))
+        await asyncio.wait_for(writing.wait(), 5)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        monkeypatch.undo()
+        await asyncio.sleep(0.5)
+        [(project,)] = await rows(client, "SELECT id FROM projects WHERE name = 'Raced'")
+        assert (data / "projects" / project / "config.toml").is_file()
+        assert (data / "projects" / project / "AGENTS.md").is_file()

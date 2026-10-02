@@ -67,7 +67,8 @@ async def test_a_message_runs_one_turn_through_its_commit_boundaries(tmp_path):
         assert [e["type"] for e in stream] == ["run_started", "step", "chat_response", "run_finished"]
         run_id = stream[0]["run_id"]
         assert stream[2]["content"] == "An answer." and stream[2]["result_saved"] is True
-        assert stream[3] == {"type": "run_finished", "run_id": run_id, "status": "succeeded", "cost_usd": 0.002}
+        assert stream[3] == {"type": "run_finished", "run_id": run_id, "status": "succeeded", "cost_usd": 0.002,
+                             "accounting": {"reported_usd": 0.002, "estimated_usd": 0, "unknown_attempts": 0}}
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert (turn["status"], turn["answer"], turn["result_saved"], turn["cost_usd"]) == (
             "succeeded", {"text": "An answer."}, True, 0.002)
@@ -371,3 +372,201 @@ async def test_a_stop_before_the_stream_starts_prevents_any_dispatch(tmp_path):
         assert (await counts(client))["budget_reservations"] == 0
         assert (await send(client, conversation, "again"))[-1]["status"] == "succeeded"
         await background_idle(client)
+
+
+# Cases from review
+
+
+async def test_a_reply_recorded_after_its_conversation_was_deleted_still_settles_as_reported(tmp_path):
+    from backend.db import delete
+    provider = MockProvider()
+    arrived = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reply(body):
+        arrived.set()
+        await release.wait()
+        return provider.answer("late", cost=0.0015)
+
+    provider.replies.append(reply)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = asyncio.create_task(send(client, conversation))
+        await arrived.wait()
+        # The deletion commits between the reply and its record (no revocation reaches the turn here).
+        await asyncio.to_thread(delete, client.state["db"], client.state["content"], "conversation", conversation)
+        release.set()
+        final = (await stream)[-1]
+        assert final["status"] == "deleted"
+        assert await rows(client, "SELECT run_id, paying_conversation_id, status, settled_usd, basis"
+                                  " FROM budget_reservations") == [(None, None, "settled", 0.0015, "reported")]
+        assert await rows(client, "SELECT count(*) FROM runs") == [(0,)]
+
+
+async def test_a_closed_response_cancels_its_turn_even_while_send_is_blocked(tmp_path):
+    provider = MockProvider()
+    held(provider)
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        disconnect, blocked = asyncio.Event(), asyncio.Event()
+        body = json.dumps({"content": "hi"}).encode()
+        messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            await disconnect.wait()
+            return {"type": "http.disconnect"}
+
+        async def send_blocked(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                blocked.set()
+                await asyncio.Event().wait()  # the client stopped reading
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"}, "http_version": "1.1",
+                 "method": "POST", "path": f"/api/conversations/{conversation}/message/stream",
+                 "raw_path": b"", "query_string": b"", "scheme": "http", "client": ("127.0.0.1", 1),
+                 "server": ("127.0.0.1", 8765),
+                 "headers": [(b"host", b"127.0.0.1:8765"), (b"x-scholia-client", b"local"),
+                             (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]}
+        response = asyncio.create_task(client.app(scope, receive, send_blocked))
+        await asyncio.wait_for(blocked.wait(), 5)
+        run_id = active_turn(client, conversation).run_id
+        disconnect.set()
+        await asyncio.wait_for(response, 5)
+        await wait_for(lambda: not client.state["harness"].registry.is_active(run_id))
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", run_id) == [
+            ("cancelled", "researcher")]
+
+
+async def test_a_response_that_fails_before_it_starts_leaves_no_claim(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client, title="t")
+        body = json.dumps({"content": "hi"}).encode()
+        messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def receive():
+            return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+        async def send_fails(message):
+            raise OSError("the client went away")
+
+        scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+                 "path": f"/api/conversations/{conversation}/message/stream", "raw_path": b"", "query_string": b"",
+                 "scheme": "http", "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 8765),
+                 "headers": [(b"host", b"127.0.0.1:8765"), (b"x-scholia-client", b"local"),
+                             (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]}
+        with pytest.raises(Exception):
+            await client.app(scope, receive, send_fails)
+        await wait_for(lambda: not client.state["harness"].registry.turns)
+        assert (await send(client, conversation, "again"))[-1]["status"] == "succeeded"  # no 409 left behind
+        assert client.provider.answers and all(b["messages"][-1]["content"] == "again" for b in client.provider.answers)
+
+
+async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tmp_path, monkeypatch):
+    import time
+    from backend import providers as providers_module
+    real = providers_module.gate_inputs
+    checking = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_inputs(data_root):
+        loop.call_soon_threadsafe(checking.set)
+        time.sleep(0.3)  # the gate is still checking when Stop arrives
+        return real(data_root)
+
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client, title="t")
+        monkeypatch.setattr(providers_module, "gate_inputs", slow_inputs)
+        stream = asyncio.create_task(send(client, conversation))
+        await asyncio.wait_for(checking.wait(), 5)
+        run_id = active_turn(client, conversation).run_id
+        await client.post(f"/api/runs/{run_id}/cancel")
+        assert (await stream)[-1]["status"] == "cancelled"
+        assert client.provider.chats == []
+        assert await rows(client, "SELECT status, settled_usd FROM budget_reservations") == [("released", None)]
+
+
+async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(tmp_path, monkeypatch):
+    import httpx
+    real_exit = httpx.AsyncClient.__aexit__
+    closing = asyncio.Event()
+
+    async def slow_exit(self, *exc):
+        closing.set()
+        await asyncio.sleep(0.3)
+        await real_exit(self, *exc)
+
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client, title="t")
+        monkeypatch.setattr(httpx.AsyncClient, "__aexit__", slow_exit)
+        stream = asyncio.create_task(send(client, conversation))
+        await asyncio.wait_for(closing.wait(), 5)
+        run_id = active_turn(client, conversation).run_id
+        await client.post(f"/api/runs/{run_id}/cancel")
+        assert (await stream)[-1]["status"] == "cancelled"
+        assert await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations") == [
+            ("settled", 0.002, "reported")]
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE type = 'model_attempt'") == [(1,)]
+
+
+async def test_an_answer_that_cannot_be_saved_is_still_shown_marked_unsaved(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client, title="t")
+
+        def disk_full(self, conn, claim, answer, ctx):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(runs_module.Harness, "_commit_answer", disk_full)
+        stream = await send(client, conversation)
+        response = next(e for e in stream if e["type"] == "chat_response")
+        assert (response["content"], response["result_saved"], response["error"]) == ("An answer.", False, "save_failed")
+        assert stream[-1]["status"] == "failed"
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert (turn["status"], turn["reason_code"], turn["answer"]) == ("failed", "save_failed", None)
+        assert turn["accounting"] == {"reported_usd": 0.002, "estimated_usd": 0, "unknown_attempts": 0}
+
+
+@pytest.mark.parametrize("cost", [float("inf"), float("nan"), -0.5, "0.1", True])
+async def test_an_invalid_reported_cost_neither_breaks_the_turn_nor_counts(tmp_path, cost):
+    provider = MockProvider()
+    import json as json_module
+    body = json_module.dumps({"choices": [{"message": {"content": "Fine."}}],
+                              "usage": {"prompt_tokens": 1000, "completion_tokens": 1000, "cost": cost}})
+    provider.replies.append((200, body.encode()))  # Infinity and NaN as some providers write them
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "succeeded"
+        # Settled from the reported tokens at the price for the model, marked estimated.
+        [(settled, basis)] = await rows(client, "SELECT settled_usd, basis FROM budget_reservations")
+        assert basis == "estimated" and settled == pytest.approx(0.006)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["accounting"]["unknown_attempts"] == 1 and turn["accounting"]["reported_usd"] == 0
+
+
+async def test_a_providers_settings_and_key_do_not_change_while_a_run_uses_it(tmp_path):
+    provider = MockProvider()
+    release = held(provider)
+    data = tmp_path / "data"
+    async with started(data, provider) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = asyncio.create_task(send(client, conversation))
+        await wait_for(lambda: provider.answers)
+        before = (data / "config.toml").read_text()
+        settings = (await client.get("/api/settings")).json()
+        for response in (
+            await client.put("/api/keys/openrouter", json={"key": "new"}),
+            await client.post("/api/setup", json={"openrouter_key": "new"}),
+            await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+                "ui.language": "en", "providers.openrouter.base_url": "https://openrouter.ai/api/v2"}}),
+        ):
+            assert (response.status_code, response.json()["code"]) == (409, "active_run")
+        assert (data / "config.toml").read_text() == before  # a mixed update changed no field
+        assert client.keyring.keys[(runs_module.credentials.SERVICE, "openrouter")] != "new"
+        unrelated = await client.put("/api/settings", json={"hash": settings["hash"], "updates": {"ui.language": "en"}})
+        assert unrelated.status_code == 200
+        release.set()
+        await stream
+        await background_idle(client)
+        assert (await client.put("/api/keys/openrouter", json={"key": "new"})).status_code == 200

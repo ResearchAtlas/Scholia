@@ -101,21 +101,27 @@ class Instructions(BaseModel):
 
 class EventStream(StreamingResponse):
     """A server-sent event stream that always listens for the client's disconnect and
-    stops the stream when it comes, whatever ASGI version the server speaks, so a
-    closed window stops its turn as Stop does. The request body has been read before
-    the response starts, so this listener is the only reader of `receive`."""
+    stops the stream when it comes, whatever ASGI version the server speaks. However
+    the response ends (finished, disconnected, or failed before it started), on_close
+    runs, so a closed window stops its turn as Stop does and a claim is never left
+    behind. The request body has been read before the response starts, so this
+    listener is the only reader of `receive`."""
 
-    def __init__(self, events):
+    def __init__(self, events, on_close):
         super().__init__(events, media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+        self.on_close = on_close
 
     async def __call__(self, scope, receive, send):
-        async with anyio.create_task_group() as group:
-            async def run_then_stop(fn):
-                await fn()
-                group.cancel_scope.cancel()
+        try:
+            async with anyio.create_task_group() as group:
+                async def run_then_stop(fn):
+                    await fn()
+                    group.cancel_scope.cancel()
 
-            group.start_soon(run_then_stop, partial(self.stream_response, send))
-            await run_then_stop(partial(self.listen_for_disconnect, receive))
+                group.start_soon(run_then_stop, partial(self.stream_response, send))
+                await run_then_stop(partial(self.listen_for_disconnect, receive))
+        finally:
+            self.on_close()
 
 
 def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyring_backend=None,
@@ -198,9 +204,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
 
     @app.post("/api/setup")
     async def setup(body: Setup):
+        refuse_if_busy({providers.OPENROUTER})
         await asyncio.to_thread(_ensure_openrouter, data_dir)
         warning = await _save_key(providers.OPENROUTER, body.openrouter_key)
         return {"ok": True, "warning": warning}
+
+    def refuse_if_busy(names):
+        """A provider's settings or key do not change under work that is calling it."""
+        if any(harness().provider_busy(name) for name in names):
+            raise ApiError(409, "active_run", "A running task uses this provider; stop it or wait")
 
     async def _save_key(provider, key):
         try:
@@ -209,6 +221,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             raise ApiError(500, "key_not_saved", "The key could not be saved") from None
         openrouter.clear_negotiation_cache()
         openrouter_client.clear_cache()
+        stored_in = "file" if warning else "credential_store"
+        await write(lambda conn: conn.execute(  # which provider's key changed and where it went; never the key
+            "INSERT INTO audit_log (event, data) VALUES ('key_changed', ?)",
+            (json.dumps({"provider": provider, "stored_in": stored_in}),)))
         return "credential_store_unavailable" if warning else None
 
     @app.get("/api/providers")
@@ -219,6 +235,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     async def put_key(provider: str, body: Key):
         if provider not in providers.configured(data_dir):
             raise ApiError(404, "unknown_provider", "That provider is not set up")
+        refuse_if_busy({provider})
         return {"ok": True, "warning": await _save_key(provider, body.key)}
 
     @app.get("/api/providers/{provider}/models")
@@ -250,6 +267,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         loaded = await settings_for(body.project_id)
         if body.hash != loaded._digest:
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
+        refuse_if_busy(_providers_changed(body.updates))  # before any field is written
         try:
             await asyncio.to_thread(loaded.save, body.updates)
         except SettingsChanged:
@@ -315,9 +333,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, ?, 'research')", (project_id, body.name))
             conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('project_created', ?, '{}')",
                          (project_id,))
+        written = asyncio.ensure_future(write(insert))
         try:
-            await write(insert)
-        except BaseException:
+            await asyncio.shield(written)
+        except asyncio.CancelledError:
+            # The write goes on in its thread: keep the folder if it commits.
+            if not await _committed(written):
+                await asyncio.to_thread(shutil.rmtree, folder, ignore_errors=True)
+            raise
+        except Exception:
             await asyncio.to_thread(shutil.rmtree, folder, ignore_errors=True)
             raise
         return project_dict(await project_row(project_id))
@@ -390,7 +414,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
                                (conversation_id,)).fetchone()
             turns = conn.execute(
                 "SELECT t.run_id, t.seq, t.author, t.user_message, t.answer, t.result_saved, t.reason_code,"
-                " r.status, r.cancel_reason, r.settled_cost_usd, r.started_at, r.finished_at, t.retry_of_run_id"
+                " r.status, r.cancel_reason, r.settled_cost_usd, r.started_at, r.finished_at, t.retry_of_run_id,"
+                " t.accounting"
                 " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.conversation_id = ? ORDER BY t.seq",
                 (conversation_id,)).fetchall()
             return row, turns
@@ -402,9 +427,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             "run_id": run_id, "seq": seq, "author": author, "message": json.loads(message),
             "answer": json.loads(answer) if answer else None, "result_saved": bool(saved),
             "status": derived_status(status, run_id, registry), "reason_code": reason, "cancel_reason": cancel,
-            "cost_usd": cost, "started_at": started, "finished_at": finished, "continues": retry_of,
-        } for run_id, seq, author, message, answer, saved, reason, status, cancel, cost, started, finished, retry_of
-            in turns]}
+            "cost_usd": cost, "accounting": json.loads(accounting) if accounting else None,
+            "started_at": started, "finished_at": finished, "continues": retry_of,
+        } for run_id, seq, author, message, answer, saved, reason, status, cancel, cost, started, finished, retry_of,
+            accounting in turns]}
 
     @app.put("/api/conversations/{conversation_id}")
     async def rename_conversation(conversation_id: str, body: Rename):
@@ -434,21 +460,19 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     async def send_message(conversation_id: str, body: Message):
         claim = await harness().admit_turn(conversation_id, body.content, model=body.model,
                                            provider=body.provider, effort=body.effort)
+        return stream(claim)
 
+    def stream(claim):
         async def sse():
             async for event in harness().events(claim):
                 yield f"data: {json.dumps(event)}\n\n"
-        return EventStream(sse())
+        return EventStream(sse(), on_close=lambda: harness().stream_closed(claim))
 
     @app.post("/api/runs/{run_id}/continue")
     async def continue_run(run_id: str, body: Continue | None = None):
         body = body or Continue()
         claim = await harness().continue_turn(run_id, model=body.model, provider=body.provider, effort=body.effort)
-
-        async def sse():
-            async for event in harness().events(claim):
-                yield f"data: {json.dumps(event)}\n\n"
-        return EventStream(sse())
+        return stream(claim)
 
     @app.post("/api/runs/{run_id}/cancel")
     async def cancel_run(run_id: str):
@@ -484,6 +508,32 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         return FileResponse(file, headers={"Cache-Control": "no-cache"})
 
     return LocalRequestGuard(app, origins=[origin, *dev_origins])
+
+
+async def _committed(future) -> bool:
+    """Whether a write that is still going on commits, waiting for it however often cancelled."""
+    while True:
+        try:
+            await asyncio.shield(future)
+            return True
+        except asyncio.CancelledError:
+            if future.cancelled():
+                return False
+        except Exception:
+            return False
+
+
+def _providers_changed(updates) -> set:
+    """The providers a settings update would change."""
+    names = set()
+    for key, value in updates.items():
+        parts = key.split(".")
+        if parts[0] == "providers":
+            if len(parts) > 1:
+                names.add(parts[1])
+            elif isinstance(value, dict):
+                names.update(value)
+    return names
 
 
 def static_file(root: Path | None, path: str) -> Path | None:
