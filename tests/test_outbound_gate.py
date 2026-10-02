@@ -7,6 +7,7 @@ loopback cases with real sockets are in test_local_declaration.py.
 import asyncio
 import dataclasses
 import json
+import re
 import sqlite3
 import threading
 
@@ -16,7 +17,7 @@ import pytest
 from backend.db import Database, new_id
 from backend.db.content import ContentStore
 from backend.db.deletion import delete
-from backend.outbound_gate import GateInputs, OutboundDenied, OutboundGate
+from backend.outbound_gate import GateInputs, Kind, OutboundDenied, OutboundGate
 
 OPENROUTER_API = "https://openrouter.ai/api/v1"
 CHAT = f"{OPENROUTER_API}/chat/completions"
@@ -244,6 +245,8 @@ NON_PUBLIC = [
     "240.0.0.1", "224.0.0.1", "239.255.255.250", "255.255.255.255", "[fc00::1]", "[fd12:3456::1]", "[fe80::1]",
     "[ff02::1]", "[ff0e::1]", "[2001:db8::1]", "[::ffff:10.0.0.1]", "167772161", "0xa9fea9fe", "[64:ff9b::a00:1]",
     "[64:ff9b::a9fe:a9fe]", "[2002:a00:1::1]", "[fe80::1%25en0]",
+    # outside 2000::/3, though ipaddress calls these global
+    "[fec0::1]", "[4000::1]", "[6000::1]", "[8000::1]", "[c000::1]", "[e000::1]", "[fe00::1]",
 ]
 
 
@@ -258,10 +261,10 @@ def test_open_access_links_must_be_public_addresses(db, remote, setup, level, as
         assert caught.value.reason == "non_public_address", host
     assert remote.received == []
     assert {(row["kind"], row["reason"]) for _, row in audit(db)} == {("open_access", "non_public_address")}
-    for host in ("8.8.8.8", "[2606:4700::1111]", "[64:ff9b::808:808]"):  # public literals are fine
+    for host in ("8.8.8.8", "[2606:4700::1111]", "[2001:4860::8888]", "[64:ff9b::808:808]"):  # public literals
         link = f"http://{host}/paper.pdf"
         send(setup.gate, project_id, candidate(db, project_id, link), "GET", link, asynchronous)
-    assert len(remote.received) == 3
+    assert len(remote.received) == 4
 
 
 @pytest.mark.parametrize("host", ["10.0.0.5", "192.168.1.20", "[fd12:3456::1]", "100.64.0.1"])
@@ -999,6 +1002,82 @@ def test_audit_rows_record_the_decision_without_content(db, remote, setup):
         "SELECT group_concat(data) || group_concat(event) FROM audit_log").fetchone()[0])
     for secret in ("SECRET", KEY, "example/model-a", "/api/v1", "works", "search"):
         assert secret not in stored
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("method", ["SECRET_PROJECT_FACT", "secret project fact", "TRACE", "CONNECT", "PROPFIND"])
+def test_a_non_standard_method_is_refused_and_never_recorded(db, remote, setup, method, asynchronous):
+    project_id = project(db)  # Normal, where the provider would otherwise take any method
+    for url in (f"{OTHER_PROVIDER}/chat/completions", PUBLIC["scholarly_api"], f"{HELPER}/health"):
+        with pytest.raises(OutboundDenied, match="unsupported_method"):
+            send(setup.gate, project_id, None, method, url, asynchronous)
+    assert remote.received == []
+    rows = [row for _, row in audit(db)]
+    assert [(row["method"], row["reason"], row["kind"]) for row in rows] == [("OTHER", "unsupported_method", None)] * 3
+    stored = json.dumps(audit(db)).upper()
+    assert "SECRET" not in stored and "PROJECT" not in stored and method.upper() not in stored
+
+
+@pytest.mark.parametrize("project_id", [
+    "SECRET project fact", "", None, 1, "general", new_id().upper(), new_id() + " ", "../" + new_id(),
+    "12345678-1234-1234-8234-123456789012",  # version 1, not 4
+])
+def test_a_client_takes_only_a_project_id(db, setup, project_id):
+    with pytest.raises(ValueError, match="project_id"):
+        setup.gate.client(project_id)
+    with pytest.raises(ValueError, match="project_id"):
+        setup.gate.async_client(project_id)
+    assert audit(db) == []
+
+
+REASONS = {
+    "unknown_project", "unknown_destination", "non_public_address", "credential_to_non_provider", "not_a_fetch",
+    "not_allowed_at_level", "not_declared", "not_approved", "unknown_level", "host_mismatch",
+    "gate_inputs_unavailable", "cross_origin_redirect", "sensitivity_changed", "unsupported_method",
+    "not_openrouter", "private_inputs_missing", "unchecked_request", "unsupported_endpoint", "unsupported_feature",
+    "route_not_allowed", "missing_flags", "key_not_confirmed",
+}
+ORIGIN = re.compile(r"https?://(\[[0-9a-f:.%]+\]|[a-z0-9.-]+):[0-9]{1,5}")
+
+
+def test_every_audit_field_is_from_a_fixed_set_or_a_canonical_origin(db, remote, setup):
+    # A mix of decisions whose requests carry caller text in every place they can.
+    secret = "SECRET-FACT"
+    remote.redirects[f"{OPENROUTER_API}/models"] = (302, f"https://{secret}.example/{secret}")
+    for level in ("normal", "private", "local_only"):
+        project_id = project(db, level)
+        candidate_id = candidate(db, project_id)
+        with setup.gate.client(project_id, candidate_id=candidate_id, approved=True,
+                               headers={"X-Note": secret}) as client:
+            for method, url, kwargs in (
+                ("POST", f"{CHAT}?{secret}", {"json": chat(note=secret), "headers": AUTH}),
+                ("GET", f"{OPENROUTER_API}/models", {}),
+                ("GET", f"https://api.crossref.org/{secret}?q={secret}", {}),
+                ("GET", f"{OA_LINK}?{secret}", {"headers": {"X-Api-Key": secret}}),
+                ("POST", f"https://huggingface.co/{secret}", {"content": secret.encode()}),
+                ("GET", f"https://{secret}.example/{secret}", {}),
+                ("GET", f"https://api.crossref.org/{secret}", {"headers": {"Host": f"{secret}.example"}}),
+                (secret, f"https://api.crossref.org/{secret}", {}),
+                ("GET", f"{HELPER}/{secret}", {}),
+            ):
+                try:
+                    client.request(method, url, **kwargs)
+                except OutboundDenied:
+                    pass
+    rows = audit(db)
+    assert len(rows) >= 27
+    for _, row in rows:
+        assert set(row) == {"decision", "reason", "kind", "destination", "method", "sensitivity", "approved"}
+        assert row["decision"] in {"allow", "deny"}
+        assert row["reason"] is None if row["decision"] == "allow" else row["reason"] in REASONS
+        assert row["kind"] in {kind.value for kind in Kind} | {None}
+        assert row["method"] in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "OTHER"}
+        assert row["sensitivity"] in {"normal", "private", "local_only", None}
+        assert row["approved"] in {True, False}
+        assert row["destination"] in {None, "unknown"} or ORIGIN.fullmatch(row["destination"])
+    # Only a refused unknown host's own name can appear, as a canonical origin.
+    stored = [json.dumps(row) for _, row in rows if secret.lower() not in (row["destination"] or "")]
+    assert not any(secret in text or secret.lower() in text for text in stored)
 
 
 def test_ipv6_destinations_are_shown_with_brackets(db, remote, setup):

@@ -16,8 +16,9 @@ request body or credentials (Authorization, Proxy-Authorization, Cookie, any
 header named like a key or token, or user info in the URL). The others are
 public fetches: a GET or HEAD with no body and no credentials, whatever the level,
 to a public address: an IP literal that is not globally routable (private,
-link-local, shared, unique-local, documentation, reserved or multicast, or an
-IPv6 form embedding such an IPv4 address) is refused. A Private model request
+link-local, shared, unique-local, documentation, reserved or multicast, any
+IPv6 address outside 2000::/3, or a NAT64 form of such an IPv4 address) is
+refused. A Private model request
 must be a POST to exactly /api/v1/chat/completions on OpenRouter. Gated clients keep
 no cookies, so no response can make a later request carry one.
 
@@ -40,7 +41,10 @@ exact origins count there, and nothing else does. Names are never resolved, so
   only for a client marked as approved by the researcher. Nothing else.
 
 Audit rows hold the decision, reason, kind, destination origin, method, level
-and approval flag; never a path, query, header or body. A row records the
+and approval flag; never a path, query, header or body. Every field is from a
+fixed set except the destination, which is a canonical origin: a method outside
+the standard ones is refused and recorded as OTHER, and a client takes only a
+project id in the schema's form. A row records the
 decision, not delivery: a crash after the commit leaves an allow row for a
 request that was never sent. If the row cannot be written, nothing is sent.
 
@@ -107,12 +111,16 @@ PRIVATE_FIELDS = frozenset({
 })
 ZDR = {"provider": {"zdr": True}}  # every Private request carries it, whatever the allowlist says
 _CLIENT_OPTIONS = frozenset({"base_url", "follow_redirects", "headers", "max_redirects", "timeout"})
+# Methods as httpx sends them (upper case); any other is refused and audited as OTHER.
+_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+_PROJECT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 # Destinations that may receive a body or credentials, each under its level's rules.
 _PRIVATE_PEERS = frozenset({Kind.MODEL_PROVIDER, Kind.LOCAL_PROVIDER, Kind.LOCAL_HELPER})
 _CREDENTIAL_HEADER = re.compile(r"auth|cookie|key|token|secret|session|passw|credential", re.IGNORECASE)
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _THIS_HOST = (ipaddress.IPv4Network("127.0.0.0/8"), ipaddress.IPv4Network("0.0.0.0/8"))
 _NAT64 = ipaddress.IPv6Network("64:ff9b::/96")  # a gateway connects to the IPv4 address in its last 32 bits
+_GLOBAL_UNICAST = ipaddress.IPv6Network("2000::/3")  # the only IPv6 block assigned for public addresses
 
 
 class OutboundDenied(Exception):
@@ -175,14 +183,14 @@ class OutboundGate:
         Proxy and certificate settings in the environment are ignored: TLS uses
         certifi's CA bundle.
         """
-        transport = _Transport(self, _Scope(project_id, candidate_id, approved),
+        transport = _Transport(self, _Scope(_project_id(project_id), candidate_id, approved),
                                self._transport or httpx.HTTPTransport(trust_env=False))
         return httpx.Client(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
     def async_client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
                      **options) -> httpx.AsyncClient:
         """The async form of client()."""
-        transport = _AsyncTransport(self, _Scope(project_id, candidate_id, approved),
+        transport = _AsyncTransport(self, _Scope(_project_id(project_id), candidate_id, approved),
                                     self._transport or httpx.AsyncHTTPTransport(trust_env=False))
         return httpx.AsyncClient(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
@@ -223,7 +231,9 @@ class OutboundGate:
             # The level is read in the transaction that records the decision, so a
             # change of level is ordered entirely before or after it.
             level = _level(conn, scope.project_id)
-            if error is not None:
+            if request.method not in _METHODS:  # an arbitrary method string could carry content
+                kind, reason = None, "unsupported_method"
+            elif error is not None:
                 kind, reason = None, "gate_inputs_unavailable"
             else:
                 kind = _classify(conn, target, providers, helper, scope)
@@ -273,6 +283,13 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self):
         await self._inner.aclose()
+
+
+def _project_id(project_id):
+    """The project id, which is recorded in the audit log, so only in the schema's form."""
+    if not (isinstance(project_id, str) and _PROJECT_ID.fullmatch(project_id)):
+        raise ValueError("project_id must be a project's id (a lowercase UUID4)")
+    return project_id
 
 
 def _no_cookies():
@@ -335,18 +352,21 @@ def _origin_of(text):
 def _non_public(host: str) -> bool:
     """Whether a canonical host is an IP literal that is not globally routable.
 
-    Names are not looked up. A NAT64 address is judged by the IPv4 address a
-    gateway translates it to as well. (ipaddress already counts all of 6to4 and
-    Teredo as not global.)
+    Names are not looked up. Public IPv6 is defined positively: inside 2000::/3
+    and global by ipaddress (which counts reserved blocks such as 4000::/2 and
+    the old site-local fec0::/10 as global). A NAT64 address is judged by the
+    IPv4 address a gateway translates it to.
     """
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         return False
-    addresses = [address]
-    if address.version == 6 and address in _NAT64:
-        addresses.append(ipaddress.IPv4Address(int(address) & 0xFFFFFFFF))
-    return any(not a.is_global or a.is_multicast for a in addresses)
+    if address.version == 6:
+        if address in _NAT64:
+            address = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+        elif address not in _GLOBAL_UNICAST:
+            return True
+    return not address.is_global or address.is_multicast
 
 
 def _is_this_host(host: str) -> bool:
@@ -535,7 +555,7 @@ def _record(conn, request, scope, level, kind, destination, reason):
             "reason": reason,
             "kind": kind,
             "destination": destination,
-            "method": request.method,
+            "method": request.method if request.method in _METHODS else "OTHER",
             "sensitivity": level,
             "approved": scope.approved is True,
         })),
