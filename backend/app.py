@@ -20,13 +20,14 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
-from backend.runs import AdmissionError, Harness, derived_status
+from backend.runs import AdmissionError, Harness, _through, derived_status
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, load_instructions, load_settings,
                               write_private)
 
@@ -38,6 +39,29 @@ PROJECT_DEFAULTS = {  # written to a new project's config.toml
     "project.template": "imrad",
     "project.budget_usd": 50,
 }
+
+
+class _AnyName(Convertor):
+    """A path segment holding any non-empty name: slashes and line breaks included."""
+    regex = "(?s:.+)"
+
+    def convert(self, value):
+        return value
+
+    def to_string(self, value):
+        return value
+
+
+register_url_convertor("name", _AnyName())  # a provider's name is any TOML key
+
+
+async def _finished(fn, *args):
+    """Run fn in a worker thread to its end. A cancellation waits for the thread and is
+    raised after it, so a lock held around this call covers the whole write."""
+    result, cancelled = await _through(asyncio.to_thread(fn, *args))
+    if cancelled:
+        raise asyncio.CancelledError()
+    return result
 
 
 class ApiError(Exception):
@@ -236,14 +260,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     async def provider_index():
         return {"providers": await provider_list()}
 
-    @app.put("/api/keys/{provider:path}")  # a provider's name is any TOML key, slashes included
+    @app.put("/api/keys/{provider:name}")
     async def put_key(provider: str, body: Key):
         if provider not in providers.configured(data_dir):
             raise ApiError(404, "unknown_provider", "That provider is not set up")
         refuse_if_busy({provider})
         return {"ok": True, "warning": await _save_key(provider, body.key)}
 
-    @app.get("/api/providers/{provider:path}/models")
+    @app.get("/api/providers/{provider:name}/models")
     async def provider_models(provider: str, refresh: bool = False):
         configured = providers.configured(data_dir)
         if provider not in configured:
@@ -279,7 +303,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         changed = _providers_changed(body.updates, providers.configured(data_dir))
         refuse_if_busy(changed)  # before any field is written
         try:
-            await asyncio.to_thread(loaded.save, body.updates)
+            await _finished(loaded.save, body.updates)  # under the project-files lock to its end
         except SettingsChanged:
             raise ApiError(409, "settings_changed", "The settings changed since they were read") from None
         except ValueError:
@@ -300,7 +324,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     async def put_instructions(body: Instructions):
         async with project_files if body.project_id is not None else contextlib.nullcontext():
             path = await instructions_path(body.project_id)  # the project still exists, under the lock
-            await asyncio.to_thread(write_private, path, body.text.encode("utf-8"))
+            await _finished(write_private, path, body.text.encode("utf-8"))
         _, warnings = await asyncio.to_thread(load_instructions, data_dir, body.project_id)
         return {"ok": True, "warnings": warnings}
 
@@ -383,11 +407,11 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             raise ApiError(400, "general_project", "The General project cannot be deleted")
         async with project_files:
             try:
-                revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id)
+                revoked = await _finished(delete, db(), state["content"], "project", project_id)
             except LookupError:  # deleted meanwhile by another request
                 raise ApiError(404, "not_found", "No such project") from None
             harness().revoke(revoked)
-            removed = await asyncio.to_thread(_remove_folder, data_dir / "projects" / project_id)
+            removed = await _finished(_remove_folder, data_dir / "projects" / project_id)
         if not removed:  # the record is gone; its tombstone makes the next launch retry the files
             log.warning("a deleted project's folder could not be removed fully; it is retried at the next launch")
             return {"ok": True, "files_left": True}

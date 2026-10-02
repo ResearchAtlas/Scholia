@@ -340,3 +340,42 @@ async def test_a_quoted_providers_key_clears_what_was_learned_about_the_provider
             '"providers".openrouter.kind': "openai-compatible"}})
         assert response.status_code == 200
         assert not openrouter_client._caches
+
+
+async def test_a_cancelled_project_write_keeps_the_lock_until_its_thread_finishes(tmp_path, monkeypatch):
+    import threading
+    from backend import app as app_module
+    data = tmp_path / "data"
+    async with started(data) as client:
+        project = (await client.post("/api/projects", json={"name": "Going"})).json()["id"]
+        entered, release = threading.Event(), threading.Event()
+        real = app_module.write_private
+
+        def slow_write(path, content):
+            entered.set()
+            release.wait(5)
+            real(path, content)
+
+        monkeypatch.setattr(app_module, "write_private", slow_write)
+        write = asyncio.create_task(client.put("/api/instructions", json={"project_id": project, "text": "notes"}))
+        await asyncio.to_thread(entered.wait, 5)
+        write.cancel()  # its worker thread goes on writing
+        deletion = asyncio.create_task(client.delete(f"/api/projects/{project}"))
+        await asyncio.sleep(0.2)
+        assert not deletion.done()  # the deletion waits for the write to end
+        release.set()
+        assert (await deletion).json() == {"ok": True}
+        with pytest.raises(asyncio.CancelledError):
+            await write
+        assert not (data / "projects" / project).exists()
+
+
+async def test_a_provider_name_with_a_line_break_can_be_given_a_key_and_listed(tmp_path):
+    async with started(tmp_path / "data") as client:
+        settings = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            '"providers"."lab\\ninternal".kind': "openai-compatible",
+            '"providers"."lab\\ninternal".base_url': "http://127.0.0.1:9/v1"}})
+        assert "lab\ninternal" in {p["name"] for p in (await client.get("/api/providers")).json()["providers"]}
+        assert (await client.put("/api/keys/lab%0Ainternal", json={"key": "k"})).json() == {"ok": True, "warning": None}
+        assert (await client.get("/api/providers/lab%0Ainternal/models")).status_code == 200

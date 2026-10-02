@@ -138,3 +138,22 @@ def test_an_existing_data_folder_is_narrowed_to_owner_only_without_following_lin
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(strict.stat().st_mode) == 0o400  # never broadened
     assert stat.S_IMODE(outside.stat().st_mode) == 0o644  # a link's target is left alone
+
+
+def test_a_linked_data_folder_is_narrowed_at_its_real_path_and_a_folder_that_cannot_be_listed_is_closed(tmp_path):
+    real, outside = tmp_path / "real", tmp_path / "outside"
+    for folder in (real / "a", real / "b", outside):
+        folder.mkdir(parents=True)
+    for path in (real / "a" / "f", real / "b" / "f", outside / "f"):
+        path.write_text("x")
+        os.chmod(path, 0o644)
+    os.symlink(outside, real / "elsewhere")
+    os.symlink(real, tmp_path / "data")  # the data folder is a link the researcher made
+    os.chmod(real / "a", 0o355)  # its owner cannot list it
+    try:
+        desktop.narrow_tree(tmp_path / "data")
+        assert stat.S_IMODE((real / "a").stat().st_mode) == 0o300  # closed to others, never broadened
+        assert stat.S_IMODE((real / "b" / "f").stat().st_mode) == 0o600  # the walk went on
+        assert stat.S_IMODE((outside / "f").stat().st_mode) == 0o644  # a link inside is never followed
+    finally:
+        os.chmod(real / "a", 0o700)

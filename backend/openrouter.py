@@ -282,7 +282,7 @@ def _count(value):
 
 
 def _failed(kind, attempts, route):
-    log.warning("model call failed: provider=%s kind=%s attempts=%d", route.provider.name, kind, len(attempts))
+    log.warning("model call failed: provider=%r kind=%s attempts=%d", route.provider.name, kind, len(attempts))
     return ModelResult(None, None, kind, attempts)
 
 

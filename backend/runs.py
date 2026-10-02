@@ -45,7 +45,7 @@ from backend.settings import load_instructions, load_settings
 
 log = logging.getLogger(__name__)
 
-STALE_CLAIM_SECONDS = 30  # an unstarted claim older than this is a dropped response
+STALE_CLAIM_SECONDS = 30  # an admitted turn whose response has not started by then was dropped
 MODEL_CALL_SECONDS = 120  # one call's total bound, both attempts included
 MAX_MESSAGE_CHARS = 100_000
 HISTORY_TURNS = 20  # ponytail: a fixed history window until the context assembler counts tokens
@@ -74,7 +74,7 @@ class ActiveRun:
     run_id: str
     kind: str  # "turn" or "background"
     conversation_id: str | None
-    created: float = field(default_factory=time.monotonic)
+    admitted: float | None = None  # when its admission finished; None while it is being admitted
     task: asyncio.Task | None = None
     cancel_requested: threading.Event = field(default_factory=threading.Event)  # read inside transactions
     cancel_reason: str | None = None  # "researcher", "revoked" or "shutdown"
@@ -100,8 +100,9 @@ class Registry:
             raise AdmissionError(503, "shutting_down", "The app is closing")
         held = self.turns.get(conversation_id)
         if held is not None:
-            if held.task is None and time.monotonic() - held.created > STALE_CLAIM_SECONDS:
-                # Its response was dropped before it started, so its turn never ran.
+            if held.task is None and held.admitted is not None and time.monotonic() - held.admitted > STALE_CLAIM_SECONDS:
+                # Admitted and recorded, but its response was dropped before it started, so its turn never ran.
+                # A claim still being admitted is never released: its admission may yet write its run.
                 log.warning("released a stale claim on a conversation whose response never started")
                 self.release(held)
                 self.dropped.append(held.run_id)
@@ -409,6 +410,7 @@ class Harness:
             "effort": effort, "estimate": plan.predicted_cost, "budgets": budgets,
             "message": message,
         }
+        claim.admitted = time.monotonic()
         return claim
 
     async def events(self, claim: ActiveRun):
@@ -661,10 +663,10 @@ class Harness:
             elif attempts < BACKGROUND_ATTEMPTS:  # rule 3: another model call
                 output = await self._background_call(active, project_id, workflow, inputs)
             else:  # rule 4
-                await self._write(lambda conn: self._finish_background(conn, active.run_id, "interrupted", None, inputs))
+                await self._write(lambda conn: self._finish_background(conn, active, "interrupted", None, inputs))
                 return
             await self._write(lambda conn: self._finish_background(
-                conn, active.run_id, "succeeded" if output is not None else "failed", output, inputs, active=active))
+                conn, active, "succeeded" if output is not None else "failed", output, inputs))
         except asyncio.CancelledError:
             call, shutdown = active.call, active.cancel_reason == "shutdown"
             cancel_reason = "revoked" if active.cancel_reason == "revoked" else "researcher"
@@ -672,10 +674,10 @@ class Harness:
             def stop(conn):
                 _close_call(conn, call)
                 if not shutdown:  # at shutdown it stays running and restarts next time
-                    self._finish_background(conn, active.run_id, "cancelled", None, None, cancel_reason=cancel_reason)
+                    self._finish_background(conn, active, "cancelled", None, None, cancel_reason=cancel_reason)
             await _through(self._write(stop))
         except spending.BudgetExceeded:
-            await _through(self._write(lambda conn: self._finish_background(conn, active.run_id, "failed", None, None)))
+            await _through(self._write(lambda conn: self._finish_background(conn, active, "failed", None, None)))
         except Exception as error:
             log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
         finally:
@@ -719,12 +721,13 @@ class Harness:
                                   output=lambda result: _clean_title(result.content))
         return _clean_title(result.content) if result.ok else None
 
-    def _finish_background(self, conn, run_id, status, output, inputs, cancel_reason=None, active=None):
+    def _finish_background(self, conn, active, status, output, inputs, cancel_reason=None):
         """The run's effect, terminal status and settled cost, in one transaction. A cancel
-        requested before this commits wins: the run ends cancelled, with no effect."""
+        requested before this commits wins, on every path: the run ends cancelled, with no effect."""
+        run_id = active.run_id
         if not _running(conn, run_id):
             return
-        if active is not None and active.cancel_requested.is_set() and active.cancel_reason != "shutdown":
+        if active.cancel_requested.is_set() and active.cancel_reason != "shutdown":
             status, output = "cancelled", None
             cancel_reason = "revoked" if active.cancel_reason == "revoked" else "researcher"
         if status == "succeeded" and output is not None:

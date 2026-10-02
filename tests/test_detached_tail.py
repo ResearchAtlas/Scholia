@@ -328,3 +328,22 @@ async def test_a_cancel_that_arrives_before_the_title_is_written_wins(tmp_path):
         # Its call finished and reported its cost, which is kept, once.
         [(basis,)] = await rows(client, "SELECT basis FROM budget_reservations WHERE paying_conversation_id IS NULL")
         assert basis == "reported"
+
+
+@pytest.mark.parametrize("status", ["interrupted", "failed", "succeeded"])
+async def test_every_finishing_write_of_a_background_run_honours_a_cancel_that_came_first(tmp_path, status):
+    from backend.runs import ActiveRun
+    async with started(tmp_path / "data") as client:
+        conversation_id = await new_conversation(client, title="Named first, so no title run is queued")
+        await send(client, conversation_id)
+        run_id = await seed_title_run(client, conversation_id, attempts=2)
+        active = ActiveRun(run_id, "background", None)
+        active.cancel_reason = "researcher"
+        active.cancel_requested.set()  # the Stop came while the finishing write was queued
+        harness = client.state["harness"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: harness._finish_background(
+            conn, active, status, "Too late" if status == "succeeded" else None,
+            {"conversation_id": conversation_id, "title_rev": 0}))
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", run_id) == [
+            ("cancelled", "researcher")]
+        assert (await conversation(client, conversation_id))["title"] == "Named first, so no title run is queued"

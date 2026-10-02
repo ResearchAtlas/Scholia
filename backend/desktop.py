@@ -61,17 +61,46 @@ def take_lock(data_dir) -> int | None:
 
 def narrow_tree(data_dir) -> None:
     """Narrow an existing data folder to owner-only: folders to at most 0700 and files to at
-    most 0600, never broadening a mode and never following a symbolic link. A folder copied
-    or restored with wider modes is closed to other accounts before anything is opened."""
-    for folder, folders, files in os.walk(data_dir):
-        for name, mask in ((folder, 0o700), *((os.path.join(folder, f), 0o600) for f in files)):
-            try:
-                info = os.lstat(name)
-                if not stat.S_ISLNK(info.st_mode) and stat.S_IMODE(info.st_mode) & ~mask:
-                    os.chmod(name, stat.S_IMODE(info.st_mode) & mask, follow_symlinks=False)
-            except FileNotFoundError:  # removed meanwhile
-                pass
-        folders[:] = [f for f in folders if not os.path.islink(os.path.join(folder, f))]
+    most 0600, never broadening a mode. A folder copied or restored with wider modes is
+    closed to other accounts before anything is opened.
+
+    The walk starts at the data folder's real path (the folder itself may be a link the
+    researcher made; the app opens everything through it) and never follows a link inside
+    it. Each folder is narrowed before it is listed, so a folder that cannot be listed is
+    still closed to other accounts, and with it everything below it."""
+    pending = [os.path.realpath(data_dir)]
+    while pending:
+        folder = pending.pop()
+        if not _narrow(folder, 0o700):
+            continue
+        try:
+            entries = list(os.scandir(folder))
+        except FileNotFoundError:  # removed meanwhile
+            continue
+        except PermissionError:
+            log.warning("a folder in the data folder could not be listed; it is closed to other accounts")
+            continue
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(entry.path)
+            else:
+                _narrow(entry.path, 0o600)
+
+
+def _narrow(path, mask) -> bool:
+    """Narrow path's mode to mask, never broadening it. Returns whether path is a real
+    folder or file that is still there; a link is left as it is.
+    ponytail: lstat, then chmod; the data folder is owner-only, so nobody else can swap
+    in a link between the two."""
+    try:
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            return False
+        if stat.S_IMODE(info.st_mode) & ~mask:
+            os.chmod(path, stat.S_IMODE(info.st_mode) & mask, follow_symlinks=False)
+        return True
+    except FileNotFoundError:  # removed meanwhile
+        return False
 
 
 def frontend_folder() -> Path:

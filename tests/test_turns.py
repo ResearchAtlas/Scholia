@@ -5,6 +5,7 @@ gate's transport. Titles and other detached work are in test_detached_tail.py.
 """
 
 import asyncio
+import threading
 import json
 
 import pytest
@@ -669,7 +670,7 @@ async def test_a_forced_shutdown_never_closes_the_database_under_running_work(tm
     # million), marked estimated.
     ((400, {"error": {}, "usage": {"prompt_tokens": 1000, "completion_tokens": 0}}),
      {"prompt_tokens": 1000, "completion_tokens": 1000}, (0.007, "estimated")),
-    # A rejection that went out and reported nothing keeps the estimate (section 4.3).
+    # A rejection that went out and reported nothing keeps the estimate (F11).
     ((400, {"error": {}}), {"prompt_tokens": 10, "completion_tokens": 10, "cost": 0.002}, ("estimate", "estimated")),
 ])
 async def test_a_call_settles_from_every_attempt_it_made(tmp_path, monkeypatch, first, second, settled):
@@ -689,3 +690,29 @@ async def test_a_call_settles_from_every_attempt_it_made(tmp_path, monkeypatch, 
             client, "SELECT estimate_usd, settled_usd, basis FROM budget_reservations")
         assert estimate > 0.002
         assert (round(amount, 9), basis) == ((estimate if settled[0] == "estimate" else settled[0]), settled[1])
+
+
+async def test_a_claim_still_being_admitted_is_never_released_as_stale(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        loading = threading.Event()
+        release = threading.Event()
+        real = runs_module.load_instructions
+
+        def slow_instructions(*args):  # the first admission stalls before its run is written
+            loading.set()
+            release.wait(5)
+            return real(*args)
+
+        monkeypatch.setattr(runs_module, "load_instructions", slow_instructions)
+        monkeypatch.setattr(runs_module, "STALE_CLAIM_SECONDS", 0)
+        first = asyncio.create_task(harness.admit_turn(conversation, "slow"))
+        await asyncio.to_thread(loading.wait, 5)
+        with pytest.raises(runs_module.AdmissionError, match="already running"):
+            await harness.admit_turn(conversation, "second")
+        release.set()
+        claim = await first
+        stream = [event async for event in harness.events(claim)]
+        assert stream[-1]["status"] == "succeeded"
+        await background_idle(client)

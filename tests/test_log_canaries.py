@@ -116,3 +116,29 @@ async def test_an_existing_log_folder_and_file_are_narrowed_to_owner_only(tmp_pa
     handler.close()
     logging.getLogger().removeHandler(handler)
     assert stat.S_IMODE((folder / "scholia.log").stat().st_mode) == 0o400
+
+
+async def test_the_log_never_writes_through_a_link(tmp_path):
+    import os
+    import pytest
+    outside = tmp_path / "outside.txt"
+    outside.write_text("")
+    os.chmod(outside, 0o644)
+    data = tmp_path / "data"
+    (data / "logs").mkdir(parents=True)
+    os.symlink(outside, data / "logs" / "scholia.log")
+    handler = logs.configure(data)
+    try:
+        logging.raiseExceptions, raised = False, logging.raiseExceptions  # the failed write is reported, not raised
+        logging.getLogger("backend.test").warning("a line")
+    finally:
+        logging.raiseExceptions = raised
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    assert outside.read_text() == "" and stat.S_IMODE(outside.stat().st_mode) == 0o644
+    linked = tmp_path / "linked"
+    (linked).mkdir()
+    os.symlink(tmp_path / "outside-logs", linked / "logs", target_is_directory=True)
+    (tmp_path / "outside-logs").mkdir()
+    with pytest.raises(NotADirectoryError):
+        logs.configure(linked)
