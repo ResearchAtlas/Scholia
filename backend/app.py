@@ -28,9 +28,9 @@ from backend import APP_VERSION, credentials, openrouter, openrouter_client, pro
 from backend.db import BackupStoppedError, ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
-from backend.runs import AdmissionError, Harness, _through, derived_status, visible
+from backend.runs import AdmissionError, Harness, _through, derived_status
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, load_instructions, load_settings,
-                              write_private)
+                              visible, write_private)
 
 log = logging.getLogger(__name__)
 

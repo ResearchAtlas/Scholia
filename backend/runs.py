@@ -35,14 +35,13 @@ import logging
 import threading
 import time
 import traceback
-import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass, field
 
 from backend import budget_router, credentials, openrouter, providers, spending
 from backend.db import new_id, utc_now
 from backend.openrouter_client import get_model_metadata
-from backend.settings import load_instructions, load_settings
+from backend.settings import load_instructions, load_settings, visible
 
 log = logging.getLogger(__name__)
 
@@ -871,14 +870,6 @@ def _accounting(conn, run_id, complete=True):
         if json.loads(data).get("charge") == "unknown" and json.loads(data).get("dispatched"))
     return {"reported_usd": totals.get("reported", 0), "estimated_usd": totals.get("estimated", 0),
             "unknown_attempts": unknown, "complete": complete}
-
-
-def visible(text):
-    """text trimmed, or None when it holds no visible character: only separators, or format
-    and control characters such as a zero-width space."""
-    if not isinstance(text, str) or not any(unicodedata.category(c)[0] not in "CZ" for c in text):
-        return None
-    return text.strip()
 
 
 def _clean_title(text):

@@ -13,6 +13,7 @@ import re
 import stat
 import tempfile
 import threading
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -296,6 +297,20 @@ def _leaves(node, prefix=()):
             stack.pop()
 
 
+_BLANK_LETTERS = set("\u115f\u1160\u3164\uffa0\u2800")  # Hangul fillers and the blank Braille pattern
+
+
+def visible(text):
+    """text trimmed, or None when it holds no visible character: only separators, format and
+    control characters (a zero-width space), marks with nothing to attach to (a variation
+    selector), or the few letters that draw nothing.
+    ponytail: by Unicode category plus a short list; a font can still draw a character blank."""
+    if not isinstance(text, str) or not any(
+            unicodedata.category(c)[0] not in "CMZ" and c not in _BLANK_LETTERS for c in text):
+        return None
+    return text.strip()
+
+
 def _match(schema, path):
     """Return (pattern, spec) for path; the spec's check also catches a wrong shape."""
     for pattern, spec in schema.items():
@@ -342,12 +357,9 @@ def _hides_secret(value):
     return False
 
 
-def _field_names(schema, path):
-    """The parts of path that are field names, leaving out identifiers.
-
-    Identifiers are the schema's "*" positions: provider names, model ids and
-    extension ids. Every other part, tables inside open sections included, is a field name.
-    """
+def _identifiers(schema, path):
+    """The positions in path that are identifiers: the schema's "*" positions (provider
+    names, model ids and extension ids)."""
     identifiers = set()
     for pattern in schema:
         for i, (p, k) in enumerate(zip(pattern, path)):  # the part of path that follows this pattern
@@ -355,6 +367,13 @@ def _field_names(schema, path):
                 break
             if p == "*":
                 identifiers.add(i)
+    return identifiers
+
+
+def _field_names(schema, path):
+    """The parts of path that are field names, leaving out identifiers. Every part that is
+    not an identifier, tables inside open sections included, is a field name."""
+    identifiers = _identifiers(schema, path)
     return [part for i, part in enumerate(path) if i not in identifiers]
 
 
@@ -371,6 +390,8 @@ def _check(schema, path, value):
         return path, "is a personal setting and cannot be set in a project file"
     if any(_secret_name(name) for name in _field_names(schema, path)) or _hides_secret(value):
         return path, "looks like a secret; keys belong in the credential store"
+    if any(visible(path[i]) is None for i in _identifiers(schema, path) if i < len(path)):
+        return path, "needs a name with a visible character"
     pattern, spec = _match(schema, path)
     if spec is not None and not spec[1](value):
         return pattern, "is not valid"

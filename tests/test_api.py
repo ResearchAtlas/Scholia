@@ -665,7 +665,7 @@ async def test_a_blank_project_name_is_refused_and_names_are_trimmed(tmp_path, n
         assert changed.status_code == 400
 
 
-@pytest.mark.parametrize("title", ["​", "  ﻿ "])
+@pytest.mark.parametrize("title", ["\u200b", " \u00a0\ufeff ", "\u034f", "\ufe0f", "\u3164", "\u2800"])
 async def test_a_new_conversation_titled_with_nothing_visible_has_no_title(tmp_path, title):
     async with started(tmp_path / "data") as client:
         conversation = (await client.post("/api/conversations", json={"title": title})).json()
@@ -674,5 +674,27 @@ async def test_a_new_conversation_titled_with_nothing_visible_has_no_title(tmp_p
 
 async def test_a_generated_title_with_nothing_visible_is_no_title():
     from backend.runs import _clean_title
-    assert _clean_title("​‍") is None
-    assert _clean_title(" “Cohort studies” ") == "Cohort studies"
+    assert _clean_title("\u200b\u200d") is None and _clean_title("\ufe0f\u034f") is None
+    assert _clean_title(" \u201cCohort studies\u201d ") == "Cohort studies"
+    assert _clean_title("Caf\u00e9") == "Caf\u00e9" and _clean_title("\u961f\u5217\u7814\u7a76") == "\u961f\u5217\u7814\u7a76"
+
+
+@pytest.mark.parametrize("updates", [
+    {'"providers"."".kind': "openai-compatible", '"providers"."".base_url': "http://127.0.0.1:9/v1"},
+    {'"providers"."\\u200b".kind': "openai-compatible", '"providers"."\\u200b".base_url': "http://127.0.0.1:9/v1"},
+    {"providers": {"": {"kind": "openai-compatible", "base_url": "http://127.0.0.1:9/v1"}}},
+])
+async def test_a_provider_needs_a_visible_name(tmp_path, updates):
+    async with started(tmp_path / "data") as client:
+        settings = (await client.get("/api/settings")).json()
+        response = await client.put("/api/settings", json={"hash": settings["hash"], "updates": updates})
+        assert (response.status_code, response.json()["code"]) == (400, "invalid_setting")
+        assert [p["name"] for p in (await client.get("/api/providers")).json()["providers"]] == ["openrouter"]
+
+
+async def test_a_hand_written_provider_with_no_name_is_ignored(tmp_path):
+    data = tmp_path / "data"
+    async with started(data) as client:
+        with open(data / "config.toml", "a", encoding="utf-8") as config:
+            config.write('\n[providers.""]\nkind = "openai-compatible"\nbase_url = "http://127.0.0.1:9/v1"\n')
+        assert [p["name"] for p in (await client.get("/api/providers")).json()["providers"]] == ["openrouter"]
