@@ -578,3 +578,41 @@ async def test_a_key_save_that_fails_after_replacing_the_file_is_still_audited_a
             "SELECT json_extract(data, '$.stored_in') FROM audit_log WHERE event = 'key_changed'"
             " ORDER BY seq").fetchall())
         assert audited[-1] == ("uncertain",)
+
+
+async def test_a_catalog_listed_while_its_provider_changed_is_not_kept(tmp_path, monkeypatch):
+    from backend import openrouter_client
+    async with started(tmp_path / "data") as client:
+        listing, release = asyncio.Event(), asyncio.Event()
+        real = openrouter_client.models
+
+        async def slow_models(*args, **kwargs):  # the snapshot was taken; the listing is under way
+            listing.set()
+            await release.wait()
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(openrouter_client, "models", slow_models)
+        catalog = asyncio.create_task(client.get("/api/providers/openrouter/models"))
+        await listing.wait()
+        assert (await client.put("/api/keys/openrouter", json={"key": "sk-or-new"})).status_code == 200
+        release.set()
+        response = await catalog
+        assert (response.status_code, response.json()["code"]) == (409, "settings_changed")
+        assert not openrouter_client._caches  # what it learned with the old key was dropped
+
+
+async def test_a_key_for_a_provider_removed_meanwhile_is_not_stored(tmp_path):
+    from backend.settings import load_settings
+    data = tmp_path / "data"
+    async with started(data) as client:
+        settings = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            "providers.lab.kind": "openai-compatible", "providers.lab.base_url": "http://127.0.0.1:9/v1"}})
+        lock = client.state["harness"].settings_lock
+        async with lock:  # a settings change is under way
+            saving = asyncio.create_task(client.put("/api/keys/lab", json={"key": "k"}))
+            await asyncio.sleep(0.1)
+            await asyncio.to_thread(lambda: load_settings(data).save({"providers.lab": None}))  # it removes lab
+        response = await saving
+        assert (response.status_code, response.json()["code"]) == (404, "unknown_provider")
+        assert not [name for _, name in client.keyring.keys if name == "lab"]

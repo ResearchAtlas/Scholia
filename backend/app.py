@@ -261,6 +261,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
             return {"ok": True, "warning": await _to_end(set_up())}
 
+    learned = {"generation": 0}  # bumped whenever what was learned about providers is forgotten
+
+    def forget_providers():
+        """Forget what was learned about providers (catalogs, reasoning negotiation), after a
+        provider's settings or key changed."""
+        learned["generation"] += 1
+        openrouter.clear_negotiation_cache()
+        openrouter_client.clear_cache()
+
     def refuse_if_busy(names):
         """A provider's settings or key do not change under work that is calling it."""
         if any(harness().provider_busy(name) for name in names):
@@ -278,8 +287,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         except credentials.CredentialsFileError:
             raise ApiError(500, "key_not_saved", "The key could not be saved") from None
         finally:
-            openrouter.clear_negotiation_cache()
-            openrouter_client.clear_cache()
+            forget_providers()
             await write(lambda conn: conn.execute(  # which provider's key changed and where it went; never the key
                 "INSERT INTO audit_log (event, data) VALUES ('key_changed', ?)",
                 (json.dumps({"provider": provider, "stored_in": stored_in}),)))
@@ -291,21 +299,26 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @app.put("/api/keys/{provider:name}")
     async def put_key(provider: str, body: Key):
-        if provider not in providers.configured(data_dir):
-            raise ApiError(404, "unknown_provider", "That provider is not set up")
         async with harness().settings_lock:  # ordered with the provider snapshot of turn admission
+            if provider not in providers.configured(data_dir):  # as the key is saved against it
+                raise ApiError(404, "unknown_provider", "That provider is not set up")
             refuse_if_busy({provider})
             return {"ok": True, "warning": await _to_end(_save_key(provider, body.key))}
 
     @app.get("/api/providers/{provider:name}/models")
     async def provider_models(provider: str, refresh: bool = False):
-        configured = providers.configured(data_dir)
-        if provider not in configured:
-            raise ApiError(404, "unknown_provider", "That provider is not set up")
-        key = await asyncio.to_thread(credentials.load_key, data_dir, provider, keyring_backend)
+        async with harness().settings_lock:  # a snapshot of the provider and its key, and its generation
+            configured = providers.configured(data_dir)
+            if provider not in configured:
+                raise ApiError(404, "unknown_provider", "That provider is not set up")
+            key = await asyncio.to_thread(credentials.load_key, data_dir, provider, keyring_backend)
+            generation = learned["generation"]
         general = await read(lambda conn: conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
         async with state["gate"].async_client(general) as client:
             models = await openrouter_client.models(client, configured[provider], key, force=refresh)
+        if learned["generation"] != generation:  # the provider changed meanwhile: what this learned is stale
+            forget_providers()
+            raise ApiError(409, "settings_changed", "The provider changed while its models were listed")
         status = openrouter_client.catalog_status(configured[provider], key)
         return {"models": sorted((models or {}).values(), key=lambda m: m["id"]), "status": status}
 
@@ -344,8 +357,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # it replaced the file: what was learned about it no longer holds. ponytail: cleared
             # even when nothing was written, which only costs a re-learn.
             if changed:
-                openrouter.clear_negotiation_cache()
-                openrouter_client.clear_cache()
+                forget_providers()
         return {"values": loaded.values, "warnings": loaded.warnings, "hash": loaded._digest}
 
     @app.get("/api/instructions")

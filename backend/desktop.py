@@ -74,29 +74,38 @@ def narrow_tree(data_dir) -> None:
 
     The walk starts at the data folder's real path (the folder itself may be a link the
     researcher made; the app opens everything through it). The app never makes a link
-    inside it, so one found there is refused (UnsafeDataFolderError) rather than followed
-    later by a reader of settings, keys or instructions. Each folder is narrowed before
-    it is listed, so a folder that cannot be listed is still closed to other accounts,
-    and with it everything below it."""
-    pending = [os.path.realpath(data_dir)]
+    inside it, so a folder holding one is refused (UnsafeDataFolderError) rather than
+    followed later by a reader of settings, keys or instructions; so is a folder holding
+    a folder that cannot be listed, since what it holds cannot be checked. Each folder is
+    narrowed before it is listed, and the walk narrows everything it can reach before it
+    refuses, so whatever the outcome nothing is left open to other accounts."""
+    pending, refused = [os.path.realpath(data_dir)], None
     while pending:
         folder = pending.pop()
-        if not _narrow(folder, 0o700):
-            continue
         try:
+            if not _narrow(folder, 0o700):
+                continue
             entries = list(os.scandir(folder))
         except FileNotFoundError:  # removed meanwhile
             continue
         except PermissionError:
-            log.warning("a folder in the data folder could not be listed; it is closed to other accounts")
+            refused = refused or UnsafeDataFolderError("a folder in the data folder cannot be listed")
+            continue
+        except UnsafeDataFolderError as error:
+            refused = refused or error
             continue
         for entry in entries:
             if entry.is_symlink():
-                raise UnsafeDataFolderError("the data folder holds a link, which Scholia does not follow")
-            if entry.is_dir(follow_symlinks=False):
+                refused = refused or UnsafeDataFolderError("the data folder holds a link, which Scholia does not follow")
+            elif entry.is_dir(follow_symlinks=False):
                 pending.append(entry.path)
             else:
-                _narrow(entry.path, 0o600)
+                try:
+                    _narrow(entry.path, 0o600)
+                except UnsafeDataFolderError as error:
+                    refused = refused or error
+    if refused is not None:
+        raise refused
 
 
 def _narrow(path, mask) -> bool:

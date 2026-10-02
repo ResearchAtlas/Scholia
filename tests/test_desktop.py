@@ -147,21 +147,32 @@ def test_an_existing_data_folder_is_narrowed_to_owner_only(tmp_path):
     assert stat.S_IMODE(strict.stat().st_mode) == 0o400  # never broadened
 
 
-def test_a_linked_data_folder_is_narrowed_at_its_real_path_and_a_folder_that_cannot_be_listed_is_closed(tmp_path):
+def test_a_linked_data_folder_is_narrowed_at_its_real_path(tmp_path):
     real = tmp_path / "real"
-    for folder in (real / "a", real / "b"):
-        folder.mkdir(parents=True)
-    for path in (real / "a" / "f", real / "b" / "f"):
-        path.write_text("x")
-        os.chmod(path, 0o644)
+    (real / "b").mkdir(parents=True)
+    (real / "b" / "f").write_text("x")
+    os.chmod(real / "b" / "f", 0o644)
     os.symlink(real, tmp_path / "data")  # the data folder is a link the researcher made
-    os.chmod(real / "a", 0o355)  # its owner cannot list it
+    desktop.narrow_tree(tmp_path / "data")
+    assert stat.S_IMODE((real / "b" / "f").stat().st_mode) == 0o600
+
+
+def test_a_folder_that_cannot_be_listed_is_closed_and_the_data_folder_refused(tmp_path):
+    data = tmp_path / "data"
+    for folder in (data / "projects" / "p", data / "b"):
+        folder.mkdir(parents=True)
+    os.symlink(tmp_path / "elsewhere.md", data / "projects" / "p" / "AGENTS.md")  # hidden from the walk
+    (data / "b" / "f").write_text("x")
+    os.chmod(data / "b" / "f", 0o644)
+    os.chmod(data / "projects" / "p", 0o333)  # its owner cannot list it
     try:
-        desktop.narrow_tree(tmp_path / "data")
-        assert stat.S_IMODE((real / "a").stat().st_mode) == 0o300  # closed to others, never broadened
-        assert stat.S_IMODE((real / "b" / "f").stat().st_mode) == 0o600  # the walk went on
+        with pytest.raises(desktop.UnsafeDataFolderError):
+            desktop.narrow_tree(data)
+        assert stat.S_IMODE((data / "projects" / "p").stat().st_mode) == 0o300  # closed to others
+        assert stat.S_IMODE((data / "b" / "f").stat().st_mode) == 0o600  # everything reachable was narrowed
+        assert desktop.run(data, [].append) == 1  # the app does not open it
     finally:
-        os.chmod(real / "a", 0o700)
+        os.chmod(data / "projects" / "p", 0o700)
 
 
 @pytest.mark.parametrize("linked", ["config.toml", "credentials.json", "projects/p/AGENTS.md", "projects/p"])
