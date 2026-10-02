@@ -239,6 +239,41 @@ def test_open_access_host_must_come_from_a_named_candidate_of_the_project(db, re
     assert len(remote.received) == 1
 
 
+NON_PUBLIC = [
+    "10.0.0.5", "172.16.0.1", "192.168.1.20", "169.254.169.254", "100.64.0.1", "198.18.0.1", "192.0.2.1",
+    "240.0.0.1", "224.0.0.1", "239.255.255.250", "255.255.255.255", "[fc00::1]", "[fd12:3456::1]", "[fe80::1]",
+    "[ff02::1]", "[ff0e::1]", "[2001:db8::1]", "[::ffff:10.0.0.1]", "167772161", "0xa9fea9fe", "[64:ff9b::a00:1]",
+    "[64:ff9b::a9fe:a9fe]", "[2002:a00:1::1]", "[fe80::1%25en0]",
+]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+def test_open_access_links_must_be_public_addresses(db, remote, setup, level, asynchronous):
+    project_id = project(db, level)
+    for host in NON_PUBLIC:
+        link = f"http://{host}/latest/meta-data"
+        with pytest.raises(OutboundDenied) as caught:
+            send(setup.gate, project_id, candidate(db, project_id, link), "GET", link, asynchronous)
+        assert caught.value.reason == "non_public_address", host
+    assert remote.received == []
+    assert {(row["kind"], row["reason"]) for _, row in audit(db)} == {("open_access", "non_public_address")}
+    for host in ("8.8.8.8", "[2606:4700::1111]", "[64:ff9b::808:808]"):  # public literals are fine
+        link = f"http://{host}/paper.pdf"
+        send(setup.gate, project_id, candidate(db, project_id, link), "GET", link, asynchronous)
+    assert len(remote.received) == 3
+
+
+@pytest.mark.parametrize("host", ["10.0.0.5", "192.168.1.20", "[fd12:3456::1]", "100.64.0.1"])
+def test_providers_on_private_networks_follow_their_own_rules(db, remote, setup, host):
+    setup.change(provider_urls=(f"http://{host}:8000/v1",))
+    with setup.gate.client(project(db)) as client:
+        client.post(f"http://{host}:8000/v1/chat/completions", json=chat(), headers={"Authorization": "Bearer lan"})
+    with setup.gate.client(project(db, "local_only")) as client:
+        refused(client, "GET", f"http://{host}:8000/v1/models", "not_allowed_at_level")
+    assert len(remote.received) == 1
+
+
 def test_local_only_needs_the_researchers_approval_for_outside_sources(db, remote, setup):
     project_id = project(db, "local_only")
     candidate_id = candidate(db, project_id)
@@ -768,6 +803,32 @@ def test_private_refuses_other_providers(db, remote, setup):
     assert remote.received == []
 
 
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("path", [
+    "/api/v1/completions", "/api/v1/responses", "/api/v1/embeddings", "/api/v1/keys", "/api/v1/chat/completions/",
+    "/api/v1/chat/completions?stream=true", "/api/v1/chat/completions?", "/api/v1/chat%2Fcompletions",
+    "/api/v1/chat//completions", "/API/V1/chat/completions", "/api/v1/chat/completions;x", "/v1/chat/completions",
+    "/api/v1/chat/completions/x", "/api/v2/chat/completions",
+])
+def test_private_requests_use_only_the_chat_completions_endpoint(db, remote, setup, path, asynchronous):
+    url = f"https://openrouter.ai{path}"
+    for level, reason in (("private", "unsupported_endpoint"), ("normal", None)):
+        project_id = project(db, level)
+        if reason:
+            with pytest.raises(OutboundDenied, match=reason):
+                send(setup.gate, project_id, None, "POST", url, asynchronous, json=chat(), headers=AUTH)
+            assert remote.received == []
+        else:  # Normal keeps any path on a configured provider
+            send(setup.gate, project_id, None, "POST", url, asynchronous, json=chat(), headers=AUTH)
+            assert len(remote.received) == 1
+
+
+def test_the_chat_completions_path_after_dot_segments_is_the_endpoint(db, remote, setup):
+    # httpx removes dot segments before sending, so this is the endpoint on the wire.
+    private_post(setup, db, chat(), url="https://openrouter.ai/api/v1/chat/x/../completions")
+    assert remote.received[0].url.raw_path == b"/api/v1/chat/completions"
+
+
 def test_private_needs_the_allowlist_entrys_own_flags_and_always_zdr(db, remote, setup):
     setup.change(private_route=lambda model: {"provider": {"zdr": True, "data_collection": "deny"}})
     with pytest.raises(OutboundDenied, match="missing_flags"):
@@ -918,7 +979,7 @@ def test_private_rules_do_not_apply_at_normal(db, remote, setup):
 def test_audit_rows_record_the_decision_without_content(db, remote, setup):
     project_id = project(db, "private")
     with setup.gate.client(project_id, headers={"X-Trace": "SECRET-HEADER"}) as client:
-        client.post(f"{CHAT}?session=SECRET-PARAM", json=chat(), headers=AUTH)
+        client.post(CHAT, json=chat(), headers=AUTH)
         refused(client, "POST", CHAT, "missing_flags", json=chat(provider={}), headers=AUTH)
         client.get("https://api.openalex.org/works?search=SECRET-QUERY&filter=SECRET-FILTER")
         refused(client, "GET", "https://evil.example/SECRET-PATH?q=SECRET-QUERY", "unknown_destination")
@@ -1009,10 +1070,29 @@ def test_a_redirect_to_another_origin_is_refused(db, remote, setup, follow, loca
 @pytest.mark.parametrize("location", ["/api/v1/other", f"{OPENROUTER_API}/other", "https://OpenRouter.ai:443/api/v1/other"])
 def test_a_same_origin_redirect_is_checked_again(db, remote, setup, location):
     remote.redirects[CHAT] = (307, location)
-    with setup.gate.client(project(db, "private"), follow_redirects=True) as client:
+    with setup.gate.client(project(db), follow_redirects=True) as client:
         assert client.post(CHAT, json=chat(), headers=AUTH).status_code == 200
     assert [str(r.url) for r in remote.received] == [CHAT, f"{OPENROUTER_API}/other"]
     assert decisions(db) == [("allow", None), ("allow", None)]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_private_request_redirected_to_another_path_is_refused(db, remote, setup, asynchronous):
+    remote.redirects[CHAT] = (307, "/api/v1/other")  # 307 resends the body to the new path
+    project_id = project(db, "private")
+
+    async def run_async():
+        async with setup.gate.async_client(project_id, follow_redirects=True) as client:
+            await client.post(CHAT, json=chat(), headers=AUTH)
+
+    with pytest.raises(OutboundDenied, match="unsupported_endpoint"):
+        if asynchronous:
+            asyncio.run(run_async())
+        else:
+            with setup.gate.client(project_id, follow_redirects=True) as client:
+                client.post(CHAT, json=chat(), headers=AUTH)
+    assert [str(r.url) for r in remote.received] == [CHAT]
+    assert decisions(db) == [("allow", None), ("deny", "unsupported_endpoint")]
 
 
 def test_a_same_origin_redirect_the_policy_refuses_is_not_followed(db, remote, setup):

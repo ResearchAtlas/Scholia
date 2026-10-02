@@ -14,7 +14,11 @@ provider's host), the local helper, a local provider on loopback, and a model
 download source. Only model providers, local providers and the helper take a
 request body or credentials (Authorization, Proxy-Authorization, Cookie, any
 header named like a key or token, or user info in the URL). The others are
-public fetches: a GET or HEAD with no body and no credentials, whatever the level. Gated clients keep
+public fetches: a GET or HEAD with no body and no credentials, whatever the level,
+to a public address: an IP literal that is not globally routable (private,
+link-local, shared, unique-local, documentation, reserved or multicast, or an
+IPv6 form embedding such an IPv4 address) is refused. A Private model request
+must be a POST to exactly /api/v1/chat/completions on OpenRouter. Gated clients keep
 no cookies, so no response can make a later request carry one.
 
 Hosts are compared in one canonical spelling (see `_canonical_host`): lowercase
@@ -47,9 +51,10 @@ project that is Private. Code in this process is trusted: the gate
 guards against mistakes and model-driven requests, not against code that builds
 its own client or reaches into a client's private attributes.
 
-Limits: names are resolved by the system, so a hosts file that maps "localhost"
-elsewhere, or a public name that resolves to this machine or a private network
-address, is not detected; only an open-access fetch can reach such a name.
+Limits: the gate does no lookups and names are resolved by the system, so a
+hosts file that maps "localhost" elsewhere, or a public name that resolves to
+this machine or a private network address, is not detected; only an
+open-access fetch can reach such a name.
 Cross-origin redirects are refused even between allowed hosts, whether or not
 the client follows them, so a source that redirects to another host (a download
 CDN, say) needs a change here when it is wired in.
@@ -78,6 +83,7 @@ class Kind(StrEnum):
 
 
 OPENROUTER = ("https", "openrouter.ai", 443)
+OPENROUTER_CHAT = b"/api/v1/chat/completions"  # the only path a Private request may use, with no query
 SCHOLARLY_APIS = frozenset({
     ("https", "api.openalex.org", 443),
     ("https", "api.crossref.org", 443),
@@ -106,6 +112,7 @@ _PRIVATE_PEERS = frozenset({Kind.MODEL_PROVIDER, Kind.LOCAL_PROVIDER, Kind.LOCAL
 _CREDENTIAL_HEADER = re.compile(r"auth|cookie|key|token|secret|session|passw|credential", re.IGNORECASE)
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _THIS_HOST = (ipaddress.IPv4Network("127.0.0.0/8"), ipaddress.IPv4Network("0.0.0.0/8"))
+_NAT64 = ipaddress.IPv6Network("64:ff9b::/96")  # a gateway connects to the IPv4 address in its last 32 bits
 
 
 class OutboundDenied(Exception):
@@ -325,6 +332,23 @@ def _origin_of(text):
         return None
 
 
+def _non_public(host: str) -> bool:
+    """Whether a canonical host is an IP literal that is not globally routable.
+
+    Names are not looked up. A NAT64 address is judged by the IPv4 address a
+    gateway translates it to as well. (ipaddress already counts all of 6to4 and
+    Teredo as not global.)
+    """
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    addresses = [address]
+    if address.version == 6 and address in _NAT64:
+        addresses.append(ipaddress.IPv4Address(int(address) & 0xFFFFFFFF))
+    return any(not a.is_global or a.is_multicast for a in addresses)
+
+
 def _is_this_host(host: str) -> bool:
     """Whether a canonical host names this machine."""
     if host == "localhost" or host.endswith(".localhost"):
@@ -385,8 +409,11 @@ def _policy(conn, level, kind, target, scope, private_problem, public_problem):
         return "unknown_project"
     if kind is None:
         return "unknown_destination"
-    if kind not in _PRIVATE_PEERS and public_problem:
-        return public_problem
+    if kind not in _PRIVATE_PEERS:
+        if _non_public(target[1]):
+            return "non_public_address"
+        if public_problem:
+            return public_problem
     if level == "normal" or kind is Kind.LOCAL_HELPER:
         return None
     if level == "private":
@@ -409,6 +436,8 @@ def _private_problem(request: httpx.Request, inputs: GateInputs):
         return "private_inputs_missing"
     if request.method != "POST":
         return "unchecked_request"
+    if request.url.raw_path != OPENROUTER_CHAT:  # the path as sent, so no query or other spelling
+        return "unsupported_endpoint"
     content = _body(request)
     if content is None:
         return "unchecked_request"
