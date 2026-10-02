@@ -186,7 +186,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        db = await asyncio.to_thread(Database, data_dir)
+        # Opening the database (its checks, the backup before a migration, migrations) and the
+        # daily backup are local maintenance: the desktop entry's start deadline does not count
+        # them (state["maintenance"]), since on a large folder they are progress, not a hang.
+        state["maintenance"] = True
+        try:
+            db = await asyncio.to_thread(Database, data_dir)
+        finally:
+            state.pop("maintenance", None)
         content = ContentStore(db)
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
@@ -195,14 +202,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             await harness.recover()
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
             # The daily backup runs at launch, before the app accepts a request, so the
-            # database and the settings files it copies show one state. The desktop entry's
-            # start deadline does not count it (state["backing_up"]): a large folder's backup is
-            # progress, not a hang. Backups while the app is open and idle are S1-12's.
-            state["backing_up"] = True
+            # database and the settings files it copies show one state. Backups while the app
+            # is open and idle are S1-12's.
+            state["maintenance"] = True
             try:
                 await asyncio.to_thread(_daily_backup, db)
             finally:
-                state.pop("backing_up", None)
+                state.pop("maintenance", None)
             yield
         finally:
             await harness.shutdown()

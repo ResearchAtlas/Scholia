@@ -69,9 +69,8 @@ def take_lock(data_dir) -> int | None:
     try:
         fd = os.open(data_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     except OSError as error:
-        if error.errno == errno.ELOOP:
-            raise UnsafeDataFolderError(f"Scholia will not open its data folder: {_LINK}") from None
-        raise
+        problem = _LINK if error.errno == errno.ELOOP else "its lock file cannot be opened"
+        raise UnsafeDataFolderError(f"Scholia will not open its data folder: {problem}") from None
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
         os.close(fd)
@@ -269,15 +268,18 @@ def _run_server(server, sock, loop):
 
 
 def _wait_started(server, thread, state):
-    """Wait for the server to start, at most START_SECONDS, not counting the daily backup at
-    launch (state["backing_up"]): a large folder's backup is progress, not a hang."""
-    deadline = time.monotonic() + START_SECONDS
+    """Wait for the server to start, at most START_SECONDS, not counting the local maintenance
+    of opening the database and the daily backup (state["maintenance"]): on a large folder
+    it is progress, not a hang."""
+    left, last = float(START_SECONDS), time.monotonic()
     while not server.started:
         if not thread.is_alive():
             return False
-        if state.get("backing_up"):
-            deadline = time.monotonic() + START_SECONDS
-        elif time.monotonic() > deadline:
+        now = time.monotonic()
+        if not state.get("maintenance"):  # only the rest of startup spends the budget
+            left -= now - last
+        last = now
+        if left <= 0:
             return False
         thread.join(0.05)
     return True

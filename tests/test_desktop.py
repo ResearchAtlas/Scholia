@@ -335,3 +335,58 @@ def test_a_lock_file_that_is_a_link_is_refused_and_never_followed(tmp_path, targ
     windows = []
     assert desktop.run(data, windows.append) == 1
     assert windows == []  # not reported as already open
+
+
+def test_the_start_deadline_keeps_its_budget_across_the_backup(monkeypatch):
+    # 0.6 s of startup, a 4.4 s backup, then 0.6 s more: 1.2 s outside the backup, over 1 s.
+    clock = iter([0.0, 0.6, 5.0, 5.3, 5.6, 5.9])
+    server, state = type("Server", (), {"started": False})(), {}
+    steps = iter([lambda: state.update(maintenance=True), lambda: state.pop("maintenance"), lambda: None,
+                  lambda: setattr(server, "started", True), lambda: None])
+
+    class Thread:
+        def is_alive(self):
+            return True
+
+        def join(self, seconds):
+            next(steps)()
+
+    monkeypatch.setattr(desktop.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(desktop, "START_SECONDS", 1)
+    assert desktop._wait_started(server, Thread(), state) is False
+
+
+@pytest.mark.parametrize("kind", ["folder", "unreadable"])
+def test_a_lock_file_that_cannot_be_opened_is_refused(tmp_path, kind):
+    data = tmp_path / "data"
+    data.mkdir()
+    lock = data / desktop.LOCK_FILE
+    if kind == "folder":
+        lock.mkdir()
+    else:
+        lock.write_text("")
+        os.chmod(lock, 0o000)
+    try:
+        with pytest.raises(desktop.UnsafeDataFolderError):
+            desktop.take_lock(data)
+        assert desktop.run(data, [].append) == 1
+    finally:
+        if kind == "unreadable":
+            os.chmod(lock, 0o600)
+
+
+def test_a_slow_database_opening_does_not_count_against_the_start_deadline(tmp_path, monkeypatch):
+    import time
+    from backend import app as app_module
+    real_database = app_module.Database
+
+    def slow_database(data_dir):  # a large database's checks, backup and migration
+        time.sleep(1.5)
+        return real_database(data_dir)
+
+    monkeypatch.setattr(app_module, "Database", slow_database)
+    monkeypatch.setattr(desktop, "START_SECONDS", 1)
+    seen = []
+    assert desktop.run(tmp_path / "data", _open_and_close(seen), keyring_backend=FakeKeyring(),
+                       listening=register_server) == 0
+    assert seen == [True]
