@@ -630,3 +630,16 @@ async def test_the_daily_backup_runs_at_launch_before_the_app_accepts_a_request(
         assert (await client.get("/api/health")).status_code == 200
     assert len(list((tmp_path / "data" / "backups" / "daily").iterdir())) == 1
 
+
+
+@pytest.mark.parametrize("key", ["   ", "sk-or v1", "sk-or-\nv1", "sk-or-​v1", "sk-or-é"])
+async def test_an_unusable_key_is_refused_and_a_pasted_one_is_trimmed(tmp_path, key):
+    from scholia_app import FakeKeyring
+    keyring = FakeKeyring()
+    async with started(tmp_path / "data", keyring=keyring, setup=False) as client:
+        refused = await client.post("/api/setup", json={"openrouter_key": key})
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
+        assert (await client.get("/api/setup")).json() == {"needed": True}
+        assert (await client.post("/api/setup", json={"openrouter_key": "  sk-or-v1-abc\n"})).status_code == 200
+        assert "sk-or-v1-abc" in keyring.keys.values()
+        assert (await client.put("/api/keys/openrouter", json={"key": key})).status_code == 400

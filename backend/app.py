@@ -126,12 +126,23 @@ class Continue(BaseModel):
     effort: str | None = None
 
 
+def _usable_key(key):
+    """A provider key, trimmed (a pasted key often ends in a line break); it must be printable
+    ASCII with no spaces, as a Bearer token in a request header needs."""
+    key = key.strip()
+    if not key or any(not "\x21" <= c <= "\x7e" for c in key):
+        raise ValueError("a key is printable text without spaces")
+    return key
+
+
 class Key(BaseModel):
     key: str = Field(min_length=1, max_length=1000)
+    _key = field_validator("key")(classmethod(lambda cls, v: _usable_key(v)))
 
 
 class Setup(BaseModel):
     openrouter_key: str = Field(min_length=1, max_length=1000)
+    _key = field_validator("openrouter_key")(classmethod(lambda cls, v: _usable_key(v)))
 
 
 class SettingsUpdate(BaseModel):
