@@ -235,9 +235,115 @@ def test_open_access_host_must_come_from_a_named_candidate_of_the_project(db, re
             refused(client, "GET", url, "unknown_destination")
     assert remote.received == []
     with setup.gate.client(project_id, candidate_id=mine) as client:
-        client.get("https://repository.example.org/other/path.pdf")  # the host, not only the exact link
+        refused(client, "GET", "https://repository.example.org/other/path.pdf", "not_candidate_url")
         refused(client, "GET", "https://evil.example/p.pdf", "unknown_destination")
+        client.get(OA_LINK)
     assert len(remote.received) == 1
+
+
+OA_WITH_QUERY = "https://repository.example.org/files/paper.pdf?download=1"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_an_open_access_fetch_is_bound_to_the_exact_link(db, remote, setup, asynchronous):
+    project_id = project(db, "private")
+    candidate_id = candidate(db, project_id, OA_WITH_QUERY)
+    for url in ("https://repository.example.org/files/paper.pdf", "https://repository.example.org/files/paper.pdf?download=2",
+                f"{OA_WITH_QUERY}&q=SECRET", "https://repository.example.org/files/paper.pdf/?download=1",
+                "https://repository.example.org/files/SECRET?download=1", "https://repository.example.org/",
+                "https://repository.example.org/files/paper%2Epdf?download=1"):
+        with pytest.raises(OutboundDenied) as caught:
+            send(setup.gate, project_id, candidate_id, "GET", url, asynchronous)
+        assert caught.value.reason == "not_candidate_url", url
+    assert remote.received == []
+    send(setup.gate, project_id, candidate_id, "GET", OA_WITH_QUERY, asynchronous)
+    send(setup.gate, project_id, candidate_id, "GET", f"{OA_WITH_QUERY}#page=2", asynchronous)  # not sent
+    send(setup.gate, project_id, candidate_id, "HEAD", "HTTPS://Repository.Example.ORG:443/files/paper.pdf?download=1",
+         asynchronous)
+    assert [(r.url.host, r.url.raw_path) for r in remote.received] == [
+        ("repository.example.org", b"/files/paper.pdf?download=1")] * 3
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_redirects_followed_from_the_link_may_reach_other_paths(db, remote, setup, asynchronous):
+    project_id = project(db)
+    candidate_id = candidate(db, project_id)
+    remote.redirects[OA_LINK] = (302, "/landing")
+    remote.redirects["https://repository.example.org/landing"] = (301, "https://repository.example.org/pdf/1.pdf")
+
+    async def run_async():
+        async with setup.gate.async_client(project_id, candidate_id=candidate_id, follow_redirects=True) as client:
+            return await client.get(OA_LINK)
+
+    if asynchronous:
+        response = asyncio.run(run_async())
+    else:
+        with setup.gate.client(project_id, candidate_id=candidate_id, follow_redirects=True) as client:
+            response = client.get(OA_LINK)
+    assert response.status_code == 200
+    assert [str(r.url) for r in remote.received] == [
+        OA_LINK, "https://repository.example.org/landing", "https://repository.example.org/pdf/1.pdf"]
+    assert decisions(db) == [("allow", None)] * 3
+    # The same URLs as new requests are not the link.
+    for url in ("https://repository.example.org/landing", "https://repository.example.org/pdf/1.pdf"):
+        with pytest.raises(OutboundDenied, match="not_candidate_url"):
+            send(setup.gate, project_id, candidate_id, "GET", url, asynchronous)
+
+
+def test_a_redirect_followed_by_hand_continues_only_through_next_request(db, remote, setup):
+    project_id = project(db)
+    candidate_id = candidate(db, project_id)
+    remote.redirects[OA_LINK] = (302, "/landing")
+    with setup.gate.client(project_id, candidate_id=candidate_id) as client:
+        response = client.get(OA_LINK)
+        assert response.status_code == 302
+        refused(client, "GET", "https://repository.example.org/landing", "not_candidate_url")
+        assert client.send(response.next_request).status_code == 200
+    with setup.gate.client(project_id, candidate_id=candidate_id) as other:  # a hop belongs to its own client
+        with pytest.raises(OutboundDenied, match="not_candidate_url"):
+            other.send(response.next_request)
+    assert [str(r.url) for r in remote.received] == [OA_LINK, "https://repository.example.org/landing"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_request_target_override_is_refused(db, remote, setup, asynchronous):
+    # httpcore sends extensions["target"] instead of the URL's path and query.
+    project_id = project(db, "private")
+    candidate_id = candidate(db, project_id)
+    for method, url, kwargs in (("GET", OA_LINK, {}), ("POST", CHAT, {"json": chat(), "headers": AUTH})):
+        with pytest.raises(OutboundDenied, match="host_mismatch"):
+            send(setup.gate, project_id, candidate_id, method, url, asynchronous,
+                 extensions={"target": b"/SECRET?q=SECRET"}, **kwargs)
+    assert remote.received == []
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_refused_hosts_name_is_never_recorded(db, remote, setup, asynchronous):
+    secret = "secret-fact-jane-doe"
+    project_id = project(db)
+    remote.redirects[f"{OPENROUTER_API}/models"] = (302, f"https://{secret}.example/x")
+    for url in (f"https://{secret}.example/x", f"http://{secret}.local:8080/", f"{OPENROUTER_API}/models"):
+        with pytest.raises(OutboundDenied) as caught:
+            send(setup.gate, project_id, None, "GET", url, asynchronous)
+        assert caught.value.destination == "unknown" and secret not in str(caught.value)
+    assert [(row["reason"], row["destination"]) for _, row in audit(db)] == [
+        ("unknown_destination", "unknown"), ("unknown_destination", "unknown"), (None, "https://openrouter.ai:443"),
+        ("cross_origin_redirect", "unknown")]
+    delete(db, ContentStore(db), "project", project_id)
+    rows = db.read(lambda conn: conn.execute("SELECT group_concat(data) FROM audit_log").fetchone()[0])
+    assert len(audit(db)) == 4 and secret not in rows  # the rows outlive the project, without the name
+
+
+def test_recognized_destinations_keep_their_origin_when_refused(db, remote, setup):
+    setup.change(provider_urls=())
+    declare(db, "http://127.0.0.1:9999/v1")  # declared, though no provider is configured there
+    with setup.gate.client(project(db, "local_only")) as client:
+        refused(client, "GET", "http://127.0.0.1:9999/v1/models", "unknown_destination")
+        refused(client, "GET", f"{OPENROUTER_API}/models", "unknown_destination")  # a fixed host, unconfigured
+        refused(client, "GET", "https://huggingface.co/x", "not_allowed_at_level")
+        refused(client, "GET", "http://127.0.0.1:9998/", "unknown_destination")
+    assert [row["destination"] for _, row in audit(db)] == [
+        "http://127.0.0.1:9999", "https://openrouter.ai:443", "https://huggingface.co:443", "unknown"]
 
 
 NON_PUBLIC = [
@@ -627,7 +733,7 @@ def test_a_declaration_covers_every_spelling_of_its_address_but_not_a_name(db, r
              asynchronous, json=chat())
     assert len(remote.received) == 4
     assert [(row["kind"], row["destination"]) for _, row in audit(db)] == (
-        [("local_provider", "http://127.0.0.1:11434")] * 4 + [(None, "http://localhost:11434")])
+        [("local_provider", "http://127.0.0.1:11434")] * 4 + [(None, "unknown")])
 
 
 def send(gate, project_id, candidate_id, method, url, asynchronous, **kwargs):
@@ -994,7 +1100,7 @@ def test_audit_rows_record_the_decision_without_content(db, remote, setup):
          "destination": "https://openrouter.ai:443", "method": "POST", "sensitivity": "private", "approved": False},
         {"decision": "allow", "reason": None, "kind": "scholarly_api", "destination": "https://api.openalex.org:443",
          "method": "GET", "sensitivity": "private", "approved": False},
-        {"decision": "deny", "reason": "unknown_destination", "kind": None, "destination": "https://evil.example:443",
+        {"decision": "deny", "reason": "unknown_destination", "kind": None, "destination": "unknown",
          "method": "GET", "sensitivity": "private", "approved": False},
     ]
     assert {row_project for row_project, _ in rows} == {project_id}
@@ -1036,6 +1142,7 @@ REASONS = {
     "not_allowed_at_level", "not_declared", "not_approved", "unknown_level", "host_mismatch",
     "gate_inputs_unavailable", "cross_origin_redirect", "sensitivity_changed", "unsupported_method",
     "not_openrouter", "private_inputs_missing", "unchecked_request", "unsupported_endpoint", "unsupported_feature",
+    "not_candidate_url",
     "route_not_allowed", "missing_flags", "key_not_confirmed",
 }
 ORIGIN = re.compile(r"https?://(\[[0-9a-f:.%]+\]|[a-z0-9.-]+):[0-9]{1,5}")
@@ -1076,9 +1183,8 @@ def test_every_audit_field_is_from_a_fixed_set_or_a_canonical_origin(db, remote,
         assert row["sensitivity"] in {"normal", "private", "local_only", None}
         assert row["approved"] in {True, False}
         assert row["destination"] in {None, "unknown"} or ORIGIN.fullmatch(row["destination"])
-    # Only a refused unknown host's own name can appear, as a canonical origin.
-    stored = [json.dumps(row) for _, row in rows if secret.lower() not in (row["destination"] or "")]
-    assert not any(secret in text or secret.lower() in text for text in stored)
+    stored = json.dumps(rows)
+    assert secret not in stored and secret.lower() not in stored
 
 
 def test_ipv6_destinations_are_shown_with_brackets(db, remote, setup):

@@ -6,10 +6,12 @@ destination (scheme, host and port), allows or refuses it by the project's
 sensitivity level, and records the decision in `audit_log` before anything is
 sent. Every redirect hop goes through the same check, and a redirect to another
 origin is refused. Anything not classified is refused, and so is a request whose
-Host header or TLS name differs from its URL's host.
+Host header, TLS name or request target (an httpcore extension) differs from its
+URL.
 
 Destination kinds: a model provider (configured in settings), a scholarly API, an
-open-access host taken from a named candidate of the project (never a model
+open-access link taken from a named candidate of the project (the exact link,
+then only the same-origin redirects httpx follows from that fetch; never a model
 provider's host), the local helper, a local provider on loopback, and a model
 download source. Only model providers, local providers and the helper take a
 request body or credentials (Authorization, Proxy-Authorization, Cookie, any
@@ -42,7 +44,10 @@ exact origins count there, and nothing else does. Names are never resolved, so
 
 Audit rows hold the decision, reason, kind, destination origin, method, level
 and approval flag; never a path, query, header or body. Every field is from a
-fixed set except the destination, which is a canonical origin: a method outside
+fixed set except the destination, which is the canonical origin of a destination
+the gate recognizes (a fixed source, a configured provider or the helper, a
+declared local server, the candidate's link) and otherwise "unknown", so a
+refused host's own name is never kept: a method outside
 the standard ones is refused and recorded as OTHER, and a client takes only a
 project id in the schema's form. A row records the
 decision, not delivery: a crash after the commit leaves an allow row for a
@@ -121,6 +126,10 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 _THIS_HOST = (ipaddress.IPv4Network("127.0.0.0/8"), ipaddress.IPv4Network("0.0.0.0/8"))
 _NAT64 = ipaddress.IPv6Network("64:ff9b::/96")  # a gateway connects to the IPv4 address in its last 32 bits
 _GLOBAL_UNICAST = ipaddress.IPv6Network("2000::/3")  # the only IPv6 block assigned for public addresses
+_KNOWN = SCHOLARLY_APIS | MODEL_SOURCES | {OPENROUTER}
+# Marks a request httpx builds to follow a redirect from an allowed open-access
+# fetch; httpx copies a request's extensions into the redirect it builds.
+_HOP = object()
 
 
 class OutboundDenied(Exception):
@@ -200,7 +209,8 @@ class OutboundGate:
         # A Host header or TLS name other than the URL's could reach another site
         # behind the same server or CDN.
         addressed = (request.headers.get("host") == request.url.netloc.decode("ascii")
-                     and "sni_hostname" not in request.extensions)
+                     and "sni_hostname" not in request.extensions and "target" not in request.extensions)
+        hop = request.extensions.get(_HOP) is scope
         # What a scholarly, open-access or download request may not be. User info in
         # the URL is a credential too: httpx turns it into Authorization only for a
         # first request, never for a redirect hop.
@@ -213,11 +223,10 @@ class OutboundGate:
         # The inputs are called outside the transaction, and the Private checks only
         # when the project is Private now. The level is read again in the transaction.
         seen = self._db.read(lambda conn: _level(conn, scope.project_id))
-        error = None
+        error, providers, helper = None, frozenset(), None
         try:
             inputs = self._inputs()
-            providers = frozenset(_origin_of(url) for url in inputs.provider_urls)
-            helper = _origin_of(inputs.helper_url)
+            providers, helper = _origins(inputs)
             if target != OPENROUTER:
                 private_problem = "not_openrouter"
             elif seen == "private":
@@ -231,25 +240,40 @@ class OutboundGate:
             # The level is read in the transaction that records the decision, so a
             # change of level is ordered entirely before or after it.
             level = _level(conn, scope.project_id)
+            link = _candidate_link(conn, scope)
             if request.method not in _METHODS:  # an arbitrary method string could carry content
                 kind, reason = None, "unsupported_method"
             elif error is not None:
                 kind, reason = None, "gate_inputs_unavailable"
             else:
-                kind = _classify(conn, target, providers, helper, scope)
-                reason = _policy(conn, level, kind, target, scope, private_problem, public_problem)
+                kind = _classify(target, providers, helper, link)
+                # An open-access fetch is bound to the candidate's exact link, as sent;
+                # other URLs on its origin only as redirects followed from it.
+                bound = hop or (link is not None and target == _origin(link) and request.url.raw_path == link.raw_path)
+                reason = _policy(conn, level, kind, target, scope, private_problem, public_problem, bound)
                 if reason is None and not addressed:
                     reason = "host_mismatch"
-            _record(conn, request, scope, level, kind, _show(target), reason)
-            return reason
+            shown = _shown(conn, target, kind, link, providers, helper)
+            _record(conn, request, scope, level, kind, shown, reason)
+            return kind, reason, shown
 
-        if reason := self._db.write(decide):
-            raise OutboundDenied(reason, _show(target)) from error
+        kind, reason, shown = self._db.write(decide)
+        if reason:
+            raise OutboundDenied(reason, shown) from error
+        return kind
 
-    def _refuse_redirect(self, request: httpx.Request, scope: _Scope, destination: str) -> None:
-        self._db.write(lambda conn: _record(
-            conn, request, scope, _level(conn, scope.project_id), None, destination, "cross_origin_redirect"))
-        raise OutboundDenied("cross_origin_redirect", destination)
+    def _refuse_redirect(self, request: httpx.Request, scope: _Scope, target) -> None:
+        try:
+            providers, helper = _origins(self._inputs())
+        except Exception:  # they only name the destination; the refusal stands either way
+            providers, helper = frozenset(), None
+
+        def record(conn):
+            shown = _shown(conn, target, None, _candidate_link(conn, scope), providers, helper)
+            _record(conn, request, scope, _level(conn, scope.project_id), None, shown, "cross_origin_redirect")
+            return shown
+
+        raise OutboundDenied("cross_origin_redirect", self._db.write(record))
 
 
 class _Transport(httpx.BaseTransport):
@@ -257,11 +281,14 @@ class _Transport(httpx.BaseTransport):
         self._gate, self._scope, self._inner = gate, scope, inner
 
     def handle_request(self, request):
-        self._gate._check(request, self._scope)
+        kind = self._gate._check(request, self._scope)
         response = self._inner.handle_request(request)
-        if (destination := _foreign_redirect(request, response)) is not None:
+        leaves, target = _redirect(request, response)
+        if leaves:
             response.close()
-            self._gate._refuse_redirect(request, self._scope, destination)
+            self._gate._refuse_redirect(request, self._scope, target)
+        if kind is Kind.OPEN_ACCESS and response.has_redirect_location:
+            request.extensions[_HOP] = self._scope  # httpx copies it into the redirect it builds
         return response
 
     def close(self):
@@ -274,11 +301,14 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request):
         # The database blocks, so it is reached off the event loop.
-        await asyncio.to_thread(self._gate._check, request, self._scope)
+        kind = await asyncio.to_thread(self._gate._check, request, self._scope)
         response = await self._inner.handle_async_request(request)
-        if (destination := _foreign_redirect(request, response)) is not None:
+        leaves, target = _redirect(request, response)
+        if leaves:
             await response.aclose()
-            await asyncio.to_thread(self._gate._refuse_redirect, request, self._scope, destination)
+            await asyncio.to_thread(self._gate._refuse_redirect, request, self._scope, target)
+        if kind is Kind.OPEN_ACCESS and response.has_redirect_location:
+            request.extensions[_HOP] = self._scope
         return response
 
     async def aclose(self):
@@ -396,7 +426,37 @@ def _level(conn, project_id):
     return row[0] if row else None
 
 
-def _classify(conn, target, providers, helper, scope):
+def _origins(inputs):
+    """The configured providers' origins and the helper's origin."""
+    return frozenset(_origin_of(url) for url in inputs.provider_urls), _origin_of(inputs.helper_url)
+
+
+def _candidate_link(conn, scope):
+    """The named candidate's open-access link as an httpx.URL, or None."""
+    if scope.candidate_id is None:
+        return None
+    row = conn.execute(
+        "SELECT oa_url FROM candidates WHERE id = ? AND project_id = ?", (scope.candidate_id, scope.project_id),
+    ).fetchone()
+    try:
+        return httpx.URL(row[0]) if row and isinstance(row[0], str) else None
+    except httpx.InvalidURL:
+        return None
+
+
+def _shown(conn, target, kind, link, providers, helper):
+    """How the audit log names a destination: its canonical origin when the gate
+    recognizes it, else "unknown", so a refused host's own name is never kept."""
+    if target is not None and (
+        kind is not None or target in _KNOWN or target in providers or target == helper
+        or (link is not None and target == _origin(link))
+        or any(_origin_of(url) == target for (url,) in conn.execute("SELECT base_url FROM local_declarations"))
+    ):
+        return _show(target)
+    return "unknown"
+
+
+def _classify(target, providers, helper, link):
     if target is None:
         return None
     if _is_this_host(target[1]):
@@ -413,17 +473,12 @@ def _classify(conn, target, providers, helper, scope):
         return Kind.SCHOLARLY_API
     if target in MODEL_SOURCES:
         return Kind.MODEL_DOWNLOAD
-    if scope.candidate_id is not None:
-        row = conn.execute(
-            "SELECT oa_url FROM candidates WHERE id = ? AND project_id = ?",
-            (scope.candidate_id, scope.project_id),
-        ).fetchone()
-        if row and target == _origin_of(row[0]):
-            return Kind.OPEN_ACCESS
+    if link is not None and target == _origin(link):
+        return Kind.OPEN_ACCESS
     return None
 
 
-def _policy(conn, level, kind, target, scope, private_problem, public_problem):
+def _policy(conn, level, kind, target, scope, private_problem, public_problem, bound):
     """None to allow, or the reason for refusing."""
     if level is None:
         return "unknown_project"
@@ -434,6 +489,8 @@ def _policy(conn, level, kind, target, scope, private_problem, public_problem):
             return "non_public_address"
         if public_problem:
             return public_problem
+    if kind is Kind.OPEN_ACCESS and not bound:
+        return "not_candidate_url"
     if level == "normal" or kind is Kind.LOCAL_HELPER:
         return None
     if level == "private":
@@ -527,24 +584,25 @@ def _carries(body, flags) -> bool:
     return True
 
 
-def _foreign_redirect(request: httpx.Request, response: httpx.Response):
-    """The destination of a redirect away from the request's origin, or None.
+def _redirect(request: httpx.Request, response: httpx.Response):
+    """(True, the origin it leads to or None if unreadable) for a redirect away from
+    the request's origin; else (False, None).
 
     Only a relative path, or an absolute URL with the same origin, stays. Anything
     else, including a Location httpx would read in an unusual way, leaves.
     """
     if not response.has_redirect_location:
-        return None
+        return False, None
     try:
         location = httpx.URL(response.headers["Location"])
     except httpx.InvalidURL:
-        return "unknown"
+        return True, None
     if not location.scheme and not location.host:
-        return None
+        return False, None
     target = _origin(location, location.scheme or request.url.scheme) if location.host else None
     if target is not None and target == _origin(request.url):
-        return None
-    return _show(target) or "unknown"
+        return False, None
+    return True, target
 
 
 def _record(conn, request, scope, level, kind, destination, reason):
