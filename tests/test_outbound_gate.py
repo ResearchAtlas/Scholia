@@ -1019,7 +1019,8 @@ def test_a_non_standard_method_is_refused_and_never_recorded(db, remote, setup, 
 
 
 @pytest.mark.parametrize("project_id", [
-    "SECRET project fact", "", None, 1, "general", new_id().upper(), new_id() + " ", "../" + new_id(),
+    "SECRET project fact", "", None, 1, "general", "ABCDEF12-3456-4789-ABCD-EF1234567890",  # valid once lowercased
+    new_id() + " ", "../" + new_id(),
     "12345678-1234-1234-8234-123456789012",  # version 1, not 4
 ])
 def test_a_client_takes_only_a_project_id(db, setup, project_id):
