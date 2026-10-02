@@ -625,3 +625,41 @@ async def test_a_blank_rename_is_refused_and_a_title_is_trimmed(tmp_path):
         assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
         renamed = await client.put(f"/api/conversations/{conversation}", json={"title": "  Second  "})
         assert renamed.json()["title"] == "Second"
+
+
+async def test_a_cancelled_project_creation_ends_with_its_folder_and_record_or_neither(tmp_path, monkeypatch):
+    import threading
+    from backend import app as app_module
+    data = tmp_path / "data"
+    async with started(data) as client:
+        entered, release = threading.Event(), threading.Event()
+        real = app_module._write_project_folder
+
+        def slow_folder(*args):
+            entered.set()
+            release.wait(5)
+            real(*args)
+
+        monkeypatch.setattr(app_module, "_write_project_folder", slow_folder)
+        creating = asyncio.create_task(client.post("/api/projects", json={"name": "Half made"}))
+        await asyncio.to_thread(entered.wait, 5)
+        creating.cancel()  # the request goes away while the folder is written
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await creating
+        names = [p["name"] for p in (await client.get("/api/projects")).json()["projects"]]
+        folders = sorted(p.name for p in (data / "projects").iterdir())
+        project_ids = sorted(p["id"] for p in (await client.get("/api/projects")).json()["projects"]
+                             if p["kind"] != "general")
+        assert "Half made" in names and folders == project_ids  # both, never a folder alone
+
+
+@pytest.mark.parametrize("name", ["", "   ", "　"])
+async def test_a_blank_project_name_is_refused_and_names_are_trimmed(tmp_path, name):
+    async with started(tmp_path / "data") as client:
+        refused = await client.post("/api/projects", json={"name": name})
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
+        project = (await client.post("/api/projects", json={"name": "  Interviews  "})).json()
+        assert project["name"] == "Interviews"
+        changed = await client.patch(f"/api/projects/{project['id']}", json={"name": name})
+        assert changed.status_code == 400

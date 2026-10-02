@@ -83,13 +83,22 @@ def _error(status, code, message):
     return JSONResponse({"code": code, "message": message}, status_code=status)
 
 
+def _visible(text):
+    """A name or title, trimmed; one with no visible character is refused."""
+    if text is not None and not text.strip():
+        raise ValueError("it needs a visible character")
+    return text.strip() if text is not None else None
+
+
 class NewProject(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+    _name = field_validator("name")(classmethod(lambda cls, v: _visible(v)))
 
 
 class ProjectChange(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     target_venue: str | None = Field(default=None, max_length=200)
+    _name = field_validator("name")(classmethod(lambda cls, v: _visible(v)))
 
 
 class NewConversation(BaseModel):
@@ -100,12 +109,7 @@ class NewConversation(BaseModel):
 class Rename(BaseModel):
     title: str = Field(min_length=1, max_length=200)
 
-    @field_validator("title")
-    @classmethod
-    def not_blank(cls, title):
-        if not title.strip():
-            raise ValueError("a title needs a visible character")
-        return title.strip()
+    _title = field_validator("title")(classmethod(lambda cls, v: _visible(v)))
 
 
 class Message(BaseModel):
@@ -418,24 +422,21 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def create_project(body: NewProject):
         project_id = new_id()
         folder = data_dir / "projects" / project_id
-        # The folder first: if the record then fails, an unused folder is all that is left.
-        await asyncio.to_thread(_write_project_folder, data_dir, project_id)
 
         def insert(conn):
             conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, ?, 'research')", (project_id, body.name))
             conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('project_created', ?, '{}')",
                          (project_id,))
-        written = asyncio.ensure_future(write(insert))
-        try:
-            await asyncio.shield(written)
-        except asyncio.CancelledError:
-            # The write goes on in its thread: keep the folder if it commits.
-            if not await _committed(written):
+
+        async def creating():  # the folder, then the record; a folder with no record is removed
+            try:
+                await asyncio.to_thread(_write_project_folder, data_dir, project_id)
+                await write(insert)
+            except BaseException:
                 await asyncio.to_thread(shutil.rmtree, folder, ignore_errors=True)
-            raise
-        except Exception:
-            await asyncio.to_thread(shutil.rmtree, folder, ignore_errors=True)
-            raise
+                raise
+
+        await _to_end(creating())  # a cancelled request still ends with both, or neither
         return project_dict(await project_row(project_id))
 
     @app.get("/api/projects/{project_id}")
@@ -616,19 +617,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         return FileResponse(file, headers={"Cache-Control": "no-cache"})
 
     return LocalRequestGuard(app, origin=origin, dev_origins=dev_origins, session=session)
-
-
-async def _committed(future) -> bool:
-    """Whether a write that is still going on commits, waiting for it however often cancelled."""
-    while True:
-        try:
-            await asyncio.shield(future)
-            return True
-        except asyncio.CancelledError:
-            if future.cancelled():
-                return False
-        except Exception:
-            return False
 
 
 def _providers_changed(updates, configured) -> set:
