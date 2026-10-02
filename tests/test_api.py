@@ -258,3 +258,73 @@ async def test_a_cancelled_project_creation_keeps_the_folder_of_a_project_that_w
         [(project,)] = await rows(client, "SELECT id FROM projects WHERE name = 'Raced'")
         assert (data / "projects" / project / "config.toml").is_file()
         assert (data / "projects" / project / "AGENTS.md").is_file()
+
+
+async def test_a_provider_named_with_a_slash_can_be_given_a_key_and_listed(tmp_path):
+    async with started(tmp_path / "data") as client:
+        settings = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            '"providers"."lab/internal".kind': "openai-compatible",
+            '"providers"."lab/internal".base_url': "http://127.0.0.1:9/v1"}})
+        assert (await client.put("/api/keys/lab/internal", json={"key": "k"})).json() == {"ok": True, "warning": None}
+        assert (await client.get("/api/providers/lab/internal/models")).status_code == 200
+        listed = {p["name"]: p["has_key"] for p in (await client.get("/api/providers")).json()["providers"]}
+        assert listed["lab/internal"] is True
+
+
+@pytest.mark.parametrize("title", ["", "   "])
+async def test_an_empty_title_is_no_title_so_one_is_generated(tmp_path, title):
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={"title": title})).json()
+        assert (conversation["title"], conversation["title_source"]) == (None, None)
+        await send(client, conversation["id"])
+        await background_idle(client)
+        assert (await client.get(f"/api/conversations/{conversation['id']}")).json()["title"] == "A short title"
+
+
+async def test_instructions_cannot_recreate_the_folder_of_a_project_being_deleted(tmp_path, monkeypatch):
+    import time
+    from backend import app as app_module
+    data = tmp_path / "data"
+    async with started(data) as client:
+        project = (await client.post("/api/projects", json={"name": "Going"})).json()["id"]
+        real_delete = app_module.delete
+        deleting = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def slow_delete(*args, **kwargs):
+            loop.call_soon_threadsafe(deleting.set)
+            time.sleep(0.3)
+            return real_delete(*args, **kwargs)
+
+        monkeypatch.setattr(app_module, "delete", slow_delete)
+        deletion = asyncio.create_task(client.delete(f"/api/projects/{project}"))
+        await deleting.wait()
+        written = await client.put("/api/instructions", json={"project_id": project, "text": "secret notes"})
+        assert (await deletion).json() == {"ok": True}
+        assert written.status_code == 404
+        assert not (data / "projects" / project).exists()
+
+
+async def test_two_deletions_of_one_project_end_in_ok_and_not_found(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Twice"})).json()["id"]
+        first, second = await asyncio.gather(client.delete(f"/api/projects/{project}"),
+                                             client.delete(f"/api/projects/{project}"))
+        assert sorted([first.status_code, second.status_code]) == [200, 404]
+
+
+async def test_a_project_folder_left_by_a_failed_removal_is_reported_and_removed_at_the_next_launch(tmp_path):
+    import os
+    data, keyring = tmp_path / "data", FakeKeyring()
+    async with started(data, keyring=keyring) as client:
+        project = (await client.post("/api/projects", json={"name": "Stuck"})).json()["id"]
+        folder = data / "projects" / project
+        os.chmod(folder, 0o500)  # its files cannot be removed now
+        try:
+            assert (await client.delete(f"/api/projects/{project}")).json() == {"ok": True, "files_left": True}
+            assert (folder / "AGENTS.md").exists()
+        finally:
+            os.chmod(folder, 0o700)
+    async with started(data, keyring=keyring, setup=False):
+        assert not folder.exists()  # the tombstone named it; the next launch removed it

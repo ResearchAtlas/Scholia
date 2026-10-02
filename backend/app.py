@@ -136,6 +136,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     data_dir = Path(data_dir)
     frontend_dir = Path(frontend_dir).resolve() if frontend_dir else None
     state = {}
+    # ponytail: one lock for every write to a project's folder and for deleting a project, so a
+    # write can never recreate the folder of a project deleted meanwhile; such writes are rare.
+    project_files = asyncio.Lock()
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -146,6 +149,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         state.update(db=db, content=content, gate=gate, harness=harness)
         try:
             await harness.recover()
+            await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
             try:
                 await asyncio.to_thread(db.backup_if_due)
             except Exception as error:  # the app still opens; the next launch tries again
@@ -232,14 +236,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     async def provider_index():
         return {"providers": await provider_list()}
 
-    @app.put("/api/keys/{provider}")
+    @app.put("/api/keys/{provider:path}")  # a provider's name is any TOML key, slashes included
     async def put_key(provider: str, body: Key):
         if provider not in providers.configured(data_dir):
             raise ApiError(404, "unknown_provider", "That provider is not set up")
         refuse_if_busy({provider})
         return {"ok": True, "warning": await _save_key(provider, body.key)}
 
-    @app.get("/api/providers/{provider}/models")
+    @app.get("/api/providers/{provider:path}/models")
     async def provider_models(provider: str, refresh: bool = False):
         configured = providers.configured(data_dir)
         if provider not in configured:
@@ -265,7 +269,11 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
 
     @app.put("/api/settings")
     async def put_settings(body: SettingsUpdate):
-        loaded = await settings_for(body.project_id)
+        async with project_files if body.project_id is not None else contextlib.nullcontext():
+            return await save_settings(body)
+
+    async def save_settings(body):
+        loaded = await settings_for(body.project_id)  # for a project: checked to exist under the lock
         if body.hash != loaded._digest:
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
         refuse_if_busy(_providers_changed(body.updates, providers.configured(data_dir)))  # before any field is written
@@ -289,8 +297,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
 
     @app.put("/api/instructions")
     async def put_instructions(body: Instructions):
-        path = await instructions_path(body.project_id)
-        await asyncio.to_thread(write_private, path, body.text.encode("utf-8"))
+        async with project_files if body.project_id is not None else contextlib.nullcontext():
+            path = await instructions_path(body.project_id)  # the project still exists, under the lock
+            await asyncio.to_thread(write_private, path, body.text.encode("utf-8"))
         _, warnings = await asyncio.to_thread(load_instructions, data_dir, body.project_id)
         return {"ok": True, "warnings": warnings}
 
@@ -371,9 +380,16 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         row = await project_row(project_id)
         if row[2] == "general":
             raise ApiError(400, "general_project", "The General project cannot be deleted")
-        revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id)
-        harness().revoke(revoked)
-        await asyncio.to_thread(shutil.rmtree, data_dir / "projects" / project_id, ignore_errors=True)
+        async with project_files:
+            try:
+                revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id)
+            except LookupError:  # deleted meanwhile by another request
+                raise ApiError(404, "not_found", "No such project") from None
+            harness().revoke(revoked)
+            removed = await asyncio.to_thread(_remove_folder, data_dir / "projects" / project_id)
+        if not removed:  # the record is gone; its tombstone makes the next launch retry the files
+            log.warning("a deleted project's folder could not be removed fully; it is retried at the next launch")
+            return {"ok": True, "files_left": True}
         return {"ok": True}
 
     # Conversations
@@ -395,6 +411,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     @app.post("/api/conversations", status_code=201)
     async def create_conversation(body: NewConversation):
         conversation_id = new_id()
+        title = (body.title or "").strip() or None  # an empty title is no title, so one is generated
 
         def insert(conn):
             project_id = body.project_id or conn.execute(
@@ -403,7 +420,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
                 raise ApiError(404, "not_found", "No such project")
             conn.execute(
                 "INSERT INTO conversations (id, project_id, title, title_source) VALUES (?, ?, ?, ?)",
-                (conversation_id, project_id, body.title, "researcher" if body.title else None))
+                (conversation_id, project_id, title, "researcher" if title else None))
             conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
         await write(insert)
         return await get_conversation(conversation_id)
@@ -569,6 +586,29 @@ def static_file(root: Path | None, path: str) -> Path | None:
         if resolved.is_relative_to(root) and stat.S_ISREG(resolved.stat().st_mode):
             return resolved
     return None
+
+
+def _remove_folder(path) -> bool:
+    """Remove a folder and everything in it. Returns whether nothing is left."""
+    path = Path(path)
+    if not path.exists() and not path.is_symlink():
+        return True
+    errors = []
+    shutil.rmtree(path, onexc=lambda function, failed, error: errors.append(error))
+    return not errors and not path.exists() and not path.is_symlink()
+
+
+def _sweep_deleted_project_folders(data_dir, db):
+    """Remove the folders of projects that were deleted but whose files a failure left behind.
+    Only folders named by a project's tombstone are touched."""
+    projects = Path(data_dir) / "projects"
+    if not projects.is_dir() or projects.is_symlink():
+        return
+    deleted = {object_id for (object_id,) in db.read(lambda conn: conn.execute(
+        "SELECT object_id FROM tombstones WHERE kind = 'project'").fetchall())}
+    for folder in projects.iterdir():
+        if folder.name in deleted and not _remove_folder(folder):
+            log.warning("a deleted project's folder still could not be removed")
 
 
 def _ensure_openrouter(data_dir):

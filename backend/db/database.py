@@ -87,7 +87,7 @@ class Database:
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
-        self._closed = False  # set when close() starts; later reads and writes are refused
+        self._closed = False  # set when close() starts, under _readers_lock; later reads and writes are refused
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
@@ -123,9 +123,11 @@ class Database:
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("write() cannot be called from inside a write")
-        if self._closed:
-            raise DatabaseClosedError("the database is closed")
-        return self._writer.submit(self._transaction, fn).result()
+        with self._readers_lock:  # admitted and queued in one step, so never queued behind close()
+            if self._closed:
+                raise DatabaseClosedError("the database is closed")
+            future = self._writer.submit(self._transaction, fn)
+        return future.result()
 
     def read(self, fn):
         """Run fn(conn) in one read transaction on this thread's read-only connection."""
@@ -193,7 +195,11 @@ class Database:
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("checkpoint() cannot be called from inside a write")
-        return self._writer.submit(self._truncate_wal, True).result()
+        with self._readers_lock:
+            if self._closed:
+                raise DatabaseClosedError("the database is closed")
+            future = self._writer.submit(self._truncate_wal, True)
+        return future.result()
 
     def close(self):
         """Close the database. Reads and writes that start after this are refused

@@ -16,6 +16,7 @@ import fcntl
 import logging
 import os
 import socket
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -58,6 +59,21 @@ def take_lock(data_dir) -> int | None:
     return fd
 
 
+def narrow_tree(data_dir) -> None:
+    """Narrow an existing data folder to owner-only: folders to at most 0700 and files to at
+    most 0600, never broadening a mode and never following a symbolic link. A folder copied
+    or restored with wider modes is closed to other accounts before anything is opened."""
+    for folder, folders, files in os.walk(data_dir):
+        for name, mask in ((folder, 0o700), *((os.path.join(folder, f), 0o600) for f in files)):
+            try:
+                info = os.lstat(name)
+                if not stat.S_ISLNK(info.st_mode) and stat.S_IMODE(info.st_mode) & ~mask:
+                    os.chmod(name, stat.S_IMODE(info.st_mode) & mask, follow_symlinks=False)
+            except FileNotFoundError:  # removed meanwhile
+                pass
+        folders[:] = [f for f in folders if not os.path.islink(os.path.join(folder, f))]
+
+
 def frontend_folder() -> Path:
     """The built interface: inside the app bundle, or frontend/dist in a checkout."""
     if getattr(sys, "frozen", False):
@@ -77,6 +93,7 @@ def run(data_dir, open_window, *, keyring_backend=None, transport=None, listenin
         open_window(None)  # shows that the app is already open
         return 1
     try:
+        narrow_tree(data_dir)
         return _serve(Path(data_dir), open_window, keyring_backend, transport, listening)
     finally:
         os.close(lock)

@@ -712,3 +712,34 @@ def test_close_waits_for_reads_in_progress_and_then_refuses_new_work(tmp_path):
         db.read(lambda conn: None)
     with pytest.raises(DatabaseClosedError):
         db.write(lambda conn: None)
+
+
+def test_a_write_admitted_before_close_runs_before_the_writer_closes(tmp_path, monkeypatch):
+    """A write checked in just before close() starts is queued ahead of the close."""
+    import backend.db.database as database_module
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    real_submit = db._writer.submit
+    admitted, closing = threading.Event(), threading.Event()
+
+    def submit(fn, *args):
+        if fn == db._transaction:
+            admitted.set()
+            closing.wait(0.3)  # close() tries to start here; it cannot until this write is queued
+        return real_submit(fn, *args)
+
+    monkeypatch.setattr(db._writer, "submit", submit)
+    results = []
+    writer = threading.Thread(target=lambda: results.append(db.write(add_audit_row)))
+    writer.start()
+    admitted.wait(5)
+    closer = threading.Thread(target=db.close)
+    closer.start()
+    closing.set()
+    writer.join(5)
+    closer.join(5)
+    assert results and not closer.is_alive()
+    with pytest.raises(DatabaseClosedError):
+        db.write(add_audit_row)
+    with Database(tmp_path / "data") as reopened:
+        assert audit_events(reopened) == [("kept",)]

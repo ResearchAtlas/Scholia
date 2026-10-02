@@ -117,3 +117,24 @@ def test_closing_the_window_interrupts_running_work_and_stops_the_server(tmp_pat
     fd = desktop.take_lock(data)  # released at exit
     assert fd is not None
     os.close(fd)
+
+
+def test_an_existing_data_folder_is_narrowed_to_owner_only_without_following_links(tmp_path):
+    data, outside = tmp_path / "data", tmp_path / "outside.txt"
+    (data / "projects" / "p").mkdir(parents=True)
+    for path in (data / "scholia.sqlite3", data / "config.toml", data / "projects" / "p" / "AGENTS.md", outside):
+        path.write_text("x")
+        os.chmod(path, 0o644)
+    for folder in (data, data / "projects", data / "projects" / "p"):
+        os.chmod(folder, 0o755)
+    strict = data / "credentials.json"
+    strict.write_text("{}")
+    os.chmod(strict, 0o400)
+    os.symlink(outside, data / "link.txt")
+    desktop.narrow_tree(data)
+    for folder in (data, data / "projects", data / "projects" / "p"):
+        assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    for path in (data / "scholia.sqlite3", data / "config.toml", data / "projects" / "p" / "AGENTS.md"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(strict.stat().st_mode) == 0o400  # never broadened
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o644  # a link's target is left alone
