@@ -132,6 +132,7 @@ _KNOWN = SCHOLARLY_APIS | MODEL_SOURCES | {OPENROUTER}
 # fetch; httpx copies a request's extensions into the redirect it builds. The
 # value is a one-time token from _Scope.expect, bound to the next URL.
 _HOP = object()
+MAX_PENDING_HOPS = 16  # per client
 
 
 class OutboundDenied(Exception):
@@ -175,10 +176,17 @@ class _Scope:
     def expect(self, url):
         """A one-time token for the redirect hop to url, an (origin, raw path) pair.
 
-        Tokens live in this client's scope, so no other client can use one.
+        Tokens live in this client's scope, so no other client can use one. A new
+        token replaces any pending one for the same URL, and at most
+        MAX_PENDING_HOPS stay pending, the oldest dropped first, so redirects that
+        are never followed cannot grow memory without bound.
         """
         token = object()
         with self.lock:
+            for stale in [t for t, pending in self.hops.items() if pending == url]:
+                del self.hops[stale]
+            while len(self.hops) >= MAX_PENDING_HOPS:
+                del self.hops[next(iter(self.hops))]  # dicts keep insertion order
             self.hops[token] = url
         return token
 

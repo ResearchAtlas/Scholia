@@ -17,7 +17,7 @@ import pytest
 from backend.db import Database, new_id
 from backend.db.content import ContentStore
 from backend.db.deletion import delete
-from backend.outbound_gate import GateInputs, Kind, OutboundDenied, OutboundGate
+from backend.outbound_gate import MAX_PENDING_HOPS, GateInputs, Kind, OutboundDenied, OutboundGate
 
 OPENROUTER_API = "https://openrouter.ai/api/v1"
 CHAT = f"{OPENROUTER_API}/chat/completions"
@@ -351,6 +351,59 @@ def test_a_hop_is_one_time_and_bound_to_its_url(db, remote, setup, asynchronous)
     assert outcomes == ["not_candidate_url"] * (1 + 2 * len(OFF_HOP)) + [200, "not_candidate_url"]
     assert [str(r.url) for r in remote.received] == [OA_LINK, OA_LINK, HOP_TARGET]
     assert "SECRET" not in json.dumps(audit(db))
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_pending_hops_are_bounded(db, setup, asynchronous):
+    sent = []
+
+    def handler(request):  # a source that redirects every fetch somewhere new
+        sent.append(str(request.url))
+        if request.url.path == "/files/paper.pdf":
+            return httpx.Response(302, headers={"Location": f"/landing?n={len(sent)}"})
+        return httpx.Response(200)
+
+    gate = OutboundGate(db, setup.gate._inputs, transport=httpx.MockTransport(handler))
+    project_id = project(db)
+    candidate_id = candidate(db, project_id)
+    count = 3 * MAX_PENDING_HOPS
+    # The map stays at the bound; the oldest hops were dropped; the most recent works once.
+    if asynchronous:
+        async def scenario():
+            async with gate.async_client(project_id, candidate_id=candidate_id) as client:
+                hops = [(await client.get(OA_LINK)).next_request for _ in range(count)]
+                assert len(client._transport._scope.hops) == MAX_PENDING_HOPS
+                with pytest.raises(OutboundDenied, match="not_candidate_url"):
+                    await client.send(hops[0])
+                assert (await client.send(hops[-1])).status_code == 200
+                with pytest.raises(OutboundDenied, match="not_candidate_url"):
+                    await client.send(hops[-1])
+
+        asyncio.run(scenario())
+    else:
+        with gate.client(project_id, candidate_id=candidate_id) as client:
+            hops = [client.get(OA_LINK).next_request for _ in range(count)]
+            assert len(client._transport._scope.hops) == MAX_PENDING_HOPS
+            with pytest.raises(OutboundDenied, match="not_candidate_url"):
+                client.send(hops[0])
+            assert client.send(hops[-1]).status_code == 200
+            with pytest.raises(OutboundDenied, match="not_candidate_url"):
+                client.send(hops[-1])
+    assert sent[-1] == f"https://repository.example.org/landing?n={count}"
+
+
+def test_a_new_hop_replaces_a_pending_one_for_the_same_url(db, remote, setup):
+    project_id = project(db)
+    candidate_id = candidate(db, project_id)
+    remote.redirects[OA_LINK] = (302, "/landing")
+    with setup.gate.client(project_id, candidate_id=candidate_id) as client:
+        first = client.get(OA_LINK).next_request
+        second = client.get(OA_LINK).next_request
+        assert len(client._transport._scope.hops) == 1
+        refused(client, "GET", "https://repository.example.org/landing", "not_candidate_url")  # a new request
+        with pytest.raises(OutboundDenied, match="not_candidate_url"):
+            client.send(first)  # replaced
+        assert client.send(second).status_code == 200
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
