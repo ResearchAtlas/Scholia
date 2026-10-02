@@ -187,6 +187,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     # write can never recreate the folder of a project deleted meanwhile; such writes are rare.
     project_files = asyncio.Lock()
 
+    async def daily_backup(db):
+        """The daily backup, under the project-files lock: the database it copies and the
+        project folders it copies show one state, since a project's deletion (which holds
+        the lock) waits for it. ponytail: in a daemon thread, so a backup stuck in a file
+        operation never holds the process open; its partial copy is removed by the next one."""
+        async with project_files:
+            await _in_daemon_thread(_daily_backup, db)
+
     @contextlib.asynccontextmanager
     async def lifespan(app):
         db = await asyncio.to_thread(Database, data_dir)
@@ -199,19 +207,17 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             await harness.recover()
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
             # The daily backup runs once the app is open, so a large folder never holds up its
-            # start; it reads its own consistent copy. Closing stops it (the next launch takes
-            # it) and waits for it at most BACKUP_STOP_SECONDS, so the exit stays bounded.
-            # ponytail: a daemon thread, so a backup stuck in a file operation never holds the
-            # process open; its partial copy is removed by the next backup.
-            backup = threading.Thread(target=_daily_backup, args=(db,), name="scholia-backup", daemon=True)
-            backup.start()
+            # start. Closing stops it (the next launch takes it) and waits for it at most
+            # BACKUP_STOP_SECONDS, so the exit stays bounded.
+            backup = asyncio.ensure_future(daily_backup(db))
             yield
         finally:
             await harness.shutdown()
             if backup is not None:
                 db.stop_backups()
-                await asyncio.to_thread(backup.join, BACKUP_STOP_SECONDS)
-                if backup.is_alive():
+                await asyncio.wait({backup}, timeout=BACKUP_STOP_SECONDS)
+                if not backup.done():
+                    backup.cancel()  # its daemon thread ends with the process
                     log.warning("the daily backup did not stop within %s s; closing anyway", BACKUP_STOP_SECONDS)
             await asyncio.to_thread(db.close)
             state.clear()
@@ -676,6 +682,24 @@ def _remove_folder(path) -> bool:
     errors = []
     shutil.rmtree(path, onexc=lambda function, failed, error: errors.append(error))
     return not errors and not path.exists() and not path.is_symlink()
+
+
+async def _in_daemon_thread(fn, *args):
+    """Run fn in a daemon thread and await its result. Unlike a worker thread, it never
+    holds the process open at exit; if this await is cancelled, the thread runs on alone."""
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def run():
+        try:
+            settle, value = future.set_result, fn(*args)
+        except BaseException as error:
+            settle, value = future.set_exception, error
+        with contextlib.suppress(RuntimeError):  # the loop closed meanwhile
+            loop.call_soon_threadsafe(lambda: future.done() or settle(value))
+
+    threading.Thread(target=run, name="scholia-backup", daemon=True).start()
+    return await future
 
 
 def _daily_backup(db):

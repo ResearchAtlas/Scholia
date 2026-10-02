@@ -698,3 +698,26 @@ async def test_a_hand_written_provider_with_no_name_is_ignored(tmp_path):
         with open(data / "config.toml", "a", encoding="utf-8") as config:
             config.write('\n[providers.""]\nkind = "openai-compatible"\nbase_url = "http://127.0.0.1:9/v1"\n')
         assert [p["name"] for p in (await client.get("/api/providers")).json()["providers"]] == ["openrouter"]
+
+
+async def test_a_project_deletion_waits_for_the_daily_backup(tmp_path, monkeypatch):
+    import threading
+    from backend.db import Database
+    entered, release = threading.Event(), threading.Event()
+    real_backup = Database.backup_if_due
+
+    def slow_backup(self, now=None):
+        entered.set()
+        release.wait(5)
+        return real_backup(self, now)
+
+    monkeypatch.setattr(Database, "backup_if_due", slow_backup)
+    data = tmp_path / "data"
+    async with started(data) as client:
+        project = (await client.post("/api/projects", json={"name": "Going"})).json()["id"]
+        await asyncio.to_thread(entered.wait, 5)
+        deletion = asyncio.create_task(client.delete(f"/api/projects/{project}"))
+        await asyncio.sleep(0.2)
+        assert not deletion.done()  # the backup copies the database and the project's folder as one state
+        release.set()
+        assert (await deletion).json() == {"ok": True}
