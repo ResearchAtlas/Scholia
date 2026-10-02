@@ -109,7 +109,7 @@ jobs:
           mkdir build/mnt
           hdiutil attach build/Scholia.dmg -readonly -nobrowse -mountpoint build/mnt
           ls -la build/mnt
-          test "$(ls -A build/mnt)" = "$(printf 'Scholia.app\nApplications')"
+          test "$(ls -A build/mnt)" = "$(printf 'Applications\nScholia.app')"
           test "$(readlink build/mnt/Applications)" = /Applications
           codesign --verify --deep --strict "build/mnt/Scholia.app"
           codesign -dv "build/mnt/Scholia.app" 2>&1 | grep -x "Signature=adhoc"
