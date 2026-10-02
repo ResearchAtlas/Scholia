@@ -53,6 +53,10 @@ class ForeignDatabaseError(RuntimeError):
     """The file is not this app's database. It is left unchanged."""
 
 
+class DatabaseClosedError(RuntimeError):
+    """The database is closed or closing: nothing more is read or written through it."""
+
+
 class DatabaseDamagedError(RuntimeError):
     """An integrity check failed. Writing stops and the file is left as it is."""
 
@@ -83,6 +87,9 @@ class Database:
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
+        self._closed = False  # set when close() starts; later reads and writes are refused
+        self._reads = 0  # reads in progress, which close() waits for
+        self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
         self._commit_lock = threading.Lock()  # orders the damaged flag with commits
         self._truncation_pending = False  # a WAL truncation a reader blocked, retried after each write
@@ -116,23 +123,34 @@ class Database:
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("write() cannot be called from inside a write")
+        if self._closed:
+            raise DatabaseClosedError("the database is closed")
         return self._writer.submit(self._transaction, fn).result()
 
     def read(self, fn):
         """Run fn(conn) in one read transaction on this thread's read-only connection."""
         _refuse_event_loop()
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = _connect(self.path, readonly=True, check_same_thread=False)
-            with self._readers_lock:
-                self._readers.append(conn)
-            self._local.conn = conn
-        conn.execute("BEGIN")
+        with self._readers_lock:
+            if self._closed:
+                raise DatabaseClosedError("the database is closed")
+            self._reads += 1
         try:
-            return fn(conn)
+            conn = getattr(self._local, "conn", None)
+            if conn is None:
+                conn = _connect(self.path, readonly=True, check_same_thread=False)
+                with self._readers_lock:
+                    self._readers.append(conn)
+                self._local.conn = conn
+            conn.execute("BEGIN")
+            try:
+                return fn(conn)
+            finally:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
         finally:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
+            with self._readers_lock:
+                self._reads -= 1
+                self._reads_done.notify_all()
 
     def backup(self, now=None):
         """Check the database, write a backup generation and rotate old ones.
@@ -178,10 +196,19 @@ class Database:
         return self._writer.submit(self._truncate_wal, True).result()
 
     def close(self):
+        """Close the database. Reads and writes that start after this are refused
+        (DatabaseClosedError); reads in progress finish first, and a write already
+        submitted runs before the writer connection closes. So work still running when
+        the app stops gets an error, never a connection closed under it."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")
         with self._readers_lock:
+            if self._closed:  # closed already, or closing in another thread
+                return
+            self._closed = True
+            while self._reads:
+                self._reads_done.wait()
             readers, self._readers = self._readers, []
         for conn in readers:
             conn.close()

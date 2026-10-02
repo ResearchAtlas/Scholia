@@ -224,8 +224,10 @@ class Harness:
         await self._write(record)
         await self.kick_background()
 
-    async def shutdown(self, timeout: float = 10.0) -> None:
-        """Stop admitting, cancel what is running and wait for it, up to timeout seconds."""
+    async def shutdown(self, timeout: float = 10.0) -> int:
+        """Stop admitting, cancel what is running and wait for it, up to timeout seconds.
+        Returns how many tasks were still running; the database refuses them once it
+        closes (see Database.close)."""
         self.registry.closed = True
         tasks = []
         for active in list(self.registry.runs.values()):
@@ -234,10 +236,12 @@ class Harness:
         # Detached work (starting background runs, recording stopped claims) reads and writes
         # the database too: it must finish before the database closes.
         tasks += [t for t in self._tasks if not t.done()]
+        pending = ()
         if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=timeout)
-            if pending:
-                log.warning("%d runs did not stop within %s s of shutdown", len(pending), timeout)
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:  # the database closes anyway: they get DatabaseClosedError, never a closed connection
+                log.warning("%d tasks did not stop within %s s of shutdown; closing the database", len(pending), timeout)
+        return len(pending)
 
     # Cancel
 

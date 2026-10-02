@@ -631,3 +631,31 @@ async def test_shutdown_waits_for_detached_work_before_the_database_closes(tmp_p
     assert detached and all(task.done() for task in detached)
     assert all(task.done() for task in harness._tasks)
     assert not harness.registry.runs
+
+
+async def test_a_forced_shutdown_never_closes_the_database_under_running_work(tmp_path):
+    """Work that outlasts shutdown's bounded wait keeps its connection until it finishes;
+    the database closes after it, and refuses anything later."""
+    import threading
+    from backend.db import DatabaseClosedError
+    async with started(tmp_path / "data") as client:
+        harness, db = client.state["harness"], client.state["db"]
+        loop = asyncio.get_running_loop()
+        reading, release = asyncio.Event(), threading.Event()
+
+        def slow(conn):
+            loop.call_soon_threadsafe(reading.set)
+            release.wait(5)
+            return conn.execute("SELECT count(*) FROM projects").fetchone()
+
+        held = harness._detach(asyncio.to_thread(db.read, slow))
+        await reading.wait()
+        assert await harness.shutdown(timeout=0.1) == 1  # the bound passes with the read still running
+        closing = asyncio.ensure_future(asyncio.to_thread(db.close))
+        await asyncio.sleep(0.2)
+        assert not closing.done()  # waiting for the read, not closing its connection under it
+        release.set()
+        assert await held == (1,)
+        await closing
+        with pytest.raises(DatabaseClosedError):
+            await asyncio.to_thread(db.read, lambda conn: None)

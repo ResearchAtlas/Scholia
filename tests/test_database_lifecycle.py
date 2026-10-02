@@ -684,3 +684,31 @@ def test_existing_permissions_are_left_as_they_are(tmp_path):
         sidecars = (mode(data / f"{DB_NAME}-wal"), mode(data / f"{DB_NAME}-shm"))
     assert sidecars == (0o640, 0o640)
     assert (mode(data), mode(data / DB_NAME), mode(data / "backups")) == (0o750, 0o640, 0o750)
+
+
+def test_close_waits_for_reads_in_progress_and_then_refuses_new_work(tmp_path):
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    reading, release = threading.Event(), threading.Event()
+    outcome = []
+
+    def slow(conn):
+        reading.set()
+        release.wait(5)
+        return conn.execute("SELECT count(*) FROM projects").fetchone()
+
+    reader = threading.Thread(target=lambda: outcome.append(db.read(slow)))
+    reader.start()
+    reading.wait(5)
+    closer = threading.Thread(target=db.close)
+    closer.start()
+    closer.join(0.2)
+    assert closer.is_alive()  # waiting for the read, not closing its connection under it
+    release.set()
+    reader.join(5)
+    closer.join(5)
+    assert outcome == [(1,)] and not closer.is_alive()
+    with pytest.raises(DatabaseClosedError):
+        db.read(lambda conn: None)
+    with pytest.raises(DatabaseClosedError):
+        db.write(lambda conn: None)
