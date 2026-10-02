@@ -654,7 +654,7 @@ async def test_a_cancelled_project_creation_ends_with_its_folder_and_record_or_n
         assert "Half made" in names and folders == project_ids  # both, never a folder alone
 
 
-@pytest.mark.parametrize("name", ["", "   ", "　"])
+@pytest.mark.parametrize("name", ["", "   ", "\u3000", "\u200b", "\u200d\ufeff", " \u00a0\u200b "])
 async def test_a_blank_project_name_is_refused_and_names_are_trimmed(tmp_path, name):
     async with started(tmp_path / "data") as client:
         refused = await client.post("/api/projects", json={"name": name})

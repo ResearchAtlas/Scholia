@@ -13,6 +13,7 @@ import logging
 import shutil
 import stat
 import threading
+import unicodedata
 from functools import partial
 from pathlib import Path
 
@@ -84,10 +85,13 @@ def _error(status, code, message):
 
 
 def _visible(text):
-    """A name or title, trimmed; one with no visible character is refused."""
-    if text is not None and not text.strip():
+    """A name or title, trimmed; one with no visible character (only spaces, or format and
+    control characters such as a zero-width space) is refused."""
+    if text is None:
+        return None
+    if not any(unicodedata.category(c)[0] not in "CZ" for c in text):
         raise ValueError("it needs a visible character")
-    return text.strip() if text is not None else None
+    return text.strip()
 
 
 class NewProject(BaseModel):

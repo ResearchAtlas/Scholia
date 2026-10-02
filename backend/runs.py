@@ -481,8 +481,9 @@ class Harness:
             result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["messages"], effort=ctx["effort"])
             if not result.ok:
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
-                                                                          result.error_kind))
-                emit({"type": "error", "code": result.error_kind})
+                                                                          result.error_kind, claim=claim))
+                if final["status"] == "failed":  # not a Stop that came first
+                    emit({"type": "error", "code": result.error_kind})
                 emit({"type": "run_finished", **final})
                 return
             answer = {"text": result.content, **({"reasoning": result.reasoning} if result.reasoning else {})}
@@ -496,7 +497,7 @@ class Harness:
                       "result_saved": False, "error": "save_failed"})
                 with suppress(Exception):
                     final = await _through(self._write(lambda conn: self._finish_turn(
-                        conn, claim.run_id, "failed", None, "save_failed")))
+                        conn, claim.run_id, "failed", None, "save_failed", claim=claim)))
                     emit({"type": "run_finished", **final[0]})
                 return
             emit({"type": "chat_response", "content": result.content, "reasoning": result.reasoning,
@@ -507,8 +508,9 @@ class Harness:
             emit({"type": "run_finished", **final})
         except spending.BudgetExceeded as exceeded:  # stopped at a limit: Continue is offered once it is raised
             final, _ = await _through(self._write(lambda conn: self._finish_turn(
-                conn, claim.run_id, "cancelled", "limit", "budget", limit={"budget": exceeded.budget})))
-            emit({"type": "limit_reached", "budget": exceeded.budget})
+                conn, claim.run_id, "cancelled", "limit", "budget", limit={"budget": exceeded.budget}, claim=claim)))
+            if final.get("cancel_reason") == "limit":  # not a Stop that came first
+                emit({"type": "limit_reached", "budget": exceeded.budget})
             emit({"type": "run_finished", **final})
         except Exception as error:  # a defect, not a provider failure; the turn ends failed
             log.error("turn failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
@@ -530,13 +532,18 @@ class Harness:
 
         def stop(conn):
             _close_call(conn, call)
-            return self._finish_turn(conn, claim.run_id, status, cancel_reason, reason or status)
+            return self._finish_turn(conn, claim.run_id, status, cancel_reason, reason or status, claim=claim)
 
         return await self._write(stop)
 
-    def _finish_turn(self, conn, run_id, status, cancel_reason, reason_code, limit=None):
+    def _finish_turn(self, conn, run_id, status, cancel_reason, reason_code, limit=None, claim=None):
         """Write a terminal status for a turn that has no answer, if it is still running.
-        Returns the status the turn has afterwards."""
+        Returns the status the turn has afterwards. With claim, a Stop (or revocation)
+        requested before this transaction wins over any other ending, as at the primary
+        commit: the turn ends cancelled."""
+        if claim is not None and claim.cancel_requested.is_set() and claim.cancel_reason != "shutdown":
+            status, reason_code, limit = "cancelled", "cancelled", None
+            cancel_reason = "revoked" if claim.cancel_reason == "revoked" else "researcher"
         if _running(conn, run_id):
             if limit is not None:
                 _event(conn, run_id, "limit_hit", limit)
@@ -547,10 +554,12 @@ class Harness:
             conn.execute("UPDATE turns SET reason_code = ?, memory_status = 'skipped', result_saved = 0,"
                          " accounting = ? WHERE run_id = ?",
                          (reason_code, json.dumps(_accounting(conn, run_id)), run_id))
-        row = conn.execute("SELECT status, settled_cost_usd FROM runs WHERE id = ?", (run_id,)).fetchone()
+        row = conn.execute("SELECT status, cancel_reason, settled_cost_usd FROM runs WHERE id = ?",
+                           (run_id,)).fetchone()
         if row is None:
             return {"run_id": run_id, "status": "deleted"}
-        return {"run_id": run_id, "status": row[0], "cost_usd": row[1], "accounting": _accounting(conn, run_id)}
+        return {"run_id": run_id, "status": row[0], **({"cancel_reason": row[1]} if row[1] else {}),
+                "cost_usd": row[2], "accounting": _accounting(conn, run_id)}
 
     def _commit_answer(self, conn, claim, answer, ctx):
         """The primary commit. Refused if cancellation was requested, so no answer is

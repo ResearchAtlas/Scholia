@@ -872,3 +872,34 @@ async def test_a_conversation_deleted_between_reservation_and_dispatch_sends_not
         assert (await deletion).json() == {"ok": True}
         assert client.provider.answers == []
         assert rest[-1]["type"] == "run_finished"
+
+
+@pytest.mark.parametrize("ending", ["provider_error", "limit"])
+async def test_a_stop_that_comes_before_a_failed_or_limited_turn_commits_wins(tmp_path, monkeypatch, ending):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "stopped")
+
+        def stop():  # the Stop is requested as the turn is about to end otherwise (only the flag, no task cancel)
+            claim.cancel_reason = "researcher"
+            claim.cancel_requested.set()
+
+        if ending == "provider_error":
+            def stop_then_fail(body):
+                stop()
+                return (500, {"error": {"message": "upstream"}})
+            provider.replies.append(stop_then_fail)
+        else:
+            real = runs_module.spending.reserve
+
+            def stop_then_refuse(conn, **kwargs):
+                stop()
+                return real(conn, **{**kwargs, "conversation_budget_usd": 0.0000001})
+            monkeypatch.setattr(runs_module.spending, "reserve", stop_then_refuse)
+        stream = [event async for event in harness.events(claim)]
+        assert [e["type"] for e in stream if e["type"] in ("error", "limit_reached")] == []
+        assert stream[-1]["status"] == "cancelled" and stream[-1]["cancel_reason"] == "researcher"
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id) == [
+            ("cancelled", "researcher")]
