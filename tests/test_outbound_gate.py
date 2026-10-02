@@ -305,6 +305,74 @@ def test_a_redirect_followed_by_hand_continues_only_through_next_request(db, rem
     assert [str(r.url) for r in remote.received] == [OA_LINK, "https://repository.example.org/landing"]
 
 
+HOP_TARGET = "https://repository.example.org/landing?id=1"
+OFF_HOP = ["https://repository.example.org/SECRET", "https://repository.example.org/landing?id=1&q=SECRET",
+           "https://repository.example.org/landing?id=2", "https://repository.example.org/landing"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_a_hop_is_one_time_and_bound_to_its_url(db, remote, setup, asynchronous):
+    project_id = project(db)
+    candidate_id = candidate(db, project_id)
+    remote.redirects[OA_LINK] = (302, "/landing?id=1")
+
+    def outcome(call):
+        try:
+            return call().status_code
+        except OutboundDenied as denied:
+            return denied.reason
+
+    async def outcome_async(call):
+        try:
+            return (await call()).status_code
+        except OutboundDenied as denied:
+            return denied.reason
+
+    def requests(first, second):
+        """Hops moved to other paths or queries, new requests copying the marker, then the real hop twice."""
+        moved = first.next_request  # the hop itself, sent elsewhere
+        moved.url = httpx.URL(OFF_HOP[0])
+        copies = [httpx.Request("GET", url, extensions=marked.extensions)
+                  for marked in (first.next_request, second.request) for url in OFF_HOP]
+        return [moved] + copies + [second.next_request, second.next_request]
+
+    if asynchronous:
+        async def scenario():
+            async with setup.gate.async_client(project_id, candidate_id=candidate_id) as client:
+                pending = requests(await client.get(OA_LINK), await client.get(OA_LINK))
+                return [await outcome_async(lambda r=r: client.send(r)) for r in pending]
+
+        outcomes = asyncio.run(scenario())
+    else:
+        with setup.gate.client(project_id, candidate_id=candidate_id) as client:
+            pending = requests(client.get(OA_LINK), client.get(OA_LINK))
+            outcomes = [outcome(lambda r=r: client.send(r)) for r in pending]
+    # Every moved or copied hop is refused; the real hop works once; its replay is refused.
+    assert outcomes == ["not_candidate_url"] * (1 + 2 * len(OFF_HOP)) + [200, "not_candidate_url"]
+    assert [str(r.url) for r in remote.received] == [OA_LINK, OA_LINK, HOP_TARGET]
+    assert "SECRET" not in json.dumps(audit(db))
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_another_client_cannot_use_a_hop(db, remote, setup, asynchronous):
+    project_id = project(db)
+    candidate_id = candidate(db, project_id)
+    remote.redirects[OA_LINK] = (302, "/landing")
+    with setup.gate.client(project_id, candidate_id=candidate_id) as client:
+        hop = client.get(OA_LINK).next_request
+    with pytest.raises(OutboundDenied, match="not_candidate_url"):
+        if asynchronous:
+            async def go():
+                async with setup.gate.async_client(project_id, candidate_id=candidate_id) as other:
+                    await other.send(hop)
+
+            asyncio.run(go())
+        else:
+            with setup.gate.client(project_id, candidate_id=candidate_id) as other:
+                other.send(hop)
+    assert [str(r.url) for r in remote.received] == [OA_LINK]
+
+
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 def test_a_request_target_override_is_refused(db, remote, setup, asynchronous):
     # httpcore sends extensions["target"] instead of the URL's path and query.

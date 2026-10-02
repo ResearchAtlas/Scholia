@@ -74,9 +74,10 @@ import ipaddress
 import json
 import re
 import socket
+import threading
 from collections.abc import Callable, Collection, Mapping
 from http.cookiejar import CookieJar, DefaultCookiePolicy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 import httpx
@@ -128,7 +129,8 @@ _NAT64 = ipaddress.IPv6Network("64:ff9b::/96")  # a gateway connects to the IPv4
 _GLOBAL_UNICAST = ipaddress.IPv6Network("2000::/3")  # the only IPv6 block assigned for public addresses
 _KNOWN = SCHOLARLY_APIS | MODEL_SOURCES | {OPENROUTER}
 # Marks a request httpx builds to follow a redirect from an allowed open-access
-# fetch; httpx copies a request's extensions into the redirect it builds.
+# fetch; httpx copies a request's extensions into the redirect it builds. The
+# value is a one-time token from _Scope.expect, bound to the next URL.
 _HOP = object()
 
 
@@ -166,6 +168,30 @@ class _Scope:
     project_id: str
     candidate_id: str | None
     approved: bool
+    # Redirect hops this client may still take: one-time token -> (origin, path and query as sent).
+    hops: dict = field(default_factory=dict, compare=False, repr=False)
+    lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
+
+    def expect(self, url):
+        """A one-time token for the redirect hop to url, an (origin, raw path) pair.
+
+        Tokens live in this client's scope, so no other client can use one.
+        """
+        token = object()
+        with self.lock:
+            self.hops[token] = url
+        return token
+
+    def use(self, token, url):
+        """Whether token is this client's unused token for url. Using it consumes it."""
+        with self.lock:  # sync clients may share threads, and async checks run on worker threads
+            try:
+                if self.hops.get(token) != url:
+                    return False
+            except TypeError:  # an unhashable value set by hand
+                return False
+            del self.hops[token]
+            return True
 
 
 class OutboundGate:
@@ -210,7 +236,7 @@ class OutboundGate:
         # behind the same server or CDN.
         addressed = (request.headers.get("host") == request.url.netloc.decode("ascii")
                      and "sni_hostname" not in request.extensions and "target" not in request.extensions)
-        hop = request.extensions.get(_HOP) is scope
+        hop = scope.use(request.extensions.get(_HOP), (target, request.url.raw_path))
         # What a scholarly, open-access or download request may not be. User info in
         # the URL is a credential too: httpx turns it into Authorization only for a
         # first request, never for a redirect hop.
@@ -288,7 +314,7 @@ class _Transport(httpx.BaseTransport):
             response.close()
             self._gate._refuse_redirect(request, self._scope, target)
         if kind is Kind.OPEN_ACCESS and response.has_redirect_location:
-            request.extensions[_HOP] = self._scope  # httpx copies it into the redirect it builds
+            request.extensions[_HOP] = self._scope.expect(_next_url(request, response))  # httpx copies it
         return response
 
     def close(self):
@@ -308,7 +334,7 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
             await response.aclose()
             await asyncio.to_thread(self._gate._refuse_redirect, request, self._scope, target)
         if kind is Kind.OPEN_ACCESS and response.has_redirect_location:
-            request.extensions[_HOP] = self._scope
+            request.extensions[_HOP] = self._scope.expect(_next_url(request, response))
         return response
 
     async def aclose(self):
@@ -603,6 +629,16 @@ def _redirect(request: httpx.Request, response: httpx.Response):
     if target is not None and target == _origin(request.url):
         return False, None
     return True, target
+
+
+def _next_url(request: httpx.Request, response: httpx.Response):
+    """(origin, raw path) of the request httpx builds to follow a same-origin redirect.
+
+    Computed as httpx computes it; only called once _redirect found it stays.
+    """
+    location = httpx.URL(response.headers["Location"])
+    url = request.url.join(location) if location.is_relative_url else location
+    return _origin(url), url.raw_path
 
 
 def _record(conn, request, scope, level, kind, destination, reason):
