@@ -2,7 +2,7 @@
 
 Run it with the environment that built the app:
 
-    uv run python tools/license_audit.py "build/dist/AAB Research.app"
+    uv run python tools/license_audit.py "build/dist/Scholia.app"
 
 It lists every file in the app and every module archived inside it, and
 assigns each to a component: Scholia's own code, CPython with the third-party

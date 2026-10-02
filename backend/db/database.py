@@ -24,8 +24,8 @@ from backend.db.migrations import MIGRATIONS
 
 log = logging.getLogger(__name__)
 
-DB_NAME = "aab.sqlite3"
-APPLICATION_ID = 0x41414252  # "AABR", written by migration 0001
+DB_NAME = "scholia.sqlite3"
+APPLICATION_ID = 0x5343484C  # "SCHL", written by migration 0001
 DAILY_KEPT = 7
 WEEKLY_KEPT = 4
 SETTINGS_FILES = ("config.toml", "AGENTS.md")  # copied into each backup: personal and per project
@@ -94,7 +94,7 @@ class Database:
             _create_private(self.path)
         except FileExistsError:  # refuse another app's, a newer or a damaged file before anything writes to it
             _open_checked(self.path, "quick_check", latest=len(migrations)).close()
-        self._writer = ThreadPoolExecutor(1, thread_name_prefix="aab-db-writer")
+        self._writer = ThreadPoolExecutor(1, thread_name_prefix="scholia-db-writer")
         try:
             self._writer_ident = self._writer.submit(self._open_writer, migrations).result()
         except BaseException:

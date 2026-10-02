@@ -1,7 +1,7 @@
 # PyInstaller spec for the app: an onedir .app built through BUNDLE, without UPX, shipping
 # the license texts that tools/license_audit.py requires. tools/build_app.sh runs it, then
 # adds the llama.cpp helper and makes the DMG.
-#     uv run pyinstaller --noconfirm --clean --distpath build/dist --workpath build/work tools/aab-research.spec
+#     uv run pyinstaller --noconfirm --clean --distpath build/dist --workpath build/work tools/scholia.spec
 import sys
 import tomllib
 from pathlib import Path
@@ -26,12 +26,12 @@ a = Analysis(
     datas=notice_datas(DISTRIBUTIONS),
 )
 pyz = PYZ(a.pure)
-exe = EXE(pyz, a.scripts, exclude_binaries=True, name="AAB Research", console=False, upx=False)
-coll = COLLECT(exe, a.binaries, a.datas, name="AAB Research", upx=False)
+exe = EXE(pyz, a.scripts, exclude_binaries=True, name="Scholia", console=False, upx=False)
+coll = COLLECT(exe, a.binaries, a.datas, name="Scholia", upx=False)
 app = BUNDLE(
     coll,
-    name="AAB Research.app",
-    bundle_identifier="io.github.researchatlas.aab-research",
+    name="Scholia.app",
+    bundle_identifier="io.github.researchatlas.scholia",
     version=tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"],
     # The highest minimum among the bundled binaries (sqlite-vec's library); build_app.sh
     # checks that none needs a later macOS.

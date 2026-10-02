@@ -150,11 +150,21 @@ def test_an_existing_database_at_version_zero_is_backed_up_before_migrating(tmp_
         backup.close()
 
 
+def test_the_database_carries_the_scholia_identity_and_reopens(tmp_path):
+    data = tmp_path / "data"
+    Database(data).close()
+    assert (data / "scholia.sqlite3").is_file() and DB_NAME == "scholia.sqlite3"
+    assert APPLICATION_ID.to_bytes(4, "big") == b"SCHL"
+    with Database(data) as db:  # reopened: the id migration 0001 wrote is the id startup checks
+        assert db.read(lambda conn: conn.execute("PRAGMA application_id").fetchone()) == (APPLICATION_ID,)
+
+
 @pytest.mark.parametrize("application_id, version, has_table", [
     (0, 1, True),
     (0, 0, True),
     (0x12345678, 1, False),
-], ids=["no-id-in-range-version", "no-id-no-version", "other-id"])
+    (0x41414252, 2, True),  # "AABR", the id before the app was named Scholia
+], ids=["no-id-in-range-version", "no-id-no-version", "other-id", "pre-scholia-id"])
 def test_another_apps_database_is_refused_and_left_unchanged(tmp_path, application_id, version, has_table):
     data = tmp_path / "data"
     data.mkdir()
@@ -340,7 +350,14 @@ def test_the_startup_check_reads_the_file_header_in_one_snapshot(tmp_path, monke
 
 
 KILLED_MIGRATION = r"""
-import os, signal, sqlite3, sys
+import os, signal, sqlite3, sys, time
+
+
+def crash(*args):
+    os.kill(os.getpid(), signal.SIGKILL)
+    while True:  # the signal is delivered asynchronously; never return to the next statement
+        time.sleep(1)
+
 from backend.db import Database
 from backend.db.migrations import MIGRATIONS
 
@@ -348,7 +365,7 @@ real_connect = sqlite3.connect
 
 def connect(*args, **kwargs):
     conn = real_connect(*args, **kwargs)
-    conn.create_function("crash", 0, lambda: os.kill(os.getpid(), signal.SIGKILL))
+    conn.create_function("crash", 0, crash)
     conn.execute("PRAGMA cache_size = 10")  # spill uncommitted pages into the WAL
     return conn
 

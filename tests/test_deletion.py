@@ -654,13 +654,20 @@ def test_a_truncation_blocked_by_a_reader_is_retried_after_the_next_write(tmp_pa
 
 
 KILLED_DELETION = r"""
-import os, signal, sqlite3, sys
+import os, signal, sqlite3, sys, time
+
+
+def crash(*args):
+    os.kill(os.getpid(), signal.SIGKILL)
+    while True:  # the signal is delivered asynchronously; never return to the next statement
+        time.sleep(1)
+
 
 real_connect = sqlite3.connect
 
 def connect(*args, **kwargs):
     conn = real_connect(*args, **kwargs)
-    conn.create_function("crash", 0, lambda: os.kill(os.getpid(), signal.SIGKILL))
+    conn.create_function("crash", 0, crash)
     conn.execute("PRAGMA cache_size = 10")  # spill uncommitted pages into the WAL
     return conn
 
@@ -673,7 +680,7 @@ store = ContentStore(db)
 if when == "inside":
     db.write(lambda conn: conn.execute("CREATE TRIGGER crash_inside AFTER DELETE ON run_events BEGIN SELECT crash(); END"))
 else:
-    store.collect_garbage = lambda now=None: os.kill(os.getpid(), signal.SIGKILL)
+    store.collect_garbage = crash
 delete(db, store, kind, object_id)
 """
 

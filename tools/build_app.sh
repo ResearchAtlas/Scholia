@@ -1,12 +1,12 @@
 #!/bin/bash
-# Builds build/dist/AAB Research.app and build/AAB-Research.dmg on macOS (arm64).
+# Builds build/dist/Scholia.app and build/Scholia.dmg on macOS (arm64).
 #     tools/build_app.sh <verified llama.cpp archive from tools/fetch.py>
 # Run it in the environment that builds the app (uv run). Every build is ad-hoc signed:
 # no Developer ID, no notarization.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 archive=$1
-app="build/dist/AAB Research.app"
+app="build/dist/Scholia.app"
 # llama-server and the libraries it links, under the names it links them by
 libraries=(
   libllama-server-impl.dylib libllama-common.0.dylib libmtmd.0.dylib libllama.0.dylib
@@ -21,7 +21,7 @@ diff -u tools/notices/llama.cpp/LICENSES.txt <(build/llama.cpp/llama licenses) \
   || { echo "tools/notices/llama.cpp/LICENSES.txt differs from the release's notices" >&2; exit 1; }
 
 python -m PyInstaller --noconfirm --clean --distpath build/dist --workpath build/work \
-  tools/aab-research.spec
+  tools/scholia.spec
 
 # The server goes in Contents/MacOS and its libraries in Contents/Frameworks/llama-cpp
 # (codesign allows a dot in a Frameworks folder name only for frameworks).
@@ -51,8 +51,8 @@ find "$app" -type f -print0 | while IFS= read -r -d "" file; do
 done
 
 # The disk image: the app and a link to Applications.
-rm -rf build/dmg build/AAB-Research.dmg && mkdir build/dmg
-ditto "$app" "build/dmg/AAB Research.app"
+rm -rf build/dmg build/Scholia.dmg && mkdir build/dmg
+ditto "$app" "build/dmg/Scholia.app"
 ln -s /Applications build/dmg/Applications
-hdiutil create -volname "AAB Research" -srcfolder build/dmg -fs HFS+ -format UDZO \
-  build/AAB-Research.dmg
+hdiutil create -volname "Scholia" -srcfolder build/dmg -fs HFS+ -format UDZO \
+  build/Scholia.dmg

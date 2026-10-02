@@ -17,7 +17,7 @@ Conventions in every table:
 """
 
 _0001 = r"""
-PRAGMA application_id = 1094795858;
+PRAGMA application_id = 1396918348;  -- "SCHL", backend.db.database.APPLICATION_ID
 
 -- Projects
 

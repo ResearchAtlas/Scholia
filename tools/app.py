@@ -1,5 +1,5 @@
 """Entry point of the packaged app. Until the desktop app exists, its only mode is the
-self-test: `AAB Research --self-test --model <embedding model>`."""
+self-test: `Scholia --self-test --model <embedding model>`."""
 
 import sys
 

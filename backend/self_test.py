@@ -317,7 +317,7 @@ def run(helper: Path, model: Path) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="AAB Research")
+    parser = argparse.ArgumentParser(prog="Scholia")
     parser.add_argument("--self-test", action="store_true", required=True,
                         help="check the native pieces of this build and exit")
     parser.add_argument("--model", type=Path, required=True, help="the pinned embedding model")
