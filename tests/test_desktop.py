@@ -147,14 +147,18 @@ def test_an_existing_data_folder_is_narrowed_to_owner_only(tmp_path):
     assert stat.S_IMODE(strict.stat().st_mode) == 0o400  # never broadened
 
 
-def test_a_linked_data_folder_is_narrowed_at_its_real_path(tmp_path):
+def test_a_data_folder_that_is_itself_a_link_is_refused(tmp_path):
     real = tmp_path / "real"
     (real / "b").mkdir(parents=True)
     (real / "b" / "f").write_text("x")
     os.chmod(real / "b" / "f", 0o644)
-    os.symlink(real, tmp_path / "data")  # the data folder is a link the researcher made
-    desktop.narrow_tree(tmp_path / "data")
-    assert stat.S_IMODE((real / "b" / "f").stat().st_mode) == 0o600
+    os.symlink(real, tmp_path / "data")  # its target could be swapped after any check
+    with pytest.raises(desktop.UnsafeDataFolderError):
+        desktop.narrow_tree(tmp_path / "data")
+    with pytest.raises(desktop.UnsafeDataFolderError):
+        desktop.take_lock(tmp_path / "data")
+    assert desktop.run(tmp_path / "data", [].append) == 1
+    assert not (real / desktop.LOCK_FILE).exists()  # nothing opened through it
 
 
 def test_a_folder_that_cannot_be_listed_is_closed_and_the_data_folder_refused(tmp_path):
@@ -271,3 +275,63 @@ def test_every_file_is_narrowed_even_after_a_problem_was_found(tmp_path):
         desktop.narrow_tree(data)
     for name in ("b.toml", "credentials.json", "z.toml"):
         assert stat.S_IMODE((data / name).stat().st_mode) == 0o600
+
+
+def _open_and_close(seen):
+    def window(url):
+        origin, session = url.split("/#session=")
+        with httpx.Client(base_url=origin, headers={"X-Scholia-Client": "local", "X-Scholia-Session": session},
+                          timeout=10) as http:
+            seen.append(http.get("/api/health").json()["ok"])
+    return window
+
+
+def test_a_slow_daily_backup_does_not_count_against_the_start_deadline(tmp_path, monkeypatch):
+    import time
+    from backend.db import Database
+    real_backup = Database.backup_if_due
+
+    def slow_backup(self, now=None):  # a large folder's backup, longer than the start deadline
+        time.sleep(1.5)
+        return real_backup(self, now)
+
+    monkeypatch.setattr(Database, "backup_if_due", slow_backup)
+    monkeypatch.setattr(desktop, "START_SECONDS", 1)
+    seen = []
+    assert desktop.run(tmp_path / "data", _open_and_close(seen), keyring_backend=FakeKeyring(),
+                       listening=register_server) == 0
+    assert seen == [True]
+
+
+def test_a_start_that_hangs_elsewhere_still_fails_at_the_deadline(tmp_path, monkeypatch):
+    import time
+    from backend.runs import Harness
+    real_recover = Harness.recover
+
+    async def slow_recover(self):
+        import asyncio
+        await asyncio.sleep(2.5)
+        return await real_recover(self)
+
+    monkeypatch.setattr(Harness, "recover", slow_recover)
+    monkeypatch.setattr(desktop, "START_SECONDS", 1)
+    seen = []
+    started_at = time.monotonic()
+    assert desktop.run(tmp_path / "data", _open_and_close(seen), keyring_backend=FakeKeyring(),
+                       listening=register_server) == 1
+    assert seen == [] and time.monotonic() - started_at < 20
+
+
+@pytest.mark.parametrize("target", ["missing", "locked"])
+def test_a_lock_file_that_is_a_link_is_refused_and_never_followed(tmp_path, target):
+    data, outside = tmp_path / "data", tmp_path / "outside.lock"
+    data.mkdir()
+    if target == "locked":
+        outside.write_text("")
+    os.symlink(outside, data / desktop.LOCK_FILE)
+    with pytest.raises(desktop.UnsafeDataFolderError):
+        desktop.take_lock(data)
+    assert outside.exists() == (target == "locked")  # nothing created through the link
+    windows = []
+    assert desktop.run(data, windows.append) == 1
+    assert windows == []  # not reported as already open

@@ -381,95 +381,6 @@ async def test_a_provider_name_with_a_line_break_can_be_given_a_key_and_listed(t
         assert (await client.get("/api/providers/lab%0Ainternal/models")).status_code == 200
 
 
-async def test_the_daily_backup_runs_after_the_app_opens_and_closing_waits_for_it(tmp_path, monkeypatch):
-    import threading
-    from backend.db import Database
-    started_backup, release, order = threading.Event(), threading.Event(), []
-    real_backup, real_close = Database.backup_if_due, Database.close
-
-    def slow_backup(self, now=None):
-        started_backup.set()
-        release.wait(5)
-        try:
-            return real_backup(self, now)
-        finally:
-            order.append("backup ended")
-
-    def close(self):
-        order.append("close")
-        real_close(self)
-
-    monkeypatch.setattr(Database, "backup_if_due", slow_backup)
-    monkeypatch.setattr(Database, "close", close)
-    async with started(tmp_path / "data") as client:  # open while the backup is still running
-        assert (await client.get("/api/health")).status_code == 200
-        await asyncio.to_thread(started_backup.wait, 5)
-        assert order == []
-        threading.Timer(0.2, release.set).start()
-    assert order == ["backup ended", "close"]
-
-
-async def test_closing_stops_a_long_backup_and_removes_its_partial_copy(tmp_path, monkeypatch):
-    import threading
-    import time
-    from backend.db import Database
-    from backend.db import database as database_module
-    stopped = threading.Event()
-    real_check, real_backup = Database._check_stopped, Database._backup
-
-    def crawl(self, conn=None):  # the backup's statements crawl, as on a very large database
-        real_check(self, conn)
-        if conn is not None:
-            conn.set_progress_handler(lambda: (time.sleep(0.01), self._backups_stopped)[1], 10)
-
-    def backup(self, now):
-        try:
-            return real_backup(self, now)
-        except database_module.BackupStoppedError:
-            stopped.set()
-            raise
-
-    monkeypatch.setattr(Database, "_check_stopped", crawl)
-    monkeypatch.setattr(Database, "_backup", backup)
-    data = tmp_path / "data"
-    async with started(data) as client:
-        await asyncio.sleep(0.3)  # the backup is under way
-        assert (await client.get("/api/health")).status_code == 200
-        closing = time.monotonic()
-    assert time.monotonic() - closing < 2
-    assert stopped.is_set()
-    assert list((data / "backups" / "daily").iterdir()) == []  # no generation, no partial copy
-
-
-async def test_a_backup_stuck_in_a_file_step_never_holds_up_closing_and_is_not_published(tmp_path, monkeypatch):
-    import threading
-    import time
-    from backend import app as app_module
-    from backend.db import database as database_module
-    copying, release, ended = threading.Event(), threading.Event(), threading.Event()
-    real_copy = database_module._copy_settings
-
-    def stuck_copy(*args):
-        copying.set()
-        release.wait(10)  # a file step no statement handler can stop
-        try:
-            return real_copy(*args)
-        finally:
-            ended.set()
-
-    monkeypatch.setattr(database_module, "_copy_settings", stuck_copy)
-    monkeypatch.setattr(app_module, "BACKUP_STOP_SECONDS", 0.3)
-    data = tmp_path / "data"
-    async with started(data):
-        await asyncio.to_thread(copying.wait, 5)
-        closing = time.monotonic()
-    assert time.monotonic() - closing < 2  # closed without waiting for the stuck step
-    release.set()
-    await asyncio.to_thread(ended.wait, 5)
-    await asyncio.sleep(0.2)
-    assert list((data / "backups" / "daily").iterdir()) == []  # it stopped before publishing
-
-
 async def test_long_provider_names_and_model_ids_are_accepted_in_messages(tmp_path):
     long_name, long_model = "lab-" + "x" * 150, "org/" + "m" * 400
     async with started(tmp_path / "data") as client:
@@ -700,32 +611,22 @@ async def test_a_hand_written_provider_with_no_name_is_ignored(tmp_path):
         assert [p["name"] for p in (await client.get("/api/providers")).json()["providers"]] == ["openrouter"]
 
 
-async def test_a_daily_backup_overlapped_by_a_project_deletion_copies_again(tmp_path, monkeypatch):
-    import shutil
-    import sqlite3
-    from backend.db import ContentStore, Database, delete
-    from backend.db import database as database_module
-    data = tmp_path / "data"
-    async with started(data) as client:
-        project = (await client.post("/api/projects", json={"name": "Going"})).json()["id"]
-    real_copy, calls = database_module._copy_settings, []
+async def test_the_daily_backup_runs_at_launch_before_the_app_accepts_a_request(tmp_path, monkeypatch):
+    import threading
+    from backend.db import Database
+    finished = threading.Event()
+    real_backup = Database.backup_if_due
 
-    def copy_while_deleting(data_dir, target):  # the deletion commits after the copy was taken
-        calls.append(target)
-        if len(calls) == 1:
-            with Database(data_dir) as db:
-                delete(db, ContentStore(db), "project", project)
-            shutil.rmtree(data_dir / "projects" / project)
-        return real_copy(data_dir, target)
+    def slow_backup(self, now=None):
+        import time
+        time.sleep(0.3)
+        result = real_backup(self, now)
+        finished.set()
+        return result
 
-    monkeypatch.setattr(database_module, "_copy_settings", copy_while_deleting)
+    monkeypatch.setattr(Database, "backup_if_due", slow_backup)
+    async with started(tmp_path / "data") as client:
+        assert finished.is_set()  # the database and the settings files were copied before any request
+        assert (await client.get("/api/health")).status_code == 200
+    assert len(list((tmp_path / "data" / "backups" / "daily").iterdir())) == 1
 
-    def back_up():
-        with Database(data) as db:
-            return db.backup()
-
-    generation = await asyncio.to_thread(back_up)
-    assert len(calls) == 2  # it copied again
-    with sqlite3.connect(generation / "scholia.sqlite3") as conn:
-        assert conn.execute("SELECT count(*) FROM projects WHERE id = ?", (project,)).fetchone() == (0,)
-    assert not (generation / "projects" / project).exists()

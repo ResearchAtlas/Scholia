@@ -12,7 +12,6 @@ import json
 import logging
 import shutil
 import stat
-import threading
 from functools import partial
 from pathlib import Path
 
@@ -25,7 +24,7 @@ from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
-from backend.db import BackupStoppedError, ContentStore, Database, delete, new_id, utc_now
+from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
 from backend.runs import AdmissionError, Harness, _through, derived_status
@@ -33,8 +32,6 @@ from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, loa
                               visible, write_private)
 
 log = logging.getLogger(__name__)
-
-BACKUP_STOP_SECONDS = 3  # how long closing waits for a stopped backup to end
 
 PROJECT_DEFAULTS = {  # written to a new project's config.toml
     "project.citation_style": "apa7",
@@ -194,26 +191,21 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
         state.update(db=db, content=content, gate=gate, harness=harness)
-        backup = None
         try:
             await harness.recover()
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
-            # The daily backup runs once the app is open, so a large folder never holds up its
-            # start. Closing stops it (the next launch takes it) and waits for it at most
-            # BACKUP_STOP_SECONDS, so the exit stays bounded.
-            # ponytail: in a daemon thread, so a backup stuck in a file operation never holds
-            # the process open; its partial copy is removed by the next one. It takes no lock:
-            # a project deletion that overlaps it makes it copy again (Database._backup).
-            backup = asyncio.ensure_future(_in_daemon_thread(_daily_backup, db))
+            # The daily backup runs at launch, before the app accepts a request, so the
+            # database and the settings files it copies show one state. The desktop entry's
+            # start deadline does not count it (state["backing_up"]): a large folder's backup is
+            # progress, not a hang. Backups while the app is open and idle are S1-12's.
+            state["backing_up"] = True
+            try:
+                await asyncio.to_thread(_daily_backup, db)
+            finally:
+                state.pop("backing_up", None)
             yield
         finally:
             await harness.shutdown()
-            if backup is not None:
-                db.stop_backups()
-                await asyncio.wait({backup}, timeout=BACKUP_STOP_SECONDS)
-                if not backup.done():
-                    backup.cancel()  # its daemon thread ends with the process
-                    log.warning("the daily backup did not stop within %s s; closing anyway", BACKUP_STOP_SECONDS)
             await asyncio.to_thread(db.close)
             state.clear()
 
@@ -679,29 +671,9 @@ def _remove_folder(path) -> bool:
     return not errors and not path.exists() and not path.is_symlink()
 
 
-async def _in_daemon_thread(fn, *args):
-    """Run fn in a daemon thread and await its result. Unlike a worker thread, it never
-    holds the process open at exit; if this await is cancelled, the thread runs on alone."""
-    loop = asyncio.get_running_loop()
-    future = loop.create_future()
-
-    def run():
-        try:
-            settle, value = future.set_result, fn(*args)
-        except BaseException as error:
-            settle, value = future.set_exception, error
-        with contextlib.suppress(RuntimeError):  # the loop closed meanwhile
-            loop.call_soon_threadsafe(lambda: future.done() or settle(value))
-
-    threading.Thread(target=run, name="scholia-backup", daemon=True).start()
-    return await future
-
-
 def _daily_backup(db):
     try:
         db.backup_if_due()
-    except BackupStoppedError:
-        log.info("the daily backup was stopped by closing; the next launch takes it")
     except Exception as error:  # the app stays open; the next launch tries again
         log.warning("the daily backup failed (%s)", type(error).__name__)
 

@@ -57,10 +57,6 @@ class DatabaseClosedError(RuntimeError):
     """The database is closed or closing: nothing more is read or written through it."""
 
 
-class BackupStoppedError(RuntimeError):
-    """A backup was stopped by stop_backups(); its partial copy was removed."""
-
-
 class DatabaseDamagedError(RuntimeError):
     """An integrity check failed. Writing stops and the file is left as it is."""
 
@@ -95,7 +91,6 @@ class Database:
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
-        self._backups_stopped = False  # set once by stop_backups; a running backup watches it
         self._commit_lock = threading.Lock()  # orders the damaged flag with commits
         self._truncation_pending = False  # a WAL truncation a reader blocked, retried after each write
         _mkdir_private(self.data_dir)
@@ -305,85 +300,49 @@ class Database:
 
     # Backups
 
-    def stop_backups(self):
-        """Stop a backup in progress and refuse later ones. A statement the backup is
-        running ends at once (a progress handler watches the flag), and the backup stops
-        before its next step; it removes its partial copy and raises BackupStoppedError.
-        Used before closing, so a long backup never holds up the app's exit; the next
-        launch takes the backup instead. Safe from any thread."""
-        self._backups_stopped = True
-
-    def _check_stopped(self, conn=None):
-        """Raise BackupStoppedError once backups were stopped; arm conn to stop with them."""
-        if self._backups_stopped:
-            raise BackupStoppedError("backups were stopped")
-        if conn is not None:
-            conn.set_progress_handler(lambda: self._backups_stopped, 1000)
-
     def _backup(self, now):
-        self._check_stopped()
         daily = self.backups_dir / "daily"
         _mkdir_private(self.backups_dir)
         _mkdir_private(daily)
         for stale in daily.glob(".*.tmp"):  # left by a crash during an earlier backup
             shutil.rmtree(stale)
         try:
-            source = _open_checked(self.path, "integrity_check", opened=self._check_stopped)
+            source = _open_checked(self.path, "integrity_check")
         except DatabaseDamagedError as error:
             with self._commit_lock:
                 self._damaged = str(error)
             raise
-        except sqlite3.OperationalError as error:
-            if self._backups_stopped:
-                raise BackupStoppedError("the backup was stopped") from error
-            raise
         try:
             stamp = now.strftime(_STAMP)
             tmp = daily / f".{stamp}.tmp"
-            for attempt in range(_BACKUP_ATTEMPTS):
-                os.mkdir(tmp, 0o700)
-                published = None
+            os.mkdir(tmp, 0o700)
+            published = None
+            try:
+                copy, info = tmp / DB_NAME, tmp / "backup.json"
+                _create_private(copy)
+                source.execute("VACUUM INTO ?", (str(copy),))
                 try:
-                    copy, info = tmp / DB_NAME, tmp / "backup.json"
-                    _create_private(copy)
-                    source.execute("VACUUM INTO ?", (str(copy),))
-                    try:
-                        check = _open_checked(copy, "quick_check", opened=self._check_stopped)
-                    except DatabaseDamagedError as error:
-                        raise RuntimeError(f"the backup copy failed its check: {error}") from error
-                    with closing(check):
-                        schema_version = check.execute("PRAGMA user_version").fetchone()[0]
-                        projects = _research_projects(check)
-                    _create_private(info, json.dumps({
-                        "app_version": APP_VERSION,
-                        "schema_version": schema_version,
-                        "sqlite_version": sqlite3.sqlite_version,
-                    }).encode())
-                    self._check_stopped()
-                    settings = _copy_settings(self.data_dir, tmp)
-                    # A project in the copy whose folder is gone was deleted after the copy was
-                    # taken: copy again, so the database and the project folders show one state.
-                    gone = [p for p in projects if not (self.data_dir / "projects" / p).is_dir()]
-                    if gone and attempt + 1 < _BACKUP_ATTEMPTS:
-                        raise _Overlapped()
-                    if gone:
-                        log.warning("a backup holds %d projects whose folders are missing", len(gone))
-                    for path in (copy, info, *reversed(settings), tmp):  # files before their folders
-                        _fsync(path)
-                    self._check_stopped()  # the last point before it is published
-                    generation = daily / stamp
-                    os.rename(tmp, generation)
-                    published = generation
-                    _fsync(daily)
-                    break
-                except _Overlapped:
-                    shutil.rmtree(tmp, ignore_errors=True)
-                except BaseException as error:
-                    # A failed backup must not count as one, even after its rename.
-                    shutil.rmtree(published or tmp, ignore_errors=True)
-                    if isinstance(error, sqlite3.OperationalError) and self._backups_stopped:
-                        raise BackupStoppedError("the backup was stopped") from error
-                    raise
+                    check = _open_checked(copy, "quick_check")
+                except DatabaseDamagedError as error:
+                    raise RuntimeError(f"the backup copy failed its check: {error}") from error
+                with closing(check):
+                    schema_version = check.execute("PRAGMA user_version").fetchone()[0]
+                _create_private(info, json.dumps({
+                    "app_version": APP_VERSION,
+                    "schema_version": schema_version,
+                    "sqlite_version": sqlite3.sqlite_version,
+                }).encode())
+                settings = _copy_settings(self.data_dir, tmp)
+                for path in (copy, info, *reversed(settings), tmp):  # files before their folders
+                    _fsync(path)
+                generation = daily / stamp
+                os.rename(tmp, generation)
+                published = generation
+                _fsync(daily)
+            except BaseException:
+                # A failed backup must not count as one, even after its rename.
+                shutil.rmtree(published or tmp, ignore_errors=True)
+                raise
         finally:
             source.close()
         self._apply_retention(keep=generation)
@@ -436,7 +395,7 @@ def _switch_to_wal(conn):
         time.sleep(0.01)
 
 
-def _open_checked(path, check, latest=None, opened=None):
+def _open_checked(path, check, latest=None):
     """Open path read-only and run PRAGMA check (quick_check or integrity_check).
 
     Returns the open connection. Raises DatabaseDamagedError when the file is
@@ -445,13 +404,10 @@ def _open_checked(path, check, latest=None, opened=None):
     database, unless it is new and empty, and NewerDatabaseError when
     user_version is above latest; and a database that will be migrated gets
     integrity_check instead of check. Nothing is written to the file or its WAL.
-    opened, if given, is called with the connection before the check runs.
     """
     conn = None
     try:
         conn = _connect(path, readonly=True)
-        if opened is not None:
-            opened(conn)
         if latest is not None:  # the live database at startup
             version, has_schema = _usable_state(conn, latest)
             if has_schema and version < latest:
@@ -512,21 +468,6 @@ def _rotate(backups, keep):
             shutil.rmtree(old)
     for old in _generations(weekly)[:-WEEKLY_KEPT]:
         shutil.rmtree(old)
-
-
-_BACKUP_ATTEMPTS = 3  # copies a backup takes when project deletions keep overlapping it
-
-
-class _Overlapped(Exception):
-    """A project was deleted while a backup copied it: the backup copies again."""
-
-
-def _research_projects(conn):
-    """The ids of the research projects (each has a folder) in a database copy."""
-    try:
-        return [row[0] for row in conn.execute("SELECT id FROM projects WHERE kind <> 'general'")]
-    except sqlite3.OperationalError:  # no projects table yet
-        return []
 
 
 def _copy_settings(data_dir, target):

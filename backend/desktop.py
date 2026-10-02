@@ -25,6 +25,7 @@ import socket
 import stat
 import sys
 import threading
+import time
 from pathlib import Path
 
 APP_NAME = "Scholia"
@@ -54,14 +55,27 @@ def data_folder() -> Path:
 
 def take_lock(data_dir) -> int | None:
     """Take the data folder's lock. Returns its file descriptor, to keep open while
-    the app runs, or None when another instance holds it."""
+    the app runs, or None when another instance holds it. A lock file that is a link,
+    not a regular file or not this account's is refused (UnsafeDataFolderError): it is
+    opened before the folder is checked, so it is never followed."""
     data_dir = Path(data_dir)
     data_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.mkdir(data_dir, 0o700)
     except FileExistsError:
         pass
-    fd = os.open(data_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    if os.path.islink(data_dir):  # its target could be swapped after the check: never used
+        raise UnsafeDataFolderError("Scholia will not open its data folder: the folder itself is a link")
+    try:
+        fd = os.open(data_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise UnsafeDataFolderError(f"Scholia will not open its data folder: {_LINK}") from None
+        raise
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        os.close(fd)
+        raise UnsafeDataFolderError("Scholia will not open its data folder: its lock file is not its own")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -74,8 +88,8 @@ def narrow_tree(data_dir) -> None:
     """Narrow an existing data folder to owner-only (folders to at most 0700, files to at
     most 0600, never broadening a mode) before anything in it is opened, or refuse it.
 
-    The walk starts at the data folder's real path (the folder itself may be a link the
-    researcher made; the app opens everything through it). It refuses the folder
+    The data folder itself must not be a link (its target could be swapped after this
+    check; S1-12 provides choosing another place). The walk refuses the folder
     (UnsafeDataFolderError) when what it holds may have been changed by another account,
     since a reader of settings, keys or instructions would trust it: a link (the app never
     makes one there), an item another account owns, an item other accounts could write
@@ -83,7 +97,9 @@ def narrow_tree(data_dir) -> None:
     researcher checks and narrows it), an access-control entry that allows someone in,
     or a folder that cannot be listed, whose contents cannot be checked. The walk narrows
     everything else it reaches before it refuses."""
-    pending, problem = [os.path.realpath(data_dir)], None
+    if os.path.islink(data_dir):
+        raise UnsafeDataFolderError("Scholia will not open its data folder: the folder itself is a link")
+    pending, problem = [os.fspath(data_dir)], None
     while pending:
         folder = pending.pop()
         found = _narrow(folder, 0o700)
@@ -185,7 +201,11 @@ def run(data_dir, open_window, *, keyring_backend=None, transport=None, listenin
     arguments are for tests: a credential store, a transport for outbound requests,
     and a hook given the listening socket.
     """
-    lock = take_lock(data_dir)
+    try:
+        lock = take_lock(data_dir)
+    except UnsafeDataFolderError as error:  # ponytail: said on stderr; S1-12's data-folder screen explains it
+        print(f"Scholia: {error}", file=sys.stderr)
+        return 1
     if lock is None:
         open_window(None)  # shows that the app is already open
         return 1
@@ -223,7 +243,7 @@ def _serve(data_dir, open_window, keyring_backend, transport, listening):
         loop = {}
         thread = threading.Thread(target=_run_server, args=(server, sock, loop), name="scholia-server", daemon=True)
         thread.start()
-        if not _wait_started(server, thread):
+        if not _wait_started(server, thread, app.app.state.scholia):
             log.error("the backend did not start")
             server.should_exit = True
             thread.join(STOP_SECONDS)
@@ -248,14 +268,19 @@ def _run_server(server, sock, loop):
     asyncio.run(main())
 
 
-def _wait_started(server, thread):
-    for _ in range(START_SECONDS * 20):
-        if server.started:
-            return True
+def _wait_started(server, thread, state):
+    """Wait for the server to start, at most START_SECONDS, not counting the daily backup at
+    launch (state["backing_up"]): a large folder's backup is progress, not a hang."""
+    deadline = time.monotonic() + START_SECONDS
+    while not server.started:
         if not thread.is_alive():
             return False
+        if state.get("backing_up"):
+            deadline = time.monotonic() + START_SECONDS
+        elif time.monotonic() > deadline:
+            return False
         thread.join(0.05)
-    return server.started
+    return True
 
 
 def _stop(app, server, thread, loop):
