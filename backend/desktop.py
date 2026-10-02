@@ -14,6 +14,7 @@ is not supported: only this entry takes the lock.
 import asyncio
 import contextlib
 import ctypes
+import errno
 import fcntl
 import functools
 import json
@@ -100,7 +101,8 @@ def narrow_tree(data_dir) -> None:
             if entry.is_dir(follow_symlinks=False):
                 pending.append(entry.path)
             else:
-                problem = problem or _narrow(entry.path, 0o600)
+                found = _narrow(entry.path, 0o600)  # every file is narrowed, whatever was found before
+                problem = problem or found
     if problem:
         raise UnsafeDataFolderError(f"Scholia will not open its data folder: {problem}")
 
@@ -123,8 +125,9 @@ def _narrow(path, mask):
         return "it holds an item another account owns"
     if mode & 0o022:
         return "other accounts could change what it holds"
-    if _acl_allows(path):
-        return "an access rule lets other accounts in"
+    found = _acl_problem(path)
+    if found:
+        return found
     if mode & ~mask:
         os.chmod(path, mode & mask, follow_symlinks=False)
     return None
@@ -141,22 +144,30 @@ def _libc():
     return libc
 
 
-def _acl_allows(path) -> bool:
-    """Whether path carries a macOS access-control entry that allows something, which can
-    let another account in whatever its mode says (deny entries are harmless)."""
+def _acl_problem(path):
+    """Why path's macOS access-control list is unsafe, or None: an entry that allows
+    something (inherited or inheritable ones included) can let another account in whatever
+    the mode says, and a list that cannot be read cannot be checked. Deny entries are
+    harmless."""
     if sys.platform != "darwin":
-        return False
+        return None
     acl = _libc().acl_get_link_np(os.fsencode(path), 0x100)  # ACL_TYPE_EXTENDED
     if not acl:
-        return False
+        return None if ctypes.get_errno() == errno.ENOENT else "its access rules cannot be checked"  # ENOENT: none
     try:
         text = _libc().acl_to_text(acl, None)
+        if not text:
+            return "its access rules cannot be checked"
         try:
-            return b":allow:" in ctypes.string_at(text)
+            entries = ctypes.string_at(text).splitlines()[1:]  # after the "!#acl 1" header
         finally:
             _libc().acl_free(text)
     finally:
         _libc().acl_free(acl)
+    # An entry is tag:qualifier...:id:kind[,flags]:permissions; kind is allow or deny.
+    if any(len(fields) < 5 or fields[-2].split(b",")[0] != b"deny" for fields in (e.split(b":") for e in entries if e)):
+        return "an access rule lets other accounts in"
+    return None
 
 
 def frontend_folder() -> Path:

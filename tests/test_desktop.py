@@ -228,3 +228,46 @@ def test_a_data_folder_with_an_access_rule_letting_others_in_is_refused(tmp_path
             desktop.narrow_tree(data)  # a deny rule lets nobody in
         finally:
             subprocess.run(["/bin/chmod", "-N", str(data / "config.toml")], check=True)
+
+
+def test_inherited_and_inheritable_access_rules_are_refused(tmp_path):
+    from network_guard import allow_subprocess
+    data = tmp_path / "data"
+    data.mkdir()
+    with allow_subprocess("/bin/chmod"):
+        subprocess.run(["/bin/chmod", "+a", "everyone allow read,file_inherit,directory_inherit", str(data)],
+                       check=True)
+        (data / "config.toml").write_text("x")  # inherits the rule
+        os.chmod(data / "config.toml", 0o600)
+        try:
+            assert desktop._acl_problem(data / "config.toml") == "an access rule lets other accounts in"
+            with pytest.raises(desktop.UnsafeDataFolderError):
+                desktop.narrow_tree(data)
+        finally:
+            subprocess.run(["/bin/chmod", "-N", str(data), str(data / "config.toml")], check=True)
+
+
+def test_an_access_list_that_cannot_be_read_is_refused(tmp_path, monkeypatch):
+    import ctypes
+    import errno
+
+    class Unreadable:
+        def acl_get_link_np(self, path, kind):
+            ctypes.set_errno(errno.EACCES)
+            return None
+
+    monkeypatch.setattr(desktop, "_libc", lambda: Unreadable())
+    assert desktop._acl_problem(tmp_path) == "its access rules cannot be checked"
+
+
+def test_every_file_is_narrowed_even_after_a_problem_was_found(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    os.symlink(tmp_path / "elsewhere", data / "a-link")
+    for name in ("b.toml", "credentials.json", "z.toml"):
+        (data / name).write_text("x")
+        os.chmod(data / name, 0o644)
+    with pytest.raises(desktop.UnsafeDataFolderError):
+        desktop.narrow_tree(data)
+    for name in ("b.toml", "credentials.json", "z.toml"):
+        assert stat.S_IMODE((data / name).stat().st_mode) == 0o600

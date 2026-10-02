@@ -432,7 +432,6 @@ class Harness:
         claim.context = {
             "project_id": project_id, "seq": seq, "route": route, "key": key, "messages": messages,
             "effort": effort, "estimate": plan.predicted_cost,
-            "message": message,
         }
         claim.admitted = time.monotonic()
         return claim
@@ -583,8 +582,7 @@ class Harness:
                 (new_id(), ctx["project_id"], claim.run_id, json.dumps({
                     "conversation_id": claim.conversation_id, "title_rev": untitled[0],
                     "provider": ctx["route"].provider.name, "model": ctx["route"].model,
-                    "message": ctx["message"][:4000],
-                })))
+                })))  # content-free: the message is read from the source turn when the run calls
         return {"run_id": claim.run_id, "status": "succeeded", "cost_usd": cost,
                 "accounting": _accounting(conn, claim.run_id)}
 
@@ -690,12 +688,14 @@ class Harness:
             if active.cancel_requested.is_set():  # stopped before it began
                 raise asyncio.CancelledError()
             row = await self._read(lambda conn: conn.execute(
-                "SELECT project_id, workflow, attempts, inputs, status FROM runs WHERE id = ?",
+                "SELECT r.project_id, r.workflow, r.attempts, r.inputs, r.status, t.user_message FROM runs r"
+                " LEFT JOIN turns t ON t.run_id = r.source_turn_id WHERE r.id = ?",
                 (active.run_id,)).fetchone())
             if row is None or row[4] != "running":
                 return  # rule 1: finished (or deleted); never run again
-            project_id, workflow, attempts, inputs, _ = row
+            project_id, workflow, attempts, inputs, _, source = row
             inputs = json.loads(inputs or "{}")
+            inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
             recorded = await self._read(lambda conn: conn.execute(
                 "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished' ORDER BY seq DESC LIMIT 1",
                 (active.run_id,)).fetchone())
@@ -729,6 +729,8 @@ class Harness:
         """One model call for a background run. Returns its output, or None if it failed."""
         if workflow != "title":
             raise ValueError(f"unknown background workflow {workflow!r}")
+        if not inputs.get("message"):  # its source turn is gone: nothing to title
+            return None
         async with self.settings_lock:  # the provider snapshot, as for a turn (see _admit)
             active.provider = inputs.get("provider")
             route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),

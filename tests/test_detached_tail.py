@@ -191,8 +191,8 @@ async def seed_title_run(client, conversation_id, *, attempts, status="running",
             "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, attempts, status, inputs)"
             " VALUES (?, ?, 'background', 'title', ?, ?, ?, ?)",
             (run_id, project, turn, attempts, status, json.dumps({
-                "conversation_id": conversation_id, "title_rev": rev, "provider": "openrouter", "model": "test/model",
-                "message": "What is a cohort study?"})))
+                "conversation_id": conversation_id, "title_rev": rev, "provider": "openrouter",
+                "model": "test/model"})))
         if recorded is not None:
             step = {"step": 0, "outcome": outcome, **({"output": recorded} if outcome == "ok" else {})}
             conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'step_finished', ?)",
@@ -392,3 +392,16 @@ async def test_a_stop_before_a_background_runs_task_first_runs_ends_it_cancelled
             ("cancelled", "researcher")]
         assert not harness.registry.is_active(run_id)
         assert client.provider.titles == []
+
+
+async def test_a_title_runs_record_holds_no_message_text_and_its_call_reads_the_source_turn(tmp_path):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        await send(client, conversation_id, "A distinctive question about cohorts")
+        await background_idle(client)
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE workflow = 'title'")
+        assert "distinctive" not in inputs and set(json.loads(inputs)) == {
+            "conversation_id", "title_rev", "provider", "model"}
+        [title_request] = provider.titles
+        assert title_request["messages"][-1]["content"] == "A distinctive question about cohorts"
