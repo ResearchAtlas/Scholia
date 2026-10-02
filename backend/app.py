@@ -94,14 +94,14 @@ class Rename(BaseModel):
 
 class Message(BaseModel):
     content: str
-    model: str | None = Field(default=None, max_length=200)
-    provider: str | None = Field(default=None, max_length=100)
+    model: str | None = Field(default=None, max_length=512)  # as long as the model catalog accepts
+    provider: str | None = None  # any configured provider's name; admission checks it is one
     effort: str | None = None
 
 
 class Continue(BaseModel):
-    model: str | None = Field(default=None, max_length=200)
-    provider: str | None = Field(default=None, max_length=100)
+    model: str | None = Field(default=None, max_length=512)
+    provider: str | None = None
     effort: str | None = None
 
 
@@ -171,16 +171,18 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
         state.update(db=db, content=content, gate=gate, harness=harness)
+        backup = None
         try:
             await harness.recover()
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
-            try:
-                await asyncio.to_thread(db.backup_if_due)
-            except Exception as error:  # the app still opens; the next launch tries again
-                log.warning("the daily backup failed (%s)", type(error).__name__)
+            # The daily backup runs once the app is open, so a large folder never holds up its
+            # start; it reads its own consistent copy, and closing waits for it.
+            backup = asyncio.ensure_future(asyncio.to_thread(_daily_backup, db))
             yield
         finally:
             await harness.shutdown()
+            if backup is not None:
+                await asyncio.wait({backup})
             await asyncio.to_thread(db.close)
             state.clear()
 
@@ -621,6 +623,13 @@ def _remove_folder(path) -> bool:
     errors = []
     shutil.rmtree(path, onexc=lambda function, failed, error: errors.append(error))
     return not errors and not path.exists() and not path.is_symlink()
+
+
+def _daily_backup(db):
+    try:
+        db.backup_if_due()
+    except Exception as error:  # the app stays open; the next launch tries again
+        log.warning("the daily backup failed (%s)", type(error).__name__)
 
 
 def _sweep_deleted_project_folders(data_dir, db):

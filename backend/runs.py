@@ -50,6 +50,7 @@ MODEL_CALL_SECONDS = 120  # one call's total bound, both attempts included
 MAX_MESSAGE_CHARS = 100_000
 HISTORY_TURNS = 20  # ponytail: a fixed history window until the context assembler counts tokens
 BACKGROUND_ATTEMPTS = 2
+CANCEL_WAIT_SECONDS = 10  # how long a cancel request waits to report how the run ended
 SYSTEM_RULES = (
     "You are Scholia, a research assistant working inside the researcher's own project. "
     "Answer in the language of the researcher's message unless they ask otherwise. "
@@ -275,15 +276,23 @@ class Harness:
         return any(active.provider == name for active in self.registry.runs.values())
 
     async def cancel(self, run_id: str, reason: str = "researcher") -> dict | None:
-        """Request cancellation. Returns the run's status as it reads, or None if no such run.
-        Repeating it is safe; a finished run is left as it is."""
+        """Request cancellation and report how the run ended, or None if no such run.
+
+        A run decides at its commit whether the request came first: one whose result
+        commits before it sees the request keeps that result, and the reply says so
+        rather than promising a cancellation. The reply is "cancelling" only if the run
+        has not ended within CANCEL_WAIT_SECONDS. Repeating it is safe; a finished run
+        is left as it is."""
         await self._record_dropped()
         active = self.registry.runs.get(run_id)
         if active is not None:
             self._request_cancel(active, reason)
             if active.closing is not None:  # its response never started: recorded now
                 return await active.closing
-            return {"run_id": run_id, "status": "cancelling"}
+            if active.task is not None:
+                await asyncio.wait({active.task}, timeout=CANCEL_WAIT_SECONDS)
+                if not active.task.done():
+                    return {"run_id": run_id, "status": "cancelling"}
         row = await self._read(lambda conn: conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone())
         if row is None:
             return None
@@ -528,7 +537,7 @@ class Harness:
 
     def _commit_answer(self, conn, claim, answer, ctx):
         """The primary commit. Refused if cancellation was requested, so no answer is
-        published after a Stop the turn saw first."""
+        published after a Stop the turn saw first; a later Stop is told the turn succeeded."""
         if claim.cancel_requested.is_set():
             raise _Cancelled()
         if not _running(conn, claim.run_id):  # deleted (or ended) since it was admitted: nothing to publish
@@ -723,7 +732,9 @@ class Harness:
 
     def _finish_background(self, conn, active, status, output, inputs, cancel_reason=None):
         """The run's effect, terminal status and settled cost, in one transaction. A cancel
-        requested before this commits wins, on every path: the run ends cancelled, with no effect."""
+        requested before this transaction checks for it wins, on every path: the run ends
+        cancelled, with no effect. One that comes later finds the run ended, and the cancel
+        request reports how (Harness.cancel)."""
         run_id = active.run_id
         if not _running(conn, run_id):
             return

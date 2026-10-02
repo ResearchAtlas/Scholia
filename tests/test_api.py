@@ -379,3 +379,45 @@ async def test_a_provider_name_with_a_line_break_can_be_given_a_key_and_listed(t
         assert "lab\ninternal" in {p["name"] for p in (await client.get("/api/providers")).json()["providers"]}
         assert (await client.put("/api/keys/lab%0Ainternal", json={"key": "k"})).json() == {"ok": True, "warning": None}
         assert (await client.get("/api/providers/lab%0Ainternal/models")).status_code == 200
+
+
+async def test_the_daily_backup_runs_after_the_app_opens_and_closing_waits_for_it(tmp_path, monkeypatch):
+    import threading
+    from backend.db import Database
+    started_backup, release, order = threading.Event(), threading.Event(), []
+    real_backup, real_close = Database.backup_if_due, Database.close
+
+    def slow_backup(self, now=None):
+        started_backup.set()
+        release.wait(5)
+        result = real_backup(self, now)
+        order.append("backup")
+        return result
+
+    def close(self):
+        order.append("close")
+        real_close(self)
+
+    monkeypatch.setattr(Database, "backup_if_due", slow_backup)
+    monkeypatch.setattr(Database, "close", close)
+    async with started(tmp_path / "data") as client:  # open while the backup is still running
+        assert (await client.get("/api/health")).status_code == 200
+        await asyncio.to_thread(started_backup.wait, 5)
+        assert order == []
+        threading.Timer(0.2, release.set).start()
+    assert order == ["backup", "close"]
+    assert len(list((tmp_path / "data" / "backups" / "daily").iterdir())) == 1
+
+
+async def test_long_provider_names_and_model_ids_are_accepted_in_messages(tmp_path):
+    long_name, long_model = "lab-" + "x" * 150, "org/" + "m" * 400
+    async with started(tmp_path / "data") as client:
+        settings = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            f'"providers"."{long_name}".kind': "openai-compatible",
+            f'"providers"."{long_name}".base_url': "http://127.0.0.1:9/v1"}})
+        await client.put(f"/api/keys/{long_name}", json={"key": "k"})
+        conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
+        stream = await send(client, conversation, provider=long_name, model=long_model)
+        assert stream[-1]["status"] == "succeeded"
+        assert client.provider.answers[-1]["model"] == long_model

@@ -189,7 +189,7 @@ async def test_cancel_during_the_model_call_ends_the_turn_and_settles_its_estima
         await wait_for(lambda: provider.answers)
         run_id = active_turn(client, conversation).run_id
 
-        assert (await client.post(f"/api/runs/{run_id}/cancel")).json() == {"run_id": run_id, "status": "cancelling"}
+        assert (await client.post(f"/api/runs/{run_id}/cancel")).json() == {"run_id": run_id, "status": "cancelled"}
         final = events(await stream)[-1]
         assert (final["type"], final["status"]) == ("run_finished", "cancelled")
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", run_id) == [

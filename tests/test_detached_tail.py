@@ -131,7 +131,7 @@ async def test_stop_on_the_turn_leaves_its_title_run_and_cancel_in_the_list_stop
         assert (await client.post(f"/api/runs/{turn}/cancel")).json()["status"] == "succeeded"
         assert client.state["harness"].registry.is_active(title)  # Stop on the turn left it running
 
-        assert (await client.post(f"/api/runs/{title}/cancel")).json()["status"] == "cancelling"
+        assert (await client.post(f"/api/runs/{title}/cancel")).json()["status"] == "cancelled"
         await background_idle(client)
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", title) == [
             ("cancelled", "researcher")]
@@ -253,7 +253,7 @@ async def test_cancelling_a_title_run_twice_ends_it_once_and_it_never_restarts(t
         title = await title_run(client)
         first = (await client.post(f"/api/runs/{title}/cancel")).json()
         second = (await client.post(f"/api/runs/{title}/cancel")).json()
-        assert first["status"] == "cancelling" and second["status"] in ("cancelling", "cancelled")
+        assert first["status"] == second["status"] == "cancelled"
         await background_idle(client)
         await client.state["harness"].kick_background()  # nothing left to start
         await background_idle(client)
@@ -347,3 +347,32 @@ async def test_every_finishing_write_of_a_background_run_honours_a_cancel_that_c
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", run_id) == [
             ("cancelled", "researcher")]
         assert (await conversation(client, conversation_id))["title"] == "Named first, so no title run is queued"
+
+
+async def test_a_stop_that_comes_while_the_title_commits_is_told_the_title_was_written(tmp_path, monkeypatch):
+    import threading
+    from backend import runs as runs_module
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation_id = await new_conversation(client)
+        checked, resume = threading.Event(), threading.Event()
+        real = runs_module.Harness._finish_background
+
+        def paused_after_the_check(self, conn, active, *args, **kwargs):
+            running = active.cancel_requested.is_set()
+            real(self, conn, active, *args, **kwargs)  # checks, writes the title, then pauses before COMMIT
+            if not running:
+                checked.set()
+                resume.wait(5)
+
+        monkeypatch.setattr(runs_module.Harness, "_finish_background", paused_after_the_check)
+        await send(client, conversation_id)
+        await asyncio.to_thread(checked.wait, 5)
+        title = await title_run(client)
+        cancel = asyncio.create_task(client.post(f"/api/runs/{title}/cancel"))
+        await asyncio.sleep(0.1)
+        resume.set()
+        assert (await cancel).json()["status"] == "succeeded"  # the reply says how it ended
+        await background_idle(client)
+        assert (await conversation(client, conversation_id))["title"] == "A short title"
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", title) == [("succeeded",)]
