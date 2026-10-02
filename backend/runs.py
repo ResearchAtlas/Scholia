@@ -360,29 +360,35 @@ class Harness:
         if conversation is None:
             raise AdmissionError(404, "not_found", "No such conversation")
         (project_id,) = conversation
-        personal, project_settings = await asyncio.to_thread(
-            lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
-        chosen = model or project_settings.values.get("models", {}).get("default") \
-            or personal.values["models"]["default"]
-        configured = providers.configured(self.data_dir, personal)
-        if not configured:
-            raise AdmissionError(400, "no_provider", "No model provider is set up")
-        provider_name = provider or (providers.OPENROUTER if providers.OPENROUTER in configured or len(configured) != 1
-                                     else next(iter(configured)))
-        if provider_name not in configured:
-            raise AdmissionError(400, "unknown_provider", "That provider is not set up")
-        provider_config = configured[provider_name]
-        claim.provider = provider_name
-        plan = budget_router.create_run_plan(
-            message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
-            is_openrouter=provider_config.is_openrouter)
-        if plan.model is None:
-            raise AdmissionError(400, "model_needed", "Choose a model for this provider")
-        route = providers.Route(provider_config, plan.model)
-        key = await asyncio.to_thread(credentials.load_key, self.data_dir, provider_name, self.keyring_backend)
-        if key is None:
-            raise AdmissionError(400, "provider_key_missing", "The provider has no key")
+        # The provider snapshot (settings, route and key) is taken under settings_lock, which
+        # provider and key changes also hold: a change lands before it, or is refused as busy
+        # once claim.provider names the provider.
+        async with self.settings_lock:
+            personal, project_settings = await asyncio.to_thread(
+                lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
+            chosen = model or project_settings.values.get("models", {}).get("default") \
+                or personal.values["models"]["default"]
+            configured = providers.configured(self.data_dir, personal)
+            if not configured:
+                raise AdmissionError(400, "no_provider", "No model provider is set up")
+            provider_name = provider or (
+                providers.OPENROUTER if providers.OPENROUTER in configured or len(configured) != 1
+                else next(iter(configured)))
+            if provider_name not in configured:
+                raise AdmissionError(400, "unknown_provider", "That provider is not set up")
+            provider_config = configured[provider_name]
+            claim.provider = provider_name
+            plan = budget_router.create_run_plan(
+                message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
+                is_openrouter=provider_config.is_openrouter)
+            if plan.model is None:
+                raise AdmissionError(400, "model_needed", "Choose a model for this provider")
+            route = providers.Route(provider_config, plan.model)
+            key = await asyncio.to_thread(credentials.load_key, self.data_dir, provider_name, self.keyring_backend)
+            if key is None:
+                raise AdmissionError(400, "provider_key_missing", "The provider has no key")
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
+
         def admit(conn):
             if claim.cancel_requested.is_set():  # stopped while it was admitted (shutdown): write nothing
                 raise AdmissionError(503, "shutting_down", "The app is closing") if claim.cancel_reason == "shutdown" \
@@ -411,7 +417,11 @@ class Harness:
             _event(conn, claim.run_id, "route", {"route": route.key, "plan": plan.to_dict()})
             return seq, history[::-1]
 
-        seq, history = await self._write(admit)
+        (seq, history), cancelled = await self._write_through(admit)
+        if cancelled:  # its request went away while the run was written: it never runs, as by Stop
+            await _through(self._write(lambda conn: self._finish_turn(
+                conn, claim.run_id, "cancelled", "researcher", "cancelled")))
+            raise asyncio.CancelledError()
         messages = [{"role": "system", "content": SYSTEM_RULES + (f"\n\n{instructions}" if instructions else "")}]
         for user_message, answer in history:
             messages.append({"role": "user", "content": json.loads(user_message).get("text", "")})
@@ -683,7 +693,6 @@ class Harness:
                 return  # rule 1: finished (or deleted); never run again
             project_id, workflow, attempts, inputs, _ = row
             inputs = json.loads(inputs or "{}")
-            active.provider = inputs.get("provider")
             recorded = await self._read(lambda conn: conn.execute(
                 "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished' ORDER BY seq DESC LIMIT 1",
                 (active.run_id,)).fetchone())
@@ -717,10 +726,12 @@ class Harness:
         """One model call for a background run. Returns its output, or None if it failed."""
         if workflow != "title":
             raise ValueError(f"unknown background workflow {workflow!r}")
-        route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),
-                                        inputs.get("model"))
-        key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
-                                                self.keyring_backend)
+        async with self.settings_lock:  # the provider snapshot, as for a turn (see _admit)
+            active.provider = inputs.get("provider")
+            route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),
+                                            inputs.get("model"))
+            key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
+                                                    self.keyring_backend)
         if route is None or key is None:
             return None
         def start(conn):

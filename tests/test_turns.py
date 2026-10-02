@@ -756,3 +756,88 @@ async def test_an_admission_stopped_by_shutdown_writes_no_run(tmp_path, monkeypa
             await admitting
         assert await rows(client, "SELECT count(*) FROM runs WHERE kind = 'turn'") == [(0,)]
         assert conversation not in harness.registry.turns
+
+
+async def test_an_admission_whose_request_goes_away_while_its_run_is_written_ends_cancelled(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        writing, release = threading.Event(), threading.Event()
+        real = runs_module._event
+
+        def slow_event(conn, run_id, event_type, data):  # the admission transaction is under way
+            if event_type == "route":
+                writing.set()
+                release.wait(5)
+            return real(conn, run_id, event_type, data)
+
+        monkeypatch.setattr(runs_module, "_event", slow_event)
+        admitting = asyncio.create_task(harness.admit_turn(conversation, "gone"))
+        await asyncio.to_thread(writing.wait, 5)
+        admitting.cancel()  # the request goes away
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await admitting
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE kind = 'turn'") == [
+            ("cancelled", "researcher")]
+        assert conversation not in harness.registry.turns
+        monkeypatch.setattr(runs_module, "_event", real)
+        assert (await send(client, conversation, "next"))[-1]["status"] == "succeeded"
+        await background_idle(client)
+
+
+async def test_a_cancelled_conversation_deletion_still_stops_its_running_turn(tmp_path, monkeypatch):
+    from backend import app as app_module
+    provider = MockProvider()
+    held(provider)  # the turn's call stays in flight
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client)
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": "hi"}))
+        await wait_for(lambda: provider.answers)
+        run_id = active_turn(client, conversation).run_id
+        entered, release = threading.Event(), threading.Event()
+        real = app_module.delete
+
+        def slow_delete(*args):
+            entered.set()
+            release.wait(5)
+            return real(*args)
+
+        monkeypatch.setattr(app_module, "delete", slow_delete)
+        deletion = asyncio.create_task(client.delete(f"/api/conversations/{conversation}"))
+        await asyncio.to_thread(entered.wait, 5)
+        deletion.cancel()  # the request goes away while the deletion commits
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await deletion
+        await wait_for(lambda: not client.state["harness"].registry.is_active(run_id))  # revoked all the same
+        await stream
+
+
+async def test_a_provider_change_waits_for_an_admission_snapshot_and_is_then_refused_as_busy(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        loading, release = threading.Event(), threading.Event()
+        real = runs_module.load_settings
+
+        def slow_settings(*args):
+            if not loading.is_set():
+                loading.set()
+                release.wait(5)
+            return real(*args)
+
+        monkeypatch.setattr(runs_module, "load_settings", slow_settings)
+        admitting = asyncio.create_task(harness.admit_turn(conversation, "hi"))
+        await asyncio.to_thread(loading.wait, 5)
+        settings = (await client.get("/api/settings")).json()
+        change = asyncio.create_task(client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            "providers.openrouter.kind": "openai-compatible"}}))
+        await asyncio.sleep(0.2)
+        assert not change.done()  # it waits for the snapshot
+        release.set()
+        claim = await admitting
+        assert (await change).json()["code"] == "active_run"  # then the turn holds the provider
+        assert [e async for e in harness.events(claim)][-1]["status"] == "succeeded"
+        await background_idle(client)

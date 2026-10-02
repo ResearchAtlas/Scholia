@@ -219,3 +219,59 @@ async def test_other_preflights_are_refused(tmp_path, origin, method, asked):
         response = await client.options("/api/projects", headers={
             "Origin": origin, "Access-Control-Request-Method": method, "Access-Control-Request-Headers": asked})
         assert response.status_code == 403 and "access-control-allow-origin" not in response.headers
+
+
+SESSION = "s" * 43
+COOKIE = f"scholia_session_{HOST.rsplit(':', 1)[1]}"
+
+
+async def test_with_a_session_every_request_needs_this_launchs_cookie(tmp_path):
+    async with started(tmp_path / "data", setup=False, session=SESSION) as client:
+        app = client.app
+        own = (b"cookie", f"{COOKIE}={SESSION}".encode())
+        assert (await raw(app, "GET", "/api/projects", headers(MARK, own)))[0] == 200
+        for extra, expected in [
+            ([MARK], (401, "session_required")),  # what another account on this machine can send
+            ([MARK, (b"cookie", f"{COOKIE}=wrong".encode())], (401, "session_required")),
+            ([MARK, (b"cookie", f"scholia_session_1={SESSION}".encode())], (401, "session_required")),
+            ([MARK, (b"cookie", f"other=1; {COOKIE}={SESSION}".encode())], (200, None)),
+        ]:
+            status, body = await raw(app, "GET", "/api/projects", headers(*extra))
+            assert (status, body["code"] if status != 200 else None) == expected
+        assert (await raw(app, "GET", "/", headers()))[0] == 401  # static pages too
+        assert (await raw(app, "GET", "/api/projects", headers(MARK, own), client=("10.0.0.2", 1)))[1]["code"] == \
+            "not_local"  # the earlier checks still come first
+        assert (await raw(app, "GET", "/api/projects", headers(MARK, own, host="evil.test:80")))[1]["code"] == \
+            "host_refused"
+
+
+async def test_only_the_session_url_sets_the_cookie_and_it_is_http_only_and_strict(tmp_path):
+    async with started(tmp_path / "data", setup=False, session=SESSION) as client:
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        def scope(path):
+            return {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+                    "path": path, "raw_path": path.encode(), "query_string": b"", "headers": headers(),
+                    "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765), "scheme": "http"}
+
+        await client.app(scope("/session/" + "x" * 43), receive, send)
+        assert sent[0]["status"] == 403
+        sent.clear()
+        await client.app(scope("/session/" + SESSION), receive, send)
+        start = dict(sent[0]["headers"])
+        assert (sent[0]["status"], start[b"location"]) == (303, b"/")
+        assert start[b"set-cookie"] == f"{COOKIE}={SESSION}; Path=/; HttpOnly; SameSite=Strict".encode()
+
+
+async def test_a_session_needs_a_long_secret_and_no_development_origins():
+    from backend.local_guard import LocalRequestGuard
+    with pytest.raises(ValueError):
+        LocalRequestGuard(None, origin=ORIGIN, session="short")
+    with pytest.raises(ValueError):
+        LocalRequestGuard(None, origin=ORIGIN, dev_origins=("http://localhost:5173",), session=SESSION)

@@ -414,35 +414,60 @@ async def test_closing_stops_a_long_backup_and_removes_its_partial_copy(tmp_path
     import time
     from backend.db import Database
     from backend.db import database as database_module
-    backing_up, interrupted = threading.local(), threading.Event()
-    real_connect, real_backup = database_module._connect, Database._backup
+    stopped = threading.Event()
+    real_check, real_backup = Database._check_stopped, Database._backup
 
-    def connect(path, **kwargs):  # the backup's reads crawl, as on a very large database
-        conn = real_connect(path, **kwargs)
-        if getattr(backing_up, "on", False):
-            conn.set_progress_handler(lambda: time.sleep(0.01), 10)
-        return conn
+    def crawl(self, conn=None):  # the backup's statements crawl, as on a very large database
+        real_check(self, conn)
+        if conn is not None:
+            conn.set_progress_handler(lambda: (time.sleep(0.01), self._backups_stopped)[1], 10)
 
     def backup(self, now):
-        backing_up.on = True
         try:
             return real_backup(self, now)
         except database_module.BackupStoppedError:
-            interrupted.set()
+            stopped.set()
             raise
-        finally:
-            backing_up.on = False
 
-    monkeypatch.setattr(database_module, "_connect", connect)
+    monkeypatch.setattr(Database, "_check_stopped", crawl)
     monkeypatch.setattr(Database, "_backup", backup)
     data = tmp_path / "data"
     async with started(data) as client:
         await asyncio.sleep(0.3)  # the backup is under way
         assert (await client.get("/api/health")).status_code == 200
         closing = time.monotonic()
-    assert time.monotonic() - closing < 5
-    assert interrupted.is_set()
+    assert time.monotonic() - closing < 2
+    assert stopped.is_set()
     assert list((data / "backups" / "daily").iterdir()) == []  # no generation, no partial copy
+
+
+async def test_a_backup_stuck_in_a_file_step_never_holds_up_closing_and_is_not_published(tmp_path, monkeypatch):
+    import threading
+    import time
+    from backend import app as app_module
+    from backend.db import database as database_module
+    copying, release, ended = threading.Event(), threading.Event(), threading.Event()
+    real_copy = database_module._copy_settings
+
+    def stuck_copy(*args):
+        copying.set()
+        release.wait(10)  # a file step no statement handler can stop
+        try:
+            return real_copy(*args)
+        finally:
+            ended.set()
+
+    monkeypatch.setattr(database_module, "_copy_settings", stuck_copy)
+    monkeypatch.setattr(app_module, "BACKUP_STOP_SECONDS", 0.3)
+    data = tmp_path / "data"
+    async with started(data):
+        await asyncio.to_thread(copying.wait, 5)
+        closing = time.monotonic()
+    assert time.monotonic() - closing < 2  # closed without waiting for the stuck step
+    release.set()
+    await asyncio.to_thread(ended.wait, 5)
+    await asyncio.sleep(0.2)
+    assert list((data / "backups" / "daily").iterdir()) == []  # it stopped before publishing
 
 
 async def test_long_provider_names_and_model_ids_are_accepted_in_messages(tmp_path):
@@ -484,3 +509,50 @@ async def test_a_cancelled_settings_save_still_clears_what_was_learned_about_the
         with pytest.raises(asyncio.CancelledError):
             await saving
         assert not openrouter_client._caches
+
+
+async def test_a_save_that_fails_after_replacing_the_file_still_clears_the_provider_caches(tmp_path, monkeypatch):
+    from backend import openrouter_client
+    from backend.settings import Settings
+    async with started(tmp_path / "data") as client:
+        await client.get("/api/providers/openrouter/models")
+        assert openrouter_client._caches
+        real = Settings.save
+
+        def save_then_fail(self, updates):
+            real(self, updates)
+            raise OSError("the folder could not be synced")
+
+        monkeypatch.setattr(Settings, "save", save_then_fail)
+        settings = (await client.get("/api/settings")).json()
+        with pytest.raises(OSError):  # the test client raises what the app did not handle
+            await client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+                "providers.openrouter.kind": "openai-compatible"}})
+        assert not openrouter_client._caches
+
+
+async def test_a_cancelled_key_change_is_still_audited_and_clears_the_provider_caches(tmp_path, monkeypatch):
+    import threading
+    from backend import credentials, openrouter_client
+    async with started(tmp_path / "data") as client:
+        await client.get("/api/providers/openrouter/models")
+        assert openrouter_client._caches
+        entered, release = threading.Event(), threading.Event()
+        real = credentials.save_key
+
+        def slow_save(*args):
+            entered.set()
+            release.wait(5)
+            return real(*args)
+
+        monkeypatch.setattr(credentials, "save_key", slow_save)
+        change = asyncio.create_task(client.put("/api/keys/openrouter", json={"key": "sk-or-new"}))
+        await asyncio.to_thread(entered.wait, 5)
+        change.cancel()  # the request goes away while the key is stored
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await change
+        assert not openrouter_client._caches
+        audited = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT count(*) FROM audit_log WHERE event = 'key_changed'").fetchone()[0])
+        assert audited == 2  # setup's, then this one

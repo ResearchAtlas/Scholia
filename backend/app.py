@@ -12,6 +12,7 @@ import json
 import logging
 import shutil
 import stat
+import threading
 from functools import partial
 from pathlib import Path
 
@@ -32,6 +33,8 @@ from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, loa
                               write_private)
 
 log = logging.getLogger(__name__)
+
+BACKUP_STOP_SECONDS = 3  # how long closing waits for a stopped backup to end
 
 PROJECT_DEFAULTS = {  # written to a new project's config.toml
     "project.citation_style": "apa7",
@@ -55,13 +58,19 @@ class _AnyName(Convertor):
 register_url_convertor("name", _AnyName())  # a provider's name is any TOML key
 
 
-async def _finished(fn, *args):
-    """Run fn in a worker thread to its end. A cancellation waits for the thread and is
-    raised after it, so a lock held around this call covers the whole write."""
-    result, cancelled = await _through(asyncio.to_thread(fn, *args))
+async def _to_end(awaitable):
+    """Await to its end. A cancellation waits for it and is raised after it, so what it
+    writes is always followed through (caches cleared, audit written, runs revoked) and
+    a lock held around it covers all of it."""
+    result, cancelled = await _through(awaitable)
     if cancelled:
         raise asyncio.CancelledError()
     return result
+
+
+async def _finished(fn, *args):
+    """Run fn in a worker thread to its end (see _to_end)."""
+    return await _to_end(asyncio.to_thread(fn, *args))
 
 
 class ApiError(Exception):
@@ -149,11 +158,12 @@ class EventStream(StreamingResponse):
             self.on_close()
 
 
-def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyring_backend=None,
+def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_dir=None, keyring_backend=None,
                transport=None) -> FastAPI:
     """The app for one data folder, served at origin (e.g. "http://127.0.0.1:53111").
 
-    frontend_dir holds the built interface; keyring_backend selects the credential
+    session is this launch's secret, which every request must then carry (see
+    local_guard; the desktop entry always sets one); frontend_dir holds the built interface; keyring_backend selects the credential
     store (None: the system's); transport is where the outbound gate sends checked
     requests (None: the network; tests pass a mock).
     """
@@ -177,14 +187,19 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
             # The daily backup runs once the app is open, so a large folder never holds up its
             # start; it reads its own consistent copy. Closing stops it (the next launch takes
-            # it) and waits for its thread, so the exit stays bounded.
-            backup = asyncio.ensure_future(asyncio.to_thread(_daily_backup, db))
+            # it) and waits for it at most BACKUP_STOP_SECONDS, so the exit stays bounded.
+            # ponytail: a daemon thread, so a backup stuck in a file operation never holds the
+            # process open; its partial copy is removed by the next backup.
+            backup = threading.Thread(target=_daily_backup, args=(db,), name="scholia-backup", daemon=True)
+            backup.start()
             yield
         finally:
             await harness.shutdown()
             if backup is not None:
                 db.stop_backups()
-                await asyncio.wait({backup})
+                await asyncio.to_thread(backup.join, BACKUP_STOP_SECONDS)
+                if backup.is_alive():
+                    log.warning("the daily backup did not stop within %s s; closing anyway", BACKUP_STOP_SECONDS)
             await asyncio.to_thread(db.close)
             state.clear()
 
@@ -237,10 +252,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
 
     @app.post("/api/setup")
     async def setup(body: Setup):
-        refuse_if_busy({providers.OPENROUTER})
-        await asyncio.to_thread(_ensure_openrouter, data_dir)
-        warning = await _save_key(providers.OPENROUTER, body.openrouter_key)
-        return {"ok": True, "warning": warning}
+        async with harness().settings_lock:  # ordered with the provider snapshot of turn admission
+            refuse_if_busy({providers.OPENROUTER})
+
+            async def set_up():
+                await asyncio.to_thread(_ensure_openrouter, data_dir)
+                return await _save_key(providers.OPENROUTER, body.openrouter_key)
+
+            return {"ok": True, "warning": await _to_end(set_up())}
 
     def refuse_if_busy(names):
         """A provider's settings or key do not change under work that is calling it."""
@@ -248,6 +267,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             raise ApiError(409, "active_run", "A running task uses this provider; stop it or wait")
 
     async def _save_key(provider, key):
+        """Store a key, clear what was learned with the old one, and audit the change.
+        Callers run it to its end (_to_end), so a stored key is always followed through."""
         try:
             warning = await asyncio.to_thread(credentials.save_key, data_dir, provider, key, keyring_backend)
         except credentials.CredentialsFileError:
@@ -268,8 +289,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     async def put_key(provider: str, body: Key):
         if provider not in providers.configured(data_dir):
             raise ApiError(404, "unknown_provider", "That provider is not set up")
-        refuse_if_busy({provider})
-        return {"ok": True, "warning": await _save_key(provider, body.key)}
+        async with harness().settings_lock:  # ordered with the provider snapshot of turn admission
+            refuse_if_busy({provider})
+            return {"ok": True, "warning": await _to_end(_save_key(provider, body.key))}
 
     @app.get("/api/providers/{provider:name}/models")
     async def provider_models(provider: str, refresh: bool = False):
@@ -307,22 +329,18 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
         changed = _providers_changed(body.updates, providers.configured(data_dir))
         refuse_if_busy(changed)  # before any field is written
-        saved = False
-
-        def save():
-            nonlocal saved
-            loaded.save(body.updates)
-            saved = True
-
         try:
-            await _finished(save)  # under the project-files lock to its end
+            await _finished(loaded.save, body.updates)  # under the project-files lock to its end
         except SettingsChanged:
             raise ApiError(409, "settings_changed", "The settings changed since they were read") from None
         except ValueError:
             raise ApiError(400, "invalid_setting", "A setting is not valid") from None
         finally:
-            if saved and changed:  # a provider changed, even if the request was cancelled meanwhile:
-                openrouter.clear_negotiation_cache()  # what was learned about it no longer holds
+            # A provider may have changed, whatever became of the request or of the save after
+            # it replaced the file: what was learned about it no longer holds. ponytail: cleared
+            # even when nothing was written, which only costs a re-learn.
+            if changed:
+                openrouter.clear_negotiation_cache()
                 openrouter_client.clear_cache()
         return {"values": loaded.values, "warnings": loaded.warnings, "hash": loaded._digest}
 
@@ -418,13 +436,16 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
         row = await project_row(project_id)
         if row[2] == "general":
             raise ApiError(400, "general_project", "The General project cannot be deleted")
+        async def deleting():  # the record, the stopping of its runs and its folder, to their end
+            revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id)
+            harness().revoke(revoked)
+            return await asyncio.to_thread(_remove_folder, data_dir / "projects" / project_id)
+
         async with project_files:
             try:
-                revoked = await _finished(delete, db(), state["content"], "project", project_id)
+                removed = await _to_end(deleting())
             except LookupError:  # deleted meanwhile by another request
                 raise ApiError(404, "not_found", "No such project") from None
-            harness().revoke(revoked)
-            removed = await _finished(_remove_folder, data_dir / "projects" / project_id)
         if not removed:  # the record is gone; its tombstone makes the next launch retry the files
             log.warning("a deleted project's folder could not be removed fully; it is retried at the next launch")
             return {"ok": True, "files_left": True}
@@ -503,11 +524,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
 
     @app.delete("/api/conversations/{conversation_id}")
     async def delete_conversation(conversation_id: str):
-        try:
+        async def deleting():  # the deletion and the stopping of its runs, together, to their end
             revoked = await asyncio.to_thread(delete, db(), state["content"], "conversation", conversation_id)
+            harness().revoke(revoked)
+
+        try:
+            await _to_end(deleting())
         except LookupError:
             raise ApiError(404, "not_found", "No such conversation") from None
-        harness().revoke(revoked)
         return {"ok": True}
 
     # Turns and runs
@@ -563,7 +587,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             raise ApiError(404, "not_found", "Not found")
         return FileResponse(file, headers={"Cache-Control": "no-cache"})
 
-    return LocalRequestGuard(app, origin=origin, dev_origins=dev_origins)
+    return LocalRequestGuard(app, origin=origin, dev_origins=dev_origins, session=session)
 
 
 async def _committed(future) -> bool:

@@ -84,15 +84,22 @@ def test_closing_the_window_interrupts_running_work_and_stops_the_server(tmp_pat
 
     def window(url):
         seen["url"] = url
-        headers = {"X-Scholia-Client": "local", "Origin": url}
-        with httpx.Client(base_url=url, headers=headers, timeout=10) as http:
+        origin = url.split("/session/")[0]
+        headers = {"X-Scholia-Client": "local", "Origin": origin}
+        with httpx.Client(base_url=origin, headers=headers, timeout=10) as http:
+            assert http.get("/api/health").json()["code"] == "session_required"  # another account's view
+            assert http.get(url.split("/session/")[0] + "/session/" + "x" * 43).status_code == 403
+            started = http.get(url)  # the window's first page: sets this launch's cookie
+            assert (started.status_code, started.headers["location"]) == (303, "/")
+            assert "HttpOnly" in started.headers["set-cookie"] and "SameSite=Strict" in started.headers["set-cookie"]
             assert http.get("/api/health").json()["ok"] is True
             assert http.post("/api/setup", json={"openrouter_key": KEY}).status_code == 200
             conversation = http.post("/api/conversations", json={"title": "t"}).json()["id"]
             seen["conversation"] = conversation
+            cookies = http.cookies
 
         def stream():
-            with httpx.Client(base_url=url, headers=headers, timeout=30) as http:
+            with httpx.Client(base_url=origin, headers=headers, cookies=cookies, timeout=30) as http:
                 seen["stream"] = http.post(f"/api/conversations/{conversation}/message/stream",
                                            json={"content": "hi"}).text
 

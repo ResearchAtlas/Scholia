@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, suppress
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -95,9 +95,7 @@ class Database:
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
-        self._backup_reading = None  # the connection a running backup is reading, so stop_backups can interrupt it
-        self._backups_stopped = False  # set by stop_backups, under _interrupt_lock
-        self._interrupt_lock = threading.Lock()
+        self._backups_stopped = False  # set once by stop_backups; a running backup watches it
         self._commit_lock = threading.Lock()  # orders the damaged flag with commits
         self._truncation_pending = False  # a WAL truncation a reader blocked, retried after each write
         _mkdir_private(self.data_dir)
@@ -308,31 +306,29 @@ class Database:
     # Backups
 
     def stop_backups(self):
-        """Stop a backup in progress at its next statement and refuse later ones. The
-        stopped backup removes its partial copy and raises BackupStoppedError. Used
-        before closing, so a long backup never holds up the app's exit; the next
+        """Stop a backup in progress and refuse later ones. A statement the backup is
+        running ends at once (a progress handler watches the flag), and the backup stops
+        before its next step; it removes its partial copy and raises BackupStoppedError.
+        Used before closing, so a long backup never holds up the app's exit; the next
         launch takes the backup instead. Safe from any thread."""
-        with self._interrupt_lock:
-            self._backups_stopped = True
-            if self._backup_reading is not None:
-                with suppress(sqlite3.ProgrammingError):  # closed meanwhile
-                    self._backup_reading.interrupt()
+        self._backups_stopped = True
 
-    def _reading(self, conn):
-        """Register conn as the connection the running backup reads (None when it ends)."""
-        with self._interrupt_lock:
-            if conn is not None and self._backups_stopped:
-                raise BackupStoppedError("backups were stopped")
-            self._backup_reading = conn
+    def _check_stopped(self, conn=None):
+        """Raise BackupStoppedError once backups were stopped; arm conn to stop with them."""
+        if self._backups_stopped:
+            raise BackupStoppedError("backups were stopped")
+        if conn is not None:
+            conn.set_progress_handler(lambda: self._backups_stopped, 1000)
 
     def _backup(self, now):
+        self._check_stopped()
         daily = self.backups_dir / "daily"
         _mkdir_private(self.backups_dir)
         _mkdir_private(daily)
         for stale in daily.glob(".*.tmp"):  # left by a crash during an earlier backup
             shutil.rmtree(stale)
         try:
-            source = _open_checked(self.path, "integrity_check", opened=self._reading)
+            source = _open_checked(self.path, "integrity_check", opened=self._check_stopped)
         except DatabaseDamagedError as error:
             with self._commit_lock:
                 self._damaged = str(error)
@@ -351,7 +347,7 @@ class Database:
                 _create_private(copy)
                 source.execute("VACUUM INTO ?", (str(copy),))
                 try:
-                    check = _open_checked(copy, "quick_check", opened=self._reading)
+                    check = _open_checked(copy, "quick_check", opened=self._check_stopped)
                 except DatabaseDamagedError as error:
                     raise RuntimeError(f"the backup copy failed its check: {error}") from error
                 with closing(check):
@@ -361,9 +357,11 @@ class Database:
                     "schema_version": schema_version,
                     "sqlite_version": sqlite3.sqlite_version,
                 }).encode())
+                self._check_stopped()
                 settings = _copy_settings(self.data_dir, tmp)
                 for path in (copy, info, *reversed(settings), tmp):  # files before their folders
                     _fsync(path)
+                self._check_stopped()  # the last point before it is published
                 generation = daily / stamp
                 os.rename(tmp, generation)
                 published = generation
@@ -375,7 +373,6 @@ class Database:
                     raise BackupStoppedError("the backup was stopped") from error
                 raise
         finally:
-            self._reading(None)
             source.close()
         self._apply_retention(keep=generation)
         return generation

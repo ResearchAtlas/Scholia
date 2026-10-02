@@ -339,11 +339,17 @@ def check_backend() -> dict:
                                          "usage": {"cost": 0}})
 
     async def drive(folder):
-        origin = "http://127.0.0.1:1"
-        app = create_app(folder, origin=origin, keyring_backend=_Keys(), transport=httpx.MockTransport(provider))
+        origin, session = "http://127.0.0.1:1", secrets.token_urlsafe(32)  # as the desktop entry starts it
+        app = create_app(folder, origin=origin, session=session, keyring_backend=_Keys(),
+                         transport=httpx.MockTransport(provider))
         async with app.app.router.lifespan_context(app.app):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin,
                                          headers={"X-Scholia-Client": "local"}) as client:
+                outside = await client.get("/api/projects")
+                if outside.status_code != 401:
+                    raise RuntimeError(f"a request without this launch's session got {outside.status_code}")
+                if (await client.get(f"/session/{session}")).status_code != 303:
+                    raise RuntimeError("the session could not be started")
                 for method, path, body in (("POST", "/api/setup", {"openrouter_key": "self-test"}),
                                            ("POST", "/api/projects", {"name": "Self-test"})):
                     response = await client.request(method, path, json=body)

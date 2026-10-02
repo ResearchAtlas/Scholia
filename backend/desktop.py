@@ -15,6 +15,7 @@ import asyncio
 import fcntl
 import logging
 import os
+import secrets
 import socket
 import stat
 import sys
@@ -111,7 +112,8 @@ def frontend_folder() -> Path:
 
 
 def run(data_dir, open_window, *, keyring_backend=None, transport=None, listening=lambda sock: None) -> int:
-    """Run the app on data_dir until open_window(url) returns (the window closed).
+    """Run the app on data_dir until open_window(url) returns (the window closed). url
+    starts this launch's session (see local_guard) and then shows the app.
 
     Returns 0, or 1 when another instance holds the data folder. The keyword
     arguments are for tests: a credential store, a transport for outbound requests,
@@ -141,7 +143,8 @@ def _serve(data_dir, open_window, keyring_backend, transport, listening):
         sock.listen(64)
         listening(sock)
         origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
-        app = create_app(data_dir, origin=origin, frontend_dir=frontend_folder(),
+        session = secrets.token_urlsafe(32)  # this launch's; only the window gets it
+        app = create_app(data_dir, origin=origin, session=session, frontend_dir=frontend_folder(),
                          keyring_backend=keyring_backend, transport=transport)
         server = uvicorn.Server(uvicorn.Config(
             app, lifespan="on", loop="asyncio", http="h11", ws="none", log_config=None, access_log=False,
@@ -155,7 +158,7 @@ def _serve(data_dir, open_window, keyring_backend, transport, listening):
             thread.join(STOP_SECONDS)
             return 1
         try:
-            open_window(origin)
+            open_window(f"{origin}/session/{session}")
         finally:
             _stop(app, server, thread, loop)
         return 0
