@@ -342,6 +342,8 @@ class Harness:
         """Validate a message and admit its turn, or raise AdmissionError having written nothing."""
         if visible(message) is None:  # nothing visible to ask, invisible characters included
             raise AdmissionError(400, "empty_message", "The message is empty")
+        if model is not None and visible(model) is None:
+            raise AdmissionError(400, "model_needed", "Choose a model")
         if len(message) > MAX_MESSAGE_CHARS:
             raise AdmissionError(400, "message_too_long", "The message is too long")
         if effort is not None and effort not in budget_router._REASONING_OUTPUT_TOKENS:
@@ -366,8 +368,9 @@ class Harness:
         async with self.settings_lock:
             personal, project_settings = await asyncio.to_thread(
                 lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
-            chosen = model or project_settings.values.get("models", {}).get("default") \
-                or personal.values["models"]["default"]
+            # A model asked for must be named; a blank default in a settings file is passed over.
+            chosen = visible(model) or visible(project_settings.values.get("models", {}).get("default")) \
+                or visible(personal.values["models"]["default"]) or "auto"
             configured = providers.configured(self.data_dir, personal)
             if not configured:
                 raise AdmissionError(400, "no_provider", "No model provider is set up")

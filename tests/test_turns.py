@@ -924,3 +924,19 @@ async def test_an_answer_with_nothing_visible_fails_the_turn_as_malformed(tmp_pa
         conversation = await new_conversation(client, title="t")
         stream = await send(client, conversation)
         assert (stream[-2]["code"], stream[-1]["status"]) == ("malformed", "failed")
+
+
+async def test_a_blank_model_is_refused_in_a_request_and_passed_over_in_settings(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client, title="t")
+        response = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                     json={"content": "hi", "model": "   "})
+        assert (response.status_code, response.json()["code"]) == (400, "model_needed")
+        assert client.provider.answers == []
+        project = (await client.get(f"/api/conversations/{conversation}")).json()["project_id"]
+        settings = (await client.get("/api/settings", params={"project_id": project})).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"models.default": " ​ "}})
+        assert (await send(client, conversation, "hello"))[-1]["status"] == "succeeded"
+        assert client.provider.answers[-1]["model"].strip() == client.provider.answers[-1]["model"] != ""
+        await background_idle(client)
