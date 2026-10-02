@@ -390,9 +390,10 @@ async def test_the_daily_backup_runs_after_the_app_opens_and_closing_waits_for_i
     def slow_backup(self, now=None):
         started_backup.set()
         release.wait(5)
-        result = real_backup(self, now)
-        order.append("backup")
-        return result
+        try:
+            return real_backup(self, now)
+        finally:
+            order.append("backup ended")
 
     def close(self):
         order.append("close")
@@ -405,8 +406,43 @@ async def test_the_daily_backup_runs_after_the_app_opens_and_closing_waits_for_i
         await asyncio.to_thread(started_backup.wait, 5)
         assert order == []
         threading.Timer(0.2, release.set).start()
-    assert order == ["backup", "close"]
-    assert len(list((tmp_path / "data" / "backups" / "daily").iterdir())) == 1
+    assert order == ["backup ended", "close"]
+
+
+async def test_closing_stops_a_long_backup_and_removes_its_partial_copy(tmp_path, monkeypatch):
+    import threading
+    import time
+    from backend.db import Database
+    from backend.db import database as database_module
+    backing_up, interrupted = threading.local(), threading.Event()
+    real_connect, real_backup = database_module._connect, Database._backup
+
+    def connect(path, **kwargs):  # the backup's reads crawl, as on a very large database
+        conn = real_connect(path, **kwargs)
+        if getattr(backing_up, "on", False):
+            conn.set_progress_handler(lambda: time.sleep(0.01), 10)
+        return conn
+
+    def backup(self, now):
+        backing_up.on = True
+        try:
+            return real_backup(self, now)
+        except database_module.BackupStoppedError:
+            interrupted.set()
+            raise
+        finally:
+            backing_up.on = False
+
+    monkeypatch.setattr(database_module, "_connect", connect)
+    monkeypatch.setattr(Database, "_backup", backup)
+    data = tmp_path / "data"
+    async with started(data) as client:
+        await asyncio.sleep(0.3)  # the backup is under way
+        assert (await client.get("/api/health")).status_code == 200
+        closing = time.monotonic()
+    assert time.monotonic() - closing < 5
+    assert interrupted.is_set()
+    assert list((data / "backups" / "daily").iterdir()) == []  # no generation, no partial copy
 
 
 async def test_long_provider_names_and_model_ids_are_accepted_in_messages(tmp_path):
@@ -421,3 +457,30 @@ async def test_long_provider_names_and_model_ids_are_accepted_in_messages(tmp_pa
         stream = await send(client, conversation, provider=long_name, model=long_model)
         assert stream[-1]["status"] == "succeeded"
         assert client.provider.answers[-1]["model"] == long_model
+
+
+async def test_a_cancelled_settings_save_still_clears_what_was_learned_about_the_provider(tmp_path, monkeypatch):
+    import threading
+    from backend import openrouter_client
+    from backend.settings import Settings
+    async with started(tmp_path / "data") as client:
+        await client.get("/api/providers/openrouter/models")
+        assert openrouter_client._caches
+        entered, release = threading.Event(), threading.Event()
+        real = Settings.save
+
+        def slow_save(self, updates):
+            entered.set()
+            release.wait(5)
+            real(self, updates)
+
+        monkeypatch.setattr(Settings, "save", slow_save)
+        settings = (await client.get("/api/settings")).json()
+        saving = asyncio.create_task(client.put("/api/settings", json={"hash": settings["hash"], "updates": {
+            "providers.openrouter.kind": "openai-compatible"}}))
+        await asyncio.to_thread(entered.wait, 5)
+        saving.cancel()  # the save goes on in its thread and is written
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await saving
+        assert not openrouter_client._caches

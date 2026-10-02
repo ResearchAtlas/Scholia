@@ -77,6 +77,7 @@ class ActiveRun:
     conversation_id: str | None
     admitted: float | None = None  # when its admission finished; None while it is being admitted
     task: asyncio.Task | None = None
+    started: bool = False  # its task has begun; one cancelled before that would never run its cleanup
     cancel_requested: threading.Event = field(default_factory=threading.Event)  # read inside transactions
     cancel_reason: str | None = None  # "researcher", "revoked" or "shutdown"
     events: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -182,6 +183,9 @@ class Harness:
         self.keyring_backend = keyring_backend
         self.registry = Registry()
         self._tasks = set()  # detached tasks, kept referenced until they finish
+        # Orders settings saves with the budget reads of call admission: a lowered budget either
+        # lands before a call reads it or after that call was admitted.
+        self.settings_lock = asyncio.Lock()
 
     async def _write(self, fn):
         return await asyncio.to_thread(self.db.write, fn)
@@ -256,7 +260,9 @@ class Harness:
         active.cancel_reason = reason
         active.cancel_requested.set()
         if active.task is not None:
-            active.task.cancel()
+            if active.started:
+                active.task.cancel()
+            # else it sees the request as it starts, and ends through its own cleanup
         elif self.registry.runs.get(active.run_id) is active:
             self.registry.release(active)
             if active.kind == "turn":
@@ -350,10 +356,10 @@ class Harness:
 
     async def _admit(self, claim, message, *, model, provider, effort, retry_of):
         conversation = await self._read(lambda conn: conn.execute(
-            "SELECT project_id, budget_usd FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone())
+            "SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone())
         if conversation is None:
             raise AdmissionError(404, "not_found", "No such conversation")
-        project_id, conversation_budget = conversation
+        (project_id,) = conversation
         personal, project_settings = await asyncio.to_thread(
             lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
         chosen = model or project_settings.values.get("models", {}).get("default") \
@@ -377,13 +383,10 @@ class Harness:
         if key is None:
             raise AdmissionError(400, "provider_key_missing", "The provider has no key")
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
-        budgets = {
-            "project_budget_usd": project_settings.values["project"]["budget_usd"],
-            "conversation_budget_usd": conversation_budget if conversation_budget is not None
-            else personal.values["budget"]["conversation_usd"],
-        }
-
         def admit(conn):
+            if claim.cancel_requested.is_set():  # stopped while it was admitted (shutdown): write nothing
+                raise AdmissionError(503, "shutting_down", "The app is closing") if claim.cancel_reason == "shutdown" \
+                    else AdmissionError(409, "cancelled", "The message was cancelled")
             if not conn.execute("SELECT 1 FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone():
                 raise AdmissionError(404, "not_found", "No such conversation")
             (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM turns WHERE conversation_id = ?",
@@ -416,7 +419,7 @@ class Harness:
         messages.append({"role": "user", "content": message})
         claim.context = {
             "project_id": project_id, "seq": seq, "route": route, "key": key, "messages": messages,
-            "effort": effort, "estimate": plan.predicted_cost, "budgets": budgets,
+            "effort": effort, "estimate": plan.predicted_cost,
             "message": message,
         }
         claim.admitted = time.monotonic()
@@ -447,6 +450,7 @@ class Harness:
             self.stream_closed(claim)
 
     async def _turn(self, claim: ActiveRun) -> None:
+        claim.started = True
         ctx = claim.context
         emit = claim.events.put_nowait
 
@@ -456,10 +460,12 @@ class Harness:
             await claim.wanted.wait()
 
         try:
+            if claim.cancel_requested.is_set():  # stopped before it began
+                raise asyncio.CancelledError()
             await handed({"type": "run_started", "run_id": claim.run_id, "conversation_id": claim.conversation_id,
                           "seq": ctx["seq"]})
             call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, ctx["estimate"],
-                                       ctx["budgets"], phase="answer")
+                                       phase="answer")
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["messages"], effort=ctx["effort"])
             if not result.ok:
@@ -572,27 +578,39 @@ class Harness:
 
     # Model calls
 
-    async def _reserve(self, active, project_id, paying_conversation_id, estimate, budgets, *, phase):
-        """Admit one model call: its reservation and step_started event. A cancellation
-        during the write releases the reservation once it is written."""
+    async def _budgets(self, project_id):
+        """The project's budget and the default conversation budget, as the settings say now."""
+        personal, project = await asyncio.to_thread(
+            lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
+        return project.values["project"]["budget_usd"], personal.values["budget"]["conversation_usd"]
+
+    async def _reserve(self, active, project_id, paying_conversation_id, estimate, *, phase):
+        """Admit one model call: its reservation and step_started event, against the budgets
+        as they are now (read under settings_lock). A cancellation during the write releases
+        the reservation once it is written."""
         run_id = active.run_id
 
         def reserve(conn):
             if not _running(conn, run_id):  # deleted or ended since it was admitted
                 raise _Cancelled()
+            (own,) = conn.execute("SELECT budget_usd FROM conversations WHERE id = ?",
+                                  (paying_conversation_id,)).fetchone() or (None,)
             (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
                                    (run_id,)).fetchone()
             reservation = spending.reserve(conn, run_id=run_id, step_seq=step, project_id=project_id,
                                            paying_conversation_id=paying_conversation_id, estimate_usd=estimate,
-                                           **budgets)
+                                           project_budget_usd=project_budget,
+                                           conversation_budget_usd=own if own is not None else default_budget)
             _event(conn, run_id, "step_started", {"step": step, "phase": phase, "estimate_usd": estimate,
                                                    "reservation_id": reservation})
             return _Call(run_id, step, reservation)
 
-        try:
-            call, cancelled = await self._write_through(reserve)
-        except _Cancelled:
-            raise asyncio.CancelledError() from None
+        async with self.settings_lock:
+            project_budget, default_budget = await self._budgets(project_id)
+            try:
+                call, cancelled = await self._write_through(reserve)
+            except _Cancelled:
+                raise asyncio.CancelledError() from None
         active.call = call
         if cancelled or active.cancel_requested.is_set():
             raise asyncio.CancelledError()
@@ -654,7 +672,10 @@ class Harness:
                 active.task = asyncio.create_task(self._background(active))
 
     async def _background(self, active: ActiveRun) -> None:
+        active.started = True
         try:
+            if active.cancel_requested.is_set():  # stopped before it began
+                raise asyncio.CancelledError()
             row = await self._read(lambda conn: conn.execute(
                 "SELECT project_id, workflow, attempts, inputs, status FROM runs WHERE id = ?",
                 (active.run_id,)).fetchone())
@@ -702,8 +723,6 @@ class Harness:
                                                 self.keyring_backend)
         if route is None or key is None:
             return None
-        budget = (await asyncio.to_thread(load_settings, self.data_dir, project_id)).values["project"]["budget_usd"]
-
         def start(conn):
             if not _running(conn, active.run_id):
                 raise _Cancelled()
@@ -718,10 +737,12 @@ class Harness:
                                                           "reservation_id": reservation})
             return _Call(active.run_id, step, reservation)
 
-        try:
-            call, cancelled = await self._write_through(start)
-        except _Cancelled:
-            raise asyncio.CancelledError() from None
+        async with self.settings_lock:  # the project's budget as it is now
+            budget, _ = await self._budgets(project_id)
+            try:
+                call, cancelled = await self._write_through(start)
+            except _Cancelled:
+                raise asyncio.CancelledError() from None
         active.call = call
         if cancelled:
             raise asyncio.CancelledError()

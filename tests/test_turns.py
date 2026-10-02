@@ -716,3 +716,43 @@ async def test_a_claim_still_being_admitted_is_never_released_as_stale(tmp_path,
         stream = [event async for event in harness.events(claim)]
         assert stream[-1]["status"] == "succeeded"
         await background_idle(client)
+
+
+async def test_a_stop_before_the_turns_task_first_runs_ends_it_cancelled(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "stopped at once")
+        claim.task = asyncio.create_task(harness._turn(claim))
+        harness._request_cancel(claim, "researcher")  # before the task's first step
+        await claim.task
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id) == [
+            ("cancelled", "researcher")]
+        assert not harness.registry.is_active(claim.run_id)
+        assert (await send(client, conversation, "next"))[-1]["status"] == "succeeded"  # the claim is free
+        await background_idle(client)
+
+
+async def test_an_admission_stopped_by_shutdown_writes_no_run(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        loading, release = threading.Event(), threading.Event()
+        real = runs_module.load_instructions
+
+        def slow_instructions(*args):
+            loading.set()
+            release.wait(5)
+            return real(*args)
+
+        monkeypatch.setattr(runs_module, "load_instructions", slow_instructions)
+        admitting = asyncio.create_task(harness.admit_turn(conversation, "slow"))
+        await asyncio.to_thread(loading.wait, 5)
+        claim = harness.registry.turns[conversation]
+        harness._request_cancel(claim, "shutdown")  # as shutdown does, before the run is written
+        await claim.closing
+        release.set()
+        with pytest.raises(runs_module.AdmissionError, match="closing"):
+            await admitting
+        assert await rows(client, "SELECT count(*) FROM runs WHERE kind = 'turn'") == [(0,)]
+        assert conversation not in harness.registry.turns

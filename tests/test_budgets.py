@@ -259,3 +259,22 @@ def test_usage_after_the_project_is_deleted_is_dropped_and_recreates_nothing(db)
     assert db.write(lambda conn: spending.release(conn, undispatched)) is False
     assert db.read(lambda conn: conn.execute("SELECT count(*) FROM budget_reservations").fetchone()) == (0,)
     assert project_spent(db, project) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_budget_lowered_while_a_turn_waits_binds_its_next_call(tmp_path):
+    from scholia_app import started
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        project = (await client.get(f"/api/conversations/{conversation}")).json()["project_id"]
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "admitted under the old budget")
+        stream = harness.events(claim)
+        assert (await anext(stream))["type"] == "run_started"  # its call is reserved on the next pull
+        settings = (await client.get("/api/settings", params={"project_id": project})).json()
+        response = await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                           "updates": {"project.budget_usd": 0.000001}})
+        assert response.status_code == 200, response.text
+        rest = [event async for event in stream]
+        assert [e for e in rest if e["type"] == "limit_reached"] == [{"type": "limit_reached", "budget": "project"}]
+        assert client.provider.answers == []  # nothing was sent

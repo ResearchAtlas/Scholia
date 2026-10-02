@@ -376,3 +376,19 @@ async def test_a_stop_that_comes_while_the_title_commits_is_told_the_title_was_w
         await background_idle(client)
         assert (await conversation(client, conversation_id))["title"] == "A short title"
         assert await rows(client, "SELECT status FROM runs WHERE id = ?", title) == [("succeeded",)]
+
+
+async def test_a_stop_before_a_background_runs_task_first_runs_ends_it_cancelled(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation_id = await new_conversation(client, title="Named first, so no title run is queued")
+        await send(client, conversation_id)
+        run_id = await seed_title_run(client, conversation_id, attempts=0)
+        harness = client.state["harness"]
+        active = harness.registry.add_background(run_id)
+        active.task = asyncio.create_task(harness._background(active))
+        harness._request_cancel(active, "researcher")  # before the task's first step
+        await active.task
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", run_id) == [
+            ("cancelled", "researcher")]
+        assert not harness.registry.is_active(run_id)
+        assert client.provider.titles == []

@@ -24,7 +24,7 @@ from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
-from backend.db import ContentStore, Database, delete, new_id, utc_now
+from backend.db import BackupStoppedError, ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
 from backend.runs import AdmissionError, Harness, _through, derived_status
@@ -176,12 +176,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             await harness.recover()
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
             # The daily backup runs once the app is open, so a large folder never holds up its
-            # start; it reads its own consistent copy, and closing waits for it.
+            # start; it reads its own consistent copy. Closing stops it (the next launch takes
+            # it) and waits for its thread, so the exit stays bounded.
             backup = asyncio.ensure_future(asyncio.to_thread(_daily_backup, db))
             yield
         finally:
             await harness.shutdown()
             if backup is not None:
+                db.stop_backups()
                 await asyncio.wait({backup})
             await asyncio.to_thread(db.close)
             state.clear()
@@ -296,7 +298,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
     @app.put("/api/settings")
     async def put_settings(body: SettingsUpdate):
         async with project_files if body.project_id is not None else contextlib.nullcontext():
-            return await save_settings(body)
+            async with harness().settings_lock:  # ordered with the budget reads of call admission
+                return await save_settings(body)
 
     async def save_settings(body):
         loaded = await settings_for(body.project_id)  # for a project: checked to exist under the lock
@@ -304,15 +307,23 @@ def create_app(data_dir, *, origin: str, dev_origins=(), frontend_dir=None, keyr
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
         changed = _providers_changed(body.updates, providers.configured(data_dir))
         refuse_if_busy(changed)  # before any field is written
+        saved = False
+
+        def save():
+            nonlocal saved
+            loaded.save(body.updates)
+            saved = True
+
         try:
-            await _finished(loaded.save, body.updates)  # under the project-files lock to its end
+            await _finished(save)  # under the project-files lock to its end
         except SettingsChanged:
             raise ApiError(409, "settings_changed", "The settings changed since they were read") from None
         except ValueError:
             raise ApiError(400, "invalid_setting", "A setting is not valid") from None
-        if changed:  # a provider's kind, URL or name changed: what was learned about it no longer holds
-            openrouter.clear_negotiation_cache()
-            openrouter_client.clear_cache()
+        finally:
+            if saved and changed:  # a provider changed, even if the request was cancelled meanwhile:
+                openrouter.clear_negotiation_cache()  # what was learned about it no longer holds
+                openrouter_client.clear_cache()
         return {"values": loaded.values, "warnings": loaded.warnings, "hash": loaded._digest}
 
     @app.get("/api/instructions")
@@ -628,6 +639,8 @@ def _remove_folder(path) -> bool:
 def _daily_backup(db):
     try:
         db.backup_if_due()
+    except BackupStoppedError:
+        log.info("the daily backup was stopped by closing; the next launch takes it")
     except Exception as error:  # the app stays open; the next launch tries again
         log.warning("the daily backup failed (%s)", type(error).__name__)
 

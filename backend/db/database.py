@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -57,6 +57,10 @@ class DatabaseClosedError(RuntimeError):
     """The database is closed or closing: nothing more is read or written through it."""
 
 
+class BackupStoppedError(RuntimeError):
+    """A backup was stopped by stop_backups(); its partial copy was removed."""
+
+
 class DatabaseDamagedError(RuntimeError):
     """An integrity check failed. Writing stops and the file is left as it is."""
 
@@ -91,6 +95,9 @@ class Database:
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
+        self._backup_reading = None  # the connection a running backup is reading, so stop_backups can interrupt it
+        self._backups_stopped = False  # set by stop_backups, under _interrupt_lock
+        self._interrupt_lock = threading.Lock()
         self._commit_lock = threading.Lock()  # orders the damaged flag with commits
         self._truncation_pending = False  # a WAL truncation a reader blocked, retried after each write
         _mkdir_private(self.data_dir)
@@ -300,6 +307,24 @@ class Database:
 
     # Backups
 
+    def stop_backups(self):
+        """Stop a backup in progress at its next statement and refuse later ones. The
+        stopped backup removes its partial copy and raises BackupStoppedError. Used
+        before closing, so a long backup never holds up the app's exit; the next
+        launch takes the backup instead. Safe from any thread."""
+        with self._interrupt_lock:
+            self._backups_stopped = True
+            if self._backup_reading is not None:
+                with suppress(sqlite3.ProgrammingError):  # closed meanwhile
+                    self._backup_reading.interrupt()
+
+    def _reading(self, conn):
+        """Register conn as the connection the running backup reads (None when it ends)."""
+        with self._interrupt_lock:
+            if conn is not None and self._backups_stopped:
+                raise BackupStoppedError("backups were stopped")
+            self._backup_reading = conn
+
     def _backup(self, now):
         daily = self.backups_dir / "daily"
         _mkdir_private(self.backups_dir)
@@ -307,10 +332,14 @@ class Database:
         for stale in daily.glob(".*.tmp"):  # left by a crash during an earlier backup
             shutil.rmtree(stale)
         try:
-            source = _open_checked(self.path, "integrity_check")
+            source = _open_checked(self.path, "integrity_check", opened=self._reading)
         except DatabaseDamagedError as error:
             with self._commit_lock:
                 self._damaged = str(error)
+            raise
+        except sqlite3.OperationalError as error:
+            if self._backups_stopped:
+                raise BackupStoppedError("the backup was stopped") from error
             raise
         try:
             stamp = now.strftime(_STAMP)
@@ -322,7 +351,7 @@ class Database:
                 _create_private(copy)
                 source.execute("VACUUM INTO ?", (str(copy),))
                 try:
-                    check = _open_checked(copy, "quick_check")
+                    check = _open_checked(copy, "quick_check", opened=self._reading)
                 except DatabaseDamagedError as error:
                     raise RuntimeError(f"the backup copy failed its check: {error}") from error
                 with closing(check):
@@ -339,11 +368,14 @@ class Database:
                 os.rename(tmp, generation)
                 published = generation
                 _fsync(daily)
-            except BaseException:
+            except BaseException as error:
                 # A failed backup must not count as one, even after its rename.
                 shutil.rmtree(published or tmp, ignore_errors=True)
+                if isinstance(error, sqlite3.OperationalError) and self._backups_stopped:
+                    raise BackupStoppedError("the backup was stopped") from error
                 raise
         finally:
+            self._reading(None)
             source.close()
         self._apply_retention(keep=generation)
         return generation
@@ -395,7 +427,7 @@ def _switch_to_wal(conn):
         time.sleep(0.01)
 
 
-def _open_checked(path, check, latest=None):
+def _open_checked(path, check, latest=None, opened=None):
     """Open path read-only and run PRAGMA check (quick_check or integrity_check).
 
     Returns the open connection. Raises DatabaseDamagedError when the file is
@@ -404,10 +436,13 @@ def _open_checked(path, check, latest=None):
     database, unless it is new and empty, and NewerDatabaseError when
     user_version is above latest; and a database that will be migrated gets
     integrity_check instead of check. Nothing is written to the file or its WAL.
+    opened, if given, is called with the connection before the check runs.
     """
     conn = None
     try:
         conn = _connect(path, readonly=True)
+        if opened is not None:
+            opened(conn)
         if latest is not None:  # the live database at startup
             version, has_schema = _usable_state(conn, latest)
             if has_schema and version < latest:
