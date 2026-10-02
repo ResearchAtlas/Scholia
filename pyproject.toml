@@ -14,6 +14,8 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "platformdirs>=4.3.0",
     "pywebview>=6.1,<7",
+    "tomlkit>=0.15.1",
+    "keyring>=25.7.0",
     "sqlite-vec==0.1.9",
     "apsw>=3.53.4.0,<3.54",
     "pyobjc-framework-vision>=12.1,<12.2 ; sys_platform == 'darwin'",
