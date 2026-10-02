@@ -27,4 +27,4 @@ uv run pytest
 cd frontend && npm ci && node --test
 ```
 
-CI (`.github/workflows/ci.yml`) runs on every pull request on macOS on Apple silicon, with python.org's CPython 3.13: the backend and frontend tests, a PyInstaller build of a small frozen program (`tools/runtime_probe.spec`), and a license audit of that build (`tools/license_audit.py`). The audit expects python.org's interpreter, the one the app ships.
+CI (`.github/workflows/ci.yml`) runs on every pull request on macOS on Apple silicon, with python.org's CPython 3.13: the backend and frontend tests, a PyInstaller build of the app and its DMG (`tools/build_app.sh`, with the hash-verified llama.cpp helper), the app's self-test run inside the DMG, and a license audit of the app (`tools/license_audit.py`). The audit expects python.org's interpreter, the one the app ships.

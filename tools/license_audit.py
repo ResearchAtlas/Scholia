@@ -1,21 +1,22 @@
-"""License audit of a frozen PyInstaller onedir bundle.
+"""License audit of the app: a PyInstaller onedir .app with the llama.cpp helper.
 
-Run it with the environment that built the bundle:
+Run it with the environment that built the app:
 
-    uv run python tools/license_audit.py build/dist/scholia-probe
+    uv run python tools/license_audit.py "build/dist/AAB Research.app"
 
-It lists every file in the bundle and every module archived inside it, and
+It lists every file in the app and every module archived inside it, and
 assigns each to a component: Scholia's own code, CPython with the third-party
-code python.org's build carries, PyInstaller, or an installed Python
-distribution. It fails when
+code python.org's build carries, PyInstaller, the llama.cpp helper, or an
+installed Python distribution. It fails when
 - a file or module belongs to no known component,
 - a component's license is not on the allowed list,
 - a distribution's native code has not been reviewed for the libraries it embeds, or
-- a component's license text is not shipped in the bundle's licenses/ folder.
+- a component's license text is not shipped in the app's Contents/Resources/licenses/ folder.
 
 A PyInstaller spec ships those texts with `notice_datas()`.
 """
 
+import fnmatch
 import re
 import sys
 import sysconfig
@@ -26,8 +27,18 @@ from importlib import metadata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTENTS = "_internal"  # PyInstaller's onedir contents folder
-LICENSES = "licenses"  # license texts ship in <contents>/licenses/<component>/
+# In a .app, PyInstaller puts binaries in Contents/Frameworks and data files in
+# Contents/Resources, and links each folder's entries from the other.
+CONTENTS = ("Contents/Frameworks", "Contents/Resources")
+# PyInstaller's stand-in for a dot in a folder name under Contents/Frameworks, which codesign
+# allows only for frameworks (PyInstaller.building.osx.DOT_REPLACEMENT)
+DOT = "__dot__"
+LICENSES = "Contents/Resources/licenses"  # license texts ship in <LICENSES>/<component>/
+# The llama.cpp helper: build_app.sh puts the server beside the app's executable and the
+# libraries it links in their own Frameworks folder.
+HELPER = "llama.cpp"
+HELPER_SERVER = "Contents/MacOS/llama-server"
+HELPER_LIBRARY = re.compile(r"Contents/Frameworks/llama-cpp/lib(llama|ggml|mtmd)[\w.-]*\.dylib")
 # The build interpreter's installation, which every bundled CPython file must come from
 CPYTHON_HOME = Path(sys.base_prefix)
 # "stdlib", not "platstdlib": inside a venv, "platstdlib" names the venv
@@ -83,11 +94,42 @@ LIBRARIES = {
     "xz": ("0BSD OR LicenseRef-Public-Domain", []),  # liblzma: public domain before 5.6, then 0BSD
     "BLAKE2": ("CC0-1.0 OR OpenSSL OR Apache-2.0", []),
     "HACL-star": ("MIT", [ROOT / "tools/notices/HACL-star/LICENSE"]),
+    # llama.cpp b11146's server and libraries. Reviewed: ggml and llama.cpp (MIT) with
+    # cpp-httplib (MIT), nlohmann/json (MIT) and BoringSSL (Apache-2.0), whose notices the
+    # release prints with `llama licenses` (build_app.sh checks the file matches), and
+    # stb_image (MIT or Unlicense) and miniaudio (Unlicense or MIT-0) in libmtmd, taken
+    # under the Unlicense, which needs no notice.
+    HELPER: ("MIT AND Apache-2.0 AND (MIT OR Unlicense) AND (Unlicense OR MIT-0)",
+             [ROOT / "tools/notices/llama.cpp/LICENSES.txt"]),
 }
 
-# Distributions whose native code was reviewed, with the third-party libraries it embeds
-# (names in LIBRARIES). No distribution's native code is bundled yet.
-REVIEWED_NATIVE: dict[str, list[str]] = {}
+# Distributions whose native code was reviewed: for each native file (a pattern on its path
+# in the installed distribution), the third-party libraries it embeds (names in LIBRARIES).
+REVIEWED_NATIVE: dict[str, dict[str, list[str]]] = {
+    "apsw": {"apsw/__init__.*": ["SQLite"]},  # the SQLite amalgamation, linked statically
+    "sqlite-vec": {"sqlite_vec/vec0.dylib": []},  # one C source file, no dependencies
+    # Bindings to Apple's frameworks; libffi comes from the system, not the wheel.
+    "pyobjc-core": {"objc/*": []},
+    "pyobjc-framework-Cocoa": {"*": []},
+    "pyobjc-framework-Quartz": {"Quartz/*": []},
+    "pyobjc-framework-CoreML": {"CoreML/*": []},
+    "pyobjc-framework-Vision": {"Vision/*": []},
+}
+
+# Licenses read from a distribution's own license text where its metadata is not a usable
+# SPDX expression.
+REVIEWED_LICENSES = {
+    "apsw": "Zlib",  # metadata "any-OSI"; its LICENSE is the zlib license, or any OSI license
+    "sqlite-vec": "MIT OR Apache-2.0",  # metadata names both licenses in free text
+}
+# License texts for distributions whose wheels ship none, from their upstream repositories
+# at the bundled versions.
+SUPPLIED_NOTICES = {
+    "sqlite-vec": ["sqlite-vec/LICENSE-MIT", "sqlite-vec/LICENSE-APACHE"],
+    "pyobjc-core": ["pyobjc/License.txt"],
+    "pyobjc-framework-CoreML": ["pyobjc/License.txt"],
+    "pyobjc-framework-Vision": ["pyobjc/License.txt"],
+}
 
 CLASSIFIERS = {
     "MIT License": "MIT",
@@ -200,7 +242,9 @@ def component(name: str):
         license, notice = LIBRARIES[name]
         return license, notice if isinstance(notice, str) else [(p, p.name) for p in notice]
     dist = metadata.distribution(name)
-    return _dist_license(dist), _license_files(dist)
+    supplied = [ROOT / "tools/notices" / path for path in SUPPLIED_NOTICES.get(name, [])]
+    files = _license_files(dist) or [(path, path.name) for path in supplied]
+    return REVIEWED_LICENSES.get(name) or _dist_license(dist), files
 
 
 def _shipped_by_default() -> list[str]:
@@ -214,7 +258,7 @@ def notice_datas(dists=()) -> list[tuple[str, str]]:
     (Scholia, CPython, PyInstaller and the libraries with their own files) and of `dists`."""
     names = [*_shipped_by_default(), *dists]
     return [
-        (str(source), str(Path(LICENSES, name, dest).parent))
+        (str(source), str(Path("licenses", name, dest).parent))
         for name in names
         for source, dest in component(name)[1]
     ]
@@ -259,14 +303,36 @@ def assign_module(kind: str, name: str):
     return sorted(set(owners)) if owners else None
 
 
+def _inner(rel: str) -> str | None:
+    """A file's path inside PyInstaller's contents folders, or None if outside them."""
+    for folder in CONTENTS:
+        if rel.startswith(folder + "/"):
+            *folders, name = rel[len(folder) + 1:].split("/")
+            return "/".join([*(f.replace(DOT, ".") for f in folders), name])
+    return None
+
+
+def _pyinstaller_icon() -> Path:
+    return Path(metadata.distribution("pyinstaller").locate_file(
+        "PyInstaller/bootloader/images/icon-windowed.icns"))
+
+
 def assign_file(bundle: Path, rel: str, problems: list[str]):
-    """The components a bundled file belongs to, or None."""
-    parts = rel.split("/")
-    if len(parts) == 1:  # the executable: PyInstaller's bootloader and an archive
-        return ["PyInstaller"] if _is_macho(bundle / rel) else None
-    if parts[0] != CONTENTS:
+    """The components a file in the app belongs to, or None."""
+    path = bundle / rel
+    if rel == HELPER_SERVER or HELPER_LIBRARY.fullmatch(rel):
+        return [HELPER] if _is_macho(path) else None
+    if rel.startswith("Contents/MacOS/") and rel.count("/") == 2:
+        # the app's executable: PyInstaller's bootloader and an archive
+        return ["PyInstaller"] if _is_macho(path) else None
+    if rel in ("Contents/Info.plist", "Contents/_CodeSignature/CodeResources"):
+        return ["Scholia"]  # the app's metadata and its signature seal
+    if rel == "Contents/Resources/icon-windowed.icns":  # PyInstaller's default app icon
+        return ["PyInstaller"] if path.read_bytes() == _pyinstaller_icon().read_bytes() else None
+    inner = _inner(rel)
+    if inner is None:
         return None
-    inner = "/".join(parts[1:])
+    parts = inner.split("/")
     stem = parts[-1].split(".")[0]
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     cpython = ["CPython", *CPYTHON_EMBEDDED.get(stem, [])]
@@ -274,30 +340,32 @@ def assign_file(bundle: Path, rel: str, problems: list[str]):
     if inner == "base_library.zip":  # PyInstaller's archive of stdlib modules, checked by member
         return ["CPython"]
     if inner.startswith(f"python{version}/lib-dynload/"):
-        return cpython if len(parts) == 4 and (LIB_DYNLOAD / parts[-1]).is_file() else None
-    if parts[1] == "Python.framework":  # Versions/<version>/ mirrors the installation
-        source = "/".join(parts[4:])
-        if parts[2:4] != ["Versions", version] or not source or not (CPYTHON_HOME / source).is_file():
+        return cpython if len(parts) == 3 and (LIB_DYNLOAD / parts[-1]).is_file() else None
+    if parts[0] == "Python.framework":  # Versions/<version>/ mirrors the installation
+        source = "/".join(parts[3:])
+        if parts[1:3] != ["Versions", version] or not source or not (CPYTHON_HOME / source).is_file():
             return None
-        if source == "Python" or not _is_macho(bundle / rel):  # the interpreter, or a resource
+        if source == "Python" or not _is_macho(path):  # the interpreter, or a resource
             return cpython
-        if len(parts) == 6 and parts[4] == "lib":  # a library the build ships, as at top level
+        if len(parts) == 5 and parts[3] == "lib":  # a library the build ships, as at top level
             return CPYTHON_EMBEDDED.get(stem)
         return None
     if inner == "Python" and (CPYTHON_HOME / "Python").is_file():
         return cpython
-    if len(parts) == 2 and parts[1].endswith(".dylib") and (CPYTHON_HOME / "lib" / parts[1]).is_file():
+    if len(parts) == 1 and inner.endswith(".dylib") and (CPYTHON_HOME / "lib" / inner).is_file():
         return CPYTHON_EMBEDDED.get(stem)  # a library the build ships; None if not reviewed
     owner = _record_owners().get(inner)
     if owner is None:
         return None
-    if not _is_macho(bundle / rel):
+    if not _is_macho(path):
         return [owner]
-    if owner not in REVIEWED_NATIVE:
+    reviewed = REVIEWED_NATIVE.get(owner, {})
+    embedded = next((libs for pattern, libs in reviewed.items() if fnmatch.fnmatch(inner, pattern)), None)
+    if embedded is None:
         problems.append(
             f"{rel}: native code from {owner} has not been reviewed for the libraries it embeds"
         )
-    return [owner, *REVIEWED_NATIVE.get(owner, [])]
+    return [owner, *(embedded or [])]
 
 
 def _archived(path: Path, problems: list[str]) -> list[tuple[str, str]]:
@@ -323,7 +391,7 @@ def audit(bundle: Path) -> tuple[dict[str, set[str]], list[str]]:
     problems: list[str] = []
     if not bundle.is_dir():
         return found, [f"{bundle}: not a directory"]
-    notices = Path(CONTENTS, LICENSES).as_posix() + "/"
+    notices = LICENSES + "/"
     inventoried = 0
     owners_of: dict[str, list[str]] = {}
     links = []
@@ -348,9 +416,9 @@ def audit(bundle: Path) -> tuple[dict[str, set[str]], list[str]]:
         for owner in owners:
             found[owner].add(rel)
         members = []
-        if "/" not in rel:
+        if owners == ["PyInstaller"] and rel.startswith("Contents/MacOS/"):
             members = _archived(path, problems)
-        elif rel == f"{CONTENTS}/base_library.zip":
+        elif _inner(rel) == "base_library.zip":
             with zipfile.ZipFile(path) as archive:
                 for member in archive.namelist():
                     if member.endswith(".pyc"):
@@ -403,7 +471,7 @@ def _check(bundle: Path, name: str) -> list[str]:
             problems.append(f"{name}: license {license} is not allowed")
     except ValueError as error:
         problems.append(f"{name}: {error}")
-    shipped = f"{CONTENTS}/{LICENSES}"
+    shipped = LICENSES
     if isinstance(notice, str):
         doc = _regular_file(bundle, f"{shipped}/CPython/{CPYTHON_DOC.name}")
         if not doc or notice not in doc.read_text(encoding="utf-8", errors="replace"):

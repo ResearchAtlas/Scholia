@@ -16,12 +16,18 @@ dependencies = [
     "pywebview>=6.1,<7",
     "tomlkit>=0.15.1",
     "keyring>=25.7.0",
+    "sqlite-vec==0.1.9",
+    "apsw>=3.53.4.0,<3.54",
+    "pyobjc-framework-vision>=12.1,<12.2 ; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
 mcp = ["mcp==2.2.0"]
 
 [dependency-groups]
+citeproc-spike = [
+    "wasmtime==49.0.0",
+]
 dev = [
     "pytest",
     "pytest-asyncio",
