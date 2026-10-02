@@ -59,7 +59,7 @@ ON_DELETE = {
     ("turns", "retry_of_run_id"): "retry_of_run_id = NULL",
     ("candidates", "run_id"): DELETE,
     ("search_plans", "run_id"): DELETE,
-    ("budget_reservations", "run_id"): DELETE,
+    ("budget_reservations", "run_id"): "run_id = NULL",  # spending outlives the run; the project still counts it
     ("section_leases", "run_id"): DELETE,
     ("citations", "support_run_id"): "support_run_id = NULL",
     ("artifact_versions", "run_id"): "run_id = NULL",

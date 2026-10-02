@@ -259,9 +259,14 @@ CREATE TABLE search_plans (
     PRIMARY KEY (run_id, version)
 ) STRICT;
 
+-- Spending. A row is written in the transaction that admits a model call, and
+-- settles (reported usage, else its estimate) or is released (never dispatched)
+-- exactly once. It outlives its run and conversation: deleting them clears
+-- run_id and paying_conversation_id and keeps the row in the project's spending.
+-- Deleting the project deletes it.
 CREATE TABLE budget_reservations (
     id TEXT PRIMARY KEY CHECK (id GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-4[0-9a-f][0-9a-f][0-9a-f]-[89ab][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
-    run_id TEXT NOT NULL REFERENCES runs (id),
+    run_id TEXT REFERENCES runs (id),
     step_seq INTEGER NOT NULL CHECK (step_seq >= 0),
     paying_conversation_id TEXT REFERENCES conversations (id),
     project_id TEXT NOT NULL REFERENCES projects (id),
@@ -270,8 +275,16 @@ CREATE TABLE budget_reservations (
     settled_usd REAL CHECK (settled_usd >= 0),
     basis TEXT CHECK (basis IN ('reported', 'estimated')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) CHECK (created_at IS strftime('%Y-%m-%dT%H:%M:%fZ', created_at)),
-    settled_at TEXT CHECK (settled_at IS strftime('%Y-%m-%dT%H:%M:%fZ', settled_at))
+    settled_at TEXT CHECK (settled_at IS strftime('%Y-%m-%dT%H:%M:%fZ', settled_at)),
+    CHECK ((status = 'open') = (settled_at IS NULL)),
+    CHECK ((status = 'settled') = (settled_usd IS NOT NULL AND basis IS NOT NULL))
 ) STRICT;
+
+CREATE TRIGGER budget_reservations_settle_once BEFORE UPDATE OF id, step_seq, project_id, estimate_usd, status, settled_usd, basis, created_at, settled_at ON budget_reservations
+WHEN OLD.status <> 'open'
+BEGIN
+    SELECT RAISE(ABORT, 'a settled or released reservation never changes');
+END;
 
 -- seq never repeats, even after applied rows are removed, because the index
 -- records the last sequence it applied. project_id outlives a deleted project
