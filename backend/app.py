@@ -12,6 +12,7 @@ import json
 import logging
 import shutil
 import stat
+import time
 from functools import partial
 from pathlib import Path
 
@@ -184,16 +185,25 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     # write can never recreate the folder of a project deleted meanwhile; such writes are rare.
     project_files = asyncio.Lock()
 
+    @contextlib.contextmanager
+    def maintenance():
+        """Mark local maintenance for the desktop entry's start deadline: state holds when the
+        current maintenance started and how long finished maintenance took."""
+        started = time.monotonic()
+        state["maintenance_started"] = started
+        try:
+            yield
+        finally:
+            state["maintenance_seconds"] = state.get("maintenance_seconds", 0.0) + time.monotonic() - started
+            state.pop("maintenance_started", None)
+
     @contextlib.asynccontextmanager
     async def lifespan(app):
         # Opening the database (its checks, the backup before a migration, migrations) and the
         # daily backup are local maintenance: the desktop entry's start deadline does not count
-        # them (state["maintenance"]), since on a large folder they are progress, not a hang.
-        state["maintenance"] = True
-        try:
+        # them (see maintenance), since on a large folder they are progress, not a hang.
+        with maintenance():
             db = await asyncio.to_thread(Database, data_dir)
-        finally:
-            state.pop("maintenance", None)
         content = ContentStore(db)
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
@@ -204,11 +214,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # The daily backup runs at launch, before the app accepts a request, so the
             # database and the settings files it copies show one state. Backups while the app
             # is open and idle are S1-12's.
-            state["maintenance"] = True
-            try:
+            with maintenance():
                 await asyncio.to_thread(_daily_backup, db)
-            finally:
-                state.pop("maintenance", None)
             yield
         finally:
             await harness.shutdown()

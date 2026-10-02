@@ -337,23 +337,30 @@ def test_a_lock_file_that_is_a_link_is_refused_and_never_followed(tmp_path, targ
     assert windows == []  # not reported as already open
 
 
-def test_the_start_deadline_keeps_its_budget_across_the_backup(monkeypatch):
-    # 0.6 s of startup, a 4.4 s backup, then 0.6 s more: 1.2 s outside the backup, over 1 s.
-    clock = iter([0.0, 0.6, 5.0, 5.3, 5.6, 5.9])
+@pytest.mark.parametrize("after, started", [(0.39, True), (0.41, False)])
+def test_the_start_deadline_counts_only_time_outside_maintenance(monkeypatch, after, started):
+    # 0.6 s of startup, then maintenance from 0.6 to 5.0, then `after` more seconds: the budget
+    # of 1 s is spent exactly by the time outside maintenance.
+    now = [0.0]
     server, state = type("Server", (), {"started": False})(), {}
-    steps = iter([lambda: state.update(maintenance=True), lambda: state.pop("maintenance"), lambda: None,
-                  lambda: setattr(server, "started", True), lambda: None])
 
     class Thread:
         def is_alive(self):
             return True
 
         def join(self, seconds):
-            next(steps)()
+            now[0] = round(now[0] + 0.01, 2)
+            if now[0] == 0.6:
+                state["maintenance_started"] = 0.6
+            if now[0] == 5.0:
+                state["maintenance_seconds"] = 4.4
+                state.pop("maintenance_started")
+            if now[0] == round(5.0 + after, 2) and started:
+                server.started = True
 
-    monkeypatch.setattr(desktop.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(desktop.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(desktop, "START_SECONDS", 1)
-    assert desktop._wait_started(server, Thread(), state) is False
+    assert desktop._wait_started(server, Thread(), state) is started
 
 
 @pytest.mark.parametrize("kind", ["folder", "unreadable"])

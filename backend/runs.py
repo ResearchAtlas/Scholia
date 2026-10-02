@@ -340,7 +340,7 @@ class Harness:
     async def admit_turn(self, conversation_id: str, message, *, model=None, provider=None, effort=None,
                          retry_of=None) -> ActiveRun:
         """Validate a message and admit its turn, or raise AdmissionError having written nothing."""
-        if not isinstance(message, str) or not message.strip():
+        if visible(message) is None:  # nothing visible to ask, invisible characters included
             raise AdmissionError(400, "empty_message", "The message is empty")
         if len(message) > MAX_MESSAGE_CHARS:
             raise AdmissionError(400, "message_too_long", "The message is too long")

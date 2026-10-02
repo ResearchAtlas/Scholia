@@ -269,17 +269,16 @@ def _run_server(server, sock, loop):
 
 def _wait_started(server, thread, state):
     """Wait for the server to start, at most START_SECONDS, not counting the local maintenance
-    of opening the database and the daily backup (state["maintenance"]): on a large folder
-    it is progress, not a hang."""
-    left, last = float(START_SECONDS), time.monotonic()
+    of opening the database and the daily backup (the app's maintenance times in state): on
+    a large folder it is progress, not a hang."""
+    began = time.monotonic()
     while not server.started:
         if not thread.is_alive():
             return False
+        current = state.get("maintenance_started")  # read before the total: an end between counts twice, never not at all
         now = time.monotonic()
-        if not state.get("maintenance"):  # only the rest of startup spends the budget
-            left -= now - last
-        last = now
-        if left <= 0:
+        maintained = state.get("maintenance_seconds", 0.0) + (now - current if current is not None else 0.0)
+        if now - began - maintained > START_SECONDS:
             return False
         thread.join(0.05)
     return True

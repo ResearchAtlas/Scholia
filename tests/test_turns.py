@@ -907,3 +907,20 @@ async def test_a_stop_that_comes_before_a_failed_or_limited_turn_commits_wins(tm
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id) == [outcome]
         if reason == "shutdown":  # interrupted by closing the app: Continue is offered
             assert (await client.post(f"/api/runs/{claim.run_id}/continue")).status_code == 200
+
+
+@pytest.mark.parametrize("content", ["​", " ️ "])
+async def test_a_message_with_nothing_visible_is_refused_and_sends_nothing(tmp_path, content):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client, title="t")
+        response = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": content})
+        assert (response.status_code, response.json()["code"]) == (400, "empty_message")
+        assert client.provider.answers == [] and await rows(client, "SELECT count(*) FROM runs") == [(0,)]
+
+
+async def test_an_answer_with_nothing_visible_fails_the_turn_as_malformed(tmp_path):
+    provider = MockProvider((200, {"choices": [{"message": {"content": "​‍"}}], "usage": {"cost": 0.001}}))
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert (stream[-2]["code"], stream[-1]["status"]) == ("malformed", "failed")

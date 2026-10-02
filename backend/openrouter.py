@@ -27,6 +27,7 @@ import httpx
 from backend import reasoning_capability
 from backend.outbound_gate import DISPATCHED, OutboundDenied
 from backend.reasoning_control import resolve_reasoning_payload
+from backend.settings import visible
 from backend.spending import amount
 
 log = logging.getLogger(__name__)
@@ -269,7 +270,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
                 continue
             return _failed(attempts[-1].outcome, attempts, route)
         content, reasoning = _answer(body)
-        if content is None or not content.strip():
+        if visible(content) is None:  # nothing to show, invisible characters included
             attempts.append(Attempt("malformed", response.status_code, _ms(started), usage))
             return _failed("malformed", attempts, route)
         attempts.append(Attempt("ok", response.status_code, _ms(started), usage))
