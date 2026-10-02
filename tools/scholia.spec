@@ -17,13 +17,32 @@ from license_audit import notice_datas  # noqa: E402
 DISTRIBUTIONS = [
     "apsw", "sqlite-vec", "pyobjc-core", "pyobjc-framework-Cocoa", "pyobjc-framework-Quartz",
     "pyobjc-framework-CoreML", "pyobjc-framework-Vision",
+    # The backend: its server stack, settings and keys
+    "fastapi", "starlette", "pydantic", "pydantic_core", "annotated-types", "annotated-doc",
+    "typing-inspection", "typing_extensions", "anyio", "sniffio", "idna", "uvicorn", "h11", "click",
+    "python-multipart", "httpx", "httpcore", "certifi", "tomlkit", "keyring", "jaraco.classes",
+    "jaraco.context", "jaraco.functools", "more-itertools", "platformdirs",
+    # The window
+    "pywebview", "bottle", "proxy_tools", "pyobjc-framework-WebKit", "pyobjc-framework-UniformTypeIdentifiers",
+]
+
+# Optional pieces the app never uses, which hooks or optional imports would otherwise collect:
+# uvicorn's faster loop and parser, its websockets, reload and config-file support (the app
+# runs it with loop="asyncio", http="h11", ws="none" and no config file), and test and
+# build tooling.
+EXCLUDES = [
+    "uvloop", "httptools", "websockets", "wsproto", "watchfiles", "yaml", "dotenv",
+    "pytest", "_pytest", "pluggy", "iniconfig", "pygments", "setuptools", "pkg_resources", "_distutils_hack",
 ]
 
 a = Analysis(
     [str(ROOT / "tools/app.py")],
     pathex=[str(ROOT)],
     binaries=collect_dynamic_libs("sqlite_vec"),  # sqlite-vec has no PyInstaller hook
-    datas=notice_datas(DISTRIBUTIONS),
+    excludes=EXCLUDES,
+    datas=notice_datas(DISTRIBUTIONS)
+    # the reasoning-capability record, which the provider adapter reads beside its module
+    + [(str(ROOT / "backend/reasoning_capabilities.json"), "backend")],
 )
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, exclude_binaries=True, name="Scholia", console=False, upx=False)

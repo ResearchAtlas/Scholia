@@ -1,0 +1,7 @@
+certifi 2025.11.12 ships in Scholia unmodified, under the Mozilla Public License 2.0
+(its license text is beside this file). Its files keep their own names inside the app
+(the certifi package and certifi/cacert.pem) and are not part of Scholia's own source.
+
+The source of this exact version:
+https://github.com/certifi/python-certifi/tree/2025.11.12
+https://pypi.org/project/certifi/2025.11.12/#files

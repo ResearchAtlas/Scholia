@@ -356,3 +356,18 @@ async def test_shutdown_interrupts_a_running_turn_and_settles_its_call(tmp_path)
         assert (await rows(client, "SELECT basis FROM budget_reservations"))[0][0] == "estimated"
         response = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "x"})
         assert (response.status_code, response.json()["code"]) == (503, "shutting_down")
+
+
+async def test_a_stop_before_the_stream_starts_prevents_any_dispatch(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "hi")  # admitted; its response has not started
+        assert (await client.post(f"/api/runs/{claim.run_id}/cancel")).json()["status"] == "cancelled"
+        assert [event async for event in harness.events(claim)] == []  # the late response streams nothing
+        assert client.provider.chats == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id) == [
+            ("cancelled", "researcher")]
+        assert (await counts(client))["budget_reservations"] == 0
+        assert (await send(client, conversation, "again"))[-1]["status"] == "succeeded"
+        await background_idle(client)

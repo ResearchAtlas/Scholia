@@ -39,6 +39,7 @@ LICENSES = "Contents/Resources/licenses"  # license texts ship in <LICENSES>/<co
 HELPER = "llama.cpp"
 HELPER_SERVER = "Contents/MacOS/llama-server"
 HELPER_LIBRARY = re.compile(r"Contents/Frameworks/llama-cpp/lib(llama|ggml|mtmd)[\w.-]*\.dylib")
+PYDANTIC_CORE_CRATES = "pydantic-core-crates"
 # The build interpreter's installation, which every bundled CPython file must come from
 CPYTHON_HOME = Path(sys.base_prefix)
 # "stdlib", not "platstdlib": inside a venv, "platstdlib" names the venv
@@ -101,6 +102,25 @@ LIBRARIES = {
     # under the Unlicense, which needs no notice.
     HELPER: ("MIT AND Apache-2.0 AND (MIT OR Unlicense) AND (Unlicense OR MIT-0)",
              [ROOT / "tools/notices/llama.cpp/LICENSES.txt"]),
+    # The Rust crates and standard library compiled into pydantic-core's extension, with the
+    # licenses tools/rust_notices.py found in its Cargo.lock (it prints this expression).
+    PYDANTIC_CORE_CRATES: (
+        "((MIT OR Apache-2.0) AND Unicode-DFS-2016) AND (Apache-2.0 OR BSL-1.0) AND (Apache-2.0 OR MIT)"
+        " AND (Apache-2.0 WITH LLVM-exception) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT)"
+        " AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND MIT AND (MIT OR Apache-2.0)"
+        " AND (MIT OR Apache-2.0 OR LGPL-2.1-or-later) AND Unicode-3.0 AND (Unlicense OR MIT)",
+        [ROOT / "tools/notices/pydantic-core/RUST-NOTICES.txt"]),
+}
+# Rust extensions whose compiled-in crates' notices tools/rust_notices.py generated for exactly
+# this version; another version fails the audit until they are generated again.
+RUST_NOTICES = {"pydantic_core": "2.41.5"}
+
+# Unmodified MPL-2.0 packages (decided 2026-10-02). Each passes only by its entry here, at
+# exactly this version, never by its license alone, and ships with its license text and a
+# link to that version's source. Its files keep their own names in the bundle, apart from
+# Scholia's code.
+MPL_PACKAGES = {
+    "certifi": "2025.11.12",
 }
 
 # Distributions whose native code was reviewed: for each native file (a pattern on its path
@@ -114,6 +134,9 @@ REVIEWED_NATIVE: dict[str, dict[str, list[str]]] = {
     "pyobjc-framework-Quartz": {"Quartz/*": []},
     "pyobjc-framework-CoreML": {"CoreML/*": []},
     "pyobjc-framework-Vision": {"Vision/*": []},
+    "pyobjc-framework-WebKit": {"WebKit/*": []},
+    # A Rust extension: the crates it uses, and Rust's standard library, are linked in.
+    "pydantic_core": {"pydantic_core/_pydantic_core.*": [PYDANTIC_CORE_CRATES]},
 }
 
 # Licenses read from a distribution's own license text where its metadata is not a usable
@@ -121,6 +144,9 @@ REVIEWED_NATIVE: dict[str, dict[str, list[str]]] = {
 REVIEWED_LICENSES = {
     "apsw": "Zlib",  # metadata "any-OSI"; its LICENSE is the zlib license, or any OSI license
     "sqlite-vec": "MIT OR Apache-2.0",  # metadata names both licenses in free text
+    # Its metadata says MIT, but the only license text upstream, which ships, is BSD-style
+    # (Armin Ronacher, Jonathan Tushman).
+    "proxy_tools": "BSD-2-Clause",
 }
 # License texts for distributions whose wheels ship none, from their upstream repositories
 # at the bundled versions.
@@ -129,6 +155,9 @@ SUPPLIED_NOTICES = {
     "pyobjc-core": ["pyobjc/License.txt"],
     "pyobjc-framework-CoreML": ["pyobjc/License.txt"],
     "pyobjc-framework-Vision": ["pyobjc/License.txt"],
+    "pyobjc-framework-UniformTypeIdentifiers": ["pyobjc/License.txt"],
+    # Upstream's LICENSE.txt at commit db43f1e35d4f90a65c5a4d56d9e9af88212ec6e6; 0.1.0 is untagged.
+    "proxy_tools": ["proxy_tools/LICENSE.txt"],
 }
 
 CLASSIFIERS = {
@@ -244,6 +273,8 @@ def component(name: str):
     dist = metadata.distribution(name)
     supplied = [ROOT / "tools/notices" / path for path in SUPPLIED_NOTICES.get(name, [])]
     files = _license_files(dist) or [(path, path.name) for path in supplied]
+    if name in MPL_PACKAGES:  # its source link ships beside its license
+        files.append((ROOT / "tools/notices" / name / "SOURCE.txt", "SOURCE.txt"))
     return REVIEWED_LICENSES.get(name) or _dist_license(dist), files
 
 
@@ -354,6 +385,8 @@ def assign_file(bundle: Path, rel: str, problems: list[str]):
         return cpython
     if len(parts) == 1 and inner.endswith(".dylib") and (CPYTHON_HOME / "lib" / inner).is_file():
         return CPYTHON_EMBEDDED.get(stem)  # a library the build ships; None if not reviewed
+    if parts[0] == "backend" and not _is_macho(path) and (ROOT / inner).is_file():
+        return ["Scholia"]  # a data file of Scholia's own backend, such as its reasoning record
     owner = _record_owners().get(inner)
     if owner is None:
         return None
@@ -467,10 +500,20 @@ def _check(bundle: Path, name: str) -> list[str]:
     try:
         if license is None:
             problems.append(f"{name}: no license in its metadata")
+        elif name in MPL_PACKAGES and license == "MPL-2.0":
+            version = metadata.version(name)
+            if version != MPL_PACKAGES[name]:
+                problems.append(f"{name}: version {version} is not the reviewed MPL-2.0 version {MPL_PACKAGES[name]}")
+            source = ROOT / "tools/notices" / name / "SOURCE.txt"
+            if not source.is_file() or f"{name} {MPL_PACKAGES[name]} " not in source.read_text(encoding="utf-8"):
+                problems.append(f"{name}: SOURCE.txt does not name version {MPL_PACKAGES[name]}")
         elif not allowed(license):
             problems.append(f"{name}: license {license} is not allowed")
     except ValueError as error:
         problems.append(f"{name}: {error}")
+    if name in RUST_NOTICES and metadata.version(name) != RUST_NOTICES[name]:
+        problems.append(f"{name}: version {metadata.version(name)} has no Rust notices; generate them with "
+                        "tools/rust_notices.py")
     shipped = LICENSES
     if isinstance(notice, str):
         doc = _regular_file(bundle, f"{shipped}/CPython/{CPYTHON_DOC.name}")
