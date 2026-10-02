@@ -197,6 +197,13 @@ async def test_cancel_during_the_model_call_ends_the_turn_and_settles_its_estima
         [(estimate, settled, basis)] = await rows(
             client, "SELECT estimate_usd, settled_usd, basis FROM budget_reservations WHERE run_id = ?", run_id)
         assert (settled, basis) == (estimate, "estimated") and estimate > 0  # never shown as $0
+        # The attempt cut off in flight is recorded, content-free, with an unknown charge.
+        [(attempt,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
+                                  run_id)
+        assert json.loads(attempt) == {"step": 0, "route": json.loads(attempt)["route"], "outcome": "cancelled",
+                                       "http_status": None, "dispatched": True, "charge": "unknown"}
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["accounting"] == {"reported_usd": 0, "estimated_usd": estimate, "unknown_attempts": 1}
         # Repeating is safe and reports the terminal status; an unknown run is 404.
         assert (await client.post(f"/api/runs/{run_id}/cancel")).json() == {"run_id": run_id, "status": "cancelled"}
         assert (await client.post(f"/api/runs/{new_id()}/cancel")).status_code == 404
@@ -288,11 +295,17 @@ async def test_a_step_that_does_not_fit_the_budget_is_refused_before_any_call(tm
         conversation = await new_conversation(client, project_id=project)
         stream = await send(client, conversation)
         assert [e["type"] for e in stream] == ["run_started", "limit_reached", "run_finished"]
-        assert stream[1]["budget"] == "project" and stream[-1]["status"] == "failed"
+        assert stream[1]["budget"] == "project" and stream[-1]["status"] == "cancelled"
         assert provider.chats == []
         assert (await counts(client))["budget_reservations"] == 0
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
-        assert turn["reason_code"] == "budget"
+        assert (turn["reason_code"], turn["cancel_reason"]) == ("budget", "limit")  # stopped at a limit
+        # Once the budget is raised, Continue sends the message again.
+        settings = (await client.get("/api/settings", params={"project_id": project})).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"project.budget_usd": 50}})
+        continued = events(await client.post(f"/api/runs/{turn['run_id']}/continue"))
+        assert continued[-1]["status"] == "succeeded" and len(provider.answers) == 1
 
 
 # Interruption and recovery
@@ -396,8 +409,9 @@ async def test_a_reply_recorded_after_its_conversation_was_deleted_still_settles
         # The deletion commits between the reply and its record (no revocation reaches the turn here).
         await asyncio.to_thread(delete, client.state["db"], client.state["content"], "conversation", conversation)
         release.set()
-        final = (await stream)[-1]
-        assert final["status"] == "deleted"
+        stream = await stream
+        assert "chat_response" not in [e["type"] for e in stream]  # nothing is published for a deleted turn
+        assert stream[-1]["status"] == "deleted"
         assert await rows(client, "SELECT run_id, paying_conversation_id, status, settled_usd, basis"
                                   " FROM budget_reservations") == [(None, None, "settled", 0.0015, "reported")]
         assert await rows(client, "SELECT count(*) FROM runs") == [(0,)]

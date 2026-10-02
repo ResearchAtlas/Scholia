@@ -156,10 +156,12 @@ def _running(conn, run_id) -> bool:
 
 @dataclass
 class _Call:
-    """One admitted model call: its step, reservation and whether it may have left."""
+    """One admitted model call: its run, step, reservation and whether it may have left."""
+    run_id: str
     step: int
     reservation_id: str
     dispatched: bool = False
+    route: str | None = None  # the route key, once the call is under way
 
 
 class Harness:
@@ -455,9 +457,9 @@ class Harness:
         except asyncio.CancelledError:
             final, _ = await _through(self._stop_turn(claim))
             emit({"type": "run_finished", **final})
-        except spending.BudgetExceeded as exceeded:
+        except spending.BudgetExceeded as exceeded:  # stopped at a limit: Continue is offered once it is raised
             final, _ = await _through(self._write(lambda conn: self._finish_turn(
-                conn, claim.run_id, "failed", None, "budget", limit={"budget": exceeded.budget})))
+                conn, claim.run_id, "cancelled", "limit", "budget", limit={"budget": exceeded.budget})))
             emit({"type": "limit_reached", "budget": exceeded.budget})
             emit({"type": "run_finished", **final})
         except Exception as error:  # a defect, not a provider failure; the turn ends failed
@@ -507,8 +509,8 @@ class Harness:
         published after a Stop the turn saw first."""
         if claim.cancel_requested.is_set():
             raise _Cancelled()
-        if not _running(conn, claim.run_id):
-            return self._finish_turn(conn, claim.run_id, "cancelled", None, None)  # deleted or ended meanwhile
+        if not _running(conn, claim.run_id):  # deleted (or ended) since it was admitted: nothing to publish
+            raise _Cancelled()
         cost = spending.run_cost(conn, claim.run_id)
         _event(conn, claim.run_id, "run_finished", {"status": "succeeded"})
         conn.execute("UPDATE turns SET answer = ?, result_saved = 1, phase = 'answer', memory_status = 'skipped',"
@@ -545,7 +547,7 @@ class Harness:
                                            **budgets)
             _event(conn, run_id, "step_started", {"step": step, "phase": phase, "estimate_usd": estimate,
                                                    "reservation_id": reservation})
-            return _Call(step, reservation)
+            return _Call(run_id, step, reservation)
 
         try:
             call, cancelled = await self._write_through(reserve)
@@ -569,6 +571,7 @@ class Harness:
         def dispatched():  # the gate let the request out: from here it may be billed
             call.dispatched = True
 
+        call.route = route.key
         async with self.gate.async_client(project_id[0]) as client:
             result = await openrouter.query_model(
                 client, route, key, messages, timeout=MODEL_CALL_SECONDS, effort=effort, max_tokens=max_tokens,
@@ -672,7 +675,7 @@ class Harness:
                                            project_budget_usd=budget, conversation_budget_usd=None)
             _event(conn, active.run_id, "step_started", {"step": step, "phase": "title", "estimate_usd": estimate,
                                                           "reservation_id": reservation})
-            return _Call(step, reservation)
+            return _Call(active.run_id, step, reservation)
 
         try:
             call, cancelled = await self._write_through(start)
@@ -716,10 +719,18 @@ async def _through(awaitable):
 
 
 def _close_call(conn, call):
-    """Settle a call that may have gone out at its estimate, or release one that never
-    left. Either happens once; a call already recorded is left as it is."""
-    if call is not None:
-        (spending.settle if call.dispatched else spending.release)(conn, call.reservation_id)
+    """Close a call cut off before it was recorded: one that may have gone out settles at
+    its estimate and leaves a content-free attempt with an unknown charge; one that never
+    left is released. Either happens once; a call already recorded is left as it is."""
+    if call is None:
+        return
+    if call.dispatched:
+        if spending.settle(conn, call.reservation_id) and _running(conn, call.run_id):
+            _event(conn, call.run_id, "model_attempt", {
+                "step": call.step, "route": call.route, "outcome": "cancelled", "http_status": None,
+                "dispatched": True, "charge": "unknown"})
+    else:
+        spending.release(conn, call.reservation_id)
 
 
 def _accounting(conn, run_id):
