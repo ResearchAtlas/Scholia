@@ -12,7 +12,9 @@ is not supported: only this entry takes the lock.
 """
 
 import asyncio
+import contextlib
 import fcntl
+import json
 import logging
 import os
 import secrets
@@ -24,6 +26,7 @@ from pathlib import Path
 
 APP_NAME = "Scholia"
 LOCK_FILE = "scholia.lock"
+SESSION_FILE = "session.json"  # owner-only: this launch's origin and session, for this account's native clients
 START_SECONDS = 30
 STOP_SECONDS = 15
 ALREADY_OPEN = (
@@ -33,6 +36,10 @@ ALREADY_OPEN = (
 )
 
 log = logging.getLogger(__name__)
+
+
+class UnsafeDataFolderError(RuntimeError):
+    """The data folder holds something Scholia will not open, such as a link."""
 
 
 def data_folder() -> Path:
@@ -66,9 +73,11 @@ def narrow_tree(data_dir) -> None:
     closed to other accounts before anything is opened.
 
     The walk starts at the data folder's real path (the folder itself may be a link the
-    researcher made; the app opens everything through it) and never follows a link inside
-    it. Each folder is narrowed before it is listed, so a folder that cannot be listed is
-    still closed to other accounts, and with it everything below it."""
+    researcher made; the app opens everything through it). The app never makes a link
+    inside it, so one found there is refused (UnsafeDataFolderError) rather than followed
+    later by a reader of settings, keys or instructions. Each folder is narrowed before
+    it is listed, so a folder that cannot be listed is still closed to other accounts,
+    and with it everything below it."""
     pending = [os.path.realpath(data_dir)]
     while pending:
         folder = pending.pop()
@@ -82,6 +91,8 @@ def narrow_tree(data_dir) -> None:
             log.warning("a folder in the data folder could not be listed; it is closed to other accounts")
             continue
         for entry in entries:
+            if entry.is_symlink():
+                raise UnsafeDataFolderError("the data folder holds a link, which Scholia does not follow")
             if entry.is_dir(follow_symlinks=False):
                 pending.append(entry.path)
             else:
@@ -90,13 +101,13 @@ def narrow_tree(data_dir) -> None:
 
 def _narrow(path, mask) -> bool:
     """Narrow path's mode to mask, never broadening it. Returns whether path is a real
-    folder or file that is still there; a link is left as it is.
+    folder or file that is still there; a link (put there meanwhile) is refused.
     ponytail: lstat, then chmod; the data folder is owner-only, so nobody else can swap
     in a link between the two."""
     try:
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode):
-            return False
+            raise UnsafeDataFolderError("the data folder holds a link, which Scholia does not follow")
         if stat.S_IMODE(info.st_mode) & ~mask:
             os.chmod(path, stat.S_IMODE(info.st_mode) & mask, follow_symlinks=False)
         return True
@@ -113,7 +124,7 @@ def frontend_folder() -> Path:
 
 def run(data_dir, open_window, *, keyring_backend=None, transport=None, listening=lambda sock: None) -> int:
     """Run the app on data_dir until open_window(url) returns (the window closed). url
-    starts this launch's session (see local_guard) and then shows the app.
+    carries this launch's session in its fragment (see local_guard).
 
     Returns 0, or 1 when another instance holds the data folder. The keyword
     arguments are for tests: a credential store, a transport for outbound requests,
@@ -126,6 +137,9 @@ def run(data_dir, open_window, *, keyring_backend=None, transport=None, listenin
     try:
         narrow_tree(data_dir)
         return _serve(Path(data_dir), open_window, keyring_backend, transport, listening)
+    except UnsafeDataFolderError as error:  # ponytail: said on stderr; S1-12's data-folder screen explains it
+        print(f"Scholia: {error}", file=sys.stderr)
+        return 1
     finally:
         os.close(lock)
 
@@ -135,6 +149,7 @@ def _serve(data_dir, open_window, keyring_backend, transport, listening):
 
     from backend import logs
     from backend.app import create_app
+    from backend.settings import write_private
 
     handler = logs.configure(data_dir)
     try:
@@ -143,7 +158,8 @@ def _serve(data_dir, open_window, keyring_backend, transport, listening):
         sock.listen(64)
         listening(sock)
         origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
-        session = secrets.token_urlsafe(32)  # this launch's; only the window gets it
+        session = secrets.token_urlsafe(32)  # this launch's: the window and this account's native clients
+        write_private(data_dir / SESSION_FILE, json.dumps({"origin": origin, "session": session}).encode())
         app = create_app(data_dir, origin=origin, session=session, frontend_dir=frontend_folder(),
                          keyring_backend=keyring_backend, transport=transport)
         server = uvicorn.Server(uvicorn.Config(
@@ -158,11 +174,13 @@ def _serve(data_dir, open_window, keyring_backend, transport, listening):
             thread.join(STOP_SECONDS)
             return 1
         try:
-            open_window(f"{origin}/session/{session}")
+            open_window(f"{origin}/#session={session}")  # a fragment never reaches a server
         finally:
             _stop(app, server, thread, loop)
         return 0
     finally:
+        with contextlib.suppress(FileNotFoundError):  # this launch's session ends with it
+            os.unlink(data_dir / SESSION_FILE)
         logging.getLogger().removeHandler(handler)
         handler.close()
 

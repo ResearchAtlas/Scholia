@@ -162,7 +162,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                transport=None) -> FastAPI:
     """The app for one data folder, served at origin (e.g. "http://127.0.0.1:53111").
 
-    session is this launch's secret, which every request must then carry (see
+    session is this launch's secret, which every API request must then carry (see
     local_guard; the desktop entry always sets one); frontend_dir holds the built interface; keyring_backend selects the credential
     store (None: the system's); transport is where the outbound gate sends checked
     requests (None: the network; tests pass a mock).
@@ -268,17 +268,21 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     async def _save_key(provider, key):
         """Store a key, clear what was learned with the old one, and audit the change.
-        Callers run it to its end (_to_end), so a stored key is always followed through."""
+        Callers run it to its end (_to_end), so a stored key is always followed through.
+        A save that fails may still have changed the key (a file replaced before its
+        folder could be synced): it is followed through too, audited as uncertain."""
+        stored_in = "uncertain"
         try:
             warning = await asyncio.to_thread(credentials.save_key, data_dir, provider, key, keyring_backend)
+            stored_in = "file" if warning else "credential_store"
         except credentials.CredentialsFileError:
             raise ApiError(500, "key_not_saved", "The key could not be saved") from None
-        openrouter.clear_negotiation_cache()
-        openrouter_client.clear_cache()
-        stored_in = "file" if warning else "credential_store"
-        await write(lambda conn: conn.execute(  # which provider's key changed and where it went; never the key
-            "INSERT INTO audit_log (event, data) VALUES ('key_changed', ?)",
-            (json.dumps({"provider": provider, "stored_in": stored_in}),)))
+        finally:
+            openrouter.clear_negotiation_cache()
+            openrouter_client.clear_cache()
+            await write(lambda conn: conn.execute(  # which provider's key changed and where it went; never the key
+                "INSERT INTO audit_log (event, data) VALUES ('key_changed', ?)",
+                (json.dumps({"provider": provider, "stored_in": stored_in}),)))
         return "credential_store_unavailable" if warning else None
 
     @app.get("/api/providers")

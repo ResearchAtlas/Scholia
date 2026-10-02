@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 
 import httpx
+import pytest
 
 from backend import desktop
 from backend.db import Database
@@ -84,22 +85,22 @@ def test_closing_the_window_interrupts_running_work_and_stops_the_server(tmp_pat
 
     def window(url):
         seen["url"] = url
-        origin = url.split("/session/")[0]
+        origin, session = url.split("/#session=")
+        discovered = data / desktop.SESSION_FILE  # what a native client of this account reads
+        assert json.loads(discovered.read_text()) == {"origin": origin, "session": session}
+        assert stat.S_IMODE(discovered.stat().st_mode) == 0o600
         headers = {"X-Scholia-Client": "local", "Origin": origin}
         with httpx.Client(base_url=origin, headers=headers, timeout=10) as http:
             assert http.get("/api/health").json()["code"] == "session_required"  # another account's view
-            assert http.get(url.split("/session/")[0] + "/session/" + "x" * 43).status_code == 403
-            started = http.get(url)  # the window's first page: sets this launch's cookie
-            assert (started.status_code, started.headers["location"]) == (303, "/")
-            assert "HttpOnly" in started.headers["set-cookie"] and "SameSite=Strict" in started.headers["set-cookie"]
+            headers["X-Scholia-Session"] = session
+            http.headers["X-Scholia-Session"] = session
             assert http.get("/api/health").json()["ok"] is True
             assert http.post("/api/setup", json={"openrouter_key": KEY}).status_code == 200
             conversation = http.post("/api/conversations", json={"title": "t"}).json()["id"]
             seen["conversation"] = conversation
-            cookies = http.cookies
 
         def stream():
-            with httpx.Client(base_url=origin, headers=headers, cookies=cookies, timeout=30) as http:
+            with httpx.Client(base_url=origin, headers=headers, timeout=30) as http:
                 seen["stream"] = http.post(f"/api/conversations/{conversation}/message/stream",
                                            json={"content": "hi"}).text
 
@@ -111,6 +112,7 @@ def test_closing_the_window_interrupts_running_work_and_stops_the_server(tmp_pat
                        listening=register_server) == 0
 
     assert not [t for t in threading.enumerate() if t.name == "scholia-server"]  # the server stopped
+    assert not (data / desktop.SESSION_FILE).exists()  # the session ended with the launch
     with Database(data) as db:
         [(status, cancel_reason, cost)] = db.read(lambda conn: conn.execute(
             "SELECT status, cancel_reason, settled_cost_usd FROM runs WHERE kind = 'turn'").fetchall())
@@ -126,10 +128,10 @@ def test_closing_the_window_interrupts_running_work_and_stops_the_server(tmp_pat
     os.close(fd)
 
 
-def test_an_existing_data_folder_is_narrowed_to_owner_only_without_following_links(tmp_path):
-    data, outside = tmp_path / "data", tmp_path / "outside.txt"
+def test_an_existing_data_folder_is_narrowed_to_owner_only(tmp_path):
+    data = tmp_path / "data"
     (data / "projects" / "p").mkdir(parents=True)
-    for path in (data / "scholia.sqlite3", data / "config.toml", data / "projects" / "p" / "AGENTS.md", outside):
+    for path in (data / "scholia.sqlite3", data / "config.toml", data / "projects" / "p" / "AGENTS.md"):
         path.write_text("x")
         os.chmod(path, 0o644)
     for folder in (data, data / "projects", data / "projects" / "p"):
@@ -137,30 +139,45 @@ def test_an_existing_data_folder_is_narrowed_to_owner_only_without_following_lin
     strict = data / "credentials.json"
     strict.write_text("{}")
     os.chmod(strict, 0o400)
-    os.symlink(outside, data / "link.txt")
     desktop.narrow_tree(data)
     for folder in (data, data / "projects", data / "projects" / "p"):
         assert stat.S_IMODE(folder.stat().st_mode) == 0o700
     for path in (data / "scholia.sqlite3", data / "config.toml", data / "projects" / "p" / "AGENTS.md"):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(strict.stat().st_mode) == 0o400  # never broadened
-    assert stat.S_IMODE(outside.stat().st_mode) == 0o644  # a link's target is left alone
 
 
 def test_a_linked_data_folder_is_narrowed_at_its_real_path_and_a_folder_that_cannot_be_listed_is_closed(tmp_path):
-    real, outside = tmp_path / "real", tmp_path / "outside"
-    for folder in (real / "a", real / "b", outside):
+    real = tmp_path / "real"
+    for folder in (real / "a", real / "b"):
         folder.mkdir(parents=True)
-    for path in (real / "a" / "f", real / "b" / "f", outside / "f"):
+    for path in (real / "a" / "f", real / "b" / "f"):
         path.write_text("x")
         os.chmod(path, 0o644)
-    os.symlink(outside, real / "elsewhere")
     os.symlink(real, tmp_path / "data")  # the data folder is a link the researcher made
     os.chmod(real / "a", 0o355)  # its owner cannot list it
     try:
         desktop.narrow_tree(tmp_path / "data")
         assert stat.S_IMODE((real / "a").stat().st_mode) == 0o300  # closed to others, never broadened
         assert stat.S_IMODE((real / "b" / "f").stat().st_mode) == 0o600  # the walk went on
-        assert stat.S_IMODE((outside / "f").stat().st_mode) == 0o644  # a link inside is never followed
     finally:
         os.chmod(real / "a", 0o700)
+
+
+@pytest.mark.parametrize("linked", ["config.toml", "credentials.json", "projects/p/AGENTS.md", "projects/p"])
+def test_a_data_folder_holding_a_link_is_refused_and_the_link_is_never_followed(tmp_path, linked):
+    data, outside = tmp_path / "data", tmp_path / "outside"
+    (data / "projects" / "p").mkdir(parents=True)
+    outside.mkdir()
+    (outside / "target").write_text('[providers.openrouter]\nbase_url = "https://attacker.example/v1"\n')
+    os.chmod(outside / "target", 0o666)
+    link = data / linked
+    if link.exists():
+        link.rmdir()
+    os.symlink(outside / ("target" if "." in linked else ""), link)
+    with pytest.raises(desktop.UnsafeDataFolderError):
+        desktop.narrow_tree(data)
+    assert stat.S_IMODE((outside / "target").stat().st_mode) == 0o666  # left alone
+    windows = []
+    assert desktop.run(data, windows.append) == 1  # the app does not open it
+    assert windows == [] and not (data / "scholia.sqlite3").exists()

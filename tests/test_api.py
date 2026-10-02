@@ -556,3 +556,25 @@ async def test_a_cancelled_key_change_is_still_audited_and_clears_the_provider_c
         audited = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
             "SELECT count(*) FROM audit_log WHERE event = 'key_changed'").fetchone()[0])
         assert audited == 2  # setup's, then this one
+
+
+async def test_a_key_save_that_fails_after_replacing_the_file_is_still_audited_and_clears_the_caches(
+        tmp_path, monkeypatch):
+    from backend import credentials, openrouter_client
+    async with started(tmp_path / "data") as client:
+        await client.get("/api/providers/openrouter/models")
+        assert openrouter_client._caches
+        real = credentials.save_key
+
+        def save_then_fail(*args):
+            real(*args)  # the key changed; then its folder could not be synced
+            raise credentials.CredentialsFileError("the folder could not be synced")
+
+        monkeypatch.setattr(credentials, "save_key", save_then_fail)
+        response = await client.put("/api/keys/openrouter", json={"key": "sk-or-new"})
+        assert (response.status_code, response.json()["code"]) == (500, "key_not_saved")
+        assert not openrouter_client._caches
+        audited = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT json_extract(data, '$.stored_in') FROM audit_log WHERE event = 'key_changed'"
+            " ORDER BY seq").fetchall())
+        assert audited[-1] == ("uncertain",)

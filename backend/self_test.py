@@ -348,8 +348,7 @@ def check_backend() -> dict:
                 outside = await client.get("/api/projects")
                 if outside.status_code != 401:
                     raise RuntimeError(f"a request without this launch's session got {outside.status_code}")
-                if (await client.get(f"/session/{session}")).status_code != 303:
-                    raise RuntimeError("the session could not be started")
+                client.headers["X-Scholia-Session"] = session
                 for method, path, body in (("POST", "/api/setup", {"openrouter_key": "self-test"}),
                                            ("POST", "/api/projects", {"name": "Self-test"})):
                     response = await client.request(method, path, json=body)

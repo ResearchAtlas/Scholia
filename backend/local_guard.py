@@ -22,17 +22,18 @@ client's disconnect, and it decides before any route parses a body.
   Access-Control-Allow-Origin for that origin alone, without credentials. Any
   other preflight is refused.
 - Anything outside /api is static navigation: GET or HEAD only.
-- With a session (the desktop entry always sets one), every request must also carry
-  this launch's session cookie, after all the checks above. Only the app's own window
-  gets it: it opens /session/<token>, which sets the cookie (HttpOnly,
-  SameSite=Strict, named for this port) and redirects to /. So a program of another
-  account on this machine, which can reach the loopback port and send any header, is
-  refused. A development server's cross-origin calls carry no cookie: development
-  runs without a session.
+- With a session (the desktop entry always sets one), every API request must also carry
+  this launch's secret in `X-Scholia-Session`, after all the checks above. The app's
+  window gets it in its URL's fragment (never sent to a server) and keeps it in its own
+  origin's session storage; a native client of the same account reads it from the
+  owner-only session.json in the data folder. A program of another account on this
+  machine, which can reach the loopback port and send any other header, is refused.
+  The app's static pages hold no data and need no secret. Development (with
+  development origins) runs without a session.
 
 The client header is not authentication. This protects against web pages and
 documents, and with a session against other accounts on this machine, not against
-other programs running as the same user (who can read this account's processes).
+other programs running as the same user.
 """
 
 import hmac
@@ -45,7 +46,7 @@ _CHANGES = {"POST", "PUT", "PATCH", "DELETE"}
 _CORS_METHODS = b"GET, POST, PUT, PATCH, DELETE"
 _CORS_HEADERS = {b"content-type", CLIENT_HEADER}
 _JSON = {b"application/json", b"application/json; charset=utf-8"}
-SESSION_PATH = "/session/"
+SESSION_HEADER = b"x-scholia-session"
 
 
 class LocalRequestGuard:
@@ -61,7 +62,6 @@ class LocalRequestGuard:
         self.origins = {origin.encode(), *self.dev_origins}
         self.hosts = {o.split(b"://", 1)[1] for o in self.origins}
         self.session = session.encode() if session is not None else None
-        self.cookie = b"scholia_session_" + origin.rsplit(":", 1)[1].encode()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
@@ -72,11 +72,8 @@ class LocalRequestGuard:
         if problem:
             status, code = problem
             return await _refuse(send, scope, status, code, "The request was refused")
-        if self.session is not None:
-            if scope["path"].startswith(SESSION_PATH) and scope["method"] == "GET":
-                return await self._start_session(scope, send)
-            if not self._has_session(scope):
-                return await _refuse(send, scope, 401, "session_required", "The request was refused")
+        if self.session is not None and _is_api(scope["path"]) and not self._has_session(scope):
+            return await _refuse(send, scope, 401, "session_required", "The request was refused")
         origin = dict(scope["headers"]).get(b"origin")
         if scope["method"] == "OPTIONS":  # a development origin's preflight, checked above
             return await _preflight(send, origin)
@@ -85,24 +82,8 @@ class LocalRequestGuard:
         return await self.app(scope, receive, send)
 
     def _has_session(self, scope):
-        for name, value in scope["headers"]:
-            if name == b"cookie":
-                for part in value.split(b";"):
-                    key, _, token = part.strip().partition(b"=")
-                    if key == self.cookie and hmac.compare_digest(token, self.session):
-                        return True
-        return False
-
-    async def _start_session(self, scope, send):
-        """The window's first page: set the session cookie and go to the app."""
-        token = scope["path"][len(SESSION_PATH):].encode()
-        if not hmac.compare_digest(token, self.session):
-            return await _refuse(send, scope, 403, "session_refused", "The request was refused")
-        cookie = self.cookie + b"=" + self.session + b"; Path=/; HttpOnly; SameSite=Strict"
-        await send({"type": "http.response.start", "status": 303, "headers": [
-            (b"location", b"/"), (b"set-cookie", cookie), (b"cache-control", b"no-store"),
-            (b"content-length", b"0")]})
-        await send({"type": "http.response.body", "body": b""})
+        given = [value for name, value in scope["headers"] if name == SESSION_HEADER]
+        return len(given) == 1 and hmac.compare_digest(given[0], self.session)
 
     def problem(self, scope):
         """(status, code) for a refused request, or None."""
@@ -116,7 +97,7 @@ class LocalRequestGuard:
         if len(hosts) != 1 or hosts[0] not in self.hosts:
             return 403, "host_refused"
         method, path = scope["method"], scope["path"]
-        if not (path == "/api" or path.startswith("/api/")):
+        if not _is_api(path):
             return None if method in ("GET", "HEAD") else (405, "method_not_allowed")
         origins = headers.get(b"origin", [])
         fetch_site = headers.get(b"sec-fetch-site", [b""])[-1]
@@ -145,6 +126,10 @@ class LocalRequestGuard:
                     t.replace(b" ", b"") for t in _JSON}:
                 return 415, "json_required"
         return None
+
+
+def _is_api(path):
+    return path == "/api" or path.startswith("/api/")
 
 
 async def _preflight(send, origin):

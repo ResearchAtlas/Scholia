@@ -360,7 +360,7 @@ class Harness:
         if conversation is None:
             raise AdmissionError(404, "not_found", "No such conversation")
         (project_id,) = conversation
-        # The provider snapshot (settings, route and key) is taken under settings_lock, which
+        # The provider snapshot (settings and route) is taken under settings_lock, which
         # provider and key changes also hold: a change lands before it, or is refused as busy
         # once claim.provider names the provider.
         async with self.settings_lock:
@@ -384,9 +384,11 @@ class Harness:
             if plan.model is None:
                 raise AdmissionError(400, "model_needed", "Choose a model for this provider")
             route = providers.Route(provider_config, plan.model)
-            key = await asyncio.to_thread(credentials.load_key, self.data_dir, provider_name, self.keyring_backend)
-            if key is None:
-                raise AdmissionError(400, "provider_key_missing", "The provider has no key")
+        # The key is read outside the lock (a credential store may ask the researcher first);
+        # it cannot change meanwhile, since key changes are refused while claim.provider is set.
+        key = await asyncio.to_thread(credentials.load_key, self.data_dir, provider_name, self.keyring_backend)
+        if key is None:
+            raise AdmissionError(400, "provider_key_missing", "The provider has no key")
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
 
         def admit(conn):
@@ -730,8 +732,8 @@ class Harness:
             active.provider = inputs.get("provider")
             route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),
                                             inputs.get("model"))
-            key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
-                                                    self.keyring_backend)
+        key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
+                                                self.keyring_backend)
         if route is None or key is None:
             return None
         def start(conn):
