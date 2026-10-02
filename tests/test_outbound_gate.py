@@ -392,18 +392,43 @@ def test_pending_hops_are_bounded(db, setup, asynchronous):
     assert sent[-1] == f"https://repository.example.org/landing?n={count}"
 
 
-def test_a_new_hop_replaces_a_pending_one_for_the_same_url(db, remote, setup):
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_hops_to_the_same_url_issued_together_each_work_once(db, remote, setup, asynchronous):
     project_id = project(db)
     candidate_id = candidate(db, project_id)
     remote.redirects[OA_LINK] = (302, "/landing")
-    with setup.gate.client(project_id, candidate_id=candidate_id) as client:
-        first = client.get(OA_LINK).next_request
-        second = client.get(OA_LINK).next_request
-        assert len(client._transport._scope.hops) == 1
-        refused(client, "GET", "https://repository.example.org/landing", "not_candidate_url")  # a new request
-        with pytest.raises(OutboundDenied, match="not_candidate_url"):
-            client.send(first)  # replaced
-        assert client.send(second).status_code == 200
+
+    def outcome(response_or_reason):
+        return response_or_reason if isinstance(response_or_reason, str) else response_or_reason.status_code
+
+    if asynchronous:
+        async def attempt(client, hop):
+            try:
+                return await client.send(hop)
+            except OutboundDenied as denied:
+                return denied.reason
+
+        async def scenario():
+            async with setup.gate.async_client(project_id, candidate_id=candidate_id) as client:
+                first, second = await asyncio.gather(client.get(OA_LINK), client.get(OA_LINK))
+                hops = [first.next_request, second.next_request]
+                together = await asyncio.gather(*(attempt(client, hop) for hop in hops))
+                replays = await asyncio.gather(*(attempt(client, hop) for hop in hops))
+                return list(together) + list(replays)
+
+        outcomes = asyncio.run(scenario())
+    else:
+        def attempt(client, hop):
+            try:
+                return client.send(hop)
+            except OutboundDenied as denied:
+                return denied.reason
+
+        with setup.gate.client(project_id, candidate_id=candidate_id) as client:
+            hops = [client.get(OA_LINK).next_request, client.get(OA_LINK).next_request]
+            outcomes = [attempt(client, hop) for hop in hops + hops]
+    assert [outcome(o) for o in outcomes] == [200, 200, "not_candidate_url", "not_candidate_url"]
+    assert [str(r.url) for r in remote.received] == [OA_LINK, OA_LINK] + ["https://repository.example.org/landing"] * 2
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
