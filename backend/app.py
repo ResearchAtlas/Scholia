@@ -354,9 +354,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # A snapshot older than a provider change caches nothing (its refresh is refused).
             models = await openrouter_client.models(client, configured[provider], key, force=refresh,
                                                     generation=generation)
-        if openrouter_client.generation() != generation:
-            raise ApiError(409, "settings_changed", "The provider changed while its models were listed")
         status = openrouter_client.catalog_status(configured[provider], key)
+        if openrouter_client.generation() != generation:  # after everything this answer reports
+            raise ApiError(409, "settings_changed", "The provider changed while its models were listed")
         return {"models": sorted((models or {}).values(), key=lambda m: m["id"]), "status": status}
 
     # Settings and instructions

@@ -1507,3 +1507,46 @@ async def test_async_client_checks_and_audits_the_same_way(db, remote, setup):
     assert await asyncio.to_thread(decisions, db) == [
         ("allow", None), ("deny", "missing_flags"), ("deny", "not_allowed_at_level"),
         ("deny", "unchecked_request"), ("allow", None), ("deny", "cross_origin_redirect")]
+
+
+@pytest.mark.parametrize("ours, allowed", [(True, True), (False, False)])
+def test_a_plain_http_local_provider_gets_a_request_only_from_this_accounts_listener(db, remote, ours, allowed):
+    asked = []
+    inputs = GateInputs(provider_urls=(LOCAL_SERVER, "https://127.0.0.1:8443/v1"), helper_url=HELPER)
+    gate = OutboundGate(db, lambda: inputs, transport=httpx.MockTransport(remote),
+                        local_listener=lambda host, port: asked.append((host, port)) or ours)
+    project_id = project(db)
+    with gate.client(project_id) as client:
+        if allowed:
+            client.post(f"{LOCAL_SERVER}/chat/completions", json=chat(), headers=AUTH)
+        else:
+            refused(client, "POST", f"{LOCAL_SERVER}/chat/completions", "local_server_not_yours", json=chat(),
+                    headers=AUTH)
+        client.get(f"{HELPER}/health")  # the helper is this app's own child: not asked
+        client.post("https://127.0.0.1:8443/v1/chat/completions", json=chat(), headers=AUTH)  # TLS: not asked
+    assert asked[0] == ("127.0.0.1", 11434) and ("127.0.0.1", 8443) not in asked
+    assert [r.url.port for r in remote.received] == ([11434] if allowed else []) + [8765, 8443]
+    assert (("deny", "local_server_not_yours") in decisions(db)) is not allowed
+
+
+def test_the_listener_check_is_the_real_one_only_when_requests_reach_the_network(db):
+    from backend.outbound_gate import listener_is_ours
+    assert OutboundGate(db, GateInputs)._local_listener is listener_is_ours
+    assert OutboundGate(db, GateInputs, transport=httpx.MockTransport(lambda r: None))._local_listener is None
+
+
+def test_lsof_finds_this_accounts_listener_and_nothing_on_a_free_port():
+    import socket as socket_module
+    from backend.outbound_gate import listener_is_ours
+    from network_guard import allow_subprocess
+    listening = socket_module.socket()
+    listening.bind(("127.0.0.1", 0))
+    listening.listen()
+    port = listening.getsockname()[1]
+    try:
+        with allow_subprocess("/usr/sbin/lsof"):
+            assert listener_is_ours("127.0.0.1", port) is True
+            listening.close()
+            assert listener_is_ours("127.0.0.1", port) is False
+    finally:
+        listening.close()

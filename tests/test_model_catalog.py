@@ -281,3 +281,16 @@ def test_a_snapshot_older_than_a_cache_clear_lists_and_caches_nothing():
 
     assert asyncio.run(go()) is None
     assert calls == [] and not openrouter_client._caches
+
+
+def test_catalog_status_never_makes_or_drops_a_cache_entry():
+    from backend import openrouter_client
+    from backend.providers import Provider
+    provider = Provider("openrouter", "openrouter", "https://openrouter.ai/api/v1")
+    openrouter_client.clear_cache()
+    openrouter_client._caches[("openrouter", provider.base_url, b"current")] = {
+        "models": {"a/b": {}}, "last_fetched": 1, "last_attempt": 1, "task": None, "error": None}
+    status = openrouter_client.catalog_status(provider, "an older key")
+    assert status["last_fetched"] is None and status["stale"] is True
+    assert list(openrouter_client._caches) == [("openrouter", provider.base_url, b"current")]
+    openrouter_client.clear_cache()

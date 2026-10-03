@@ -199,7 +199,9 @@ async def models(client, provider, key, *, force=False, generation=None):
 
 
 def catalog_status(provider, key):
-    state = _cache_state(provider, key)
+    """The catalog's freshness for this provider and key. Read only: it never makes or
+    drops a cache entry (Scholia)."""
+    state = _caches.get(_scope(provider, key)) or {"last_fetched": 0, "error": None}
     return {"last_fetched": state["last_fetched"] or None,
             "stale": bool(state["error"]) or time.time() - state["last_fetched"] >= CACHE_TTL_SECONDS,
             "error": state["error"]}

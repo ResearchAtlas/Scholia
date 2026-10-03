@@ -72,8 +72,10 @@ CDN, say) needs a change here when it is wired in.
 import asyncio
 import ipaddress
 import json
+import os
 import re
 import socket
+import subprocess
 import threading
 from collections.abc import Callable, Collection, Mapping
 from http.cookiejar import CookieJar, DefaultCookiePolicy
@@ -211,12 +213,21 @@ class OutboundGate:
     db is the main Database. inputs returns the current GateInputs and is called
     for each request. transport is where checked requests go; tests pass an
     httpx.MockTransport, and otherwise each client gets httpx's own.
+
+    local_listener(host, port) says whether a process of this account listens there.
+    A local provider reached over plain HTTP gets a request only then: another account
+    on this machine could otherwise take its port while it is not running and receive
+    the key and the content. It defaults to an lsof check when requests reach the real
+    network, and to none when a transport is passed (that transport is the destination).
+    ponytail: checked just before sending; a listener of this account holds the port, and
+    macOS lets no other account bind it meanwhile.
     """
 
-    def __init__(self, db, inputs: Callable[[], GateInputs], *, transport=None):
+    def __init__(self, db, inputs: Callable[[], GateInputs], *, transport=None, local_listener=None):
         self._db = db
         self._inputs = inputs
         self._transport = transport
+        self._local_listener = local_listener or (None if transport is not None else listener_is_ours)
 
     def client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
                **options) -> httpx.Client:
@@ -257,6 +268,14 @@ class OutboundGate:
             public_problem = "not_a_fetch"
         else:
             public_problem = None
+        # Whose process listens on a plain-HTTP loopback port, asked outside the transaction.
+        owned = None
+        if self._local_listener is not None and target is not None and target[0] == "http" \
+                and _is_this_host(target[1]):
+            try:
+                owned = bool(self._local_listener(target[1], target[2]))
+            except Exception:  # unknown counts as not ours
+                owned = False
         # The inputs are called outside the transaction, and the Private checks only
         # when the project is Private now. The level is read again in the transaction.
         seen = self._db.read(lambda conn: _level(conn, scope.project_id))
@@ -290,6 +309,8 @@ class OutboundGate:
                 reason = _policy(conn, level, kind, target, scope, private_problem, public_problem, bound)
                 if reason is None and not addressed:
                     reason = "host_mismatch"
+                if reason is None and kind is Kind.LOCAL_PROVIDER and owned is False:
+                    reason = "local_server_not_yours"
             shown = _shown(conn, target, kind, link, providers, helper)
             _record(conn, request, scope, level, kind, shown, reason)
             return kind, reason, shown
@@ -352,6 +373,15 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self):
         await self._inner.aclose()
+
+
+def listener_is_ours(host, port) -> bool:
+    """Whether a process of this account listens on this TCP port. lsof run as this account
+    lists only this account's processes (-u narrows it to them in any case)."""
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()), f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+        capture_output=True, timeout=5, check=False)
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def _dispatched(request):
