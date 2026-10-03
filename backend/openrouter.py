@@ -83,6 +83,7 @@ class Attempt:
     elapsed_ms: int
     usage: dict = field(default_factory=dict)  # tokens and cost as the provider reported them
     dispatched: bool = True  # False when the request certainly never reached the provider
+    retention: dict | None = None  # the retention terms the outbound gate applied to it (Scholia)
 
     @property
     def reported_cost(self):
@@ -99,7 +100,7 @@ class Attempt:
             tokens["reasoning_tokens"] = reasoning
         cost = self.reported_cost
         return {"outcome": self.outcome, "http_status": self.http_status, "elapsed_ms": self.elapsed_ms,
-                "dispatched": self.dispatched,
+                "dispatched": self.dispatched, **({"retention": self.retention} if self.retention is not None else {}),
                 **tokens, "charge": "reported" if cost is not None else (
                     "estimated" if "prompt_tokens" in tokens and "completion_tokens" in tokens else "unknown"),
                 **({"cost_usd": cost} if cost is not None else {})}
@@ -224,12 +225,12 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
     billed. on_dispatch, if given, is called with that notice, so a caller cancelled
     before it knows nothing left.
     """
-    sent = []  # the gate's notice that the current attempt's request went out
+    sent = []  # the gate's notices that the current attempt's request went out, with the terms it applied
 
-    def dispatched():
-        sent.append(True)
+    def dispatched(terms=None):
+        sent.append(terms)
         if on_dispatch is not None:
-            on_dispatch()
+            on_dispatch(terms)
 
     extensions = {DISPATCHED: dispatched}
     payload = build_payload(route, messages, effort=effort, zdr_enabled=zdr_enabled, max_tokens=max_tokens,
@@ -255,12 +256,14 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             # The gate's notice decides whether the request left: refused, cut off by the time
             # bound during the gate's check, or never connected, it did not.
             left = bool(sent) and not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout))
-            attempts.append(Attempt(classify_error(error), None, _ms(started), dispatched=left))
+            attempts.append(Attempt(classify_error(error), None, _ms(started), dispatched=left,
+                                    retention=sent[-1] if left else None))
             return _failed(attempts[-1].outcome, attempts, route)
         body = _json(response)
         usage = body.get("usage") if isinstance(body, dict) and isinstance(body.get("usage"), dict) else {}
         if response.status_code >= 400:
-            attempts.append(Attempt(classify_status(response.status_code), response.status_code, _ms(started), usage))
+            attempts.append(Attempt(classify_status(response.status_code), response.status_code, _ms(started), usage,
+                                    retention=sent[-1] if sent else None))
             retry = (response.status_code == 400 and "reasoning" in payload and not route.provider.is_openrouter
                      and len(attempts) < MAX_ATTEMPTS)
             if retry:
@@ -271,9 +274,10 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             return _failed(attempts[-1].outcome, attempts, route)
         content, reasoning = _answer(body)
         if visible(content) is None:  # nothing to show, invisible characters included
-            attempts.append(Attempt("malformed", response.status_code, _ms(started), usage))
+            attempts.append(Attempt("malformed", response.status_code, _ms(started), usage,
+                                    retention=sent[-1] if sent else None))
             return _failed("malformed", attempts, route)
-        attempts.append(Attempt("ok", response.status_code, _ms(started), usage))
+        attempts.append(Attempt("ok", response.status_code, _ms(started), usage, retention=sent[-1] if sent else None))
         if len(attempts) > 1 and "reasoning" not in payload:
             _remember_no_reasoning(route, key)
         return ModelResult(content, reasoning, None, attempts)

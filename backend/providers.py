@@ -93,15 +93,16 @@ def configured(data_root, settings=None, *, include_off=False) -> dict[str, Prov
 
 def gate_inputs(data_root) -> GateInputs:
     """What the outbound gate needs: the configured providers' base URLs, and for Private
-    projects the allowlist entry covering an OpenRouter model, which OpenRouter must also list
-    with a zero-retention endpoint, and whether a key's data settings are confirmed (see
-    backend/governance.py). The gate calls the last two inside its decision transaction."""
+    projects the allowlist entry covering an OpenRouter model (its flags, and its key, terms
+    and date for the record), which OpenRouter must also list with a zero-retention endpoint,
+    and whether a key's data settings are confirmed (see backend/governance.py). The gate
+    calls the last two inside its decision transaction."""
     found = configured(data_root)
     openrouter = [p for p in found.values() if p.is_openrouter and is_openrouter(p.base_url)]
 
     def private_route(conn, model):
-        flags = governance.private_flags(governance.allowlist(conn), model)
-        return flags if flags is not None and any(governance.zero_retention(p, model) for p in openrouter) else None
+        entry = governance.covering_entry(governance.allowlist(conn), model)
+        return entry if entry is not None and any(governance.zero_retention(p, model) for p in openrouter) else None
 
     return GateInputs(provider_urls=tuple(p.base_url for p in found.values()), private_route=private_route,
                       key_attested=lambda conn, key: governance.key_attested(conn, data_root, key))

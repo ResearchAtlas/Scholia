@@ -15,25 +15,17 @@ After the commit, the WAL is checkpointed and truncated, so deleted content does
 not stay in old WAL frames, and unreferenced content files are collected.
 """
 
+import contextlib
 import json
 import logging
-import threading
+import weakref
 
 log = logging.getLogger(__name__)
 
-# Revocations and the outbound gate's hand-offs are ordered by this lock (slice-1 spec section
-# 10): every write that revokes runs (a deletion, a tightened or review-locked project) holds it,
-# and the gate holds it from a request's decision until the request is handed to the transport.
-# So a request is handed over either before a revocation commits, and is then stopped as any
-# running request is, or after it, and refused by the dispatch check. ponytail: one lock for the
-# process; revoking writes are rare, and the gate holds it for one decision.
-REVOCATION = threading.Lock()
-
-
-def revoking_write(db, fn):
-    """db.write(fn), for a write that revokes runs: ordered with the gate's hand-offs."""
-    with REVOCATION:
-        return db.write(fn)
+# The outbound gate open over a database, if any, by database: delete() marks its write with the
+# gate's revoking_from_thread, for the project of what it deletes, so that no request of that
+# project enters the transport after the deletion commits (slice-1 spec section 10).
+REVOKING = weakref.WeakKeyDictionary()
 
 # What can be deleted: kind -> (table, column holding the tombstone's title).
 KINDS = {
@@ -166,7 +158,10 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
     """
     if kind not in KINDS:
         raise ValueError(f"cannot delete a {kind!r}")
-    revoked = revoking_write(db, lambda conn: _delete(conn, kind, object_id, remove_all_trace))
+    barrier = REVOKING.get(db)
+    project_id = db.read(lambda conn: _project_of(conn, kind, object_id)) if barrier else None
+    with barrier(project_id) if barrier else contextlib.nullcontext():
+        revoked = db.write(lambda conn: _delete(conn, kind, object_id, remove_all_trace))
     if on_committed is not None:
         on_committed(revoked)
     # The deletion is committed. These finish removing its traces, and the next
@@ -182,6 +177,15 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
     except Exception as error:
         log.warning("WAL truncation after a deletion failed (%s)", type(error).__name__)
     return revoked
+
+
+def _project_of(conn, kind, object_id):
+    """The project whose runs deleting the object may revoke; None (any project) for a personal
+    memory record, or an object that does not exist."""
+    table, _ = KINDS[kind]
+    row = conn.execute(f"SELECT {'id' if kind == 'project' else 'project_id'} FROM {table} WHERE id = ?",
+                       (object_id,)).fetchone()
+    return row[0] if row else None
 
 
 def _delete(conn, kind, object_id, remove_all_trace):

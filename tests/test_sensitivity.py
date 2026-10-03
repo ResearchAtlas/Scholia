@@ -372,63 +372,160 @@ async def test_a_level_changed_while_a_turn_is_admitted_refuses_it_before_anythi
         assert provider.chats == [] and await rows(client, "SELECT count(*) FROM runs") == [(0,)]
 
 
-# A revocation between the gate's decision and the hand-off to the transport
+# A revocation between the gate's decision and the request's entry into the transport
+
+
+def revocation_requests(client, project, conversation):
+    return {
+        "tighten": lambda: set_level(client, project, "private"),
+        "lock": lambda: client.post(f"/api/projects/{project}/review-lock", json={"locked": True}),
+        "delete": lambda: client.delete(f"/api/conversations/{conversation}"),
+    }
+
+
+def recording(monkeypatch, provider, order):
+    """Record when a revocation writes (in its transaction, just before it commits) and when a
+    chat request enters the transport (the provider's handler, called as the transport is entered)."""
+    from backend.db import deletion
+    real_revoke_running, real_revoke = governance.revoke_running, deletion._revoke
+    monkeypatch.setattr(governance, "revoke_running",
+                        lambda *args: order.append("revoked") or real_revoke_running(*args))
+    monkeypatch.setattr(deletion, "_revoke", lambda conn: order.append("revoked") or real_revoke(conn))
+
+    async def entered(request):  # the transport's handler, in front of the provider
+        if request.url.path.endswith("/chat/completions"):
+            order.append("entered")
+        return await provider(request)
+
+    return entered
 
 
 @pytest.mark.parametrize("change", ["tighten", "lock", "delete"])
-async def test_a_revocation_never_commits_between_a_decision_and_its_hand_off(tmp_path, monkeypatch, change):
-    # The exact interleaving: the gate has decided to allow the request, and before it hands the
-    # request to the transport, a tightening, a lock or a deletion revokes the run, and this
-    # process hears of it only later. The revocation waits for the hand-off, so the request was
-    # dispatched before the revocation committed (and is then stopped as any running request
-    # is), never after it.
+async def test_a_revocation_committed_after_a_decision_means_the_request_is_decided_again(tmp_path, monkeypatch,
+                                                                                         change):
+    # The exact interleaving: the gate has decided to allow the request; before the request enters
+    # the transport, a tightening, a lock or a deletion revokes the run and commits, this process
+    # hears of it only later, and the loop is held up just before the request would enter. The
+    # request never enters the transport after the revocation commits: it is decided again, and
+    # refused.
     from backend import outbound_gate
-    from backend.db import deletion
     from backend.runs import Harness
-    provider = MockProvider()
     order = []
-    async with started(tmp_path / "data", provider) as client:
+    provider = MockProvider()
+    async with started(tmp_path / "data", recording(monkeypatch, provider, order)) as client:
         project = await new_project(client)
         conversation = await new_conversation(client, project)
         loop, db = asyncio.get_running_loop(), client.state["db"]
         real_check, real_dispatched = outbound_gate.OutboundGate._check, outbound_gate._dispatched
-        real_revoke_running, real_revoke, real_harness_revoke = governance.revoke_running, deletion._revoke, Harness.revoke
-        requests = {
-            "tighten": lambda: set_level(client, project, "private"),
-            "lock": lambda: client.post(f"/api/projects/{project}/review-lock", json={"locked": True}),
-            "delete": lambda: client.delete(f"/api/conversations/{conversation}"),
-        }
+        real_harness_revoke = Harness.revoke
+        request = revocation_requests(client, project, conversation)[change]
 
-        def revoked_in_record():
+        def committed():
             row = db.read(lambda conn: conn.execute("SELECT cancel_reason FROM runs WHERE kind = 'turn'").fetchone())
             return row is None or row[0] == "revoked"
 
-        def check_then_revoke(self, request, scope):
-            kind = real_check(self, request, scope)
-            if scope.project_id == project and not order:  # the turn's call, decided and allowed
-                asyncio.run_coroutine_threadsafe(requests[change](), loop)
+        def check_then_revoke(self, request_, scope):
+            decided = real_check(self, request_, scope)
+            if scope.project_id == project and "revoked" not in order:  # the turn's call, decided and allowed
+                asyncio.run_coroutine_threadsafe(request(), loop)
                 deadline = time.monotonic() + 1
-                while not revoked_in_record() and time.monotonic() < deadline:
-                    time.sleep(0.01)  # the revocation is not let through before the hand-off
-            return kind
+                while not committed() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            return decided
 
-        def dispatched(request):
-            order.append("dispatched")
-            real_dispatched(request)
-
-        def heard_later(self, run_ids):  # this process hears of the revocation only after a while
-            loop.call_later(0.3, real_harness_revoke, self, run_ids)
+        def dispatched(*args):  # the last moment before the request enters: the loop is held up
+            loop.call_soon(time.sleep, 0.3)
+            real_dispatched(*args)
 
         monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_revoke)
         monkeypatch.setattr(outbound_gate, "_dispatched", dispatched)
-        monkeypatch.setattr(Harness, "revoke", heard_later)
-        monkeypatch.setattr(governance, "revoke_running",
-                            lambda *args: order.append("revoked") or real_revoke_running(*args))
-        monkeypatch.setattr(deletion, "_revoke", lambda conn: order.append("revoked") or real_revoke(conn))
+        monkeypatch.setattr(Harness, "revoke", lambda self, ids: loop.call_later(0.3, real_harness_revoke, self, ids))
         response = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
         await wait_for(lambda: "revoked" in order)
         await asyncio.sleep(0.4)
         await background_idle(client)
-        assert order[:2] == ["dispatched", "revoked"]
+        assert "entered" not in order[order.index("revoked"):]  # never entered after the revocation
+        assert "entered" not in order and provider.chats == []
+        decisions = await rows(client, "SELECT data ->> 'decision' FROM audit_log WHERE event = 'outbound'"
+                                       " AND project_id = ? ORDER BY seq", project)
+        assert decisions == [("allow",), ("deny",)]  # decided again after the revocation, and refused
         if change != "delete":
             assert events(response)[-1]["cancel_reason"] == "revoked"
+
+
+@pytest.mark.parametrize("change", ["tighten", "lock", "delete"])
+async def test_a_revocation_that_begins_as_a_request_enters_the_transport_finds_it_entered(tmp_path, monkeypatch,
+                                                                                          change):
+    # The other side of the boundary: the revocation is asked for at the last moment before the
+    # request enters the transport, and the loop is then held up while it commits. The request
+    # entered in the same step as its last check, so it is the in-flight case Stop handles; it
+    # never enters after the revocation commits.
+    from backend import outbound_gate
+    from backend.runs import Harness
+    order = []
+    provider = MockProvider()
+    async with started(tmp_path / "data", recording(monkeypatch, provider, order)) as client:
+        project = await new_project(client)
+        conversation = await new_conversation(client, project)
+        loop = asyncio.get_running_loop()
+        real_dispatched, real_harness_revoke = outbound_gate._dispatched, Harness.revoke
+        request = revocation_requests(client, project, conversation)[change]
+
+        def dispatched(*args):
+            if not order:
+                loop.create_task(request())
+                loop.call_soon(time.sleep, 0.3)  # the loop is held up while the revocation commits
+            real_dispatched(*args)
+
+        monkeypatch.setattr(outbound_gate, "_dispatched", dispatched)
+        monkeypatch.setattr(Harness, "revoke", lambda self, ids: loop.call_later(0.3, real_harness_revoke, self, ids))
+        await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
+        await wait_for(lambda: "revoked" in order)
+        await asyncio.sleep(0.4)
+        await background_idle(client)
+        assert order[:2] == ["entered", "revoked"]
+
+
+async def test_a_revocation_elsewhere_in_the_project_has_the_request_decided_again_and_sent(tmp_path, monkeypatch):
+    from backend import outbound_gate
+    order = []
+    provider = MockProvider()
+    async with started(tmp_path / "data", recording(monkeypatch, provider, order)) as client:
+        project = await new_project(client)
+        conversation = await new_conversation(client, project)
+        other = await new_conversation(client, project)
+        loop = asyncio.get_running_loop()
+        real_check = outbound_gate.OutboundGate._check
+
+        def check_then_delete_other(self, request_, scope):
+            decided = real_check(self, request_, scope)
+            if scope.project_id == project and "revoked" not in order:
+                asyncio.run_coroutine_threadsafe(client.delete(f"/api/conversations/{other}"), loop).result(timeout=2)
+            return decided
+
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_delete_other)
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "succeeded" and len(provider.answers) == 1
+        await background_idle(client)
+        decisions = await rows(client, "SELECT data ->> 'decision' FROM audit_log WHERE event = 'outbound'"
+                                       " AND project_id = ? ORDER BY seq LIMIT 2", project)
+        assert decisions == [("allow",), ("allow",)]  # decided again once the deletion settled
+
+
+async def test_revocations_and_dispatches_never_wait_for_each_others_workers(tmp_path):
+    # With one worker for the loop's threads, a turn's request, a tightening of another project
+    # and deletions all finish: no revocation holds a worker while waiting for a dispatch that
+    # needs one, nor the other way round.
+    from concurrent.futures import ThreadPoolExecutor
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(1))
+        project, elsewhere = await new_project(client), await new_project(client)
+        conversation = await new_conversation(client, project)
+        others = [await new_conversation(client, project) for _ in range(3)]
+        work = [send(client, conversation), set_level(client, elsewhere, "private"),
+                *(client.delete(f"/api/conversations/{other}") for other in others)]
+        done = await asyncio.wait_for(asyncio.gather(*work), timeout=10)
+        assert done[0][-1]["status"] == "succeeded"
+        await background_idle(client)

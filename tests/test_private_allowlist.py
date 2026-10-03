@@ -243,14 +243,25 @@ async def test_the_gate_reads_the_allowlist_and_the_catalog_itself(tmp_path):
         await client.get("/api/providers/openrouter/models")  # the catalog, as read
         inputs = client.state["gate"]._inputs()
         db = client.state["db"]
-        flags = await asyncio.to_thread(db.read, lambda conn: (inputs.private_route(conn, ZDR_MODEL),
+        found = await asyncio.to_thread(db.read, lambda conn: (inputs.private_route(conn, ZDR_MODEL),
                                                                 inputs.private_route(conn, PLAIN_MODEL)))
-        assert flags == ({"provider": {"zdr": True}}, None)
+        assert (found[0]["route_key"], found[0]["required_flags"], found[1]) == (
+            "openrouter:*", {"provider": {"zdr": True}}, None)
         assert project
 
 
-async def test_each_attempt_records_the_retention_policy_it_was_sent_under(tmp_path):
-    # Ticket 18's provenance: each call's route and its retention terms.
+async def attempt_terms(client):
+    rows_ = await rows(client, "SELECT r.workflow, e.data FROM run_events e JOIN runs r ON r.id = e.run_id"
+                               " WHERE e.type = 'model_attempt' ORDER BY r.started_at, e.seq")
+    return [(workflow, json.loads(data).get("retention")) for workflow, data in rows_]
+
+
+def applied(entry):
+    return {"route_key": entry["route_key"], "terms_url": entry["terms_url"], "checked_on": entry["checked_on"]}
+
+
+async def test_each_attempt_records_the_retention_terms_the_gate_applied(tmp_path):
+    # Ticket 18's provenance: each call's route and its retention terms, as the gate decided them.
     provider = provider_for_private()
     async with started(tmp_path / "data", provider) as client:
         await save(client, {"providers.local.kind": "openai-compatible", "providers.local.base_url": LOCAL,
@@ -263,16 +274,45 @@ async def test_each_attempt_records_the_retention_policy_it_was_sent_under(tmp_p
         normal = (await client.post("/api/conversations", json={"title": "Plain"})).json()["id"]
         await send(client, normal, model=ZDR_MODEL)
         await background_idle(client)
-        entry = governance.shipped()["entries"][0]
-        attempts = await rows(client, "SELECT r.workflow, e.data FROM run_events e JOIN runs r ON r.id = e.run_id"
-                                      " WHERE e.type = 'model_attempt' ORDER BY r.started_at, e.seq")
-        policies = [(workflow, json.loads(data)["retention"]) for workflow, data in attempts]
+        shipped = applied(governance.shipped()["entries"][0])
         [(declared_at,)] = await rows(client, "SELECT declared_at FROM local_declarations")
-        assert policies == [
-            ("agent", {"level": "private", "zero_retention": True, "allowlist_entry": "openrouter:*",
-                       "terms_url": entry["terms_url"], "checked_on": entry["checked_on"]}),
-            ("title", {"level": "private", "zero_retention": True, "allowlist_entry": "openrouter:*",
-                       "terms_url": entry["terms_url"], "checked_on": entry["checked_on"]}),
+        assert await attempt_terms(client) == [
+            ("agent", {"level": "private", "zero_retention": True, "allowlist": [shipped]}),
+            ("title", {"level": "private", "zero_retention": True, "allowlist": [shipped]}),
             ("agent", {"level": "private", "declared_origin": "http://127.0.0.1:11434", "declared_at": declared_at}),
             ("agent", {"level": "normal"}),
+        ]
+
+
+async def test_the_terms_recorded_are_those_applied_at_dispatch_not_at_admission(tmp_path, monkeypatch):
+    # Admitted under the shipped entry; an entry for the model itself, and a new declaration of the
+    # local server, land before the dispatch: each attempt records what was applied then.
+    from backend import runs
+    provider = provider_for_private()
+    async with started(tmp_path / "data", provider) as client:
+        await save(client, {"providers.local.kind": "openai-compatible", "providers.local.base_url": LOCAL,
+                            "providers.local.models": "all"})
+        await client.put("/api/keys/local", json={"key": "local"})
+        await declare(client, "local")
+        _, conversation = await private_conversation(client)
+        real = runs.Harness._reserve
+        changes = [lambda: client.put(f"/api/private-routes/openrouter:{ZDR_MODEL}", json={"enabled": True}),
+                   lambda: declare(client, "local")]
+
+        async def changed_then_reserve(self, *args, **kwargs):
+            if changes:
+                await changes.pop(0)()
+            return await real(self, *args, **kwargs)
+
+        monkeypatch.setattr(runs.Harness, "_reserve", changed_then_reserve)
+        await send(client, conversation, model=ZDR_MODEL, content="no title for this one")
+        await send(client, conversation, model="llama", provider="local")
+        await background_idle(client)
+        exact = next(e for e in (await client.get("/api/private-routes")).json()["routes"]
+                     if e["route_key"] == f"openrouter:{ZDR_MODEL}")
+        [(declared_at,)] = await rows(client, "SELECT declared_at FROM local_declarations")
+        terms = [t for workflow, t in await attempt_terms(client) if workflow == "agent"]
+        assert terms == [
+            {"level": "private", "zero_retention": True, "allowlist": [applied(exact)]},
+            {"level": "private", "declared_origin": "http://127.0.0.1:11434", "declared_at": declared_at},
         ]

@@ -670,11 +670,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             return {"ok": True, "files_left": True}
         return {"ok": True}
 
-    async def revoking(change):
-        """Write a change that returns the runs it revoked, ordered with the gate's hand-offs, and
-        stop them, both to their end."""
+    async def revoking(project_id, change):
+        """Write a change that returns the project's runs it revoked, marked with the outbound gate
+        so that no request of the project enters the transport after it commits, and stop them,
+        both to their end."""
         async def change_and_stop():
-            harness().revoke(await asyncio.to_thread(governance.revoking_write, db(), change))
+            async with state["gate"].revoking(project_id):
+                harness().revoke(await write(change))
         await _to_end(change_and_stop())
 
     def unchanged(conn, project_id, level, locked):
@@ -713,7 +715,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                               revoked_runs=len(revoked))
             return revoked
 
-        await revoking(change)
+        await revoking(project_id, change)
         return project_dict(await project_row(project_id))
 
     @app.post("/api/projects/{project_id}/review-lock")
@@ -744,7 +746,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                               venue_set=venue is not None, revoked_runs=len(revoked))
             return revoked
 
-        await revoking(change)
+        await revoking(project_id, change)
         return project_dict(await project_row(project_id))
 
     # Governance: the key confirmation, declared local servers, the Private allowlist, the audit log

@@ -31,6 +31,12 @@ AUTH = {"Authorization": f"Bearer {KEY}"}
 ZDR_ONLY = {"provider": {"zdr": True}}
 
 
+def entry(flags):
+    """An allowlist entry with these request flags, as GateInputs.private_route returns it."""
+    return {"route_key": "openrouter:*", "required_flags": flags, "terms_url": "https://openrouter.ai/terms",
+            "checked_on": "2026-10-03T00:00:00.000Z"}
+
+
 def chat(**fields):
     return {"model": "example/model-a", "messages": [{"role": "user", "content": "SECRET-PROMPT"}],
             "provider": {"zdr": True}, **fields}
@@ -69,7 +75,7 @@ def setup(db, remote):
     state = {"inputs": GateInputs(
         provider_urls=(OPENROUTER_API, OTHER_PROVIDER, LOCAL_SERVER),
         helper_url=HELPER,
-        private_route=lambda conn, model: ZDR_ONLY if model in ROUTES else None,
+        private_route=lambda conn, model: entry(ZDR_ONLY) if model in ROUTES else None,
         key_attested=lambda conn, key: key == KEY,
     )}
 
@@ -1086,14 +1092,14 @@ def test_the_chat_completions_path_after_dot_segments_is_the_endpoint(db, remote
 
 
 def test_private_needs_the_allowlist_entrys_own_flags_and_always_zdr(db, remote, setup):
-    setup.change(private_route=lambda conn, model: {"provider": {"zdr": True, "data_collection": "deny"}})
+    setup.change(private_route=lambda conn, model: entry({"provider": {"zdr": True, "data_collection": "deny"}}))
     with pytest.raises(OutboundDenied, match="missing_flags"):
         private_post(setup, db, chat())
     private_post(setup, db, chat(provider={"zdr": True, "data_collection": "deny"}))
-    setup.change(private_route=lambda conn, model: {})  # an entry cannot waive provider.zdr
+    setup.change(private_route=lambda conn, model: entry({}))  # an entry cannot waive provider.zdr
     with pytest.raises(OutboundDenied, match="missing_flags"):
         private_post(setup, db, chat(provider={}))
-    for flags in (None, ["provider"], "zdr"):
+    for flags in (None, ["provider"], "zdr", entry(None), entry("zdr")):
         setup.change(private_route=lambda conn, model, flags=flags: flags)
         with pytest.raises(OutboundDenied, match="route_not_allowed"):
             private_post(setup, db, chat())
@@ -1578,7 +1584,7 @@ def test_a_route_or_confirmation_withdrawn_after_the_inputs_were_read_refuses(db
     # between is seen, because both are read again with the decision's own connection.
     def route(conn, model):
         assert conn.in_transaction
-        return ZDR_ONLY if conn.execute("SELECT count(*) FROM private_routes").fetchone()[0] else None
+        return entry(ZDR_ONLY) if conn.execute("SELECT count(*) FROM private_routes").fetchone()[0] else None
 
     def attested(conn, key):
         assert conn.in_transaction

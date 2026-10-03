@@ -32,7 +32,6 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.db import new_id, utc_now
-from backend.db.deletion import revoking_write  # noqa: F401  (tightening and locking write through it)
 from backend.openrouter_client import get_model_metadata
 from backend.outbound_gate import is_openrouter, local_origin
 from backend.settings import write_private
@@ -260,20 +259,6 @@ class Policy:
                 return "private_route_not_allowed"
             return None
         return "route_not_allowed"
-
-    def terms(self, provider, model):
-        """The retention terms a step sent to this provider's model under this policy is covered
-        by, for its record (ticket 18's provenance): the level, and OpenRouter's zero retention
-        with its allowlist entry and the date its terms were checked, or the declaration of a
-        server on this Mac."""
-        origin = local_origin(provider.base_url)
-        if self.level != "normal" and origin in self.declared:
-            return {"level": self.level, "declared_origin": origin, "declared_at": self.declared[origin]}
-        entry = covering_entry(self.entries, model) if self.zero_retention and provider.is_openrouter else None
-        if entry is not None:
-            return {"level": self.level, "zero_retention": True, "allowlist_entry": entry["route_key"],
-                    "terms_url": entry["terms_url"], "checked_on": entry["checked_on"]}
-        return {"level": self.level}
 
     def allows_provider(self, provider) -> bool:
         """Whether some model of the provider may be allowed: the defaults pass over the rest."""
