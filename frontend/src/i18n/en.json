@@ -462,7 +462,7 @@
   "audit.exported": "Saved to {path}",
   "audit.clear": "Clear the log",
   "audit.clearTitle": "Clear the audit log?",
-  "audit.clearBody": "Every entry is deleted. A record that the log was cleared stays.",
+  "audit.clearBody": "Every entry is deleted. A record that the log was cleared stays, and so does each record of a Delete everywhere that replaced the backups.",
   "audit.clearConfirm": "Clear",
   "audit.allowed": "Allowed",
   "audit.refused": "Refused: {reason}",

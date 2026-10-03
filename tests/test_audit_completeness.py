@@ -195,3 +195,87 @@ async def test_every_refusal_reason_and_destination_kind_is_named_in_each_interf
         catalog = json.loads((root / name).read_text(encoding="utf-8"))
         assert {r for r in REASONS | {"local_server_not_yours"} if f"audit.reason.{r}" not in catalog} == set(), name
         assert {k.value for k in Kind if f"audit.kind.{k.value}" not in catalog} == set(), name
+
+
+# Clearing keeps the purge records a restore compares
+
+
+async def clear_log(client):
+    token = (await client.delete("/api/audit")).json()["token"]
+    return await client.delete("/api/audit", params={"token": token})
+
+
+def pause_staging(monkeypatch):
+    """Hold a restore once its backup is staged, before anything is replaced: (staged, go) events."""
+    import threading
+    import backend.backups as backups_module
+    real, staged, go = backups_module._stage, threading.Event(), threading.Event()
+
+    def stage_then_wait(*args):
+        real(*args)
+        staged.set()
+        assert go.wait(10)
+
+    monkeypatch.setattr(backups_module, "_stage", stage_then_wait)
+    return staged, go
+
+
+async def test_a_log_cleared_while_a_restore_stages_its_backup_keeps_the_restore_valid(tmp_path, monkeypatch):
+    # An earlier "Delete everywhere" left one backup, which is restored; the log is cleared between
+    # staging and replacement. The purge record stays, so the restore sees no purge since it began.
+    async with started(tmp_path / "data") as client:
+        gone = (await client.post("/api/projects", json={"name": "Gone"})).json()["id"]
+        assert (await client.delete(f"/api/projects/{gone}", params={"purge_backups": "true"})).status_code == 200
+        [backup] = [b["id"] for b in (await client.get("/api/backups")).json()["backups"]]
+        staged, go = pause_staging(monkeypatch)
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        assert await asyncio.to_thread(staged.wait, 5)
+        assert (await clear_log(client)).status_code == 200
+        assert await rows(client, "SELECT event FROM audit_log ORDER BY seq") == [("backup_purge",), ("audit_cleared",)]
+        with pytest.raises(sqlite3.IntegrityError):  # nor can anything else delete it
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+                "DELETE FROM audit_log WHERE event = 'backup_purge'"))
+        go.set()
+        assert (await restore).status_code == 200
+
+
+async def test_a_purge_during_a_restore_is_not_hidden_by_clearing_the_log(tmp_path, monkeypatch):
+    # A restore stages a backup holding project Kept. Meanwhile Kept is deleted everywhere, and the
+    # purge cannot remove the staged copy (staging_left); then the log is cleared. The restore still
+    # finds the purge, and refuses: the staged copy of deleted data is never put in place.
+    import threading
+    import backend.backups as backups_module
+    async with started(tmp_path / "data") as client:
+        kept = (await client.post("/api/projects", json={"name": "Kept"})).json()["id"]
+        backup = (await client.post("/api/backups")).json()["id"]
+        staged, go = pause_staging(monkeypatch)
+        real_remove = backups_module._remove
+
+        def remove(path):
+            if backups_module.STAGING in Path(path).parts:
+                raise OSError("I/O error")
+            real_remove(path)
+
+        monkeypatch.setattr(backups_module, "_remove", remove)
+        db, clearing, cleared = client.state["db"], threading.Event(), threading.Event()
+        real_write = db.write
+
+        def write_when_let(fn):  # the clearing is admitted with the deletion, and writes after the purge
+            if fn.__qualname__.endswith("clear_audit.<locals>.clear"):
+                clearing.set()
+                assert cleared.wait(10)
+            return real_write(fn)
+
+        monkeypatch.setattr(db, "write", write_when_let)
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        assert await asyncio.to_thread(staged.wait, 5)
+        deletion = asyncio.create_task(client.delete(f"/api/projects/{kept}", params={"purge_backups": "true"}))
+        token = (await client.delete("/api/audit")).json()["token"]
+        clear = asyncio.create_task(client.delete("/api/audit", params={"token": token}))
+        assert await asyncio.to_thread(clearing.wait, 5)
+        go.set()
+        assert (await deletion).json()["staging_left"] is True  # the staged copy is still there
+        cleared.set()
+        assert (await clear).status_code == 200
+        assert (await restore).status_code == 404  # a purge came between: not this backup
+        assert kept not in {p["id"] for p in (await client.get("/api/projects")).json()["projects"]}

@@ -458,7 +458,7 @@
   "audit.exported": "已保存到 {path}",
   "audit.clear": "清空日志",
   "audit.clearTitle": "清空审计日志？",
-  "audit.clearBody": "所有条目都会被删除，但会保留一条“日志已清空”的记录。",
+  "audit.clearBody": "所有条目都会被删除，但会保留一条“日志已清空”的记录，以及每次“全部删除，包括备份”替换备份的记录。",
   "audit.clearConfirm": "清空",
   "audit.allowed": "已允许",
   "audit.refused": "已拒绝：{reason}",

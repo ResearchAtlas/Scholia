@@ -976,7 +976,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @app.delete("/api/audit")
     async def clear_audit(token: str | None = None):
         """Clear the audit log, after the researcher confirms (a first request answers 409
-        confirmation_required with a token). A record of the clearing stays."""
+        confirmation_required with a token). A record of the clearing stays, and so do the
+        records of purged backups, which a restore compares (backups._purges)."""
         if not confirmed(token, "audit_clear"):
             return confirmation_needed("audit_clear")
 
@@ -984,7 +985,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             (rows,) = conn.execute("SELECT count(*) FROM audit_log").fetchone()
             governance.record(conn, "audit_cleared", rows=rows)
             conn.execute("DELETE FROM audit_log WHERE seq < (SELECT max(seq) FROM audit_log)"
-                         " AND event <> 'audit_cleared'")  # every clearing stays on record
+                         " AND event NOT IN ('audit_cleared', 'backup_purge')")  # these stay on record
             return rows
 
         return {"ok": True, "rows": await _to_end(write(clear))}
