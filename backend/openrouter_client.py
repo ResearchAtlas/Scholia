@@ -215,10 +215,12 @@ def catalog_read(route) -> bool:
                for (name, base_url, _), state in _caches.items())  # an empty catalog read well lists nothing
 
 
-def get_model_metadata(route):
-    """The cached catalog row for a route's model, or None. Never performs network I/O."""
-    for (name, base_url, _), state in _caches.items():
-        if name == route.provider.name and base_url == route.provider.base_url and state["models"]:
+def get_model_metadata(route, key=None):
+    """The cached catalog row for a route's model, or None; with key, only from the catalog
+    read with that key. Never performs network I/O."""
+    for (name, base_url, digest), state in _caches.items():
+        if name == route.provider.name and base_url == route.provider.base_url and state["models"] \
+                and (key is None or digest == _scope(route.provider, key)[2]):
             return state["models"].get(route.model)
     return None
 

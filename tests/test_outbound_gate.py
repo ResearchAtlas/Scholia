@@ -76,8 +76,8 @@ def setup(db, remote):
     state = {"inputs": GateInputs(
         provider_urls=(OPENROUTER_API, OTHER_PROVIDER, LOCAL_SERVER),
         helper_url=HELPER,
-        private_route=lambda conn, model: entry(ZDR_ONLY) if model in ROUTES else None,
-        key_attested=lambda conn, key: CONFIRMED_UNTIL if key == KEY else None,
+        private_route=lambda conn, provider, key, model: entry(ZDR_ONLY) if model in ROUTES else None,
+        key_attested=lambda conn, provider, key: CONFIRMED_UNTIL if key == KEY else None,
     )}
 
     class Setup:
@@ -1093,15 +1093,15 @@ def test_the_chat_completions_path_after_dot_segments_is_the_endpoint(db, remote
 
 
 def test_private_needs_the_allowlist_entrys_own_flags_and_always_zdr(db, remote, setup):
-    setup.change(private_route=lambda conn, model: entry({"provider": {"zdr": True, "data_collection": "deny"}}))
+    setup.change(private_route=lambda *args: entry({"provider": {"zdr": True, "data_collection": "deny"}}))
     with pytest.raises(OutboundDenied, match="missing_flags"):
         private_post(setup, db, chat())
     private_post(setup, db, chat(provider={"zdr": True, "data_collection": "deny"}))
-    setup.change(private_route=lambda conn, model: entry({}))  # an entry cannot waive provider.zdr
+    setup.change(private_route=lambda *args: entry({}))  # an entry cannot waive provider.zdr
     with pytest.raises(OutboundDenied, match="missing_flags"):
         private_post(setup, db, chat(provider={}))
     for flags in (None, ["provider"], "zdr", entry(None), entry("zdr")):
-        setup.change(private_route=lambda conn, model, flags=flags: flags)
+        setup.change(private_route=lambda *args, flags=flags: flags)
         with pytest.raises(OutboundDenied, match="route_not_allowed"):
             private_post(setup, db, chat())
     assert len(remote.received) == 1
@@ -1119,7 +1119,7 @@ def test_private_refuses_a_key_without_a_current_confirmation(db, remote, setup,
 
 @pytest.mark.parametrize("until", [1, True, "2000-01-01T00:00:00.000Z"])
 def test_private_needs_a_confirmation_that_lapses_later(db, remote, setup, until):
-    setup.change(key_attested=lambda conn, key: until)  # not a time, or one already past
+    setup.change(key_attested=lambda *args: until)  # not a time, or one already past
     with pytest.raises(OutboundDenied, match="key_not_confirmed"):
         private_post(setup, db, chat())
     assert remote.received == []
@@ -1172,7 +1172,7 @@ async def test_failing_inputs_are_recorded_as_a_refusal_async(db, remote, setup)
 def test_private_checks_run_only_for_private_projects(db, remote, setup):
     calls = []
 
-    def route(conn, model):
+    def route(conn, provider, key, model):
         calls.append("route")
         raise RuntimeError("allowlist unreadable")
 
@@ -1584,11 +1584,11 @@ def _attest(db):
 def test_a_route_or_confirmation_withdrawn_after_the_inputs_were_read_refuses(db, remote, setup, withdrawn):
     # The inputs are read before the decision; a confirmation or allowlist entry withdrawn in
     # between is seen, because both are read again with the decision's own connection.
-    def route(conn, model):
+    def route(conn, provider, key, model):
         assert conn.in_transaction
         return entry(ZDR_ONLY) if conn.execute("SELECT count(*) FROM private_routes").fetchone()[0] else None
 
-    def attested(conn, key):
+    def attested(conn, provider, key):
         assert conn.in_transaction
         return CONFIRMED_UNTIL if conn.execute("SELECT count(*) FROM key_attestations").fetchone()[0] else None
 

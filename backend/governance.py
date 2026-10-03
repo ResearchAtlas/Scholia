@@ -109,10 +109,11 @@ def private_flags(entries, model):
     return entry["required_flags"] if entry is not None else None
 
 
-def zero_retention(provider, model) -> bool:
-    """Whether the provider's catalog, as read, lists a zero-retention endpoint for the model."""
+def zero_retention(provider, model, key=None) -> bool:
+    """Whether the provider's catalog, as read (with key, when given: as read with that key),
+    lists a zero-retention endpoint for the model."""
     from backend.providers import Route  # providers reads this module's checks for the gate
-    return (get_model_metadata(Route(provider, model)) or {}).get("supports_zdr") is True
+    return (get_model_metadata(Route(provider, model), key) or {}).get("supports_zdr") is True
 
 
 # Declared local servers
@@ -189,14 +190,14 @@ def fingerprint(data_dir, key):
     return hmac.new(_salt(data_dir), key.encode(), hashlib.sha256).hexdigest()
 
 
-def confirmation(conn, data_dir, key, now=None):
-    """The key's data-settings confirmation: status is current, missing (none at all),
-    other_key (none for this key), outdated (of an earlier statement) or expired; with the
-    latest confirmation's times."""
+def confirmation(conn, data_dir, provider, key, now=None):
+    """The provider's data-settings confirmation of its key: status is current, missing (none
+    at all), other_key (none for this key), outdated (of an earlier statement) or expired;
+    with the latest confirmation's times."""
     now = now or utc_now()
     mark = fingerprint(data_dir, key)
     rows = conn.execute("SELECT key_fingerprint, statement, confirmed_at, expires_at FROM key_attestations"
-                        " ORDER BY confirmed_at DESC").fetchall()
+                        " WHERE provider = ? ORDER BY confirmed_at DESC", (provider,)).fetchall()
     mine = [row for row in rows if hmac.compare_digest(row[0], mark)]
     current = [row for row in mine if row[1] == KEY_STATEMENT and row[3] > now]
     if current or not mine:
@@ -215,18 +216,20 @@ def key_reference(mark):
     return mark[:16]
 
 
-def key_confirmed_until(conn, data_dir, key):
-    """When the key's current data-settings confirmation lapses (the latest of them), or None
-    when it has none: the outbound gate holds a Private request's dispatch to that time."""
+def key_confirmed_until(conn, data_dir, provider, key):
+    """When the provider's current data-settings confirmation of the key lapses (the latest of
+    them), or None when it has none: the outbound gate holds a Private request's dispatch to
+    that time. A confirmation is the provider's own: another entry holding the same key has its
+    own, and a provider whose key changed is asked again (section 6.4), even when the key returns."""
     mark, now = fingerprint(data_dir, key), utc_now()
     until = [expires for fingerprint_, statement, expires in conn.execute(
-        "SELECT key_fingerprint, statement, expires_at FROM key_attestations")
+        "SELECT key_fingerprint, statement, expires_at FROM key_attestations WHERE provider = ?", (provider,))
         if hmac.compare_digest(fingerprint_, mark) and statement == KEY_STATEMENT and expires > now]
     return max(until) if until else None
 
 
-def key_attested(conn, data_dir, key) -> bool:
-    return key_confirmed_until(conn, data_dir, key) is not None
+def key_attested(conn, data_dir, provider, key) -> bool:
+    return key_confirmed_until(conn, data_dir, provider, key) is not None
 
 
 def confirm_key(conn, data_dir, provider, key):

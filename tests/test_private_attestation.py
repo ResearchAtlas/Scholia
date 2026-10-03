@@ -217,3 +217,59 @@ async def test_a_private_title_run_resumed_after_a_restart_reads_the_catalog_fir
         await background_idle(client)
         assert [body["provider"] for body in provider.titles] == [{"zdr": True}]
         assert await rows(client, "SELECT status FROM runs WHERE workflow = 'title'") == [("succeeded",)]
+
+
+async def add_work(client, key=KEY):
+    """A second OpenRouter entry, work, with key."""
+    current = (await client.get("/api/settings")).json()
+    await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+        "providers.work.kind": "openrouter", "providers.work.base_url": "https://openrouter.ai/api/v1",
+        "providers.work.models": "all"}})
+    assert (await client.put("/api/keys/work", json={"key": key})).status_code == 200
+
+
+async def status_of(client, name):
+    [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == name]
+    return shown["key_confirmation"]["status"]
+
+
+async def test_a_confirmation_is_for_one_provider_even_when_another_holds_the_same_key(tmp_path):
+    # Two OpenRouter entries with the same key: a confirmation made through one is not the other's,
+    # and a key changed away and back is asked about again while the other's confirmation stands.
+    provider = MockProvider(catalog=[MODEL], zero_retention=[MODEL])
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await setup_private(client)
+        await add_work(client)
+        assert (await confirm_key(client, "work")).status_code == 200
+        assert await status_of(client, "openrouter") == "missing"
+        assert await refused_code(client, conversation) == (403, "key_not_confirmed")
+        assert (await confirm_key(client, "openrouter")).status_code == 200
+        assert (await client.put("/api/keys/openrouter", json={"key": "sk-or-another-test-key"})).status_code == 200
+        assert (await client.put("/api/keys/openrouter", json={"key": KEY})).status_code == 200  # the first key again
+        assert (await status_of(client, "openrouter"), await status_of(client, "work")) == ("missing", "current")
+        assert await refused_code(client, conversation) == (403, "key_not_confirmed")
+        assert provider.chats == []
+
+
+async def test_the_gate_checks_the_confirmation_of_the_provider_a_request_goes_through(tmp_path, monkeypatch):
+    # Both entries confirmed the same key; the first one's confirmation ends after admission. Its
+    # request is refused at the gate, though the other entry's confirmation of that key stands.
+    from backend import runs
+    provider = MockProvider(catalog=[MODEL], zero_retention=[MODEL])
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await setup_private(client)
+        await add_work(client)
+        for name in ("openrouter", "work"):
+            assert (await confirm_key(client, name)).status_code == 200
+        real = runs.Harness._reserve
+
+        async def unconfirmed_then_reserve(self, *args, **kwargs):
+            await write(client, "DELETE FROM key_attestations WHERE provider = 'openrouter'")
+            return await real(self, *args, **kwargs)
+
+        monkeypatch.setattr(runs.Harness, "_reserve", unconfirmed_then_reserve)
+        stream = await send(client, conversation, model=MODEL, provider="openrouter")
+        assert (stream[-2]["code"], stream[-1]["status"]) == ("refused", "failed")
+        assert provider.chats == []
+        assert await rows(client, "SELECT data ->> 'reason' FROM audit_log WHERE event = 'outbound'"
+                                  " AND data ->> 'decision' = 'deny'") == [("key_not_confirmed",)]

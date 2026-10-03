@@ -698,10 +698,12 @@ async def test_a_cancelled_allowlist_change_keeps_its_mark_until_its_write_has_f
         assert await asyncio.to_thread(real_write, disabled)
 
 
-async def test_a_key_changed_through_another_name_is_ordered_with_dispatch(tmp_path, monkeypatch):
-    # Two names for the same OpenRouter key; the confirmation was made through the other one.
-    # Changing that other name's key ends the confirmation the first name was using, between the
-    # first name's decision and its entry into the transport: it is decided again, and refused.
+async def test_a_key_changed_through_another_name_is_ordered_with_dispatch_and_ends_only_its_confirmation(
+        tmp_path, monkeypatch):
+    # Two names for the same OpenRouter key, each with its own confirmation. Changing the other
+    # name's key between the first name's decision and its entry into the transport is ordered
+    # with it: the request is decided again. Its own confirmation stands; the change forgot every
+    # catalog, so it is refused for its route until the catalog is read again, not for its key.
     from backend import openrouter_client, outbound_gate
     from scholia_app import KEY
     openrouter_client.clear_cache()
@@ -712,7 +714,8 @@ async def test_a_key_changed_through_another_name_is_ordered_with_dispatch(tmp_p
             "providers.work.kind": "openrouter", "providers.work.base_url": "https://openrouter.ai/api/v1",
             "providers.work.models": "all"}})
         assert (await client.put("/api/keys/work", json={"key": KEY})).status_code == 200  # the same key
-        project, conversation = await private_setup(client, key_owner="work")
+        assert (await confirm_key(client, "work")).status_code == 200
+        project, conversation = await private_setup(client)
         loop, db = asyncio.get_running_loop(), client.state["db"]
         real_check = outbound_gate.OutboundGate._check
 
@@ -722,7 +725,7 @@ async def test_a_key_changed_through_another_name_is_ordered_with_dispatch(tmp_p
                 order.append("changed")
                 asyncio.run_coroutine_threadsafe(client.put("/api/keys/work", json={"key": "sk-or-another"}), loop)
                 deadline = time.monotonic() + 1
-                while db.read(lambda conn: conn.execute("SELECT count(*) FROM key_attestations").fetchone()) != (0,) \
+                while db.read(lambda conn: conn.execute("SELECT count(*) FROM key_attestations").fetchone()) != (1,) \
                         and time.monotonic() < deadline:
                     time.sleep(0.01)
             return found
@@ -730,10 +733,11 @@ async def test_a_key_changed_through_another_name_is_ordered_with_dispatch(tmp_p
         monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_change_the_other_key)
         stream = await send(client, conversation, model="example/zdr-model", provider="openrouter")
         await background_idle(client)
-        assert order[0] == "changed" and "entered" not in order and provider.chats == []
-        decisions = await rows(client, "SELECT data ->> 'decision' FROM audit_log WHERE event = 'outbound'"
-                                       " AND project_id = ? ORDER BY seq", project)
-        assert decisions == [("allow",), ("deny",)] and stream[-1]["status"] == "failed"
+        assert order == ["changed"] and provider.chats == [] and stream[-1]["status"] == "failed"
+        reasons = await rows(client, "SELECT data ->> 'reason' FROM audit_log WHERE event = 'outbound'"
+                                     " AND project_id = ? ORDER BY seq", project)
+        assert reasons == [(None,), ("route_not_allowed",)]
+        assert await rows(client, "SELECT provider FROM key_attestations") == [("openrouter",)]
 
 
 async def test_a_confirmation_that_lapses_between_decision_and_entry_is_honoured(tmp_path, monkeypatch):

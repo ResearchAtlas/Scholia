@@ -153,8 +153,8 @@ def test_private_uses_a_declared_server_without_openrouters_flags_or_a_confirmed
     # Ticket 64: the same declaration, audit record and dispatch checks as Local only; the
     # Private allowlist and the key confirmation are OpenRouter's alone.
     base, received = server(stack)
-    gate = OutboundGate(db, lambda: GateInputs(provider_urls=[f"{base}/v1"], private_route=lambda conn, model: None,
-                                               key_attested=lambda conn, key: False), local_listener=ours)
+    gate = OutboundGate(db, lambda: GateInputs(provider_urls=[f"{base}/v1"], private_route=lambda *args: None,
+                                               key_attested=lambda *args: False), local_listener=ours)
     with gate.client(project(db, "private")) as client:
         with pytest.raises(OutboundDenied, match="not_declared"):  # loopback alone is only transport
             client.post(f"{base}/v1/chat/completions", json={"model": "local", "messages": []})

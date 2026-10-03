@@ -491,7 +491,8 @@ class Harness:
             raise AdmissionError(400, "model_needed", "Choose a model for this provider")
         if problem := policy.problem(provider_config, model_for_problem):
             raise AdmissionError(403, problem, "This project's protection does not allow that model")
-        if zero_retention and not await self._read(lambda conn: governance.key_attested(conn, self.data_dir, key)):
+        if zero_retention and not await self._read(lambda conn: governance.key_attested(
+                conn, self.data_dir, provider_config.name, key)):
             raise AdmissionError(403, "key_not_confirmed", "Confirm the key's OpenRouter data settings first")
         route = providers.Route(provider_config, plan.model)
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
@@ -780,7 +781,8 @@ class Harness:
             call.dispatched, call.retention = True, terms
 
         call.route = route.key
-        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id)) as client:
+        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id),
+                                          provider=route.provider.name) as client:
             result = await openrouter.query_model(
                 client, route, key, messages, timeout=MODEL_CALL_SECONDS, effort=effort, max_tokens=max_tokens,
                 zdr_enabled=zero_retention, model_entry=get_model_metadata(route), on_dispatch=dispatched)

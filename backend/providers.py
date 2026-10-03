@@ -94,18 +94,23 @@ def configured(data_root, settings=None, *, include_off=False) -> dict[str, Prov
 def gate_inputs(data_root) -> GateInputs:
     """What the outbound gate needs: the configured providers' base URLs, and for Private
     projects the allowlist entry covering an OpenRouter model (its flags, and its key, terms
-    and date for the record), which OpenRouter must also list with a zero-retention endpoint,
-    and whether a key's data settings are confirmed (see backend/governance.py). The gate
-    calls the last two inside its decision transaction."""
+    and date for the record), which the catalog of the provider the request goes through, as
+    read with its key, must also list with a zero-retention endpoint, and whether that
+    provider's key's data settings are confirmed (see backend/governance.py). The gate calls
+    the last two inside its decision transaction."""
     found = configured(data_root)
-    openrouter = [p for p in found.values() if p.is_openrouter and is_openrouter(p.base_url)]
 
-    def private_route(conn, model):
+    def private_route(conn, provider, key, model):
+        """Only for an OpenRouter entry on its own origin, by the catalog it read with key."""
+        chosen = found.get(provider)
+        if chosen is None or not (chosen.is_openrouter and is_openrouter(chosen.base_url)):
+            return None
         entry = governance.covering_entry(governance.allowlist(conn), model)
-        return entry if entry is not None and any(governance.zero_retention(p, model) for p in openrouter) else None
+        return entry if entry is not None and governance.zero_retention(chosen, model, key) else None
 
     return GateInputs(provider_urls=tuple(p.base_url for p in found.values()), private_route=private_route,
-                      key_attested=lambda conn, key: governance.key_confirmed_until(conn, data_root, key))
+                      key_attested=lambda conn, provider, key: governance.key_confirmed_until(
+                          conn, data_root, provider, key))
 
 
 def resolve_route(data_root, provider_name: str | None, model: str | None) -> Route | None:

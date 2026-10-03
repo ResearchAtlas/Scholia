@@ -13,7 +13,7 @@ import json
 import pytest
 
 from backend import governance, openrouter_client
-from scholia_app import MockProvider, background_idle, confirm_key, declare, send, started
+from scholia_app import KEY, MockProvider, background_idle, confirm_key, declare, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -243,8 +243,8 @@ async def test_the_gate_reads_the_allowlist_and_the_catalog_itself(tmp_path):
         await client.get("/api/providers/openrouter/models")  # the catalog, as read
         inputs = client.state["gate"]._inputs()
         db = client.state["db"]
-        found = await asyncio.to_thread(db.read, lambda conn: (inputs.private_route(conn, ZDR_MODEL),
-                                                                inputs.private_route(conn, PLAIN_MODEL)))
+        found = await asyncio.to_thread(db.read, lambda conn: [inputs.private_route(conn, "openrouter", KEY, model)
+                                                                for model in (ZDR_MODEL, PLAIN_MODEL)])
         assert (found[0]["route_key"], found[0]["required_flags"], found[1]) == (
             "openrouter:*", {"provider": {"zdr": True}}, None)
         assert project
@@ -319,3 +319,33 @@ async def test_the_terms_recorded_are_those_applied_at_dispatch_not_at_admission
             {"level": "private", "zero_retention": True, "allowlist": [applied(exact)], "key_confirmed_until": until},
             {"level": "private", "declared_origin": "http://127.0.0.1:11434", "declared_at": declared_at},
         ]
+
+
+async def test_the_gate_reads_the_catalog_of_the_provider_and_key_a_request_goes_through(tmp_path, monkeypatch):
+    # Two OpenRouter entries with their own keys. Between admission and dispatch, the second one's
+    # catalog, read again, no longer lists a zero-retention endpoint for the model: its request is
+    # refused at the gate, whatever the first one's catalog says.
+    from backend import runs
+    provider = provider_for_private()
+    async with started(tmp_path / "data", provider) as client:
+        await save(client, {"providers.work.kind": "openrouter", "providers.work.base_url": "https://openrouter.ai/api/v1",
+                            "providers.work.models": "all"})
+        assert (await client.put("/api/keys/work", json={"key": "sk-or-work-test-key"})).status_code == 200
+        _, conversation = await private_conversation(client)
+        assert (await confirm_key(client, "work")).status_code == 200
+        for name in ("openrouter", "work"):
+            assert ZDR_MODEL in {m["id"] for m in (await client.get(f"/api/providers/{name}/models")).json()["models"]}
+        real = runs.Harness._reserve
+
+        async def refreshed_then_reserve(self, *args, **kwargs):
+            [work] = [state for (name, *_), state in openrouter_client._caches.items() if name == "work"]
+            work["models"] = {**work["models"], ZDR_MODEL: {**work["models"][ZDR_MODEL], "supports_zdr": False}}
+            return await real(self, *args, **kwargs)
+
+        monkeypatch.setattr(runs.Harness, "_reserve", refreshed_then_reserve)
+        stream = await send(client, conversation, model=ZDR_MODEL, provider="work")
+        await background_idle(client)
+        assert provider.chats == [] and stream[-1]["status"] == "failed"
+        assert {reason for (reason,) in await rows(
+            client, "SELECT data ->> 'reason' FROM audit_log WHERE event = 'outbound'"
+                    " AND data ->> 'decision' = 'deny'")} == {"route_not_allowed"}

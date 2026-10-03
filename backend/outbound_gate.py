@@ -194,18 +194,20 @@ class GateInputs:
 
     provider_urls: base URLs of the model providers configured in settings.
     helper_url: base URL of the running local helper, on loopback.
-    private_route(conn, model): the enabled Private allowlist entry covering an OpenRouter
-        model id (a mapping with its required_flags, route_key, terms_url and checked_on), or
-        None if none covers it.
-    key_attested(conn, key): when a key's current data-settings confirmation lapses (an
-        ISO 8601 UTC time), or None when it has none; a request is dispatched only before then.
-    Both are called inside the decision transaction, with its connection.
+    private_route(conn, provider, key, model): the enabled Private allowlist entry covering an
+        OpenRouter model id (a mapping with its required_flags, route_key, terms_url and
+        checked_on) for a request through the named provider with key, or None if none does.
+    key_attested(conn, provider, key): when the named provider's current data-settings
+        confirmation of the key lapses (an ISO 8601 UTC time), or None when it has none; a
+        request is dispatched only before then.
+    Both are called inside the decision transaction, with its connection, and with the
+    provider the client was made for (see OutboundGate.client), or None.
     """
 
     provider_urls: Collection[str] = ()
     helper_url: str | None = None
-    private_route: Callable[[object, str], Mapping | None] | None = None  # see above
-    key_attested: Callable[[object, str], str | None] | None = None
+    private_route: Callable[[object, str | None, str, str], Mapping | None] | None = None  # see above
+    key_attested: Callable[[object, str | None, str], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -214,6 +216,7 @@ class _Scope:
     candidate_id: str | None
     approved: bool
     admit: Callable | None = field(default=None, compare=False, repr=False)  # see OutboundGate.client
+    provider: str | None = None  # see OutboundGate.client
     # Redirect hops this client may still take: one-time token -> (origin, path and query as sent).
     hops: dict = field(default_factory=dict, compare=False, repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
@@ -369,26 +372,29 @@ class OutboundGate:
                     loop.call_soon_threadsafe(self._end, project_id)
 
     def client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
-               admit: Callable | None = None, **options) -> httpx.Client:
+               admit: Callable | None = None, provider: str | None = None, **options) -> httpx.Client:
         """A client for one project's requests.
 
         candidate_id names the candidate whose open-access link this client may
         fetch. approved means the researcher approved these requests, which Local
         only projects need for scholarly APIs and open-access hosts. admit(conn), if
         given, is called in the decision transaction of every request the policy
-        allows; anything but True refuses it as "revoked". options are
+        allows; anything but True refuses it as "revoked". provider names the configured
+        provider a model call goes through: a Private request to OpenRouter is checked against
+        that provider's catalog and its own confirmation of the key (none without it). options are
         limited to base_url, follow_redirects, headers, max_redirects and timeout.
         Proxy and certificate settings in the environment are ignored: TLS uses
         certifi's CA bundle.
         """
-        transport = _Transport(self, _Scope(_project_id(project_id), candidate_id, approved, admit),
+        transport = _Transport(self, _Scope(_project_id(project_id), candidate_id, approved, admit, provider=provider),
                                self._transport or httpx.HTTPTransport(trust_env=False))
         return httpx.Client(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
     def async_client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
-                     admit: Callable | None = None, **options) -> httpx.AsyncClient:
+                     admit: Callable | None = None, provider: str | None = None, **options) -> httpx.AsyncClient:
         """The async form of client()."""
-        transport = _AsyncTransport(self, _Scope(_project_id(project_id), candidate_id, approved, admit),
+        transport = _AsyncTransport(self, _Scope(_project_id(project_id), candidate_id, approved, admit,
+                                                 provider=provider),
                                     self._transport or httpx.AsyncHTTPTransport(trust_env=False))
         return httpx.AsyncClient(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
@@ -459,7 +465,7 @@ class OutboundGate:
                 problem, entries = private_problem, None
                 if isinstance(problem, tuple) and level == "private" and kind is Kind.MODEL_PROVIDER:
                     try:
-                        problem, entries = _private_problem(conn, inputs, *problem)
+                        problem, entries = _private_problem(conn, inputs, scope.provider, *problem)
                     except Exception as caught:  # recorded as a refusal, and chained to it
                         error, kind, problem = caught, None, "gate_inputs_unavailable"
                 reason = "gate_inputs_unavailable" if error is not None else \
@@ -850,14 +856,15 @@ def _private_request(request: httpx.Request, inputs: GateInputs):
     return models, body, request.headers.get("authorization", ""), key.strip()
 
 
-def _private_problem(conn, inputs: GateInputs, models, body, authorization, key):
+def _private_problem(conn, inputs: GateInputs, provider, models, body, authorization, key):
     """(Why a request to OpenRouter cannot go out from a Private project, or None; the terms it
     goes out under: the allowlist entries and when the key's confirmation lapses): each model on
-    the allowlist with its entry's flags, provider.zdr = true, and a key whose data-settings
-    confirmation is current, read in the decision transaction."""
+    the allowlist with its entry's flags and listed with a zero-retention endpoint by the
+    provider's catalog, provider.zdr = true, and a key whose data-settings confirmation by the
+    provider is current, read in the decision transaction."""
     entries = []
     for model in models:
-        entry = inputs.private_route(conn, model)
+        entry = inputs.private_route(conn, provider, key, model)
         flags = entry.get("required_flags") if isinstance(entry, Mapping) else None
         if not isinstance(flags, Mapping):
             return "route_not_allowed", None
@@ -867,7 +874,7 @@ def _private_problem(conn, inputs: GateInputs, models, body, authorization, key)
     if not _carries(body, ZDR):
         return "missing_flags", None
     scheme = authorization.partition(" ")[0]
-    until = inputs.key_attested(conn, key) if scheme.lower() == "bearer" and key else None
+    until = inputs.key_attested(conn, provider, key) if scheme.lower() == "bearer" and key else None
     if not isinstance(until, str) or until <= utc_now():
         return "key_not_confirmed", None
     return None, {"entries": entries, "key_confirmed_until": until}

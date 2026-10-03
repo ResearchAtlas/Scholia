@@ -417,7 +417,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         # A server on this Mac and when it was declared; an OpenRouter key's data-settings confirmation.
         governed = await read(lambda conn: [
             (governance.declaration(conn, p.base_url),
-             governance.confirmation(conn, data_dir, key) if key is not None and p.is_openrouter else None)
+             governance.confirmation(conn, data_dir, p.name, key) if key is not None and p.is_openrouter else None)
             for p, key in zip(configured.values(), keys)])
         return [{"name": p.name, "kind": p.kind, "base_url": p.base_url, "has_key": key is not None,
                  "enabled": p.name in on, "local": local_origin(p.base_url) is not None,
@@ -457,8 +457,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(409, "active_run", "A running task uses this provider; stop it or wait")
 
     async def _save_key(provider, key):
-        """_store_key, ordered with every project's dispatch: a key change ends the confirmations
-        made for it, which other names for the same key may be using too."""
+        """_store_key, ordered with every project's dispatch: a key change ends the provider's
+        confirmations, which its requests may be using."""
         return await state["gate"].ordered(None, _store_key(provider, key))
 
     async def _store_key(provider, key):
