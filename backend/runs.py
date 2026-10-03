@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 
 from backend import budget_router, credentials, openrouter, providers, spending
 from backend.db import new_id, utc_now
-from backend.openrouter_client import get_model_metadata
+from backend.openrouter_client import catalog_read, get_model_metadata
 from backend.settings import load_instructions, load_settings, visible
 
 log = logging.getLogger(__name__)
@@ -60,6 +60,20 @@ TITLE_RULES = (
     "Write a title of at most six words for a conversation that begins with the message below. "
     "Use the language of the message. Reply with the title only, without quotation marks."
 )
+
+
+def _unusable(table, provider, model) -> str | None:
+    """Why a model may not be called, or None: model_not_offered when its provider does not offer
+    it (Recommended, All or Pick) or its catalog, once read, no longer lists it; model_window when
+    its window is not usable (slice-1 spec section 8: needed, or under 4,096). A catalog not read
+    yet cannot judge either; the context assembler sizes every request against the window (S1-19)."""
+    if not providers.offered(table, provider, model, budget_router.RECOMMENDED):
+        return "model_not_offered"
+    route = providers.Route(provider, model)
+    row = get_model_metadata(route)
+    if row is None:
+        return "model_not_offered" if catalog_read(route) else None
+    return None if providers.window(table, model, row.get("context_length"))["status"] == "ok" else "model_window"
 
 
 class AdmissionError(Exception):
@@ -393,9 +407,17 @@ class Harness:
                 raise AdmissionError(400, "unknown_provider", "That provider is not set up")
             provider_config = configured[provider_name]
             claim.provider = provider_name
+            # The models the provider offers (Recommended, All or Pick): a model it does not
+            # offer is refused, and Auto picks among those it does.
+            table = (personal.values.get("providers") or {}).get(provider_name) or {}
+
+            if chosen != budget_router.AUTO and (problem := _unusable(table, provider_config, chosen)):
+                raise AdmissionError(400, problem, "That model is not offered for this provider" if problem == "model_not_offered"
+                                     else "That model has no usable window; set one in Settings")
             plan = budget_router.create_run_plan(
                 message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
-                is_openrouter=provider_config.is_openrouter)
+                is_openrouter=provider_config.is_openrouter, offered=lambda m: _unusable(table, provider_config, m) is None,
+                picked=table["models"] if isinstance(table.get("models"), list) else ())
             if plan.model is None:
                 raise AdmissionError(400, "model_needed", "Choose a model for this provider")
             route = providers.Route(provider_config, plan.model)
@@ -778,6 +800,11 @@ class Harness:
             active.provider = inputs.get("provider")
             route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),
                                             inputs.get("model"))
+            if route is not None:  # a model its provider no longer offers is not called: no title
+                personal = await asyncio.to_thread(load_settings, self.data_dir)
+                table = (personal.values.get("providers") or {}).get(route.provider.name) or {}
+                if _unusable(table, route.provider, route.model):
+                    route = None
         key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
                                                 self.keyring_backend)
         if route is None or key is None:

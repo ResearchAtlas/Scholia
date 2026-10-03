@@ -133,7 +133,8 @@ async def test_first_run_setup_stores_the_key_in_the_credential_store_only(tmp_p
         assert KEY not in (data / "config.toml").read_text()
         assert not (data / FALLBACK_FILE).exists()
         assert (await client.get("/api/providers")).json() == {"providers": [
-            {"name": "openrouter", "kind": "openrouter", "base_url": "https://openrouter.ai/api/v1", "has_key": True}]}
+            {"name": "openrouter", "kind": "openrouter", "base_url": "https://openrouter.ai/api/v1", "has_key": True,
+             "enabled": True}]}
 
 
 async def test_without_a_credential_store_the_key_goes_to_an_owner_only_file_with_a_warning(tmp_path):
@@ -214,7 +215,8 @@ async def test_instructions_are_saved_owner_only_and_warned_at_the_cap(tmp_path)
     data = tmp_path / "data"
     async with started(data) as client:
         project = (await client.post("/api/projects", json={"name": "P"})).json()["id"]
-        assert (await client.put("/api/instructions", json={"text": "Be brief."})).json() == {"ok": True, "warnings": []}
+        saved = (await client.put("/api/instructions", json={"text": "Be brief."})).json()
+        assert (saved["ok"], saved["warnings"], len(saved["hash"])) == (True, [], 64)
         assert (await client.get("/api/instructions")).json()["text"] == "Be brief."
         assert stat.S_IMODE((data / "AGENTS.md").stat().st_mode) == 0o600
         big = await client.put("/api/instructions", json={"project_id": project, "text": "x" * 40_000})

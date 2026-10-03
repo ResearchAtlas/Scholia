@@ -11,6 +11,8 @@ import { clear, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
 import { imageAsLink, safeHref } from '../links.js';
 import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
+import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
+import { messageRoute } from '../settings.js';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
@@ -73,7 +75,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     try {
       const target = id ?? (await post('/api/conversations', { project_id: projectId })).id;
       setDraft(target); // shown here from now on, so Stop works while it is admitted
-      await send(target, `/api/conversations/${target}/message/stream`, { content: text }, text);
+      await readChoice(); // the model chosen at an earlier launch, before anything is sent
+      await send(target, `/api/conversations/${target}/message/stream`, { content: text, ...messageRoute(currentChoice()) }, text);
       if (!conversation && here.current) onCreated(target);
       return true;
     } catch (error) {
@@ -85,7 +88,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   async function resume(turn) {
     setProblem(null);
     try {
-      await send(id, `/api/runs/${turn.run_id}/continue`, {}, turn.message?.text ?? '');
+      await readChoice();
+      await send(id, `/api/runs/${turn.run_id}/continue`, messageRoute(currentChoice()), turn.message?.text ?? '');
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
     }
@@ -131,7 +135,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
         </div>
       </div>
 
-      <Composer running={running} problem={problem} onSend={submit}
+      <Composer running={running} problem={problem} onSend={submit} projectId={projectId}
         onStop={() => Promise.resolve(stop(id, live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id))
           .then(load).catch(() => {})} />
     </section>
@@ -245,7 +249,7 @@ function Answer({ text }) {
   );
 }
 
-function Composer({ running, problem, onSend, onStop }) {
+function Composer({ running, problem, onSend, onStop, projectId }) {
   const t = useT();
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
@@ -277,11 +281,13 @@ function Composer({ running, problem, onSend, onStop }) {
     <form onSubmit={submit} className="shrink-0 px-4 pb-4">
       <div className="mx-auto w-full max-w-3xl">
         {problem && <p role="alert" className="mb-2 text-sm text-destructive">{problem}</p>}
-        <div className="flex items-end gap-2 rounded-2xl border bg-card p-2 shadow-sm transition-shadow focus-within:border-brand/50 focus-within:shadow-md focus-within:shadow-brand/5">
+        <div className="rounded-2xl border bg-card p-2 shadow-sm transition-shadow focus-within:border-brand/50 focus-within:shadow-md focus-within:shadow-brand/5">
           <label htmlFor="composer" className="sr-only">{t('composer.label')}</label>
           <textarea id="composer" ref={box} rows={1} value={text} placeholder={t('composer.placeholder')}
             onChange={(event) => setText(event.target.value)} onKeyDown={key}
-            className="scroll-thin max-h-60 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed outline-none placeholder:text-muted-foreground" />
+            className="scroll-thin block max-h-60 min-h-9 w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed outline-none placeholder:text-muted-foreground" />
+          <div className="mt-1 flex items-center justify-between gap-2">
+          <ModelPicker projectId={projectId} />
           {running ? (
             <Button type="button" size="icon" variant="secondary" className="size-9 shrink-0 rounded-xl" onClick={onStop} aria-label={t('composer.stop')}>
               <Square className="fill-current" aria-hidden="true" />
@@ -292,6 +298,7 @@ function Composer({ running, problem, onSend, onStop }) {
               <ArrowUp aria-hidden="true" />
             </Button>
           )}
+          </div>
         </div>
         <p className="mt-1.5 px-2 text-[11px] text-muted-foreground">{t('composer.hint')}</p>
       </div>

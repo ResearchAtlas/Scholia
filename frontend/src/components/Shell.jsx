@@ -14,7 +14,7 @@ import { Divider } from './Divider.jsx';
 import { Sidebar } from './Sidebar.jsx';
 import { ConversationView } from './ConversationView.jsx';
 import { SidePanel } from './SidePanel.jsx';
-import { SettingsDialog } from './SettingsDialog.jsx';
+import { Settings } from './Settings.jsx';
 import { cn } from '@/lib/utils';
 
 const CURRENT = 'scholia.project';
@@ -45,7 +45,7 @@ function remember(projectId) {
   }
 }
 
-export function Shell({ health, settings }) {
+export function Shell({ health, settings, onLanguage }) {
   const t = useT();
   const width = useWindowWidth();
   const [layout, setLayout] = useState(() => fromSettings(settings.values));
@@ -65,10 +65,23 @@ export function Shell({ health, settings }) {
     setNotice(errorText(t, error instanceof ApiError ? error.code : 'internal'));
   }, [t]);
 
+  // Only the newest read of the projects is shown, with the newest project asked for.
+  const projectReads = useRef({ count: 0, prefer: undefined });
   const loadProjects = useCallback(async (prefer) => {
-    const { projects: listed } = await get('/api/projects');
+    const reads = projectReads.current;
+    const read = ++reads.count;
+    if (prefer !== undefined) reads.prefer = prefer;
+    let listed;
+    try {
+      ({ projects: listed } = await get('/api/projects'));
+    } catch (error) {
+      if (read === reads.count) reads.prefer = undefined; // a failed read's preference does not outlive it
+      throw error;
+    }
+    if (read !== reads.count) return listed; // a newer read is under way
+    const wanted = reads.prefer ?? remembered();
+    reads.prefer = undefined;
     setProjects(listed);
-    const wanted = prefer ?? remembered();
     const chosen = listed.find((p) => p.id === wanted) ?? listed.find((p) => p.kind !== 'general') ?? listed[0];
     setProjectId(chosen?.id ?? null);
     return listed;
@@ -223,7 +236,8 @@ export function Shell({ health, settings }) {
           )}
         </div>
       </div>
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} health={health} />
+      <Settings open={settingsOpen} onOpenChange={setSettingsOpen} health={health} onLanguage={onLanguage}
+        project={projects.find((p) => p.id === projectId)} onProjectChanged={() => loadProjects(projectId).catch(fail)} />
       {notice && (
         <div role="alert" className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 animate-fade-up rounded-lg border bg-card px-4 py-2.5 text-sm shadow-lg"
           onClick={() => setNotice(null)}>

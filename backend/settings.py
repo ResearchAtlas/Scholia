@@ -115,11 +115,20 @@ _RETRIEVAL = {
 PERSONAL = {
     ("ui", "language"): ("system", _choice("system", "en", "zh-CN")),
     ("ui", "follow_up"): ("steer", _choice("steer", "queue")),
+    # The model picker's choice, kept across launches: id "auto", or a model id with its
+    # provider; unset, the [models] defaults apply.
+    ("ui", "model", "id"): (None, lambda v: visible(v) is not None),
+    ("ui", "model", "provider"): (None, lambda v: visible(v) is not None),
     ("ui", "layout", "sidebar_width"): (248, _int(180, 360)),
     ("ui", "layout", "sidebar_open"): (True, _flag),
     ("ui", "layout", "panel_share"): (0.5, _number(0, 1)),
     ("providers", "*", "kind"): (None, _choice("openrouter", "openai-compatible")),
     ("providers", "*", "base_url"): (None, _base_url),
+    # Which of a provider's models are offered: "recommended", "all", or a list of model ids
+    # (the stage walk's Recommended, All or Pick); unset is Recommended on OpenRouter, else All.
+    ("providers", "*", "models"): (None, lambda v: v in ("recommended", "all")
+                                   or (type(v) is list and all(type(x) is str and visible(x) for x in v))),
+    ("providers", "*", "enabled"): (None, _flag),  # false is Off: kept, but never called
     ("providers", "*", "default_window"): (None, _WINDOW),
     ("providers", "*", "windows", "*"): (None, _WINDOW),
     ("models", "default"): ("auto", _text),
@@ -211,6 +220,9 @@ class Settings:
     label: str
     values: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
+    # The same problems for an interface to state in its own language: {"key": ..., "line": ...};
+    # key is None when the whole file could not be used.
+    problems: list = field(default_factory=list)
     _digest: str | None = None
     _broken: bool = False
 
@@ -493,12 +505,14 @@ def _parse(settings, raw):
         _fill(settings, None)
         settings._digest, settings._broken = _digest(raw), True
         settings.warnings.append(f"{settings.label}: nested too deeply to read; using the defaults")
+        settings.problems.append({"key": None, "line": None})
 
 
 def _fill(settings, raw):
     settings._digest = _digest(raw)
     settings.values = _defaults(settings.schema)
     settings.warnings = []
+    settings.problems = []
     settings._broken = False
     if raw is None:
         return
@@ -508,10 +522,12 @@ def _fill(settings, raw):
     except UnicodeDecodeError:
         settings._broken = True
         settings.warnings.append(f"{settings.label}: not UTF-8 text; using the defaults")
+        settings.problems.append({"key": None, "line": None})
         return
     except tomlkit.exceptions.ParseError as error:
         settings._broken = True
         settings.warnings.append(f"{settings.label} line {error.line}: not valid TOML; using the defaults")
+        settings.problems.append({"key": None, "line": error.line})
         return
     lines = _key_lines(text)
     for path, value in _leaves(data):
@@ -521,6 +537,7 @@ def _fill(settings, raw):
             default = settings.schema.get(pattern, (None,))[0]
             fallback = "ignored" if default is None else f"using the default {default!r}"
             settings.warnings.append(f"{settings.label} line {_line(lines, path)}: {key} {problem}; {fallback}")
+            settings.problems.append({"key": key, "line": _line(lines, path)})
         elif pattern:
             node = settings.values
             for part in path[:-1]:
@@ -552,6 +569,7 @@ def load_settings(data_root, project_id=None):
         _parse(settings, None)
         settings._broken = True
         settings.warnings.append(f"{settings.label} could not be read; using the defaults")
+        settings.problems.append({"key": None, "line": None})
     return settings
 
 
@@ -584,6 +602,30 @@ INSTRUCTIONS_CAP = 32 * 1024  # bytes of UTF-8, personal and project combined
 
 def load_instructions(data_root, project_id=None):
     """Return (text, warnings): the personal AGENTS.md, then the project's, capped at 32 KiB."""
+    data, warnings = _joined_instructions(data_root, project_id)
+    if len(data) > INSTRUCTIONS_CAP:
+        warnings.append("Instructions exceed the 32 KiB combined cap; only the first 32 KiB are used")
+        data = data[:INSTRUCTIONS_CAP]
+    return data.decode("utf-8", errors="ignore"), warnings  # ignore drops a character cut in half
+
+
+def instruction_file_size(path) -> int:
+    """One AGENTS.md's size as the join counts it (UTF-8, unreadable bytes replaced); 0 when it is
+    absent, empty or cannot be read."""
+    try:
+        raw = _read(Path(path))
+    except OSError:
+        return 0
+    return len(raw.decode("utf-8", errors="replace").encode("utf-8")) if raw else 0
+
+
+def instructions_size(data_root, project_id=None) -> int:
+    """The combined instructions' size in UTF-8 bytes before the cap cuts them, as the cap counts it."""
+    return len(_joined_instructions(data_root, project_id)[0])
+
+
+def _joined_instructions(data_root, project_id):
+    """The personal and the project's AGENTS.md as one UTF-8 text, uncut, with warnings."""
     paths = [Path(data_root) / "AGENTS.md"]
     if project_id is not None:
         paths.append(_project_folder(data_root, project_id) / "AGENTS.md")
@@ -594,15 +636,11 @@ def load_instructions(data_root, project_id=None):
         except OSError:
             warnings.append(f"{path.name} could not be read; it was left out")
             continue
-        if raw is None:
+        if not raw:  # absent or empty: nothing to join, so no separator either
             continue
         try:
             parts.append(raw.decode("utf-8"))
         except UnicodeDecodeError:
             parts.append(raw.decode("utf-8", errors="replace"))
             warnings.append(f"{path.name} is not UTF-8 text; unreadable characters were replaced")
-    data = "\n\n".join(parts).encode("utf-8")
-    if len(data) > INSTRUCTIONS_CAP:
-        warnings.append("Instructions exceed the 32 KiB combined cap; only the first 32 KiB are used")
-        data = data[:INSTRUCTIONS_CAP]
-    return data.decode("utf-8", errors="ignore"), warnings  # ignore drops a character cut in half
+    return "\n\n".join(parts).encode("utf-8"), warnings

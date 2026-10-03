@@ -6,7 +6,7 @@ import { imageAsLink, safeHref } from '../src/links.js';
 import { SESSION_KEY, takeSession } from '../src/session.js';
 import { EventReader } from '../src/sse.js';
 import { continuable, moveTargets, projectName } from '../src/projects.js';
-import { errorText, money } from '../src/text.js';
+import { errorText, money, visible } from '../src/text.js';
 import { apply, send, subscribe, unsavedAnswer } from '../src/live.js';
 import { packageRoot, record } from '../licenses.mjs';
 import { saveSettings } from '../src/api.js';
@@ -208,4 +208,9 @@ test('the license record keeps every bundled version of a package, once each', a
   } finally {
     rmSync(out, { recursive: true, force: true });
   }
+});
+
+test('a text with nothing visible reads as none, as the backend reads it', () => {
+  assert.equal(visible('  a/b '), 'a/b');
+  for (const blank of ['', '   ', '\u200b', '\u3164', '\u2800', '\ufe0f', null]) assert.equal(visible(blank), null, JSON.stringify(blank));
 });

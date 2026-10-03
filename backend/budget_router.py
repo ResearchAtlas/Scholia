@@ -39,6 +39,8 @@ MODEL_TIERS = {
     "mid": ["google/gemini-3.1-pro-preview", "openai/gpt-5.4-mini", "deepseek/deepseek-v4-pro"],
     "premium": ["anthropic/claude-opus-4.8", "openai/gpt-5.5", "google/gemini-3.1-pro-preview"],
 }
+# The models offered as Recommended on OpenRouter: the tiers' preferred models.
+RECOMMENDED = frozenset(model for tier in MODEL_TIERS.values() for model in tier)
 
 # Rough tokens per mode for one answer call. Deliberately conservative and clearly
 # approximate: heuristics, never measured.
@@ -50,6 +52,7 @@ _MODE_TOKENS = {
 _TITLE_TOKENS = {"input": 600, "output": 40}
 # Rough reasoning tokens (billed as output) a generation call adds at each effort.
 _REASONING_OUTPUT_TOKENS = {"minimal": 0, "low": 800, "medium": 2000, "high": 5000, "xhigh": 9000}
+EFFORT_LEVELS = tuple(_REASONING_OUTPUT_TOKENS)  # the levels a turn may ask for, lowest first
 # Per million tokens, when the provider publishes no price.
 _UNKNOWN_PRICE = {"input": 1.0, "output": 5.0}
 
@@ -89,19 +92,22 @@ def detect_task_signal(query: str, has_files: bool = False) -> str:
 
 
 def create_run_plan(query: str, model: str | None, route_for, *, effort: str | None = None,
-                    is_openrouter: bool = True, has_files: bool = False) -> RunPlan:
+                    is_openrouter: bool = True, has_files: bool = False, offered=lambda m: True,
+                    picked=()) -> RunPlan:
     """The plan for a message. model is a model id or Auto; route_for(model) gives
-    the route whose catalog prices it. Auto takes the balanced tier's first model on
-    OpenRouter; elsewhere a model must be chosen, and the plan's model is None."""
+    the route whose catalog prices it. Auto takes the first model the provider offers
+    (offered(model)) among the tiers' preferred models on OpenRouter, the balanced tier
+    first, then among the models picked for it; with none, the plan's model is None."""
     signal = detect_task_signal(query, has_files)
     if model and model != AUTO:
         chosen, reason = model, "chosen_model"
-    elif is_openrouter:
-        chosen, reason = MODEL_TIERS["mid"][0], "auto_mid_tier"
     else:
-        chosen, reason = None, "model_needed"
+        preferred = [m for tier in ("mid", "budget", "premium") for m in MODEL_TIERS[tier]] if is_openrouter else []
+        chosen = next((m for m in [*preferred, *picked] if offered(m)), None)
+        reason = ("auto_mid_tier" if chosen == MODEL_TIERS["mid"][0] else "auto_offered") if chosen else "model_needed"
     predicted = estimate_message_cost(signal, route_for(chosen), effort) if chosen else 0.0
-    return RunPlan(mode=signal, model_tier="mid", model=chosen, predicted_cost=predicted,
+    tier = next((name for name, models in MODEL_TIERS.items() if chosen in models), "mid")
+    return RunPlan(mode=signal, model_tier=tier, model=chosen, predicted_cost=predicted,
                    policy_reason=reason, task_signal=signal)
 
 
