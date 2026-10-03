@@ -7,6 +7,7 @@ import sqlite3
 import stat
 import shutil
 import threading
+import uuid
 import zipfile
 
 import pyzipper
@@ -954,6 +955,22 @@ async def test_the_backup_before_a_project_deletion_waits_for_a_restore_staging_
         assert (await restore).status_code == 200
         await deletion
         assert backed_up.is_set()
+
+
+async def test_a_temporary_name_taken_by_someone_else_is_never_removed(tmp_path, monkeypatch):
+    destination, theirs = tmp_path / "Backups", b"another writer's temporary file"
+    destination.mkdir()
+    monkeypatch.setattr(backups_module.uuid, "uuid4", lambda: uuid.UUID(int=0))  # the same temporary name
+    source = tmp_path / "a.txt"
+    source.write_bytes(b"x")
+
+    def audit(path):  # just before it creates its temporary file, another writer takes that name
+        (destination / f".{path.name}.00000000.tmp").write_bytes(theirs)
+
+    with pytest.raises(FileExistsError):
+        await asyncio.to_thread(backups_module._write_zip, destination, "scholia-backup", [("a.txt", source)],
+                                None, stop=lambda: False, audit=audit)
+    assert [p.read_bytes() for p in destination.iterdir()] == [theirs]  # theirs is left as it was
 
 
 @pytest.mark.parametrize("hard_links", [True, False])

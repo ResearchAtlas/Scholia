@@ -1309,12 +1309,14 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop, audit):
     when true (the app is closing), it stops with 503 closing. Returns the file's path."""
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     final = _free_name(destination, prefix, stamp)
-    tmp, published = destination / f".{final.name}.tmp", False
+    # A temporary name of its own, removed on failure only once this call has made it.
+    tmp, made, published = destination / f".{final.name}.{uuid.uuid4().hex[:8]}.tmp", False, False
     audit(final)
     pyzipper = _pyzipper()
     options = {"encryption": pyzipper.WZ_AES} if passphrase else {}
     try:
         with open(tmp, "xb", opener=lambda path, flags: os.open(path, flags, 0o600)) as raw:
+            made = True
             with pyzipper.AESZipFile(raw, "w", compression=pyzipper.ZIP_DEFLATED, **options) as archive:
                 if passphrase:
                     archive.setpassword(passphrase.encode("utf-8"))
@@ -1346,7 +1348,8 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop, audit):
                 audit(final)
         _fsync(destination)
     except BaseException as error:
-        tmp.unlink(missing_ok=True)
+        if made:
+            tmp.unlink(missing_ok=True)
         if published:  # but its folder could not be synced: not a backup
             final.unlink(missing_ok=True)
         if isinstance(error, DatabaseClosedError):
