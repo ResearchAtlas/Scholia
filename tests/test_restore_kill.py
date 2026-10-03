@@ -722,6 +722,7 @@ async def test_a_committed_restore_clears_what_an_interrupted_one_left_in_stagin
         monkeypatch.setattr(backups_module, "_fsync", failing_fsync)
         first = await client.post("/api/backups/restore", json={"generation": backup})
         assert first.json()["code"] == "restore_interrupted"
+        assert any((data / "backups" / backups_module.STAGING).rglob("scholia.sqlite3"))  # what it staged is kept
         monkeypatch.setattr(backups_module, "_fsync", real_fsync)
         second = await client.post("/api/backups/restore", json={"generation": backup})
         assert second.status_code == 200, second.text
@@ -745,7 +746,7 @@ async def test_a_restore_out_of_a_damaged_folder_that_fails_before_its_journal_l
     async with started(data, setup=False) as client:
         monkeypatch.setattr(backups_module, "write_private", no_room_for_a_new_journal)
         response = await client.post("/api/backups/restore", json={"generation": backup})
-        assert response.status_code == 500
+        assert response.json()["code"] == "restore_interrupted"  # the journal there cannot be read: not "unchanged"
     damaged = data / "backups" / backups_module.DAMAGED
     assert not damaged.exists() or list(damaged.iterdir()) == []  # a purge would count an empty one as a copy
 
@@ -768,3 +769,64 @@ async def test_staging_left_by_a_restore_goes_before_anything_else_is_served(tmp
         monkeypatch.setattr(backups_module.shutil, "rmtree", rmtree)
         assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
     assert seen == [(True, True)]  # removed while only the restore was served
+
+
+async def test_a_replay_that_cannot_be_committed_closes_its_database_though_its_harness_did_not_stop(tmp_path,
+                                                                                                     monkeypatch):
+    from backend.runs import Harness
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+    real_open, real_shutdown, opened, stopped = backups_module.Database, Harness.shutdown, [], []
+
+    def database(*args, **kwargs):
+        opened.append(real_open(*args, **kwargs))
+        return opened[-1]
+
+    async def shutdown(self, timeout=10.0):
+        stopped.append(self)
+        if len(stopped) == 1:
+            raise RuntimeError("cannot stop")
+        return await real_shutdown(self, timeout)
+
+    real_commit, commits = backups_module._commit_journal, []
+
+    def cannot_commit(data_dir, journal, audits):  # the replay's commit fails; putting it back commits too
+        commits.append(journal["direction"])
+        if len(commits) == 1:
+            raise OSError("I/O error")
+        real_commit(data_dir, journal, audits)
+
+    monkeypatch.setattr(backups_module, "Database", database)
+    monkeypatch.setattr(Harness, "shutdown", shutdown)
+    monkeypatch.setattr(backups_module, "_commit_journal", cannot_commit)
+    async with started(data, setup=False) as client:
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept", "Later"}
+        assert opened[0].closed  # the replayed one, closed before its files were put back
+
+
+async def test_a_launch_finishes_a_restore_whose_undo_failed_after_its_empty_set_aside_folder_went(tmp_path,
+                                                                                                    monkeypatch):
+    import errno
+    import json
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_link, real_write = backups_module.os.link, backups_module.write_private
+
+    def cannot_link(source, target):  # the swap fails at its first step, with nothing set aside yet
+        raise OSError(errno.EIO, "I/O error")
+
+    def no_room_to_undo(path, payload):  # and the undo cannot record itself
+        if Path(path).name == backups_module.JOURNAL and json.loads(payload)["direction"] == "back":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_write(path, payload)
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module.os, "link", cannot_link)
+        monkeypatch.setattr(backups_module, "write_private", no_room_to_undo)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.json()["code"] == "restore_interrupted"
+    monkeypatch.setattr(backups_module.os, "link", real_link)
+    monkeypatch.setattr(backups_module, "write_private", real_write)
+    names, text, folders, projects = await state_after_launch(data)  # the launch finishes it forward
+    assert names == {"General", "Kept"} and text == "Backed up"

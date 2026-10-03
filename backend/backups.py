@@ -51,7 +51,7 @@ log = logging.getLogger(__name__)
 
 IDLE_CHECK_SECONDS = 600
 SENSITIVE = ("private", "local_only")  # a backup or export holding such a project is encrypted
-STAGING = ".staging"  # under backups/: restores and full backups in progress, emptied at launch
+STAGING = ".staging"  # under backups/: restores and full backups in progress, emptied at launch and by a committed restore
 # Under backups/: damaged databases a restore moved aside. Nothing removes one on its own; only the
 # researcher's "Delete everywhere including backups" does (purge), as a deletion reaches every copy.
 DAMAGED = "damaged"
@@ -434,9 +434,11 @@ async def _restore(state, body):
         state["restoring"] = True  # from here only health, the backups list and this restore are served
         return await _replace(state, body, staging, purges)
     finally:  # before anything else is served again
-        if not await asyncio.to_thread(_replay_pending, data_dir):  # else the next launch still needs it
-            await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
-        state.pop("restoring", None)
+        try:
+            if not await asyncio.to_thread(_replay_pending, data_dir):  # else the next launch still needs it
+                await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
+        finally:
+            state.pop("restoring", None)
 
 
 async def _replace(state, body, staging, purges):
@@ -759,11 +761,12 @@ def _commit_journal(data_dir, journal, audits):
 def _read_journal(data_dir):
     """The restore journal; None when there is none, {} when it cannot be read."""
     try:
-        return json.loads((data_dir / "backups" / JOURNAL).read_bytes())
+        journal = json.loads((data_dir / "backups" / JOURNAL).read_bytes())
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
         return {}
+    return journal if isinstance(journal, dict) else {}
 
 
 def _replay_pending(data_dir):
@@ -787,6 +790,10 @@ def _audit_restore(conn, record):
 def _forward(data_dir, journal):
     """Put the backup in place, from wherever an earlier attempt stopped."""
     staged, aside, live = data_dir / journal["staged"], data_dir / journal["aside"], data_dir / DB_NAME
+    if not aside.is_dir():  # an empty one a failed attempt removed: made again, as at the start
+        _mkdir_private(aside.parent)
+        _mkdir_private(aside)
+        _fsync(aside.parent)
     if (staged / DB_NAME).exists():  # the backup's database is not in place yet
         if live.exists() and not (aside / DB_NAME).exists():
             os.link(live, aside / DB_NAME)
@@ -992,10 +999,17 @@ def _remove_if_empty(folder):
 
 def _clear_staging(data_dir, current):
     """After a restore committed: the previous state it set aside in current, and whatever earlier
-    restores or backups left in staging. current's other contents go when the restore ends."""
+    restores or backups left in staging. current's other contents go when the restore ends. Each
+    is tried; the first failure is raised after the others."""
+    failures = []
     for folder in (current / "replaced", *((data_dir / "backups" / STAGING).iterdir())):
-        if folder != current and _exists(folder):
-            _remove(folder)
+        try:
+            if folder != current and _exists(folder):
+                _remove(folder)
+        except OSError as error:
+            failures.append(error)
+    if failures:
+        raise failures[0]
 
 
 def _remove(path):
