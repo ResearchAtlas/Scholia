@@ -85,9 +85,15 @@ function useCatalog(open, projectId, chosenModel) {
       const listings = await Promise.allSettled(ready.map((p) => loadModels(p.name)));
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
         ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
+      // A provider whose listing failed is reported with Try again; one that could not be read
+      // at all keeps the rows shown before.
+      const failed = listings.map((listing) => (listing.status === 'rejected'
+        ? (listing.reason instanceof ApiError ? listing.reason.code : 'internal') : listing.value.status?.error ?? null));
+      const unread = new Set(ready.filter((p, i) => listings[i].status === 'rejected').map((p) => p.name));
       if (mine !== latest.current || !here.current) return;
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
-        defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto' };
+        defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto',
+        problem: failed.find(Boolean) ?? null };
       // A chosen model is dropped when its provider is no longer ready (the provider list says
       // so), or when its own provider's current listing no longer offers it.
       if (choice?.model) {
@@ -95,7 +101,7 @@ function useCatalog(open, projectId, chosenModel) {
         const own = at >= 0 && listings[at].status === 'fulfilled' ? listings[at].value : null;
         if (at < 0 || !stillUsable(own, choice.model)) setChoice(null); // its provider gone, or no longer offered or usable
       }
-      setCatalog(next);
+      setCatalog((current) => ({ ...next, models: [...next.models, ...(current?.models ?? []).filter((m) => unread.has(m.provider))] }));
     } catch (error) { // shown with Try again; what was read before stays
       if (mine === latest.current && here.current) {
         const problem = error instanceof ApiError ? error.code : 'internal';
