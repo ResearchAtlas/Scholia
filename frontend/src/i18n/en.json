@@ -57,6 +57,7 @@
   "turn.continue": "Continue",
   "turn.image": "Image: {label}",
   "turn.imageUnnamed": "Image",
+  "turn.imageFrom": "from {host}",
   "panel.library": "Library",
   "panel.manuscript": "Manuscript",
   "panel.close": "Close panel",

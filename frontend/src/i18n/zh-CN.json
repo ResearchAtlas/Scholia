@@ -57,6 +57,7 @@
   "turn.continue": "继续",
   "turn.image": "图片：{label}",
   "turn.imageUnnamed": "图片",
+  "turn.imageFrom": "来自 {host}",
   "panel.library": "文献库",
   "panel.manuscript": "文稿",
   "panel.close": "关闭面板",

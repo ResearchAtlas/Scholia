@@ -71,8 +71,10 @@ export async function stream(path, body, onEvent, signal) {
   }
 }
 
-// Settings with the file-hash precondition: reads the current hash, writes, and on a
-// conflict reads again and retries once.
+// Saves the keys of one direct action (the layout, the open panel) with the file-hash
+// precondition: it reads the file, writes only those keys, and on a conflict reads again and
+// retries once. Every other key keeps the value on disk, so nothing the researcher has not
+// just set is overwritten. Settings forms reload and ask instead (ticket 14; S1-10).
 export async function saveSettings(updates, projectId) {
   const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   for (let attempt = 0; ; attempt += 1) {

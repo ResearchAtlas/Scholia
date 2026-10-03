@@ -7,7 +7,7 @@ import { SESSION_KEY, takeSession } from '../src/session.js';
 import { EventReader } from '../src/sse.js';
 import { continuable, moveTargets, projectName } from '../src/projects.js';
 import { errorText, money } from '../src/text.js';
-import { apply, send, subscribe } from '../src/live.js';
+import { apply, send, subscribe, unsavedAnswer } from '../src/live.js';
 import { packageRoot } from '../licenses.mjs';
 
 const open = (width, extra = {}) => columns({ width, ...DEFAULTS, panelOpen: false, ...extra });
@@ -55,8 +55,10 @@ test('model output links only to the web and mail, and its images become links',
   for (const bad of ['javascript:alert(1)', 'data:text/html,x', '/local', 'file:///etc/passwd', null]) {
     assert.equal(safeHref(bad), null, bad);
   }
-  assert.deepEqual(imageAsLink('https://example.org/f.png', ' Figure 1 '), { href: 'https://example.org/f.png', label: 'Figure 1' });
-  assert.deepEqual(imageAsLink('data:image/png;base64,AAAA', ''), { href: null, label: null });
+  assert.deepEqual(imageAsLink('https://example.org:8443/f.png', ' Figure 1 '),
+    { href: 'https://example.org:8443/f.png', label: 'Figure 1', host: 'example.org:8443' });
+  assert.deepEqual(imageAsLink('data:image/png;base64,AAAA', ''), { href: null, label: null, host: null });
+  assert.deepEqual(imageAsLink('mailto:a@example.org', 'x'), { href: null, label: 'x', host: null });
 });
 
 function memoryStorage() {
@@ -107,6 +109,17 @@ test('errors show their own text, or the general one; costs never show as zero',
   assert.equal(money(0.0042, 'en'), '$0.0042');
   assert.equal(money(1.5, 'en'), '$1.50');
   assert.equal(money(undefined, 'en'), null);
+});
+
+test('an answer shown but not saved stays available by its run', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response(streamOf(
+    'data: {"type":"run_started","run_id":"r9"}\n\n',
+    'data: {"type":"chat_response","content":"Kept","result_saved":false}\n\n',
+    'data: {"type":"run_finished","status":"failed"}\n\n')));
+  await send('c9', '/x', {}, 'Q');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(unsavedAnswer('r9'), 'Kept');
+  assert.equal(unsavedAnswer('r1'), null);
 });
 
 test('a live turn follows its events', () => {

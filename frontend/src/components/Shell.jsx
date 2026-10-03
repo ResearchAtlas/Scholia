@@ -58,6 +58,8 @@ export function Shell({ health, settings }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState(null);
   const saved = useRef(layout);
+  const shown = useRef(null); // the project shown now: a list read for another is dropped
+  const opener = useRef(null); // what opened an overlaid panel, focused again when it closes
 
   const fail = useCallback((error) => {
     setNotice(errorText(t, error instanceof ApiError ? error.code : 'internal'));
@@ -72,33 +74,44 @@ export function Shell({ health, settings }) {
     return listed;
   }, []);
 
-  const loadConversations = useCallback(async (id = projectId) => {
-    if (!id) return [];
+  const loadConversations = useCallback(async () => {
+    const id = shown.current;
+    if (!id) return null;
     const { conversations: listed } = await get(`/api/conversations?project_id=${encodeURIComponent(id)}`);
+    if (shown.current !== id) return null;
     setConversations(listed);
     return listed;
-  }, [projectId]);
+  }, []);
 
   useEffect(() => {
     loadProjects().catch(fail);
   }, [loadProjects, fail]);
 
-  useEffect(() => subscribe((id, turn, type) => { // the list shows which conversations run
-    if (type !== 'run_started' && type !== 'run_finished') return;
-    loadConversations().catch(() => {});
-    // ponytail: a title run follows a first answer; one later look shows its title, poll if titles lag
-    if (type === 'run_finished') setTimeout(() => loadConversations().catch(() => {}), 4000);
-  }), [loadConversations]);
+  useEffect(() => { // the list shows which conversations run
+    const timers = new Set();
+    const unsubscribe = subscribe((id, turn, type) => {
+      if (type !== 'run_started' && type !== 'run_finished') return;
+      loadConversations().catch(() => {});
+      // ponytail: a title run follows a first answer; one later look shows its title, poll if titles lag
+      if (type === 'run_finished') {
+        const timer = setTimeout(() => { timers.delete(timer); loadConversations().catch(() => {}); }, 4000);
+        timers.add(timer);
+      }
+    });
+    return () => { unsubscribe(); timers.forEach(clearTimeout); };
+  }, [loadConversations]);
 
   useEffect(() => {
     if (!projectId) return;
     remember(projectId);
+    shown.current = projectId;
+    setConversations([]);
     setConversationId(null);
     setPanel('none');
-    loadConversations(projectId).then((listed) => setConversationId(listed[0]?.id ?? null)).catch(fail);
+    loadConversations().then((listed) => listed && setConversationId(listed[0]?.id ?? null)).catch(fail);
     get(`/api/settings?project_id=${encodeURIComponent(projectId)}`)
-      .then((loaded) => setPanel(loaded.values?.ui?.panel ?? 'none'))
-      .catch(() => setPanel('none'));
+      .then((loaded) => shown.current === projectId && setPanel(loaded.values?.ui?.panel ?? 'none'))
+      .catch(() => {});
   }, [projectId, loadConversations, fail]);
 
   const saveLayout = useCallback((next) => {
@@ -110,13 +123,16 @@ export function Shell({ health, settings }) {
     saveSettings(changed).catch(fail);
   }, [fail]);
 
-  const togglePanel = useCallback((which) => {
+  const togglePanel = useCallback((which, from) => {
     const next = panel === which ? 'none' : which;
+    if (from) opener.current = from;
     setPanel(next);
+    if (next === 'none') requestAnimationFrame(() => opener.current?.isConnected && opener.current.focus());
     if (projectId) saveSettings({ 'ui.panel': next }, projectId).catch(fail);
   }, [panel, projectId, fail]);
 
   const view = columns({ width, ...layout, panelOpen: panel !== 'none' });
+  const overlaid = panel !== 'none' && view.overlay; // the panel covers the conversation, which is inert meanwhile
 
   function newConversation() { // a blank conversation; it is made at its first message
     setConversationId(null);
@@ -171,9 +187,9 @@ export function Shell({ health, settings }) {
       </Drawer.Root>
       <div className="flex min-w-0 flex-1 flex-col bg-background">
         <div className="relative flex min-h-0 flex-1">
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1" inert={overlaid || undefined}>
             <ConversationView
-              key={conversationId ?? 'none'}
+              key={`${projectId}:${conversationId ?? 'new'}`}
               conversation={conversation}
               projectId={projectId}
               panel={panel}
@@ -200,7 +216,7 @@ export function Shell({ health, settings }) {
           {panel !== 'none' && (
             <div className={cn('shrink-0 bg-background', view.overlay && 'absolute inset-y-0 right-0 z-30 border-l shadow-2xl')}
               style={{ width: view.panel }}>
-              <SidePanel which={panel} onClose={() => togglePanel(panel)} />
+              <SidePanel which={panel} overlay={overlaid} onClose={() => togglePanel(panel)} />
             </div>
           )}
         </div>

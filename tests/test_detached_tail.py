@@ -406,3 +406,18 @@ async def test_a_title_runs_record_holds_no_message_text_and_its_call_reads_the_
             "conversation_id", "title_rev", "provider", "model"}
         [title_request] = provider.titles
         assert title_request["messages"][-1]["content"] == "A distinctive question about cohorts"
+
+
+async def test_running_background_runs_stay_on_the_activity_list(tmp_path):
+    old, new1, new2 = new_id(), new_id(), new_id()
+    async with started(tmp_path / "data") as client:
+        def insert(conn):
+            general = conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0]
+            for run_id, status, started_at in ((old, "running", "2026-01-01T00:00:00.000Z"),
+                                               (new1, "succeeded", "2026-02-01T00:00:00.000Z"),
+                                               (new2, "failed", "2026-03-01T00:00:00.000Z")):
+                conn.execute("INSERT INTO runs (id, project_id, kind, workflow, status, started_at)"
+                             " VALUES (?, ?, 'background', 'title', ?, ?)", (run_id, general, status, started_at))
+        await asyncio.to_thread(client.state["db"].write, insert)
+        listed = (await client.get("/api/activity?limit=2")).json()["runs"]
+        assert [r["run_id"] for r in listed] == [old, new2]

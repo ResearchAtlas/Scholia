@@ -7,6 +7,7 @@ import { post, stream } from './api.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
+const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), for this window
 const listeners = new Set();
 
 function set(conversationId, turn, eventType) {
@@ -43,6 +44,7 @@ export function send(conversationId, path, body, text) {
   return new Promise((admitted, refused) => {
     stream(path, body, (event) => {
       turn = apply(turn, event);
+      if (event.type === 'chat_response' && event.result_saved === false && turn.runId) unsaved.set(turn.runId, event.content);
       set(conversationId, turn, event.type);
       if (turn.runId) admitted();
     }, abort.signal).catch((error) => {
@@ -63,6 +65,10 @@ export async function stop(conversationId, runId) {
   const id = runId ?? turns.get(conversationId)?.runId;
   if (id) await post(`/api/runs/${id}/cancel`);
   else aborts.get(conversationId)?.abort();
+}
+
+export function unsavedAnswer(runId) {
+  return unsaved.get(runId) ?? null;
 }
 
 export function clear(conversationId) {

@@ -676,7 +676,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         rows = await read(lambda conn: conn.execute(
             "SELECT r.id, r.project_id, r.workflow, r.status, r.cancel_reason, r.settled_cost_usd, r.attempts,"
             " r.started_at, r.finished_at, p.name, p.kind FROM runs r JOIN projects p ON p.id = r.project_id"
-            " WHERE r.kind = 'background' ORDER BY r.started_at DESC LIMIT ?", (max(1, min(limit, 200)),)).fetchall())
+            # Running runs first, so one is never pushed off the list where it is cancelled.
+            " WHERE r.kind = 'background' ORDER BY r.status = 'running' DESC, r.started_at DESC LIMIT ?",
+            (max(1, min(limit, 200)),)).fetchall())
         registry = harness().registry
         return {"runs": [{
             "run_id": run_id, "project_id": project_id, "project_name": name, "project_kind": kind,

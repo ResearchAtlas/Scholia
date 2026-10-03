@@ -1,19 +1,22 @@
 // i18n: migrated
 // The side panel (S6): the Library or a manuscript, with a close button. Their contents
-// come in later PRs (S7 and S8); until then each says what will appear.
+// come in later PRs (S7 and S8); until then each says what will appear. When it slides over
+// the conversation, focus moves into it and Escape closes it.
 import { BookOpen, FileText, X } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { Button } from '@/components/ui/button';
 
-export function SidePanel({ which, onClose }) {
+export function SidePanel({ which, overlay, onClose }) {
   const t = useT();
   const library = which === 'library';
   const Icon = library ? BookOpen : FileText;
   return (
-    <aside className="flex h-full flex-col" aria-label={library ? t('panel.library') : t('panel.manuscript')}>
+    <aside className="flex h-full flex-col" aria-label={library ? t('panel.library') : t('panel.manuscript')}
+      onKeyDown={overlay ? (event) => event.key === 'Escape' && onClose() : undefined}>
       <header className="flex h-12 shrink-0 items-center gap-2 border-b pl-4 pr-2">
         <h2 className="flex-1 text-sm font-medium">{library ? t('panel.library') : t('panel.manuscript')}</h2>
-        <Button variant="ghost" size="icon" className="size-8" onClick={onClose} aria-label={t('panel.close')}>
+        <Button variant="ghost" size="icon" className="size-8" onClick={onClose} aria-label={t('panel.close')}
+          autoFocus={overlay}>
           <X aria-hidden="true" />
         </Button>
       </header>

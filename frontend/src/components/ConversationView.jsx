@@ -7,22 +7,24 @@ import Markdown from 'react-markdown';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, RotateCw, Square } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { clear, send, stop, useLiveTurn } from '../live.js';
+import { clear, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
 import { imageAsLink, safeHref } from '../links.js';
 import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
+const POLL_MS = 1000; // while a saved turn still reads running, until it settles
+
 export function ConversationView({ conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated }) {
   const t = useT();
-  const id = conversation?.id ?? null;
+  const [draft, setDraft] = useState(null); // a new conversation, made at its first message
+  const id = conversation?.id ?? draft;
   const live = useLiveTurn(id);
-  const [turns, setTurns] = useState(id ? null : []);
+  const [turns, setTurns] = useState(conversation ? null : []);
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);
   const end = useRef(null);
-  const created = useRef(null); // a new conversation, made at its first message
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -38,20 +40,31 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     load();
   }, [load]);
 
-  useEffect(() => { // a finished live turn hands over to the saved one
+  useEffect(() => { // a finished live turn hands over to its saved record
     if (live?.done) load().then(() => clear(id));
   }, [live?.done, id, load]);
 
+  // A saved turn that still reads running (its stream ended early, or it is stopping) is
+  // read again until it settles.
+  const waiting = !live && (turns ?? []).some((turn) => turn.status === 'running');
   useEffect(() => {
-    end.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+    if (!waiting) return undefined;
+    const timer = setTimeout(load, POLL_MS);
+    return () => clearTimeout(timer);
+  }, [waiting, turns, load]);
+
+  useEffect(() => {
+    const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    end.current?.scrollIntoView({ block: 'end', behavior: still ? 'auto' : 'smooth' });
   }, [turns, live?.answer, live?.text]);
 
   async function submit(text) {
     setProblem(null);
     try {
-      created.current ??= id ?? (await post('/api/conversations', { project_id: projectId })).id;
-      await send(created.current, `/api/conversations/${created.current}/message/stream`, { content: text }, text);
-      if (!id) onCreated(created.current);
+      const target = id ?? (await post('/api/conversations', { project_id: projectId })).id;
+      setDraft(target); // shown here from now on, so Stop works while it is admitted
+      await send(target, `/api/conversations/${target}/message/stream`, { content: text }, text);
+      if (!conversation) onCreated(target);
       return true;
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
@@ -68,9 +81,14 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     }
   }
 
-  const shown = (turns ?? []).filter((turn) => !(live && turn.status === 'running'));
+  // An answer shown but not saved stays shown, marked unsaved, for as long as the window is open.
+  const shown = (turns ?? []).filter((turn) => !(live && !live.done && turn.status === 'running')).map((turn) => {
+    const unsaved = !turn.answer && unsavedAnswer(turn.run_id);
+    return unsaved ? { ...turn, answer: { text: unsaved }, result_saved: false } : turn;
+  });
   const running = Boolean(live && !live.done) || shown.some((turn) => turn.status === 'running');
   const latest = shown.at(-1);
+  const saved = live?.done && shown.some((turn) => turn.run_id === live.runId);
 
   return (
     <section className="flex h-full flex-col" aria-label={conversationTitle(t, conversation)}>
@@ -83,8 +101,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
         <h1 className="min-w-0 flex-1 truncate px-1 text-sm font-medium" title={conversation ? conversationTitle(t, conversation) : undefined}>
           {conversation ? conversationTitle(t, conversation) : ''}
         </h1>
-        <PanelButton icon={BookOpen} label={t('panel.library')} pressed={panel === 'library'} onClick={() => onPanel('library')} />
-        <PanelButton icon={FileText} label={t('panel.manuscript')} pressed={panel === 'manuscript'} onClick={() => onPanel('manuscript')} />
+        <PanelButton icon={BookOpen} label={t('panel.library')} pressed={panel === 'library'} onClick={(event) => onPanel('library', event.currentTarget)} />
+        <PanelButton icon={FileText} label={t('panel.manuscript')} pressed={panel === 'manuscript'} onClick={(event) => onPanel('manuscript', event.currentTarget)} />
       </header>
 
       <div className="scroll-thin min-h-0 flex-1 overflow-y-auto">
@@ -97,14 +115,15 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
               <Turn key={turn.run_id} turn={turn}
                 onContinue={turn === latest && continuable(turn) && !running ? () => resume(turn) : null} />
             ))}
-            {live && <LiveTurn turn={live} />}
+            {live && !saved && <LiveTurn turn={live} />}
           </ol>
           <div ref={end} />
         </div>
       </div>
 
       <Composer running={running} problem={problem} onSend={submit}
-        onStop={() => stop(id, live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id).catch(() => {})} />
+        onStop={() => Promise.resolve(stop(id, live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id))
+          .then(load).catch(() => {})} />
     </section>
   );
 }
@@ -154,7 +173,8 @@ function Turn({ turn, onContinue }) {
   const cost = turn.cost_usd > 0 ? money(turn.cost_usd, language) : null;
   const note = {
     interrupted: t('turn.interrupted'),
-    failed: t('turn.failed', { reason: errorText(t, turn.reason_code) }),
+    // an answer that was shown but not saved says so below it instead
+    failed: turn.answer && turn.reason_code === 'save_failed' ? null : t('turn.failed', { reason: errorText(t, turn.reason_code) }),
   }[turn.status] ?? (turn.status === 'cancelled'
     ? { limit: t('turn.limit'), revoked: t('turn.revoked') }[turn.cancel_reason] ?? t('turn.stopped')
     : null);
@@ -201,10 +221,14 @@ function Answer({ text }) {
           const safe = safeHref(href);
           return safe ? <a href={safe} target="_blank" rel="noreferrer noopener">{children}</a> : <span>{children}</span>;
         },
-        img: ({ src, alt }) => {
-          const { href, label } = imageAsLink(src, alt);
+        img: ({ src, alt }) => { // a placeholder with its alt text and host (PR02A), never loaded
+          const { href, label, host } = imageAsLink(src, alt);
           const text = label ? t('turn.image', { label }) : t('turn.imageUnnamed');
-          return href ? <a href={href} target="_blank" rel="noreferrer noopener">{text}</a> : <span>{text}</span>;
+          return href ? (
+            <a href={href} target="_blank" rel="noreferrer noopener">
+              {text} <span className="text-muted-foreground">{t('turn.imageFrom', { host })}</span>
+            </a>
+          ) : <span>{text}</span>;
         },
       }}>{text}</Markdown>
     </div>

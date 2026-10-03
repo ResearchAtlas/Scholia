@@ -10,8 +10,15 @@ export function safeHref(href) {
   return SAFE_LINK.test(trimmed) ? trimmed : null;
 }
 
-// An image in model output, as a link: { href, label }. href is null when the address is
-// not a web address (data:, javascript:, a relative path), and then nothing is linked.
+// An image in model output, as a link: { href, label, host }. href is null when the address
+// is not a web address (data:, javascript:, a relative path), and then nothing is linked.
 export function imageAsLink(src, alt) {
-  return { href: safeHref(src), label: typeof alt === 'string' && alt.trim() ? alt.trim() : null };
+  const href = safeHref(src);
+  let host = null;
+  try {
+    host = href && !href.startsWith('mailto:') ? new URL(href).host : null;
+  } catch {
+    // not a URL after all: no host to show
+  }
+  return { href: host ? href : null, label: typeof alt === 'string' && alt.trim() ? alt.trim() : null, host };
 }
