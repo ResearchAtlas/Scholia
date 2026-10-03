@@ -29,6 +29,7 @@ ROUTES = {"example/model-a", "example/model-b"}
 KEY = "sk-or-v1-confirmed-key"
 AUTH = {"Authorization": f"Bearer {KEY}"}
 ZDR_ONLY = {"provider": {"zdr": True}}
+CONFIRMED_UNTIL = "2999-01-01T00:00:00.000Z"  # when a confirmed key's confirmation lapses
 
 
 def entry(flags):
@@ -76,7 +77,7 @@ def setup(db, remote):
         provider_urls=(OPENROUTER_API, OTHER_PROVIDER, LOCAL_SERVER),
         helper_url=HELPER,
         private_route=lambda conn, model: entry(ZDR_ONLY) if model in ROUTES else None,
-        key_attested=lambda conn, key: key == KEY,
+        key_attested=lambda conn, key: CONFIRMED_UNTIL if key == KEY else None,
     )}
 
     class Setup:
@@ -1116,8 +1117,9 @@ def test_private_refuses_a_key_without_a_current_confirmation(db, remote, setup,
     assert remote.received == []
 
 
-def test_private_needs_a_confirmation_that_is_exactly_true(db, remote, setup):
-    setup.change(key_attested=lambda conn, key: 1)
+@pytest.mark.parametrize("until", [1, True, "2000-01-01T00:00:00.000Z"])
+def test_private_needs_a_confirmation_that_lapses_later(db, remote, setup, until):
+    setup.change(key_attested=lambda conn, key: until)  # not a time, or one already past
     with pytest.raises(OutboundDenied, match="key_not_confirmed"):
         private_post(setup, db, chat())
     assert remote.received == []
@@ -1588,7 +1590,7 @@ def test_a_route_or_confirmation_withdrawn_after_the_inputs_were_read_refuses(db
 
     def attested(conn, key):
         assert conn.in_transaction
-        return conn.execute("SELECT count(*) FROM key_attestations").fetchone()[0] > 0
+        return CONFIRMED_UNTIL if conn.execute("SELECT count(*) FROM key_attestations").fetchone()[0] else None
 
     db.write(lambda conn: conn.execute(
         "INSERT INTO private_routes (route_key, source, required_flags) VALUES ('openrouter:*', 'shipped', '{}')"))

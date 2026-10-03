@@ -215,8 +215,18 @@ def key_reference(mark):
     return mark[:16]
 
 
+def key_confirmed_until(conn, data_dir, key):
+    """When the key's current data-settings confirmation lapses (the latest of them), or None
+    when it has none: the outbound gate holds a Private request's dispatch to that time."""
+    mark, now = fingerprint(data_dir, key), utc_now()
+    until = [expires for fingerprint_, statement, expires in conn.execute(
+        "SELECT key_fingerprint, statement, expires_at FROM key_attestations")
+        if hmac.compare_digest(fingerprint_, mark) and statement == KEY_STATEMENT and expires > now]
+    return max(until) if until else None
+
+
 def key_attested(conn, data_dir, key) -> bool:
-    return confirmation(conn, data_dir, key)["status"] == "current"
+    return key_confirmed_until(conn, data_dir, key) is not None
 
 
 def confirm_key(conn, data_dir, provider, key):

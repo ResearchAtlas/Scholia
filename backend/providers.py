@@ -105,7 +105,7 @@ def gate_inputs(data_root) -> GateInputs:
         return entry if entry is not None and any(governance.zero_retention(p, model) for p in openrouter) else None
 
     return GateInputs(provider_urls=tuple(p.base_url for p in found.values()), private_route=private_route,
-                      key_attested=lambda conn, key: governance.key_attested(conn, data_root, key))
+                      key_attested=lambda conn, key: governance.key_confirmed_until(conn, data_root, key))
 
 
 def resolve_route(data_root, provider_name: str | None, model: str | None) -> Route | None:

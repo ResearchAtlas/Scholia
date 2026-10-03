@@ -631,3 +631,187 @@ async def test_a_route_taken_away_between_a_decision_and_entry_means_the_request
                                      " WHERE event = 'outbound' AND project_id = ? ORDER BY seq", project)
         assert reasons == [("allow", None), ("deny", "not_declared" if change == "withdraw" else "route_not_allowed")]
         assert stream[-1]["status"] == "failed"
+
+
+# Every write that can take a route away is ordered with dispatch, whatever happens to its request
+
+
+async def private_setup(client, *, key_owner="openrouter"):
+    """A Private project and conversation that may use example/zdr-model on OpenRouter, with the
+    key confirmed through key_owner's card."""
+    current = (await client.get("/api/settings")).json()
+    await client.put("/api/settings", json={"hash": current["hash"], "updates": {"providers.openrouter.models": "all"}})
+    assert (await confirm_key(client, key_owner)).status_code == 200
+    project = await new_project(client, "private")
+    return project, await new_conversation(client, project)
+
+
+def zdr_provider():
+    return MockProvider(catalog=["example/zdr-model"], zero_retention=["example/zdr-model"])
+
+
+async def test_a_cancelled_allowlist_change_keeps_its_mark_until_its_write_has_finished(tmp_path, monkeypatch):
+    # The request turning the allowlist entry off is cancelled while its write has not reached
+    # the database. Its mark stays until the write has finished, so a Private request decided
+    # meanwhile is decided again after it, and refused; it never enters the transport after.
+    import threading
+    from backend import openrouter_client, outbound_gate
+    openrouter_client.clear_cache()
+    order, provider = [], zdr_provider()
+    async with started(tmp_path / "data", recording(monkeypatch, provider, order)) as client:
+        project, conversation = await private_setup(client)
+        db, loop = client.state["db"], asyncio.get_running_loop()
+        real_write, real_check = db.write, outbound_gate.OutboundGate._check
+        started_, go = threading.Event(), threading.Event()
+
+        def slow_write(fn):  # the allowlist write waits before it reaches the database
+            if fn.__qualname__.endswith("change_private_route.<locals>.change"):
+                started_.set()
+                go.wait(3)
+            return real_write(fn)
+
+        def disabled(conn):
+            return conn.execute("SELECT count(*) FROM private_routes WHERE enabled = 0").fetchone() == (1,)
+
+        def check_then_let_it_go(self, request_, scope, *args):
+            found = real_check(self, request_, scope, *args)
+            if scope.project_id == project:
+                go.set()
+                deadline = time.monotonic() + 1
+                while not real_write(disabled) and time.monotonic() < deadline:  # it commits meanwhile
+                    time.sleep(0.01)
+            return found
+
+        monkeypatch.setattr(db, "write", slow_write)
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_let_it_go)
+        change = asyncio.create_task(client.put("/api/private-routes/openrouter:*", json={"enabled": False}))
+        await asyncio.to_thread(started_.wait, 3)
+        change.cancel()
+        await asyncio.sleep(0.05)  # the cancellation has reached the request
+        threading.Timer(0.5, go.set).start()  # the write goes on after a while in any case
+        stream = await send(client, conversation, model="example/zdr-model")
+        with pytest.raises(asyncio.CancelledError):
+            await change
+        await background_idle(client)
+        assert "entered" not in order and provider.chats == []
+        assert stream[-1]["status"] == "failed"
+        assert await asyncio.to_thread(real_write, disabled)
+
+
+async def test_a_key_changed_through_another_name_is_ordered_with_dispatch(tmp_path, monkeypatch):
+    # Two names for the same OpenRouter key; the confirmation was made through the other one.
+    # Changing that other name's key ends the confirmation the first name was using, between the
+    # first name's decision and its entry into the transport: it is decided again, and refused.
+    from backend import openrouter_client, outbound_gate
+    from scholia_app import KEY
+    openrouter_client.clear_cache()
+    order, provider = [], zdr_provider()
+    async with started(tmp_path / "data", recording(monkeypatch, provider, order)) as client:
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+            "providers.work.kind": "openrouter", "providers.work.base_url": "https://openrouter.ai/api/v1",
+            "providers.work.models": "all"}})
+        assert (await client.put("/api/keys/work", json={"key": KEY})).status_code == 200  # the same key
+        project, conversation = await private_setup(client, key_owner="work")
+        loop, db = asyncio.get_running_loop(), client.state["db"]
+        real_check = outbound_gate.OutboundGate._check
+
+        def check_then_change_the_other_key(self, request_, scope, *args):
+            found = real_check(self, request_, scope, *args)
+            if scope.project_id == project and "changed" not in order:
+                order.append("changed")
+                asyncio.run_coroutine_threadsafe(client.put("/api/keys/work", json={"key": "sk-or-another"}), loop)
+                deadline = time.monotonic() + 1
+                while db.read(lambda conn: conn.execute("SELECT count(*) FROM key_attestations").fetchone()) != (0,) \
+                        and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            return found
+
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_change_the_other_key)
+        stream = await send(client, conversation, model="example/zdr-model", provider="openrouter")
+        await background_idle(client)
+        assert order[0] == "changed" and "entered" not in order and provider.chats == []
+        decisions = await rows(client, "SELECT data ->> 'decision' FROM audit_log WHERE event = 'outbound'"
+                                       " AND project_id = ? ORDER BY seq", project)
+        assert decisions == [("allow",), ("deny",)] and stream[-1]["status"] == "failed"
+
+
+async def test_a_confirmation_that_lapses_between_decision_and_entry_is_honoured(tmp_path, monkeypatch):
+    from backend import openrouter_client, outbound_gate
+    from datetime import UTC, datetime, timedelta
+    from backend.db import utc_now
+    openrouter_client.clear_cache()
+    order, provider = [], zdr_provider()
+    async with started(tmp_path / "data", recording(monkeypatch, provider, order)) as client:
+        project, conversation = await private_setup(client)
+        db = client.state["db"]
+        lapses = (datetime.now(UTC) + timedelta(seconds=1.5)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        await asyncio.to_thread(db.write, lambda conn: conn.execute("UPDATE key_attestations SET expires_at = ?",
+                                                                    (lapses,)))
+        real_check = outbound_gate.OutboundGate._check
+
+        def check_then_wait_past_it(self, request_, scope, *args):
+            found = real_check(self, request_, scope, *args)
+            if scope.project_id == project and "decided" not in order:
+                order.append("decided")
+                while utc_now() <= lapses:  # the confirmation lapses before the request would enter
+                    time.sleep(0.02)
+            return found
+
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_wait_past_it)
+        stream = await send(client, conversation, model="example/zdr-model")
+        await background_idle(client)
+        assert order == ["decided"] and provider.chats == []
+        reasons = await rows(client, "SELECT data ->> 'reason' FROM audit_log WHERE event = 'outbound'"
+                                     " AND project_id = ? ORDER BY seq", project)
+        assert reasons == [(None,), ("key_not_confirmed",)] and stream[-1]["status"] == "failed"
+
+
+@pytest.mark.parametrize("change", [{"providers.openrouter.enabled": False},
+                                    {"providers.openrouter.base_url": "https://api.moved.example/v1"}])
+async def test_a_provider_turned_off_or_moved_between_a_catalog_decision_and_entry_is_honoured(
+        tmp_path, monkeypatch, change):
+    from backend import openrouter_client, outbound_gate
+    openrouter_client.clear_cache()
+    order, provider = [], zdr_provider()
+
+    async def handler(request):  # in front of the provider: when a catalog page enters the transport
+        if request.url.path.endswith("/models"):
+            order.append("entered")
+        return await provider(request)
+
+    async with started(tmp_path / "data", handler) as client:
+        openrouter_client.clear_cache()
+        loop = asyncio.get_running_loop()
+        real_check = outbound_gate.OutboundGate._check
+
+        async def turn_off():
+            current = (await client.get("/api/settings")).json()
+            return await client.put("/api/settings", json={"hash": current["hash"], "updates": change})
+
+        def check_then_turn_off(self, request_, scope, *args):
+            found = real_check(self, request_, scope, *args)
+            if request_.url.path.endswith("/models") and "changed" not in order:
+                order.append("changed")
+                assert asyncio.run_coroutine_threadsafe(turn_off(), loop).result(timeout=2).status_code == 200
+            return found
+
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_turn_off)
+        listing = await client.get("/api/providers/openrouter/models")
+        assert order == ["changed"]  # the catalog page never entered the transport after the change
+        assert listing.status_code in (404, 409) or listing.json()["status"]["error"] == "refresh_failed"
+
+
+async def test_a_catalog_read_ends_at_its_deadline_under_a_revocation_that_does_not_end(tmp_path, monkeypatch):
+    from backend import openrouter_client
+    openrouter_client.clear_cache()
+    monkeypatch.setattr(openrouter_client, "CATALOG_SECONDS", 0.5)
+    async with started(tmp_path / "data") as client:
+        openrouter_client.clear_cache()
+        gate = client.state["gate"]
+        gate._begin(None)  # a revocation of every project under way, for longer than the deadline
+        try:
+            listing = await asyncio.wait_for(client.get("/api/providers/openrouter/models"), timeout=5)
+        finally:
+            gate._end(None)
+        assert listing.json()["status"]["error"] == "refresh_failed" and listing.json()["models"] == []

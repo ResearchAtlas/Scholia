@@ -53,13 +53,15 @@ deletion or a tightened project, or one in a review-locked project, sends nothin
 more, retries and same-origin redirect hops included ("revoked").
 
 No request enters the transport after a revocation commits. Every write that revokes
-a project's runs or takes away a route (a tightened or review-locked project; a
-deletion, a withdrawn declaration or a change to the Private allowlist, for every
-project) is marked on the event loop before it starts and after it ends (`revoking`,
-`revoking_from_thread`).
+a project's runs or takes away a route (a tightened or review-locked project; for every
+project, a deletion, a withdrawn declaration, a change to the Private allowlist, a
+provider's key, which also ends its confirmations, and a provider turned off, moved or
+removed) is marked on the event loop from before it starts until it has finished,
+whatever happens to the request that made it (`ordered`, `revoking_from_thread`).
 An async client decides a request when no revocation of its project is under way, and
 on the loop, in the same step in which it calls the transport, finds that none began
-meanwhile, or else decides again once it has ended. So a request entered the transport
+meanwhile and that the key's confirmation it was decided under has not lapsed, or else
+decides again once the revocation has ended. So a request entered the transport
 before a revocation began (the in-flight case Stop stops), or is decided after it, and
 refused. Nothing here waits on a thread for the loop or the other way round. (A sync
 client, which only tests use, is not ordered with revocations.) What the gate applied
@@ -112,7 +114,7 @@ from enum import StrEnum
 
 import httpx
 
-from backend.db import deletion
+from backend.db import deletion, utc_now
 
 
 class Kind(StrEnum):
@@ -193,14 +195,15 @@ class GateInputs:
     private_route(conn, model): the enabled Private allowlist entry covering an OpenRouter
         model id (a mapping with its required_flags, route_key, terms_url and checked_on), or
         None if none covers it.
-    key_attested(conn, key): whether a key has a current data-settings confirmation.
+    key_attested(conn, key): when a key's current data-settings confirmation lapses (an
+        ISO 8601 UTC time), or None when it has none; a request is dispatched only before then.
     Both are called inside the decision transaction, with its connection.
     """
 
     provider_urls: Collection[str] = ()
     helper_url: str | None = None
     private_route: Callable[[object, str], Mapping | None] | None = None  # see above
-    key_attested: Callable[[object, str], bool] | None = None
+    key_attested: Callable[[object, str], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -293,16 +296,22 @@ class OutboundGate:
             self._waiters.add(waiter)
             await waiter
 
-    @contextlib.asynccontextmanager
-    async def revoking(self, project_id):
-        """Around a write, made from the event loop, that revokes a project's runs or takes away a
-        route it may use (None: every project): marked before it starts and after it ends (see the
-        module's docstring)."""
+    async def ordered(self, project_id, write):
+        """Await write (an awaitable), which may revoke a project's runs or take away a route its
+        requests may use (None: every project's), ordered with dispatch: marked from before it
+        starts until it has finished, whatever happens to the request that started it (see the
+        module's docstring). A cancellation of the caller is raised at once; the write goes on,
+        and its mark with it."""
         self._begin(project_id)
-        try:
-            yield
-        finally:
+        writing = asyncio.ensure_future(write)
+
+        def done(task):
             self._end(project_id)
+            if not task.cancelled():
+                task.exception()  # retrieved here when nobody awaits it any more
+
+        writing.add_done_callback(done)
+        return await asyncio.shield(writing)
 
     @contextlib.contextmanager
     def revoking_from_thread(self, project_id):
@@ -515,7 +524,8 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
             begun = gate._begun_for(project_id)
             # The database blocks, so it is reached off the event loop.
             kind, terms, hop = await asyncio.to_thread(gate._check, request, self._scope, hop)
-            if gate._begun_for(project_id) == begun:
+            lapsed = (terms or {}).get("key_confirmed_until")  # a Private key's confirmation, as decided
+            if gate._begun_for(project_id) == begun and not (lapsed and lapsed <= utc_now()):
                 break
         # In this same step, with no revocation begun since the decision, the request enters the transport.
         _dispatched(request, terms)
@@ -584,14 +594,15 @@ def _dispatched(request, terms=None):
         notify(terms)
 
 
-def _terms(conn, level, kind, target, entries):
+def _terms(conn, level, kind, target, private):
     """The retention terms a decision applied: the level; and for a Private request to
-    OpenRouter, zero retention with each model's allowlist entry; or for a declared server on
-    this machine, its declaration."""
+    OpenRouter, zero retention with each model's allowlist entry and when the key's
+    confirmation lapses; or for a declared server on this machine, its declaration."""
     terms = {"level": level}
-    if level == "private" and kind is Kind.MODEL_PROVIDER and entries:
+    if level == "private" and kind is Kind.MODEL_PROVIDER and private:
         terms.update(zero_retention=True, allowlist=[
-            {key: entry.get(key) for key in ("route_key", "terms_url", "checked_on")} for entry in entries])
+            {key: entry.get(key) for key in ("route_key", "terms_url", "checked_on")} for entry in private["entries"]],
+            key_confirmed_until=private["key_confirmed_until"])
     elif level in ("private", "local_only") and kind is Kind.LOCAL_PROVIDER:
         found = [at for url, at in conn.execute("SELECT base_url, declared_at FROM local_declarations")
                  if _origin_of(url) == target]
@@ -829,10 +840,10 @@ def _private_request(request: httpx.Request, inputs: GateInputs):
 
 
 def _private_problem(conn, inputs: GateInputs, models, body, authorization, key):
-    """(Why a request to OpenRouter cannot go out from a Private project, or None; the allowlist
-    entries it goes out under): each model on the allowlist with its entry's flags, provider.zdr
-    = true, and a key whose data-settings confirmation is current, read in the decision
-    transaction."""
+    """(Why a request to OpenRouter cannot go out from a Private project, or None; the terms it
+    goes out under: the allowlist entries and when the key's confirmation lapses): each model on
+    the allowlist with its entry's flags, provider.zdr = true, and a key whose data-settings
+    confirmation is current, read in the decision transaction."""
     entries = []
     for model in models:
         entry = inputs.private_route(conn, model)
@@ -845,9 +856,10 @@ def _private_problem(conn, inputs: GateInputs, models, body, authorization, key)
     if not _carries(body, ZDR):
         return "missing_flags", None
     scheme = authorization.partition(" ")[0]
-    if scheme.lower() != "bearer" or not key or inputs.key_attested(conn, key) is not True:
+    until = inputs.key_attested(conn, key) if scheme.lower() == "bearer" and key else None
+    if not isinstance(until, str) or until <= utc_now():
         return "key_not_confirmed", None
-    return None, entries
+    return None, {"entries": entries, "key_confirmed_until": until}
 
 
 def _body(request: httpx.Request):

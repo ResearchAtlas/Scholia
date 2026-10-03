@@ -64,58 +64,60 @@ async def _fetch_catalog_rows(client, url, id_field, key):
     total_bytes = 0
     deadline = time.monotonic() + CATALOG_SECONDS
     try:
-        while True:
-            if time.monotonic() > deadline:
-                raise ValueError("catalog deadline")
-            async with client.stream("GET", url, headers=headers, params={"after": cursor} if cursor else None,
-                                     timeout=10.0) as response:
-                response.raise_for_status()
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    body.extend(chunk)
-                    total_bytes += len(chunk)
-                    if total_bytes > MAX_CATALOG_BYTES or time.monotonic() > deadline:
+        # The whole read, the outbound gate's admission of each page included (Scholia).
+        async with asyncio.timeout(CATALOG_SECONDS):
+            while True:
+                if time.monotonic() > deadline:
+                    raise ValueError("catalog deadline")
+                async with client.stream("GET", url, headers=headers, params={"after": cursor} if cursor else None,
+                                         timeout=10.0) as response:
+                    response.raise_for_status()
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_CATALOG_BYTES or time.monotonic() > deadline:
+                            raise ValueError("oversized catalog")
+                    payload = json.loads(body)
+                if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                    raise ValueError("invalid catalog shape")
+                page = payload["data"]
+                for row in page:
+                    if not isinstance(row, dict) or not isinstance(row.get(id_field), str) or not row[id_field].strip():
+                        raise ValueError("invalid catalog row")
+                    identity = row[id_field]
+                    if identity != identity.strip() or len(identity) > 512 or any(ord(c) < 32 for c in identity):
+                        raise ValueError("invalid catalog identity")
+                    if id_field == "id" and identity in seen:
+                        raise ValueError("duplicate model id")
+                    seen.add(identity)
+                    rows.append(row)
+                    if len(rows) > MAX_CATALOG_MODELS:
                         raise ValueError("oversized catalog")
-                payload = json.loads(body)
-            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-                raise ValueError("invalid catalog shape")
-            page = payload["data"]
-            for row in page:
-                if not isinstance(row, dict) or not isinstance(row.get(id_field), str) or not row[id_field].strip():
-                    raise ValueError("invalid catalog row")
-                identity = row[id_field]
-                if identity != identity.strip() or len(identity) > 512 or any(ord(c) < 32 for c in identity):
-                    raise ValueError("invalid catalog identity")
-                if id_field == "id" and identity in seen:
-                    raise ValueError("duplicate model id")
-                seen.add(identity)
-                rows.append(row)
-                if len(rows) > MAX_CATALOG_MODELS:
-                    raise ValueError("oversized catalog")
-            # Honor same-endpoint cursors; never follow provider-supplied URLs.
-            links = payload.get("links", {})
-            if not isinstance(links, dict) or links.get("next") is not None:
-                raise ValueError("unsupported pagination links")
-            if any(payload.get(k) for k in ("next", "next_page", "next_cursor")):
-                raise ValueError("unsupported pagination")
-            for field in ("total", "total_count"):
-                if field in payload:
-                    total = payload[field]
-                    if type(total) is not int or total < 0 or (expected_total is not None and total != expected_total):
-                        raise ValueError("invalid catalog total")
-                    expected_total = total
-            if expected_total is not None and len(rows) > expected_total:
-                raise ValueError("incomplete catalog")
-            if payload.get("has_more", False) is False:
-                if expected_total is not None and expected_total != len(rows):
+                # Honor same-endpoint cursors; never follow provider-supplied URLs.
+                links = payload.get("links", {})
+                if not isinstance(links, dict) or links.get("next") is not None:
+                    raise ValueError("unsupported pagination links")
+                if any(payload.get(k) for k in ("next", "next_page", "next_cursor")):
+                    raise ValueError("unsupported pagination")
+                for field in ("total", "total_count"):
+                    if field in payload:
+                        total = payload[field]
+                        if type(total) is not int or total < 0 or (expected_total is not None and total != expected_total):
+                            raise ValueError("invalid catalog total")
+                        expected_total = total
+                if expected_total is not None and len(rows) > expected_total:
                     raise ValueError("incomplete catalog")
-                return rows
-            if payload.get("has_more") is not True or not page:
-                raise ValueError("invalid pagination")
-            next_cursor = payload.get("last_id")
-            if next_cursor != page[-1][id_field] or next_cursor == cursor:
-                raise ValueError("invalid pagination cursor")
-            cursor = next_cursor
+                if payload.get("has_more", False) is False:
+                    if expected_total is not None and expected_total != len(rows):
+                        raise ValueError("incomplete catalog")
+                    return rows
+                if payload.get("has_more") is not True or not page:
+                    raise ValueError("invalid pagination")
+                next_cursor = payload.get("last_id")
+                if next_cursor != page[-1][id_field] or next_cursor == cursor:
+                    raise ValueError("invalid pagination cursor")
+                cursor = next_cursor
     except Exception as error:  # cancellation propagates
         # No upstream response body, headers, URL query or credential in logs or the UI.
         log.warning("model catalog fetch failed (%s); keeping the previous catalog", classify_error(error))

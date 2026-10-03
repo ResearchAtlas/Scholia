@@ -408,6 +408,11 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(409, "active_run", "A running task uses this provider; stop it or wait")
 
     async def _save_key(provider, key):
+        """_store_key, ordered with every project's dispatch: a key change ends the confirmations
+        made for it, which other names for the same key may be using too."""
+        return await state["gate"].ordered(None, _store_key(provider, key))
+
+    async def _store_key(provider, key):
         """Store a key, clear what was learned with the old one, and audit the change.
         Callers run it to its end (_to_end), so a stored key is always followed through.
         A save that fails may still have changed the key (a file replaced before its
@@ -523,7 +528,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         changed = _providers_changed(body.updates, providers.configured(data_dir, include_off=True))
         refuse_if_busy(changed)  # before any field is written
         try:
-            await _finished(loaded.save, body.updates)  # under the project-files lock to its end
+            saving = _finished(loaded.save, body.updates)  # under the project-files lock to its end
+            # A provider turned off, moved or removed takes routes away: ordered with dispatch.
+            await (state["gate"].ordered(None, saving) if changed else saving)
         except SettingsChanged:
             raise ApiError(409, "settings_changed", "The settings changed since they were read") from None
         except ValueError:
@@ -675,8 +682,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         so that no request of the project enters the transport after it commits, and stop them,
         both to their end."""
         async def change_and_stop():
-            async with state["gate"].revoking(project_id):
-                harness().revoke(await write(change))
+            harness().revoke(await state["gate"].ordered(project_id, write(change)))
         await _to_end(change_and_stop())
 
     def unchanged(conn, project_id, level, locked):
@@ -798,8 +804,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             if found is None:
                 raise ApiError(404, "unknown_provider", "That provider is not set up")
             # Every project's requests that could use the server are ordered with the withdrawal.
-            async with state["gate"].revoking(None):
-                withdrawn = await _to_end(write(lambda conn: governance.withdraw(conn, found.name, found.base_url)))
+            withdrawn = await _to_end(state["gate"].ordered(
+                None, write(lambda conn: governance.withdraw(conn, found.name, found.base_url))))
             if not withdrawn:
                 raise ApiError(404, "not_found", "That server is not declared")
         return {"ok": True}
@@ -837,8 +843,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             governance.record(conn, "private_route_changed", route=key, enabled=body.enabled,
                               rechecked=body.rechecked)
 
-        async with state["gate"].revoking(None):  # every Private project's requests are ordered with it
-            await write(change)
+        await _to_end(state["gate"].ordered(None, write(change)))  # every Private project's requests ordered with it
         return await private_routes()
 
     @app.get("/api/audit")

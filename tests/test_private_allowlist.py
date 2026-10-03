@@ -276,9 +276,11 @@ async def test_each_attempt_records_the_retention_terms_the_gate_applied(tmp_pat
         await background_idle(client)
         shipped = applied(governance.shipped()["entries"][0])
         [(declared_at,)] = await rows(client, "SELECT declared_at FROM local_declarations")
+        [(until,)] = await rows(client, "SELECT expires_at FROM key_attestations")
+        private = {"level": "private", "zero_retention": True, "allowlist": [shipped], "key_confirmed_until": until}
         assert await attempt_terms(client) == [
-            ("agent", {"level": "private", "zero_retention": True, "allowlist": [shipped]}),
-            ("title", {"level": "private", "zero_retention": True, "allowlist": [shipped]}),
+            ("agent", private),
+            ("title", private),
             ("agent", {"level": "private", "declared_origin": "http://127.0.0.1:11434", "declared_at": declared_at}),
             ("agent", {"level": "normal"}),
         ]
@@ -311,8 +313,9 @@ async def test_the_terms_recorded_are_those_applied_at_dispatch_not_at_admission
         exact = next(e for e in (await client.get("/api/private-routes")).json()["routes"]
                      if e["route_key"] == f"openrouter:{ZDR_MODEL}")
         [(declared_at,)] = await rows(client, "SELECT declared_at FROM local_declarations")
+        [(until,)] = await rows(client, "SELECT expires_at FROM key_attestations")
         terms = [t for workflow, t in await attempt_terms(client) if workflow == "agent"]
         assert terms == [
-            {"level": "private", "zero_retention": True, "allowlist": [applied(exact)]},
+            {"level": "private", "zero_retention": True, "allowlist": [applied(exact)], "key_confirmed_until": until},
             {"level": "private", "declared_origin": "http://127.0.0.1:11434", "declared_at": declared_at},
         ]
