@@ -17,6 +17,7 @@ Database and file work runs off the event loop.
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -198,6 +199,20 @@ async def back_up_now(request: Request):
 
 
 @contextlib.contextmanager
+def _file_errors(status=500, code="write_failed", message="The file could not be written"):
+    """A file system failure as a code, logged by kind only, never with its path."""
+    try:
+        yield
+    except OSError as error:
+        log.warning("a backup, restore or export failed on a file (%s, errno %s)", type(error).__name__, error.errno)
+        if error.errno == errno.ENOSPC:
+            raise BackupError(507, "disk_full", "The disk is full") from None
+        if error.errno in (errno.EACCES, errno.EPERM, errno.EROFS) and code == "write_failed":
+            raise BackupError(400, "destination_not_writable", "Scholia cannot write to that folder") from None
+        raise BackupError(status, code, message) from None
+
+
+@contextlib.contextmanager
 def _backup_errors():
     """A backup's failures, as the interface reads them."""
     try:
@@ -223,6 +238,11 @@ async def full_backup(body: FullBackup, request: Request):
 
 
 def _full_backup(db, destination, passphrase):
+    with _file_errors():
+        return _write_full_backup(db, destination, passphrase)
+
+
+def _write_full_backup(db, destination, passphrase):
     staging = _staging(db.data_dir)
     try:
         with _backup_errors():
@@ -261,7 +281,8 @@ async def restore(body: Restore, request: Request):
     if (body.generation is None) == (body.file is None):
         raise BackupError(400, "invalid_request", "Name one automatic backup or one backup file")
     state = request.app.state.scholia
-    async with state["backups_lock"]:
+    # Project folder writes wait (see backend.app's project-files lock) while the folder is swapped.
+    async with state["backups_lock"], state.get("project_files") or contextlib.nullcontext():
         return await _to_end(_restore(state, body))
 
 
@@ -269,7 +290,8 @@ async def _restore(state, body):
     data_dir = state["data_dir"]
     staging = await asyncio.to_thread(_staging, data_dir)
     try:
-        await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
+        with _file_errors(400, "backup_unreadable", "The backup could not be read"):
+            await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
         db, harness = state.get("db"), state.get("harness")
         damaged = db is None or db.damaged is not None
         safety = None
@@ -351,7 +373,8 @@ def _stage(data_dir, body, staging):
 def _stage_generation(data_dir, generation, staging):
     kind, _, name = generation.partition("/")
     folder = data_dir / "backups" / kind / name
-    if kind not in KINDS or not _stamp_of(Path(name)) or folder.is_symlink() or not folder.is_dir():
+    if kind not in KINDS or name != Path(name).name or not _stamp_of(Path(name)) or folder.is_symlink() \
+            or not folder.is_dir():
         raise BackupError(404, "not_found", "No such backup")
     for path in sorted(folder.rglob("*")):
         relative = path.relative_to(folder).as_posix()
@@ -506,6 +529,11 @@ async def export_project(project_id: str, body: Export, request: Request):
 
 
 def _export(db, project_id, destination, passphrase):
+    with _file_errors():
+        return _write_export(db, project_id, destination, passphrase)
+
+
+def _write_export(db, project_id, destination, passphrase):
     data = db.read(lambda conn: _project_records(conn, project_id))
     if data is None:
         raise BackupError(404, "not_found", "No such project")

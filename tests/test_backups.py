@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import sqlite3
 import stat
 import zipfile
@@ -152,6 +153,23 @@ async def test_a_full_backup_goes_only_to_an_existing_folder_outside_the_data_fo
         assert await audit(client, "full_backup") == []
 
 
+async def test_a_folder_that_cannot_be_written_gets_a_code_and_no_path_in_the_log(tmp_path, caplog):
+    destination = tmp_path / "read-only"
+    destination.mkdir()
+    os.chmod(destination, 0o500)
+    try:
+        async with started(tmp_path / "data") as client:
+            project = await new_project(client)
+            for path, body in (("/api/backups/full", {}), (f"/api/projects/{project}/export", {})):
+                response = await client.post(path, json={"destination": str(destination), **body})
+                assert (response.status_code, response.json()["code"]) == (400, "destination_not_writable")
+            assert await audit(client, "full_backup") == [] and await audit(client, "project_export") == []
+    finally:
+        os.chmod(destination, 0o700)
+    assert list(destination.iterdir()) == []
+    assert str(destination) not in caplog.text and "PermissionError" in caplog.text
+
+
 # Restore
 
 
@@ -217,7 +235,8 @@ async def test_a_backup_from_a_newer_version_is_refused_with_its_explanation(tmp
         assert not client.state["db"].closed
 
 
-@pytest.mark.parametrize("generation", ["daily/../../x", "monthly/20260101T000000000000Z", "daily/nope"])
+@pytest.mark.parametrize("generation", ["daily/../../x", "monthly/20260101T000000000000Z", "daily/nope",
+                                        "daily/../../../elsewhere/20260101T000000000000Z"])
 async def test_only_a_listed_backup_can_be_restored(tmp_path, generation):
     async with started(tmp_path / "data") as client:
         response = await client.post("/api/backups/restore", json={"generation": generation})

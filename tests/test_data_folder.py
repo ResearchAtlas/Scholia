@@ -184,3 +184,22 @@ def test_a_chosen_folder_that_is_not_there_is_not_made_anew(tmp_path, monkeypatc
     assert desktop.run(default, _window(seen), listening=register_server) == 1
     assert seen[0]["data_folder_problem"] == "missing" and seen[0]["data_folder"] == str(disk / "Scholia")
     assert not disk.exists()
+
+
+def test_only_an_empty_folder_or_one_holding_scholias_data_is_recorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default, documents, moved = tmp_path / "default", tmp_path / "Documents", tmp_path / "Moved"
+    documents.mkdir()
+    (documents / "run.sh").write_text("echo hi\n")
+    os.chmod(documents / "run.sh", 0o755)
+    with pytest.raises(ValueError, match="empty folder"):  # its files would be narrowed to owner-only
+        data_folder.choose(default, str(documents))
+    assert mode(documents / "run.sh") == 0o755 and not (default / data_folder.LOCATION_FILE).exists()
+    moved.mkdir()
+    (moved / "scholia.sqlite3").write_bytes(b"")  # a data folder the researcher moved there
+    assert data_folder.choose(default, str(moved)) == moved
+
+
+def test_the_synced_check_ignores_case_as_the_file_system_does(tmp_path):
+    for place in ("dropbox/Scholia", "library/cloudstorage/OneDrive-x/Scholia", "LIBRARY/Mobile Documents/x"):
+        assert data_folder.synced(tmp_path / place, home=tmp_path, fs_type=apfs) is not None

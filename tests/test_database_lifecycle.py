@@ -960,3 +960,13 @@ def test_backups_are_listed_newest_first_with_their_versions_and_sizes(tmp_path)
     assert listed[0]["app_version"] == APP_VERSION and listed[0]["schema_version"] == len(MIGRATIONS)
     assert listed[-2]["app_version"] is None  # its backup.json cannot be read
     assert all(g["size"] > 0 for g in listed)
+
+
+def test_a_closed_database_says_so_even_to_a_thread_given_its_writers_id(tmp_path, monkeypatch):
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    writer = db._writer_ident
+    db.close()
+    monkeypatch.setattr(database_module.threading, "get_ident", lambda: writer)  # thread ids are reused
+    with pytest.raises(DatabaseClosedError):
+        db.write(add_audit_row)

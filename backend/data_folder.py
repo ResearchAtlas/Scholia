@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from backend import APP_VERSION
+from backend.db.database import DB_NAME
 from backend.desktop import UnsafeDataFolderError, _acl_problem, _check_ancestors, _check_folder
 from backend.settings import write_private
 
@@ -71,7 +72,7 @@ def synced(path, *, home=None, fs_type=None) -> str | None:
     places = {Path(os.path.abspath(path)), Path(os.path.realpath(path))}  # as written, and with links followed
     for base in {home, Path(os.path.realpath(home))}:
         for folder, name in SYNCED.items():
-            if any(place.is_relative_to(base / folder) for place in places):
+            if any(_inside(place, base / folder) for place in places):
                 return f"it is inside {name}, which syncs its files"
     existing = Path(os.path.realpath(path))
     while not existing.exists():  # a folder not made yet sits on its nearest existing parent's file system
@@ -80,6 +81,11 @@ def synced(path, *, home=None, fs_type=None) -> str | None:
     if kind in NETWORK_FILE_SYSTEMS:
         return f"it is on a network file system ({kind})"
     return None
+
+
+def _inside(place, folder):
+    """Whether place is folder or inside it, ignoring case as macOS's file systems usually do."""
+    return Path(str(place).casefold()).is_relative_to(Path(str(folder).casefold()))
 
 
 class _StatFS(ctypes.Structure):  # macOS struct statfs, 64-bit inodes
@@ -108,7 +114,8 @@ def file_system_type(path) -> str | None:
 def choose(default, path, *, home=None, fs_type=None) -> Path:
     """Record path as the data folder for the next launch, after checking it as the desktop entry
     will: an absolute path, not synced or on a network, a folder (made here, owner-only, under an
-    existing one) that no other account can change. Choosing the default removes the record.
+    existing one) that no other account can change, and empty or holding Scholia's data already
+    (the next launch narrows everything in it to owner-only). Choosing the default removes the record.
     Raises ValueError, or UnsafeDataFolderError, saying why it cannot be used."""
     if not os.path.isabs(path) or ".." in Path(path).parts:
         raise ValueError("Choose a folder by its full path")
@@ -119,6 +126,9 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     _check_ancestors(path)
     if not path.parent.is_dir():
         raise ValueError("The folder above it does not exist")
+    if path != default and path.is_dir() and not path.is_symlink() and any(path.iterdir()) \
+            and not (path / DB_NAME).is_file():
+        raise ValueError("Choose an empty folder, or one that holds Scholia's data")
     try:
         os.mkdir(path, 0o700)
     except FileExistsError:

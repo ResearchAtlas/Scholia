@@ -285,6 +285,7 @@ class Database:
             log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
         self._writer.submit(self._close_writer).result()
         self._writer.shutdown()
+        self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
 
     # Writer thread
 
