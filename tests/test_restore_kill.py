@@ -354,6 +354,14 @@ async def test_a_restore_done_whose_audit_row_cannot_be_written_is_reported_done
         assert response.json()["not_recorded"] == ["audit"]
         assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept"}
         assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # it runs
+        assert (data / "backups" / backups_module.JOURNAL).exists()  # kept, to write the audit row
+        staging = data / "backups" / backups_module.STAGING
+        assert not staging.exists() or not any(staging.rglob("scholia.sqlite3"))  # no copy of the previous state left
+        monkeypatch.setattr(backups_module, "_missing_files", real_missing)
+        again = await client.post("/api/backups/restore", json={"generation": backup})
+        assert again.status_code == 200, again.text  # not held up by it: its audit row is written with this one's
+        assert sorted(a.get("source") for a in await restore_audits(client)) == ["automatic", "automatic"]
+    assert not (data / "backups" / backups_module.JOURNAL).exists()
 
 
 async def test_a_restore_done_whose_missing_files_cannot_be_checked_is_reported_done(tmp_path, monkeypatch):
@@ -529,3 +537,67 @@ async def test_a_replayed_restore_whose_audit_row_cannot_be_written_keeps_its_jo
         [record] = await restore_audits(client)
         assert (record["interrupted"], record["finished"]) == (True, "forward")
     assert not (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_a_replay_committed_at_launch_is_never_put_back_over_later_work(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+    real_end = backups_module.end_journal
+
+    def failing(data_dir):
+        raise OSError("I/O error")
+
+    monkeypatch.setattr(backups_module, "end_journal", failing)  # the replay runs, its journal is not ended
+    async with started(data, setup=False) as client:
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # new work
+    monkeypatch.setattr(backups_module, "end_journal", real_end)
+    restore_recovery = failing_recovery(monkeypatch, 1)
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "database_unavailable"
+    assert project_names(data) == {"General", "Kept", "After"}  # never put back
+    restore_recovery()
+    async with started(data, setup=False) as client:
+        assert [(a["interrupted"], a["finished"]) for a in await restore_audits(client)] == [(True, "forward")]
+    assert not (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_a_restore_that_cannot_be_committed_is_put_back_before_it_serves_anything(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    started_harnesses, real_recover = [], Harness.recover
+
+    async def recover(self):
+        started_harnesses.append(self)
+        await real_recover(self)
+
+    def cannot_commit(data_dir, journal, audits):
+        raise OSError("I/O error")
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(Harness, "recover", recover)
+        monkeypatch.setattr(backups_module, "_commit_journal", cannot_commit)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+        restored_harness, previous_harness = started_harnesses
+        assert restored_harness.registry.closed and client.state["harness"] is previous_harness  # it was stopped
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept", "Later"}
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201
+    assert not (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_a_restore_out_of_a_damaged_folder_that_cannot_be_committed_leaves_it_limited(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    (data / "backups" / backups_module.JOURNAL).write_text("{ not json")
+
+    def cannot_commit(data_dir, journal, audits):
+        raise OSError("I/O error")
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "_commit_journal", cannot_commit)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+        assert (await client.get("/api/projects")).json()["code"] == "database_damaged"  # limited again, offering restore
+        assert "database_damaged" in (await client.get("/api/health")).json()

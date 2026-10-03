@@ -5,6 +5,7 @@ asyncio event loop; async code uses asyncio.to_thread.
 """
 
 import asyncio
+import errno
 import fcntl
 import json
 import logging
@@ -152,6 +153,7 @@ class Database:
 
     def release_writes(self):
         """Admit writes again after hold_writes()."""
+        _refuse_event_loop()
         with self._readers_lock:
             self._held = False
 
@@ -598,7 +600,9 @@ def _check_identity(uri, latest):
         _usable_state(conn, latest)
     except (ForeignDatabaseError, NewerDatabaseError):
         raise
-    except sqlite3.DatabaseError as error:  # an unreadable file included
+    except sqlite3.DatabaseError as error:
+        if getattr(error, "sqlite_errorcode", 0) & 0xFF not in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+            raise OSError(errno.EIO, "the database could not be checked") from error  # such as an I/O error
         raise DatabaseDamagedError(f"the file cannot be read as a database: {error}") from error
     finally:
         if conn is not None:

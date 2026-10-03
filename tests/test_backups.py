@@ -721,7 +721,9 @@ async def test_a_restore_refused_for_work_that_does_not_stop_leaves_that_work_wi
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert (response.status_code, response.json()["code"]) == (409, "work_running")
         assert client.state["harness"] is harness and stuck in harness._tasks  # not replaced: it still owns the work
-        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # admitting again
+        assert not harness.registry.closed
+        conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
+        assert (await send(client, conversation))[-1]["status"] == "succeeded"  # it admits turns again
         release.set()
         await stuck
         response = await client.post("/api/backups/restore", json={"generation": backup})
@@ -773,10 +775,123 @@ async def test_a_restore_whose_safety_copy_fails_leaves_the_app_writing(tmp_path
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
 
+        refused = []
+
         def failing(self, *args, **kwargs):
+            try:  # writes are held from before the safety copy
+                self.write(lambda conn: conn.execute("INSERT INTO audit_log (event, data) VALUES ('late', '{}')"))
+            except Exception as error:
+                refused.append(type(error).__name__)
             raise OSError("I/O error")
 
         monkeypatch.setattr(Database, "backup", failing)
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert (response.status_code, response.json()["code"]) == (500, "safety_copy_failed")
-        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # its writes admitted
+        assert refused == ["DatabaseClosedError"]
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # admitted again
+
+
+async def test_a_restore_that_fails_unexpectedly_before_the_swap_leaves_the_app_running(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        harness, real, calls = client.state["harness"], backups_module._purges, []
+
+        async def failing_the_second_time(state):  # the check made once every request is out
+            calls.append(True)
+            if len(calls) == 2:
+                raise OSError("I/O error")
+            return await real(state)
+
+        monkeypatch.setattr(backups_module, "_purges", failing_the_second_time)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+        assert not harness.registry.closed and not client.state["db"]._held
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201
+
+
+async def test_a_write_queued_before_a_restore_is_in_its_safety_copy(tmp_path):
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        db = client.state["db"]
+        writing, go = threading.Event(), threading.Event()
+
+        def slow(conn):  # queued and running on the writer, its task cancelled
+            writing.set()
+            go.wait(5)
+            conn.execute("INSERT INTO audit_log (event, data) VALUES ('queued', '{}')")
+
+        task = asyncio.create_task(asyncio.to_thread(db.write, slow))
+        await asyncio.to_thread(writing.wait, 5)
+        task.cancel()
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        await asyncio.sleep(0.3)
+        assert not restore.done()  # it waits for the write already queued
+        go.set()
+        response = await restore
+        assert response.status_code == 200, response.text
+    conn = sqlite3.connect((data / "backups" / response.json()["safety_copy"] / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    try:
+        assert conn.execute("SELECT count(*) FROM audit_log WHERE event = 'queued'").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+async def test_a_title_run_a_refused_restore_stopped_runs_again(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        harness, calling, calls = client.state["harness"], asyncio.Event(), []
+
+        async def title(body):
+            calls.append(body)
+            if len(calls) == 1:  # the first title call waits until the restore's shutdown stops it
+                calling.set()
+                await asyncio.Event().wait()
+            return client.provider.answer("Cohort studies")
+
+        client.provider.title_replies = [title, title]
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        await send(client, conversation)
+        await calling.wait()
+        release = asyncio.Event()
+        stuck = harness._detach(release.wait())  # other work that outlasts the shutdown's wait
+        real = Harness.shutdown
+        monkeypatch.setattr(Harness, "shutdown", lambda self, timeout=10.0: real(self, 0.2))
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "work_running")
+        release.set()
+        await stuck
+        await background_idle(client)
+        assert len(calls) == 2  # the stopped title run started again on the same harness
+        assert (await client.get(f"/api/conversations/{conversation}")).json()["title"] == "Cohort studies"
+
+
+async def test_a_title_run_still_stopping_when_a_restore_is_refused_runs_again_once_stopped(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        calling, calls = asyncio.Event(), []
+
+        async def title(body):
+            calls.append(body)
+            if len(calls) == 1:  # the first title call takes longer to stop than the shutdown waits
+                calling.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.5)
+                    raise
+            return client.provider.answer("Cohort studies")
+
+        client.provider.title_replies = [title, title]
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        await send(client, conversation)
+        await calling.wait()
+        real = Harness.shutdown
+        monkeypatch.setattr(Harness, "shutdown", lambda self, timeout=10.0: real(self, 0.1))
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "work_running")
+        await background_idle(client)
+        assert len(calls) == 2  # started again once it had stopped, by the harness admitting again
+        assert (await client.get(f"/api/conversations/{conversation}")).json()["title"] == "Cohort studies"

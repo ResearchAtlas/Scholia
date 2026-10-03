@@ -470,3 +470,15 @@ async def test_the_identity_check_is_never_run_on_the_event_loop(tmp_path):
     another_apps_database(tmp_path)
     with pytest.raises(RuntimeError):
         check_identity(tmp_path / "scholia.sqlite3")
+
+
+def test_a_database_sqlite_cannot_read_for_another_reason_than_its_contents_is_not_opened(tmp_path, monkeypatch):
+    import sqlite3
+    from backend.db import database
+    another_apps_database(tmp_path / "Other")
+
+    def io_error(conn, latest):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(database, "_usable_state", io_error)
+    assert data_folder.database_problem(tmp_path / "Other")[0] == "unchecked"  # not taken for damaged

@@ -750,6 +750,8 @@ class Harness:
             log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
         finally:
             self.registry.release(active)
+            if active.cancel_reason == "shutdown" and not self.registry.closed:  # admitting again (resume)
+                self._detach(self.kick_background())
 
     async def _background_call(self, active, project_id, workflow, inputs):
         """One model call for a background run. Returns its output, or None if it failed."""
