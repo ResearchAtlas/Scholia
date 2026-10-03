@@ -9,8 +9,8 @@ import { ChevronRight, KeyRound, Plus, Search } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, put } from '../api.js';
 import { errorText } from '../text.js';
-import { WINDOW_PRESETS, forgetModels, groupOf, loadModels, settingKey, useSettingsFile } from '../settings.js';
-import { CommitField, Field, FileProblems, Restore, Section, Segmented } from './fields.jsx';
+import { WINDOW_PRESETS, forgetModels, groupOf, loadModels, onCatalogChange, settingKey, useSettingsFile } from '../settings.js';
+import { CommitField, Field, FileProblems, LoadState, Restore, Section, Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
@@ -43,7 +43,9 @@ export function Providers() {
     await Promise.all([load(), personal.reload()]);
   }, [load, personal]);
 
-  if (!list || !personal.values) return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
+  if (!list || !personal.values) {
+    return <LoadState problem={personal.problem ?? problem} onRetry={() => { setProblem(null); load(); personal.reload(); }} />;
+  }
   const tables = personal.values.providers ?? {};
   return (
     <div className="space-y-8">
@@ -187,8 +189,10 @@ function Picker({ provider, picked, save }) {
   const t = useT();
   const [models, setModels] = useState(null);
   const [query, setQuery] = useState('');
-  useEffect(() => {
-    loadModels(provider.name).then((listing) => setModels(listing.models)).catch(() => setModels([]));
+  useEffect(() => { // read again whenever a provider or its models change
+    const read = () => loadModels(provider.name).then((listing) => setModels(listing.models)).catch(() => setModels([]));
+    read();
+    return onCatalogChange(read);
   }, [provider.name]);
   const chosen = useMemo(() => new Set(picked ?? []), [picked]);
   const [busy, setBusy] = useState(false); // one change at a time, each from the list as saved
@@ -236,6 +240,7 @@ function PerModel({ provider, table, save }) {
     .catch(() => setModels([])), [provider.name]);
   useEffect(() => {
     load();
+    return onCatalogChange(load); // a default window, offer or key changed: the rows read again
   }, [load]);
   if (!models) return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
   const numbers = new Intl.NumberFormat(language);

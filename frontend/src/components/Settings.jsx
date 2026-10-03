@@ -9,7 +9,7 @@ import { ApiError, get, patch, post } from '../api.js';
 import { errorText, money } from '../text.js';
 import { projectName } from '../projects.js';
 import { BUDGET_SUGGESTIONS, loadModels, useInstructions, useSettingsFile, utf8Bytes, valueAt } from '../settings.js';
-import { CommitField, Field, FileProblems, Restore, Section, Segmented } from './fields.jsx';
+import { CommitField, Field, FileProblems, LoadState, Restore, Section, Segmented } from './fields.jsx';
 import { Providers } from './Providers.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -67,17 +67,12 @@ function Problem({ code }) {
   </p>;
 }
 
-function Loading() {
-  const t = useT();
-  return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
-}
-
 function General({ onLanguage, projectId }) {
   const t = useT();
   const personal = useSettingsFile();
   const [problem, setProblem] = useState(null);
   const values = personal.values;
-  if (!values) return <Loading />;
+  if (!values) return <LoadState problem={personal.problem} onRetry={personal.reload} />;
   return (
     <div className="space-y-8">
       <PageTitle>{t('settings.page.general')}</PageTitle>
@@ -126,7 +121,7 @@ function InstructionsEditor({ projectId, withProject, label, hint }) {
     rejected.current = null;
     setConfirming(false);
   }, [file?.text, file?.hash]);
-  if (!file || draft === null) return <Loading />;
+  if (!file || draft === null) return <LoadState problem={instructions.problem} onRetry={instructions.reload} />;
   // As the backend joins them: the two files, with a blank line between when both hold text.
   const own = utf8Bytes(draft);
   const combined = own + file.other_bytes + (own && file.other_bytes ? 2 : 0);
@@ -188,7 +183,7 @@ function Subagents() {
   const [adding, setAdding] = useState('');
   const [problem, setProblem] = useState(null);
   const values = personal.values;
-  if (!values) return <Loading />;
+  if (!values) return <LoadState problem={personal.problem} onRetry={personal.reload} />;
   const list = [...new Set(values.subagents.models ?? [])]; // a ranked list names each model once
   // One change at a time, each from the list as saved (or read again after a refusal), so a
   // change never builds on one that was not written.
@@ -288,7 +283,9 @@ function ThisProject({ project, onProjectChanged }) {
     }
   }
 
-  if (!own.values || !personal.values) return <Loading />;
+  if (!own.values || !personal.values) {
+    return <LoadState problem={own.problem ?? personal.problem} onRetry={() => { own.reload(); personal.reload(); }} />;
+  }
   const values = own.values;
   return (
     <div className="space-y-8">
@@ -352,7 +349,7 @@ function Advanced({ health }) {
   const offered = useOfferedModels();
   const [problem, setProblem] = useState(null);
   const ids = useMemo(() => [...new Set(offered.map((m) => m.id))], [offered]);
-  if (!personal.values) return <Loading />;
+  if (!personal.values) return <LoadState problem={personal.problem} onRetry={personal.reload} />;
   return (
     <div className="space-y-10">
       <PageTitle>{t('settings.page.advanced')}</PageTitle>

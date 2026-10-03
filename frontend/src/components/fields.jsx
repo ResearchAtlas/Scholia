@@ -5,6 +5,8 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { RotateCcw } from 'lucide-react';
 import { useT } from '../i18n/index.js';
+import { errorText } from '../text.js';
+import { Button } from '@/components/ui/button';
 import { commitDecision } from '../settings.js';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
@@ -112,5 +114,17 @@ export function FileProblems({ problems }) {
           : problem.line ? t('settings.problemFile', { line: problem.line }) : t('settings.problemFileUnread')}</li>
       ))}
     </ul>
+  );
+}
+
+// Loading, or, when the first read failed, why, with a way to try again.
+export function LoadState({ problem, onRetry }) {
+  const t = useT();
+  if (!problem) return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
+  return (
+    <div role="alert" className="space-y-3 rounded-md bg-destructive/10 px-3 py-3 text-sm text-destructive">
+      <p>{errorText(t, problem)}</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>{t('common.retry')}</Button>
+    </div>
   );
 }

@@ -110,7 +110,7 @@ export function useInstructions(projectId, withProject) {
     }
   }, [file?.hash, projectId, reload]);
 
-  return { file, problem, save };
+  return { file, problem, save, reload };
 }
 
 // The bytes a text takes in UTF-8, as the 32 KiB instructions cap counts them.
