@@ -260,3 +260,40 @@ async def test_async_client_over_real_sockets(db, stack):
         await asyncio.to_thread(declare, db, f"{base}/v1")
         assert (await client.post(f"{base}/v1/chat/completions", json={"messages": []})).status_code == 200
     assert received == [("POST", "/v1/chat/completions")]
+
+
+# Declaring through the API (slice-1 spec section 6.4; ticket 64)
+
+
+@pytest.mark.asyncio
+async def test_a_declaration_is_one_per_exact_origin_audited_and_can_be_withdrawn(tmp_path):
+    from scholia_app import started
+
+    async with started(tmp_path / "data") as client:
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+            "providers.ollama.kind": "openai-compatible", "providers.ollama.base_url": "http://127.0.0.1:11434/v1",
+            "providers.again.kind": "openai-compatible", "providers.again.base_url": "http://127.0.0.1:11434/other",
+            "providers.cloud.kind": "openai-compatible", "providers.cloud.base_url": "https://api.example.com/v1"}})
+        for name in ("ollama", "again"):  # two names for one server: one declaration, the newer
+            assert (await client.post("/api/local-declarations", json={"provider": name})).json() == {"ok": True}
+        db = client.state["db"]
+        stored = await asyncio.to_thread(db.read, lambda conn: conn.execute(
+            "SELECT provider, base_url, statement FROM local_declarations").fetchall())
+        assert stored == [("again", "http://127.0.0.1:11434/other", "2026-10-03")]
+        listed = {p["name"]: (p["local"], p["declared_at"] is not None)
+                  for p in (await client.get("/api/providers")).json()["providers"]}
+        assert listed == {"openrouter": (False, False), "ollama": (True, True), "again": (True, True),
+                          "cloud": (False, False)}
+        response = await client.post("/api/local-declarations", json={"provider": "cloud"})
+        assert (response.status_code, response.json()["code"]) == (400, "not_local")
+        assert (await client.post("/api/local-declarations", json={"provider": "nobody"})).status_code == 404
+
+        assert (await client.delete("/api/local-declarations/ollama")).json() == {"ok": True}  # its origin's
+        assert (await client.delete("/api/local-declarations/again")).status_code == 404
+        audit = await asyncio.to_thread(db.read, lambda conn: conn.execute(
+            "SELECT event, data FROM audit_log WHERE event LIKE 'local_%' ORDER BY seq").fetchall())
+        assert [(event, json.loads(data)) for event, data in audit] == [
+            ("local_declared", {"provider": "ollama", "origin": "http://127.0.0.1:11434", "statement": "2026-10-03"}),
+            ("local_declared", {"provider": "again", "origin": "http://127.0.0.1:11434", "statement": "2026-10-03"}),
+            ("local_declaration_withdrawn", {"provider": "ollama", "origin": "http://127.0.0.1:11434"})]

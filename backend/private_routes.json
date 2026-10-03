@@ -1,0 +1,15 @@
+{
+  "list": "private_routes",
+  "checked_on": "2026-10-03",
+  "source": "https://openrouter.ai/docs/features/zdr",
+  "entries": [
+    {
+      "route_key": "openrouter:*",
+      "required_flags": {"provider": {"zdr": true}},
+      "allowed_features": [],
+      "terms_url": "https://openrouter.ai/docs/features/zdr",
+      "checked_on": "2026-10-03T00:00:00.000Z",
+      "exceptions": ["plugins_and_tools", "in_memory_caching", "key_data_settings"]
+    }
+  ]
+}

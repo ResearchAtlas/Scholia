@@ -9,6 +9,7 @@ import tomlkit
 
 from backend.credentials import FALLBACK_FILE, SERVICE
 from backend.db import new_id
+from backend.governance import KEY_STATEMENT
 from scholia_app import KEY, FakeKeyring, background_idle, send, started
 
 pytestmark = pytest.mark.asyncio
@@ -134,7 +135,9 @@ async def test_first_run_setup_stores_the_key_in_the_credential_store_only(tmp_p
         assert not (data / FALLBACK_FILE).exists()
         assert (await client.get("/api/providers")).json() == {"providers": [
             {"name": "openrouter", "kind": "openrouter", "base_url": "https://openrouter.ai/api/v1", "has_key": True,
-             "enabled": True}]}
+             "enabled": True, "local": False, "declared_at": None,
+             "key_confirmation": {"status": "missing", "statement": KEY_STATEMENT, "confirmed_at": None,
+                                  "expires_at": None}}]}
 
 
 async def test_without_a_credential_store_the_key_goes_to_an_owner_only_file_with_a_warning(tmp_path):

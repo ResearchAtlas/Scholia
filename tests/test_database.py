@@ -91,14 +91,15 @@ def test_failed_write_rolls_back_and_raises(db):
 
 
 def test_writes_from_many_threads_run_one_at_a_time_on_one_thread(db):
-    db.write(lambda conn: conn.execute("INSERT INTO audit_log (event, data) VALUES ('counter', '{\"n\": 0}')"))
+    # A counter in a scratch row (the audit log, the earlier scratch table, is append-only).
+    db.write(lambda conn: conn.execute("INSERT INTO list_checks VALUES ('venues', '0', '2026-01-01T00:00:00.000Z')"))
     writer_threads = set()
 
     def increment(conn):
         writer_threads.add(threading.get_ident())
-        (n,) = conn.execute("SELECT data ->> 'n' FROM audit_log").fetchone()
+        (n,) = conn.execute("SELECT CAST(entry_id AS INTEGER) FROM list_checks").fetchone()
         time.sleep(0.0005)  # widen the read-modify-write window
-        conn.execute("UPDATE audit_log SET data = json_object('n', ?)", (n + 1,))
+        conn.execute("UPDATE list_checks SET entry_id = ?", (str(n + 1),))
 
     def worker():
         for _ in range(25):
@@ -109,7 +110,7 @@ def test_writes_from_many_threads_run_one_at_a_time_on_one_thread(db):
         thread.start()
     for thread in threads:
         thread.join()
-    assert db.read(lambda conn: conn.execute("SELECT data ->> 'n' FROM audit_log").fetchone()) == (200,)
+    assert db.read(lambda conn: conn.execute("SELECT CAST(entry_id AS INTEGER) FROM list_checks").fetchone()) == (200,)
     assert len(writer_threads) == 1 and threading.get_ident() not in writer_threads
 
 

@@ -21,6 +21,14 @@ interrupted at shutdown), settling a call that may have gone out at its estimate
 and releasing a reservation whose call never left. A running turn that is not
 in this process's registry reads as interrupted, and startup records it so.
 
+Every model call passes the dispatch check (may_dispatch) inside the outbound
+gate's decision transaction: a run revoked by a deletion or a change to its
+project (cancel_reason 'revoked' in the record), or one whose owners are gone or
+whose project is review-locked, sends nothing more. A revoked run ends cancelled
+with cancel_reason revoked, keeping its settled costs and applying no effect.
+Admission checks what the project allows (backend/governance.py) and refuses a
+route it does not, before anything is written.
+
 Background runs (titles) run outside any turn, so the conversation accepts its
 next message at once. Each model call they start is counted in `attempts`, in its
 own transaction, before the call. On every start, including after a crash, a
@@ -38,7 +46,7 @@ import traceback
 from contextlib import suppress
 from dataclasses import dataclass, field
 
-from backend import budget_router, credentials, openrouter, providers, spending
+from backend import budget_router, credentials, governance, openrouter, openrouter_client, providers, spending
 from backend.db import new_id, utc_now
 from backend.openrouter_client import catalog_read, get_model_metadata
 from backend.settings import load_instructions, load_settings, visible
@@ -74,6 +82,14 @@ def _unusable(table, provider, model) -> str | None:
     if row is None:
         return "model_not_offered" if catalog_read(route) else None
     return None if providers.window(table, model, row.get("context_length"))["status"] == "ok" else "model_window"
+
+
+def _default_provider(configured, policy) -> str:
+    """The provider of a message that names none: OpenRouter when it is set up, else the only
+    one; counting only the providers the project's level may use, when it may use any (a Local
+    only project, a declared server)."""
+    usable = {name: p for name, p in configured.items() if policy.allows_provider(p)} or configured
+    return providers.OPENROUTER if providers.OPENROUTER in usable or len(usable) != 1 else next(iter(usable))
 
 
 class AdmissionError(Exception):
@@ -172,6 +188,31 @@ def _running(conn, run_id) -> bool:
     return row is not None and row[0] == "running"
 
 
+def _revoked(conn, run_id) -> bool:
+    """Whether a running run was revoked in the record, by a deletion or a change to its project."""
+    row = conn.execute("SELECT cancel_reason FROM runs WHERE id = ? AND status = 'running'", (run_id,)).fetchone()
+    return row is not None and row[0] == "revoked"
+
+
+def may_dispatch(conn, run_id) -> bool:
+    """The check before every dispatch (slice-1 spec section 10, Revocation), which the outbound
+    gate reads in its decision transaction, so retries are covered too: the run is still running
+    and not revoked; every owner it has still exists (a turn's project and conversation; detached
+    work's project and source turn; project background work's project alone, whose missing
+    conversation and source turn are no deletion); and its project is not review-locked. The
+    project's current level and the route it allows are the gate's own checks there."""
+    row = conn.execute(
+        "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
+        " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
+        " r.source_turn_id IS NULL OR EXISTS (SELECT 1 FROM turns WHERE run_id = r.source_turn_id)"
+        " FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?", (run_id,)).fetchone()
+    if row is None:
+        return False
+    status, cancel_reason, kind, locked, has_conversation, has_source = row
+    owners = has_conversation if kind in ("turn", "child") else has_source
+    return status == "running" and cancel_reason is None and not locked and bool(owners)
+
+
 @dataclass
 class _Call:
     """One admitted model call: its run, step, reservation and whether it may have left."""
@@ -230,16 +271,19 @@ class Harness:
                 "SELECT DISTINCT run_id FROM budget_reservations WHERE status = 'open' AND run_id IS NOT NULL")}
             spending.settle_left_open(conn)
             now = utc_now()
-            for (run_id,) in conn.execute(
-                    "SELECT id FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')").fetchall():
-                _event(conn, run_id, "run_finished", {"status": "interrupted"})
+            for run_id, revoked in conn.execute(
+                    "SELECT id, cancel_reason = 'revoked' FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')"
+            ).fetchall():
+                status = "cancelled" if revoked else "interrupted"  # a revoked run stays revoked
+                _event(conn, run_id, "run_finished", {"status": status})
                 conn.execute(
-                    "UPDATE runs SET status = 'interrupted', finished_at = ?, settled_cost_usd = ? WHERE id = ?",
-                    (now, spending.run_cost(conn, run_id), run_id))
+                    "UPDATE runs SET status = ?, finished_at = ?, settled_cost_usd = ? WHERE id = ?",
+                    (status, now, spending.run_cost(conn, run_id), run_id))
                 conn.execute(
-                    "UPDATE turns SET reason_code = 'interrupted', memory_status = coalesce(memory_status, 'skipped'),"
+                    "UPDATE turns SET reason_code = ?, memory_status = coalesce(memory_status, 'skipped'),"
                     " accounting = ? WHERE run_id = ?",
-                    (json.dumps(_accounting(conn, run_id, complete=run_id not in in_flight)), run_id))
+                    ("cancelled" if revoked else "interrupted",
+                     json.dumps(_accounting(conn, run_id, complete=run_id not in in_flight)), run_id))
 
         await self._write(record)
         await self.kick_background()
@@ -382,15 +426,20 @@ class Harness:
         async with self.settings_lock:
             personal, project_settings = await asyncio.to_thread(
                 lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
+            # What the project allows (its level, the review lock, the Private allowlist and the
+            # declared local servers); the admission transaction checks the level and lock again.
+            policy = await self._read(lambda conn: governance.policy(conn, project_id))
+            if policy is None:
+                raise AdmissionError(404, "not_found", "No such conversation")
+            if policy.locked:  # M1: every generative function, until the venue rules relax it
+                raise AdmissionError(403, "review_locked", "This project is review-locked")
             # A model asked for must be named; a blank default in a settings file is passed over.
             chosen = visible(model) or visible(project_settings.values.get("models", {}).get("default")) \
                 or visible(personal.values["models"]["default"]) or "auto"
             configured = providers.configured(self.data_dir, personal)
             if not configured:
                 raise AdmissionError(400, "no_provider", "No model provider is set up")
-            provider_name = provider or (
-                providers.OPENROUTER if providers.OPENROUTER in configured or len(configured) != 1
-                else next(iter(configured)))
+            provider_name = provider or _default_provider(configured, policy)
             if provider_name not in configured:
                 raise AdmissionError(400, "unknown_provider", "That provider is not set up")
             provider_config = configured[provider_name]
@@ -398,28 +447,49 @@ class Harness:
             # The models the provider offers (Recommended, All or Pick): a model it does not
             # offer is refused, and Auto picks among those it does.
             table = (personal.values.get("providers") or {}).get(provider_name) or {}
-
+            if not policy.allows_provider(provider_config):  # none of its models, whichever is asked for
+                raise AdmissionError(403, policy.problem(provider_config, chosen),
+                                     "This project's protection does not allow that provider")
             if chosen != budget_router.AUTO and (problem := _unusable(table, provider_config, chosen)):
                 raise AdmissionError(400, problem, "That model is not offered for this provider" if problem == "model_not_offered"
                                      else "That model has no usable window; set one in Settings")
-            plan = budget_router.create_run_plan(
-                message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
-                is_openrouter=provider_config.is_openrouter, offered=lambda m: _unusable(table, provider_config, m) is None,
-                picked=table["models"] if isinstance(table.get("models"), list) else ())
-            if plan.model is None:
-                raise AdmissionError(400, "model_needed", "Choose a model for this provider")
-            route = providers.Route(provider_config, plan.model)
         # The key is read outside the lock (a credential store may ask the researcher first);
-        # it cannot change meanwhile, since key changes are refused while claim.provider is set.
+        # it cannot change meanwhile, since key changes are refused while claim.provider is set,
+        # and neither can the provider's settings, so the plan is made from the snapshot.
         key = await asyncio.to_thread(credentials.load_key, self.data_dir, provider_name, self.keyring_backend)
         if key is None:
             raise AdmissionError(400, "provider_key_missing", "The provider has no key")
+        zero_retention = policy.zero_retention and provider_config.is_openrouter
+        if zero_retention and not catalog_read(providers.Route(provider_config, "")):
+            await self.catalog(provider_config, key)  # which models OpenRouter serves with zero retention
+
+        def plan_among(allowed):
+            return budget_router.create_run_plan(
+                message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
+                is_openrouter=provider_config.is_openrouter,
+                offered=lambda m: _unusable(table, provider_config, m) is None and allowed(m),
+                picked=table["models"] if isinstance(table.get("models"), list) else ())
+
+        plan = plan_among(lambda m: policy.problem(provider_config, m) is None)
+        # Before anything is written or sent: a model the project does not allow is refused, and
+        # when Auto found none, the project's rule is named if it ruled out the one Auto would pick.
+        model_for_problem = plan.model or plan_among(lambda m: True).model
+        if model_for_problem is None:
+            raise AdmissionError(400, "model_needed", "Choose a model for this provider")
+        if problem := policy.problem(provider_config, model_for_problem):
+            raise AdmissionError(403, problem, "This project's protection does not allow that model")
+        if zero_retention and not await self._read(lambda conn: governance.key_attested(conn, self.data_dir, key)):
+            raise AdmissionError(403, "key_not_confirmed", "Confirm the key's OpenRouter data settings first")
+        route = providers.Route(provider_config, plan.model)
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
 
         def admit(conn):
             moved = conn.execute("SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone()
             if moved is not None and moved[0] != project_id:  # moved since it was read: its settings were another's
                 raise AdmissionError(409, "conversation_moved", "The conversation moved to another project; send again")
+            level = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if level is not None and (level[0], bool(level[1])) != (policy.level, policy.locked):
+                raise AdmissionError(409, "project_changed", "The project's protection changed; send again")
             if claim.cancel_requested.is_set():  # stopped while it was admitted (shutdown): write nothing
                 raise AdmissionError(503, "shutting_down", "The app is closing") if claim.cancel_reason == "shutdown" \
                     else AdmissionError(409, "cancelled", "The message was cancelled")
@@ -459,7 +529,7 @@ class Harness:
         messages.append({"role": "user", "content": message})
         claim.context = {
             "project_id": project_id, "seq": seq, "route": route, "key": key, "messages": messages,
-            "effort": effort, "estimate": plan.predicted_cost,
+            "effort": effort, "estimate": plan.predicted_cost, "zero_retention": zero_retention,
         }
         claim.admitted = time.monotonic()
         return claim
@@ -506,7 +576,8 @@ class Harness:
             call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, ctx["estimate"],
                                        phase="answer")
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
-            result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["messages"], effort=ctx["effort"])
+            result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["messages"], effort=ctx["effort"],
+                                      zero_retention=ctx["zero_retention"])
             if not result.ok:
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
                                                                           result.error_kind, claim=claim))
@@ -577,6 +648,8 @@ class Harness:
             else:
                 status, reason_code = "cancelled", "cancelled"
                 cancel_reason = "revoked" if claim.cancel_reason == "revoked" else "researcher"
+        if _revoked(conn, run_id):  # revoked in the record, which this process may not have heard yet
+            status, cancel_reason, reason_code, limit = "cancelled", "revoked", "cancelled", None
         if _running(conn, run_id):
             if limit is not None:
                 _event(conn, run_id, "limit_hit", limit)
@@ -599,7 +672,7 @@ class Harness:
         published after a Stop the turn saw first; a later Stop is told the turn succeeded."""
         if claim.cancel_requested.is_set():
             raise _Cancelled()
-        if not _running(conn, claim.run_id):  # deleted (or ended) since it was admitted: nothing to publish
+        if not _running(conn, claim.run_id) or _revoked(conn, claim.run_id):  # deleted, ended or revoked: nothing to publish
             raise _Cancelled()
         cost = spending.run_cost(conn, claim.run_id)
         _event(conn, claim.run_id, "run_finished", {"status": "succeeded"})
@@ -643,7 +716,7 @@ class Harness:
         run_id = active.run_id
 
         def reserve(conn):
-            if not _running(conn, run_id):  # deleted or ended since it was admitted
+            if not _running(conn, run_id) or _revoked(conn, run_id):  # deleted, ended or revoked since it was admitted
                 raise _Cancelled()
             (own,) = conn.execute("SELECT budget_usd FROM conversations WHERE id = ?",
                                   (paying_conversation_id,)).fetchone() or (None,)
@@ -668,10 +741,20 @@ class Harness:
             raise asyncio.CancelledError()
         return call
 
-    async def _call(self, active, call, route, key, messages, *, effort=None, max_tokens=None, output=None):
-        """Dispatch one admitted call through the gate and record it, settling its
-        reservation. output(result), if given, is recorded on the finished step, so a
-        run can later finish from the record."""
+    async def catalog(self, provider, key, *, force=False, generation=None):
+        """The provider's models (openrouter_client.models), read through the gate under the
+        General project, which stays Normal: a catalog request holds no project's content."""
+        general = await self._read(lambda conn: conn.execute(
+            "SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
+        async with self.gate.async_client(general) as client:
+            return await openrouter_client.models(client, provider, key, force=force, generation=generation)
+
+    async def _call(self, active, call, route, key, messages, *, effort=None, max_tokens=None, output=None,
+                    zero_retention=False):
+        """Dispatch one admitted call through the gate, with the dispatch check, and record it,
+        settling its reservation. zero_retention sends it with provider.zdr = true (a Private
+        project's OpenRouter call). output(result), if given, is recorded on the finished step,
+        so a run can later finish from the record."""
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         project_id = await self._read(lambda conn: conn.execute(
@@ -683,10 +766,10 @@ class Harness:
             call.dispatched = True
 
         call.route = route.key
-        async with self.gate.async_client(project_id[0]) as client:
+        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id)) as client:
             result = await openrouter.query_model(
                 client, route, key, messages, timeout=MODEL_CALL_SECONDS, effort=effort, max_tokens=max_tokens,
-                model_entry=get_model_metadata(route), on_dispatch=dispatched)
+                zdr_enabled=zero_retention, model_entry=get_model_metadata(route), on_dispatch=dispatched)
             finished = {"step": call.step, "outcome": result.error_kind or "ok"}
             if output is not None and result.ok:
                 finished["output"] = output(result)
@@ -730,13 +813,16 @@ class Harness:
             if active.cancel_requested.is_set():  # stopped before it began
                 raise asyncio.CancelledError()
             row = await self._read(lambda conn: conn.execute(
-                "SELECT r.project_id, r.workflow, r.attempts, r.inputs, r.status, t.user_message FROM runs r"
-                " LEFT JOIN turns t ON t.run_id = r.source_turn_id WHERE r.id = ?",
+                "SELECT r.project_id, r.workflow, r.attempts, r.inputs, r.status, t.user_message, r.cancel_reason"
+                " FROM runs r LEFT JOIN turns t ON t.run_id = r.source_turn_id WHERE r.id = ?",
                 (active.run_id,)).fetchone())
             if row is None or row[4] != "running":
                 return  # rule 1: finished (or deleted); never run again
-            project_id, workflow, attempts, inputs, _, source = row
+            project_id, workflow, attempts, inputs, _, source, cancel_reason = row
             inputs = json.loads(inputs or "{}")
+            if cancel_reason == "revoked":  # revoked while it waited, or before a crash: no call, no effect
+                await self._write(lambda conn: self._finish_background(conn, active, "cancelled", None, inputs))
+                return
             inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
             recorded = await self._read(lambda conn: conn.execute(
                 "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished' ORDER BY seq DESC LIMIT 1",
@@ -786,8 +872,13 @@ class Harness:
                                                 self.keyring_backend)
         if route is None or key is None:
             return None
+        # Under the project's level now; the gate refuses a route it no longer allows.
+        private = await self._read(lambda conn: conn.execute(
+            "SELECT 1 FROM projects WHERE id = ? AND sensitivity = 'private'", (project_id,)).fetchone())
+        zero_retention = bool(private) and route.provider.is_openrouter
+
         def start(conn):
-            if not _running(conn, active.run_id):
+            if not _running(conn, active.run_id) or _revoked(conn, active.run_id):
                 raise _Cancelled()
             conn.execute("UPDATE runs SET attempts = attempts + 1 WHERE id = ?", (active.run_id,))  # before the call
             (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
@@ -810,7 +901,7 @@ class Harness:
         if cancelled:
             raise asyncio.CancelledError()
         messages = [{"role": "system", "content": TITLE_RULES}, {"role": "user", "content": inputs["message"]}]
-        result = await self._call(active, call, route, key, messages, max_tokens=60,
+        result = await self._call(active, call, route, key, messages, max_tokens=60, zero_retention=zero_retention,
                                   output=lambda result: _clean_title(result.content))
         return _clean_title(result.content) if result.ok else None
 
@@ -822,9 +913,10 @@ class Harness:
         run_id = active.run_id
         if not _running(conn, run_id):
             return
-        if active.cancel_requested.is_set() and active.cancel_reason != "shutdown":
+        revoked = _revoked(conn, run_id)  # in the record, which this process may not have heard yet
+        if revoked or (active.cancel_requested.is_set() and active.cancel_reason != "shutdown"):
             status, output = "cancelled", None
-            cancel_reason = "revoked" if active.cancel_reason == "revoked" else "researcher"
+            cancel_reason = "revoked" if revoked or active.cancel_reason == "revoked" else "researcher"
         if status == "succeeded" and output is not None:
             # The title is written only if nobody changed it since the run was queued.
             conn.execute(

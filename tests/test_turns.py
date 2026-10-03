@@ -272,19 +272,25 @@ async def test_a_provider_failure_fails_the_turn_with_its_kind_and_settles_once(
         assert len(provider.answers) == 1  # no retry
 
 
-async def test_a_request_the_gate_refuses_never_leaves_and_its_reservation_is_released(tmp_path):
-    provider = MockProvider()
+async def test_a_request_the_gate_refuses_never_leaves_and_its_reservation_is_released(tmp_path, monkeypatch):
+    from backend import governance
+    provider = MockProvider(catalog=["example/model"])  # listed, with no zero-retention endpoint
     async with started(tmp_path / "data", provider) as client:
-        project = (await client.post("/api/projects", json={"name": "Interviews"})).json()["id"]
-        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
-            "UPDATE projects SET sensitivity = 'private' WHERE id = ?", (project,)))
+        project = (await client.post("/api/projects", json={"name": "Interviews", "sensitivity": "private"})).json()["id"]
+        # Admission is told the route is allowed and the key confirmed; the gate, which reads the
+        # allowlist and OpenRouter's catalog itself, refuses a model with no zero-retention endpoint.
+        monkeypatch.setattr(governance.Policy, "problem", lambda self, provider, model: None)
+        monkeypatch.setattr(governance, "key_attested", lambda conn, data_dir, key: True)
         conversation = await new_conversation(client, project_id=project)
-        stream = await send(client, conversation)
+        await client.put("/api/settings", json={"hash": (await client.get("/api/settings")).json()["hash"],
+                                                "updates": {"providers.openrouter.models": "all"}})
+        stream = await send(client, conversation, model="example/model")
         assert (stream[-2]["code"], stream[-1]["status"]) == ("refused", "failed")
         assert provider.chats == []
         assert await rows(client, "SELECT status, settled_usd FROM budget_reservations") == [("released", None)]
         assert await rows(client, "SELECT json_extract(data, '$.decision'), json_extract(data, '$.reason')"
-                                  " FROM audit_log WHERE event = 'outbound'") == [("deny", "private_inputs_missing")]
+                                  " FROM audit_log WHERE event = 'outbound' AND json_extract(data, '$.kind') IS NOT NULL"
+                                  " AND json_extract(data, '$.decision') = 'deny'") == [("deny", "route_not_allowed")]
 
 
 async def test_a_step_that_does_not_fit_the_budget_is_refused_before_any_call(tmp_path):

@@ -13,7 +13,8 @@ knows the configured providers' origins from `gate_inputs`.
 
 from dataclasses import dataclass
 
-from backend.outbound_gate import GateInputs
+from backend import governance
+from backend.outbound_gate import GateInputs, is_openrouter
 from backend.settings import load_settings
 
 OPENROUTER = "openrouter"
@@ -91,12 +92,19 @@ def configured(data_root, settings=None, *, include_off=False) -> dict[str, Prov
 
 
 def gate_inputs(data_root) -> GateInputs:
-    """What the outbound gate needs from settings: the configured providers' base URLs.
+    """What the outbound gate needs: the configured providers' base URLs, and for Private
+    projects the allowlist entry covering an OpenRouter model, which OpenRouter must also list
+    with a zero-retention endpoint, and whether a key's data settings are confirmed (see
+    backend/governance.py). The gate calls the last two inside its decision transaction."""
+    found = configured(data_root)
+    openrouter = [p for p in found.values() if p.is_openrouter and is_openrouter(p.base_url)]
 
-    The Private allowlist and key confirmations are not wired yet, so a Private
-    project's requests to a model provider are refused (the gate fails closed).
-    """
-    return GateInputs(provider_urls=tuple(p.base_url for p in configured(data_root).values()))
+    def private_route(conn, model):
+        flags = governance.private_flags(governance.allowlist(conn), model)
+        return flags if flags is not None and any(governance.zero_retention(p, model) for p in openrouter) else None
+
+    return GateInputs(provider_urls=tuple(p.base_url for p in found.values()), private_route=private_route,
+                      key_attested=lambda conn, key: governance.key_attested(conn, data_root, key))
 
 
 def resolve_route(data_root, provider_name: str | None, model: str | None) -> Route | None:

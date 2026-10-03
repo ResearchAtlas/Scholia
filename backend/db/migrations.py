@@ -551,4 +551,20 @@ BEGIN
 END;
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002)
+# The audit log is append-only (ticket 18): a row never changes, and is deleted only by
+# clearing the log, which first writes the record of the clearing; so every deleted row is
+# older than an 'audit_cleared' row that stays.
+_0003 = r"""
+CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only');
+END;
+
+CREATE TRIGGER audit_log_cleared_only BEFORE DELETE ON audit_log
+WHEN NOT EXISTS (SELECT 1 FROM audit_log WHERE event = 'audit_cleared' AND seq > OLD.seq)
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log rows are deleted only by clearing the log, after its record');
+END;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003)
