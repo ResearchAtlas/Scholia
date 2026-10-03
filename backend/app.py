@@ -31,8 +31,8 @@ from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
 from backend.runs import AdmissionError, Harness, _through, derived_status
-from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instructions_size, load_instructions,
-                              load_settings, visible, write_private)
+from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instruction_file_size, instructions_size,
+                              load_instructions, load_settings, visible, write_private)
 from backend import budget_router, reasoning_capability
 
 log = logging.getLogger(__name__)
@@ -459,11 +459,20 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             joined = project_id or with_project
             if with_project is not None:
                 await project_row(with_project)
-            raw = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b"")
+            try:
+                raw, unreadable = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b""), False
+            except OSError:  # it exists but cannot be read: the editor says so and does not save over it
+                raw, unreadable = b"", True
             _, warnings = await asyncio.to_thread(load_instructions, data_dir, joined)
             combined = await asyncio.to_thread(instructions_size, data_dir, joined)
+            # The other file the cap counts with this one: the personal file for a project's, the
+            # project's for the personal file.
+            other = data_dir / "AGENTS.md" if project_id else \
+                data_dir / "projects" / with_project / "AGENTS.md" if with_project else None
+            other_bytes = await asyncio.to_thread(instruction_file_size, other) if other else 0
         text = raw.decode("utf-8", errors="replace")
         return {"text": text, "hash": hashlib.sha256(raw).hexdigest(), "combined_bytes": combined,
+                "other_bytes": other_bytes, "unreadable": unreadable,
                 "replaced": text.encode("utf-8") != raw,  # not UTF-8: saving it back replaces those bytes
                 "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
 

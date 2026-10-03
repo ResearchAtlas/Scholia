@@ -127,7 +127,9 @@ function InstructionsEditor({ projectId, withProject, label, hint }) {
     setConfirming(false);
   }, [file?.text, file?.hash]);
   if (!file || draft === null) return <Loading />;
-  const combined = file.combined_bytes - utf8Bytes(file.text) + utf8Bytes(draft);
+  // As the backend joins them: the two files, with a blank line between when both hold text.
+  const own = utf8Bytes(draft);
+  const combined = own + file.other_bytes + (own && file.other_bytes ? 2 : 0);
   const over = combined > file.cap_bytes;
   const id = projectId ? 'project-instructions' : 'personal-instructions';
   return (
@@ -136,16 +138,17 @@ function InstructionsEditor({ projectId, withProject, label, hint }) {
         aside={<span className={cn('text-xs tabular-nums', over ? 'text-destructive' : 'text-muted-foreground')}>
           {t('settings.instructionsSize', { used: Math.ceil(combined / 1024), cap: file.cap_bytes / 1024 })}
         </span>}>
-        <Textarea id={id} value={draft} onChange={(event) => setDraft(event.target.value)} rows={8} readOnly={saving}
+        <Textarea id={id} value={draft} onChange={(event) => setDraft(event.target.value)} rows={8} readOnly={saving || file.unreadable}
           className="font-mono text-[13px] leading-relaxed" spellCheck={false} />
       </Field>
+      {file.unreadable && <p role="alert" className="text-xs text-destructive">{t('settings.instructionsUnreadable')}</p>}
       {file.replaced && <p role="alert" className="text-xs text-warning">{t('settings.instructionsReplaced')}</p>}
       {over && <p role="alert" className="text-xs text-destructive">{t('settings.instructionsOverCap')}</p>}
       <Problem code={instructions.problem} />
       <div className="flex justify-end gap-2">
         <Button variant="ghost" size="sm" disabled={saving || draft === file.text}
           onClick={() => { setDraft(file.text); setConfirming(false); }}>{t('common.cancel')}</Button>
-        <Button size="sm" disabled={saving || draft === file.text} onClick={async () => {
+        <Button size="sm" disabled={saving || file.unreadable || draft === file.text} onClick={async () => {
           if (file.replaced && !confirming) {
             setConfirming(true);
             return;

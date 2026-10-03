@@ -316,3 +316,28 @@ async def test_the_personal_editor_is_measured_with_the_projects_instructions(tm
         read = (await client.get("/api/instructions", params={"with_project": project})).json()
         assert (read["text"], read["combined_bytes"]) == ("x" * 20_000, 40_002)
         assert (await client.get("/api/instructions", params={"with_project": "nope"})).status_code == 404
+
+
+async def test_the_editor_gets_the_other_files_size_and_empty_files_add_no_separator(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "P"})).json()["id"]
+        await client.put("/api/instructions", json={"text": ""})  # an empty personal file
+        await client.put("/api/instructions", json={"text": "y" * 100, "project_id": project})
+        own = (await client.get("/api/instructions", params={"project_id": project})).json()
+        assert (own["other_bytes"], own["combined_bytes"]) == (0, 100)  # no separator for an empty file
+        await client.put("/api/instructions", json={"text": "x" * 10})
+        personal = (await client.get("/api/instructions", params={"with_project": project})).json()
+        assert (personal["other_bytes"], personal["combined_bytes"]) == (100, 112)
+
+
+async def test_an_unreadable_instruction_file_is_reported_not_an_error(tmp_path):
+    import os
+    async with started(tmp_path / "data") as client:
+        path = tmp_path / "data" / "AGENTS.md"
+        path.write_text("secret")
+        os.chmod(path, 0)
+        try:
+            read = await client.get("/api/instructions")
+            assert read.status_code == 200 and read.json()["unreadable"] is True and read.json()["text"] == ""
+        finally:
+            os.chmod(path, 0o600)

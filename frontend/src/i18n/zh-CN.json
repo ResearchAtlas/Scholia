@@ -276,5 +276,6 @@
   "picker.setWindow": "设置 {model} 的窗口后即可使用",
   "settings.instructionsReplaced": "此文件不是 UTF-8 文本。部分字符无法读取，显示为 �；保存后这些字符会被永久替换。",
   "settings.instructionsReplaceConfirm": "保存并替换",
-  "errors.model_not_offered": "此服务商未提供该模型。请在“服务商与模型”中启用它，或选择其他模型。"
+  "errors.model_not_offered": "此服务商未提供该模型。请在“服务商与模型”中启用它，或选择其他模型。",
+  "settings.instructionsUnreadable": "无法读取此文件，因此不能在此编辑。请检查数据文件夹中该文件的权限。"
 }

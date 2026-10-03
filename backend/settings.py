@@ -585,6 +585,16 @@ def load_instructions(data_root, project_id=None):
     return data.decode("utf-8", errors="ignore"), warnings  # ignore drops a character cut in half
 
 
+def instruction_file_size(path) -> int:
+    """One AGENTS.md's size as the join counts it (UTF-8, unreadable bytes replaced); 0 when it is
+    absent, empty or cannot be read."""
+    try:
+        raw = _read(Path(path))
+    except OSError:
+        return 0
+    return len(raw.decode("utf-8", errors="replace").encode("utf-8")) if raw else 0
+
+
 def instructions_size(data_root, project_id=None) -> int:
     """The combined instructions' size in UTF-8 bytes before the cap cuts them, as the cap counts it."""
     return len(_joined_instructions(data_root, project_id)[0])
@@ -602,7 +612,7 @@ def _joined_instructions(data_root, project_id):
         except OSError:
             warnings.append(f"{path.name} could not be read; it was left out")
             continue
-        if raw is None:
+        if not raw:  # absent or empty: nothing to join, so no separator either
             continue
         try:
             parts.append(raw.decode("utf-8"))
