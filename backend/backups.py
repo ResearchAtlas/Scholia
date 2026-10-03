@@ -432,13 +432,11 @@ async def _restore(state, body):
             with _file_errors(400, "backup_unreadable", "The backup could not be read"):
                 await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
         state["restoring"] = True  # from here only health, the backups list and this restore are served
-        try:
-            return await _replace(state, body, staging, purges)
-        finally:
-            state.pop("restoring", None)
-    finally:  # a committed restore never needs it again: the previous state there goes, purged copies with it
+        return await _replace(state, body, staging, purges)
+    finally:  # before anything else is served again
         if not await asyncio.to_thread(_replay_pending, data_dir):  # else the next launch still needs it
             await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
+        state.pop("restoring", None)
 
 
 async def _replace(state, body, staging, purges):
@@ -515,18 +513,19 @@ async def _replace(state, body, staging, purges):
             log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
             if restored is not None and state.get("db") is restored:  # it started: stopped before it served anything
                 await _stop(state, restored)
-            if not await _roll_back(state, restored, damaged, restore_id):
+            rolled_back = await _roll_back(state, restored, damaged, restore_id)
+            await asyncio.to_thread(_remove_if_empty, aside)  # made before its journal: none, if it failed before
+            if not rolled_back:
                 _limit(state, "restore_interrupted", "A restore could neither be finished nor undone; restore a backup")
                 _forget(state)
                 raise BackupError(500, "restore_interrupted",
                                   "The restore could not be finished or undone; open Scholia again to finish it") from error
             raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
                 from error
-        if not damaged:  # the previous state set aside: a committed restore never needs it, and purges never reach it
-            try:
-                await asyncio.to_thread(shutil.rmtree, aside)
-            except Exception as error:  # the next launch empties staging
-                log.warning("removing the previous state after a restore failed (%s)", type(error).__name__)
+        try:  # a committed restore never needs what staging holds, and purges never reach it
+            await asyncio.to_thread(_clear_staging, data_dir, staging)
+        except Exception as error:  # the next launch empties staging
+            log.warning("removing the previous state after a restore failed (%s)", type(error).__name__)
         await recorded("audit", restored.write, lambda conn: [_audit_restore(conn, audit) for audit in audits])
         if "audit" not in not_recorded:
             await recorded("journal", end_journal, data_dir)
@@ -555,9 +554,12 @@ async def _stop(state, db):
     try:
         if state.get("db") is db and state.get("harness") is not None:
             await state["harness"].shutdown()
+    except Exception as error:
+        log.warning("stopping the harness of a restore that was not committed failed (%s)", type(error).__name__)
+    try:
         await asyncio.to_thread(db.close)
     except Exception as error:
-        log.warning("stopping an app started on a restore that was not committed failed (%s)", type(error).__name__)
+        log.warning("closing the database of a restore that was not committed failed (%s)", type(error).__name__)
     _forget(state)
 
 
@@ -589,7 +591,10 @@ async def _roll_back(state, restored, damaged, restore_id):
         except Exception as error:
             log.warning("closing a restored database that failed to start failed (%s)", type(error).__name__)
     try:
-        if ((await asyncio.to_thread(_read_journal, data_dir)) or {}).get("id") == restore_id:
+        journal = await asyncio.to_thread(_read_journal, data_dir)
+        if journal == {}:  # there but unreadable: what this restore moved cannot be told
+            raise OSError("the restore journal cannot be read")
+        if journal is not None and journal.get("id") == restore_id:
             await asyncio.to_thread(_back_from_journal, data_dir)
     except Exception as error:
         log.error("putting the previous state back after a failed restore failed (%s); the next launch finishes it",
@@ -828,8 +833,7 @@ def _back(data_dir, journal, audit=False):
         if (aside / sidecar).exists():
             _move(aside / sidecar, data_dir / sidecar)
     _fsync(data_dir)
-    with contextlib.suppress(OSError):  # empty now; one that is not is kept
-        aside.rmdir()
+    _remove_if_empty(aside)  # empty now; one that is not is kept
     audits = [*journal.get("audits", []), *([{"id": journal.get("id"), "interrupted": True, "finished": "back"}]
                                              if audit else [])]
     if audits:  # rows still to write, its own at launch or an earlier restore's it carried: kept for them
@@ -979,6 +983,19 @@ async def _finish_journal(db, audits):
 
 def _exists(path):
     return path.exists() or path.is_symlink()
+
+
+def _remove_if_empty(folder):
+    with contextlib.suppress(OSError):
+        folder.rmdir()
+
+
+def _clear_staging(data_dir, current):
+    """After a restore committed: the previous state it set aside in current, and whatever earlier
+    restores or backups left in staging. current's other contents go when the restore ends."""
+    for folder in (current / "replaced", *((data_dir / "backups" / STAGING).iterdir())):
+        if folder != current and _exists(folder):
+            _remove(folder)
 
 
 def _remove(path):

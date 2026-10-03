@@ -634,19 +634,11 @@ async def test_a_failed_restore_never_undoes_an_earlier_committed_one(tmp_path, 
 
 
 async def test_a_restore_that_fails_keeps_the_audit_rows_an_earlier_one_still_had_to_write(tmp_path, monkeypatch):
-    from backend.db import Database
     data = tmp_path / "data"
     backup, kept, later = await prepare(data)
-    real_write, real_open, failing = Database.write, backups_module.Database, []
-
-    def write(self, fn):
-        if failing:
-            failing.clear()
-            raise OSError("I/O error")
-        return real_write(self, fn)
+    real_open = backups_module.Database
 
     def audit_fails(conn, record):  # the first restore's audit row cannot be written
-        failing.append(True)
         raise OSError("I/O error")
 
     async with started(data, setup=False) as client:
@@ -696,3 +688,83 @@ async def test_a_committed_restore_leaves_no_copy_of_the_previous_state_by_the_t
         monkeypatch.setattr(backups_module, "_audit_restore", audit)
         assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
     assert seen == [[]]
+
+
+async def test_a_failed_restore_whose_journal_cannot_be_read_back_is_never_called_unchanged(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_open = backups_module.Database
+
+    def cannot_open(*args, **kwargs):  # the swap is done; then its journal cannot be read either
+        monkeypatch.setattr(backups_module, "_read_journal", lambda data_dir: {})
+        raise RuntimeError("cannot open")
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "Database", cannot_open)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")  # never "nothing changed"
+        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"  # limited, offering restore
+    monkeypatch.setattr(backups_module, "Database", real_open)
+
+
+async def test_a_committed_restore_clears_what_an_interrupted_one_left_in_staging(tmp_path, monkeypatch):
+    import errno
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_fsync = backups_module._fsync
+
+    def failing_fsync(path):  # the first restore's swap and its undo both fail: it is interrupted
+        if (data / "backups" / backups_module.JOURNAL).exists():
+            raise OSError(errno.EIO, "I/O error")
+        real_fsync(path)
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "_fsync", failing_fsync)
+        first = await client.post("/api/backups/restore", json={"generation": backup})
+        assert first.json()["code"] == "restore_interrupted"
+        monkeypatch.setattr(backups_module, "_fsync", real_fsync)
+        second = await client.post("/api/backups/restore", json={"generation": backup})
+        assert second.status_code == 200, second.text
+        staging = data / "backups" / backups_module.STAGING
+        assert not staging.exists() or list(staging.iterdir()) == []  # the first one's copies too
+
+
+async def test_a_restore_out_of_a_damaged_folder_that_fails_before_its_journal_leaves_no_empty_damaged_copy(
+        tmp_path, monkeypatch):
+    import json
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    (data / "backups" / backups_module.JOURNAL).write_text("{ not json")
+    real_write = backups_module.write_private
+
+    def no_room_for_a_new_journal(path, payload):
+        if Path(path).name == backups_module.JOURNAL and json.loads(payload)["direction"] == "forward":
+            raise OSError(28, "No space left on device")
+        real_write(path, payload)
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "write_private", no_room_for_a_new_journal)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 500
+    damaged = data / "backups" / backups_module.DAMAGED
+    assert not damaged.exists() or list(damaged.iterdir()) == []  # a purge would count an empty one as a copy
+
+
+async def test_staging_left_by_a_restore_goes_before_anything_else_is_served(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_rmtree, seen = backups_module.shutil.rmtree, []
+
+    def cannot_clear(data_dir, current):  # so the restore's own staging still holds the previous state at its end
+        raise OSError("I/O error")
+
+    async with started(data, setup=False) as client:
+        def rmtree(path, *args, **kwargs):
+            if Path(path).parent.name == backups_module.STAGING:
+                seen.append((any(Path(path).rglob("scholia.sqlite3")), client.state.get("restoring")))
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(backups_module, "_clear_staging", cannot_clear)
+        monkeypatch.setattr(backups_module.shutil, "rmtree", rmtree)
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+    assert seen == [(True, True)]  # removed while only the restore was served
