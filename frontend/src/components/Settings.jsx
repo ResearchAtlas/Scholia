@@ -183,7 +183,7 @@ function Subagents() {
   const [problem, setProblem] = useState(null);
   const values = personal.values;
   if (!values) return <Loading />;
-  const list = values.subagents.models ?? [];
+  const list = [...new Set(values.subagents.models ?? [])]; // a ranked list names each model once
   // Each change starts from the list as the last change left it, even before that is saved.
   const change = (edit) => {
     const next = edit(pending.current ?? list);

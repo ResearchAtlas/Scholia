@@ -57,7 +57,9 @@ export function useModelChoice() {
 function useCatalog(open, projectId) {
   const [catalog, setCatalog] = useState(null);
   const latest = useRef(0); // the newest load; an older one that finishes later is dropped
+  const here = useRef(true); // a picker that has gone starts no load and publishes none
   const load = useCallback(async () => {
+    if (!here.current) return;
     const mine = ++latest.current;
     try {
       forgetModels(); // the offers and windows as the settings hold them now
@@ -69,7 +71,7 @@ function useCatalog(open, projectId) {
       const listings = await Promise.allSettled(ready.map((p) => loadModels(p.name)));
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
         ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
-      if (mine !== latest.current) return;
+      if (mine !== latest.current || !here.current) return;
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
         defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto' };
       // Only a complete, current listing says a chosen model is gone.
@@ -79,14 +81,18 @@ function useCatalog(open, projectId) {
       }
       setCatalog(next);
     } catch {
-      if (mine === latest.current) {
+      if (mine === latest.current && here.current) {
         setCatalog((current) => current ?? { models: [], recent: [], efforts: {}, several: false, defaultModel: 'auto' });
       }
     }
   }, [projectId]);
   useEffect(() => {
+    here.current = true;
     load(); // at first, for the label and a chosen model's steps; then each time the picker opens
-    return () => { latest.current += 1; }; // a load still under way when the picker goes is dropped
+    return () => { // a load still under way when the picker goes is dropped, and none starts after
+      here.current = false;
+      latest.current += 1;
+    };
   }, [load]);
   useEffect(() => {
     if (open) load();
