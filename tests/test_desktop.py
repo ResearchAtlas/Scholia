@@ -194,9 +194,10 @@ def test_a_data_folder_holding_a_link_is_refused_and_the_link_is_never_followed(
     with pytest.raises(desktop.UnsafeDataFolderError):
         desktop.narrow_tree(data)
     assert stat.S_IMODE((outside / "target").stat().st_mode) == 0o666  # left alone
-    windows = []
-    assert desktop.run(data, windows.append) == 1  # the app does not open it
-    assert windows == [] and not (data / "scholia.sqlite3").exists()
+    seen = []
+    assert desktop.run(data, _health(seen), listening=register_server) == 1  # the app does not open it
+    assert seen[0]["data_folder_problem"] == "unsafe" and "link" in seen[0]["data_folder_reason"]
+    assert seen[0]["data_folder"] == str(data) and not (data / "scholia.sqlite3").exists()
 
 
 @pytest.mark.parametrize("item, mode", [("config.toml", 0o666), ("projects", 0o777), ("credentials.json", 0o620)])
@@ -278,6 +279,16 @@ def test_every_file_is_narrowed_even_after_a_problem_was_found(tmp_path):
         assert stat.S_IMODE((data / name).stat().st_mode) == 0o600
 
 
+def _health(seen):
+    """A window that reads /api/health, as the interface does first."""
+    def window(url):
+        origin, session = url.split("/#session=")
+        with httpx.Client(base_url=origin, headers={"X-Scholia-Client": "local", "X-Scholia-Session": session},
+                          timeout=10) as http:
+            seen.append(http.get("/api/health").json())
+    return window
+
+
 def _open_and_close(seen):
     def window(url):
         origin, session = url.split("/#session=")
@@ -335,7 +346,7 @@ def test_a_lock_file_that_is_a_link_is_refused_and_never_followed(tmp_path, targ
     assert outside.exists() == (target == "locked")  # nothing created through the link
     windows = []
     assert desktop.run(data, windows.append) == 1
-    assert windows == []  # not reported as already open
+    assert len(windows) == 1 and windows[0] is not None  # why it was refused, not "already open"
 
 
 @pytest.mark.parametrize("after, started", [(0.39, True), (0.41, False)])
