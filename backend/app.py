@@ -26,6 +26,7 @@ from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
+from backend import backups
 from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
@@ -239,6 +240,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown
+    app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
 
     @app.exception_handler(ApiError)
     @app.exception_handler(AdmissionError)

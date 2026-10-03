@@ -229,6 +229,10 @@ class OutboundGate:
         self._transport = transport
         self._local_listener = local_listener or (None if transport is not None else listener_is_ours)
 
+    def for_database(self, db) -> "OutboundGate":
+        """The same gate over another Database, for a restore that reopened the data folder's."""
+        return OutboundGate(db, self._inputs, transport=self._transport, local_listener=self._local_listener)
+
     def client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
                **options) -> httpx.Client:
         """A client for one project's requests.
