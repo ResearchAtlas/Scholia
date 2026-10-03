@@ -104,6 +104,33 @@ def test_a_record_scholia_could_not_read_is_replaced_by_the_new_choice(tmp_path,
     assert mode(record) == 0o600 and data_folder.located(default) == chosen
 
 
+def test_a_choice_that_cannot_be_written_keeps_the_earlier_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default, first, second = tmp_path / "default", tmp_path / "Research" / "A", tmp_path / "Research" / "B"
+    first.parent.mkdir()
+    data_folder.choose(default, str(first))
+
+    def disk_full(path, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(data_folder, "write_private", disk_full)
+    with pytest.raises(OSError):
+        data_folder.choose(default, str(second))
+    assert data_folder.located(default) == first
+
+
+def test_the_records_own_name_cannot_be_chosen(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default = tmp_path / "default"
+    record = default.parent / data_folder.LOCATION_FILE
+    record.mkdir()
+    for spelling in (str(record), str(record).upper().replace(str(tmp_path).upper(), str(tmp_path))):
+        with pytest.raises(data_folder.FolderRefused) as refused:
+            data_folder.choose(default, spelling)
+        assert refused.value.code == "data_folder_invalid"
+    assert record.is_dir()  # left as it was
+
+
 def test_a_record_name_holding_a_folder_with_something_in_it_is_never_removed(tmp_path, monkeypatch):
     monkeypatch.setattr(data_folder, "file_system_type", apfs)
     default, chosen = tmp_path / "default", tmp_path / "Research" / "Scholia"

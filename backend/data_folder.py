@@ -174,6 +174,8 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     if not os.path.isabs(path) or ".." in Path(path).parts:
         raise FolderRefused("data_folder_invalid", "Choose a folder by its full path")
     path, default = Path(path), Path(default)
+    if _names_record(path, _record(default)):  # the note of the chosen place cannot be the place
+        raise FolderRefused("data_folder_invalid", "That is where Scholia notes its data folder's place")
     problem = synced(path, home=home, fs_type=fs_type)
     if problem:
         raise FolderRefused("data_folder_synced", f"Scholia cannot keep its data there: {problem}")
@@ -200,22 +202,35 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
         raise FolderRefused(f"data_folder_{held[0]}", f"Scholia cannot use that folder: {held[1]}")
     record = _record(default)
     _clear_record(record)
-    if not is_default:
+    if is_default:
+        record.unlink(missing_ok=True)
+    else:
         write_private(record, json.dumps({"path": str(path)}).encode())
     return path
 
 
 def _clear_record(record):
-    """Removes what is at the record's name, whatever it is (an unreadable file, a link, an empty
-    folder), so a new record is written owner-only; a folder with something in it is never removed,
-    and the choice is refused."""
+    """Readies the record's name for a new record. A file stays until the new one replaces it (so a
+    failed write keeps the earlier choice), made owner-only so the new one is too, even one Scholia
+    could not read; a link or an empty folder, never a usable record, is removed; a folder with
+    something in it is never removed, and the choice is refused."""
     try:
-        if record.is_dir() and not record.is_symlink():
+        if record.is_symlink():
+            record.unlink()
+        elif record.is_dir():
             record.rmdir()
-        else:
-            record.unlink(missing_ok=True)
+        elif record.exists():
+            os.chmod(record, 0o600)
     except OSError:
         raise FolderRefused("data_folder_record", "Scholia cannot replace the record of its data folder") from None
+
+
+def _names_record(path, record):
+    """Whether path names the location record, in any spelling the file system takes for it."""
+    try:
+        return os.path.samefile(path, record)
+    except OSError:  # one of them is not there: compared by name, as a case-insensitive volume would
+        return str(path).casefold() == str(record).casefold()
 
 
 def _record(default):

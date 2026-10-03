@@ -583,9 +583,11 @@ async def _replace(state, body, staging, purges):
 async def _resume(db, harness, damaged):
     """A restore that stopped before it changed anything: the app runs on as it was, its writes
     admitted again and its harness, which keeps any work still running, admitting again. A failure
-    to restart background work is logged; the restore's own answer stands."""
-    if not damaged:
-        await asyncio.to_thread(db.release_writes)
+    to restart background work is logged; the restore's own answer stands. A damaged database runs
+    nothing: the app is limited to restoring, so its harness stays stopped."""
+    if damaged:
+        return
+    await asyncio.to_thread(db.release_writes)
     if harness is not None:
         try:
             await harness.resume()

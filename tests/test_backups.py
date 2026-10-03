@@ -710,6 +710,28 @@ async def test_a_restore_refuses_when_running_work_does_not_stop_and_runs_on(tmp
         assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # running again
 
 
+async def test_a_refused_restore_of_a_damaged_app_leaves_its_harness_stopped(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        client.state["db"]._damaged = "integrity_check failed"  # as a backup's full check marks it
+        real, resumed = Harness.shutdown, []
+
+        async def stuck(self, timeout=10.0):
+            await real(self, timeout)
+            return 1  # a task still running after the timeout
+
+        async def resume(self):
+            resumed.append(True)
+
+        monkeypatch.setattr(Harness, "shutdown", stuck)
+        monkeypatch.setattr(Harness, "resume", resume)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "work_running")
+        assert resumed == []  # nothing runs in a limited app
+        assert (await client.get("/api/health")).json().get("database_damaged")
+
+
 async def test_a_backup_rotated_away_while_staged_is_still_restored(tmp_path, monkeypatch):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
