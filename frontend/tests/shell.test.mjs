@@ -172,3 +172,19 @@ test('a settings conflict writes nothing, so a change on disk is never overwritt
     ? Response.json({ hash: 'h1', values: {} }) : Response.json({ code: 'invalid_setting' }, { status: 400 })));
   await assert.rejects(saveSettings({ 'ui.panel': 'x' }), (error) => error.code === 'invalid_setting');
 });
+
+test('this window\'s settings saves run one after another', async (t) => {
+  let hash = 0;
+  const order = [];
+  t.mock.method(globalThis, 'fetch', async (path, { method, body }) => {
+    if (method === 'GET') return Response.json({ hash: `h${hash}`, values: {} });
+    const sent = JSON.parse(body);
+    if (sent.hash !== `h${hash}`) return Response.json({ code: 'settings_changed' }, { status: 409 });
+    hash += 1; // the write lands, then its reply takes a moment
+    order.push(sent.updates['ui.panel']);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return Response.json({ hash: `h${hash}` });
+  });
+  await Promise.all([saveSettings({ 'ui.panel': 'library' }), saveSettings({ 'ui.panel': 'none' })]);
+  assert.deepEqual(order, ['library', 'none']); // the newer value is written last, not dropped
+});

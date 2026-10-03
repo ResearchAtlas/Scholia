@@ -204,6 +204,7 @@ function MoveDialog({ conversation, projects, from, onClose, onDone }) {
   const [target, setTarget] = useState(null);
   const { busy, problem, run, reset } = useAction();
   const targets = moveTargets(projects, from);
+  useEffect(() => setTarget(null), [conversation]); // each move starts with no destination chosen
   async function submit(event) {
     event.preventDefault();
     if (await run(() => post(`/api/conversations/${conversation.id}/move`, { project_id: target }))) onDone(conversation.id);

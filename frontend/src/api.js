@@ -76,7 +76,16 @@ export async function stream(path, body, onEvent, signal) {
 // value on disk. If the file changes between the read and the write, nothing is written and
 // the file's values stand, since the app never overwrites a change it has not shown
 // (ticket 14); the action is simply not remembered. Settings forms reload and ask (S1-10).
-export async function saveSettings(updates, projectId) {
+// This window's saves run one after another, so they never conflict with each other.
+let saving = Promise.resolve();
+
+export function saveSettings(updates, projectId) {
+  const save = saving.then(() => saveNow(updates, projectId));
+  saving = save.catch(() => {});
+  return save;
+}
+
+async function saveNow(updates, projectId) {
   const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
   const { hash } = await get(`/api/settings${query}`);
   try {
