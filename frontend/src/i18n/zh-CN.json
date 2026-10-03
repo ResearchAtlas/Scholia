@@ -450,7 +450,7 @@
   "audit.thisProject": "此项目",
   "audit.everything": "全部",
   "audit.sent": {
-    "other": "就本日志所记，此项目有 {count} 个请求离开了这台 Mac。"
+    "other": "就本日志所记，此项目有 {count} 个请求获准离开这台 Mac。"
   },
   "audit.empty": "尚无记录。",
   "audit.more": "显示更早的记录",

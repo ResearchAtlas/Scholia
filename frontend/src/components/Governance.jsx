@@ -3,7 +3,7 @@
 // protection, the OpenRouter key's data-settings confirmation, declared model servers on this
 // Mac, the Private allowlist and the audit log. Scholia cannot verify a confirmation or a
 // declaration, and says so where each is made.
-import { useCallback, useContext, useEffect, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { ExternalLink, Lock, ShieldCheck } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, confirmedChange, del, get, post, put } from '../api.js';
@@ -323,7 +323,7 @@ export function AuditLog({ project }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const [scope, setScope] = useState(project ? 'project' : 'all');
-  const [page, setPage] = useState(null); // { entries, next, sent_off_this_mac }
+  const [page, setPage] = useState(null); // { entries, next, allowed_off_this_mac }
   const [read, setRead] = useState(null);
   const [exported, setExported] = useState(null);
   const [ask, dialog] = useConfirm();
@@ -333,18 +333,26 @@ export function AuditLog({ project }) {
       ...(before ? { before: String(before) } : {}) });
     return get(`/api/audit?${query}`);
   }, [projectId]);
-  const load = useCallback(() => fetchPage().then((data) => {
-    setPage(data);
-    setRead(null);
-  }).catch((error) => setRead(codeOf(error))), [fetchPage]);
+  const reads = useRef(0); // each fresh read of the log; a page asked for under an earlier one is dropped
+  const load = useCallback(() => {
+    const mine = ++reads.current;
+    return fetchPage().then((data) => {
+      if (mine !== reads.current) return;
+      setPage(data);
+      setRead(null);
+    }).catch((error) => { if (mine === reads.current) setRead(codeOf(error)); });
+  }, [fetchPage]);
   const { busy, problem, run } = useChange(load);
   useEffect(() => {
     setPage(null);
     load();
   }, [load]);
   const older = () => run(async () => {
+    const mine = reads.current;
     const next = await fetchPage(page.next);
-    setPage((current) => ({ ...next, entries: [...current.entries, ...next.entries] }));
+    if (mine === reads.current) { // still the same scope and read: the older page continues it
+      setPage((current) => current && ({ ...next, entries: [...current.entries, ...next.entries] }));
+    }
     return false; // nothing changed to read again
   });
   const exportLog = () => run(async () => {
@@ -372,7 +380,7 @@ export function AuditLog({ project }) {
       {exported && <p role="status" className="break-all text-xs text-muted-foreground">{t('audit.exported', { path: exported })}</p>}
       {!page ? <LoadState problem={read} onRetry={load} /> : (
         <div className="space-y-2">
-          {page.sent_off_this_mac != null && <p className="text-xs">{t('audit.sent', { count: page.sent_off_this_mac })}</p>}
+          {page.allowed_off_this_mac != null && <p className="text-xs">{t('audit.sent', { count: page.allowed_off_this_mac })}</p>}
           {page.entries.length === 0 && <p className="text-sm text-muted-foreground">{t('audit.empty')}</p>}
           {page.entries.length > 0 && (
             <ol className="scroll-thin max-h-96 divide-y overflow-y-auto rounded-lg border">

@@ -93,9 +93,9 @@ async def test_the_view_pages_the_log_by_project_and_counts_what_left_this_mac(t
         everything = first["entries"] + rest["entries"]
         assert {e["project_id"] for e in everything} == {project}
         assert [e["event"] for e in everything][-1] == "project_created"
-        assert first["sent_off_this_mac"] == 2  # the answer and the title, to OpenRouter
+        assert first["allowed_off_this_mac"] == 2  # the answer and the title, to OpenRouter
         whole = (await client.get("/api/audit")).json()
-        assert whole["sent_off_this_mac"] is None and len(whole["entries"]) > len(everything)
+        assert whole["allowed_off_this_mac"] is None and len(whole["entries"]) > len(everything)
 
 
 async def test_an_export_is_an_owner_only_file_in_the_data_folder_and_is_audited(tmp_path):

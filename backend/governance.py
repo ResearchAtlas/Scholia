@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.db import new_id, utc_now
-from backend.openrouter_client import get_model_metadata
+from backend.openrouter_client import catalog_status, get_model_metadata
 from backend.outbound_gate import is_openrouter, local_origin
 from backend.settings import write_private
 
@@ -110,9 +110,12 @@ def private_flags(entries, model):
 
 
 def zero_retention(provider, model, key=None) -> bool:
-    """Whether the provider's catalog, as read (with key, when given: as read with that key),
-    lists a zero-retention endpoint for the model."""
+    """Whether the provider's catalog, as read (with key, when given: as read with that key, and
+    only while that catalog is fresh, so an expired or failed read fails closed), lists a
+    zero-retention endpoint for the model."""
     from backend.providers import Route  # providers reads this module's checks for the gate
+    if key is not None and catalog_status(provider, key)["stale"]:
+        return False
     return (get_model_metadata(Route(provider, model), key) or {}).get("supports_zdr") is True
 
 

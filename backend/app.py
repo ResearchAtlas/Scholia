@@ -922,7 +922,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def audit_log(project_id: str | None = None, before: int | None = None, limit: int = 100):
         """The audit log, newest first, a page at a time (before: the seq the last page ended
         at); for one project, its own rows and every clearing of the log, with how many of its
-        requests were allowed off this Mac since the log began or was last cleared."""
+        requests the gate allowed off this Mac since the log began or was last cleared (a row
+        records the decision, not delivery: a request decided again and refused before it left counts)."""
         limit = max(1, min(limit, 500))
 
         def page(conn):
@@ -939,7 +940,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         rows, sent = await read(page)
         return {"entries": [{"seq": seq, "at": at, "event": event, "project_id": project, "data": json.loads(data)}
                             for seq, at, event, project, data in rows],
-                "next": rows[-1][0] if len(rows) == limit else None, "sent_off_this_mac": sent}
+                "next": rows[-1][0] if len(rows) == limit else None, "allowed_off_this_mac": sent}
 
     @app.post("/api/audit/export")
     async def export_audit(body: AuditExport | None = None):

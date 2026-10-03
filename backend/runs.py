@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 
 from backend import budget_router, credentials, governance, openrouter, openrouter_client, providers, spending
 from backend.db import new_id, utc_now
-from backend.openrouter_client import catalog_read, get_model_metadata
+from backend.openrouter_client import catalog_read, catalog_status, get_model_metadata
 from backend.settings import load_instructions, load_settings, visible
 
 log = logging.getLogger(__name__)
@@ -473,8 +473,8 @@ class Harness:
         if key is None:
             raise AdmissionError(400, "provider_key_missing", "The provider has no key")
         zero_retention = policy.zero_retention and provider_config.is_openrouter
-        if zero_retention and not catalog_read(providers.Route(provider_config, "")):
-            await self.catalog(provider_config, key)  # which models OpenRouter serves with zero retention
+        if zero_retention and catalog_status(provider_config, key)["stale"]:  # unread, expired or failed
+            await self.catalog(provider_config, key)  # which models OpenRouter serves with zero retention now
 
         def plan_among(allowed):
             return budget_router.create_run_plan(
@@ -906,7 +906,7 @@ class Harness:
         if policy is None:
             return None
         zero_retention = policy.zero_retention and route.provider.is_openrouter
-        if zero_retention and not catalog_read(providers.Route(route.provider, "")):
+        if zero_retention and catalog_status(route.provider, key)["stale"]:  # unread, expired or failed
             await self.catalog(route.provider, key)
 
         def start(conn):

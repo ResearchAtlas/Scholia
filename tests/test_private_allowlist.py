@@ -349,3 +349,30 @@ async def test_the_gate_reads_the_catalog_of_the_provider_and_key_a_request_goes
         assert {reason for (reason,) in await rows(
             client, "SELECT data ->> 'reason' FROM audit_log WHERE event = 'outbound'"
                     " AND data ->> 'decision' = 'deny'")} == {"route_not_allowed"}
+
+
+async def test_an_expired_catalog_is_read_again_and_a_model_no_longer_zero_retention_is_refused(tmp_path):
+    provider = provider_for_private()
+    async with started(tmp_path / "data", provider) as client:
+        _, conversation = await private_conversation(client)
+        assert (await send(client, conversation, model=ZDR_MODEL))[-1]["status"] == "succeeded"
+        await background_idle(client)
+        sent = len(provider.chats)
+        provider.zero_retention = []  # OpenRouter has since dropped the model's zero-retention endpoint
+        for state in openrouter_client._caches.values():  # the catalog read an hour ago
+            state["last_fetched"] -= openrouter_client.CACHE_TTL_SECONDS + 1
+            state["last_attempt"] -= openrouter_client.REFRESH_COOLDOWN_SECONDS + 1
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "SECRET-INTERVIEW", "model": ZDR_MODEL})
+        assert (refused.status_code, refused.json()["code"]) == (403, "private_route_not_allowed")
+        assert len(provider.chats) == sent
+
+
+async def test_a_stale_catalog_never_vouches_for_zero_retention(monkeypatch):
+    from backend.providers import OPENROUTER, OPENROUTER_BASE_URL, Provider
+    provider = Provider(OPENROUTER, "openrouter", OPENROUTER_BASE_URL)
+    monkeypatch.setattr(governance, "get_model_metadata", lambda route, key=None: {"supports_zdr": True})
+    monkeypatch.setattr(governance, "catalog_status", lambda p, key: {"stale": False})
+    assert governance.zero_retention(provider, ZDR_MODEL, KEY)
+    monkeypatch.setattr(governance, "catalog_status", lambda p, key: {"stale": True})  # expired, or its refresh failed
+    assert not governance.zero_retention(provider, ZDR_MODEL, KEY)

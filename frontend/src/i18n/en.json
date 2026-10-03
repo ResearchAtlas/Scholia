@@ -453,8 +453,8 @@
   "audit.thisProject": "This project",
   "audit.everything": "Everything",
   "audit.sent": {
-    "one": "{count} request from this project left this Mac, as far as this log goes.",
-    "other": "{count} requests from this project left this Mac, as far as this log goes."
+    "one": "{count} request from this project was allowed to leave this Mac, as far as this log goes.",
+    "other": "{count} requests from this project were allowed to leave this Mac, as far as this log goes."
   },
   "audit.empty": "Nothing recorded yet.",
   "audit.more": "Show older",
