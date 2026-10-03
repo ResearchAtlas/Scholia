@@ -7,6 +7,7 @@ later record of a clearing.
 
 import asyncio
 import json
+import re
 import sqlite3
 import stat
 from pathlib import Path
@@ -70,6 +71,7 @@ async def test_every_governance_change_is_audited_without_content(tmp_path):
             assert isinstance(json.loads(data), dict)
         by_project = {event for event, project_id, _ in logged if project_id == project}
         assert {"project_created", "sensitivity_changed", "review_lock_changed", "audit_exported"} <= by_project
+        assert_named(logged)
 
 
 async def test_the_view_pages_the_log_by_project_and_counts_what_left_this_mac(tmp_path):
@@ -184,6 +186,56 @@ async def test_clearing_records_are_never_deleted(tmp_path):
                 await asyncio.to_thread(db.write, lambda conn, which=which: conn.execute(
                     f"DELETE FROM audit_log WHERE seq = (SELECT {which}(seq) FROM audit_log)"))
         assert await rows(client, "SELECT event FROM audit_log") == [("audit_cleared",), ("audit_cleared",)]
+
+
+CATALOGS = Path(__file__).resolve().parents[1] / "frontend" / "src" / "i18n"
+
+
+def catalogs():
+    return {name: json.loads((CATALOGS / name).read_text(encoding="utf-8")) for name in ("en.json", "zh-CN.json")}
+
+
+def assert_named(logged):
+    """Each event logged, and each field of its details, has its text in every catalog (an
+    outbound decision's details are shown by their own texts, checked below)."""
+    for name, catalog in catalogs().items():
+        assert {e for e, _, _ in logged if f"audit.event.{e}" not in catalog} == set(), name
+        assert {key for e, _, data in logged if e != "outbound" for key in json.loads(data)
+                if f"audit.field.{key}" not in catalog} == set(), name
+
+
+def written_events():
+    """Every event name the backend writes to the audit log, read from its source."""
+    found = set()
+    for path in (Path(__file__).resolve().parents[1] / "backend").rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        found |= set(re.findall(r"INSERT INTO audit_log \(event[^)]*\) (?:VALUES \(|SELECT )'(\w+)'", source))
+        found |= set(re.findall(r"record\(conn, \"(\w+)\"", source))
+    return found
+
+
+async def test_every_event_the_backend_writes_has_a_heading_in_each_interface_language():
+    events = written_events()
+    assert EVENTS | {"audit_cleared", "full_backup", "project_export", "restore", "backup_purge"} <= events
+    for name, catalog in catalogs().items():
+        assert {e for e in events if f"audit.event.{e}" not in catalog} == set(), name
+
+
+async def test_backups_restores_exports_and_purges_are_logged_with_text_for_each_field(tmp_path):
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Study"})).json()["id"]
+        await client.post("/api/conversations", json={"project_id": project})
+        assert (await client.post("/api/backups/full", json={"destination": str(destination)})).status_code == 200
+        exported = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
+        assert exported.status_code == 200
+        backup = (await client.post("/api/backups")).json()["id"]
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+        assert (await client.delete(f"/api/projects/{project}", params={"purge_backups": "true"})).status_code == 200
+        logged = await rows(client, "SELECT event, project_id, data FROM audit_log")
+        assert {"full_backup", "project_export", "restore", "backup_purge"} <= {e for e, _, _ in logged}
+        assert_named(logged)
 
 
 async def test_every_refusal_reason_and_destination_kind_is_named_in_each_interface_language():

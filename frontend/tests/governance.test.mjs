@@ -99,6 +99,14 @@ test('audit details are shown in the interface language, codes this version does
     'what: conversation · records removed: 4');
   assert.equal(auditDetail(en, { event: 'private_route_changed', data: { route: 'openrouter:x/y', enabled: null } }, dates),
     'route: openrouter:x/y');
+  assert.equal(auditDetail(zh, { event: 'project_export', data: { file: '/Users/me/out/p.zip', encrypted: false,
+    conversations: 1, turns: 1, artifacts: 0, materials: 0 } }, dates),
+  '文件：/Users/me/out/p.zip · 已加密：否 · 对话：1 · 对话轮次：1 · 文稿：0 · 资料：0');
+  assert.equal(auditDetail(en, { event: 'restore', data: { source: 'automatic', backup: 'daily/x', safety_copy: 'daily/y',
+    damaged_copy: null, missing_files: 0 } }, dates),
+  'restored from: an automatic backup · backup: daily/x · copy of the state before: daily/y · files missing: 0');
+  assert.equal(auditDetail(en, { event: 'full_backup', data: { settings_left_out: ['config.toml'], projects: 2 } }, dates),
+    'settings files left out: 1 · projects: 2');
   assert.equal(auditDetail(en, { event: 'later_event', data: { newer_field: 'code' } }, dates), 'newer_field: code');
   assert.equal(auditDetail(en, { event: 'outbound', data: { decision: 'deny', reason: 'a_newer_reason' } }, dates),
     'Refused: a_newer_reason');

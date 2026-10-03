@@ -1,7 +1,7 @@
 // How the audit log view shows an entry's details in the interface language. The log holds
 // codes, ids, origins, counts and times, never content (ticket 18): each known field, level,
-// yes or no, and refusal reason is shown through the catalogs; a code this version does not name
-// is shown as it is.
+// yes or no, and refusal reason is shown through the catalogs; a code this version does not name,
+// and a value that is the researcher's own (a file or backup's name), is shown as it is.
 const LEVEL_FIELDS = new Set(['from', 'to', 'sensitivity']);
 const TIME_FIELDS = new Set(['expires_at', 'declared_at']);
 
@@ -17,7 +17,9 @@ function shown(t, key, value, dates) {
   if (LEVEL_FIELDS.has(key)) return named(t, 'level', value);
   if (key === 'stored_in') return named(t, 'audit.storedIn', value);
   if (key === 'kind') return named(t, 'audit.object', value); // what a deletion deleted
+  if (key === 'source') return named(t, 'audit.backupSource', value); // what a restore put in place
   if (TIME_FIELDS.has(key) && typeof value === 'string') return dates.format(new Date(value));
+  if (Array.isArray(value)) return String(value.length); // the settings files a full backup left out: how many
   if (value && typeof value === 'object') { // the records a deletion removed, by table: their count
     return String(Object.values(value).reduce((sum, n) => sum + (Number(n) || 0), 0));
   }
