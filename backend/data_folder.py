@@ -199,11 +199,23 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     if held:
         raise FolderRefused(f"data_folder_{held[0]}", f"Scholia cannot use that folder: {held[1]}")
     record = _record(default)
-    if is_default:
-        record.unlink(missing_ok=True)
-    else:
+    _clear_record(record)
+    if not is_default:
         write_private(record, json.dumps({"path": str(path)}).encode())
     return path
+
+
+def _clear_record(record):
+    """Removes what is at the record's name, whatever it is (an unreadable file, a link, an empty
+    folder), so a new record is written owner-only; a folder with something in it is never removed,
+    and the choice is refused."""
+    try:
+        if record.is_dir() and not record.is_symlink():
+            record.rmdir()
+        else:
+            record.unlink(missing_ok=True)
+    except OSError:
+        raise FolderRefused("data_folder_record", "Scholia cannot replace the record of its data folder") from None
 
 
 def _record(default):

@@ -89,6 +89,33 @@ def test_a_chosen_place_is_recorded_owner_only_beside_the_default_folder(tmp_pat
     assert not record.exists() and data_folder.located(default) == default
 
 
+@pytest.mark.parametrize("left", ["folder", "unreadable"])
+def test_a_record_scholia_could_not_read_is_replaced_by_the_new_choice(tmp_path, monkeypatch, left):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default, chosen = tmp_path / "default", tmp_path / "Research" / "Scholia"
+    chosen.parent.mkdir()
+    record = default.parent / data_folder.LOCATION_FILE
+    if left == "folder":
+        record.mkdir()
+    else:
+        record.write_text("{}")
+        record.chmod(0)
+    assert data_folder.choose(default, str(chosen)) == chosen
+    assert mode(record) == 0o600 and data_folder.located(default) == chosen
+
+
+def test_a_record_name_holding_a_folder_with_something_in_it_is_never_removed(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default, chosen = tmp_path / "default", tmp_path / "Research" / "Scholia"
+    chosen.parent.mkdir()
+    record = default.parent / data_folder.LOCATION_FILE
+    record.mkdir()
+    (record / "kept.txt").write_text("the researcher's")
+    with pytest.raises(data_folder.FolderRefused) as refused:
+        data_folder.choose(default, str(chosen))
+    assert refused.value.code == "data_folder_record" and (record / "kept.txt").read_text() == "the researcher's"
+
+
 @pytest.mark.parametrize("path, message, code", [
     ("Research/Scholia", "full path", "data_folder_invalid"),
     ("/{tmp}/Research/../Scholia", "full path", "data_folder_invalid"),

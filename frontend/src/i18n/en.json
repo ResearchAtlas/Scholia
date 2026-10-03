@@ -178,6 +178,7 @@
   "errors.data_folder_newer": "That folder holds data from a newer version of Scholia.",
   "errors.data_folder_unchecked": "Scholia could not check the database in that folder.",
   "errors.data_folder_not_writable": "That folder is not yours, or Scholia cannot write in it.",
+  "errors.data_folder_record": "Scholia cannot replace its note of where its data is, kept beside its default folder. Remove the item named “Scholia data folder.json” there, then choose again.",
   "status.running": "Running",
   "status.succeeded": "Done",
   "status.failed": "Failed",
