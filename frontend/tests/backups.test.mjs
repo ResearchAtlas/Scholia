@@ -11,6 +11,7 @@ import { makeT } from '../src/i18n/index.js';
 import { deletePath, deletionNotices, fileSize, folderPicker, needsPassphrase, restoreBody, restoreNotes }
   from '../src/backups.js';
 import { errorText } from '../src/text.js';
+import { get } from '../src/api.js';
 
 test('a deletion asks for the backups and the trace only when chosen', () => {
   assert.equal(deletePath('conversation', 'c1'), '/api/conversations/c1');
@@ -99,4 +100,18 @@ test('every catalog key a component names is in the catalog', () => {
     .flatMap((name) => [...readFileSync(join(src, name), 'utf8').matchAll(/\bt\('([\w.]+)'/g)]
       .map((match) => match[1]).filter((key) => !Object.hasOwn(en, key)).map((key) => `${name}: ${key}`));
   assert.deepEqual(missing, []);
+});
+
+test('a request that finds the app limited tells the window, so it can offer the restore', async (t) => {
+  const seen = [];
+  globalThis.dispatchEvent = (event) => seen.push(event.type);
+  t.after(() => { delete globalThis.dispatchEvent; });
+  let answer = { status: 503, code: 'database_damaged' };
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ code: answer.code }, { status: answer.status }));
+  await assert.rejects(get('/api/projects'), (error) => error.code === 'database_damaged');
+  answer = { status: 409, code: 'settings_changed' };
+  await assert.rejects(get('/api/settings'), (error) => error.code === 'settings_changed');
+  answer = { status: 503, code: 'restoring' }; // a restore under way is not a limited app
+  await assert.rejects(get('/api/projects'));
+  assert.deepEqual(seen, ['scholia:limited']);
 });

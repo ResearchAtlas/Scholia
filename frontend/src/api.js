@@ -26,6 +26,15 @@ export function headers(json) {
   };
 }
 
+// The app became limited (a database found damaged, or a restore that could not finish or be
+// undone): the window is told, and the app checks its health and offers the restore (App.jsx).
+const LIMITED = new Set(['database_damaged', 'restore_interrupted', 'database_unavailable']);
+
+function failure(status, code) {
+  if (status === 503 && LIMITED.has(code)) globalThis.dispatchEvent?.(new Event('scholia:limited'));
+  return new ApiError(status, code);
+}
+
 export async function api(method, path, body, { signal } = {}) {
   let response;
   try {
@@ -40,7 +49,7 @@ export async function api(method, path, body, { signal } = {}) {
     throw new ApiError(0, 'unreachable');
   }
   const data = await response.json().catch(() => null);
-  if (!response.ok) throw new ApiError(response.status, data?.code ?? 'http_error');
+  if (!response.ok) throw failure(response.status, data?.code ?? 'http_error');
   return data;
 }
 
@@ -59,7 +68,7 @@ export async function stream(path, body, onEvent, signal) {
     });
   if (!response.ok) {
     const data = await response.json().catch(() => null);
-    throw new ApiError(response.status, data?.code ?? 'http_error');
+    throw failure(response.status, data?.code ?? 'http_error');
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();

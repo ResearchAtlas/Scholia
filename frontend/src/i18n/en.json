@@ -75,6 +75,7 @@
   "settings.title": "Settings",
   "settings.advanced": "Advanced",
   "settings.backgroundRuns": "Background runs",
+  "settings.backups": "Backups and restore",
   "settings.backgroundRunsHint": "Work Scholia does after an answer, such as titling a conversation.",
   "settings.noRuns": "Nothing has run in the background yet.",
   "settings.cancelRun": "Cancel",

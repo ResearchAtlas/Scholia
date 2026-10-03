@@ -29,10 +29,6 @@ export function ProjectExportSection({ project }) {
 
   return (
     <form onSubmit={submit} className="grid gap-3">
-      <div>
-        <h4 className="text-sm font-medium">{t('export.title')}</h4>
-        <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{t('export.hint')}</p>
-      </div>
       <FolderField label={t('folder.label')} value={destination} onChange={setDestination} />
       {encrypted && (
         <Passphrase id="export-passphrase" value={passphrase} onChange={setPassphrase} hint={t('export.passphraseHint')} />

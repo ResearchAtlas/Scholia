@@ -75,6 +75,7 @@
   "settings.title": "设置",
   "settings.advanced": "高级",
   "settings.backgroundRuns": "后台任务",
+  "settings.backups": "备份与恢复",
   "settings.backgroundRunsHint": "Scholia 在回答之后进行的工作，例如为对话生成标题。",
   "settings.noRuns": "还没有后台任务。",
   "settings.cancelRun": "取消",
