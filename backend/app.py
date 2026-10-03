@@ -228,13 +228,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 state["maintenance_seconds"] = state.get("maintenance_seconds", 0.0) + time.monotonic() - started
                 del state["maintenance_started"]
 
-    async def start(db):
+    async def start(db, kick=True):
         """Run the app on db: its content store, outbound gate and harness, recovered before any
-        request reaches them. A restore calls it again with the database it put in place."""
+        request reaches them. A restore calls it again with the database it put in place, with
+        kick false: nothing runs on its own (background runs) until the restore has committed."""
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
         try:
-            await harness.recover()
+            await (harness.recover() if kick else harness.recover(kick=False))
         except BaseException:
             await harness.shutdown()
             raise

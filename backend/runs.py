@@ -207,9 +207,10 @@ class Harness:
 
     # Startup and shutdown
 
-    async def recover(self) -> None:
-        """Record what a crash left behind, then restart the background runs. Call once
-        at startup, before serving requests."""
+    async def recover(self, kick=True) -> None:
+        """Record what a crash left behind, then restart the background runs (unless kick is
+        false: a restore starts them once it has committed, see kick_background). Call once at
+        startup, before serving requests."""
 
         def record(conn):
             in_flight = {run_id for (run_id,) in conn.execute(
@@ -228,7 +229,8 @@ class Harness:
                     (json.dumps(_accounting(conn, run_id, complete=run_id not in in_flight)), run_id))
 
         await self._write(record)
-        await self.kick_background()
+        if kick:
+            await self.kick_background()
 
     async def shutdown(self, timeout: float = 10.0) -> int:
         """Stop admitting, cancel what is running and wait for it, up to timeout seconds.

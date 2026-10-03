@@ -217,11 +217,11 @@ async def test_a_replayed_restore_whose_harness_cannot_start_is_put_back_from_it
     await asyncio.to_thread(run_child, data, "forward", backup)
     real, recovered = Harness.recover, []
 
-    async def failing_once(self):  # the replayed, restored database opens, but its harness cannot recover
+    async def failing_once(self, kick=True):  # the replayed, restored database opens, but its harness cannot recover
         recovered.append(self)
         if len(recovered) == 1:
             raise RuntimeError("recovery failed")
-        await real(self)
+        await real(self, kick)
 
     monkeypatch.setattr(Harness, "recover", failing_once)
     names, text, folders, projects = await state_after_launch(data)
@@ -463,11 +463,11 @@ def failing_recovery(monkeypatch, times):
     from backend.runs import Harness
     real, recovered = Harness.recover, []
 
-    async def recover(self):
+    async def recover(self, kick=True):
         recovered.append(self)
         if len(recovered) <= times:
             raise RuntimeError("recovery failed")
-        await real(self)
+        await real(self, kick)
 
     monkeypatch.setattr(Harness, "recover", recover)
     return lambda: monkeypatch.setattr(Harness, "recover", real)
@@ -568,9 +568,9 @@ async def test_a_restore_that_cannot_be_committed_is_put_back_before_it_serves_a
     backup, kept, later = await prepare(data)
     started_harnesses, real_recover = [], Harness.recover
 
-    async def recover(self):
+    async def recover(self, kick=True):
         started_harnesses.append(self)
-        await real_recover(self)
+        await real_recover(self, kick)
 
     def cannot_commit(data_dir, journal, audits):
         raise OSError("I/O error")
@@ -830,3 +830,85 @@ async def test_a_launch_finishes_a_restore_whose_undo_failed_after_its_empty_set
     monkeypatch.setattr(backups_module, "write_private", real_write)
     names, text, folders, projects = await state_after_launch(data)  # the launch finishes it forward
     assert names == {"General", "Kept"} and text == "Backed up"
+
+
+async def a_backup_holding_an_unfinished_title_run(client):
+    """A backup taken while a title run's call is out: in it, that run is still to finish. The run
+    then finishes in the live database. Returns the backup's id and the title calls made."""
+    from scholia_app import _is_title, send
+    calling, release = asyncio.Event(), asyncio.Event()
+
+    async def held(body):
+        calling.set()
+        await release.wait()
+        return client.provider.answer("Live title")
+
+    client.provider.title_replies = [held]
+    await client.post("/api/projects", json={"name": "Kept"})  # a project folder, which a swap moves
+    conversation = (await client.post("/api/conversations", json={})).json()["id"]
+    await send(client, conversation)
+    await calling.wait()
+    backup = (await client.post("/api/backups")).json()["id"]
+    release.set()
+    from scholia_app import background_idle
+    await background_idle(client)
+    return backup, lambda: [r for r in client.provider.requests if _is_title(r[2])]
+
+
+async def test_a_restore_that_cannot_be_committed_makes_no_call_for_the_backups_unfinished_runs(tmp_path, monkeypatch):
+    import time
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup, title_calls = await a_backup_holding_an_unfinished_title_run(client)
+        before = len(title_calls())
+
+        def cannot_commit(data_dir, journal, audits):  # slow to fail: time for anything already started to call
+            deadline = time.monotonic() + 1
+            while len(title_calls()) == before and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise OSError("I/O error")
+
+        monkeypatch.setattr(backups_module, "_commit_journal", cannot_commit)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+        from scholia_app import background_idle
+        await background_idle(client)
+        assert len(title_calls()) == before  # no paid call for a database that was put back
+
+
+async def test_a_committed_restore_runs_the_backups_unfinished_runs(tmp_path):
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup, title_calls = await a_backup_holding_an_unfinished_title_run(client)
+        before = len(title_calls())
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text
+        from scholia_app import background_idle
+        await background_idle(client)
+        assert len(title_calls()) == before + 1  # started once committed
+
+
+async def test_a_replay_that_cannot_be_committed_makes_no_call_for_the_backups_unfinished_runs(tmp_path, monkeypatch):
+    import time
+    from scholia_app import FakeKeyring, MockProvider, _is_title, background_idle
+    data, keyring, provider = tmp_path / "data", FakeKeyring(), MockProvider()
+    async with started(data, keyring=keyring) as client:
+        backup, _ = await a_backup_holding_an_unfinished_title_run(client)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+    real_commit, commits = backups_module._commit_journal, []
+    title_calls = lambda: [r for r in provider.requests if _is_title(r[2])]  # noqa: E731
+
+    def cannot_commit_once(data_dir, journal, audits):  # the replay's commit fails; putting it back commits
+        commits.append(journal["direction"])
+        if len(commits) == 1:
+            deadline = time.monotonic() + 1  # slow to fail: time for anything already started to call
+            while not title_calls() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise OSError("I/O error")
+        real_commit(data_dir, journal, audits)
+
+    monkeypatch.setattr(backups_module, "_commit_journal", cannot_commit_once)
+    async with started(data, provider, keyring=keyring, setup=False) as client:  # its key kept: a call could go out
+        await background_idle(client)
+        assert commits == ["forward", "back"]
+        assert title_calls() == []  # nothing ran on the replayed database

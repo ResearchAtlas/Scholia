@@ -419,11 +419,11 @@ async def test_a_restore_whose_harness_cannot_start_puts_everything_back_and_run
         project = await new_project(client)
         real, recovered = Harness.recover, []
 
-        async def failing_once(self):
+        async def failing_once(self, kick=True):
             recovered.append(self)
             if len(recovered) == 1:
                 raise RuntimeError("recovery failed")
-            await real(self)
+            await real(self, kick)
 
         monkeypatch.setattr(Harness, "recover", failing_once)
         response = await client.post("/api/backups/restore", json={"generation": backup})
@@ -505,9 +505,9 @@ async def test_a_restored_app_takes_requests_only_once_its_runs_are_recovered(tm
     from backend.runs import Harness
     real, seen = Harness.recover, []
 
-    async def recover(self):
+    async def recover(self, kick=True):
         seen.append(state.get("harness") is self)  # visible to requests while it recovers?
-        await real(self)
+        await real(self, kick)
 
     async with started(tmp_path / "data") as client:
         state = client.state

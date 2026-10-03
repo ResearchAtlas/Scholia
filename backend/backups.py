@@ -498,7 +498,7 @@ async def _replace(state, body, staging, purges):
         try:
             journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside, restore_id, earlier)
             restored = await asyncio.to_thread(Database, data_dir)  # its checks and migrations
-            await state["start"](restored)  # its harness recovered; nothing is served before this returns
+            await state["start"](restored, kick=False)  # recovered; nothing is served or runs on its own yet
             missing = await recorded("missing_files", _missing_files, restored)
             record = {
                 "id": journal["id"],
@@ -511,6 +511,7 @@ async def _replace(state, body, staging, purges):
             audits = [*earlier, record]
             # Committed, before anything is served: from here no launch puts the previous state back
             await asyncio.to_thread(_commit_journal, data_dir, journal, audits)
+            await _kick(state)  # its background runs start now: none ran on a database that could yet be put back
         except Exception as error:
             log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
             if restored is not None and state.get("db") is restored:  # it started: stopped before it served anything
@@ -548,6 +549,15 @@ async def _resume(db, harness, damaged):
             await harness.resume()
         except Exception as error:
             log.warning("restarting background work after a refused restore failed (%s)", type(error).__name__)
+
+
+async def _kick(state):
+    """Start the background runs of the app a restore committed (start ran with kick false). A
+    failure is logged: the restore stands, and they start at the next launch."""
+    try:
+        await state["harness"].kick_background()
+    except Exception as error:
+        log.warning("starting background runs after a restore failed (%s)", type(error).__name__)
 
 
 async def _stop(state, db):
@@ -925,7 +935,7 @@ async def open_at_launch(state, maintenance):
     if journal["direction"] == "forward":
         db = None
         try:
-            db = await _open(state, maintenance)
+            db = await _open(state, maintenance, kick=False)  # nothing runs on its own until it commits
             if db is None:
                 raise DatabaseDamagedError("the restored database failed its check")
             audits = [*journal.get("audits", []), {"id": journal.get("id"), "interrupted": True, "finished": "forward"}]
@@ -945,6 +955,7 @@ async def open_at_launch(state, maintenance):
                 _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be undone; restore a backup")
                 return None
         else:
+            await _kick(state)
             await _finish_journal(db, audits)
             return db
     try:  # committed, or put back: opened as it is, and limited, offering a restore, if it cannot run
@@ -958,14 +969,15 @@ async def open_at_launch(state, maintenance):
     return db
 
 
-async def _open(state, maintenance):
-    """The database opened and the app started on it, or None when it is damaged (the app is then
-    limited). Any other failure closes what was opened and is raised."""
+async def _open(state, maintenance, kick=True):
+    """The database opened and the app started on it (its background runs started unless kick is
+    false), or None when it is damaged (the app is then limited). Any other failure closes what
+    was opened and is raised."""
     db = None
     try:
         with maintenance():
             db = await asyncio.to_thread(Database, state["data_dir"])
-        await state["start"](db)
+        await state["start"](db, kick=kick)
         return db
     except DatabaseDamagedError as error:
         log.error("the database failed its check at startup; only a restore is offered")
