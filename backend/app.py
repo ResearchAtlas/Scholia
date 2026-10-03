@@ -28,10 +28,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend import APP_VERSION, credentials, governance, openrouter, openrouter_client, providers
+from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
+from backend import governance
 from backend.runs import AdmissionError, Harness, _through, derived_status
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instruction_file_size, instructions_size,
                               load_instructions, load_settings, visible, write_private)
@@ -321,6 +322,18 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         codes = {404: "not_found", 405: "method_not_allowed"}
         return _error(error.status_code, codes.get(error.status_code, "http_error"), "The request was not handled")
 
+    def db() -> Database:
+        return state["db"]
+
+    def harness() -> Harness:
+        return state["harness"]
+
+    async def read(fn):
+        return await asyncio.to_thread(db().read, fn)
+
+    async def write(fn):
+        return await asyncio.to_thread(db().write, fn)
+
     # One-time confirmation tokens for changes that need the researcher's confirmation: what each
     # confirms, and until when. ponytail: in memory, so a restart asks again.
     confirmations = {}
@@ -338,18 +351,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     def confirmed(token, *what):
         entry = confirmations.pop(token, None) if token else None
         return entry is not None and entry[0] == what and entry[1] >= time.monotonic()
-
-    def db() -> Database:
-        return state["db"]
-
-    def harness() -> Harness:
-        return state["harness"]
-
-    async def read(fn):
-        return await asyncio.to_thread(db().read, fn)
-
-    async def write(fn):
-        return await asyncio.to_thread(db().write, fn)
 
     # Health and setup
 

@@ -7,8 +7,7 @@ import { Check, ChevronsUpDown, Loader2, MoreHorizontal, PanelLeftClose, Pencil,
 import { useT } from '../i18n/index.js';
 import { ApiError, del, post, put } from '../api.js';
 import { errorText } from '../text.js';
-import { SUGGESTED_HOLDS, conversationTitle, holdsBody, moveTargets, projectName } from '../projects.js';
-import { HoldsChoice } from './Governance.jsx';
+import { conversationTitle, moveTargets, projectName } from '../projects.js';
 import { Mark } from './Mark.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -16,6 +15,8 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger }
   from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
+import { SUGGESTED_HOLDS, holdsBody } from '../projects.js';
+import { HoldsChoice } from './Governance.jsx';
 
 export function Sidebar({ projects, projectId, conversations, conversationId, onProject, onProjectsChanged,
   onConversation, onConversationsChanged, onNewConversation, onSettings, onHide }) {
