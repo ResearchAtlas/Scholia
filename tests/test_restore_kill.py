@@ -187,7 +187,7 @@ async def test_putting_the_previous_state_back_twice_keeps_its_wal(tmp_path):
     (data / "config.toml").write_text("previous")
     (staged / DB_NAME).write_bytes(b"the backup's database")
     (staged / "config.toml").write_text("from the backup")
-    backups_module._put_in_place(data, staged, aside)
+    backups_module._put_in_place(data, staged, aside, "x")
     journal = {"direction": "back", "staged": "backups/.staging/x/restore", "aside": "backups/.staging/x/replaced",
                "live_database": True, "live": ["config.toml"], "backup": ["config.toml"]}
     backups_module._back(data, journal)
@@ -601,3 +601,98 @@ async def test_a_restore_out_of_a_damaged_folder_that_cannot_be_committed_leaves
         assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
         assert (await client.get("/api/projects")).json()["code"] == "database_damaged"  # limited again, offering restore
         assert "database_damaged" in (await client.get("/api/health")).json()
+
+
+async def test_a_failed_restore_never_undoes_an_earlier_committed_one(tmp_path, monkeypatch):
+    import json
+    data = tmp_path / "data"
+    async with started(data) as client:
+        assert not (data / "AGENTS.md").exists()
+        backup = (await client.post("/api/backups")).json()["id"]
+        real_end, real_write = backups_module.end_journal, backups_module.write_private
+
+        def cannot_end(data_dir):
+            raise OSError("I/O error")
+
+        monkeypatch.setattr(backups_module, "end_journal", cannot_end)
+        first = await client.post("/api/backups/restore", json={"generation": backup})
+        assert first.status_code == 200 and first.json()["not_recorded"] == ["journal"]  # its journal stays, committed
+        monkeypatch.setattr(backups_module, "end_journal", real_end)
+        await client.put("/api/instructions", json={"text": "Written after"})  # a file its journal never knew
+
+        def no_room_for_a_new_journal(path, payload):
+            if Path(path).name == backups_module.JOURNAL and json.loads(payload)["direction"] == "forward":
+                raise OSError(28, "No space left on device")
+            real_write(path, payload)
+
+        monkeypatch.setattr(backups_module, "write_private", no_room_for_a_new_journal)
+        second = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (second.status_code, second.json()["code"]) == (500, "restore_failed")
+        assert (await client.get("/api/instructions")).json()["text"] == "Written after"  # nothing was changed
+        journal = json.loads((data / "backups" / backups_module.JOURNAL).read_bytes())
+        assert (journal["direction"], journal["id"]) == ("done", first.json()["id"])  # the first one's, as it was
+
+
+async def test_a_restore_that_fails_keeps_the_audit_rows_an_earlier_one_still_had_to_write(tmp_path, monkeypatch):
+    from backend.db import Database
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_write, real_open, failing = Database.write, backups_module.Database, []
+
+    def write(self, fn):
+        if failing:
+            failing.clear()
+            raise OSError("I/O error")
+        return real_write(self, fn)
+
+    def audit_fails(conn, record):  # the first restore's audit row cannot be written
+        failing.append(True)
+        raise OSError("I/O error")
+
+    async with started(data, setup=False) as client:
+        real_audit = backups_module._audit_restore
+        monkeypatch.setattr(backups_module, "_audit_restore", audit_fails)
+        first = await client.post("/api/backups/restore", json={"generation": backup})
+        assert first.status_code == 200 and first.json()["not_recorded"] == ["audit"]
+        monkeypatch.setattr(backups_module, "_audit_restore", real_audit)
+        opened = []
+
+        def cannot_open_once(*args, **kwargs):
+            opened.append(True)
+            if len(opened) == 1:
+                raise RuntimeError("cannot open")
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(backups_module, "Database", cannot_open_once)
+        second = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (second.status_code, second.json()["code"]) == (500, "restore_failed")
+    monkeypatch.setattr(backups_module, "Database", real_open)
+    async with started(data, setup=False) as client:  # the launch writes the first restore's row
+        assert [a["id"] for a in await restore_audits(client)] == [first.json()["id"]]
+    assert not (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_two_restores_asked_at_once_run_one_at_a_time(tmp_path):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    async with started(data, setup=False) as client:
+        responses = await asyncio.gather(*(client.post("/api/backups/restore", json={"generation": backup})
+                                           for _ in range(2)))
+        assert sorted((r.status_code, r.json().get("code")) for r in responses) == [(200, None), (409, "restoring")]
+
+
+async def test_a_committed_restore_leaves_no_copy_of_the_previous_state_by_the_time_anything_is_served(tmp_path,
+                                                                                                      monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_audit, seen = backups_module._audit_restore, []
+
+    def audit(conn, record):  # after the commit, while the restore still holds the app
+        staging = data / "backups" / backups_module.STAGING
+        seen.append(sorted(p.name for p in staging.rglob("*") if p.name == "replaced" or p.name.startswith("scholia")))
+        real_audit(conn, record)
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "_audit_restore", audit)
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+    assert seen == [[]]

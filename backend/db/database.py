@@ -564,10 +564,15 @@ def _open_checked(path, check, latest=None, stop=None):
     except BaseException as error:
         if conn is not None:
             conn.close()
-        # Corrupt or not a database, as opposed to busy, locked or unreadable.
-        if (getattr(error, "sqlite_errorcode", None) or 0) & 0xFF in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        if _is_damage(error):
             raise DatabaseDamagedError(f"{check} failed: {error}") from error
         raise
+
+
+def _is_damage(error):
+    """Whether an SQLite error says the file is corrupt or not a database, as opposed to busy,
+    locked or unreadable."""
+    return (getattr(error, "sqlite_errorcode", None) or 0) & 0xFF in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB)
 
 
 def check_identity(path, latest=len(MIGRATIONS)):
@@ -576,8 +581,9 @@ def check_identity(path, latest=len(MIGRATIONS)):
     (after a crash) is read too, from an owner-only copy of both in a private temporary folder,
     since it may hold the newest schema.
     Raises ForeignDatabaseError for another application's file, NewerDatabaseError for a newer
-    schema, DatabaseDamagedError for a file SQLite cannot read as a database, and OSError when it
-    could not be checked: the file cannot be read, or the copy cannot be made."""
+    schema, DatabaseDamagedError for a file SQLite reads as corrupt or not a database, and OSError
+    when it could not be checked: the file cannot be read, the copy cannot be made, or SQLite
+    failed for another reason (such as an I/O error)."""
     _refuse_event_loop()
     path = Path(path).resolve()
     path.open("rb").close()  # one this account cannot read is not checked, rather than taken for damaged
@@ -601,7 +607,7 @@ def _check_identity(uri, latest):
     except (ForeignDatabaseError, NewerDatabaseError):
         raise
     except sqlite3.DatabaseError as error:
-        if getattr(error, "sqlite_errorcode", 0) & 0xFF not in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        if not _is_damage(error):
             raise OSError(errno.EIO, "the database could not be checked") from error  # such as an I/O error
         raise DatabaseDamagedError(f"the file cannot be read as a database: {error}") from error
     finally:

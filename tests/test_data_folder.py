@@ -482,3 +482,14 @@ def test_a_database_sqlite_cannot_read_for_another_reason_than_its_contents_is_n
 
     monkeypatch.setattr(database, "_usable_state", io_error)
     assert data_folder.database_problem(tmp_path / "Other")[0] == "unchecked"  # not taken for damaged
+
+
+def test_a_scholia_database_whose_first_page_is_damaged_can_still_be_chosen(tmp_path, monkeypatch):
+    from backend.db import Database
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    chosen = tmp_path / "Other"
+    Database(chosen).close()
+    path = chosen / "scholia.sqlite3"
+    good = path.read_bytes()
+    path.write_bytes(good[:100] + b"\xff" * 4000 + good[4100:])  # SQLite reads it as malformed (corrupt)
+    assert data_folder.database_problem(chosen) is None  # damaged: the app offers a restore there
