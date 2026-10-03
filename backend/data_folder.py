@@ -226,11 +226,19 @@ def _clear_record(record):
 
 
 def _names_record(path, record):
-    """Whether path names the location record, in any spelling the file system takes for it."""
+    """Whether path names the location record, in any spelling the file system takes for it: the same
+    file, or the same name (as a case-insensitive volume compares it) in the same folder, however that
+    folder is reached (a link to it included)."""
     try:
-        return os.path.samefile(path, record)
-    except OSError:  # one of them is not there: compared by name, as a case-insensitive volume would
-        return str(path).casefold() == str(record).casefold()
+        if os.path.samefile(path, record):
+            return True
+    except OSError:  # one of them is not there
+        pass
+    try:
+        same_folder = os.path.samefile(path.parent, record.parent)
+    except OSError:
+        same_folder = str(path.parent).casefold() == str(record.parent).casefold()
+    return same_folder and path.name.casefold() == record.name.casefold()
 
 
 def _record(default):

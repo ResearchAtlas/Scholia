@@ -270,6 +270,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # is open and idle are S1-12's.
             with maintenance():
                 await asyncio.to_thread(_daily_backup, db)
+            # Background runs start only now, once that backup's full check has passed: on a
+            # database it found damaged (the app is then limited) nothing runs on its own.
+            if db.damaged is None:
+                await backups.start_background(state)
             yield
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
             if state.get("harness") is not None:

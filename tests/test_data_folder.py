@@ -131,6 +131,17 @@ def test_the_records_own_name_cannot_be_chosen(tmp_path, monkeypatch):
     assert record.is_dir()  # left as it was
 
 
+def test_the_records_name_cannot_be_chosen_through_a_link_to_its_folder(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default = tmp_path / "default"
+    alias = tmp_path / "Research"
+    alias.symlink_to(tmp_path)  # the default folder's parent, reached another way; no record there yet
+    with pytest.raises(data_folder.FolderRefused) as refused:
+        data_folder.choose(default, str(alias / data_folder.LOCATION_FILE))
+    assert refused.value.code == "data_folder_invalid"
+    assert not (tmp_path / data_folder.LOCATION_FILE).exists()
+
+
 def test_a_record_name_holding_a_folder_with_something_in_it_is_never_removed(tmp_path, monkeypatch):
     monkeypatch.setattr(data_folder, "file_system_type", apfs)
     default, chosen = tmp_path / "default", tmp_path / "Research" / "Scholia"

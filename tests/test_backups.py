@@ -732,6 +732,49 @@ async def test_a_refused_restore_of_a_damaged_app_leaves_its_harness_stopped(tmp
         assert (await client.get("/api/health")).json().get("database_damaged")
 
 
+async def test_damage_found_while_a_restore_waits_for_work_to_stop_leaves_the_harness_stopped(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        real, resumed, db = Harness.shutdown, [], client.state["db"]
+
+        async def stuck(self, timeout=10.0):
+            await real(self, timeout)
+            db._damaged = "integrity_check failed"  # a backup let in before found it meanwhile
+            return 1  # a task still running after the timeout
+
+        async def resume(self):
+            resumed.append(True)
+
+        monkeypatch.setattr(Harness, "shutdown", stuck)
+        monkeypatch.setattr(Harness, "resume", resume)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "work_running")
+        assert resumed == []
+
+
+async def test_background_runs_start_at_launch_only_once_the_launch_backup_has_checked_the_database(tmp_path,
+                                                                                                    monkeypatch):
+    from backend.runs import Harness
+    kicked = []
+
+    async def kick(self):
+        kicked.append(True)
+
+    def finds_damage(self):  # the launch's daily backup: its full check fails
+        self._damaged = "integrity_check failed"
+
+    monkeypatch.setattr(Harness, "kick_background", kick)
+    monkeypatch.setattr(Database, "backup_if_due", finds_damage)
+    async with started(tmp_path / "data", setup=False) as client:  # limited: setup is refused too
+        assert kicked == []  # nothing runs on its own on a database found damaged
+        assert (await client.get("/api/health")).json().get("database_damaged")
+    monkeypatch.undo()
+    monkeypatch.setattr(Harness, "kick_background", kick)
+    async with started(tmp_path / "other"):
+        assert kicked == [True]  # a sound database's runs start after its launch backup
+
+
 async def test_a_backup_rotated_away_while_staged_is_still_restored(tmp_path, monkeypatch):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
