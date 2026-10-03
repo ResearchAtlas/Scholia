@@ -161,8 +161,7 @@ async def test_a_restore_whose_undo_fails_starts_nothing_and_the_launch_puts_it_
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
         for method, path, body in (("GET", "/api/projects", None), ("PUT", "/api/instructions", {"text": "x"}),
-                                   ("PUT", "/api/settings", {"hash": None, "updates": {"ui.language": "en"}}),
-                                   ("POST", "/api/backups/restore", {"generation": backup})):
+                                   ("PUT", "/api/settings", {"hash": None, "updates": {"ui.language": "en"}})):
             refused = await client.request(method, path, json=body)  # nothing reads or writes the half-restored folder
             assert refused.json()["code"] == "restore_interrupted", path
         assert "restore" in (await client.get("/api/health")).json()["database_damaged"]
@@ -282,6 +281,8 @@ async def test_a_restore_syncs_what_its_journal_points_at_and_each_move(tmp_path
     [at] = [i for i, (kind, _) in enumerate(events) if kind == "journal"]
     synced = {path for kind, path in events[:at] if kind == "fsync"}
     assert events[at][1] <= synced  # every staged file and folder was on disk before the journal named them
+    staged = next(iter(sorted(events[at][1], key=lambda p: len(p.parts))))
+    assert {staged.parent, staged.parent.parent, data / "backups", staged.parent / "replaced"} <= synced
     moves = [(i, path) for i, (kind, path) in enumerate(events)
              if kind == "replace" and i > at and path.is_relative_to(data) and path.name != backups_module.JOURNAL
              and not path.name.startswith(".")]
@@ -289,3 +290,38 @@ async def test_a_restore_syncs_what_its_journal_points_at_and_each_move(tmp_path
     for i, target in moves:
         following = next((j for j in range(i + 1, len(events)) if events[j][0] == "replace"), len(events))
         assert ("fsync", target.parent) in events[i + 1:following], target  # synced before the next move
+
+
+async def test_a_restore_is_the_way_out_of_a_journal_that_cannot_be_read(tmp_path):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    (data / "backups" / backups_module.JOURNAL).write_text("{ not json")
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text
+        assert response.json()["damaged_copy"]  # the folder it found is kept aside, never deleted
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept"}
+        assert "database_damaged" not in (await client.get("/api/health")).json()
+    assert not (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_a_restore_works_after_a_failed_one_could_not_start_the_previous_database_again(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    async with started(data, setup=False) as client:
+        real, opened = backups_module.Database, []
+
+        def failing_twice(*args, **kwargs):  # the restored database, then the previous one, cannot open
+            opened.append(True)
+            if len(opened) <= 2:
+                raise RuntimeError("cannot open")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(backups_module, "Database", failing_twice)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.json()["code"] == "restore_failed"
+        assert (await client.get("/api/projects")).json()["code"] == "database_unavailable"  # limited, and says so
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text  # the folder is treated as damaged: moved aside
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept"}

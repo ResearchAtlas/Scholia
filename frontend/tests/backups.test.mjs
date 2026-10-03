@@ -6,6 +6,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
+import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
 import { deletePath, deletionNotices, fileSize, folderPicker, needsPassphrase, restoreBody } from '../src/backups.js';
 import { errorText } from '../src/text.js';
@@ -63,10 +64,17 @@ test('every new error code reads in each language, never as the backend\'s messa
     'destination_in_data_folder', 'invalid_destination', 'not_a_backup', 'backup_damaged', 'backup_unreadable',
     'newer_schema', 'restore_failed', 'safety_copy_failed', 'data_folder_problem', 'data_folder_synced',
     'data_folder_not_empty', 'data_folder_not_found', 'data_folder_unsafe', 'data_folder_invalid',
-    'restore_interrupted', 'restoring'];
+    'restore_interrupted', 'restoring', 'work_running'];
   for (const language of ['en', 'zh-CN']) {
     const t = makeT(language);
     for (const code of codes) assert.notEqual(errorText(t, code), t('errors.internal'), `${language}: ${code}`);
+  }
+});
+
+test('the backup and export descriptions say what is left out of their settings files', () => {
+  for (const key of ['backups.fullHint', 'export.hint']) {
+    assert.match(en[key], /left out/, key);
+    assert.match(zhCN[key], /不会包含在内/, key);
   }
 });
 

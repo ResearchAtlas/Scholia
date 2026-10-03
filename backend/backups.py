@@ -108,9 +108,12 @@ class Writers:
         try:
             yield
         finally:
-            async with self._changed:
-                self._shared -= 1
-                self._changed.notify_all()
+            self._shared -= 1  # at once, so a cancellation below cannot keep the slot
+            await asyncio.shield(self._notify())
+
+    async def _notify(self):
+        async with self._changed:
+            self._changed.notify_all()
 
     @contextlib.asynccontextmanager
     async def alone(self):
@@ -125,9 +128,8 @@ class Writers:
         try:
             yield
         finally:
-            async with self._changed:
-                self._alone = False
-                self._changed.notify_all()
+            self._alone = False
+            await asyncio.shield(self._notify())
 
 
 def _limit(state, code, reason):
@@ -409,7 +411,9 @@ async def restore(body: Restore, request: Request):
     state = request.app.state.scholia
     if state["restore_lock"].locked():
         raise BackupError(409, "restoring", "A backup is being restored")
-    if (state["data_dir"] / "backups" / JOURNAL).exists():  # the next launch finishes the last one first
+    # A journal left by a restore that could be neither finished nor undone: the app is limited,
+    # and a new restore, which treats the folder as damaged and writes its own journal, is the way out.
+    if (state["data_dir"] / "backups" / JOURNAL).exists() and "damaged" not in state:
         raise BackupError(409, "restore_interrupted", "Open Scholia again to finish the last restore")
     async with state["restore_lock"]:
         return await _to_end(_restore(state, body))
@@ -420,12 +424,13 @@ async def _restore(state, body):
     with _file_errors(500, "restore_failed", "The backup could not be put in place; nothing was changed"):
         staging = await asyncio.to_thread(_staging, data_dir)
     try:
+        purges = await _purges(state)
         async with state["backups_lock"]:  # checked and copied while the app runs on; no rotation meanwhile
             with _file_errors(400, "backup_unreadable", "The backup could not be read"):
                 await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
         state["restoring"] = True  # from here only health, the backups list and this restore are served
         try:
-            return await _replace(state, body, staging)
+            return await _replace(state, body, staging, purges)
         finally:
             state.pop("restoring", None)
     finally:
@@ -433,16 +438,20 @@ async def _restore(state, body):
             await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
 
 
-async def _replace(state, body, staging):
+async def _replace(state, body, staging, purges):
     """Stop the running work and wait out every other request, take the safety copy, then put the
-    staged backup in place and run on it; or put everything back."""
+    staged backup in place and run on it; or put everything back. purges is the last purge's
+    audit record before the backup was staged."""
     data_dir, db, harness = state["data_dir"], state.get("db"), state.get("harness")
+    # A database a failed restore closed, or none at all, is treated as damaged: moved aside, never copied.
+    damaged = db is None or db.closed or db.damaged is not None
     if harness is not None:  # admission stops, and running work stops and drains, before anything is copied
-        await harness.shutdown()
+        if await harness.shutdown():
+            await _resume(state, db, damaged)
+            raise BackupError(409, "work_running", "Some running work did not stop in time; try again")
     async with state["writers"].alone(), state["backups_lock"]:  # no other request is left inside
-        damaged = db is None or db.damaged is not None
-        if body.generation and not _generation_folder(data_dir, body.generation).is_dir():
-            await _resume(state, db, damaged)  # purged while it was being checked (Delete everywhere)
+        if not damaged and await _purges(state) != purges:
+            await _resume(state, db, damaged)  # Delete everywhere purged the backups meanwhile: not this one
             raise BackupError(404, "not_found", "No such backup")
         safety = None
         if not damaged:  # first a safety copy of the current database, as an automatic backup
@@ -457,7 +466,7 @@ async def _replace(state, body, staging):
                         from None
                 raise BackupError(500, "safety_copy_failed",
                                   "The current database could not be backed up first; nothing was changed") from error
-        if db is not None:
+        if db is not None and not db.closed:
             await asyncio.to_thread(db.close)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         aside = data_dir / "backups" / DAMAGED / stamp if damaged else staging / "replaced"
@@ -469,7 +478,8 @@ async def _replace(state, body, staging):
         except Exception as error:
             log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
             if not await _roll_back(state, restored, damaged):
-                _limit(state, "restore_interrupted", "A restore could neither be finished nor undone; open Scholia again")
+                _limit(state, "restore_interrupted", "A restore could neither be finished nor undone; restore a backup")
+                _forget(state)
                 raise BackupError(500, "restore_interrupted",
                                   "The restore could not be finished or undone; open Scholia again to finish it") from error
             raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
@@ -494,6 +504,21 @@ async def _resume(state, db, damaged):
     """A restore that stopped before it changed anything: the app runs on its database again."""
     if not damaged:
         await state["start"](db)
+
+
+def _forget(state):
+    """No database runs: the closed one is not kept in state, so a later restore treats the folder as damaged."""
+    for key in ("db", "content", "gate", "harness"):
+        state.pop(key, None)
+
+
+async def _purges(state):
+    """The last purge's audit record, to tell a purge apart from rotation; None without a database."""
+    db = state.get("db")
+    if db is None or db.closed or db.damaged is not None:
+        return None
+    return await asyncio.to_thread(db.read, lambda conn: conn.execute(
+        "SELECT max(seq) FROM audit_log WHERE event = 'backup_purge'").fetchone()[0])
 
 
 async def _roll_back(state, restored, damaged):
@@ -527,6 +552,7 @@ async def _roll_back(state, restored, damaged):
             damaged_now = isinstance(error, DatabaseDamagedError)
             _limit(state, "database_damaged" if damaged_now else "database_unavailable",
                    "The database could not be opened again after a failed restore; restore a backup")
+            _forget(state)
     return True
 
 
@@ -787,8 +813,7 @@ async def open_at_launch(state, maintenance):
                 return None
             direction = "back"
         else:
-            await asyncio.to_thread(end_journal, data_dir)
-            await _audit_replay(db, direction)
+            await _audit_replay(db, direction, end=True)
             return db
     db = await _open(state, maintenance)
     if db is not None and direction:
@@ -815,10 +840,18 @@ async def _open(state, maintenance):
         raise
 
 
-async def _audit_replay(db, direction):
-    await asyncio.to_thread(db.write, lambda conn: conn.execute(
-        "INSERT INTO audit_log (event, data) VALUES ('restore', ?)",
-        (json.dumps({"interrupted": True, "finished": direction}),)))
+async def _audit_replay(db, direction, end=False):
+    """Audit a replayed restore once its database runs, ending its journal first when end. A failure
+    here leaves the app running: an ended journal's replay is not repeated, and one not ended is
+    replayed as a no-op at the next launch."""
+    try:
+        if end:
+            await asyncio.to_thread(end_journal, db.data_dir)
+        await asyncio.to_thread(db.write, lambda conn: conn.execute(
+            "INSERT INTO audit_log (event, data) VALUES ('restore', ?)",
+            (json.dumps({"interrupted": True, "finished": direction}),)))
+    except Exception as error:
+        log.warning("recording a restore replayed at launch failed (%s)", type(error).__name__)
 
 
 def _exists(path):

@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import stat
+import shutil
 import threading
 import zipfile
 
@@ -656,3 +657,54 @@ async def test_a_cancelled_deletion_still_purges_the_backups(tmp_path, monkeypat
             await deletion
         assert len(await audit(client, "backup_purge")) == 1  # its object is gone, so it could not be asked again
         assert len((await client.get("/api/backups")).json()["backups"]) == 1
+
+
+async def test_a_restore_refuses_when_running_work_does_not_stop_and_runs_on(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        real = Harness.shutdown
+
+        async def stuck(self, timeout=10.0):
+            await real(self, timeout)
+            return 1  # a task still running after the timeout
+
+        monkeypatch.setattr(Harness, "shutdown", stuck)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "work_running")
+        monkeypatch.setattr(Harness, "shutdown", real)
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # running again
+
+
+async def test_a_backup_rotated_away_while_staged_is_still_restored(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        real = backups_module._stage
+
+        def staged_then_rotated(data_dir, body, staging):
+            real(data_dir, body, staging)
+            shutil.rmtree(data_dir / "backups" / body.generation)  # as retention may, before the swap
+
+        monkeypatch.setattr(backups_module, "_stage", staged_then_rotated)
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+
+
+async def test_a_listing_writing_its_audit_row_when_a_restore_starts_is_waited_for(tmp_path):
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        client.provider.hold = asyncio.Event()
+        listing = asyncio.create_task(client.get("/api/providers/openrouter/models"))
+        await client.provider.started.wait()  # its request is out; its audit row is written
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        await asyncio.sleep(0.2)
+        assert not restore.done()  # it waits for the listing to end before copying anything
+        client.provider.hold.set()
+        assert (await listing).status_code == 200
+        response = await restore
+        assert response.status_code == 200
+    conn = sqlite3.connect((data / "backups" / response.json()["safety_copy"] / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    try:  # the listing's outbound audit row is in the safety copy, not lost with the old database
+        assert conn.execute("SELECT count(*) FROM audit_log WHERE event = 'outbound'").fetchone()[0] >= 1
+    finally:
+        conn.close()
