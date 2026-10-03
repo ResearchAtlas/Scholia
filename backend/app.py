@@ -417,9 +417,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(500, "key_not_saved", "The key could not be saved") from None
         finally:
             forget_providers()
-            await write(lambda conn: conn.execute(  # which provider's key changed and where it went; never the key
-                "INSERT INTO audit_log (event, data) VALUES ('key_changed', ?)",
-                (json.dumps({"provider": provider, "stored_in": stored_in}),)))
+            def changed(conn):  # which provider's key changed and where it went; never the key
+                conn.execute("INSERT INTO audit_log (event, data) VALUES ('key_changed', ?)",
+                             (json.dumps({"provider": provider, "stored_in": stored_in}),))
+                # A changed key is asked about again (section 6.4), even when an earlier key returns.
+                conn.execute("DELETE FROM key_attestations WHERE provider = ?", (provider,))
+            await write(changed)
         return "credential_store_unavailable" if warning else None
 
     @app.get("/api/providers")
@@ -795,7 +798,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         always with provider.zdr = true), or record that its terms were checked again today.
         Audited."""
         model = key.removeprefix("openrouter:")
-        if model == key or not visible(model) or model != model.strip() or len(model) > 512:
+        if model == key or not 0 < len(model) <= 200 or any(not "\x21" <= c <= "\x7e" for c in model):  # a model id
             raise ApiError(400, "not_openrouter_route", "Only an OpenRouter route can be added")
 
         def change(conn):
@@ -824,12 +827,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @app.get("/api/audit")
     async def audit_log(project_id: str | None = None, before: int | None = None, limit: int = 100):
         """The audit log, newest first, a page at a time (before: the seq the last page ended
-        at); for one project, with how many of its requests were allowed off this Mac."""
+        at); for one project, its own rows and every clearing of the log, with how many of its
+        requests were allowed off this Mac since the log began or was last cleared."""
         limit = max(1, min(limit, 500))
 
         def page(conn):
             rows = conn.execute(
-                "SELECT seq, at, event, project_id, data FROM audit_log WHERE (?1 IS NULL OR project_id = ?1)"
+                "SELECT seq, at, event, project_id, data FROM audit_log"
+                " WHERE (?1 IS NULL OR project_id = ?1 OR event = 'audit_cleared')"
                 " AND (?2 IS NULL OR seq < ?2) ORDER BY seq DESC LIMIT ?3", (project_id, before, limit)).fetchall()
             sent = conn.execute(
                 "SELECT count(*) FROM audit_log WHERE project_id = ? AND event = 'outbound'"
@@ -847,6 +852,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         """Write the audit log (or one project's rows) as a JSON file in the data folder's
         exports folder, owner-only, and audit the export with its destination."""
         project_id = (body or AuditExport()).project_id
+        if project_id is not None:
+            await project_row(project_id)  # an existing project's id, never other text, goes in the record
         name = f"audit-log-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{secrets.token_hex(3)}.json"
 
         async def exporting():
@@ -875,7 +882,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         def clear(conn):
             (rows,) = conn.execute("SELECT count(*) FROM audit_log").fetchone()
             governance.record(conn, "audit_cleared", rows=rows)
-            conn.execute("DELETE FROM audit_log WHERE seq < (SELECT max(seq) FROM audit_log)")
+            conn.execute("DELETE FROM audit_log WHERE seq < (SELECT max(seq) FROM audit_log)"
+                         " AND event <> 'audit_cleared'")  # every clearing stays on record
             return rows
 
         return {"ok": True, "rows": await _to_end(write(clear))}
@@ -962,12 +970,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
         def move(conn):
             row = conn.execute(
-                "SELECT c.project_id, p.sensitivity FROM conversations c JOIN projects p ON p.id = c.project_id"
-                " WHERE c.id = ?", (conversation_id,)).fetchone()
-            target = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (body.project_id,)).fetchone()
+                "SELECT c.project_id, p.sensitivity, p.review_lock FROM conversations c"
+                " JOIN projects p ON p.id = c.project_id WHERE c.id = ?", (conversation_id,)).fetchone()
+            target = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?",
+                                  (body.project_id,)).fetchone()
             if row is None or target is None:
                 raise ApiError(404, "not_found", "No such conversation or project")
-            source, level = row
+            source, level, locked = row
             if source == body.project_id:
                 return
             # Its turn, or a title run that would send its words over the old project's route;
@@ -976,7 +985,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                             " OR source_turn_id IN (SELECT run_id FROM turns WHERE conversation_id = ?))",
                             (conversation_id, conversation_id)).fetchone():
                 raise ApiError(409, "active_run", "This conversation is running a turn")
-            if _STRICTNESS[target[0]] < _STRICTNESS[level]:
+            # A review-locked project counts as stricter than any unlocked one.
+            if (_STRICTNESS[target[0]], target[1]) < (_STRICTNESS[level], locked):
                 raise ApiError(409, "less_strict_project", "A conversation moves only to a project as strict or stricter")
             now = utc_now()
             conn.execute("UPDATE conversations SET project_id = ?, updated_at = ? WHERE id = ?",

@@ -120,9 +120,12 @@ async def test_a_new_key_needs_its_own_confirmation(tmp_path):
         conversation = await setup_private(client)
         await confirm(client)
         assert (await client.put("/api/keys/openrouter", json={"key": "sk-or-another-test-key"})).status_code == 200
-        assert await confirmation_status(client) == "other_key"
+        assert await confirmation_status(client) == "missing"  # the change ended the provider's confirmations
         assert await refused_code(client, conversation) == (403, "key_not_confirmed")
         assert provider.chats == []
+        assert (await client.put("/api/keys/openrouter", json={"key": KEY})).status_code == 200  # the first key again
+        assert await confirmation_status(client) == "missing"
+        assert await refused_code(client, conversation) == (403, "key_not_confirmed")
 
 
 async def test_the_gate_refuses_a_key_whose_confirmation_lapsed_after_admission(tmp_path, monkeypatch):

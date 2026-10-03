@@ -66,6 +66,23 @@ def test_only_named_modules_import_a_network_library(path):
     assert network_imports(path) <= ALLOWED_IMPORTS.get(path.name, set())
 
 
+def test_httpx_is_used_only_by_its_module_name():
+    # So the check below sees every call: no "from httpx import ..." of what makes requests, and no alias.
+    for path in MODULES:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ImportFrom) and node.module == "httpx":
+                assert not {alias.name for alias in node.names} & (MAKES_REQUESTS | IN_PROCESS | {"*"}), path
+            if isinstance(node, ast.Import):
+                assert all(alias.asname is None for alias in node.names if alias.name == "httpx"), path
+
+
+def test_no_module_opens_a_raw_connection():
+    for path in MODULES:
+        calls = {node.func.attr for node in ast.walk(ast.parse(path.read_text()))
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        assert not calls & {"open_connection", "create_connection", "open_unix_connection"}, path
+
+
 def test_only_the_gate_makes_an_http_client():
     for path in MODULES:
         tree = ast.parse(path.read_text())

@@ -553,15 +553,19 @@ END;
 
 # The audit log is append-only (ticket 18): a row never changes, and is deleted only by
 # clearing the log, which first writes the record of the clearing; so every deleted row is
-# older than an 'audit_cleared' row that stays.
+# older than the latest 'audit_cleared' row. The indexes keep that check, the view by
+# project and the clearing itself fast on a long log.
 _0003 = r"""
+CREATE INDEX audit_log_by_event ON audit_log (event, seq);
+CREATE INDEX audit_log_by_project ON audit_log (project_id, seq);
+
 CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log
 BEGIN
     SELECT RAISE(ABORT, 'audit_log is append-only');
 END;
 
 CREATE TRIGGER audit_log_cleared_only BEFORE DELETE ON audit_log
-WHEN NOT EXISTS (SELECT 1 FROM audit_log WHERE event = 'audit_cleared' AND seq > OLD.seq)
+WHEN OLD.seq >= coalesce((SELECT max(seq) FROM audit_log WHERE event = 'audit_cleared'), 0)
 BEGIN
     SELECT RAISE(ABORT, 'audit_log rows are deleted only by clearing the log, after its record');
 END;

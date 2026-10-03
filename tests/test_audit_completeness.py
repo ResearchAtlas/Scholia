@@ -108,6 +108,9 @@ async def test_an_export_is_an_owner_only_file_in_the_data_folder_and_is_audited
         [(data,)] = await rows(client, "SELECT data FROM audit_log WHERE event = 'audit_exported'")
         assert json.loads(data) == {"destination": f"exports/{path.name}", "rows": 1}
         assert (await client.post("/api/audit/export")).json()["rows"] > 1  # the whole log
+        unknown = await client.post("/api/audit/export", json={"project_id": "SECRET not an id"})
+        assert unknown.status_code == 404  # only an existing project's id goes in the record
+        assert "SECRET" not in json.dumps(await rows(client, "SELECT * FROM audit_log"))
 
 
 async def test_clearing_needs_confirmation_and_leaves_a_record(tmp_path):
@@ -124,6 +127,15 @@ async def test_clearing_needs_confirmation_and_leaves_a_record(tmp_path):
             ("audit_cleared", {"rows": count})]
         reused = await client.delete("/api/audit", params={"token": first.json()["token"]})
         assert reused.json()["code"] == "confirmation_required"
+
+        # A later clearing keeps the earlier one's record, and a project's view shows both.
+        project = (await client.post("/api/projects", json={"name": "C"})).json()["id"]
+        again = (await client.delete("/api/audit")).json()["token"]
+        await client.delete("/api/audit", params={"token": again})
+        assert [e for (e,) in await rows(client, "SELECT event FROM audit_log ORDER BY seq")] == [
+            "audit_cleared", "audit_cleared"]
+        view = (await client.get("/api/audit", params={"project_id": project})).json()
+        assert [e["event"] for e in view["entries"]] == ["audit_cleared", "audit_cleared"]
 
 
 async def test_the_database_keeps_the_log_append_only(tmp_path):

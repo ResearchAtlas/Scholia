@@ -39,8 +39,10 @@ from backend.settings import write_private
 LEVELS = ("normal", "private", "local_only")  # from least to most strict
 ALLOWLIST = Path(__file__).resolve().parent / "private_routes.json"
 # The versions of the statements the interface shows (frontend catalogs, keys privacy.key.* and
-# privacy.local.*). Changing a statement's text needs a new version, which asks again;
-# tests/test_private_attestation.py holds each version's digest.
+# privacy.local.*), recorded with each confirmation and declaration. Changing a statement's text
+# needs a new version (tests/test_private_attestation.py holds each version's digest); a key
+# confirmation of an earlier version is out of date, so the key is asked about again (section
+# 6.4), while a declaration keeps the version it was made under, for the record.
 KEY_STATEMENT = "2026-10-03"
 LOCAL_STATEMENT = "2026-10-03"
 CONFIRMATION_MONTHS = 6  # a key confirmation's life, and the age at which a list entry is flagged

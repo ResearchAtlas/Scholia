@@ -11,11 +11,14 @@ export function conversationTitle(t, conversation) {
   return conversation?.title || t('conversation.untitled');
 }
 
+// How strict a project is: its level, and a review-locked project above an unlocked one.
+const rank = (project) => (STRICTNESS[project?.sensitivity] ?? 0) * 2 + (project?.review_lock ? 1 : 0);
+
 // The projects a conversation in `from` may move to: any other project at the same level or
-// stricter (ticket 14). The backend refuses the rest.
+// stricter (ticket 14), a review-locked one's only to another locked project. The backend
+// refuses the rest.
 export function moveTargets(projects, from) {
-  const level = STRICTNESS[from?.sensitivity] ?? 0;
-  return projects.filter((p) => p.id !== from?.id && (STRICTNESS[p.sensitivity] ?? 0) >= level);
+  return projects.filter((p) => p.id !== from?.id && rank(p) >= rank(from));
 }
 
 // The latest turn can be continued when it was interrupted, or stopped at a limit or by a

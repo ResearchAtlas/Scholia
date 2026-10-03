@@ -338,3 +338,34 @@ async def test_the_dispatch_check_follows_each_kind_of_runs_owners(tmp_path):
         await asyncio.to_thread(db.write, lambda conn: conn.execute(
             "UPDATE projects SET review_lock = 1, sensitivity = 'local_only' WHERE id = ?", (project,)))
         assert set((await asyncio.to_thread(db.read, checks)).values()) == {False}  # nothing in a locked project
+
+
+async def test_the_listing_marks_what_local_only_and_locked_projects_allow(tmp_path):
+    provider = MockProvider(catalog=["example/cloud-model"])
+    async with started(tmp_path / "data", provider) as client:
+        local_only = await new_project(client, "local_only")
+        locked = (await client.post("/api/projects", json={"name": "R", "sensitivity": "local_only",
+                                                           "review_lock": True})).json()["id"]
+        for project, refusal in ((local_only, "route_not_allowed"), (locked, "review_locked")):
+            listing = (await client.get("/api/providers/openrouter/models", params={"project_id": project})).json()
+            assert [(m["allowed"], m["refusal"]) for m in listing["models"]] == [(False, refusal)]
+        assert (await client.get("/api/providers/openrouter/models", params={"project_id": new_id()})).status_code == 404
+
+
+async def test_a_level_changed_while_a_turn_is_admitted_refuses_it_before_anything_is_written(tmp_path, monkeypatch):
+    from backend import runs
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await new_project(client)
+        conversation = await new_conversation(client, project)
+        db = client.state["db"]
+        real = runs.load_instructions
+
+        def tightened_meanwhile(*args):  # after admission read the project's policy, before it writes
+            db.write(lambda conn: conn.execute("UPDATE projects SET sensitivity = 'private' WHERE id = ?", (project,)))
+            return real(*args)
+
+        monkeypatch.setattr(runs, "load_instructions", tightened_meanwhile)
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
+        assert (refused.status_code, refused.json()["code"]) == (409, "project_changed")
+        assert provider.chats == [] and await rows(client, "SELECT count(*) FROM runs") == [(0,)]

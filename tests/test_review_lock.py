@@ -166,3 +166,17 @@ async def test_a_title_run_in_a_project_locked_meanwhile_sends_nothing(tmp_path)
         assert await rows(client, "SELECT data ->> 'reason' FROM audit_log WHERE event = 'outbound'"
                                   " AND data ->> 'decision' = 'deny'") == [("not_allowed_at_level",)]
         assert await rows(client, "SELECT status FROM runs WHERE workflow = 'title'") == [("failed",)]
+
+
+async def test_a_locked_projects_conversation_moves_only_to_another_locked_project(tmp_path):
+    async with started(tmp_path / "data") as client:
+        source = (await locked_project(client))["id"]
+        conversation = (await client.post("/api/conversations", json={"project_id": source})).json()["id"]
+        unlocked = (await client.post("/api/projects", json={"name": "L", "sensitivity": "local_only"})).json()["id"]
+        response = await client.post(f"/api/conversations/{conversation}/move", json={"project_id": unlocked})
+        assert (response.status_code, response.json()["code"]) == (409, "less_strict_project")
+        other = (await locked_project(client, None))["id"]
+        moved = await client.post(f"/api/conversations/{conversation}/move", json={"project_id": other})
+        assert moved.status_code == 200 and moved.json()["project_id"] == other
+        back = await client.post(f"/api/conversations/{conversation}/move", json={"project_id": unlocked})
+        assert back.json()["code"] == "less_strict_project"

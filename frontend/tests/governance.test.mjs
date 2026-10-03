@@ -2,7 +2,7 @@
 // (slice-1 spec F1, sections 5 and 6.4).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { HOLDS, SUGGESTED_HOLDS, holdsBody, holdsOf } from '../src/projects.js';
+import { HOLDS, SUGGESTED_HOLDS, holdsBody, holdsOf, moveTargets } from '../src/projects.js';
 import { ApiError, confirmedChange, del } from '../src/api.js';
 import { forgetModels, loadModels } from '../src/settings.js';
 
@@ -20,6 +20,13 @@ test('a project reads back as its answer, and Local only without the lock as non
   assert.equal(holdsOf({ sensitivity: 'private', review_lock: false }), 'private');
   assert.equal(holdsOf({ sensitivity: 'local_only', review_lock: true }), 'review');
   assert.equal(holdsOf({ sensitivity: 'local_only', review_lock: false }), null);
+});
+
+test('a review-locked project\'s conversations move only to another locked project', () => {
+  const projects = [{ id: 'n', sensitivity: 'normal' }, { id: 'l', sensitivity: 'local_only', review_lock: false },
+    { id: 'r', sensitivity: 'local_only', review_lock: true }, { id: 's', sensitivity: 'local_only', review_lock: true }];
+  assert.deepEqual(moveTargets(projects, projects[2]).map((p) => p.id), ['s']);
+  assert.deepEqual(moveTargets(projects, projects[1]).map((p) => p.id), ['r', 's']);
 });
 
 test('a change that needs confirmation is sent again with its token only when confirmed', async () => {

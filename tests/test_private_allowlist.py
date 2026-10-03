@@ -205,7 +205,8 @@ async def test_allowlist_edits_take_effect_at_once_and_are_audited(tmp_path):
 
 async def test_only_openrouter_routes_can_be_added_and_an_unknown_one_is_not_rechecked(tmp_path):
     async with started(tmp_path / "data") as client:
-        for key in ("cloud:model", "openrouter:", "openrouter: padded", "model"):
+        for key in ("cloud:model", "openrouter:", "openrouter: padded", "model", "openrouter:SECRET note",
+                    "openrouter:模型", "openrouter:" + "x" * 201):
             response = await client.put(f"/api/private-routes/{key}", json={"enabled": True})
             assert (response.status_code, response.json()["code"]) == (400, "not_openrouter_route"), key
         response = await client.put("/api/private-routes/openrouter:x/unknown", json={"rechecked": True})
