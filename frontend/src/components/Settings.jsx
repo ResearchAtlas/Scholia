@@ -2,7 +2,7 @@
 // Settings (S10; slice-1 spec F12 and the stage walk): General, Providers and models,
 // Subagents, This project and Advanced. Personal values live in the personal config.toml,
 // the project's in its own; keys live in the credential store (section 4.4).
-import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { ArrowDown, ArrowUp, X } from 'lucide-react';
 import { LANGUAGES, LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, patch, post } from '../api.js';
@@ -178,20 +178,20 @@ function Subagents() {
   const t = useT();
   const personal = useSettingsFile();
   const offered = useOfferedModels();
-  const pending = useRef(null); // the list as the latest change left it, until that is saved
+  const [busy, setBusy] = useState(false); // one change at a time: the next starts from the saved list
   const [adding, setAdding] = useState('');
   const [problem, setProblem] = useState(null);
   const values = personal.values;
   if (!values) return <Loading />;
   const list = [...new Set(values.subagents.models ?? [])]; // a ranked list names each model once
-  // Each change starts from the list as the last change left it, even before that is saved.
+  // One change at a time, each from the list as saved (or read again after a refusal), so a
+  // change never builds on one that was not written.
   const change = (edit) => {
-    const next = edit(pending.current ?? list);
+    if (busy) return;
+    const next = edit(list);
     if (!next) return;
-    pending.current = next;
-    personal.save({ 'subagents.models': next }).then((saved) => {
-      if (!saved || pending.current === next) pending.current = null; // a refused change: the file read again is the base
-    });
+    setBusy(true);
+    personal.save({ 'subagents.models': next }).finally(() => setBusy(false));
   };
   const move = (id, by) => change((base) => { // by the model, in the list the last change left
     const from = base.indexOf(id);
@@ -222,11 +222,11 @@ function Subagents() {
             <li key={id} className="flex items-center gap-2 px-3 py-2 text-sm">
               <span className="w-5 text-xs tabular-nums text-muted-foreground">{i + 1}</span>
               <span className="min-w-0 flex-1 truncate font-mono text-[13px]" title={id}>{id}</span>
-              <Button variant="ghost" size="icon" className="size-7" disabled={i === 0} onClick={() => move(id, -1)}
+              <Button variant="ghost" size="icon" className="size-7" disabled={busy || i === 0} onClick={() => move(id, -1)}
                 aria-label={t('subagents.up', { model: id })}><ArrowUp aria-hidden="true" /></Button>
-              <Button variant="ghost" size="icon" className="size-7" disabled={i === list.length - 1} onClick={() => move(id, 1)}
+              <Button variant="ghost" size="icon" className="size-7" disabled={busy || i === list.length - 1} onClick={() => move(id, 1)}
                 aria-label={t('subagents.down', { model: id })}><ArrowDown aria-hidden="true" /></Button>
-              <Button variant="ghost" size="icon" className="size-7" onClick={() => remove(id)}
+              <Button variant="ghost" size="icon" className="size-7" disabled={busy} onClick={() => remove(id)}
                 aria-label={t('subagents.remove', { model: id })}><X aria-hidden="true" /></Button>
             </li>
           ))}
@@ -240,7 +240,7 @@ function Subagents() {
             <datalist id="subagent-models">
               {offered.map((m) => <option key={`${m.provider}:${m.id}`} value={m.id}>{m.name}</option>)}
             </datalist>
-            <Button type="submit" variant="outline" size="sm" className="h-9" disabled={!adding.trim()}>{t('subagents.add')}</Button>
+            <Button type="submit" variant="outline" size="sm" className="h-9" disabled={busy || !adding.trim()}>{t('subagents.add')}</Button>
           </form>
         )}
       </Section>

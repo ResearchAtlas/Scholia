@@ -92,17 +92,19 @@ def detect_task_signal(query: str, has_files: bool = False) -> str:
 
 
 def create_run_plan(query: str, model: str | None, route_for, *, effort: str | None = None,
-                    is_openrouter: bool = True, has_files: bool = False) -> RunPlan:
+                    is_openrouter: bool = True, has_files: bool = False, offered=lambda m: True,
+                    picked=()) -> RunPlan:
     """The plan for a message. model is a model id or Auto; route_for(model) gives
-    the route whose catalog prices it. Auto takes the balanced tier's first model on
-    OpenRouter; elsewhere a model must be chosen, and the plan's model is None."""
+    the route whose catalog prices it. Auto takes the first model the provider offers
+    (offered(model)) among the tiers' preferred models on OpenRouter, the balanced tier
+    first, then among the models picked for it; with none, the plan's model is None."""
     signal = detect_task_signal(query, has_files)
     if model and model != AUTO:
         chosen, reason = model, "chosen_model"
-    elif is_openrouter:
-        chosen, reason = MODEL_TIERS["mid"][0], "auto_mid_tier"
     else:
-        chosen, reason = None, "model_needed"
+        preferred = [m for tier in ("mid", "budget", "premium") for m in MODEL_TIERS[tier]] if is_openrouter else []
+        chosen = next((m for m in [*preferred, *picked] if offered(m)), None)
+        reason = ("auto_mid_tier" if chosen == MODEL_TIERS["mid"][0] else "auto_offered") if chosen else "model_needed"
     predicted = estimate_message_cost(signal, route_for(chosen), effort) if chosen else 0.0
     return RunPlan(mode=signal, model_tier="mid", model=chosen, predicted_cost=predicted,
                    policy_reason=reason, task_signal=signal)

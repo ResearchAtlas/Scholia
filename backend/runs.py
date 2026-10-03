@@ -381,9 +381,19 @@ class Harness:
                 raise AdmissionError(400, "unknown_provider", "That provider is not set up")
             provider_config = configured[provider_name]
             claim.provider = provider_name
+            # The models the provider offers (Recommended, All or Pick): a model it does not
+            # offer is refused, and Auto picks among those it does.
+            table = (personal.values.get("providers") or {}).get(provider_name) or {}
+
+            def offered(m):
+                return providers.offered(table, provider_config, m, budget_router.RECOMMENDED)
+
+            if chosen != budget_router.AUTO and not offered(chosen):
+                raise AdmissionError(400, "model_not_offered", "That model is not offered for this provider")
             plan = budget_router.create_run_plan(
                 message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
-                is_openrouter=provider_config.is_openrouter)
+                is_openrouter=provider_config.is_openrouter, offered=offered,
+                picked=table["models"] if isinstance(table.get("models"), list) else ())
             if plan.model is None:
                 raise AdmissionError(400, "model_needed", "Choose a model for this provider")
             route = providers.Route(provider_config, plan.model)

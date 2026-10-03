@@ -277,5 +277,6 @@
   "settings.problemFileUnread": "The settings file could not be read, so the defaults are used.",
   "picker.setWindow": "Set the window of {model} to use it",
   "settings.instructionsReplaced": "This file is not UTF-8 text. Some characters could not be read and are shown as �; saving it replaces them for good.",
-  "settings.instructionsReplaceConfirm": "Save, replacing them"
+  "settings.instructionsReplaceConfirm": "Save, replacing them",
+  "errors.model_not_offered": "That model is not offered for this provider. Choose it under Providers and models, or pick another."
 }

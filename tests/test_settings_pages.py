@@ -118,6 +118,7 @@ async def test_the_model_listing_says_window_offer_and_effort(tmp_path):
 
 async def test_recent_models_are_the_last_three_chosen(tmp_path):
     async with started(tmp_path / "data") as client:
+        assert (await save(client, {"providers.openrouter.models": "all"})).status_code == 200
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
         for model in ("a/one", "b/two", "a/one", "c/three", None, "d/four"):
             await send(client, conversation, **({"model": model} if model else {}))  # None is Auto
@@ -178,6 +179,7 @@ async def test_invalid_settings_are_reported_by_key_and_line(tmp_path):
 
 async def test_recent_models_survive_many_repeats_of_one(tmp_path):
     async with started(tmp_path / "data") as client:
+        assert (await save(client, {"providers.openrouter.models": "all"})).status_code == 200
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
         for model in ("c/three", "b/two"):
             await send(client, conversation, model=model)
@@ -220,3 +222,20 @@ async def test_an_instruction_file_not_in_utf8_is_flagged_before_it_is_rewritten
         (tmp_path / "data" / "AGENTS.md").write_bytes(b"caf\xe9")
         read = (await client.get("/api/instructions")).json()
         assert read["replaced"] is True and read["text"] == "caf�"
+
+
+async def test_admission_keeps_to_the_models_a_provider_offers(tmp_path):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "hi", "model": "x/not-recommended"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "model_not_offered")
+        await send(client, conversation, model="auto")  # Auto: the router's preferred, offered model
+        assert provider.answers[-1]["model"] == budget_router.MODEL_TIERS["mid"][0]
+        await save(client, {"providers.openrouter.models": ["x/picked"]})
+        await send(client, conversation, model="auto")  # under a Pick, Auto picks among the picked
+        assert provider.answers[-1]["model"] == "x/picked"
+        await save(client, {"providers.openrouter.models": []})
+        nothing = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
+        assert (nothing.status_code, nothing.json()["code"]) == (400, "model_needed")
