@@ -23,6 +23,7 @@ npm-debug.log*
 build/
 dist/
 frontend/dist/
+frontend/dist-licenses/
 frontend/.vite/
 *.dmg
 

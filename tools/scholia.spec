@@ -10,7 +10,7 @@ from PyInstaller.utils.hooks import collect_dynamic_libs
 
 ROOT = Path(SPECPATH).parent
 sys.path.insert(0, str(ROOT / "tools"))
-from license_audit import notice_datas  # noqa: E402
+from license_audit import NPM, notice_datas, npm_packages  # noqa: E402
 
 # Distributions the app bundles, whose license files ship with it; the audit fails if one
 # is bundled and missing here.
@@ -40,9 +40,12 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=collect_dynamic_libs("sqlite_vec"),  # sqlite-vec has no PyInstaller hook
     excludes=EXCLUDES,
-    datas=notice_datas(DISTRIBUTIONS)
+    # the license texts, of the npm packages the interface bundles too (build_app.sh builds it first)
+    datas=notice_datas(DISTRIBUTIONS + [NPM + name for name in npm_packages()])
     # the reasoning-capability record, which the provider adapter reads beside its module
-    + [(str(ROOT / "backend/reasoning_capabilities.json"), "backend")],
+    + [(str(ROOT / "backend/reasoning_capabilities.json"), "backend")]
+    # the built interface, which the desktop entry serves from here (backend/desktop.py)
+    + [(str(ROOT / "frontend/dist"), "frontend")],
 )
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, exclude_binaries=True, name="Scholia", console=False, upx=False)

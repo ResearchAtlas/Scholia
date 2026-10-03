@@ -114,6 +114,21 @@ class Rename(BaseModel):
     _title = field_validator("title")(classmethod(lambda cls, v: _visible(v)))
 
 
+class Move(BaseModel):
+    project_id: str = Field(min_length=1, max_length=100)
+
+
+# Sensitivity levels from least to most strict (ticket 14: a conversation moves only to a
+# project at an equal or stricter level).
+_STRICTNESS = {"normal": 0, "private": 1, "local_only": 2}
+
+# The interface's pages load only its own files. Images in model output are never fetched
+# from elsewhere (hardening PR02A): the interface shows them as links, and this refuses any
+# it misses. Inline styles are allowed because the dialogs' scroll lock inserts one.
+_CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none';"
+        " base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+
+
 class Message(BaseModel):
     content: str
     model: str | None = Field(default=None, max_length=512)  # as long as the model catalog accepts
@@ -272,7 +287,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": APP_VERSION}
+        return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir)}
 
     async def provider_list():
         configured = providers.configured(data_dir)
@@ -578,6 +593,46 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         await write(rename)
         return await get_conversation(conversation_id)
 
+    @app.post("/api/conversations/{conversation_id}/move")
+    async def move_conversation(conversation_id: str, body: Move):
+        """Move a conversation to another project at an equal or stricter level, with its
+        turns and their runs, so its history moves intact. What it spent stays in the
+        spending of the project where it was spent. Refused while it runs a turn or a
+        title run."""
+        if conversation_id in harness().registry.turns:
+            raise ApiError(409, "active_run", "This conversation is running a turn")
+
+        def move(conn):
+            row = conn.execute(
+                "SELECT c.project_id, p.sensitivity FROM conversations c JOIN projects p ON p.id = c.project_id"
+                " WHERE c.id = ?", (conversation_id,)).fetchone()
+            target = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (body.project_id,)).fetchone()
+            if row is None or target is None:
+                raise ApiError(404, "not_found", "No such conversation or project")
+            source, level = row
+            if source == body.project_id:
+                return
+            # Its turn, or a title run that would send its words over the old project's route;
+            # ordered with admission by the single writer.
+            if conn.execute("SELECT 1 FROM runs WHERE status = 'running' AND (conversation_id = ?"
+                            " OR source_turn_id IN (SELECT run_id FROM turns WHERE conversation_id = ?))",
+                            (conversation_id, conversation_id)).fetchone():
+                raise ApiError(409, "active_run", "This conversation is running a turn")
+            if _STRICTNESS[target[0]] < _STRICTNESS[level]:
+                raise ApiError(409, "less_strict_project", "A conversation moves only to a project as strict or stricter")
+            now = utc_now()
+            conn.execute("UPDATE conversations SET project_id = ?, updated_at = ? WHERE id = ?",
+                         (body.project_id, now, conversation_id))
+            conn.execute(
+                "UPDATE runs SET project_id = ? WHERE conversation_id = ?"
+                " OR source_turn_id IN (SELECT run_id FROM turns WHERE conversation_id = ?)",
+                (body.project_id, conversation_id, conversation_id))
+            conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('conversation_moved', ?, ?)",
+                         (body.project_id, json.dumps({"conversation_id": conversation_id, "from": source})))
+
+        await write(move)
+        return await get_conversation(conversation_id)
+
     @app.delete("/api/conversations/{conversation_id}")
     async def delete_conversation(conversation_id: str):
         async def deleting():  # the deletion and the stopping of its runs, together, to their end
@@ -622,14 +677,17 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def activity(limit: int = 50):
         rows = await read(lambda conn: conn.execute(
             "SELECT r.id, r.project_id, r.workflow, r.status, r.cancel_reason, r.settled_cost_usd, r.attempts,"
-            " r.started_at, r.finished_at, p.name FROM runs r JOIN projects p ON p.id = r.project_id"
-            " WHERE r.kind = 'background' ORDER BY r.started_at DESC LIMIT ?", (max(1, min(limit, 200)),)).fetchall())
+            " r.started_at, r.finished_at, p.name, p.kind FROM runs r JOIN projects p ON p.id = r.project_id"
+            # Every running run, where it is cancelled, then the newest others up to the limit.
+            " WHERE r.kind = 'background' AND (r.status = 'running' OR r.id IN (SELECT id FROM runs"
+            " WHERE kind = 'background' AND status != 'running' ORDER BY started_at DESC LIMIT ?))"
+            " ORDER BY r.status = 'running' DESC, r.started_at DESC", (max(1, min(limit, 200)),)).fetchall())
         registry = harness().registry
         return {"runs": [{
-            "run_id": run_id, "project_id": project_id, "project_name": name, "workflow": workflow,
-            "status": derived_status(status, run_id, registry), "cancel_reason": cancel, "cost_usd": cost,
-            "attempts": attempts, "started_at": started, "finished_at": finished,
-        } for run_id, project_id, workflow, status, cancel, cost, attempts, started, finished, name in rows]}
+            "run_id": run_id, "project_id": project_id, "project_name": name, "project_kind": kind,
+            "workflow": workflow, "status": derived_status(status, run_id, registry), "cancel_reason": cancel,
+            "cost_usd": cost, "attempts": attempts, "started_at": started, "finished_at": finished,
+        } for run_id, project_id, workflow, status, cancel, cost, attempts, started, finished, name, kind in rows]}
 
     # The interface: built files only, from inside their folder
 
@@ -642,7 +700,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         file = static_file(frontend_dir, path)
         if file is None:
             raise ApiError(404, "not_found", "Not found")
-        return FileResponse(file, headers={"Cache-Control": "no-cache"})
+        return FileResponse(file, headers={"Cache-Control": "no-cache", "Content-Security-Policy": _CSP})
 
     return LocalRequestGuard(app, origin=origin, dev_origins=dev_origins, session=session)
 
