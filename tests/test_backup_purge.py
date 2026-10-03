@@ -166,3 +166,27 @@ async def test_deleting_a_project_backs_it_up_first_unless_it_is_deleted_everywh
         assert rows(generation, f"SELECT title FROM tombstones WHERE object_id = '{gone}'") == [("Interview study",)]
         assert rows(generation, "SELECT count(*) FROM projects WHERE kind = 'research'") == [(0,)]
         assert not (generation / "projects" / gone).exists()
+
+
+@pytest.mark.asyncio
+async def test_damaged_copies_go_only_when_a_deletion_reaches_the_backups(tmp_path):
+    import asyncio
+    from scholia_app import send, started
+    data = tmp_path / "data"
+    async with started(data) as client:
+        first = (await client.post("/api/conversations", json={"title": TITLE})).json()["id"]
+        second = (await client.post("/api/conversations", json={"title": "Second"})).json()["id"]
+        await send(client, first, SAID)
+        copy = data / "backups" / backups.DAMAGED / "20260101T000000000000Z"  # as a restore moves one aside
+        await asyncio.to_thread(shutil.copytree, all_generations(data)[-1], copy)
+        await asyncio.to_thread(shutil.copy, data / DB_NAME, copy / DB_NAME)
+
+        assert (await client.delete(f"/api/conversations/{first}")).json() == {"ok": True}
+        assert copy.is_dir()  # a plain deletion leaves it, as it leaves the automatic backups
+        response = await client.delete(f"/api/conversations/{second}", params={"purge_backups": "true"})
+        assert response.status_code == 200
+        assert not copy.exists() and list((data / "backups" / backups.DAMAGED).iterdir()) == []
+        [(record,)] = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT data FROM audit_log WHERE event = 'backup_purge'").fetchall())
+        assert json.loads(record)["deleted_damaged_copies"] == 1
+        assert not any(holds(g, SAID) for g in all_generations(data))

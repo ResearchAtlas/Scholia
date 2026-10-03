@@ -50,7 +50,9 @@ log = logging.getLogger(__name__)
 IDLE_CHECK_SECONDS = 600
 SENSITIVE = ("private", "local_only")  # a backup or export holding such a project is encrypted
 STAGING = ".staging"  # under backups/: restores and full backups in progress, emptied at launch
-DAMAGED = "damaged"  # under backups/: damaged databases a restore moved aside, never deleted
+# Under backups/: damaged databases a restore moved aside. Nothing removes one on its own; only the
+# researcher's "Delete everywhere including backups" does (purge), as a deletion reaches every copy.
+DAMAGED = "damaged"
 _CHUNK = 1 << 20
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 # What a backup may hold; anything else in a backup file refuses it.
@@ -183,13 +185,18 @@ def backup_before_deletion(db):
 
 def purge(db, project_id, deleted):
     """"Delete everywhere including backups", after the deletion committed: a fresh automatic backup,
-    then no older one, audited. deleted says what was deleted ({"kind", "object_id"}). Returns the
-    number of automatic backups deleted. A failed backup deletes nothing and raises."""
+    then no older one and no damaged copy a restore moved aside, audited. deleted says what was
+    deleted ({"kind", "object_id"}). Returns the number of backups and copies deleted. A failed
+    backup deletes nothing and raises. The caller orders it with restores (see backups_lock)."""
     generation, removed = db.purge_backups()
+    copies = sorted((db.backups_dir / DAMAGED).glob("*")) if (db.backups_dir / DAMAGED).is_dir() else []
+    for copy in copies:
+        _remove(copy)
     db.write(lambda conn: conn.execute(
         "INSERT INTO audit_log (event, project_id, data) VALUES ('backup_purge', ?, ?)",
-        (project_id, json.dumps({**deleted, "kept": f"daily/{generation.name}", "deleted_backups": removed}))))
-    return removed
+        (project_id, json.dumps({**deleted, "kept": f"daily/{generation.name}", "deleted_backups": removed,
+                                 "deleted_damaged_copies": len(copies)}))))
+    return removed + len(copies)
 
 
 # Listing
