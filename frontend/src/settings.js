@@ -183,6 +183,16 @@ export function groupOf(provider) {
   return provider.has_key ? 'ready' : 'setup';
 }
 
+// The picker's models after a read: the rows read now, and a provider's earlier rows when only
+// its listing failed, but never across a change of the project's protection (section 6.4: only
+// the routes the project allows are shown); with no read at all (failed), none.
+export function keptModels(current, next, unread) {
+  if (!next) return [];
+  const kept = current && current.protection === next.protection
+    ? current.models.filter((m) => unread.has(m.provider)) : [];
+  return [...next.models, ...kept];
+}
+
 // What a message or a Continue sends for the picker's choice: nothing for no choice (the
 // project's or the personal [models] default applies, section 4.4), Auto, or a model with
 // its effort.

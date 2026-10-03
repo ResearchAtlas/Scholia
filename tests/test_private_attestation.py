@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from backend import governance, openrouter_client
-from scholia_app import KEY, MockProvider, background_idle, send, started
+from scholia_app import KEY, FakeKeyring, MockProvider, background_idle, confirm_key, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -51,8 +51,8 @@ async def setup_private(client):
     return (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
 
 
-async def confirm(client, statement=governance.KEY_STATEMENT, provider="openrouter"):
-    return await client.post("/api/key-attestations", json={"provider": provider, "statement": statement})
+async def confirm(client):
+    return await confirm_key(client)
 
 
 async def refused_code(client, conversation):
@@ -150,14 +150,17 @@ async def test_the_gate_refuses_a_key_whose_confirmation_lapsed_after_admission(
 
 @pytest.mark.parametrize("body, code", [
     ({"provider": "openrouter", "statement": "2020-01-01"}, (409, "statement_changed")),
-    ({"provider": "nobody", "statement": governance.KEY_STATEMENT}, (404, "unknown_provider")),
-    ({"provider": "local", "statement": governance.KEY_STATEMENT}, (400, "not_openrouter")),
+    ({"provider": "openrouter", "key": "0" * 16}, (409, "key_changed")),  # not the key the card showed
+    ({"provider": "nobody"}, (404, "unknown_provider")),
+    ({"provider": "local"}, (400, "not_openrouter")),
 ])
-async def test_a_confirmation_needs_the_current_statement_and_an_openrouter_key(tmp_path, body, code):
+async def test_a_confirmation_needs_the_current_statement_and_the_openrouter_key_it_was_shown(tmp_path, body, code):
     async with started(tmp_path / "data") as client:
         current = (await client.get("/api/settings")).json()
         await client.put("/api/settings", json={"hash": current["hash"], "updates": {
             "providers.local.kind": "openai-compatible", "providers.local.base_url": "http://127.0.0.1:11434/v1"}})
+        [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == "openrouter"]
+        body = {"statement": governance.KEY_STATEMENT, "key": shown["key_confirmation"]["key"], **body}
         response = await client.post("/api/key-attestations", json=body)
         assert (response.status_code, response.json()["code"]) == code
         assert await rows(client, "SELECT count(*) FROM key_attestations") == [(0,)]
@@ -178,3 +181,39 @@ async def test_a_statement_changes_only_with_its_version(prefix, version):
     digest = hashlib.sha256("\n".join(texts).encode()).hexdigest()
     assert texts and digest == STATEMENT_DIGESTS[prefix, version], (
         f"the {prefix} statement changed: give it a new version in backend/governance.py and record {digest}")
+
+
+async def test_a_confirmation_is_for_the_key_the_card_showed(tmp_path):
+    async with started(tmp_path / "data") as client:
+        [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == "openrouter"]
+        assert (await client.put("/api/keys/openrouter", json={"key": "sk-or-replaced-meanwhile"})).status_code == 200
+        response = await client.post("/api/key-attestations", json={
+            "provider": "openrouter", "statement": shown["key_confirmation"]["statement"],
+            "key": shown["key_confirmation"]["key"]})
+        assert (response.status_code, response.json()["code"]) == (409, "key_changed")
+        assert await rows(client, "SELECT count(*) FROM key_attestations") == [(0,)]
+        assert KEY not in json.dumps(shown)  # the card's reference is not the key
+
+
+async def test_a_private_title_run_resumed_after_a_restart_reads_the_catalog_first(tmp_path):
+    from backend.runs import Harness
+    data, keyring = tmp_path / "data", FakeKeyring()
+    real = Harness.kick_background
+
+    async def not_now(self):  # the title run is queued, then the app closes before it starts
+        return None
+
+    Harness.kick_background = not_now
+    try:
+        async with started(data, MockProvider(catalog=[MODEL], zero_retention=[MODEL]), keyring=keyring) as client:
+            conversation = await setup_private(client)
+            await confirm(client)
+            assert (await send(client, conversation, model=MODEL))[-1]["status"] == "succeeded"
+    finally:
+        Harness.kick_background = real
+    openrouter_client.clear_cache()  # a new launch has read no catalog
+    provider = MockProvider(catalog=[MODEL], zero_retention=[MODEL])
+    async with started(data, provider, keyring=keyring, setup=False) as client:
+        await background_idle(client)
+        assert [body["provider"] for body in provider.titles] == [{"zdr": True}]
+        assert await rows(client, "SELECT status FROM runs WHERE workflow = 'title'") == [("succeeded",)]

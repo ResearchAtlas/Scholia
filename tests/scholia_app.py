@@ -151,3 +151,17 @@ async def background_idle(client, timeout=5.0):
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("background work did not finish")
         await asyncio.sleep(0.01)
+
+
+async def confirm_key(client, provider="openrouter"):
+    """Confirm a provider's key's data settings as the card does: for the key and statement it showed."""
+    [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == provider]
+    confirmation = shown["key_confirmation"]
+    return await client.post("/api/key-attestations", json={
+        "provider": provider, "statement": confirmation["statement"], "key": confirmation["key"]})
+
+
+async def declare(client, provider):
+    """Declare a provider on this Mac as the card does: for the origin it showed."""
+    [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == provider]
+    return await client.post("/api/local-declarations", json={"provider": provider, "origin": shown["origin"]})

@@ -32,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.db import new_id, utc_now
+from backend.db.deletion import revoking_write  # noqa: F401  (tightening and locking write through it)
 from backend.openrouter_client import get_model_metadata
 from backend.outbound_gate import is_openrouter, local_origin
 from backend.settings import write_private
@@ -96,11 +97,17 @@ def allowlist(conn, now=None):
     return [entries[key] for key in sorted(entries)]
 
 
-def private_flags(entries, model):
-    """The request flags of the enabled entry covering an OpenRouter model, or None."""
+def covering_entry(entries, model):
+    """The enabled allowlist entry covering an OpenRouter model, or None."""
     by_key = {entry["route_key"]: entry for entry in entries}
     entry = by_key.get(f"openrouter:{model}") or by_key.get("openrouter:*")
-    return entry["required_flags"] if entry is not None and entry["enabled"] else None
+    return entry if entry is not None and entry["enabled"] else None
+
+
+def private_flags(entries, model):
+    """The request flags of the enabled entry covering an OpenRouter model, or None."""
+    entry = covering_entry(entries, model)
+    return entry["required_flags"] if entry is not None else None
 
 
 def zero_retention(provider, model) -> bool:
@@ -113,8 +120,12 @@ def zero_retention(provider, model) -> bool:
 
 
 def declared_origins(conn):
-    return frozenset(filter(None, (local_origin(url) for (url,) in conn.execute(
-        "SELECT base_url FROM local_declarations"))))
+    """{origin: when it was declared} for every declared server."""
+    found = {}
+    for url, at in conn.execute("SELECT base_url, declared_at FROM local_declarations ORDER BY declared_at"):
+        if origin := local_origin(url):
+            found[origin] = at
+    return found
 
 
 def declare(conn, provider, base_url):
@@ -195,8 +206,14 @@ def confirmation(conn, data_dir, key, now=None):
     else:
         latest = mine[0]
         status = "outdated" if latest[1] != KEY_STATEMENT else "expired"
-    return {"status": status, "statement": KEY_STATEMENT,
+    return {"status": status, "statement": KEY_STATEMENT, "key": key_reference(mark),
             "confirmed_at": latest[2] if latest else None, "expires_at": latest[3] if latest else None}
+
+
+def key_reference(mark):
+    """A short reference to the key a confirmation is shown for, from its fingerprint: a
+    confirmation names it, so one made from a card that showed another key is refused."""
+    return mark[:16]
 
 
 def key_attested(conn, data_dir, key) -> bool:
@@ -221,7 +238,7 @@ class Policy:
     """What one project allows, as read at one moment."""
     level: str
     locked: bool
-    declared: frozenset
+    declared: dict  # declared origin -> when
     entries: tuple
 
     @property
@@ -243,6 +260,20 @@ class Policy:
                 return "private_route_not_allowed"
             return None
         return "route_not_allowed"
+
+    def terms(self, provider, model):
+        """The retention terms a step sent to this provider's model under this policy is covered
+        by, for its record (ticket 18's provenance): the level, and OpenRouter's zero retention
+        with its allowlist entry and the date its terms were checked, or the declaration of a
+        server on this Mac."""
+        origin = local_origin(provider.base_url)
+        if self.level != "normal" and origin in self.declared:
+            return {"level": self.level, "declared_origin": origin, "declared_at": self.declared[origin]}
+        entry = covering_entry(self.entries, model) if self.zero_retention and provider.is_openrouter else None
+        if entry is not None:
+            return {"level": self.level, "zero_retention": True, "allowlist_entry": entry["route_key"],
+                    "terms_url": entry["terms_url"], "checked_on": entry["checked_on"]}
+        return {"level": self.level}
 
     def allows_provider(self, provider) -> bool:
         """Whether some model of the provider may be allowed: the defaults pass over the rest."""

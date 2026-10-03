@@ -221,6 +221,7 @@ class _Call:
     reservation_id: str
     dispatched: bool = False
     route: str | None = None  # the route key, once the call is under way
+    retention: dict | None = None  # the retention terms it is sent under (governance.Policy.terms)
 
 
 class Harness:
@@ -481,6 +482,7 @@ class Harness:
         if zero_retention and not await self._read(lambda conn: governance.key_attested(conn, self.data_dir, key)):
             raise AdmissionError(403, "key_not_confirmed", "Confirm the key's OpenRouter data settings first")
         route = providers.Route(provider_config, plan.model)
+        retention = policy.terms(provider_config, plan.model)
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
 
         def admit(conn):
@@ -530,6 +532,7 @@ class Harness:
         claim.context = {
             "project_id": project_id, "seq": seq, "route": route, "key": key, "messages": messages,
             "effort": effort, "estimate": plan.predicted_cost, "zero_retention": zero_retention,
+            "retention": retention,
         }
         claim.admitted = time.monotonic()
         return claim
@@ -577,7 +580,7 @@ class Harness:
                                        phase="answer")
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["messages"], effort=ctx["effort"],
-                                      zero_retention=ctx["zero_retention"])
+                                      zero_retention=ctx["zero_retention"], retention=ctx["retention"])
             if not result.ok:
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
                                                                           result.error_kind, claim=claim))
@@ -750,11 +753,12 @@ class Harness:
             return await openrouter_client.models(client, provider, key, force=force, generation=generation)
 
     async def _call(self, active, call, route, key, messages, *, effort=None, max_tokens=None, output=None,
-                    zero_retention=False):
+                    zero_retention=False, retention=None):
         """Dispatch one admitted call through the gate, with the dispatch check, and record it,
         settling its reservation. zero_retention sends it with provider.zdr = true (a Private
-        project's OpenRouter call). output(result), if given, is recorded on the finished step,
-        so a run can later finish from the record."""
+        project's OpenRouter call); retention, the terms it is sent under, is recorded with each
+        attempt. output(result), if given, is recorded on the finished step, so a run can later
+        finish from the record."""
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         project_id = await self._read(lambda conn: conn.execute(
@@ -765,7 +769,7 @@ class Harness:
         def dispatched():  # the gate let the request out: from here it may be billed
             call.dispatched = True
 
-        call.route = route.key
+        call.route, call.retention = route.key, retention
         async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id)) as client:
             result = await openrouter.query_model(
                 client, route, key, messages, timeout=MODEL_CALL_SECONDS, effort=effort, max_tokens=max_tokens,
@@ -780,7 +784,7 @@ class Harness:
                 if conn.execute("SELECT 1 FROM runs WHERE id = ?", (active.run_id,)).fetchone() is not None:
                     for attempt in result.attempts:
                         _event(conn, active.run_id, "model_attempt",
-                               {"step": call.step, "route": route.key, **attempt.record()})
+                               {"step": call.step, "route": route.key, "retention": retention, **attempt.record()})
                     _event(conn, active.run_id, "step_finished", finished)
                 if result.dispatched:
                     _settle_attempts(conn, call.reservation_id, route, result.attempts)
@@ -872,10 +876,15 @@ class Harness:
                                                 self.keyring_backend)
         if route is None or key is None:
             return None
-        # Under the project's level now; the gate refuses a route it no longer allows.
-        private = await self._read(lambda conn: conn.execute(
-            "SELECT 1 FROM projects WHERE id = ? AND sensitivity = 'private'", (project_id,)).fetchone())
-        zero_retention = bool(private) and route.provider.is_openrouter
+        # Under the project's policy now; the gate refuses a route it no longer allows. A Private
+        # title resumed at a launch reads which models OpenRouter serves with zero retention, as a
+        # turn's admission does.
+        policy = await self._read(lambda conn: governance.policy(conn, project_id))
+        if policy is None:
+            return None
+        zero_retention = policy.zero_retention and route.provider.is_openrouter
+        if zero_retention and not catalog_read(providers.Route(route.provider, "")):
+            await self.catalog(route.provider, key)
 
         def start(conn):
             if not _running(conn, active.run_id) or _revoked(conn, active.run_id):
@@ -902,6 +911,7 @@ class Harness:
             raise asyncio.CancelledError()
         messages = [{"role": "system", "content": TITLE_RULES}, {"role": "user", "content": inputs["message"]}]
         result = await self._call(active, call, route, key, messages, max_tokens=60, zero_retention=zero_retention,
+                                  retention=policy.terms(route.provider, route.model),
                                   output=lambda result: _clean_title(result.content))
         return _clean_title(result.content) if result.ok else None
 
@@ -977,8 +987,8 @@ def _close_call(conn, call):
     if call.dispatched:
         if spending.settle(conn, call.reservation_id) and _running(conn, call.run_id):
             _event(conn, call.run_id, "model_attempt", {
-                "step": call.step, "route": call.route, "outcome": "cancelled", "http_status": None,
-                "dispatched": True, "charge": "unknown"})
+                "step": call.step, "route": call.route, "retention": call.retention, "outcome": "cancelled",
+                "http_status": None, "dispatched": True, "charge": "unknown"})
     else:
         spending.release(conn, call.reservation_id)
 

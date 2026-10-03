@@ -128,13 +128,15 @@ class ReviewLock(BaseModel):
     token: str | None = Field(default=None, max_length=100)  # the confirmation lifting the lock needs
 
 
-class ProviderName(BaseModel):
+class Declaration(BaseModel):
     provider: str = Field(min_length=1, max_length=1000)
+    origin: str = Field(min_length=1, max_length=300)  # the server's origin as the researcher saw it
 
 
 class KeyConfirmation(BaseModel):
     provider: str = Field(min_length=1, max_length=1000)
     statement: str = Field(min_length=1, max_length=100)  # the version of the statement the researcher saw
+    key: str = Field(min_length=1, max_length=100)  # the reference to the key the card showed
 
 
 class PrivateRouteChange(BaseModel):
@@ -369,8 +371,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
              governance.confirmation(conn, data_dir, key) if key is not None and p.is_openrouter else None)
             for p, key in zip(configured.values(), keys)])
         return [{"name": p.name, "kind": p.kind, "base_url": p.base_url, "has_key": key is not None,
-                 "enabled": p.name in on, "local": local_origin(p.base_url) is not None, "declared_at": declared,
-                 "key_confirmation": confirmation}
+                 "enabled": p.name in on, "local": local_origin(p.base_url) is not None,
+                 "origin": local_origin(p.base_url), "declared_at": declared, "key_confirmation": confirmation}
                 for p, key, (declared, confirmation) in zip(configured.values(), keys, governed)]
 
     @app.get("/api/setup")
@@ -669,9 +671,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         return {"ok": True}
 
     async def revoking(change):
-        """Write a change that returns the runs it revoked, and stop them, both to their end."""
+        """Write a change that returns the runs it revoked, ordered with the gate's hand-offs, and
+        stop them, both to their end."""
         async def change_and_stop():
-            harness().revoke(await write(change))
+            harness().revoke(await asyncio.to_thread(governance.revoking_write, db(), change))
         await _to_end(change_and_stop())
 
     def unchanged(conn, project_id, level, locked):
@@ -750,7 +753,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def confirm_key(body: KeyConfirmation):
         """The researcher's confirmation that OpenRouter's data settings for the provider's key are
         as the statement says (section 6.4). Scholia cannot verify them: it records the
-        confirmation with a fingerprint of the key, never the key, for six months."""
+        confirmation with a fingerprint of the key, never the key, for six months. It names the
+        key the card showed (its reference), so a key changed since then is refused."""
         async with harness().settings_lock:  # ordered with key changes, which hold it too
             provider = providers.configured(data_dir, include_off=True).get(body.provider)
             if provider is None:
@@ -762,20 +766,26 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             key = await asyncio.to_thread(credentials.load_key, data_dir, provider.name, keyring_backend)
             if key is None:
                 raise ApiError(400, "provider_key_missing", "The provider has no key")
+            shown = governance.key_reference(await asyncio.to_thread(governance.fingerprint, data_dir, key))
+            if not secrets.compare_digest(shown, body.key):
+                raise ApiError(409, "key_changed", "The key changed since it was shown; read it again")
             await _to_end(write(lambda conn: governance.confirm_key(conn, data_dir, provider.name, key)))
         return {"ok": True}
 
     @app.post("/api/local-declarations")
-    async def declare_local(body: ProviderName):
-        """The researcher's declaration that a provider on this Mac runs its models here, for its
-        exact origin. Scholia cannot verify it; for a Private project it is the researcher's
-        assurance, not a retention guarantee. Audited."""
+    async def declare_local(body: Declaration):
+        """The researcher's declaration that a provider on this Mac runs its models here, for the
+        exact origin the card showed (one that changed since is refused). Scholia cannot verify
+        it; for a Private project it is the researcher's assurance, not a retention guarantee.
+        Audited."""
         async with harness().settings_lock:  # the provider's address as the settings hold it now
             provider = providers.configured(data_dir, include_off=True).get(body.provider)
             if provider is None:
                 raise ApiError(404, "unknown_provider", "That provider is not set up")
             if local_origin(provider.base_url) is None:
                 raise ApiError(400, "not_local", "Only a server on this Mac can be declared")
+            if local_origin(provider.base_url) != body.origin:
+                raise ApiError(409, "target_changed", "The server's address changed since it was shown")
             await _to_end(write(lambda conn: governance.declare(conn, provider.name, provider.base_url)))
         return {"ok": True}
 
@@ -850,8 +860,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @app.post("/api/audit/export")
     async def export_audit(body: AuditExport | None = None):
-        """Write the audit log (or one project's rows) as a JSON file in the data folder's
-        exports folder, owner-only, and audit the export with its destination."""
+        """Write the audit log (or one project's rows, with every clearing of the log) as a JSON
+        file in the data folder's exports folder, owner-only. The export is recorded with its
+        destination first, so no file is there unrecorded; a failure after that removes the file
+        and leaves the record of the attempt."""
         project_id = (body or AuditExport()).project_id
         if project_id is not None:
             await project_row(project_id)  # an existing project's id, never other text, goes in the record
@@ -859,15 +871,20 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
         async def exporting():
             rows = await read(lambda conn: conn.execute(
-                "SELECT seq, at, event, project_id, data FROM audit_log WHERE ?1 IS NULL OR project_id = ?1"
-                " ORDER BY seq", (project_id,)).fetchall())
+                "SELECT seq, at, event, project_id, data FROM audit_log"
+                " WHERE ?1 IS NULL OR project_id = ?1 OR event = 'audit_cleared' ORDER BY seq", (project_id,)).fetchall())
             entries = [{"seq": seq, "at": at, "event": event, "project_id": project, "data": json.loads(data)}
                        for seq, at, event, project, data in rows]
-            await asyncio.to_thread(write_private, data_dir / "exports" / name,
-                                    json.dumps({"format": "scholia-audit-log", "version": 1, "entries": entries},
-                                               ensure_ascii=False, indent=1).encode())
             await write(lambda conn: governance.record(conn, "audit_exported", project_id,
                                                        destination=f"exports/{name}", rows=len(entries)))
+            path = data_dir / "exports" / name
+            try:
+                await asyncio.to_thread(write_private, path, json.dumps(
+                    {"format": "scholia-audit-log", "version": 1, "entries": entries}, ensure_ascii=False,
+                    indent=1).encode())
+            except OSError:
+                await asyncio.to_thread(path.unlink, missing_ok=True)
+                raise ApiError(500, "export_failed", "The audit log could not be written") from None
             return len(entries)
 
         rows = await _to_end(exporting())

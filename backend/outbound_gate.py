@@ -50,7 +50,11 @@ exact origins count there, and nothing else does. Names are never resolved, so
 A client may also carry a dispatch check (`admit`), which the harness gives every
 model call: it is read in the same decision transaction, so a run revoked by a
 deletion or a tightened project, or one in a review-locked project, sends nothing
-more, retries and same-origin redirect hops included ("revoked").
+more, retries and same-origin redirect hops included ("revoked"). The decision and
+the hand-off to the transport hold the revocation lock (backend/db/deletion.py,
+REVOCATION), which every revoking write holds too, so no revocation commits between
+them: an async client hands the request over before letting it go. (A sync client,
+which only tests use, lets it go once the request is marked dispatched.)
 
 Audit rows hold the decision, reason, kind, destination origin, method, level
 and approval flag; never a path, query, header or body. Every field is from a
@@ -94,6 +98,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 import httpx
+
+from backend.db.deletion import REVOCATION
 
 
 class Kind(StrEnum):
@@ -373,8 +379,9 @@ class _Transport(httpx.BaseTransport):
         self._gate, self._scope, self._inner = gate, scope, inner
 
     def handle_request(self, request):
-        kind = self._gate._check(request, self._scope)
-        _dispatched(request)
+        with REVOCATION:
+            kind = self._gate._check(request, self._scope)
+            _dispatched(request)
         response = self._inner.handle_request(request)
         leaves, target = _redirect(request, response)
         if leaves:
@@ -393,10 +400,18 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
         self._gate, self._scope, self._inner = gate, scope, inner
 
     async def handle_async_request(self, request):
-        # The database blocks, so it is reached off the event loop.
-        kind = await asyncio.to_thread(self._gate._check, request, self._scope)
-        _dispatched(request)
-        response = await self._inner.handle_async_request(request)
+        # The decision and the hand-off are one step against revocations: the lock is taken on
+        # the loop without blocking it, and let go once the transport has the request.
+        while not REVOCATION.acquire(blocking=False):
+            await asyncio.sleep(0.001)
+        try:
+            # The database blocks, so it is reached off the event loop.
+            kind = await asyncio.to_thread(self._gate._check, request, self._scope)
+            _dispatched(request)
+            sending = asyncio.ensure_future(self._inner.handle_async_request(request))
+        finally:
+            REVOCATION.release()
+        response = await sending  # cancelling this request cancels the send
         leaves, target = _redirect(request, response)
         if leaves:
             await response.aclose()

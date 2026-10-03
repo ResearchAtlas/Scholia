@@ -276,7 +276,9 @@ async def test_a_declaration_is_one_per_exact_origin_audited_and_can_be_withdraw
             "providers.again.kind": "openai-compatible", "providers.again.base_url": "http://127.0.0.1:11434/other",
             "providers.cloud.kind": "openai-compatible", "providers.cloud.base_url": "https://api.example.com/v1"}})
         for name in ("ollama", "again"):  # two names for one server: one declaration, the newer
-            assert (await client.post("/api/local-declarations", json={"provider": name})).json() == {"ok": True}
+            response = await client.post("/api/local-declarations",
+                                         json={"provider": name, "origin": "http://127.0.0.1:11434"})
+            assert response.json() == {"ok": True}
         db = client.state["db"]
         stored = await asyncio.to_thread(db.read, lambda conn: conn.execute(
             "SELECT provider, base_url, statement FROM local_declarations").fetchall())
@@ -285,9 +287,12 @@ async def test_a_declaration_is_one_per_exact_origin_audited_and_can_be_withdraw
                   for p in (await client.get("/api/providers")).json()["providers"]}
         assert listed == {"openrouter": (False, False), "ollama": (True, True), "again": (True, True),
                           "cloud": (False, False)}
-        response = await client.post("/api/local-declarations", json={"provider": "cloud"})
+        response = await client.post("/api/local-declarations",
+                                     json={"provider": "cloud", "origin": "https://api.example.com:443"})
         assert (response.status_code, response.json()["code"]) == (400, "not_local")
-        assert (await client.post("/api/local-declarations", json={"provider": "nobody"})).status_code == 404
+        response = await client.post("/api/local-declarations",
+                                     json={"provider": "nobody", "origin": "http://127.0.0.1:11434"})
+        assert response.status_code == 404
 
         assert (await client.delete("/api/local-declarations/ollama")).json() == {"ok": True}  # its origin's
         assert (await client.delete("/api/local-declarations/again")).status_code == 404
@@ -297,3 +302,27 @@ async def test_a_declaration_is_one_per_exact_origin_audited_and_can_be_withdraw
             ("local_declared", {"provider": "ollama", "origin": "http://127.0.0.1:11434", "statement": "2026-10-03"}),
             ("local_declared", {"provider": "again", "origin": "http://127.0.0.1:11434", "statement": "2026-10-03"}),
             ("local_declaration_withdrawn", {"provider": "ollama", "origin": "http://127.0.0.1:11434"})]
+
+
+@pytest.mark.asyncio
+async def test_a_declaration_names_the_origin_the_researcher_saw(tmp_path):
+    from scholia_app import started
+
+    async with started(tmp_path / "data") as client:
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+            "providers.ollama.kind": "openai-compatible", "providers.ollama.base_url": "http://127.0.0.1:11434/v1"}})
+        [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == "ollama"]
+        assert shown["origin"] == "http://127.0.0.1:11434"
+        current = (await client.get("/api/settings")).json()  # its address changes after the card was shown
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+            "providers.ollama.base_url": "http://127.0.0.1:1234/v1"}})
+        stale = await client.post("/api/local-declarations", json={"provider": "ollama", "origin": shown["origin"]})
+        assert (stale.status_code, stale.json()["code"]) == (409, "target_changed")
+        assert (await client.post("/api/local-declarations", json={"provider": "ollama"})).status_code == 400
+        db = client.state["db"]
+        assert await asyncio.to_thread(db.read, lambda conn: conn.execute(
+            "SELECT count(*) FROM local_declarations").fetchone()) == (0,)
+        fresh = await client.post("/api/local-declarations",
+                                  json={"provider": "ollama", "origin": "http://127.0.0.1:1234"})
+        assert fresh.status_code == 200

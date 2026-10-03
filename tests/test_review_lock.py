@@ -14,7 +14,7 @@ import json
 import pytest
 
 from backend.db import new_id
-from scholia_app import MockProvider, background_idle, events, send, started
+from scholia_app import MockProvider, background_idle, declare, events, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -50,7 +50,7 @@ async def with_declared_local_server(client):
     await client.put("/api/settings", json={"hash": current["hash"], "updates": {
         "providers.local.kind": "openai-compatible", "providers.local.base_url": LOCAL, "providers.local.models": "all"}})
     await client.put("/api/keys/local", json={"key": "local"})
-    await client.post("/api/local-declarations", json={"provider": "local"})
+    assert (await declare(client, "local")).status_code == 200
 
 
 async def test_the_preset_is_local_only_with_the_lock_and_its_venue(tmp_path):

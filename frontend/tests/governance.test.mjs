@@ -3,8 +3,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { HOLDS, SUGGESTED_HOLDS, holdsBody, holdsOf, moveTargets } from '../src/projects.js';
-import { ApiError, confirmedChange, del } from '../src/api.js';
-import { forgetModels, loadModels } from '../src/settings.js';
+import { ApiError, confirmedChange } from '../src/api.js';
+import { forgetModels, keptModels, loadModels } from '../src/settings.js';
+import { auditDetail } from '../src/audit.js';
+import { makeT } from '../src/i18n/index.js';
 
 test('the three answers set the level, and the review answer the lock and its venue', () => {
   assert.deepEqual(HOLDS, ['own', 'private', 'review']);
@@ -29,26 +31,30 @@ test('a review-locked project\'s conversations move only to another locked proje
   assert.deepEqual(moveTargets(projects, projects[1]).map((p) => p.id), ['r', 's']);
 });
 
-test('a change that needs confirmation is sent again with its token only when confirmed', async () => {
+test('a change that needs confirmation is sent again with its token only when confirmed', async (t) => {
   const sent = [];
-  const send = async (token) => {
-    sent.push(token);
-    if (!token) throw new ApiError(409, 'confirmation_required', { code: 'confirmation_required', token: 't1' });
-    return { ok: true };
-  };
-  assert.equal(await confirmedChange(send, async () => false), null);
-  assert.deepEqual(sent, [null]); // declined: sent once, never with the token
-  assert.deepEqual(await confirmedChange(send, async () => true), { ok: true });
-  assert.deepEqual(sent, [null, null, 't1']);
-  await assert.rejects(confirmedChange(async () => { throw new ApiError(400, 'general_project'); }, async () => true),
-    (error) => error.code === 'general_project');
-  assert.deepEqual(await confirmedChange(async () => ({ applied: true }), async () => assert.fail('not asked')),
-    { applied: true }); // a stricter change goes ahead without asking
+  t.mock.method(globalThis, 'fetch', async (path, { method, body }) => {
+    const parsed = body && JSON.parse(body);
+    sent.push([method, path, parsed]);
+    if (parsed?.token === 't1' || path.endsWith('?token=t1')) return Response.json({ ok: true });
+    return Response.json({ code: 'confirmation_required', token: 't1' }, { status: 409 });
+  });
+  assert.equal(await confirmedChange('POST', '/api/projects/p/sensitivity', { level: 'normal' }, async () => false), null);
+  assert.deepEqual(sent, [['POST', '/api/projects/p/sensitivity', { level: 'normal' }]]); // declined: sent once
+  assert.deepEqual(await confirmedChange('POST', '/api/projects/p/sensitivity', { level: 'normal' }, async () => true),
+    { ok: true });
+  assert.deepEqual(sent.at(-1), ['POST', '/api/projects/p/sensitivity', { level: 'normal', token: 't1' }]);
+  assert.deepEqual(await confirmedChange('DELETE', '/api/audit', undefined, async () => true), { ok: true });
+  assert.deepEqual(sent.at(-1), ['DELETE', '/api/audit?token=t1', undefined]); // a DELETE's token goes in its query
 });
 
-test('a refusal keeps the whole answer, with its token', async (t) => {
-  t.mock.method(globalThis, 'fetch', async () => Response.json({ code: 'confirmation_required', token: 'abc' }, { status: 409 }));
-  await assert.rejects(del('/api/audit'), (error) => error.code === 'confirmation_required' && error.data.token === 'abc');
+test('a change that needs no confirmation goes ahead, and other refusals are thrown', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (path) => (path.includes('general')
+    ? Response.json({ code: 'general_project' }, { status: 400 }) : Response.json({ applied: true })));
+  assert.deepEqual(await confirmedChange('POST', '/api/projects/p/sensitivity', { level: 'private' },
+    async () => assert.fail('not asked')), { applied: true }); // a stricter change goes ahead without asking
+  await assert.rejects(confirmedChange('POST', '/api/projects/general/sensitivity', { level: 'private' }, async () => true),
+    (error) => error instanceof ApiError && error.code === 'general_project');
 });
 
 test('listings are kept per project, each asking for that project\'s allowed models', async (t) => {
@@ -65,4 +71,35 @@ test('listings are kept per project, each asking for that project\'s allowed mod
   assert.deepEqual(asked, ['/api/providers/openrouter/models', '/api/providers/openrouter/models?project_id=p1',
     '/api/providers/openrouter/models?project_id=p2']);
   forgetModels();
+});
+
+test('a provider\'s earlier rows are kept when only its listing failed, never across a change of protection', () => {
+  const a = { provider: 'openrouter', id: 'a' };
+  const b = { provider: 'local', id: 'b' };
+  const before = { protection: 'normal', models: [a, b] };
+  assert.deepEqual(keptModels(before, { protection: 'normal', models: [b] }, new Set(['openrouter'])), [b, a]);
+  assert.deepEqual(keptModels(before, { protection: 'private', models: [b] }, new Set(['openrouter'])), [b]); // tightened
+  assert.deepEqual(keptModels(before, null), []); // nothing could be read: nothing is offered
+  assert.deepEqual(keptModels(null, { protection: 'private', models: [b] }, new Set(['openrouter'])), [b]);
+});
+
+test('audit details are shown in the interface language, codes this version does not name as they are', () => {
+  const dates = new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeZone: 'UTC' });
+  const zh = makeT('zh-CN');
+  const en = makeT('en');
+  const change = { event: 'sensitivity_changed', data: { from: 'normal', to: 'private', revoked_runs: 0 } };
+  assert.equal(auditDetail(zh, change, dates), '从：普通 · 到：私密 · 停止的运行：0');
+  assert.equal(auditDetail(en, change, dates), 'from: Normal · to: Private · runs stopped: 0');
+  assert.equal(auditDetail(zh, { event: 'outbound', data: { decision: 'deny', reason: 'key_not_confirmed',
+    kind: 'model_provider', destination: 'https://openrouter.ai:443' } }, dates),
+  '已拒绝：密钥设置未确认 · 模型服务商 · https://openrouter.ai:443');
+  assert.equal(auditDetail(en, { event: 'review_lock_changed', data: { locked: true, venue_set: false } }, dates),
+    'locked: yes · venue given: no');
+  assert.equal(auditDetail(en, { event: 'deletion', data: { kind: 'conversation', deleted: { runs: 2, turns: 2 } } }, dates),
+    'what: conversation · records removed: 4');
+  assert.equal(auditDetail(en, { event: 'private_route_changed', data: { route: 'openrouter:x/y', enabled: null } }, dates),
+    'route: openrouter:x/y');
+  assert.equal(auditDetail(en, { event: 'later_event', data: { newer_field: 'code' } }, dates), 'newer_field: code');
+  assert.equal(auditDetail(en, { event: 'outbound', data: { decision: 'deny', reason: 'a_newer_reason' } }, dates),
+    'Refused: a_newer_reason');
 });

@@ -203,7 +203,8 @@ async def test_cancel_during_the_model_call_ends_the_turn_and_settles_its_estima
         [(attempt,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
                                   run_id)
         assert json.loads(attempt) == {"step": 0, "route": json.loads(attempt)["route"], "outcome": "cancelled",
-                                       "http_status": None, "dispatched": True, "charge": "unknown"}
+                                       "http_status": None, "dispatched": True, "charge": "unknown",
+                                       "retention": {"level": "normal"}}  # the terms it was sent under
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert turn["accounting"] == {"reported_usd": 0, "estimated_usd": estimate, "unknown_attempts": 1,
                                       "complete": True}

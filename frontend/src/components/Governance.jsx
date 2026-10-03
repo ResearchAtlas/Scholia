@@ -9,6 +9,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, confirmedChange, del, get, post, put } from '../api.js';
 import { HOLDS, holdsOf } from '../projects.js';
 import { forgetModels } from '../settings.js';
+import { auditDetail } from '../audit.js';
 import { CommitField, Field, LoadState, Problem, Section, Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -112,11 +113,10 @@ export function ProjectProtection({ project, onProjectChanged }) {
   const choose = (holds) => run(() => {
     if (holds === 'review') return post(`${base}/review-lock`, { locked: true });
     const level = LEVEL_OF[holds];
-    return confirmedChange((token) => post(`${base}/sensitivity`, { level, ...(token ? { token } : {}) }),
+    return confirmedChange('POST', `${base}/sensitivity`, { level },
       () => ask(t('protection.confirmTitle'), t(`protection.loosen.${level}`)));
   });
-  const unlock = () => run(() => confirmedChange(
-    (token) => post(`${base}/review-lock`, { locked: false, ...(token ? { token } : {}) }),
+  const unlock = () => run(() => confirmedChange('POST', `${base}/review-lock`, { locked: false },
     () => ask(t('protection.unlockTitle'), t('protection.unlockBody'))));
   const holds = holdsOf(project);
   return (
@@ -194,7 +194,8 @@ export function KeyConfirmation({ provider, onChanged }) {
           </a>
         ))}
         <Button size="sm" variant={current ? 'outline' : 'default'} className="ml-auto h-8" disabled={busy}
-          onClick={() => run(() => post('/api/key-attestations', { provider: provider.name, statement: confirmation.statement }))}>
+          onClick={() => run(() => post('/api/key-attestations', // for the key and the statement this card shows
+            { provider: provider.name, statement: confirmation.statement, key: confirmation.key }))}>
           {current ? t('keyConfirm.again') : t('keyConfirm.confirm')}
         </Button>
       </div>
@@ -230,7 +231,7 @@ export function LocalDeclaration({ provider, onChanged }) {
       <div className="flex justify-end">
         <Button size="sm" variant={declared ? 'outline' : 'default'} className="h-8" disabled={busy}
           onClick={() => run(() => (declared ? del(`/api/local-declarations/${encodeURIComponent(provider.name)}`)
-            : post('/api/local-declarations', { provider: provider.name })))}>
+            : post('/api/local-declarations', { provider: provider.name, origin: provider.origin })))}>
           {declared ? t('localDeclare.withdraw') : t('localDeclare.declare')}
         </Button>
       </div>
@@ -351,8 +352,7 @@ export function AuditLog({ project }) {
     setExported(done.path);
     return done;
   });
-  const clear = () => run(() => confirmedChange(
-    (token) => del(`/api/audit${token ? `?token=${encodeURIComponent(token)}` : ''}`),
+  const clear = () => run(() => confirmedChange('DELETE', '/api/audit', undefined,
     () => ask(t('audit.clearTitle'), t('audit.clearBody'), t('audit.clearConfirm'))));
   const dates = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
   return (
@@ -376,7 +376,7 @@ export function AuditLog({ project }) {
           {page.entries.length === 0 && <p className="text-sm text-muted-foreground">{t('audit.empty')}</p>}
           {page.entries.length > 0 && (
             <ol className="scroll-thin max-h-96 divide-y overflow-y-auto rounded-lg border">
-              {page.entries.map((entry) => <AuditEntry key={entry.seq} entry={entry} at={dates.format(new Date(entry.at))} />)}
+              {page.entries.map((entry) => <AuditEntry key={entry.seq} entry={entry} dates={dates} />)}
             </ol>
           )}
           {page.next && <Button variant="ghost" size="sm" disabled={busy} onClick={older}>{t('audit.more')}</Button>}
@@ -387,15 +387,12 @@ export function AuditLog({ project }) {
   );
 }
 
-function AuditEntry({ entry, at }) {
+function AuditEntry({ entry, dates }) {
   const t = useT();
   const named = t(`audit.event.${entry.event}`);
   const event = named === `audit.event.${entry.event}` ? entry.event : named; // an event this version does not name
-  const { decision, reason, destination } = entry.data;
-  const detail = entry.event === 'outbound'
-    ? [decision === 'allow' ? t('audit.allowed') : t('audit.refused', { reason }), destination].filter(Boolean).join(' · ')
-    : Object.entries(entry.data).map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
-      .join(' · ');
+  const at = dates.format(new Date(entry.at));
+  const detail = auditDetail(t, entry, dates);
   return (
     <li className="grid gap-0.5 px-3 py-2 text-sm">
       <div className="flex items-baseline justify-between gap-3">

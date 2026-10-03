@@ -13,7 +13,7 @@ import json
 import pytest
 
 from backend import governance, openrouter_client
-from scholia_app import MockProvider, background_idle, send, started
+from scholia_app import MockProvider, background_idle, confirm_key, declare, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -47,8 +47,7 @@ async def private_conversation(client, *, confirm=True, offer="all"):
     await save(client, {"providers.openrouter.models": offer})
     project = (await client.post("/api/projects", json={"name": "Interviews", "sensitivity": "private"})).json()["id"]
     if confirm:
-        response = await client.post("/api/key-attestations",
-                                     json={"provider": "openrouter", "statement": governance.KEY_STATEMENT})
+        response = await confirm_key(client)
         assert response.status_code == 200, response.text
     conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
     return project, conversation
@@ -133,7 +132,7 @@ async def test_a_declared_local_server_takes_private_requests_without_openrouter
         refused = await client.post(f"/api/conversations/{conversation}/message/stream",
                                     json={"content": "hi", "model": "llama", "provider": "local"})
         assert (refused.status_code, refused.json()["code"]) == (403, "not_declared")  # loopback is only transport
-        assert (await client.post("/api/local-declarations", json={"provider": "local"})).status_code == 200
+        assert (await declare(client, "local")).status_code == 200
         stream = await send(client, conversation, model="llama", provider="local")
         assert stream[-1]["status"] == "succeeded"
         assert "provider" not in provider.answers[-1]
@@ -146,7 +145,7 @@ async def test_a_local_only_project_with_a_declared_server_uses_it_by_default(tm
         await save(client, {"providers.local.kind": "openai-compatible", "providers.local.base_url": LOCAL,
                             "providers.local.models": ["llama"]})
         assert (await client.put("/api/keys/local", json={"key": "local"})).status_code == 200
-        await client.post("/api/local-declarations", json={"provider": "local"})
+        await declare(client, "local")
         project = (await client.post("/api/projects", json={"name": "Offline", "sensitivity": "local_only"})).json()["id"]
         conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
         refused = await client.post(f"/api/conversations/{conversation}/message/stream",
@@ -248,3 +247,32 @@ async def test_the_gate_reads_the_allowlist_and_the_catalog_itself(tmp_path):
                                                                 inputs.private_route(conn, PLAIN_MODEL)))
         assert flags == ({"provider": {"zdr": True}}, None)
         assert project
+
+
+async def test_each_attempt_records_the_retention_policy_it_was_sent_under(tmp_path):
+    # Ticket 18's provenance: each call's route and its retention terms.
+    provider = provider_for_private()
+    async with started(tmp_path / "data", provider) as client:
+        await save(client, {"providers.local.kind": "openai-compatible", "providers.local.base_url": LOCAL,
+                            "providers.local.models": "all"})
+        await client.put("/api/keys/local", json={"key": "local"})
+        await declare(client, "local")
+        _, conversation = await private_conversation(client)
+        await send(client, conversation, model=ZDR_MODEL)
+        await send(client, conversation, model="llama", provider="local")
+        normal = (await client.post("/api/conversations", json={"title": "Plain"})).json()["id"]
+        await send(client, normal, model=ZDR_MODEL)
+        await background_idle(client)
+        entry = governance.shipped()["entries"][0]
+        attempts = await rows(client, "SELECT r.workflow, e.data FROM run_events e JOIN runs r ON r.id = e.run_id"
+                                      " WHERE e.type = 'model_attempt' ORDER BY r.started_at, e.seq")
+        policies = [(workflow, json.loads(data)["retention"]) for workflow, data in attempts]
+        [(declared_at,)] = await rows(client, "SELECT declared_at FROM local_declarations")
+        assert policies == [
+            ("agent", {"level": "private", "zero_retention": True, "allowlist_entry": "openrouter:*",
+                       "terms_url": entry["terms_url"], "checked_on": entry["checked_on"]}),
+            ("title", {"level": "private", "zero_retention": True, "allowlist_entry": "openrouter:*",
+                       "terms_url": entry["terms_url"], "checked_on": entry["checked_on"]}),
+            ("agent", {"level": "private", "declared_origin": "http://127.0.0.1:11434", "declared_at": declared_at}),
+            ("agent", {"level": "normal"}),
+        ]

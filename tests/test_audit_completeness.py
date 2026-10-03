@@ -9,11 +9,12 @@ import asyncio
 import json
 import sqlite3
 import stat
+from pathlib import Path
 
 import pytest
 
 from backend import governance
-from scholia_app import MockProvider, background_idle, send, started
+from scholia_app import MockProvider, background_idle, confirm_key, declare, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -54,8 +55,8 @@ async def test_every_governance_change_is_audited_without_content(tmp_path):
         await confirm_change(client, "POST", f"/api/projects/{project}/sensitivity", {"level": "normal"})
         await client.post(f"/api/projects/{project}/review-lock", json={"locked": True, "venue": SECRET})
         await confirm_change(client, "POST", f"/api/projects/{project}/review-lock", {"locked": False})
-        await client.post("/api/key-attestations", json={"provider": "openrouter", "statement": governance.KEY_STATEMENT})
-        await client.post("/api/local-declarations", json={"provider": "local"})
+        assert (await confirm_key(client)).status_code == 200
+        assert (await declare(client, "local")).status_code == 200
         await client.delete("/api/local-declarations/local")
         await client.put("/api/private-routes/openrouter:x/model", json={"enabled": True})
         await client.delete(f"/api/conversations/{conversation}")
@@ -108,6 +109,12 @@ async def test_an_export_is_an_owner_only_file_in_the_data_folder_and_is_audited
         [(data,)] = await rows(client, "SELECT data FROM audit_log WHERE event = 'audit_exported'")
         assert json.loads(data) == {"destination": f"exports/{path.name}", "rows": 1}
         assert (await client.post("/api/audit/export")).json()["rows"] > 1  # the whole log
+        # A project's export holds every clearing of the log, as its view does.
+        token = (await client.delete("/api/audit")).json()["token"]
+        await client.delete("/api/audit", params={"token": token})
+        again = (await client.post("/api/audit/export", json={"project_id": project})).json()
+        content = json.loads(Path(again["path"]).read_text())
+        assert [e["event"] for e in content["entries"]] == ["audit_cleared"]
         unknown = await client.post("/api/audit/export", json={"project_id": "SECRET not an id"})
         assert unknown.status_code == 404  # only an existing project's id goes in the record
         assert "SECRET" not in json.dumps(await rows(client, "SELECT * FROM audit_log"))
@@ -147,3 +154,44 @@ async def test_the_database_keeps_the_log_append_only(tmp_path):
             with pytest.raises(sqlite3.IntegrityError):
                 await asyncio.to_thread(db.write, lambda conn, sql=sql: conn.execute(sql))
         assert await rows(client, "SELECT * FROM audit_log") == before
+
+
+async def test_an_export_is_recorded_before_its_file_is_written_and_a_failure_leaves_no_file(tmp_path, monkeypatch):
+    from backend import app as app_module
+    async with started(tmp_path / "data") as client:
+        real = app_module.write_private
+
+        def written_then_failed(path, data):
+            real(path, data)
+            raise OSError("the folder could not be synced")
+
+        monkeypatch.setattr(app_module, "write_private", written_then_failed)
+        response = await client.post("/api/audit/export")
+        assert (response.status_code, response.json()["code"]) == (500, "export_failed")
+        [(data,)] = await rows(client, "SELECT data FROM audit_log WHERE event = 'audit_exported'")
+        destination = tmp_path / "data" / json.loads(data)["destination"]
+        assert not destination.exists()  # the record of an attempt stays; no unrecorded file does
+
+
+async def test_clearing_records_are_never_deleted(tmp_path):
+    async with started(tmp_path / "data") as client:
+        for _ in range(2):
+            token = (await client.delete("/api/audit")).json()["token"]
+            await client.delete("/api/audit", params={"token": token})
+        db = client.state["db"]
+        for which in ("min", "max"):  # the earlier one, older than the latest clearing, as well
+            with pytest.raises(sqlite3.IntegrityError):
+                await asyncio.to_thread(db.write, lambda conn, which=which: conn.execute(
+                    f"DELETE FROM audit_log WHERE seq = (SELECT {which}(seq) FROM audit_log)"))
+        assert await rows(client, "SELECT event FROM audit_log") == [("audit_cleared",), ("audit_cleared",)]
+
+
+async def test_every_refusal_reason_and_destination_kind_is_named_in_each_interface_language():
+    # The audit view shows the gate's refusals and destination kinds through the catalogs.
+    from backend.outbound_gate import Kind
+    from test_outbound_gate import REASONS
+    root = Path(__file__).resolve().parents[1] / "frontend" / "src" / "i18n"
+    for name in ("en.json", "zh-CN.json"):
+        catalog = json.loads((root / name).read_text(encoding="utf-8"))
+        assert {r for r in REASONS | {"local_server_not_yours"} if f"audit.reason.{r}" not in catalog} == set(), name
+        assert {k.value for k in Kind if f"audit.kind.{k.value}" not in catalog} == set(), name

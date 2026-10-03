@@ -11,11 +11,10 @@ export function startSession(win = window) {
 }
 
 export class ApiError extends Error {
-  constructor(status, code, data = null) {
+  constructor(status, code) {
     super(code);
     this.status = status;
     this.code = code;
-    this.data = data; // the whole answer, such as a confirmation's token
   }
 }
 
@@ -41,7 +40,7 @@ export async function api(method, path, body, { signal } = {}) {
     throw new ApiError(0, 'unreachable');
   }
   const data = await response.json().catch(() => null);
-  if (!response.ok) throw new ApiError(response.status, data?.code ?? 'http_error', data);
+  if (!response.ok) throw new ApiError(response.status, data?.code ?? 'http_error');
   return data;
 }
 
@@ -98,14 +97,24 @@ async function saveNow(updates, projectId) {
 }
 
 // A change that may need the researcher's confirmation (a less strict level, lifting the review
-// lock, clearing the audit log): it is sent as is; when the backend asks for confirmation, ask()
-// is awaited with the change's token, and resolves to whether the researcher confirmed; the
-// change is then sent again with it. Resolves to the answer, or null when not confirmed.
-export async function confirmedChange(send, ask) {
+// lock, clearing the audit log): it is sent as is; when the backend answers 409
+// confirmation_required with a token, ask() resolves to whether the researcher confirmed, and the
+// change is sent again with the token (in the body, or the query of a DELETE). Resolves to the
+// answer, or null when not confirmed; other refusals throw as api() does.
+export async function confirmedChange(method, path, body, ask) {
+  let response;
   try {
-    return await send(null);
-  } catch (error) {
-    if (!(error instanceof ApiError) || error.code !== 'confirmation_required') throw error;
-    return (await ask()) ? send(error.data.token) : null;
+    response = await fetch(path, { method, headers: headers(body !== undefined),
+      body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch {
+    throw new ApiError(0, 'unreachable');
   }
+  const data = await response.json().catch(() => null);
+  if (response.ok) return data;
+  if (data?.code !== 'confirmation_required' || typeof data.token !== 'string') {
+    throw new ApiError(response.status, data?.code ?? 'http_error');
+  }
+  if (!(await ask())) return null;
+  return body === undefined ? api(method, `${path}?token=${encodeURIComponent(data.token)}`)
+    : api(method, path, { ...body, token: data.token });
 }

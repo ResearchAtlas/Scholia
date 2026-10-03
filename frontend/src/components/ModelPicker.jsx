@@ -13,7 +13,7 @@ import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { errorText, visible } from '../text.js';
-import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, onCatalogChange, listingToJudge, settingKey, stillUsable } from '../settings.js';
+import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, keptModels, loadModels, onCatalogChange, listingToJudge, settingKey, stillUsable } from '../settings.js';
 import { CommitField, LoadState } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
@@ -90,7 +90,7 @@ function useCatalog(open, projectId, chosenModel) {
         ? listing.value.models.filter((m) => m.offered && m.allowed !== false).map((m) => ({ ...m, provider: ready[i].name }))
         : []));
       // A provider whose listing failed is reported with Try again; one that could not be read
-      // at all keeps the rows shown before.
+      // at all keeps the rows shown before, while the project's protection is the same.
       const failed = listings.map((listing) => (listing.status === 'rejected'
         ? (listing.reason instanceof ApiError ? listing.reason.code : 'internal') : listing.value.status?.error ?? null));
       const unread = new Set(ready.filter((p, i) => listings[i].status === 'rejected').map((p) => p.name));
@@ -106,11 +106,12 @@ function useCatalog(open, projectId, chosenModel) {
         const own = at >= 0 && listings[at].status === 'fulfilled' ? listings[at].value : null;
         if (at < 0 || !stillUsable(own, choice.model)) setChoice(null); // its provider gone, or no longer offered or usable
       }
-      setCatalog((current) => ({ ...next, models: [...next.models, ...(current?.models ?? []).filter((m) => unread.has(m.provider))] }));
-    } catch (error) { // shown with Try again; what was read before stays
+      setCatalog((current) => ({ ...next, models: keptModels(current, next, unread) }));
+    } catch (error) { // shown with Try again; no model is offered meanwhile, since what the project allows is unknown
       if (mine === latest.current && here.current) {
         const problem = error instanceof ApiError ? error.code : 'internal';
-        setCatalog((current) => ({ ...(current ?? { models: [], recent: [], efforts: {}, several: false, defaultModel: 'auto' }), problem }));
+        setCatalog((current) => ({ ...(current ?? { recent: [], efforts: {}, several: false, defaultModel: 'auto' }),
+          models: keptModels(current, null), problem }));
       }
     }
   }, [projectId]);

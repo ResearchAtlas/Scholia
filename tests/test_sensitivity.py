@@ -11,13 +11,14 @@ with the PRs that add them; an indexing-style run's dispatch check is covered he
 
 import asyncio
 import json
+import time
 
 import pytest
 
 from backend import governance, openrouter, openrouter_client
 from backend.db import new_id
 from backend.runs import may_dispatch
-from scholia_app import FakeKeyring, MockProvider, background_idle, events, send, started
+from scholia_app import FakeKeyring, MockProvider, background_idle, confirm_key, events, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -251,7 +252,7 @@ async def test_continue_after_a_tightening_builds_its_turn_under_the_current_pol
 
         refused = await client.post(f"/api/runs/{revoked}/continue", json={"model": ZDR_MODEL})
         assert (refused.status_code, refused.json()["code"]) == (403, "key_not_confirmed")  # Private's rule now
-        await client.post("/api/key-attestations", json={"provider": "openrouter", "statement": governance.KEY_STATEMENT})
+        assert (await confirm_key(client)).status_code == 200
         continued = events(await client.post(f"/api/runs/{revoked}/continue", json={"model": ZDR_MODEL}))
         assert continued[-1]["status"] == "succeeded"
         assert provider.answers[-1]["provider"] == {"zdr": True}
@@ -369,3 +370,65 @@ async def test_a_level_changed_while_a_turn_is_admitted_refuses_it_before_anythi
         refused = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
         assert (refused.status_code, refused.json()["code"]) == (409, "project_changed")
         assert provider.chats == [] and await rows(client, "SELECT count(*) FROM runs") == [(0,)]
+
+
+# A revocation between the gate's decision and the hand-off to the transport
+
+
+@pytest.mark.parametrize("change", ["tighten", "lock", "delete"])
+async def test_a_revocation_never_commits_between_a_decision_and_its_hand_off(tmp_path, monkeypatch, change):
+    # The exact interleaving: the gate has decided to allow the request, and before it hands the
+    # request to the transport, a tightening, a lock or a deletion revokes the run, and this
+    # process hears of it only later. The revocation waits for the hand-off, so the request was
+    # dispatched before the revocation committed (and is then stopped as any running request
+    # is), never after it.
+    from backend import outbound_gate
+    from backend.db import deletion
+    from backend.runs import Harness
+    provider = MockProvider()
+    order = []
+    async with started(tmp_path / "data", provider) as client:
+        project = await new_project(client)
+        conversation = await new_conversation(client, project)
+        loop, db = asyncio.get_running_loop(), client.state["db"]
+        real_check, real_dispatched = outbound_gate.OutboundGate._check, outbound_gate._dispatched
+        real_revoke_running, real_revoke, real_harness_revoke = governance.revoke_running, deletion._revoke, Harness.revoke
+        requests = {
+            "tighten": lambda: set_level(client, project, "private"),
+            "lock": lambda: client.post(f"/api/projects/{project}/review-lock", json={"locked": True}),
+            "delete": lambda: client.delete(f"/api/conversations/{conversation}"),
+        }
+
+        def revoked_in_record():
+            row = db.read(lambda conn: conn.execute("SELECT cancel_reason FROM runs WHERE kind = 'turn'").fetchone())
+            return row is None or row[0] == "revoked"
+
+        def check_then_revoke(self, request, scope):
+            kind = real_check(self, request, scope)
+            if scope.project_id == project and not order:  # the turn's call, decided and allowed
+                asyncio.run_coroutine_threadsafe(requests[change](), loop)
+                deadline = time.monotonic() + 1
+                while not revoked_in_record() and time.monotonic() < deadline:
+                    time.sleep(0.01)  # the revocation is not let through before the hand-off
+            return kind
+
+        def dispatched(request):
+            order.append("dispatched")
+            real_dispatched(request)
+
+        def heard_later(self, run_ids):  # this process hears of the revocation only after a while
+            loop.call_later(0.3, real_harness_revoke, self, run_ids)
+
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_revoke)
+        monkeypatch.setattr(outbound_gate, "_dispatched", dispatched)
+        monkeypatch.setattr(Harness, "revoke", heard_later)
+        monkeypatch.setattr(governance, "revoke_running",
+                            lambda *args: order.append("revoked") or real_revoke_running(*args))
+        monkeypatch.setattr(deletion, "_revoke", lambda conn: order.append("revoked") or real_revoke(conn))
+        response = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
+        await wait_for(lambda: "revoked" in order)
+        await asyncio.sleep(0.4)
+        await background_idle(client)
+        assert order[:2] == ["dispatched", "revoked"]
+        if change != "delete":
+            assert events(response)[-1]["cancel_reason"] == "revoked"
