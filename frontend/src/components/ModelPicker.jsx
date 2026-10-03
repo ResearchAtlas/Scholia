@@ -12,7 +12,7 @@ import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { errorText, visible } from '../text.js';
 import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, onCatalogChange, listingToJudge, settingKey, stillUsable } from '../settings.js';
-import { CommitField } from './fields.jsx';
+import { CommitField, LoadState } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
 
@@ -96,9 +96,10 @@ function useCatalog(open, projectId, chosenModel) {
         if (at < 0 || !stillUsable(own, choice.model)) setChoice(null); // its provider gone, or no longer offered or usable
       }
       setCatalog(next);
-    } catch {
+    } catch (error) { // shown with Try again; what was read before stays
       if (mine === latest.current && here.current) {
-        setCatalog((current) => current ?? { models: [], recent: [], efforts: {}, several: false, defaultModel: 'auto' });
+        const problem = error instanceof ApiError ? error.code : 'internal';
+        setCatalog((current) => ({ ...(current ?? { models: [], recent: [], efforts: {}, several: false, defaultModel: 'auto' }), problem }));
       }
     }
   }, [projectId]);
@@ -215,7 +216,8 @@ export function ModelPicker({ projectId }) {
             {catalog && (query || recent.length > 0) && <Heading>{query ? t('picker.results') : t('picker.all')}</Heading>}
             {!catalog && <p className="px-2 py-3 text-sm text-muted-foreground" role="status">{t('common.loading')}</p>}
             {catalog && results.map((m) => <ModelItem key={`${m.provider}:${m.id}`} m={m} chosen={chosen} several={catalog.several} onPick={pick} />)}
-            {catalog && results.length === 0 && <p className="px-2 py-3 text-sm text-muted-foreground">{t('picker.none')}</p>}
+            {catalog?.problem && <div className="p-1"><LoadState problem={catalog.problem} onRetry={reload} /></div>}
+            {catalog && !catalog.problem && results.length === 0 && <p className="px-2 py-3 text-sm text-muted-foreground">{t('picker.none')}</p>}
           </div>
           {fixing && (
             <form className="space-y-1.5 border-t p-2" onSubmit={(event) => event.preventDefault()}>

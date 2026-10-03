@@ -71,7 +71,13 @@ export function Shell({ health, settings, onLanguage }) {
     const reads = projectReads.current;
     const read = ++reads.count;
     if (prefer !== undefined) reads.prefer = prefer;
-    const { projects: listed } = await get('/api/projects');
+    let listed;
+    try {
+      ({ projects: listed } = await get('/api/projects'));
+    } catch (error) {
+      if (read === reads.count) reads.prefer = undefined; // a failed read's preference does not outlive it
+      throw error;
+    }
     if (read !== reads.count) return listed; // a newer read is under way
     const wanted = reads.prefer ?? remembered();
     reads.prefer = undefined;

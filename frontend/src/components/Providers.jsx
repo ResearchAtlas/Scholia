@@ -269,19 +269,24 @@ function PerModel({ provider, table, save }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const [models, setModels] = useState(null);
+  const [problem, setProblem] = useState(null); // a listing that failed: Try again reads it again
   const [query, setQuery] = useState('');
   const newest = useRef(0); // only the newest read counts, so an older one cannot overwrite it
   const load = useCallback(() => {
     const mine = ++newest.current;
-    return loadModels(provider.name).then((listing) => mine === newest.current && setModels(listing.models.filter((m) => m.offered)))
-      .catch(() => mine === newest.current && setModels([]));
+    return loadModels(provider.name).then((listing) => {
+      if (mine !== newest.current) return;
+      setProblem(listing.status?.error ?? null); // a failed refresh is shown; rows it still holds stay
+      if (listing.models.length || !listing.status?.error) setModels(listing.models.filter((m) => m.offered));
+    }).catch((error) => mine === newest.current && setProblem(error instanceof ApiError ? error.code : 'internal'));
   }, [provider.name]);
+  const retry = () => { setProblem(null); load(); };
   useEffect(() => {
     load();
     const stop = onCatalogChange(load); // a default window, offer or key changed: the rows read again
     return () => { newest.current += 1; stop(); };
   }, [load]);
-  if (!models) return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
+  if (!models || (problem && !models.length)) return <LoadState problem={problem} onRetry={retry} />;
   const numbers = new Intl.NumberFormat(language);
   const price = new Intl.NumberFormat(language, { style: 'currency', currency: 'USD', maximumFractionDigits: 4 });
   const shown = models.filter((m) => `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase())).slice(0, 100);
@@ -292,6 +297,7 @@ function PerModel({ provider, table, save }) {
   };
   return (
     <div className="space-y-3">
+      {problem && <LoadState problem={problem} onRetry={retry} />}
       <p className="text-xs leading-relaxed text-muted-foreground">{t('providers.windowTrust')}</p>
       <label htmlFor={`per-model-${provider.name}`} className="sr-only">{t('providers.search')}</label>
       <Input id={`per-model-${provider.name}`} value={query} onChange={(event) => setQuery(event.target.value)}
