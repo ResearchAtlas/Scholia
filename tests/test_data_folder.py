@@ -423,7 +423,11 @@ def test_the_log_is_read_from_an_owner_only_copy(tmp_path, monkeypatch):
         modes.append(mode(Path(target)))
 
     monkeypatch.setattr(database.shutil, "copyfile", copyfile)
-    assert data_folder.database_problem(tmp_path / "Other")[0] == "newer"
+    umask = os.umask(0o022)  # permissive, so owner-only modes must come from the code
+    try:
+        assert data_folder.database_problem(tmp_path / "Other")[0] == "newer"
+    finally:
+        os.umask(umask)
     assert modes == [0o600, 0o600]
 
 
@@ -438,7 +442,8 @@ def test_a_database_whose_check_fails_is_logged_and_left_to_open_as_it_would(tmp
     monkeypatch.setattr(database.shutil, "copyfile", full)
     caplog.set_level("WARNING", logger=data_folder.log.name)
     assert data_folder.database_problem(tmp_path / "Other") is None
-    assert "could not be checked (OSError)" in caplog.text and str(tmp_path) not in caplog.text
+    assert [r.getMessage() for r in caplog.records] == [
+        f"the database in a chosen data folder could not be checked (OSError, errno {errno.ENOSPC})"]  # no path
 
 
 @pytest.mark.asyncio

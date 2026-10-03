@@ -138,7 +138,7 @@ def database_problem(folder):
     _check_folder(folder, os.getuid())
     path = folder / DB_NAME
     if path.is_symlink() or path.with_name(DB_NAME + "-wal").is_symlink():
-        raise UnsafeDataFolderError("Scholia will not open its data folder: its database is a link")
+        raise UnsafeDataFolderError("Scholia will not open its data folder: its database or its log is a link")
     if not path.is_file():
         return None
     try:
@@ -150,7 +150,8 @@ def database_problem(folder):
     except DatabaseDamagedError:
         return None
     except OSError as error:  # cannot tell here: opening the database checks it again
-        log.warning("the database in a chosen data folder could not be checked (%s)", type(error).__name__)
+        log.warning("the database in a chosen data folder could not be checked (%s, errno %s)",
+                    type(error).__name__, error.errno)
         return None
     return None
 
