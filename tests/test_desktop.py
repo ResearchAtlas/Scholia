@@ -4,6 +4,7 @@ The window is a stand-in that talks to the real server over loopback (registered
 with the test network block) and returns when the test closes it.
 """
 
+import fcntl
 import json
 import os
 import signal
@@ -452,3 +453,64 @@ def test_a_data_folder_under_a_parent_with_an_access_rule_letting_others_in_is_r
                 desktop.take_lock(parent / "data")
         finally:
             subprocess.run(["/bin/chmod", "-N", str(parent)], check=True)
+
+
+def test_a_link_above_the_data_folder_is_followed_and_every_folder_on_its_way_checked(tmp_path):
+    safe, shared = tmp_path / "safe", tmp_path / "shared"
+    (safe / "actual").mkdir(parents=True)
+    shared.mkdir()
+    os.symlink(safe / "actual", shared / "hop")  # a link through a folder others can change
+    os.symlink(shared / "hop", safe / "entry")
+    os.chmod(shared, 0o777)
+    try:
+        with pytest.raises(desktop.UnsafeDataFolderError):
+            desktop.take_lock(safe / "entry" / "data")
+        os.chmod(shared, 0o755)
+        fd = desktop.take_lock(safe / "entry" / "data")  # the same way through safe folders
+        assert fd is not None
+        os.close(fd)
+    finally:
+        os.chmod(shared, 0o755)
+
+
+def test_nothing_is_made_under_a_folder_others_could_change(tmp_path):
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir()
+    os.chmod(unsafe, 0o777)
+    try:
+        with pytest.raises(desktop.UnsafeDataFolderError):
+            desktop.take_lock(unsafe / "missing" / "Scholia")
+        assert not (unsafe / "missing").exists()
+    finally:
+        os.chmod(unsafe, 0o755)
+
+
+def test_a_lock_file_open_to_others_and_held_is_refused_not_taken_for_another_scholia(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir(mode=0o700)
+    lock = data / desktop.LOCK_FILE
+    lock.write_text("")
+    os.chmod(lock, 0o644)  # another account could have opened it and taken the lock
+    held = os.open(lock, os.O_RDONLY)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(desktop.UnsafeDataFolderError):
+            desktop.take_lock(data)
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o600  # narrowed for the next launch
+    finally:
+        os.close(held)
+    fd = desktop.take_lock(data)
+    assert fd is not None
+    os.close(fd)
+
+
+def test_a_data_folder_others_could_write_is_refused_before_its_lock_is_opened(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    os.chmod(data, 0o777)
+    try:
+        with pytest.raises(desktop.UnsafeDataFolderError):
+            desktop.take_lock(data)
+        assert not (data / desktop.LOCK_FILE).exists()
+    finally:
+        os.chmod(data, 0o700)

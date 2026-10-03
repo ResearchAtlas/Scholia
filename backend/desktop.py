@@ -55,51 +55,90 @@ def data_folder() -> Path:
 
 def take_lock(data_dir) -> int | None:
     """Take the data folder's lock. Returns its file descriptor, to keep open while
-    the app runs, or None when another instance holds it. A lock file that is a link,
-    not a regular file or not this account's is refused (UnsafeDataFolderError): it is
-    opened before the folder is checked, so it is never followed."""
+    the app runs, or None when another instance holds it. The folder is checked first
+    (no other account can replace what it holds), and the lock file is opened without
+    following a link; one that is not a regular file of this account's, or carries an
+    access rule letting others in, is refused (UnsafeDataFolderError). Scholia keeps its
+    lock file owner-only, so one another account could open is narrowed first, and if it is
+    then found held, another account holds it: refused too, not taken for another Scholia."""
     data_dir = Path(data_dir)
+    _check_ancestors(data_dir)  # before anything is made
     data_dir.parent.mkdir(parents=True, exist_ok=True)
-    _check_ancestors(data_dir)
+    _check_ancestors(data_dir)  # and the folders just made
     try:
         os.mkdir(data_dir, 0o700)
     except FileExistsError:
         pass
     if os.path.islink(data_dir):  # its target could be swapped after the check: never used
         raise UnsafeDataFolderError("Scholia will not open its data folder: the folder itself is a link")
+    _check_folder(data_dir, os.getuid())
     try:
         fd = os.open(data_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     except OSError as error:
         problem = _LINK if error.errno == errno.ELOOP else "its lock file cannot be opened"
         raise UnsafeDataFolderError(f"Scholia will not open its data folder: {problem}") from None
     info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or _acl_problem(data_dir / LOCK_FILE):
         os.close(fd)
         raise UnsafeDataFolderError("Scholia will not open its data folder: its lock file is not its own")
+    opened_to_others = stat.S_IMODE(info.st_mode) & 0o077
+    if opened_to_others:
+        os.fchmod(fd, stat.S_IMODE(info.st_mode) & 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
+        if opened_to_others:
+            raise UnsafeDataFolderError(
+                "Scholia will not open its data folder: its lock file was open to other accounts and is held") from None
         return None
     return fd
 
 
 def _check_ancestors(data_dir) -> None:
-    """Refuse a data folder another account could move or swap: every folder above it, as
-    written and as resolved, must be this account's or the system's, writable by no other
-    account unless sticky (as /tmp is: others cannot move what is not theirs), with no
-    access rule letting others in. Then the path names the folder that was checked."""
-    uid, path = os.getuid(), os.path.abspath(data_dir)
-    for ancestor in sorted(set(Path(path).parents) | set(Path(os.path.realpath(path)).parents)):
-        info = os.lstat(ancestor)
+    """Refuse a data folder another account could move or swap. The path above it is
+    resolved one part at a time, as the system does, and every folder and link met on the
+    way (those a link leads through included) must be this account's or the system's; every
+    folder must be writable by no other account unless sticky (as /tmp is: others cannot
+    move what is not theirs), with no access rule letting others in. Then the path keeps
+    naming the folder that was checked. Parts that do not exist yet are not checked; they
+    are made by this account under a checked folder."""
+    _resolve_checked(Path(os.path.abspath(data_dir)).parent, os.getuid(), [0])
+
+
+def _resolve_checked(path, uid, links):
+    current = Path(path.anchor)
+    _check_folder(current, uid)
+    for part in path.parts[1:]:
+        candidate = current / part
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            return None  # made later, by this account, under current
         if info.st_uid not in (uid, 0):
             raise UnsafeDataFolderError("Scholia will not open its data folder: a folder above it is another account's")
         if stat.S_ISLNK(info.st_mode):
-            continue  # it is resolved: the folders it leads to are checked as resolved
-        if stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX:
-            raise UnsafeDataFolderError("Scholia will not open its data folder: other accounts could move it")
-        if _acl_problem(ancestor):
-            raise UnsafeDataFolderError("Scholia will not open its data folder: an access rule above it lets others in")
+            links[0] += 1
+            if links[0] > 32:
+                raise UnsafeDataFolderError("Scholia will not open its data folder: too many links above it")
+            target = Path(os.readlink(candidate))
+            current = _resolve_checked(target if target.is_absolute() else current / target, uid, links)
+            if current is None:
+                return None
+            continue
+        _check_folder(candidate, uid)
+        current = candidate
+    return current
+
+
+def _check_folder(folder, uid) -> None:
+    info = os.lstat(folder)
+    if info.st_uid not in (uid, 0):
+        raise UnsafeDataFolderError("Scholia will not open its data folder: a folder above it is another account's")
+    if stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX:
+        raise UnsafeDataFolderError("Scholia will not open its data folder: other accounts could move it")
+    if _acl_problem(folder):
+        raise UnsafeDataFolderError("Scholia will not open its data folder: an access rule above it lets others in")
 
 
 def narrow_tree(data_dir) -> None:

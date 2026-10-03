@@ -643,3 +643,28 @@ async def test_an_unusable_key_is_refused_and_a_pasted_one_is_trimmed(tmp_path, 
         assert (await client.post("/api/setup", json={"openrouter_key": "  sk-or-v1-abc\n"})).status_code == 200
         assert "sk-or-v1-abc" in keyring.keys.values()
         assert (await client.put("/api/keys/openrouter", json={"key": key})).status_code == 400
+
+
+@pytest.mark.parametrize("endpoint", ["/api/settings", "/api/instructions"])
+async def test_a_project_read_is_ordered_with_its_deletion(tmp_path, monkeypatch, endpoint):
+    import threading
+    from backend import app as app_module
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Going"})).json()["id"]
+        entered, release = threading.Event(), threading.Event()
+        real = app_module.delete
+
+        def slow_delete(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(app_module, "delete", slow_delete)
+        deletion = asyncio.create_task(client.delete(f"/api/projects/{project}"))
+        await asyncio.to_thread(entered.wait, 5)
+        reading = asyncio.create_task(client.get(endpoint, params={"project_id": project}))
+        await asyncio.sleep(0.2)
+        assert not reading.done()  # it waits for the deletion
+        release.set()
+        assert (await deletion).json() == {"ok": True}
+        assert (await reading).status_code == 404  # never defaults for a project that is gone

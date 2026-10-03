@@ -368,7 +368,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @app.get("/api/settings")
     async def get_settings(project_id: str | None = None):
-        loaded = await settings_for(project_id)
+        async with project_files if project_id is not None else contextlib.nullcontext():  # ordered with deletion
+            loaded = await settings_for(project_id)
         return {"values": loaded.values, "warnings": loaded.warnings, "hash": loaded._digest}
 
     @app.put("/api/settings")
@@ -399,9 +400,11 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @app.get("/api/instructions")
     async def get_instructions(project_id: str | None = None):
-        path = await instructions_path(project_id)
-        text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
-        combined, warnings = await asyncio.to_thread(load_instructions, data_dir, project_id)
+        async with project_files if project_id is not None else contextlib.nullcontext():  # ordered with deletion
+            path = await instructions_path(project_id)
+            text = await asyncio.to_thread(
+                lambda: path.read_text(encoding="utf-8", errors="replace") if path.is_file() else "")
+            combined, warnings = await asyncio.to_thread(load_instructions, data_dir, project_id)
         return {"text": text, "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
 
     @app.put("/api/instructions")
