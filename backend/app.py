@@ -8,6 +8,7 @@ goes through the single writer; database calls run off the event loop.
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import shutil
@@ -25,7 +26,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
+from backend import APP_VERSION, budget_router, credentials, openrouter, openrouter_client, providers, reasoning_capability
 from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
@@ -169,6 +170,7 @@ class SettingsUpdate(BaseModel):
 class Instructions(BaseModel):
     project_id: str | None = None
     text: str
+    hash: str | None = None  # the file as it was read; a change since then is refused
 
 
 class EventStream(StreamingResponse):
@@ -288,11 +290,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir)}
 
     async def provider_list():
-        configured = providers.configured(data_dir)
+        configured = providers.configured(data_dir, include_off=True)
+        on = providers.configured(data_dir)
         keys = await asyncio.gather(*(asyncio.to_thread(credentials.load_key, data_dir, name, keyring_backend)
                                       for name in configured))
-        return [{"name": p.name, "kind": p.kind, "base_url": p.base_url, "has_key": key is not None}
-                for p, key in zip(configured.values(), keys)]
+        return [{"name": p.name, "kind": p.kind, "base_url": p.base_url, "has_key": key is not None,
+                 "enabled": p.name in on} for p, key in zip(configured.values(), keys)]
 
     @app.get("/api/setup")
     async def setup_status():
@@ -351,7 +354,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @app.put("/api/keys/{provider:name}")
     async def put_key(provider: str, body: Key):
         async with harness().settings_lock:  # ordered with the provider snapshot of turn admission
-            if provider not in providers.configured(data_dir):  # as the key is saved against it
+            if provider not in providers.configured(data_dir, include_off=True):  # as the key is saved against it
                 raise ApiError(404, "unknown_provider", "That provider is not set up")
             refuse_if_busy({provider})
             return {"ok": True, "warning": await _to_end(_save_key(provider, body.key))}
@@ -372,7 +375,32 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         status = openrouter_client.catalog_status(configured[provider], key)
         if openrouter_client.generation() != generation:  # after everything this answer reports
             raise ApiError(409, "settings_changed", "The provider changed while its models were listed")
-        return {"models": sorted((models or {}).values(), key=lambda m: m["id"]), "status": status}
+        table = (load_settings(data_dir).values.get("providers") or {}).get(provider) or {}
+        records = reasoning_capability.load_capabilities()
+        return {"models": [describe_model(configured[provider], table, m, records)
+                           for m in sorted((models or {}).values(), key=lambda m: m["id"])], "status": status}
+
+    def describe_model(provider, table, model, records):
+        """A catalog row with what the settings and the picker need: its window as reported
+        and in use, whether it is offered and recommended, and its effort steps."""
+        capability = reasoning_capability.get_capability(records, model["id"], model)
+        surface = capability.get("control_surface") or "unknown"
+        steps = (capability.get("levels") or []) if surface == "levels" else \
+            list(budget_router.EFFORT_LEVELS) if surface == "budget" else []
+        return {**model, "window": providers.window(table, model["id"], model.get("context_length")),
+                "offered": providers.offered(table, provider, model["id"], budget_router.RECOMMENDED),
+                "recommended": provider.is_openrouter and model["id"] in budget_router.RECOMMENDED,
+                "effort": {"surface": surface, "steps": [s for s in steps if s in budget_router.EFFORT_LEVELS]}}
+
+    @app.get("/api/models/recent")
+    async def recent_models():
+        """The last three models the researcher chose (not Auto's picks), newest first."""
+        rows = await read(lambda conn: conn.execute(
+            "SELECT json_extract(e.data, '$.route') FROM run_events e JOIN runs r ON r.id = e.run_id"
+            " WHERE e.type = 'route' AND json_extract(e.data, '$.plan.policy_reason') = 'chosen_model'"
+            " ORDER BY r.started_at DESC LIMIT 200").fetchall())
+        recent = list(dict.fromkeys(route for (route,) in rows if isinstance(route, str) and ":" in route))[:3]
+        return {"models": [dict(zip(("provider", "model"), route.split(":", 1))) for route in recent]}
 
     # Settings and instructions
 
@@ -397,7 +425,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         loaded = await settings_for(body.project_id)  # for a project: checked to exist under the lock
         if body.hash != loaded._digest:
             raise ApiError(409, "settings_changed", "The settings changed since they were read")
-        changed = _providers_changed(body.updates, providers.configured(data_dir))
+        changed = _providers_changed(body.updates, providers.configured(data_dir, include_off=True))
         refuse_if_busy(changed)  # before any field is written
         try:
             await _finished(loaded.save, body.updates)  # under the project-files lock to its end
@@ -417,18 +445,23 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def get_instructions(project_id: str | None = None):
         async with project_files if project_id is not None else contextlib.nullcontext():  # ordered with deletion
             path = await instructions_path(project_id)
-            text = await asyncio.to_thread(
-                lambda: path.read_text(encoding="utf-8", errors="replace") if path.is_file() else "")
+            raw = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b"")
             combined, warnings = await asyncio.to_thread(load_instructions, data_dir, project_id)
-        return {"text": text, "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
+        return {"text": raw.decode("utf-8", errors="replace"), "hash": hashlib.sha256(raw).hexdigest(),
+                "combined_bytes": len(combined.encode("utf-8")), "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
 
     @app.put("/api/instructions")
     async def put_instructions(body: Instructions):
         async with project_files if body.project_id is not None else contextlib.nullcontext():
             path = await instructions_path(body.project_id)  # the project still exists, under the lock
-            await _finished(write_private, path, body.text.encode("utf-8"))
+            if body.hash is not None:  # a file changed since the editor read it is not overwritten
+                raw = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b"")
+                if hashlib.sha256(raw).hexdigest() != body.hash:
+                    raise ApiError(409, "settings_changed", "The instructions changed since they were read")
+            data = body.text.encode("utf-8")
+            await _finished(write_private, path, data)
         _, warnings = await asyncio.to_thread(load_instructions, data_dir, body.project_id)
-        return {"ok": True, "warnings": warnings}
+        return {"ok": True, "warnings": warnings, "hash": hashlib.sha256(data).hexdigest()}
 
     async def instructions_path(project_id):
         if project_id is None:

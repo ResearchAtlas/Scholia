@@ -39,6 +39,8 @@ MODEL_TIERS = {
     "mid": ["google/gemini-3.1-pro-preview", "openai/gpt-5.4-mini", "deepseek/deepseek-v4-pro"],
     "premium": ["anthropic/claude-opus-4.8", "openai/gpt-5.5", "google/gemini-3.1-pro-preview"],
 }
+# The models offered as Recommended on OpenRouter: the tiers' preferred models.
+RECOMMENDED = frozenset(model for tier in MODEL_TIERS.values() for model in tier)
 
 # Rough tokens per mode for one answer call. Deliberately conservative and clearly
 # approximate: heuristics, never measured.
@@ -50,6 +52,7 @@ _MODE_TOKENS = {
 _TITLE_TOKENS = {"input": 600, "output": 40}
 # Rough reasoning tokens (billed as output) a generation call adds at each effort.
 _REASONING_OUTPUT_TOKENS = {"minimal": 0, "low": 800, "medium": 2000, "high": 5000, "xhigh": 9000}
+EFFORT_LEVELS = tuple(_REASONING_OUTPUT_TOKENS)  # the levels a turn may ask for, lowest first
 # Per million tokens, when the provider publishes no price.
 _UNKNOWN_PRICE = {"input": 1.0, "output": 5.0}
 

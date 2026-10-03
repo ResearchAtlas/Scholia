@@ -120,6 +120,11 @@ PERSONAL = {
     ("ui", "layout", "panel_share"): (0.5, _number(0, 1)),
     ("providers", "*", "kind"): (None, _choice("openrouter", "openai-compatible")),
     ("providers", "*", "base_url"): (None, _base_url),
+    # Which of a provider's models are offered: "recommended", "all", or a list of model ids
+    # (the stage walk's Recommended, All or Pick); unset is Recommended on OpenRouter, else All.
+    ("providers", "*", "models"): (None, lambda v: v in ("recommended", "all")
+                                   or (type(v) is list and all(type(x) is str and visible(x) for x in v))),
+    ("providers", "*", "enabled"): (None, _flag),  # false is Off: kept, but never called
     ("providers", "*", "default_window"): (None, _WINDOW),
     ("providers", "*", "windows", "*"): (None, _WINDOW),
     ("models", "default"): ("auto", _text),
