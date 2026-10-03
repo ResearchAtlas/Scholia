@@ -155,6 +155,7 @@
   "errors.backup_unreadable": "无法读取该备份。",
   "errors.newer_schema": "该备份来自更新版本的 Scholia。请更新 Scholia 后再恢复。",
   "errors.restore_failed": "未能换上该备份，所有内容均未改变。",
+  "errors.restore_interrupted": "恢复被中断。请关闭 Scholia 后重新打开以完成恢复。",
   "errors.safety_copy_failed": "Scholia 未能先保存当前状态，因此没有进行恢复。",
   "errors.data_folder_problem": "Scholia 尚未打开它的数据文件夹。",
   "errors.data_folder_synced": "该文件夹会同步到云端，或位于网络驱动器上。",

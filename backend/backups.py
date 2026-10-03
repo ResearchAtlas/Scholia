@@ -6,11 +6,13 @@ bulk deletion (backup_before_deletion). purge() takes them out of deleted data's
 Full backups and project exports are zip files in a folder the researcher chose,
 written under a temporary name and renamed when complete. One that holds a Private
 or Local only project is AES-encrypted with the researcher's passphrase (pyzipper)
-and refused without one; others are plain zip files. Neither ever holds a key, the
-logs or the lock file. A restore saves a safety copy, stops running work, puts a
-backup's database and settings files in place, reopens the database and starts the
-harness again in the same process, then reports referenced content files that are
-missing. Every one of these is audited.
+and refused without one; others are plain zip files. Neither holds a stored key, the
+logs or the lock file, and every config.toml in them leaves out the entries the app
+ignores, keys typed in by hand among them (by their names: a secret under an ordinary
+name is the researcher's own text). A restore saves a safety copy, stops running work,
+puts a backup's database and settings files in place, reopens the database and starts
+the harness again in the same process, then reports referenced content files that are
+missing. Every one of these is audited, a restore finished at launch after a crash too.
 
 Database and file work runs off the event loop.
 """
@@ -427,14 +429,16 @@ async def _restore(state, body):
             await asyncio.to_thread(db.close)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         aside = data_dir / "backups" / DAMAGED / stamp if damaged else staging / "replaced"
-        undo = restored = None
+        restored = None
         try:
-            undo = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside)
+            await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside)
             restored = await asyncio.to_thread(Database, data_dir)  # its checks and migrations
             await state["start"](restored)  # its harness recovered, then serving
         except Exception as error:
             log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
-            await _roll_back(state, restored, undo, damaged)
+            if not await _roll_back(state, restored, damaged):
+                raise BackupError(500, "restore_interrupted",
+                                  "The restore could not be finished or undone; open Scholia again to finish it") from error
             raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
                 from error
         await asyncio.to_thread(end_journal, data_dir)  # restored for good: nothing to finish at launch
@@ -456,20 +460,39 @@ async def _restore(state, body):
             await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
 
 
-async def _roll_back(state, restored, undo, damaged):
-    """After a failed restore: close what it opened, put the previous files back, and run on the
-    previous database again unless it was damaged. A step that fails is logged; the journal
-    then still says what remains, and the next launch finishes putting it back."""
-    try:
-        if restored is not None:
+async def _roll_back(state, restored, damaged):
+    """After a failed restore: close what it opened, put the previous files back as the journal
+    says (however far the swap got), and run on the previous database again unless it was
+    damaged. Returns False when the files could not be put back: then nothing is started on them,
+    the journal says what remains, and the next launch finishes putting it back."""
+    data_dir = state["data_dir"]
+    if restored is not None:
+        try:
             await asyncio.to_thread(restored.close)
-        if undo is not None:
-            await asyncio.to_thread(undo)
-        if not damaged:
-            await state["start"](await asyncio.to_thread(Database, state["data_dir"]))
+        except Exception as error:
+            log.warning("closing a restored database that failed to start failed (%s)", type(error).__name__)
+    try:
+        if (data_dir / "backups" / JOURNAL).exists():
+            await asyncio.to_thread(_back_from_journal, data_dir)
     except Exception as error:
         log.error("putting the previous state back after a failed restore failed (%s); the next launch finishes it",
                   type(error).__name__)
+        return False
+    if not damaged:
+        previous = None
+        try:
+            previous = await asyncio.to_thread(Database, data_dir)
+            await state["start"](previous)
+        except Exception as error:
+            log.error("the previous database could not be started again after a failed restore (%s)",
+                      type(error).__name__)
+            if previous is not None:
+                await asyncio.to_thread(previous.close)
+    return True
+
+
+def _back_from_journal(data_dir):
+    _back(data_dir, json.loads((data_dir / "backups" / JOURNAL).read_bytes()))
 
 
 def _stage(data_dir, body, staging):
@@ -562,9 +585,9 @@ def _put_in_place(data_dir, staged, aside):
     never leaves the folder without one; aside (made here) keeps a link to it, its WAL files and
     the live settings files. Content files are added, never removed. Before anything moves, a
     journal (JOURNAL, synced) records the plan; every step can be taken again, so a launch after a
-    crash finishes what was begun (finish_interrupted_restore). Returns undo(), which puts back
-    what was moved; a failure partway undoes it before it is raised. The caller ends the journal
-    (end_journal) once the restore has succeeded.
+    crash finishes what was begun (finish_interrupted_restore). After a failure, _back puts back
+    what was moved, from the journal. The caller ends the journal (end_journal) once the restore
+    has succeeded.
     """
     _mkdir_private(aside.parent)
     _mkdir_private(aside)
@@ -577,12 +600,7 @@ def _put_in_place(data_dir, staged, aside):
         "backup": [name for name in SWAPPED if _exists(staged / name)],
     }
     write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
-    try:
-        _forward(data_dir, journal)
-    except BaseException:
-        _back(data_dir, journal)
-        raise
-    return lambda: _back(data_dir, journal)
+    _forward(data_dir, journal)
 
 
 def _forward(data_dir, journal):
@@ -618,12 +636,14 @@ def _back(data_dir, journal):
             os.replace(aside / name, data_dir / name)
         elif name not in journal["live"]:  # there was none: one in place came from the backup
             _remove(data_dir / name)
-    if not (staged / DB_NAME).exists():  # the backup's database is in place
-        for sidecar in SIDECARS:  # its own, if it was opened
-            _remove(data_dir / sidecar)
-        if (aside / DB_NAME).exists():
+    if not (staged / DB_NAME).exists():  # the backup's database went in
+        if (aside / DB_NAME).exists():  # and is still there: its own sidecars go, then the previous one is back
+            for sidecar in SIDECARS:
+                _remove(data_dir / sidecar)
             os.replace(aside / DB_NAME, live)
-        elif not journal["live_database"]:
+        elif not journal["live_database"]:  # there was none before
+            for sidecar in SIDECARS:
+                _remove(data_dir / sidecar)
             live.unlink(missing_ok=True)
     else:
         (aside / DB_NAME).unlink(missing_ok=True)  # only a second link to the live one
@@ -642,15 +662,16 @@ def end_journal(data_dir):
     _fsync(data_dir / "backups")
 
 
-def finish_interrupted_restore(data_dir) -> bool:
+def finish_interrupted_restore(data_dir) -> str | None:
     """Finish a restore a crash interrupted while it put a backup in place, or put the previous
     state back: forward or back as its journal says. Run at launch, before the database opens and
-    before staging is emptied. Returns whether there was one. A journal that cannot be read, or
-    that names folders outside backups/, is left with staging as they are, and raises."""
+    before staging is emptied. Returns the direction taken, or None when there was none. A journal
+    that cannot be read, or that names folders outside backups/, is left with staging as they
+    are, and raises."""
     data_dir = Path(data_dir)
     path = data_dir / "backups" / JOURNAL
     if not path.is_file():
-        return False
+        return None
     journal = json.loads(path.read_bytes())
     for key in ("staged", "aside"):
         folder = PurePosixPath(journal[key])
@@ -663,7 +684,7 @@ def finish_interrupted_restore(data_dir) -> bool:
     else:
         _back(data_dir, journal)
         log.warning("a restore interrupted by a crash was undone at launch")
-    return True
+    return journal["direction"]
 
 
 def _exists(path):

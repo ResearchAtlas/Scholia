@@ -132,3 +132,75 @@ async def test_a_crash_while_putting_the_previous_state_back_is_finished_back_at
     assert names == {"General", "Kept", "Later"} and text == "After the backup"  # all as before the restore
     assert sorted(folders) == sorted([kept, later])
     assert not (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_a_restore_whose_undo_fails_starts_nothing_and_the_launch_puts_it_back(tmp_path, monkeypatch):
+    import errno
+    import json
+    from backend.settings import write_private
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_fsync, real_back, undone = backups_module._fsync, backups_module._back, []
+
+    def failing_fsync(path):  # the swap fails once everything is in place
+        if "/replaced" in str(path):
+            raise OSError(errno.EIO, "I/O error")
+        real_fsync(path)
+
+    def failing_back(data_dir, journal):  # and putting it back fails partway, once
+        undone.append(journal["direction"])
+        if len(undone) == 1:
+            write_private(data_dir / "backups" / backups_module.JOURNAL,
+                          json.dumps({**journal, "direction": "back"}).encode())
+            raise OSError(errno.EIO, "I/O error")
+        real_back(data_dir, journal)
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "_fsync", failing_fsync)
+        monkeypatch.setattr(backups_module, "_back", failing_back)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
+        projects = await client.get("/api/projects")  # nothing runs on the half-restored folder
+        assert (projects.status_code, projects.json()["code"]) == (503, "database_unavailable")
+        monkeypatch.setattr(backups_module, "_fsync", real_fsync)
+
+    names, text, folders, projects = await state_after_launch(data)  # the launch finishes putting it back
+    assert names == {"General", "Kept", "Later"} and text == "After the backup"
+    assert sorted(folders) == sorted([kept, later])
+    async with started(data, setup=False) as client:
+        rows = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT data FROM audit_log WHERE event = 'restore'").fetchall())
+    assert [json.loads(row) for (row,) in rows] == [{"interrupted": True, "finished": "back"}]
+
+
+async def test_putting_the_previous_state_back_twice_keeps_its_wal(tmp_path):
+    from backend.db import DB_NAME
+    data, staged, aside = tmp_path / "data", tmp_path / "data/backups/.staging/x/restore", \
+        tmp_path / "data/backups/.staging/x/replaced"
+    staged.mkdir(parents=True)
+    (data / DB_NAME).write_bytes(b"the damaged database")
+    (data / f"{DB_NAME}-wal").write_bytes(b"its committed work")
+    (data / "config.toml").write_text("previous")
+    (staged / DB_NAME).write_bytes(b"the backup's database")
+    (staged / "config.toml").write_text("from the backup")
+    backups_module._put_in_place(data, staged, aside)
+    journal = {"direction": "back", "staged": "backups/.staging/x/restore", "aside": "backups/.staging/x/replaced",
+               "live_database": True, "live": ["config.toml"], "backup": ["config.toml"]}
+    backups_module._back(data, journal)
+    backups_module._back(data, journal)  # a crash before the journal ended: the launch runs it again
+    assert (data / DB_NAME).read_bytes() == b"the damaged database"
+    assert (data / f"{DB_NAME}-wal").read_bytes() == b"its committed work"
+    assert (data / "config.toml").read_text() == "previous"
+
+
+async def test_a_journal_that_cannot_be_read_leaves_the_folder_unopened_and_offers_only_a_restore(tmp_path):
+    from backend.db import DB_NAME
+    data = tmp_path / "data"
+    await prepare(data)
+    (data / "backups" / backups_module.JOURNAL).write_text("{ not json")
+    before = (data / DB_NAME).read_bytes()
+    async with started(data, setup=False) as client:
+        assert "restore a backup" in (await client.get("/api/health")).json()["database_damaged"]
+        assert (await client.get("/api/projects")).json()["code"] == "database_damaged"
+        assert (await client.get("/api/backups")).status_code == 200
+    assert (data / DB_NAME).read_bytes() == before  # never opened

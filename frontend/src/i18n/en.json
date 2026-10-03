@@ -156,6 +156,7 @@
   "errors.backup_unreadable": "That backup could not be read.",
   "errors.newer_schema": "That backup comes from a newer version of Scholia. Update Scholia to restore it.",
   "errors.restore_failed": "The backup could not be put in place. Nothing was changed.",
+  "errors.restore_interrupted": "The restore was interrupted. Close Scholia and open it again to finish it.",
   "errors.safety_copy_failed": "Scholia could not first save its current state, so nothing was restored.",
   "errors.data_folder_problem": "Scholia has not opened its data folder.",
   "errors.data_folder_synced": "That folder syncs to the cloud or is on a network drive.",

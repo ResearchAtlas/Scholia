@@ -244,22 +244,24 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @contextlib.asynccontextmanager
     async def lifespan(app):
         state.update(data_dir=data_dir, start=start)
+        db = finished = None
         try:  # a restore a crash interrupted is finished before anything opens the database
-            await asyncio.to_thread(backups.finish_interrupted_restore, data_dir)
-        except Exception as error:  # left for the researcher: the database and staging stay as they are
+            finished = await asyncio.to_thread(backups.finish_interrupted_restore, data_dir)
+        except Exception as error:  # the folder may hold two states: never opened, only a restore is offered
             log.error("a restore interrupted by a crash could not be finished (%s)", type(error).__name__)
+            state["damaged"] = "a restore interrupted by a crash could not be finished; restore a backup"
         # Opening the database (its checks, the backup before a migration, migrations) and the
         # daily backup are local maintenance: the desktop entry's start deadline does not count
         # them (see maintenance), since on a large folder they are progress, not a hang.
         with maintenance():
             try:
-                db = await asyncio.to_thread(Database, data_dir)
+                if "damaged" not in state:
+                    db = await asyncio.to_thread(Database, data_dir)
             except DatabaseDamagedError as error:
                 # Never reset: the app serves health, the backups and restore (see db()) until a
                 # restore puts a backup in place; the backups router closes what that opens.
                 log.error("the database failed its check at startup; only a restore is offered")
                 state["damaged"] = str(error)
-                db = None
         if db is None:
             try:
                 yield
@@ -268,6 +270,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             return
         try:
             await start(db)
+            if finished:  # audited once the database is open: which way the interrupted restore went
+                await write(lambda conn: conn.execute("INSERT INTO audit_log (event, data) VALUES ('restore', ?)",
+                                                      (json.dumps({"interrupted": True, "finished": finished}),)))
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
             # The daily backup runs at launch, before the app accepts a request, so the
             # database and the settings files it copies show one state. Backups while the app

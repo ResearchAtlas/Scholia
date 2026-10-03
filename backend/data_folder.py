@@ -144,7 +144,9 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     if not path.parent.is_dir():
         raise FolderRefused("data_folder_not_found", "The folder above it does not exist")
     existing = path.is_dir() and not path.is_symlink()
-    is_default = path == default or (existing and default.is_dir() and os.path.samefile(path, default))
+    # A default folder that is a link is refused at launch, so the folder it leads to is recorded instead.
+    is_default = not default.is_symlink() and (
+        path == default or (existing and default.is_dir() and os.path.samefile(path, default)))
     if existing and not is_default and any(entry.name not in _FINDER_FILES for entry in path.iterdir()) \
             and not (path / DB_NAME).is_file():
         raise FolderRefused("data_folder_not_empty", "Choose an empty folder, or one that holds Scholia's data")

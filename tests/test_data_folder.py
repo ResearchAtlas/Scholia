@@ -136,6 +136,16 @@ def test_another_place_is_chosen_without_writing_into_a_refused_default_folder(t
     assert data_folder.located(default) == chosen
 
 
+def test_the_folder_a_linked_default_leads_to_is_recorded_rather_than_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    target = tmp_path / "Research" / "Scholia"
+    target.mkdir(parents=True)
+    default = tmp_path / "Scholia"
+    os.symlink(target, default)  # refused at launch: its target could be swapped
+    assert data_folder.choose(default, str(target)) == target
+    assert data_folder.located(default) == target  # the next launch opens the folder itself
+
+
 @pytest.mark.parametrize("problem", ["writable by others", "a link", "not json", "relative", "goes back up"])
 def test_a_record_that_cannot_be_trusted_or_read_refuses_the_data_folder(tmp_path, problem):
     default = tmp_path / "default"
