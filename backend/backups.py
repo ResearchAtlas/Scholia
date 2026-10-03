@@ -37,12 +37,12 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 from backend import APP_VERSION
-from backend.db import (DB_NAME, BackupBusyError, ContentStore, Database, DatabaseClosedError, DatabaseDamagedError,
+from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseClosedError, DatabaseDamagedError,
                         ForeignDatabaseError, NewerDatabaseError, utc_now)
 from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
     list_generations
 from backend.db.migrations import MIGRATIONS
-from backend.runs import Harness, _through
+from backend.runs import _through
 from backend.settings import without_ignored
 
 log = logging.getLogger(__name__)
@@ -81,6 +81,27 @@ class _Route(APIRoute):
         return handle
 
 
+# What a database damaged at startup leaves served (see LimitedMode).
+LIMITED = {("GET", "/api/health"), ("GET", "/api/backups"), ("POST", "/api/backups/restore")}
+
+
+class LimitedMode:
+    """While the database is damaged at startup ("damaged" in the app's state), only health, the
+    backups list and restore are served; every other API request gets 503 database_damaged.
+    Pure ASGI, so streamed responses pass through it untouched."""
+
+    def __init__(self, app, state):
+        self.app, self.state = app, state
+
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] == "http" and "damaged" in self.state and scope["path"].startswith("/api/")
+                and (scope["method"], scope["path"]) not in LIMITED):
+            response = JSONResponse({"code": "database_damaged",
+                                     "message": "The database failed its check; restore a backup"}, status_code=503)
+            return await response(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
 class FullBackup(BaseModel):
     destination: str = Field(min_length=1, max_length=4096)  # an absolute path to a folder
     passphrase: str | None = Field(default=None, max_length=1024)
@@ -102,8 +123,6 @@ async def lifespan(app):
     """Inside the app's own lifespan: clear what a crash left in staging, back up while idle, and
     at closing close the database and harness a restore opened (the app closes the ones it did)."""
     state = app.state.scholia
-    if "data_dir" not in state:
-        state["data_dir"] = state["db"].data_dir
     state["backups_lock"] = asyncio.Lock()  # one backup, restore or export at a time
     opened = state.get("db"), state.get("harness")
     await asyncio.to_thread(shutil.rmtree, state["data_dir"] / "backups" / STAGING, ignore_errors=True)
@@ -341,11 +360,11 @@ async def _restore(state, body):
             if undo is not None:
                 await asyncio.to_thread(undo)
             if not damaged:  # back to the database as it was, running again
-                await _start(state, await asyncio.to_thread(Database, data_dir), harness)
+                await state["start"](await asyncio.to_thread(Database, data_dir))
             log.warning("a restore failed (%s); the previous database was put back", type(error).__name__)
             raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
                 from error
-        await _start(state, restored, harness)
+        await state["start"](restored)
         missing = await asyncio.to_thread(_missing_files, restored)
         record = {
             "source": "automatic" if body.generation else "full",
@@ -361,15 +380,6 @@ async def _restore(state, body):
         return {"ok": True, **record, "schema_version": version, "missing_files": missing}
     finally:
         await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
-
-
-async def _start(state, db, previous):
-    """Run the app on db again: its content store, gate and harness, then the harness's recovery."""
-    content = ContentStore(db)
-    gate = state["gate"].for_database(db)
-    harness = Harness(previous.data_dir, db, gate, keyring_backend=previous.keyring_backend)
-    state.update(db=db, content=content, gate=gate, harness=harness)
-    await harness.recover()
 
 
 def _stage(data_dir, body, staging):

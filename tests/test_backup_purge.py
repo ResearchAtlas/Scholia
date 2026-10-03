@@ -115,3 +115,54 @@ def test_a_purge_whose_fresh_backup_fails_keeps_the_older_ones_and_audits_nothin
     finally:
         db.close()
     assert len(all_generations(data)) == 8  # a damaged or full disk never leaves no backup at all
+
+
+# Through the deletion endpoints
+
+
+async def _generations_holding(data, text):
+    return [g.name for g in all_generations(data) if holds(g, text)]
+
+
+@pytest.mark.asyncio
+async def test_delete_everywhere_takes_a_conversation_out_of_the_automatic_backups(tmp_path):
+    import asyncio
+    from scholia_app import send, started
+    data = tmp_path / "data"
+    async with started(data) as client:
+        conversation = (await client.post("/api/conversations", json={"title": TITLE})).json()["id"]
+        await send(client, conversation, SAID)
+        await client.post("/api/backups")
+        await client.post("/api/backups")
+        assert len(await _generations_holding(data, SAID)) == 2
+        response = await client.delete(f"/api/conversations/{conversation}",
+                                       params={"purge_backups": "true", "remove_all_trace": "true"})
+        assert response.status_code == 200 and response.json()["purged_backups"] == 3  # the launch's too
+        [generation] = all_generations(data)
+        assert not holds(generation, SAID) and not holds(generation, TITLE)
+        [(title,)] = rows(generation, f"SELECT title FROM tombstones WHERE object_id = '{conversation}'")
+        assert title is None
+        [(record,)] = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT data FROM audit_log WHERE event = 'backup_purge'").fetchall())
+        assert json.loads(record)["object_id"] == conversation
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_project_backs_it_up_first_unless_it_is_deleted_everywhere(tmp_path):
+    from scholia_app import started
+    data = tmp_path / "data"
+    async with started(data) as client:
+        kept = (await client.post("/api/projects", json={"name": "Clinic study"})).json()["id"]
+        before = len(all_generations(data))
+        assert (await client.delete(f"/api/projects/{kept}")).json() == {"ok": True}
+        assert len(all_generations(data)) == before + 1  # the backup before a bulk deletion
+        assert holds(all_generations(data)[-1], "Clinic study")
+
+        gone = (await client.post("/api/projects", json={"name": "Interview study"})).json()["id"]
+        await client.post("/api/backups")
+        response = await client.delete(f"/api/projects/{gone}", params={"purge_backups": "true"})
+        assert response.status_code == 200 and response.json()["purged_backups"] >= 2
+        [generation] = all_generations(data)
+        assert rows(generation, f"SELECT title FROM tombstones WHERE object_id = '{gone}'") == [("Interview study",)]
+        assert rows(generation, "SELECT count(*) FROM projects WHERE kind = 'research'") == [(0,)]
+        assert not (generation / "projects" / gone).exists()

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import pytest
 
 from backend.db import DB_NAME, Database, new_id
-from scholia_app import started
+from scholia_app import send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -67,3 +67,53 @@ async def test_a_database_found_damaged_while_open_is_moved_aside_whole_by_a_res
         assert json.loads(record)["damaged_copy"] == result["damaged_copy"]
     for path in [aside, *aside.rglob("*")]:
         assert (path.stat().st_mode & 0o777) == (0o700 if path.is_dir() else 0o600), path
+
+
+def damage_beyond_opening(data):
+    """Damage a b-tree page header so that even quick_check fails: the app cannot open it at startup."""
+    conn = sqlite3.connect((data / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    (page,) = conn.execute("SELECT rootpage FROM sqlite_schema WHERE name = 'audit_log'").fetchone()
+    (size,) = conn.execute("PRAGMA page_size").fetchone()
+    conn.close()
+    with open(data / DB_NAME, "r+b") as file:
+        file.seek((page - 1) * size)
+        file.write(b"\xff" * 16)
+
+
+async def test_a_database_damaged_at_startup_is_never_reset_and_only_restore_is_offered(tmp_path):
+    data = tmp_path / "data"
+
+    def a_backup_then_damage():
+        with Database(data) as db:
+            db.write(lambda conn: conn.executemany("INSERT INTO audit_log (event) VALUES (?)", [("e",)] * 2000))
+            db.write(lambda conn: conn.execute(
+                "INSERT INTO projects (id, name, kind) VALUES (?, 'Good', 'research')", (new_id(),)))
+            good = db.backup(now=START)
+        damage_beyond_opening(data)
+        return good
+
+    good = await asyncio.to_thread(a_backup_then_damage)
+    damaged = (data / DB_NAME).read_bytes()
+
+    async with started(data, setup=False) as client:
+        health = (await client.get("/api/health")).json()
+        assert health["ok"] is True and "quick_check" in health["database_damaged"]  # says what happened
+        for method, path in (("GET", "/api/projects"), ("POST", "/api/conversations"), ("GET", "/api/activity"),
+                             ("GET", "/api/settings"), ("PUT", "/api/instructions"), ("GET", "/api/providers"),
+                             ("POST", "/api/setup"), ("POST", "/api/backups"), ("POST", "/api/backups/full")):
+            response = await client.request(method, path, json={"text": "x"} if method in ("POST", "PUT") else None)
+            assert (response.status_code, response.json()["code"]) == (503, "database_damaged"), path
+        assert (data / DB_NAME).read_bytes() == damaged  # never reset, never written
+        assert not (data / "AGENTS.md").exists()
+        assert [b["id"] for b in (await client.get("/api/backups")).json()["backups"]] == [f"daily/{good.name}"]
+
+        response = await client.post("/api/backups/restore", json={"generation": f"daily/{good.name}"})
+        assert response.status_code == 200, response.text
+        assert (data / "backups" / response.json()["damaged_copy"] / DB_NAME).read_bytes() == damaged
+        assert "database_damaged" not in (await client.get("/api/health")).json()
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Good"}
+        assert (await client.post("/api/setup", json={"openrouter_key": "sk-or-test-not-a-real-key"})).status_code == 200
+        conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
+        assert (await send(client, conversation))[-1]["status"] == "succeeded"  # the harness runs
+        restored = client.state["db"]
+    assert restored.closed
