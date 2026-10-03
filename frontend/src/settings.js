@@ -187,3 +187,21 @@ export function decodeChoice(value) {
   if (typeof value?.id !== 'string' || typeof value?.provider !== 'string') return null;
   return { provider: value.provider, model: value.id };
 }
+
+// What a committed field does with its text: { reject: true } (the field puts its last text
+// back), { same: true } (nothing new since the last commit or the saved value), or
+// { out, shown } (saves out; shown is out as the saved value will read).
+export function commitDecision(text, { sent, value, type, min, above, step, allowEmpty }) {
+  let out = text;
+  if (!text) {
+    if (!allowEmpty) return { reject: true };
+    out = null;
+  } else if (type === 'number') {
+    const number = Number(text);
+    if (!Number.isFinite(number) || (min !== undefined && number < min) || (above !== undefined && number <= above)
+        || (step === 1 && !Number.isInteger(number))) return { reject: true, invalid: true };
+    out = number;
+  }
+  const shown = String(out ?? '');
+  return shown === (sent ?? String(value ?? '')) ? { same: true } : { out, shown };
+}

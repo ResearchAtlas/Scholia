@@ -5,6 +5,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { RotateCcw } from 'lucide-react';
 import { useT } from '../i18n/index.js';
+import { commitDecision } from '../settings.js';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 
@@ -65,29 +66,16 @@ export function CommitField({ id, value, onCommit, type = 'text', min, above, st
 
   function commit() {
     edited.current = false;
-    const text = String(draft).trim();
-    let out = text; // what is saved: null (back to the default), a number, or the text
-    if (!text) {
-      if (!allowEmpty) {
-        setDraft(sent.current ?? value ?? '');
-        return;
-      }
-      out = null;
-    } else if (type === 'number') {
-      const number = Number(text);
-      if (!Number.isFinite(number) || (min !== undefined && number < min) || (above !== undefined && number <= above)
-          || (step === 1 && !Number.isInteger(number))) {
-        setDraft(sent.current ?? value ?? '');
-        onCommit(undefined, 'invalid_request');
-        return;
-      }
-      out = number;
+    const decided = commitDecision(String(draft).trim(), { sent: sent.current, value, type, min, above, step, allowEmpty });
+    if (decided.reject) {
+      setDraft(sent.current ?? value ?? '');
+      if (decided.invalid) onCommit(undefined, 'invalid_request');
+      return;
     }
-    const shown = String(out ?? '');
-    if (shown === (sent.current ?? String(value ?? ''))) return; // nothing new since the last commit
-    sent.current = shown; // compared as the saved value will read
-    Promise.resolve(onCommit(out)).then((saved) => { // not saved (refused): the same text may be committed again
-      if (saved === false && sent.current === shown) sent.current = null;
+    if (decided.same) return;
+    sent.current = decided.shown;
+    Promise.resolve(onCommit(decided.out)).then((saved) => { // not saved (refused): the same text may be committed again
+      if (saved === false && sent.current === decided.shown) sent.current = null;
     });
   }
 

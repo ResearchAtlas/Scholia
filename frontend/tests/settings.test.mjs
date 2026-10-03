@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { choiceUpdates, decodeChoice, onCatalogChange, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, utf8Bytes, valueAt } from '../src/settings.js';
+import { choiceUpdates, commitDecision, decodeChoice, onCatalogChange, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, utf8Bytes, valueAt } from '../src/settings.js';
 import { ApiError } from '../src/api.js';
 
 test('settings keys quote the parts that are not bare TOML keys', () => {
@@ -115,4 +115,16 @@ test('a listing that reports an error is read again the next time', async (t) =>
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual((await loadModels('local')).models, [{ id: 'a' }]);
   assert.equal(calls, 2);
+});
+
+test('a committed field saves what is new since its last commit, as the saved value will read', () => {
+  const budget = { type: 'number', above: 0, value: 10, sent: null };
+  assert.deepEqual(commitDecision('20', budget), { out: 20, shown: '20' });
+  assert.deepEqual(commitDecision('10', { ...budget, sent: '20' }), { out: 10, shown: '10' }); // back to 10 while 20 saves
+  assert.deepEqual(commitDecision('20.0', { ...budget, sent: '20' }), { same: true });
+  assert.deepEqual(commitDecision('10', budget), { same: true });
+  assert.deepEqual(commitDecision('0', budget), { reject: true, invalid: true });
+  assert.deepEqual(commitDecision('', budget), { reject: true });
+  assert.deepEqual(commitDecision('', { value: 'x', allowEmpty: true, sent: null }), { out: null, shown: '' });
+  assert.deepEqual(commitDecision('2.5', { type: 'number', min: 1, step: 1, value: 3, sent: null }), { reject: true, invalid: true });
 });
