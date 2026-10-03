@@ -815,3 +815,81 @@ async def test_a_catalog_read_ends_at_its_deadline_under_a_revocation_that_does_
         finally:
             gate._end(None)
         assert listing.json()["status"]["error"] == "refresh_failed" and listing.json()["models"] == []
+
+
+# Across a restore: what a request began on the app a restore replaced ends there
+
+
+async def test_a_cancelled_provider_save_finishes_before_a_restore_puts_its_settings_in_place(tmp_path, monkeypatch):
+    # A save turning a provider off is paused after its digest check, before the file is replaced,
+    # and its request cancelled. The restore that follows waits for it: the restored config.toml
+    # is the backup's, never overwritten by the save after it.
+    import threading
+    from backend import settings as settings_module
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]  # OpenRouter on
+        current = (await client.get("/api/settings")).json()
+        real, paused, go, written = settings_module.write_private, *(threading.Event() for _ in range(3))
+
+        def write_after_a_pause(path, data):
+            if path.name == "config.toml" and not go.is_set():
+                paused.set()
+                go.wait(10)
+                real(path, data)
+                written.set()
+                return None
+            return real(path, data)
+
+        monkeypatch.setattr(settings_module, "write_private", write_after_a_pause)
+        save = asyncio.create_task(client.put("/api/settings", json={
+            "hash": current["hash"], "updates": {"providers.openrouter.enabled": False}}))
+        assert await asyncio.to_thread(paused.wait, 5)
+        save.cancel()
+        await asyncio.sleep(0.05)  # the cancellation has reached the request
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        await wait_for(lambda: restore.done() or client.state["writers"]._waiting)  # done, or waiting for the save
+        go.set()
+        assert (await restore).status_code == 200
+        with pytest.raises(asyncio.CancelledError):
+            await save
+        assert await asyncio.to_thread(written.wait, 5)  # the save's write is over, whenever it ran
+        values = (await client.get("/api/settings")).json()["values"]
+        assert values["providers"]["openrouter"].get("enabled") is not False  # the backup's settings stand
+
+
+async def test_a_catalog_request_decided_before_a_restore_never_enters_the_transport_after_it(tmp_path, monkeypatch):
+    # A catalog refresh is decided; its caller is cancelled, which leaves the refresh running and
+    # lets a restore through. The restore stops the app the decision was made on: the decision is
+    # never acted on afterwards, so the request never enters the transport after the swap.
+    import threading
+    from backend import outbound_gate
+    order, provider = [], MockProvider(catalog=["example/model"])
+
+    async def handler(request):  # in front of the provider: when a catalog page enters the transport
+        if request.url.path.endswith("/models"):
+            order.append("entered")
+        return await provider(request)
+
+    async with started(tmp_path / "data", handler) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        openrouter_client.clear_cache()
+        real_check, decided, go = outbound_gate.OutboundGate._check, threading.Event(), threading.Event()
+
+        def check_then_wait(self, request_, scope, *args):
+            found = real_check(self, request_, scope, *args)
+            if request_.url.path.endswith("/models") and not go.is_set():
+                decided.set()
+                go.wait(10)  # its continuation on the loop comes after the restore
+            return found
+
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_wait)
+        listing = asyncio.create_task(client.get("/api/providers/openrouter/models"))
+        assert await asyncio.to_thread(decided.wait, 5)
+        [refresh] = [state["task"] for state in openrouter_client._caches.values() if state["task"] is not None]
+        listing.cancel()  # the refresh goes on, shielded
+        with pytest.raises(asyncio.CancelledError):
+            await listing
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+        go.set()
+        await asyncio.wait({refresh}, timeout=5)
+        assert refresh.done() and order == []

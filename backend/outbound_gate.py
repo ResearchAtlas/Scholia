@@ -63,7 +63,9 @@ on the loop, in the same step in which it calls the transport, finds that none b
 meanwhile and that the key's confirmation it was decided under has not lapsed, or else
 decides again once the revocation has ended. So a request entered the transport
 before a revocation began (the in-flight case Stop stops), or is decided after it, and
-refused. Nothing here waits on a thread for the loop or the other way round. (A sync
+refused. Nor does a decision enter it once the gate's database has closed: the app it
+was made for has stopped, and a restore may have replaced its database and settings
+since. Nothing here waits on a thread for the loop or the other way round. (A sync
 client, which only tests use, is not ordered with revocations.) What the gate applied
 (the level, OpenRouter's zero retention with its allowlist entries, or a declared
 server) is handed with the dispatch notice, for the run's record.
@@ -300,18 +302,25 @@ class OutboundGate:
         """Await write (an awaitable), which may revoke a project's runs or take away a route its
         requests may use (None: every project's), ordered with dispatch: marked from before it
         starts until it has finished, whatever happens to the request that started it (see the
-        module's docstring). A cancellation of the caller is raised at once; the write goes on,
-        and its mark with it."""
+        module's docstring). A cancellation of the caller waits for the write and is raised after
+        it, so whatever the caller holds (its locks, its request's place before a restore) covers
+        the whole write."""
         self._begin(project_id)
-        writing = asyncio.ensure_future(write)
-
-        def done(task):
+        try:
+            writing, cancelled = asyncio.ensure_future(write), False
+            while True:
+                try:
+                    result = await asyncio.shield(writing)
+                    break
+                except asyncio.CancelledError:
+                    if writing.cancelled():
+                        raise
+                    cancelled = True
+        finally:
             self._end(project_id)
-            if not task.cancelled():
-                task.exception()  # retrieved here when nobody awaits it any more
-
-        writing.add_done_callback(done)
-        return await asyncio.shield(writing)
+        if cancelled:
+            raise asyncio.CancelledError()
+        return result
 
     @contextlib.contextmanager
     def revoking_from_thread(self, project_id):
@@ -524,6 +533,8 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
             begun = gate._begun_for(project_id)
             # The database blocks, so it is reached off the event loop.
             kind, terms, hop = await asyncio.to_thread(gate._check, request, self._scope, hop)
+            if gate._db.closed:  # the app it was decided for stopped (a restore replaced its database)
+                raise OutboundDenied("revoked", None)
             lapsed = (terms or {}).get("key_confirmed_until")  # a Private key's confirmation, as decided
             if gate._begun_for(project_id) == begun and not (lapsed and lapsed <= utc_now()):
                 break
