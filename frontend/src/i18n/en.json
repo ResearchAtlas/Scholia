@@ -279,5 +279,6 @@
   "settings.instructionsReplaced": "This file is not UTF-8 text. Some characters could not be read and are shown as �; saving it replaces them for good.",
   "settings.instructionsReplaceConfirm": "Save, replacing them",
   "errors.model_not_offered": "That model is not offered for this provider. Choose it under Providers and models, or pick another.",
+  "errors.model_window": "That model has no usable context window. Set one under Providers and models, or pick another model.",
   "settings.instructionsUnreadable": "This file could not be read, so it cannot be edited here. Check its permissions in the data folder."
 }

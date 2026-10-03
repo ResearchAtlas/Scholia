@@ -62,6 +62,17 @@ TITLE_RULES = (
 )
 
 
+def _usable(table, provider, model) -> bool:
+    """Whether a model may be called: its provider offers it (Recommended, All or Pick), and, when
+    its catalog row has been read, its window is usable (slice-1 spec section 8: not needed, not
+    under 4,096). A row not read yet cannot be judged here; the context assembler sizes every
+    request against the window (S1-19)."""
+    if not providers.offered(table, provider, model, budget_router.RECOMMENDED):
+        return False
+    row = get_model_metadata(providers.Route(provider, model))
+    return row is None or providers.window(table, model, row.get("context_length"))["status"] == "ok"
+
+
 class AdmissionError(Exception):
     """A request that cannot start. Nothing was written. code is stable for the interface."""
 
@@ -385,14 +396,14 @@ class Harness:
             # offer is refused, and Auto picks among those it does.
             table = (personal.values.get("providers") or {}).get(provider_name) or {}
 
-            def offered(m):
-                return providers.offered(table, provider_config, m, budget_router.RECOMMENDED)
-
-            if chosen != budget_router.AUTO and not offered(chosen):
-                raise AdmissionError(400, "model_not_offered", "That model is not offered for this provider")
+            if chosen != budget_router.AUTO:
+                if not providers.offered(table, provider_config, chosen, budget_router.RECOMMENDED):
+                    raise AdmissionError(400, "model_not_offered", "That model is not offered for this provider")
+                if not _usable(table, provider_config, chosen):
+                    raise AdmissionError(400, "model_window", "That model has no usable window; set one in Settings")
             plan = budget_router.create_run_plan(
                 message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
-                is_openrouter=provider_config.is_openrouter, offered=offered,
+                is_openrouter=provider_config.is_openrouter, offered=lambda m: _usable(table, provider_config, m),
                 picked=table["models"] if isinstance(table.get("models"), list) else ())
             if plan.model is None:
                 raise AdmissionError(400, "model_needed", "Choose a model for this provider")
@@ -768,7 +779,7 @@ class Harness:
             if route is not None:  # a model its provider no longer offers is not called: no title
                 personal = await asyncio.to_thread(load_settings, self.data_dir)
                 table = (personal.values.get("providers") or {}).get(route.provider.name) or {}
-                if not providers.offered(table, route.provider, route.model, budget_router.RECOMMENDED):
+                if not _usable(table, route.provider, route.model):
                     route = None
         key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
                                                 self.keyring_backend)
