@@ -13,6 +13,7 @@ import json
 
 import pytest
 
+from backend.budget_router import MODEL_TIERS
 from backend.db import new_id
 from scholia_app import FakeKeyring, MockProvider, background_idle, send, started
 
@@ -193,7 +194,7 @@ async def seed_title_run(client, conversation_id, *, attempts, status="running",
             " VALUES (?, ?, 'background', 'title', ?, ?, ?, ?)",
             (run_id, project, turn, attempts, status, json.dumps({
                 "conversation_id": conversation_id, "title_rev": rev, "provider": "openrouter",
-                "model": "test/model"})))
+                "model": MODEL_TIERS["mid"][0]})))  # a model OpenRouter offers by default (Recommended)
         if recorded is not None:
             step = {"step": 0, "outcome": outcome, **({"output": recorded} if outcome == "ok" else {})}
             conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'step_finished', ?)",
