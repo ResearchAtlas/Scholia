@@ -12,6 +12,7 @@ screen, S2) and records another place for the next launch.
 
 import ctypes
 import json
+import logging
 import os
 import platform
 import stat
@@ -37,6 +38,7 @@ SYNCED = {  # under the home folder
     "Library/CloudStorage": "a cloud storage folder (OneDrive, Dropbox, Google Drive or another)",
     "Dropbox": "Dropbox",
 }
+log = logging.getLogger(__name__)
 
 
 def located(default) -> Path:
@@ -125,16 +127,17 @@ def database_problem(folder):
     """("foreign" or "newer", why) when folder holds a scholia.sqlite3 that is another application's,
     or Scholia's from a newer version, read without writing anything there; None otherwise (none
     there, or one that cannot be read, which the app opens as it would anyway: a damaged one in its
-    damaged-database mode, offering restore). The existing folder is checked first, as taking its
-    lock would (UnsafeDataFolderError when another account could change it, or it or the database
-    is a link), so nothing another account could have put there is read."""
+    damaged-database mode, offering restore; one that could not be checked, logged, which opening
+    it checks again). The existing folder is checked first, as taking its lock would
+    (UnsafeDataFolderError when another account could change it, or it, the database or its log is
+    a link), so nothing another account could have put there is read."""
     folder = Path(folder)
     _check_ancestors(folder)
     if os.path.islink(folder):
         raise UnsafeDataFolderError("Scholia will not open its data folder: the folder itself is a link")
     _check_folder(folder, os.getuid())
     path = folder / DB_NAME
-    if path.is_symlink():
+    if path.is_symlink() or path.with_name(DB_NAME + "-wal").is_symlink():
         raise UnsafeDataFolderError("Scholia will not open its data folder: its database is a link")
     if not path.is_file():
         return None
@@ -144,7 +147,10 @@ def database_problem(folder):
         return "foreign", "it holds a database that is not Scholia's"
     except NewerDatabaseError:
         return "newer", "it holds data from a newer version of Scholia"
-    except (DatabaseDamagedError, OSError):
+    except DatabaseDamagedError:
+        return None
+    except OSError as error:  # cannot tell here: opening the database checks it again
+        log.warning("the database in a chosen data folder could not be checked (%s)", type(error).__name__)
         return None
     return None
 

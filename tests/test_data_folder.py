@@ -7,6 +7,7 @@ file system type); no real sync folder or share is used.
 import json
 import os
 import stat
+from pathlib import Path
 
 import httpx
 import pytest
@@ -382,12 +383,17 @@ def test_a_folder_others_could_change_is_refused_before_its_database_is_read(tmp
     assert read == [] and not (tmp_path / data_folder.LOCATION_FILE).exists()
 
 
-def test_a_folder_whose_database_is_a_link_is_refused(tmp_path, monkeypatch):
+@pytest.mark.parametrize("linked", ["scholia.sqlite3", "scholia.sqlite3-wal"])
+def test_a_folder_whose_database_or_its_log_is_a_link_is_refused(tmp_path, monkeypatch, linked):
     monkeypatch.setattr(data_folder, "file_system_type", apfs)
     elsewhere, chosen = tmp_path / "elsewhere", tmp_path / "Other"
-    another_apps_database(elsewhere)
+    a_newer_scholia_database_in_its_log(elsewhere)
     chosen.mkdir()
-    os.symlink(elsewhere / "scholia.sqlite3", chosen / "scholia.sqlite3")
+    for name in ("scholia.sqlite3", "scholia.sqlite3-wal"):
+        if name == linked:
+            os.symlink(elsewhere / name, chosen / name)
+        else:
+            (chosen / name).write_bytes((elsewhere / name).read_bytes())
     with pytest.raises(UnsafeDataFolderError):
         data_folder.choose(tmp_path / "default", str(chosen))
     assert not (tmp_path / data_folder.LOCATION_FILE).exists()
@@ -404,3 +410,40 @@ def test_a_chosen_folder_that_became_a_link_is_unsafe_whatever_it_leads_to(tmp_p
     seen = []
     assert desktop.run(default, _window(seen), listening=register_server) == 1
     assert seen[0]["data_folder_problem"] == "unsafe"  # the link is the problem, not what it leads to
+
+
+def test_the_log_is_read_from_an_owner_only_copy(tmp_path, monkeypatch):
+    import shutil
+    from backend.db import database
+    a_newer_scholia_database_in_its_log(tmp_path / "Other")
+    real_copy, modes = shutil.copyfile, []
+
+    def copyfile(source, target):
+        real_copy(source, target)
+        modes.append(mode(Path(target)))
+
+    monkeypatch.setattr(database.shutil, "copyfile", copyfile)
+    assert data_folder.database_problem(tmp_path / "Other")[0] == "newer"
+    assert modes == [0o600, 0o600]
+
+
+def test_a_database_whose_check_fails_is_logged_and_left_to_open_as_it_would(tmp_path, monkeypatch, caplog):
+    import errno
+    from backend.db import database
+    a_newer_scholia_database_in_its_log(tmp_path / "Other")
+
+    def full(source, target):
+        raise OSError(errno.ENOSPC, f"No space left on device: {target}")
+
+    monkeypatch.setattr(database.shutil, "copyfile", full)
+    caplog.set_level("WARNING", logger=data_folder.log.name)
+    assert data_folder.database_problem(tmp_path / "Other") is None
+    assert "could not be checked (OSError)" in caplog.text and str(tmp_path) not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_identity_check_is_never_run_on_the_event_loop(tmp_path):
+    from backend.db.database import check_identity
+    another_apps_database(tmp_path)
+    with pytest.raises(RuntimeError):
+        check_identity(tmp_path / "scholia.sqlite3")

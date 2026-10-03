@@ -554,7 +554,8 @@ def _open_checked(path, check, latest=None, stop=None):
 def check_identity(path, latest=len(MIGRATIONS)):
     """Check the database file at path as opening it would (see _usable_state), writing nothing
     beside it: no lock, WAL or shared-memory file is made there. A write-ahead log left beside it
-    (after a crash) is read too, from a private copy of both, since it may hold the newest schema.
+    (after a crash) is read too, from an owner-only copy of both in a private temporary folder,
+    since it may hold the newest schema.
     Raises ForeignDatabaseError for another application's file, NewerDatabaseError for a newer
     schema, DatabaseDamagedError for a file SQLite cannot read as a database, and OSError when the
     copy cannot be made."""
@@ -564,10 +565,11 @@ def check_identity(path, latest=len(MIGRATIONS)):
     if wal.is_symlink() or not wal.is_file() or not wal.stat().st_size:
         return _check_identity(path.as_uri() + "?mode=ro&immutable=1", latest)  # immutable: no log is read
     # ponytail: copies the whole database (only when a crash left a log); link instead if that is too slow
-    with tempfile.TemporaryDirectory() as folder:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
         copy = Path(folder) / path.name
-        shutil.copyfile(path, copy)
-        shutil.copyfile(wal, copy.with_name(copy.name + "-wal"))
+        for source, target in ((path, copy), (wal, copy.with_name(copy.name + "-wal"))):
+            _create_private(target)  # owner-only, as the database it copies; copyfile keeps that mode
+            shutil.copyfile(source, target)
         return _check_identity(copy.as_uri() + "?mode=ro", latest)
 
 
