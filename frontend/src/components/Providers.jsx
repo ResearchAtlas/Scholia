@@ -115,6 +115,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
 
   async function setChoice(next) { // one at a time: the control waits while Pick reads the listing
     setChoosing(true);
+    setKeyProblem(null); // an earlier failed change's message goes with the new attempt
     try {
       if (next === 'pick') { // starts from the models offered now; a listing that failed changes nothing
         const listing = await loadModels(provider.name).catch(() => null);
