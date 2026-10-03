@@ -244,6 +244,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @contextlib.asynccontextmanager
     async def lifespan(app):
         state.update(data_dir=data_dir, start=start)
+        try:  # a restore a crash interrupted is finished before anything opens the database
+            await asyncio.to_thread(backups.finish_interrupted_restore, data_dir)
+        except Exception as error:  # left for the researcher: the database and staging stay as they are
+            log.error("a restore interrupted by a crash could not be finished (%s)", type(error).__name__)
         # Opening the database (its checks, the backup before a migration, migrations) and the
         # daily backup are local maintenance: the desktop entry's start deadline does not count
         # them (see maintenance), since on a large folder they are progress, not a hang.

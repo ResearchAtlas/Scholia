@@ -43,7 +43,7 @@ from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _
     list_generations
 from backend.db.migrations import MIGRATIONS
 from backend.runs import _through
-from backend.settings import without_ignored
+from backend.settings import without_ignored, write_private
 
 log = logging.getLogger(__name__)
 
@@ -181,7 +181,8 @@ async def lifespan(app):
     state["backups_lock"] = asyncio.Lock()  # one backup, restore or export at a time
     state["writers"] = Writers()  # see Gate
     opened = state.get("db"), state.get("harness")
-    await asyncio.to_thread(shutil.rmtree, state["data_dir"] / "backups" / STAGING, ignore_errors=True)
+    if not (state["data_dir"] / "backups" / JOURNAL).exists():  # else a restore is still to be finished
+        await asyncio.to_thread(shutil.rmtree, state["data_dir"] / "backups" / STAGING, ignore_errors=True)
     idle = asyncio.create_task(_idle_backups(state))
     try:
         yield
@@ -413,19 +414,17 @@ async def _restore(state, body):
             await asyncio.to_thread(db.close)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         aside = data_dir / "backups" / DAMAGED / stamp if damaged else staging / "replaced"
-        undo = None
+        undo = restored = None
         try:
             undo = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside)
             restored = await asyncio.to_thread(Database, data_dir)  # its checks and migrations
+            await state["start"](restored)  # its harness recovered, then serving
         except Exception as error:
-            if undo is not None:
-                await asyncio.to_thread(undo)
-            if not damaged:  # back to the database as it was, running again
-                await state["start"](await asyncio.to_thread(Database, data_dir))
-            log.warning("a restore failed (%s); the previous database was put back", type(error).__name__)
+            log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
+            await _roll_back(state, restored, undo, damaged)
             raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
                 from error
-        await state["start"](restored)
+        await asyncio.to_thread(end_journal, data_dir)  # restored for good: nothing to finish at launch
         missing = await asyncio.to_thread(_missing_files, restored)
         record = {
             "source": "automatic" if body.generation else "full",
@@ -440,7 +439,24 @@ async def _restore(state, body):
             "PRAGMA user_version").fetchone()[0])
         return {"ok": True, **record, "schema_version": version, "missing_files": missing}
     finally:
-        await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
+        if not (data_dir / "backups" / JOURNAL).exists():  # else the next launch still needs what it holds
+            await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
+
+
+async def _roll_back(state, restored, undo, damaged):
+    """After a failed restore: close what it opened, put the previous files back, and run on the
+    previous database again unless it was damaged. A step that fails is logged; the journal
+    then still says what remains, and the next launch finishes putting it back."""
+    try:
+        if restored is not None:
+            await asyncio.to_thread(restored.close)
+        if undo is not None:
+            await asyncio.to_thread(undo)
+        if not damaged:
+            await state["start"](await asyncio.to_thread(Database, state["data_dir"]))
+    except Exception as error:
+        log.error("putting the previous state back after a failed restore failed (%s); the next launch finishes it",
+                  type(error).__name__)
 
 
 def _stage(data_dir, body, staging):
@@ -521,65 +537,124 @@ def _write_staged(staging, relative, source):
     return digest.hexdigest()
 
 
+SWAPPED = (*SETTINGS_FILES, "projects")  # what a restore replaces besides the database
+SIDECARS = (f"{DB_NAME}-wal", f"{DB_NAME}-shm")
+JOURNAL = "restore.json"  # under backups/: a restore putting a backup in place, until it has ended
+
+
 def _put_in_place(data_dir, staged, aside):
     """Put the staged backup's database, settings files and content files in place of the live ones.
 
     The live database keeps its name until the staged one replaces it in one rename, so a crash
     never leaves the folder without one; aside (made here) keeps a link to it, its WAL files and
-    the live settings files. Content files are added, never removed. Returns undo(), which puts
-    back what was moved (content files stay; nothing refers to the extra ones). A failure partway
-    undoes what was done before it is raised.
+    the live settings files. Content files are added, never removed. Before anything moves, a
+    journal (JOURNAL, synced) records the plan; every step can be taken again, so a launch after a
+    crash finishes what was begun (finish_interrupted_restore). Returns undo(), which puts back
+    what was moved; a failure partway undoes it before it is raised. The caller ends the journal
+    (end_journal) once the restore has succeeded.
     """
     _mkdir_private(aside.parent)
     _mkdir_private(aside)
-    live, sidecars = data_dir / DB_NAME, (f"{DB_NAME}-wal", f"{DB_NAME}-shm")
-    done = []  # (step, name), in order
-
-    def undo():
-        for step, name in reversed(done):
-            if step == "in":  # a staged file or folder put in place
-                _remove(data_dir / name)
-            elif step == "aside":  # a live one moved aside
-                _remove(data_dir / name)  # a sidecar the restored database made as it was opened
-                os.replace(aside / name, data_dir / name)
-            elif step == "database":  # the staged database replaced the live one, which aside links
-                for sidecar in sidecars:
-                    _remove(data_dir / sidecar)
-                if (aside / DB_NAME).exists():
-                    os.replace(aside / DB_NAME, live)
-                else:
-                    live.unlink(missing_ok=True)
-            elif step == "link":
-                (aside / DB_NAME).unlink(missing_ok=True)
-        _fsync(data_dir)
-        with contextlib.suppress(OSError):  # empty now; one that is not is kept
-            aside.rmdir()
-
+    journal = {
+        "direction": "forward",
+        "staged": staged.relative_to(data_dir).as_posix(),
+        "aside": aside.relative_to(data_dir).as_posix(),
+        "live_database": (data_dir / DB_NAME).exists(),
+        "live": [name for name in SWAPPED if _exists(data_dir / name)],
+        "backup": [name for name in SWAPPED if _exists(staged / name)],
+    }
+    write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
     try:
-        if live.exists():
+        _forward(data_dir, journal)
+    except BaseException:
+        _back(data_dir, journal)
+        raise
+    return lambda: _back(data_dir, journal)
+
+
+def _forward(data_dir, journal):
+    """Put the backup in place, from wherever an earlier attempt stopped."""
+    staged, aside, live = data_dir / journal["staged"], data_dir / journal["aside"], data_dir / DB_NAME
+    if (staged / DB_NAME).exists():  # the backup's database is not in place yet
+        if live.exists() and not (aside / DB_NAME).exists():
             os.link(live, aside / DB_NAME)
-            done.append(("link", DB_NAME))
-        for sidecar in sidecars:  # a damaged database's WAL holds committed work: it goes with it
+        for sidecar in SIDECARS:  # a damaged database's WAL holds committed work: it goes with it
             if (data_dir / sidecar).exists():
                 os.replace(data_dir / sidecar, aside / sidecar)
-                done.append(("aside", sidecar))
         if (staged / "content").is_dir():
             _add_content(staged / "content", data_dir / "content")
         os.replace(staged / DB_NAME, live)
-        done.append(("database", DB_NAME))
-        for name in (*SETTINGS_FILES, "projects"):
-            if (data_dir / name).exists() or (data_dir / name).is_symlink():
-                os.replace(data_dir / name, aside / name)
-                done.append(("aside", name))
-            if (staged / name).exists():
-                os.replace(staged / name, data_dir / name)
-                done.append(("in", name))
-        _fsync(aside)
-        _fsync(data_dir)
-    except BaseException:
-        undo()
-        raise
-    return undo
+    for name in SWAPPED:  # the live one aside first, so one found in place with none aside is the live one
+        if name in journal["live"] and not _exists(aside / name) and _exists(data_dir / name):
+            os.replace(data_dir / name, aside / name)
+        if name in journal["backup"] and _exists(staged / name):
+            os.replace(staged / name, data_dir / name)
+    _fsync(aside)
+    _fsync(data_dir)
+
+
+def _back(data_dir, journal):
+    """Put back what _forward moved, from wherever it stopped, and end the journal. Recorded as
+    the journal's direction first, so a crash meanwhile is finished backwards too."""
+    journal = {**journal, "direction": "back"}
+    write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
+    staged, aside, live = data_dir / journal["staged"], data_dir / journal["aside"], data_dir / DB_NAME
+    for name in reversed(SWAPPED):
+        if _exists(aside / name):
+            _remove(data_dir / name)
+            os.replace(aside / name, data_dir / name)
+        elif name not in journal["live"]:  # there was none: one in place came from the backup
+            _remove(data_dir / name)
+    if not (staged / DB_NAME).exists():  # the backup's database is in place
+        for sidecar in SIDECARS:  # its own, if it was opened
+            _remove(data_dir / sidecar)
+        if (aside / DB_NAME).exists():
+            os.replace(aside / DB_NAME, live)
+        elif not journal["live_database"]:
+            live.unlink(missing_ok=True)
+    else:
+        (aside / DB_NAME).unlink(missing_ok=True)  # only a second link to the live one
+    for sidecar in SIDECARS:
+        if (aside / sidecar).exists():
+            os.replace(aside / sidecar, data_dir / sidecar)
+    _fsync(data_dir)
+    with contextlib.suppress(OSError):  # empty now; one that is not is kept
+        aside.rmdir()
+    end_journal(data_dir)
+
+
+def end_journal(data_dir):
+    """The restore has ended: its journal goes, synced."""
+    (data_dir / "backups" / JOURNAL).unlink(missing_ok=True)
+    _fsync(data_dir / "backups")
+
+
+def finish_interrupted_restore(data_dir) -> bool:
+    """Finish a restore a crash interrupted while it put a backup in place, or put the previous
+    state back: forward or back as its journal says. Run at launch, before the database opens and
+    before staging is emptied. Returns whether there was one. A journal that cannot be read, or
+    that names folders outside backups/, is left with staging as they are, and raises."""
+    data_dir = Path(data_dir)
+    path = data_dir / "backups" / JOURNAL
+    if not path.is_file():
+        return False
+    journal = json.loads(path.read_bytes())
+    for key in ("staged", "aside"):
+        folder = PurePosixPath(journal[key])
+        if folder.is_absolute() or ".." in folder.parts or folder.parts[0] != "backups":
+            raise RuntimeError("the restore journal names a folder outside backups/")
+    if journal["direction"] == "forward":
+        _forward(data_dir, journal)
+        end_journal(data_dir)
+        log.warning("a restore interrupted by a crash was finished at launch")
+    else:
+        _back(data_dir, journal)
+        log.warning("a restore interrupted by a crash was undone at launch")
+    return True
+
+
+def _exists(path):
+    return path.exists() or path.is_symlink()
 
 
 def _remove(path):

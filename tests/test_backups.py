@@ -336,6 +336,30 @@ async def test_a_restore_whose_database_cannot_be_opened_puts_everything_back(tm
         assert (data / "projects" / project / "config.toml").is_file()
 
 
+async def test_a_restore_whose_harness_cannot_start_puts_everything_back_and_runs_on(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        project = await new_project(client)
+        real, recovered = Harness.recover, []
+
+        async def failing_once(self):
+            recovered.append(self)
+            if len(recovered) == 1:
+                raise RuntimeError("recovery failed")
+            await real(self)
+
+        monkeypatch.setattr(Harness, "recover", failing_once)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+        assert (await client.get(f"/api/projects/{project}")).status_code == 200  # the previous state, running
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201
+        assert (data / "projects" / project / "config.toml").is_file()
+        assert not (data / "backups" / backups_module.JOURNAL).exists()
+        assert list((data / "backups" / backups_module.STAGING).iterdir()) == []
+
+
 # Project export
 
 
