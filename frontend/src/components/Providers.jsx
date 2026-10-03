@@ -134,7 +134,9 @@ function ProviderCard({ provider, table, save, onChanged }) {
         </div>
         <Segmented label={t('providers.onOff', { name: provider.name })} value={provider.enabled ? 'on' : 'off'}
           options={[{ value: 'on', label: t('providers.on') }, { value: 'off', label: t('providers.off') }]}
-          onChange={async (value) => { await save({ [settingKey('providers', provider.name, 'enabled')]: value === 'on' ? null : false }); await onChanged(); }} />
+          onChange={async (value) => { // refused (the file changed): it was read again, and its message stays
+            if (await save({ [settingKey('providers', provider.name, 'enabled')]: value === 'on' ? null : false })) await onChanged();
+          }} />
       </header>
 
       <form onSubmit={saveKey} className="mt-4 grid gap-1.5">
