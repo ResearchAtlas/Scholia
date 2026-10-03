@@ -137,13 +137,18 @@ export function ModelPicker({ projectId }) {
     .filter(Boolean);
 
   function pick(m) {
-    if (!m) {
-      setChoice({ auto: true });
-    } else if (m.window.status === 'needed') { // a window can be set only where none is reported
+    if (m?.window.status === 'needed') { // a window can be set only where none is reported
       setFixing(m);
       return;
-    } else if (m.window.status !== 'ok') {
-      return; // reported below the smallest usable window: no setting can raise it
+    }
+    if (m && m.window.status !== 'ok') return; // reported below the smallest usable window: no setting can raise it
+    choose(m);
+  }
+
+  // Chooses Auto (m null) or a usable model, with its remembered effort, and closes the picker.
+  function choose(m) {
+    if (!m) {
+      setChoice({ auto: true });
     } else {
       const remembered = catalog.efforts[m.id];
       setChoice({ provider: m.provider, model: m.id, name: m.name, effort: m.effort.steps.includes(remembered) ? remembered : null });
@@ -171,7 +176,7 @@ export function ModelPicker({ projectId }) {
       setFixProblem(error instanceof ApiError ? error.code : 'internal');
       return; // the field stays, with the reason
     }
-    setFixing(null);
+    choose(m); // its window is set now, so the choice it was asked for completes; the catalog's check confirms it
     await reload();
   }
 
