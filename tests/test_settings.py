@@ -764,3 +764,29 @@ def test_none_clears_a_setting_back_to_its_default(tmp_path, project_id, dotted,
     assert reread.values[section].get(key) == default
     reread.save({dotted: None, "absent.key": None})  # clearing what is not there changes nothing
     assert reread.path.read_text() == f"# mine\n[{section}]\nkeep = 1  # note\n"
+
+
+@pytest.mark.parametrize("url, ok", [
+    ("https://openrouter.ai/api/v1", True),
+    ("https://llm.example.org:8443/v1", True),
+    ("http://127.0.0.1:11434/v1", True),
+    ("http://localhost:1234/v1", True),
+    ("http://[::1]:8080/v1", True),
+    ("http://llm.example.org/v1", False),  # a key would travel in clear text
+    ("http://192.168.1.5:11434/v1", False),
+    ("ftp://example.org/v1", False),
+    ("https://user:secret@example.org/v1", False),
+    ("https://example.org/v1?key=abc", False),
+    ("https://example.org/v1#x", False),
+    ("https:///v1", False),
+    ("https://example.org:99999/v1", False),
+    ("openrouter.ai", False),
+])
+def test_a_provider_base_url_is_https_or_plain_http_only_to_this_machine(tmp_path, url, ok):
+    personal = load_settings(tmp_path)
+    if ok:
+        personal.save({"providers.local.kind": "openai-compatible", "providers.local.base_url": url})
+        assert load_settings(tmp_path).values["providers"]["local"]["base_url"] == url
+    else:
+        with pytest.raises(ValueError, match="providers.local.base_url"):
+            personal.save({"providers.local.kind": "openai-compatible", "providers.local.base_url": url})

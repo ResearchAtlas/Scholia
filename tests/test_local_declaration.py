@@ -13,8 +13,8 @@ import httpx
 import pytest
 
 from backend.db import Database, new_id
-from backend.outbound_gate import GateInputs, OutboundDenied, OutboundGate
-from network_guard import mock_http_server
+from backend.outbound_gate import GateInputs, OutboundDenied, OutboundGate, listener_is_ours
+from network_guard import allow_subprocess, mock_http_server
 
 
 def server(stack, redirect_to=None):
@@ -79,8 +79,15 @@ def reasons(db):
         conn.execute("SELECT data FROM audit_log WHERE event = 'outbound' ORDER BY seq")])
 
 
+def ours(host, port):
+    """The gate's real check that this account listens there; these servers run in this process."""
+    with allow_subprocess("/usr/sbin/lsof"):
+        return listener_is_ours(host, port)
+
+
 def gate_for(db, provider_urls=(), helper_url=None):
-    return OutboundGate(db, lambda: GateInputs(provider_urls=provider_urls, helper_url=helper_url))
+    return OutboundGate(db, lambda: GateInputs(provider_urls=provider_urls, helper_url=helper_url),
+                        local_listener=ours)
 
 
 def test_loopback_provider_is_refused_for_local_only_until_declared(db, stack):

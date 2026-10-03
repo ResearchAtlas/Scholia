@@ -2,8 +2,9 @@
 
 The app runs it with `--self-test --model <embedding model>`. It checks, inside the frozen
 build, the native pieces the app ships: SQLite, FTS5 secure-delete, extension loading and
-sqlite-vec through APSW, one embedding through the llama.cpp helper, and one OCR page
-through Vision. It prints the results as JSON and exits non-zero when any check fails.
+sqlite-vec through APSW, the backend with one turn against an in-process provider, one
+embedding through the llama.cpp helper, and one OCR page through Vision. It prints the
+results as JSON and exits non-zero when any check fails.
 
 The checks also run from source (tests/test_self_test.py), except the embedding, which
 needs the model and the helper binary.
@@ -300,10 +301,81 @@ def check_ocr() -> dict:
     return {"lines": [line for line, _ in found], "min_confidence": round(min(c for _, c in found), 3)}
 
 
+class _Keys:
+    """An in-memory credential store for the backend check: the Keychain is never touched."""
+
+    def __init__(self):
+        self.keys = {}
+
+    def get_password(self, service, name):
+        return self.keys.get((service, name))
+
+    def set_password(self, service, name, value):
+        self.keys[(service, name)] = value
+
+    def delete_password(self, service, name):
+        self.keys.pop((service, name), None)
+
+
+def check_backend() -> dict:
+    """The backend as the app runs it, in a temporary data folder: startup and migrations,
+    first-run setup, a project, a conversation and one turn through the outbound gate to an
+    in-process stand-in for the provider, and shutdown. No request leaves the process. The
+    window's bindings are imported, without opening one."""
+    import asyncio
+
+    import httpx
+    import uvicorn  # noqa: F401  # bundled, as the desktop entry needs it
+    import webview  # noqa: F401
+    import WebKit  # noqa: F401
+
+    from backend.app import create_app
+
+    calls = []
+
+    async def provider(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Self-test answer."}}],
+                                         "usage": {"cost": 0}})
+
+    async def drive(folder):
+        origin, session = "http://127.0.0.1:1", secrets.token_urlsafe(32)  # as the desktop entry starts it
+        app = create_app(folder, origin=origin, session=session, keyring_backend=_Keys(),
+                         transport=httpx.MockTransport(provider))
+        async with app.app.router.lifespan_context(app.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin,
+                                         headers={"X-Scholia-Client": "local"}) as client:
+                outside = await client.get("/api/projects")
+                if outside.status_code != 401:
+                    raise RuntimeError(f"a request without this launch's session got {outside.status_code}")
+                client.headers["X-Scholia-Session"] = session
+                for method, path, body in (("POST", "/api/setup", {"openrouter_key": "self-test"}),
+                                           ("POST", "/api/projects", {"name": "Self-test"})):
+                    response = await client.request(method, path, json=body)
+                    response.raise_for_status()
+                project = response.json()["id"]
+                conversation = (await client.post("/api/conversations", json={"project_id": project,
+                                                                                "title": "Self-test"})).json()
+                stream = await client.post(f"/api/conversations/{conversation['id']}/message/stream",
+                                           json={"content": "Hello"})
+                if '"status": "succeeded"' not in stream.text:
+                    raise RuntimeError("the turn did not succeed")
+                refused = await client.get("/api/projects", headers={"X-Scholia-Client": "", "Host": "evil.example"})
+                if refused.status_code != 403:
+                    raise RuntimeError(f"a request from another host got {refused.status_code}")
+
+    with tempfile.TemporaryDirectory() as folder:
+        asyncio.run(drive(Path(folder) / "data"))
+    if calls != ["/api/v1/chat/completions"]:
+        raise RuntimeError(f"unexpected provider calls {calls}")
+    return {"turn": "succeeded"}
+
+
 def run(helper: Path, model: Path) -> dict:
     checks = {
         "sqlite": check_sqlite,
         "index": check_index,
+        "backend": check_backend,
         "embedding": lambda: check_embedding(helper, model),
         "ocr": check_ocr,
     }
@@ -317,7 +389,7 @@ def run(helper: Path, model: Path) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="AAB Research")
+    parser = argparse.ArgumentParser(prog="Scholia")
     parser.add_argument("--self-test", action="store_true", required=True,
                         help="check the native pieces of this build and exit")
     parser.add_argument("--model", type=Path, required=True, help="the pinned embedding model")

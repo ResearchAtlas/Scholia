@@ -15,7 +15,7 @@ import keyring
 
 from backend.settings import write_private
 
-SERVICE = "AAB Research"  # the app's working name, which may change before the first release
+SERVICE = "io.github.researchatlas.scholia"  # the Keychain service, the same as the bundle id
 FALLBACK_FILE = "credentials.json"
 FALLBACK_WARNING = (
     "The system credential store is unavailable, so the key was saved in an "

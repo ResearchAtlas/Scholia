@@ -59,7 +59,7 @@ ON_DELETE = {
     ("turns", "retry_of_run_id"): "retry_of_run_id = NULL",
     ("candidates", "run_id"): DELETE,
     ("search_plans", "run_id"): DELETE,
-    ("budget_reservations", "run_id"): DELETE,
+    ("budget_reservations", "run_id"): "run_id = NULL",  # spending outlives the run; the project still counts it
     ("section_leases", "run_id"): DELETE,
     ("citations", "support_run_id"): "support_run_id = NULL",
     ("artifact_versions", "run_id"): "run_id = NULL",
@@ -135,8 +135,10 @@ RULES = (
 SCOPE_LINKS: tuple[str, ...] = ()
 
 
-def delete(db, content, kind, object_id, *, remove_all_trace=False):
+def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed=None):
     """Delete one object and everything that belongs to it. Returns the ids of the active runs it revoked.
+    on_committed, if given, is called with those ids as soon as the deletion commits, before
+    the cleanup that follows, so the caller can stop that work at once.
 
     kind is a key of KINDS. remove_all_trace drops the titles from the
     tombstones. An active (running) run whose scope included a deleted record is
@@ -150,6 +152,8 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False):
     if kind not in KINDS:
         raise ValueError(f"cannot delete a {kind!r}")
     revoked = db.write(lambda conn: _delete(conn, kind, object_id, remove_all_trace))
+    if on_committed is not None:
+        on_committed(revoked)
     # The deletion is committed. These finish removing its traces, and the next
     # deletion or collection retries them if they fail now. Collection goes first,
     # since the rows it removes would otherwise stay in the WAL.

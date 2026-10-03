@@ -307,15 +307,19 @@ def test_an_object_can_be_deleted_only_once(db, store):
 
 
 def test_deleting_a_conversation_removes_its_runs_and_keeps_what_others_own(db, store):
-    x = populate(db, store, add_project(db, "Thesis"), "p")
+    project = add_project(db, "Thesis")
+    x = populate(db, store, project, "p")
     db.write(lambda conn: conn.execute("UPDATE runs SET status = 'succeeded' WHERE id = ?", (x["r2"],)))
 
     revoked = delete(db, store, "conversation", x["c1"])
 
     assert revoked == sorted(x[run] for run in ("r1", "r3", "r4", "r5", "r6"))  # r2 had finished
-    gone = [x[name] for name in ("c1", "r1", "r2", "r3", "r4", "k1", "b1", "ct1", "mr1")]
+    gone = [x[name] for name in ("c1", "r1", "r2", "r3", "r4", "k1", "ct1", "mr1")]
     assert ids_in(db, "conversations", gone) | ids_in(db, "runs", gone) | ids_in(db, "candidates", gone) == set()
-    assert ids_in(db, "budget_reservations", gone) | ids_in(db, "citations", gone) | ids_in(db, "memory_records", gone) == set()
+    assert ids_in(db, "citations", gone) | ids_in(db, "memory_records", gone) == set()
+    # Spending stays in the project, content-free, without its run and conversation.
+    assert one(db, "SELECT run_id, paying_conversation_id, project_id, estimate_usd FROM budget_reservations WHERE id = ?",
+               x["b1"]) == (None, None, project, 0.5)
     assert ids_in(db, "turns", gone, "run_id") | ids_in(db, "run_events", gone, "run_id") == set()
     assert ids_in(db, "search_plans", gone, "run_id") | ids_in(db, "section_leases", gone, "run_id") == set()
 
@@ -654,13 +658,20 @@ def test_a_truncation_blocked_by_a_reader_is_retried_after_the_next_write(tmp_pa
 
 
 KILLED_DELETION = r"""
-import os, signal, sqlite3, sys
+import os, signal, sqlite3, sys, time
+
+
+def crash(*args):
+    os.kill(os.getpid(), signal.SIGKILL)
+    while True:  # the signal is delivered asynchronously; never return to the next statement
+        time.sleep(1)
+
 
 real_connect = sqlite3.connect
 
 def connect(*args, **kwargs):
     conn = real_connect(*args, **kwargs)
-    conn.create_function("crash", 0, lambda: os.kill(os.getpid(), signal.SIGKILL))
+    conn.create_function("crash", 0, crash)
     conn.execute("PRAGMA cache_size = 10")  # spill uncommitted pages into the WAL
     return conn
 
@@ -673,7 +684,7 @@ store = ContentStore(db)
 if when == "inside":
     db.write(lambda conn: conn.execute("CREATE TRIGGER crash_inside AFTER DELETE ON run_events BEGIN SELECT crash(); END"))
 else:
-    store.collect_garbage = lambda now=None: os.kill(os.getpid(), signal.SIGKILL)
+    store.collect_garbage = crash
 delete(db, store, kind, object_id)
 """
 

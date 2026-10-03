@@ -107,19 +107,19 @@ jobs:
       - name: Open the DMG
         run: |
           mkdir build/mnt
-          hdiutil attach build/AAB-Research.dmg -readonly -nobrowse -mountpoint build/mnt
+          hdiutil attach build/Scholia.dmg -readonly -nobrowse -mountpoint build/mnt
           ls -la build/mnt
-          test "$(ls -A build/mnt)" = "$(printf 'AAB Research.app\nApplications')"
+          test "$(ls -A build/mnt)" = "$(printf 'Applications\nScholia.app')"
           test "$(readlink build/mnt/Applications)" = /Applications
-          codesign --verify --deep --strict "build/mnt/AAB Research.app"
-          codesign -dv "build/mnt/AAB Research.app" 2>&1 | grep -x "Signature=adhoc"
-          codesign -dv "build/mnt/AAB Research.app/Contents/MacOS/llama-server" 2>&1 | grep -x "Signature=adhoc"
+          codesign --verify --deep --strict "build/mnt/Scholia.app"
+          codesign -dv "build/mnt/Scholia.app" 2>&1 | grep -x "Signature=adhoc"
+          codesign -dv "build/mnt/Scholia.app/Contents/MacOS/llama-server" 2>&1 | grep -x "Signature=adhoc"
       - name: Self-test the app inside the DMG
         env:
           EXPECTED_PYTHON: ${{ steps.python.outputs.python-version }}
         run: |
           set -o pipefail
-          "build/mnt/AAB Research.app/Contents/MacOS/AAB Research" --self-test \
+          "build/mnt/Scholia.app/Contents/MacOS/Scholia" --self-test \
             --model build/models/Qwen3-Embedding-0.6B-Q8_0.gguf | tee build/self-test.json
           uv run --no-sync python - build/self-test.json <<'EOF'
           import json, os, sys
@@ -133,8 +133,8 @@ jobs:
           EOF
       - name: License audit of the app inside the DMG
         run: |
-          find "build/mnt/AAB Research.app" -type f | sort
-          uv run --no-sync python tools/license_audit.py "build/mnt/AAB Research.app"
+          find "build/mnt/Scholia.app" -type f | sort
+          uv run --no-sync python tools/license_audit.py "build/mnt/Scholia.app"
       - name: Close the DMG
         if: always()
-        run: if [ -e "build/mnt/AAB Research.app" ]; then hdiutil detach build/mnt; fi
+        run: if [ -e "build/mnt/Scholia.app" ]; then hdiutil detach build/mnt; fi

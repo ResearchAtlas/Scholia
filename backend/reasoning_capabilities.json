@@ -1,0 +1,5 @@
+{
+  "_doc": "Probe-written reasoning-capability sidecar (v1.3.0 A1/A2). The single capability authority consumed by Phase B at runtime, in place of model_registry.json.supports_reasoning. EMPTY until the A2 active-probe fills it -- while empty, every lookup returns an explicit 'unknown' record (never a fabricated supported/unsupported). Do NOT hand-edit capability values; A2 writes them from live probes. A row is invalidated at runtime when its model fingerprint changes; age (30 days) is a maintainer/release warning only.",
+  "written_at": null,
+  "capabilities": {}
+}

@@ -150,11 +150,21 @@ def test_an_existing_database_at_version_zero_is_backed_up_before_migrating(tmp_
         backup.close()
 
 
+def test_the_database_carries_the_scholia_identity_and_reopens(tmp_path):
+    data = tmp_path / "data"
+    Database(data).close()
+    assert (data / "scholia.sqlite3").is_file() and DB_NAME == "scholia.sqlite3"
+    assert APPLICATION_ID.to_bytes(4, "big") == b"SCHL"
+    with Database(data) as db:  # reopened: the id migration 0001 wrote is the id startup checks
+        assert db.read(lambda conn: conn.execute("PRAGMA application_id").fetchone()) == (APPLICATION_ID,)
+
+
 @pytest.mark.parametrize("application_id, version, has_table", [
     (0, 1, True),
     (0, 0, True),
     (0x12345678, 1, False),
-], ids=["no-id-in-range-version", "no-id-no-version", "other-id"])
+    (0x41414252, 2, True),  # "AABR", the id before the app was named Scholia
+], ids=["no-id-in-range-version", "no-id-no-version", "other-id", "pre-scholia-id"])
 def test_another_apps_database_is_refused_and_left_unchanged(tmp_path, application_id, version, has_table):
     data = tmp_path / "data"
     data.mkdir()
@@ -340,7 +350,14 @@ def test_the_startup_check_reads_the_file_header_in_one_snapshot(tmp_path, monke
 
 
 KILLED_MIGRATION = r"""
-import os, signal, sqlite3, sys
+import os, signal, sqlite3, sys, time
+
+
+def crash(*args):
+    os.kill(os.getpid(), signal.SIGKILL)
+    while True:  # the signal is delivered asynchronously; never return to the next statement
+        time.sleep(1)
+
 from backend.db import Database
 from backend.db.migrations import MIGRATIONS
 
@@ -348,7 +365,7 @@ real_connect = sqlite3.connect
 
 def connect(*args, **kwargs):
     conn = real_connect(*args, **kwargs)
-    conn.create_function("crash", 0, lambda: os.kill(os.getpid(), signal.SIGKILL))
+    conn.create_function("crash", 0, crash)
     conn.execute("PRAGMA cache_size = 10")  # spill uncommitted pages into the WAL
     return conn
 
@@ -667,3 +684,62 @@ def test_existing_permissions_are_left_as_they_are(tmp_path):
         sidecars = (mode(data / f"{DB_NAME}-wal"), mode(data / f"{DB_NAME}-shm"))
     assert sidecars == (0o640, 0o640)
     assert (mode(data), mode(data / DB_NAME), mode(data / "backups")) == (0o750, 0o640, 0o750)
+
+
+def test_close_waits_for_reads_in_progress_and_then_refuses_new_work(tmp_path):
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    reading, release = threading.Event(), threading.Event()
+    outcome = []
+
+    def slow(conn):
+        reading.set()
+        release.wait(5)
+        return conn.execute("SELECT count(*) FROM projects").fetchone()
+
+    reader = threading.Thread(target=lambda: outcome.append(db.read(slow)))
+    reader.start()
+    reading.wait(5)
+    closer = threading.Thread(target=db.close)
+    closer.start()
+    closer.join(0.2)
+    assert closer.is_alive()  # waiting for the read, not closing its connection under it
+    release.set()
+    reader.join(5)
+    closer.join(5)
+    assert outcome == [(1,)] and not closer.is_alive()
+    with pytest.raises(DatabaseClosedError):
+        db.read(lambda conn: None)
+    with pytest.raises(DatabaseClosedError):
+        db.write(lambda conn: None)
+
+
+def test_a_write_admitted_before_close_runs_before_the_writer_closes(tmp_path, monkeypatch):
+    """A write checked in just before close() starts is queued ahead of the close."""
+    import backend.db.database as database_module
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    real_submit = db._writer.submit
+    admitted, closing = threading.Event(), threading.Event()
+
+    def submit(fn, *args):
+        if fn == db._transaction:
+            admitted.set()
+            closing.wait(0.3)  # close() tries to start here; it cannot until this write is queued
+        return real_submit(fn, *args)
+
+    monkeypatch.setattr(db._writer, "submit", submit)
+    results = []
+    writer = threading.Thread(target=lambda: results.append(db.write(add_audit_row)))
+    writer.start()
+    admitted.wait(5)
+    closer = threading.Thread(target=db.close)
+    closer.start()
+    closing.set()
+    writer.join(5)
+    closer.join(5)
+    assert results and not closer.is_alive()
+    with pytest.raises(DatabaseClosedError):
+        db.write(add_audit_row)
+    with Database(tmp_path / "data") as reopened:
+        assert audit_events(reopened) == [("kept",)]

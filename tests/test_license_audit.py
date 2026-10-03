@@ -140,10 +140,23 @@ def test_file_of_no_known_component_fails(bundle):
     assert any(p.startswith("README.txt: belongs to no known") for p in problems)
 
 
-def test_disallowed_license_fails(bundle):
+def test_an_mpl_package_passes_only_by_its_named_entry_at_its_version(bundle, monkeypatch):
+    assert not la.allowed("MPL-2.0")  # never by the license alone
     _put(bundle, "Contents/Resources/certifi/cacert.pem")
     _ship(bundle, "certifi")
-    assert la.audit(bundle)[1] == ["certifi: license MPL-2.0 is not allowed"]
+    assert la.audit(bundle)[1] == []
+    shipped = sorted(p.name for p in (bundle / "Contents/Resources/licenses/certifi").iterdir())
+    assert shipped == ["LICENSE", "SOURCE.txt"]
+    source = (bundle / "Contents/Resources/licenses/certifi/SOURCE.txt").read_text()
+    version = metadata.version("certifi")
+    assert f"https://github.com/certifi/python-certifi/tree/{version}" in source
+    monkeypatch.setitem(la.MPL_PACKAGES, "certifi", "2020.1.1")
+    assert la.audit(bundle)[1] == [
+        f"certifi: version {version} is not the reviewed MPL-2.0 version 2020.1.1",
+        "certifi: SOURCE.txt does not name version 2020.1.1",
+    ]
+    monkeypatch.delitem(la.MPL_PACKAGES, "certifi")
+    assert "certifi: license MPL-2.0 is not allowed" in la.audit(bundle)[1]
 
 
 def test_missing_or_changed_license_text_fails(bundle):
@@ -172,16 +185,46 @@ MACHO_MAGICS = [
 
 @pytest.mark.parametrize("magic", MACHO_MAGICS, ids=lambda m: m.hex())
 def test_unreviewed_native_code_from_a_distribution_fails(bundle, magic):
-    _put(bundle, "Contents/Frameworks/pydantic_core/_pydantic_core.cpython-313-darwin.so", magic + bytes(28))
-    _ship(bundle, "pydantic_core")
+    _put(bundle, "Contents/Frameworks/watchfiles/_rust_notify.cpython-313-darwin.so", magic + bytes(28))
+    _ship(bundle, "watchfiles")
     problems = la.audit(bundle)[1]
     assert len(problems) == 1 and "has not been reviewed" in problems[0]
 
 
 def test_data_file_from_a_distribution_is_not_native_code(bundle):
-    _put(bundle, "Contents/Frameworks/pydantic_core/__init__.py", b"# Python source")
-    _ship(bundle, "pydantic_core")
+    _put(bundle, "Contents/Frameworks/watchfiles/__init__.py", b"# Python source")
+    _ship(bundle, "watchfiles")
     assert la.audit(bundle)[1] == []
+
+
+def test_a_rust_extension_needs_its_crates_notices_for_its_exact_version(bundle, monkeypatch):
+    _put(bundle, "Contents/Frameworks/pydantic_core/_pydantic_core.cpython-313-darwin.so", MACHO)
+    _ship(bundle, "pydantic_core")
+    assert la.audit(bundle)[1] == [
+        "pydantic-core-crates: license file RUST-NOTICES.txt is not shipped in "
+        "Contents/Resources/licenses/pydantic-core-crates/"]
+    _ship(bundle, "pydantic-core-crates")
+    found, problems = la.audit(bundle)
+    assert problems == [] and "pydantic-core-crates" in found
+    monkeypatch.setitem(la.RUST_NOTICES, "pydantic_core", "1.0.0")
+    assert any("has no Rust notices" in p for p in la.audit(bundle)[1])
+
+
+def test_the_rust_notices_are_for_the_installed_version():
+    version = metadata.version("pydantic_core")
+    assert la.RUST_NOTICES == {"pydantic_core": version}
+    header = (la.ROOT / "tools/notices/pydantic-core/RUST-NOTICES.txt").read_text().splitlines()[0]
+    assert header == f"Third-party notices for the Rust code compiled into pydantic-core {version}."
+    assert la.allowed(la.component(la.PYDANTIC_CORE_CRATES)[0])
+
+
+def test_scholias_own_backend_data_files_are_scholias(bundle):
+    _put(bundle, "Contents/Resources/backend/reasoning_capabilities.json", b"{}")
+    _ship(bundle, "Scholia")
+    found, problems = la.audit(bundle)
+    assert problems == [] and "Contents/Resources/backend/reasoning_capabilities.json" in found["Scholia"]
+    _put(bundle, "Contents/Resources/backend/not_in_the_source.json", b"{}")
+    assert la.audit(bundle)[1] == ["Contents/Resources/backend/not_in_the_source.json: belongs to no known component"]
 
 
 def test_runtime_hooks_are_assigned_to_their_own_licenses():

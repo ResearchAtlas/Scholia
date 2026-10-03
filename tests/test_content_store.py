@@ -126,7 +126,7 @@ def test_a_missing_file_raises(store):
 
 
 @pytest.mark.parametrize("name", [
-    "../../aab.sqlite3", "", "A" * 64, "a" * 63, "a" * 65, "g" * 64, "../" + "a" * 61, "a" * 64 + "\n", None, b"a" * 64,
+    "../../scholia.sqlite3", "", "A" * 64, "a" * 63, "a" * 65, "g" * 64, "../" + "a" * 61, "a" * 64 + "\n", None, b"a" * 64,
 ])
 def test_a_malformed_hash_is_refused_before_any_path_is_built(store, name):
     with pytest.raises(ValueError, match="64 lowercase"):

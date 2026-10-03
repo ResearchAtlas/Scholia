@@ -72,8 +72,10 @@ CDN, say) needs a change here when it is wired in.
 import asyncio
 import ipaddress
 import json
+import os
 import re
 import socket
+import subprocess
 import threading
 from collections.abc import Callable, Collection, Mapping
 from http.cookiejar import CookieJar, DefaultCookiePolicy
@@ -133,6 +135,10 @@ _KNOWN = SCHOLARLY_APIS | MODEL_SOURCES | {OPENROUTER}
 # value is a one-time token from _Scope.expect, bound to the next URL.
 _HOP = object()
 MAX_PENDING_HOPS = 16  # per client
+# A request extension holding a callable the gate calls once the request has passed its
+# check and is handed to the network, so a caller can tell a request that left from one
+# that was refused or cancelled before it left.
+DISPATCHED = "scholia.dispatched"
 
 
 class OutboundDenied(Exception):
@@ -207,12 +213,21 @@ class OutboundGate:
     db is the main Database. inputs returns the current GateInputs and is called
     for each request. transport is where checked requests go; tests pass an
     httpx.MockTransport, and otherwise each client gets httpx's own.
+
+    local_listener(host, port) says whether a process of this account listens there.
+    A local provider reached over plain HTTP gets a request only then: another account
+    on this machine could otherwise take its port while it is not running and receive
+    the key and the content. It defaults to an lsof check when requests reach the real
+    network, and to none when a transport is passed (that transport is the destination).
+    ponytail: checked just before sending; a listener of this account holds the port, and
+    macOS lets no other account bind it meanwhile.
     """
 
-    def __init__(self, db, inputs: Callable[[], GateInputs], *, transport=None):
+    def __init__(self, db, inputs: Callable[[], GateInputs], *, transport=None, local_listener=None):
         self._db = db
         self._inputs = inputs
         self._transport = transport
+        self._local_listener = local_listener or (None if transport is not None else listener_is_ours)
 
     def client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
                **options) -> httpx.Client:
@@ -268,6 +283,15 @@ class OutboundGate:
                 private_problem = "sensitivity_changed"  # used only if it became Private since
         except Exception as caught:  # recorded as a refusal below, and chained to it
             error = caught
+        # Whose process listens at a plain-HTTP local provider, asked outside the transaction
+        # (not for the helper, the app's own child).
+        owned = None
+        if self._local_listener is not None and target is not None and target[0] == "http" \
+                and _is_this_host(target[1]) and target in providers and target != helper:
+            try:
+                owned = bool(self._local_listener(target[1], target[2]))
+            except Exception:  # unknown counts as not ours
+                owned = False
 
         def decide(conn):
             # The level is read in the transaction that records the decision, so a
@@ -286,6 +310,8 @@ class OutboundGate:
                 reason = _policy(conn, level, kind, target, scope, private_problem, public_problem, bound)
                 if reason is None and not addressed:
                     reason = "host_mismatch"
+                if reason is None and kind is Kind.LOCAL_PROVIDER and owned is False:
+                    reason = "local_server_not_yours"
             shown = _shown(conn, target, kind, link, providers, helper)
             _record(conn, request, scope, level, kind, shown, reason)
             return kind, reason, shown
@@ -315,6 +341,7 @@ class _Transport(httpx.BaseTransport):
 
     def handle_request(self, request):
         kind = self._gate._check(request, self._scope)
+        _dispatched(request)
         response = self._inner.handle_request(request)
         leaves, target = _redirect(request, response)
         if leaves:
@@ -335,6 +362,7 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
         # The database blocks, so it is reached off the event loop.
         kind = await asyncio.to_thread(self._gate._check, request, self._scope)
+        _dispatched(request)
         response = await self._inner.handle_async_request(request)
         leaves, target = _redirect(request, response)
         if leaves:
@@ -346,6 +374,46 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self):
         await self._inner.aclose()
+
+
+def listener_is_ours(host, port) -> bool:
+    """Whether a process of this account listens at host:port: on that address, or on its
+    family's wildcard. A name (localhost) needs both 127.0.0.1 and ::1, since either may be
+    reached. lsof run as this account lists only its processes (-u narrows it in any case).
+    A wildcard counts only for its own family: lsof cannot tell a dual-stack IPv6 socket
+    from an IPv6-only one, so a dual-stack server is reached at its IPv6 address."""
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()), f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-F", "tn"],
+        capture_output=True, timeout=5, check=False)
+    if result.returncode != 0:
+        return False
+    listeners, family = [], None
+    for line in result.stdout.decode("ascii", "replace").splitlines():
+        if line.startswith("t"):
+            family = {"IPv4": 4, "IPv6": 6}.get(line[1:])
+        elif line.startswith("n") and family:
+            listeners.append((family, line[1:].rsplit(":", 1)[0].strip("[]")))
+    try:
+        wanted = [ipaddress.ip_address(host)]
+    except ValueError:
+        wanted = [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")]
+
+    def covers(listener, address):
+        family, bound = listener
+        if bound == "*":
+            return family == address.version
+        try:
+            return ipaddress.ip_address(bound) == address
+        except ValueError:
+            return False
+
+    return all(any(covers(listener, address) for listener in listeners) for address in wanted)
+
+
+def _dispatched(request):
+    notify = request.extensions.get(DISPATCHED)
+    if callable(notify):
+        notify()
 
 
 def _project_id(project_id):
