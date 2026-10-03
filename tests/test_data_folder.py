@@ -159,6 +159,8 @@ def test_a_data_folder_on_a_network_share_is_never_opened_and_another_place_is_c
         answers["first"] = [http.get(path).json() for path in ("/api/setup", "/api/settings")]  # as the interface starts
         answers["other"] = http.get("/api/projects").json()
         answers["refused"] = http.post("/api/data-folder", json={"path": str(tmp_path / "share" / "Other")}).json()
+        answers["odd"] = [http.post("/api/data-folder", json=body).json()["code"]
+                          for body in ({"path": "/tmp/x\u0000y"}, {"path": 3}, {})]
         answers["chosen"] = http.post("/api/data-folder", json={"path": str(chosen)}).json()
 
     assert desktop.run(share, _window(seen, on_the_screen), listening=register_server) == 1
@@ -167,6 +169,7 @@ def test_a_data_folder_on_a_network_share_is_never_opened_and_another_place_is_c
     assert answers["first"] == [{"needed": False}, {"values": {}, "warnings": [], "hash": None}]
     assert answers["other"]["code"] == "data_folder_problem"
     assert answers["refused"]["code"] == "data_folder_synced"
+    assert answers["odd"] == ["data_folder_invalid", "invalid_request", "invalid_request"]
     assert answers["chosen"] == {"ok": True, "data_folder": str(chosen), "restart": True}
     assert sorted(p.name for p in share.iterdir()) == [data_folder.LOCATION_FILE]  # no lock, log or database
 

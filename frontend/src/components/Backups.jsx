@@ -3,7 +3,7 @@
 // backups with Back up now and Restore, a full backup to a folder the researcher chooses, and
 // restoring from a full backup file, each restore after a confirmation. DamagedDatabaseScreen
 // offers the restore alone, for a database found damaged at startup.
-import { useContext, useEffect, useState } from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
 import { CheckCircle2, DatabaseBackup, History, TriangleAlert } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { get, post } from '../api.js';
@@ -53,7 +53,7 @@ export function BackupsSection({ onRestored = () => window.location.reload(), re
         {backups?.length > 0 && (
           <ul className="scroll-thin max-h-72 divide-y overflow-y-auto rounded-lg border">
             {backups.map((backup) => <BackupRow key={backup.id} backup={backup}
-              onRestore={() => setRestoring({ generation: backup.id, time: backup.time })} />)}
+              onRestore={(when) => setRestoring({ generation: backup.id, when })} />)}
           </ul>
         )}
       </section>
@@ -61,7 +61,7 @@ export function BackupsSection({ onRestored = () => window.location.reload(), re
       {!restoreOnly && <FullBackup />}
       <RestoreFromFile onRestore={(request) => setRestoring(request)} />
 
-      <ConfirmRestore request={restoring} onClose={() => setRestoring(null)}
+      <ConfirmRestore request={restoring} damaged={restoreOnly} onClose={() => setRestoring(null)}
         onDone={(result) => { setRestoring(null); setRestored(result); }} />
     </div>
   );
@@ -95,7 +95,7 @@ function BackupRow({ backup, onRestore }) {
           {t('backups.detail', { kind: t(`backups.${backup.kind}`), size: fileSize(backup.size, language) })}
         </p>
       </div>
-      <Button size="sm" variant="outline" className="h-7" onClick={onRestore}
+      <Button size="sm" variant="outline" className="h-7" onClick={() => onRestore(when)}
         aria-label={t('backups.restoreThis', { time: when })}>{t('backups.restore')}</Button>
     </li>
   );
@@ -158,7 +158,8 @@ function RestoreFromFile({ onRestore }) {
   );
 }
 
-function ConfirmRestore({ request, onClose, onDone }) {
+// damaged: the database is damaged, so there is no safety copy; it is moved aside instead.
+function ConfirmRestore({ request, damaged, onClose, onDone }) {
   const t = useT();
   const { busy, problem, run, reset } = useAction();
   async function confirm() {
@@ -170,8 +171,11 @@ function ConfirmRestore({ request, onClose, onDone }) {
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>{t('backups.restoreTitle')}</DialogTitle>
-          <DialogDescription>{t('backups.restoreBody')}</DialogDescription>
+          <DialogDescription>{t(damaged ? 'backups.restoreDamagedBody' : 'backups.restoreBody')}</DialogDescription>
         </DialogHeader>
+        <p className="break-all rounded-md bg-muted px-3 py-2 text-sm">
+          {request?.when ? t('backups.restoreWhat', { time: request.when }) : <span className="font-mono text-xs">{request?.file}</span>}
+        </p>
         {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
         {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}
         <DialogFooter>
@@ -186,13 +190,18 @@ function ConfirmRestore({ request, onClose, onDone }) {
 function Restored({ result, onContinue }) {
   const t = useT();
   const missing = result.missing_files ?? [];
+  const heading = useRef(null);
+  useEffect(() => heading.current?.focus(), []); // the dialog that had focus is gone
   return (
     <div className="grid gap-3">
-      <Saved text={t('backups.restored')} />
+      <div ref={heading} tabIndex={-1} className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        <Saved text={t('backups.restored')} />
+      </div>
       {missing.length > 0 && (
         <div role="alert" className="rounded-md border border-warning/40 px-3 py-2 text-sm">
           <p className="font-medium text-warning">{t('backups.missingFiles', { count: missing.length })}</p>
-          <ul className="mt-1 max-h-32 overflow-y-auto font-mono text-xs text-muted-foreground">
+          <ul tabIndex={0} aria-label={t('backups.missingFiles', { count: missing.length })}
+            className="mt-1 max-h-32 overflow-y-auto rounded-sm font-mono text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
             {missing.map((file) => <li key={file.sha256} className="truncate" title={file.sha256}>{file.sha256}</li>)}
           </ul>
         </div>

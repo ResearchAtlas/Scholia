@@ -19,6 +19,7 @@ import unicodedata
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -184,6 +185,10 @@ def limited_app(default, data_dir, problem, reason, *, origin, session, frontend
     def error(status, code, message):
         return JSONResponse({"code": code, "message": message}, status_code=status)
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid(request, failure):
+        return error(400, "invalid_request", "The request is not valid")
+
     @app.get("/api/health")
     async def health():
         return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir),
@@ -205,7 +210,7 @@ def limited_app(default, data_dir, problem, reason, *, origin, session, frontend
             return error(400, failure.code, str(failure))
         except UnsafeDataFolderError as failure:
             return error(400, "data_folder_unsafe", str(failure))
-        except OSError:
+        except (OSError, ValueError):  # such as a path with a NUL character
             return error(400, "data_folder_invalid", "That folder cannot be used")
         return {"ok": True, "data_folder": str(chosen), "restart": True}
 

@@ -399,3 +399,19 @@ async def test_a_private_project_exports_only_encrypted(tmp_path):
     [path] = destination.iterdir()
     assert b"Participant 7" not in path.read_bytes()  # titles are inside, never in the names
     assert b"Participant 7" in read(path, "conversations.json", PASSPHRASE)
+
+
+async def test_a_restored_app_takes_requests_only_once_its_runs_are_recovered(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    real, seen = Harness.recover, []
+
+    async def recover(self):
+        seen.append(state.get("harness") is self)  # visible to requests while it recovers?
+        await real(self)
+
+    async with started(tmp_path / "data") as client:
+        state = client.state
+        backup = (await client.post("/api/backups")).json()["id"]
+        monkeypatch.setattr(Harness, "recover", recover)
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+    assert seen == [False]

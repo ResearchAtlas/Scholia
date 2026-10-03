@@ -230,13 +230,17 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 del state["maintenance_started"]
 
     async def start(db):
-        """Run the app on db: its content store, outbound gate and harness, recovered. A restore
-        calls it again with the database it put in place."""
+        """Run the app on db: its content store, outbound gate and harness, recovered before any
+        request reaches them. A restore calls it again with the database it put in place."""
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
+        try:
+            await harness.recover()
+        except BaseException:
+            await harness.shutdown()
+            raise
         state.update(db=db, content=ContentStore(db), gate=gate, harness=harness)
         state.pop("damaged", None)
-        await harness.recover()
 
     @contextlib.asynccontextmanager
     async def lifespan(app):

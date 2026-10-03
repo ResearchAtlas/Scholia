@@ -483,6 +483,8 @@ def test_the_zip_encryption_packages_are_reviewed_and_ship_their_licenses(bundle
     for name, expected in (("pyzipper", {"LICENSE", "LICENSE.python"}), ("pycryptodomex", {"LICENSE.rst"})):
         assert expected <= {dest for _, dest in la.component(name)[1]}, name
     # Every native file of the installed pycryptodomex is covered by its review, and no other.
+    # The review is of this version: another one is reviewed again before it ships.
+    assert metadata.version("pycryptodomex") == "3.23.0"
     natives = [f.as_posix() for f in metadata.distribution("pycryptodomex").files if f.suffix == ".so"]
     assert len(natives) == 40
     for native in natives:

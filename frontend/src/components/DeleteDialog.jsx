@@ -21,7 +21,9 @@ export function DeleteDialog({ target, onClose, onDone }) {
   const shown = useRef(target); // the last target, so the dialog keeps its text while it closes
   if (target) shown.current = target;
   const key = target ? `${target.kind}:${target.id}` : null;
-  useEffect(() => { setRemoveAllTrace(false); setPurgeFailed(false); }, [key]); // each deletion starts afresh
+  useEffect(() => { // each deletion starts afresh; a closing dialog keeps what it shows
+    if (key) { setRemoveAllTrace(false); setPurgeFailed(false); }
+  }, [key]);
 
   async function remove(everywhere) {
     const result = await run(() => api('DELETE', deletePath(target.kind, target.id, { everywhere, removeAllTrace })));
