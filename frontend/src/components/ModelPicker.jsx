@@ -88,10 +88,10 @@ function useCatalog(open, projectId, chosenModel) {
       // so), or when its own provider's current listing no longer offers it.
       if (choice?.model) {
         const at = ready.findIndex((p) => p.name === choice.provider);
-        const own = at >= 0 ? listings[at] : null;
-        const listed = own?.status === 'fulfilled' && !own.value.status?.error;
-        const usable = (m) => m.offered && m.id === choice.model && m.window.status === 'ok';
-        if (at < 0 || (listed && !own.value.models.some(usable))) setChoice(null); // gone, or its window unusable
+        const own = at >= 0 && listings[at].status === 'fulfilled' ? listings[at].value : null;
+        const row = own?.models.find((m) => m.id === choice.model); // a row listed now is judged as it reads
+        const gone = row ? !(row.offered && row.window.status === 'ok') : Boolean(own && !own.status?.error);
+        if (at < 0 || gone) setChoice(null); // its provider gone, or it is no longer offered or usable
       }
       setCatalog(next);
     } catch {
