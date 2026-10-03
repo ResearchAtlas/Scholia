@@ -330,7 +330,9 @@ def test_backups_carry_settings_and_instructions_but_never_keys(tmp_path):
     (data / "AGENTS.md").write_text("Personal instructions\n")
     (data / "projects" / project / "AGENTS.md").write_text("Project instructions\n")
     assert save_key(data, "openrouter", KEY, backend=keyring.backends.fail.Keyring())  # in credentials.json
-    with Database(data) as db:
+    with Database(data) as db:  # a project's settings are backed up with its record
+        db.write(lambda conn: conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, 'p', 'research')",
+                                           (project,)))
         generation = db.backup()
     copied = {str(p.relative_to(generation)) for p in generation.rglob("*") if p.is_file()}
     assert {"config.toml", "AGENTS.md", f"projects/{project}/config.toml", f"projects/{project}/AGENTS.md"} <= copied
