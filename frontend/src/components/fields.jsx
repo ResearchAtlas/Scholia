@@ -56,31 +56,39 @@ export function CommitField({ id, value, onCommit, type = 'text', min, above, st
   const listId = useId();
   const [draft, setDraft] = useState(value ?? '');
   const edited = useRef(false); // typed in since the last commit
-  useEffect(() => { // a new value replaces the draft unless the researcher has typed since
-    if (!edited.current) setDraft(value ?? '');
+  const sent = useRef(null); // the text last committed, until the value catches up with it
+  useEffect(() => { // a new value replaces the draft unless the researcher has typed or committed since
+    if (edited.current || (sent.current !== null && String(value ?? '') !== sent.current)) return;
+    sent.current = null;
+    setDraft(value ?? '');
   }, [value]);
 
   function commit() {
     edited.current = false;
     const text = String(draft).trim();
-    if (text === String(value ?? '')) return;
+    let out = text; // what is saved: null (back to the default), a number, or the text
     if (!text) {
-      if (allowEmpty) onCommit(null);
-      else setDraft(value ?? '');
-      return;
-    }
-    if (type === 'number') {
+      if (!allowEmpty) {
+        setDraft(sent.current ?? value ?? '');
+        return;
+      }
+      out = null;
+    } else if (type === 'number') {
       const number = Number(text);
       if (!Number.isFinite(number) || (min !== undefined && number < min) || (above !== undefined && number <= above)
           || (step === 1 && !Number.isInteger(number))) {
-        setDraft(value ?? '');
+        setDraft(sent.current ?? value ?? '');
         onCommit(undefined, 'invalid_request');
         return;
       }
-      onCommit(number);
-    } else {
-      onCommit(text);
+      out = number;
     }
+    const shown = String(out ?? '');
+    if (shown === (sent.current ?? String(value ?? ''))) return; // nothing new since the last commit
+    sent.current = shown; // compared as the saved value will read
+    Promise.resolve(onCommit(out)).then((saved) => { // not saved (refused): the same text may be committed again
+      if (saved === false && sent.current === shown) sent.current = null;
+    });
   }
 
   return (
