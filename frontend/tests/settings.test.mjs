@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { groupOf, loadModels, forgetModels, messageRoute, settingKey, utf8Bytes, valueAt } from '../src/settings.js';
+import { groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, utf8Bytes, valueAt } from '../src/settings.js';
 
 test('settings keys quote the parts that are not bare TOML keys', () => {
   assert.equal(settingKey('providers', 'openrouter', 'models'), 'providers.openrouter.models');
@@ -20,8 +20,9 @@ test('providers are Ready, Needs setup or Off', () => {
   assert.equal(groupOf({ enabled: false, has_key: true }), 'off');
 });
 
-test('a message is sent with the chosen model and its effort, or Auto', () => {
-  assert.deepEqual(messageRoute(null), { model: 'auto' });
+test('a message is sent with the chosen model and its effort, Auto, or the settings\' default', () => {
+  assert.deepEqual(messageRoute(null), {}); // the project's or personal [models] default applies
+  assert.deepEqual(messageRoute({ auto: true }), { model: 'auto' });
   assert.deepEqual(messageRoute({ provider: 'openrouter', model: 'a/b', effort: null }), { model: 'a/b', provider: 'openrouter' });
   assert.deepEqual(messageRoute({ provider: 'local', model: 'llama', effort: 'high' }),
     { model: 'llama', provider: 'local', effort: 'high' });
@@ -46,4 +47,15 @@ test('a provider\'s models are read once per window, again after a change, and a
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual((await loadModels('openrouter')).models, [{ id: 'a' }]); // the failure was dropped
   assert.equal(calls, 3);
+});
+
+test('a settings page saves against the file as it read it, never a fresher read', async (t) => {
+  const sent = [];
+  t.mock.method(globalThis, 'fetch', async (path, { method, body }) => {
+    sent.push([method, path, body && JSON.parse(body)]);
+    return Response.json({ code: 'settings_changed' }, { status: 409 });
+  });
+  await assert.rejects(saveAgainst({ hash: 'h-read' }, { 'limits.agent_steps': 20 }, 'p1'),
+    (error) => error.code === 'settings_changed');
+  assert.deepEqual(sent, [['PUT', '/api/settings', { hash: 'h-read', updates: { 'limits.agent_steps': 20 }, project_id: 'p1' }]]);
 });

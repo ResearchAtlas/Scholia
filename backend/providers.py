@@ -53,7 +53,9 @@ def window(table: dict, model: str, reported) -> dict:
 def offered(table: dict, provider: "Provider", model: str, recommended) -> bool:
     """Whether a provider's model is offered, by its `models` setting: Recommended (unset
     on OpenRouter), All (unset elsewhere), or the models picked."""
-    choice = table.get("models") or ("recommended" if provider.is_openrouter else "all")
+    choice = table.get("models")
+    if choice is None:  # unset; an empty list is a Pick of nothing
+        choice = "recommended" if provider.is_openrouter else "all"
     if choice == "all":
         return True
     if choice == "recommended":

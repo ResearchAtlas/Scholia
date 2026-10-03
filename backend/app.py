@@ -396,10 +396,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def recent_models():
         """The last three models the researcher chose (not Auto's picks), newest first."""
         rows = await read(lambda conn: conn.execute(
-            "SELECT json_extract(e.data, '$.route') FROM run_events e JOIN runs r ON r.id = e.run_id"
+            "SELECT json_extract(e.data, '$.route') AS route FROM run_events e JOIN runs r ON r.id = e.run_id"
             " WHERE e.type = 'route' AND json_extract(e.data, '$.plan.policy_reason') = 'chosen_model'"
-            " ORDER BY r.started_at DESC LIMIT 200").fetchall())
-        recent = list(dict.fromkeys(route for (route,) in rows if isinstance(route, str) and ":" in route))[:3]
+            " GROUP BY route ORDER BY max(r.started_at) DESC LIMIT 3").fetchall())
+        recent = [route for (route,) in rows if isinstance(route, str) and ":" in route]
         return {"models": [dict(zip(("provider", "model"), route.split(":", 1))) for route in recent]}
 
     # Settings and instructions
@@ -413,7 +413,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def get_settings(project_id: str | None = None):
         async with project_files if project_id is not None else contextlib.nullcontext():  # ordered with deletion
             loaded = await settings_for(project_id)
-        return {"values": loaded.values, "warnings": loaded.warnings, "hash": loaded._digest}
+        return {"values": loaded.values, "warnings": loaded.warnings, "problems": loaded.problems,
+                "hash": loaded._digest}
 
     @app.put("/api/settings")
     async def put_settings(body: SettingsUpdate):
@@ -439,20 +440,29 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # even when nothing was written, which only costs a re-learn.
             if changed:
                 forget_providers()
-        return {"values": loaded.values, "warnings": loaded.warnings, "hash": loaded._digest}
+        return {"values": loaded.values, "warnings": loaded.warnings, "problems": loaded.problems,
+                "hash": loaded._digest}
+
+    def _instruction_bytes(project_id):
+        """The personal and the project's AGENTS.md together, as their combination is measured
+        against the cap before it is cut (settings.load_instructions joins them with a blank line)."""
+        sizes = [p.stat().st_size for p in (data_dir / "AGENTS.md",
+                 *([data_dir / "projects" / project_id / "AGENTS.md"] if project_id else [])) if p.is_file()]
+        return sum(sizes) + 2 * max(0, len(sizes) - 1)
 
     @app.get("/api/instructions")
     async def get_instructions(project_id: str | None = None):
-        async with project_files if project_id is not None else contextlib.nullcontext():  # ordered with deletion
+        async with project_files:  # ordered with deletion and with saves
             path = await instructions_path(project_id)
             raw = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b"")
-            combined, warnings = await asyncio.to_thread(load_instructions, data_dir, project_id)
+            _, warnings = await asyncio.to_thread(load_instructions, data_dir, project_id)
+            combined = await asyncio.to_thread(_instruction_bytes, project_id)
         return {"text": raw.decode("utf-8", errors="replace"), "hash": hashlib.sha256(raw).hexdigest(),
-                "combined_bytes": len(combined.encode("utf-8")), "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
+                "combined_bytes": combined, "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
 
     @app.put("/api/instructions")
     async def put_instructions(body: Instructions):
-        async with project_files if body.project_id is not None else contextlib.nullcontext():
+        async with project_files:  # the hash check and the write, one save at a time
             path = await instructions_path(body.project_id)  # the project still exists, under the lock
             if body.hash is not None:  # a file changed since the editor read it is not overwritten
                 raw = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b"")

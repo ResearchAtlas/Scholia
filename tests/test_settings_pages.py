@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from backend import budget_router, openrouter_client, providers
+from backend.db import new_id
 from backend.providers import MIN_WINDOW, Provider
 from scholia_app import MockProvider, send, started
 
@@ -138,3 +139,58 @@ async def test_an_instruction_file_changed_since_it_was_read_is_not_overwritten(
         fresh = (await client.get("/api/instructions")).json()
         assert fresh["text"] == "Edited by hand." and fresh["combined_bytes"] == len("Edited by hand.")
         assert (await client.put("/api/instructions", json={"text": "Mine."})).status_code == 200  # no hash: as before
+
+
+async def test_a_pick_of_nothing_offers_nothing():
+    assert not providers.offered({"models": []}, OPENROUTER, RECOMMENDED[0], budget_router.RECOMMENDED)
+    assert not providers.offered({"models": []}, LOCAL, "llama3", budget_router.RECOMMENDED)
+
+
+async def test_two_editors_saving_the_same_read_cannot_both_win(tmp_path):
+    async with started(tmp_path / "data") as client:
+        read = (await client.get("/api/instructions")).json()
+        saves = await asyncio.gather(*(client.put("/api/instructions", json={"text": text, "hash": read["hash"]})
+                                       for text in ("First.", "Second.")))
+        assert sorted(r.status_code for r in saves) == [200, 409]
+        kept = (await client.get("/api/instructions")).json()["text"]
+        assert kept == ("First." if saves[0].status_code == 200 else "Second.")
+
+
+async def test_the_combined_size_is_measured_before_the_cap_cuts_it(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "P"})).json()["id"]
+        await client.put("/api/instructions", json={"text": "x" * 30_000})
+        await client.put("/api/instructions", json={"text": "y" * 10_000, "project_id": project})
+        read = (await client.get("/api/instructions", params={"project_id": project})).json()
+        assert read["combined_bytes"] == 40_002 > read["cap_bytes"]  # joined by a blank line
+        assert (await client.get("/api/instructions")).json()["combined_bytes"] == 30_000
+
+
+async def test_invalid_settings_are_reported_by_key_and_line(tmp_path):
+    async with started(tmp_path / "data") as client:
+        (tmp_path / "data" / "config.toml").write_text("[limits]\nagent_steps = 0\n")
+        loaded = (await client.get("/api/settings")).json()
+        assert loaded["problems"] == [{"key": "limits.agent_steps", "line": 2}]
+        assert loaded["values"]["limits"]["agent_steps"] == 12  # the default
+        (tmp_path / "data" / "config.toml").write_text("[limits\n")
+        assert (await client.get("/api/settings")).json()["problems"] == [{"key": None, "line": 1}]
+
+
+async def test_recent_models_survive_many_repeats_of_one(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        for model in ("c/three", "b/two"):
+            await send(client, conversation, model=model)
+            await asyncio.sleep(0.01)
+
+        def repeat(conn):  # 250 later turns that chose a/one, recorded as admission records them
+            for _ in range(250):
+                run = new_id()
+                conn.execute("INSERT INTO runs (id, project_id, conversation_id, kind, workflow, status)"
+                             " SELECT ?, project_id, id, 'turn', 'agent', 'succeeded' FROM conversations WHERE id = ?",
+                             (run, conversation))
+                conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'route', ?)",
+                             (run, '{"route": "openrouter:a/one", "plan": {"policy_reason": "chosen_model"}}'))
+        await asyncio.to_thread(client.state["db"].write, repeat)
+        recent = (await client.get("/api/models/recent")).json()["models"]
+        assert [m["model"] for m in recent] == ["a/one", "b/two", "c/three"]

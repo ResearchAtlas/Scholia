@@ -187,7 +187,7 @@
   "providers.addressHint": "https, or http on this Mac only.",
   "providers.addressPlaceholder": "https://",
   "providers.key": "Key",
-  "providers.keyHint": "Leave it empty for a local server that asks for none.",
+  "providers.keyHint": "A local server that asks for no key accepts any text, such as local.",
   "providers.addSubmit": "Add",
   "providers.group.ready": "Ready",
   "providers.group.setup": "Needs setup",
@@ -271,5 +271,9 @@
   "effort.medium": "Balanced",
   "effort.high": "Thorough",
   "effort.xhigh": "Deepest",
-  "errors.window_too_small": "A window is at least 4,096 tokens."
+  "errors.window_too_small": "A window is at least 4,096 tokens.",
+  "settings.problemValue": "Line {line}: {key} is not valid, so its default is used.",
+  "settings.problemFile": "The settings file is not valid at line {line}, so the defaults are used.",
+  "settings.problemFileUnread": "The settings file could not be read, so the defaults are used.",
+  "picker.setWindow": "Set the window of {model} to use it"
 }

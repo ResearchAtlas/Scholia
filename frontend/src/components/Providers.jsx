@@ -190,7 +190,8 @@ function Picker({ provider, picked, save }) {
         <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
         <label htmlFor={`pick-${provider.name}`} className="sr-only">{t('providers.search')}</label>
         <input id={`pick-${provider.name}`} value={query} onChange={(event) => setQuery(event.target.value)}
-          placeholder={t('providers.search')} className="h-9 w-full bg-transparent pl-9 pr-3 text-sm outline-none" />
+          placeholder={t('providers.search')}
+          className="h-9 w-full rounded-t-lg bg-transparent pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring" />
       </div>
       <ul className="scroll-thin max-h-56 overflow-y-auto py-1">
         {shown.map((m) => (
@@ -295,7 +296,7 @@ function AddEndpoint({ existing, onCancel, onAdded }) {
       const saved = await personal.save({ [settingKey('providers', name, 'kind')]: 'openai-compatible',
         [settingKey('providers', name, 'base_url')]: url.trim() });
       if (!saved) return;
-      if (key.trim()) await put(`/api/keys/${encodeURIComponent(name)}`, { key });
+      await put(`/api/keys/${encodeURIComponent(name)}`, { key });
       await onAdded();
     } catch (error) {
       setProblem(error instanceof ApiError ? error.code : 'internal');
@@ -324,7 +325,7 @@ function AddEndpoint({ existing, onCancel, onAdded }) {
       {(problem || personal.problem) && <p role="alert" className="text-sm text-destructive">{errorText(t, problem ?? personal.problem)}</p>}
       <div className="flex justify-end gap-2">
         <Button type="button" variant="ghost" size="sm" onClick={onCancel}>{t('common.cancel')}</Button>
-        <Button type="submit" size="sm" disabled={busy || !nameOk || !url.trim()}>{t('providers.addSubmit')}</Button>
+        <Button type="submit" size="sm" disabled={busy || !nameOk || !url.trim() || !key.trim()}>{t('providers.addSubmit')}</Button>
       </div>
     </form>
   );

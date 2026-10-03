@@ -216,6 +216,9 @@ class Settings:
     label: str
     values: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
+    # The same problems for an interface to state in its own language: {"key": ..., "line": ...};
+    # key is None when the whole file could not be used.
+    problems: list = field(default_factory=list)
     _digest: str | None = None
     _broken: bool = False
 
@@ -498,12 +501,14 @@ def _parse(settings, raw):
         _fill(settings, None)
         settings._digest, settings._broken = _digest(raw), True
         settings.warnings.append(f"{settings.label}: nested too deeply to read; using the defaults")
+        settings.problems.append({"key": None, "line": None})
 
 
 def _fill(settings, raw):
     settings._digest = _digest(raw)
     settings.values = _defaults(settings.schema)
     settings.warnings = []
+    settings.problems = []
     settings._broken = False
     if raw is None:
         return
@@ -513,10 +518,12 @@ def _fill(settings, raw):
     except UnicodeDecodeError:
         settings._broken = True
         settings.warnings.append(f"{settings.label}: not UTF-8 text; using the defaults")
+        settings.problems.append({"key": None, "line": None})
         return
     except tomlkit.exceptions.ParseError as error:
         settings._broken = True
         settings.warnings.append(f"{settings.label} line {error.line}: not valid TOML; using the defaults")
+        settings.problems.append({"key": None, "line": error.line})
         return
     lines = _key_lines(text)
     for path, value in _leaves(data):
@@ -526,6 +533,7 @@ def _fill(settings, raw):
             default = settings.schema.get(pattern, (None,))[0]
             fallback = "ignored" if default is None else f"using the default {default!r}"
             settings.warnings.append(f"{settings.label} line {_line(lines, path)}: {key} {problem}; {fallback}")
+            settings.problems.append({"key": key, "line": _line(lines, path)})
         elif pattern:
             node = settings.values
             for part in path[:-1]:

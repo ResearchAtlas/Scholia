@@ -67,6 +67,21 @@ function Problem({ code }) {
   </p>;
 }
 
+// Values the file holds that cannot be used, by key and line; each falls back to its default
+// (ticket 14).
+function FileProblems({ problems }) {
+  const t = useT();
+  if (!problems?.length) return null;
+  return (
+    <ul role="status" className="space-y-1 rounded-md bg-warning/10 px-3 py-2 text-sm text-warning">
+      {problems.map((problem, i) => (
+        <li key={i}>{problem.key ? t('settings.problemValue', { key: problem.key, line: problem.line })
+          : problem.line ? t('settings.problemFile', { line: problem.line }) : t('settings.problemFileUnread')}</li>
+      ))}
+    </ul>
+  );
+}
+
 function Loading() {
   const t = useT();
   return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
@@ -82,6 +97,7 @@ function General({ onLanguage }) {
     <div className="space-y-8">
       <PageTitle>{t('settings.page.general')}</PageTitle>
       <Problem code={personal.problem ?? problem} />
+      <FileProblems problems={personal.problems} />
       <Field label={t('settings.language')}>
         <div>
           <Segmented label={t('settings.language')} value={values.ui.language}
@@ -183,6 +199,7 @@ function Subagents() {
     <div className="space-y-8">
       <PageTitle>{t('settings.page.subagents')}</PageTitle>
       <Problem code={personal.problem ?? problem} />
+      <FileProblems problems={personal.problems} />
       <Section title={t('subagents.models')} hint={t('subagents.modelsHint')}>
         <div className="flex items-center justify-between">
           <span className="text-xs text-muted-foreground">{t('subagents.count', { count: list.length, max: MAX_SUBAGENT_MODELS })}</span>
@@ -259,6 +276,7 @@ function ThisProject({ project, onProjectChanged }) {
     <div className="space-y-8">
       <PageTitle>{t('settings.projectTitle', { name: projectName(t, project) })}</PageTitle>
       <Problem code={own.problem ?? problem} />
+      <FileProblems problems={own.problems} />
       {!general && (
         <Field label={t('project.nameLabel')} htmlFor="project-name">
           <CommitField id="project-name" value={project.name} onCommit={(name) => change({ name })} />
@@ -321,6 +339,7 @@ function Advanced({ health }) {
     <div className="space-y-10">
       <PageTitle>{t('settings.page.advanced')}</PageTitle>
       <Problem code={personal.problem ?? problem} />
+      <FileProblems problems={personal.problems} />
       <Section title={t('settings.roles')} hint={t('settings.rolesHint')}>
         <div className="grid gap-5 sm:grid-cols-2">
           {ROLES.map((role) => {

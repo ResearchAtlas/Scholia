@@ -186,7 +186,7 @@
   "providers.addressHint": "https；仅本机可用 http。",
   "providers.addressPlaceholder": "https://",
   "providers.key": "密钥",
-  "providers.keyHint": "如本机服务不需要密钥，可留空。",
+  "providers.keyHint": "不需要密钥的本机服务可填写任意文字，例如 local。",
   "providers.addSubmit": "添加",
   "providers.group.ready": "可用",
   "providers.group.setup": "需要设置",
@@ -269,5 +269,9 @@
   "effort.medium": "均衡",
   "effort.high": "深入",
   "effort.xhigh": "最深入",
-  "errors.window_too_small": "窗口至少为 4,096 个 token。"
+  "errors.window_too_small": "窗口至少为 4,096 个 token。",
+  "settings.problemValue": "第 {line} 行：{key} 无效，因此使用默认值。",
+  "settings.problemFile": "设置文件第 {line} 行无效，因此使用默认值。",
+  "settings.problemFileUnread": "无法读取设置文件，因此使用默认值。",
+  "picker.setWindow": "设置 {model} 的窗口后即可使用"
 }
