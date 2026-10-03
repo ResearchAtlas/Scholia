@@ -602,7 +602,7 @@ def test_a_migration_does_not_run_without_its_backup(tmp_path, monkeypatch):
 
 def test_a_backup_includes_the_settings_files_and_nothing_else(tmp_path, open_umask):
     data = tmp_path / "data"
-    project, empty_project = new_id(), new_id()
+    project, empty_project, uncommitted = new_id(), new_id(), new_id()
     settings = {
         "config.toml": '[ui]\nlanguage = "en"\n',
         "AGENTS.md": "Personal instructions\n",
@@ -612,9 +612,12 @@ def test_a_backup_includes_the_settings_files_and_nothing_else(tmp_path, open_um
     others = {
         "credentials.json": '{"openrouter": "never copied"}',  # the key fallback file
         f"projects/{project}/notes.txt": "not a settings file",
+        f"projects/{uncommitted}/config.toml": "a project folder whose record is not committed",
         "logs/app.log": "not a settings file",
     }
     with Database(data) as db:
+        db.write(lambda conn: conn.executemany("INSERT INTO projects (id, name, kind) VALUES (?, 'p', 'research')",
+                                               [(project,), (empty_project,)]))
         for name, text in {**settings, **others}.items():
             (data / name).parent.mkdir(parents=True, exist_ok=True)
             (data / name).write_text(text)
@@ -743,3 +746,227 @@ def test_a_write_admitted_before_close_runs_before_the_writer_closes(tmp_path, m
         db.write(add_audit_row)
     with Database(tmp_path / "data") as reopened:
         assert audit_events(reopened) == [("kept",)]
+
+
+# Backups while the app is open
+
+
+def add_project(db, project=None):
+    project = project or new_id()
+    db.write(lambda conn: conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, 'p', 'research')",
+                                       (project,)))
+    return project
+
+
+def write_project_folder(data, project):
+    folder = data / "projects" / project
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "config.toml").write_text("[project]\n")
+    (folder / "AGENTS.md").write_text("Project instructions\n")
+
+
+def projects_in(generation):
+    conn = sqlite3.connect((generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    try:
+        return {row[0] for row in conn.execute("SELECT id FROM projects WHERE kind = 'research'")}
+    finally:
+        conn.close()
+
+
+def project_folders(generation):
+    folder = generation / "projects"
+    return {path.name for path in folder.iterdir()} if folder.exists() else set()
+
+
+def during_the_copy(monkeypatch, *changes):
+    """Make each copy attempt run the next change after the database was copied, before the
+    settings files are compared again. Returns how many attempts there were."""
+    real = database_module._copy_settings
+    attempts = []
+
+    def copy_settings(data_dir, target, projects):
+        if len(attempts) < len(changes):
+            changes[len(attempts)]()
+        attempts.append(projects)
+        real(data_dir, target, projects)
+
+    monkeypatch.setattr(database_module, "_copy_settings", copy_settings)
+    return attempts
+
+
+def test_a_setting_saved_while_a_backup_copies_is_seen_and_the_copy_taken_again(tmp_path, monkeypatch):
+    from backend.settings import write_private
+    data = tmp_path / "data"
+    with Database(data) as db:
+        project = add_project(db)
+        write_project_folder(data, project)
+        (data / "AGENTS.md").write_text("Before\n")
+        attempts = during_the_copy(monkeypatch, lambda: write_private(data / "AGENTS.md", b"Saved meanwhile\n"))
+        generation = db.backup()
+    assert len(attempts) == 2
+    assert (generation / "AGENTS.md").read_text() == "Saved meanwhile\n"
+    assert (generation / "projects" / project / "AGENTS.md").read_text() == "Project instructions\n"
+
+
+def test_a_project_deleted_while_a_backup_copies_is_wholly_gone_from_it(tmp_path, monkeypatch):
+    from backend.db import ContentStore, delete
+    data = tmp_path / "data"
+    with Database(data) as db:
+        kept, deleted = add_project(db), add_project(db)
+        for project in (kept, deleted):
+            write_project_folder(data, project)
+
+        def delete_project():  # the record, then the folder, as the app deletes a project
+            delete(db, ContentStore(db), "project", deleted)
+            shutil.rmtree(data / "projects" / deleted)
+
+        attempts = during_the_copy(monkeypatch, delete_project)
+        generation = db.backup()
+    assert deleted in attempts[0] and deleted not in attempts[1]  # the first copy still held it
+    assert projects_in(generation) == project_folders(generation) == {kept}
+
+
+def test_a_project_created_while_a_backup_copies_is_wholly_absent_from_it(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    with Database(data) as db:
+        created = new_id()
+        write_project_folder(data, created)  # the app writes the folder first, then the record
+        attempts = during_the_copy(monkeypatch, lambda: add_project(db, created))
+        generation = db.backup()
+        assert len(attempts) == 1  # nothing the copy reads changed: its folder was already there
+        assert projects_in(generation) == project_folders(generation) == set()
+        assert projects_in(db.backup()) == project_folders(db.backup()) == {created}
+
+
+def test_a_folder_that_keeps_changing_fails_the_backup_and_leaves_nothing(tmp_path, monkeypatch):
+    from backend.db import BackupBusyError
+    data = tmp_path / "data"
+    with Database(data) as db:
+        saves = [lambda n=n: (data / "config.toml").write_text(f"n = {n}\n") for n in range(database_module.COPY_ATTEMPTS)]
+        attempts = during_the_copy(monkeypatch, *saves)
+        with pytest.raises(BackupBusyError):
+            db.backup()
+    assert len(attempts) == database_module.COPY_ATTEMPTS
+    assert list((data / "backups" / "daily").iterdir()) == []
+
+
+def test_closing_stops_a_backup_in_progress_and_leaves_no_generation(tmp_path, monkeypatch):
+    from backend.db import DatabaseClosedError
+    data = tmp_path / "data"
+    db = Database(data)
+    reading = threading.Event()
+
+    real = Database._stop_requested
+
+    def stalled(self):  # a statement of the backup that would run for a long time
+        reading.set()
+        deadline = time.monotonic() + 30
+        while not self._closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return real(self)
+
+    monkeypatch.setattr(Database, "_stop_requested", stalled)
+    monkeypatch.setattr(database_module, "_PROGRESS_STEPS", 10)
+    outcome = []
+
+    def back_up():
+        try:
+            db.backup()
+        except Exception as error:
+            outcome.append(error)
+
+    backup = threading.Thread(target=back_up)
+    backup.start()
+    assert reading.wait(10)
+    began = time.monotonic()
+    db.close()
+    backup.join(10)
+    assert time.monotonic() - began < database_module.STOP_SECONDS
+    assert len(outcome) == 1 and isinstance(outcome[0], DatabaseClosedError)
+    assert "interrupted" in str(outcome[0].__context__)  # the running statement itself was stopped
+    assert list((data / "backups" / "daily").iterdir()) == []
+
+
+def test_a_deletion_during_a_backup_does_not_hold_up_writes_and_the_wal_is_truncated_after(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    db = Database(data)
+    try:
+        db.write(add_audit_row)
+        reading, release = threading.Event(), threading.Event()
+        real = Database._stop_requested
+
+        def held(self):  # the backup holds its read snapshot until released
+            if not reading.is_set():
+                reading.set()
+                release.wait(10)
+            return real(self)
+
+        monkeypatch.setattr(Database, "_stop_requested", held)
+        monkeypatch.setattr(database_module, "_PROGRESS_STEPS", 10)  # a small database runs few steps
+        backup = threading.Thread(target=db.backup)
+        backup.start()
+        assert reading.wait(10)
+        db.write(add_audit_row)  # newer than the backup's snapshot, so the WAL must keep it
+        began = time.monotonic()
+        assert db.checkpoint() is False  # without waiting the busy timeout behind the backup
+        assert time.monotonic() - began < database_module.BUSY_TIMEOUT_MS / 1000 / 2
+        release.set()
+        backup.join(10)
+        assert (data / f"{DB_NAME}-wal").stat().st_size == 0  # the backup retried it as it ended
+    finally:
+        release.set()
+        db.close()
+
+
+def test_purging_keeps_only_a_fresh_backup(tmp_path):
+    data = tmp_path / "data"
+    with Database(data) as db:
+        for day in range(10):
+            db.backup(now=START + timedelta(days=day))
+        before = len(generations(data, "daily")) + len(generations(data, "weekly"))
+        assert generations(data, "weekly")
+        generation, removed = db.purge_backups(now=START + timedelta(days=10))
+    assert removed == before
+    assert generations(data, "daily") == [generation.name] and generations(data, "weekly") == []
+
+
+def test_a_purge_whose_backup_fails_deletes_nothing(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    with Database(data) as db:
+        for day in range(3):
+            db.backup(now=START + timedelta(days=day))
+        before = generations(data, "daily")
+
+        def failing_sync(path):
+            raise OSError("disk failure")
+
+        monkeypatch.setattr(database_module, "_fsync", failing_sync)
+        with pytest.raises(OSError, match="disk failure"):
+            db.purge_backups(now=START + timedelta(days=3))
+    assert generations(data, "daily") == before
+
+
+def test_backups_are_listed_newest_first_with_their_versions_and_sizes(tmp_path):
+    data = tmp_path / "data"
+    with Database(data) as db:
+        for day in range(9):
+            db.backup(now=START + timedelta(days=day))
+    (data / "backups" / "daily" / generations(data)[0] / "backup.json").write_text("not json")
+    listed = database_module.list_generations(data)
+    assert [(g["kind"], g["time"]) for g in listed] == [
+        *[("daily", (START + timedelta(days=day)).isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+          for day in range(8, 1, -1)],
+        ("weekly", START.isoformat(timespec="milliseconds").replace("+00:00", "Z"))]
+    assert listed[0]["app_version"] == APP_VERSION and listed[0]["schema_version"] == len(MIGRATIONS)
+    assert listed[-2]["app_version"] is None  # its backup.json cannot be read
+    assert all(g["size"] > 0 for g in listed)
+
+
+def test_a_closed_database_says_so_even_to_a_thread_given_its_writers_id(tmp_path, monkeypatch):
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    writer = db._writer_ident
+    db.close()
+    monkeypatch.setattr(database_module.threading, "get_ident", lambda: writer)  # thread ids are reused
+    with pytest.raises(DatabaseClosedError):
+        db.write(add_audit_row)

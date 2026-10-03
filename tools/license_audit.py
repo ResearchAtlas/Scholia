@@ -139,6 +139,10 @@ REVIEWED_NATIVE: dict[str, dict[str, list[str]]] = {
     "pyobjc-framework-WebKit": {"WebKit/*": []},
     # A Rust extension: the crates it uses, and Rust's standard library, are linked in.
     "pydantic_core": {"pydantic_core/_pydantic_core.*": [PYDANTIC_CORE_CRATES]},
+    # PyCryptodome's own C code and PyCrypto's (its LICENSE.rst: BSD-2-Clause and public domain).
+    # Reviewed for 3.23.0: each of its 40 extensions links only libSystem, and none carries
+    # another project's copyright or license notice.
+    "pycryptodomex": {"Cryptodome/*": []},
 }
 
 # Licenses read from a distribution's own license text where its metadata is not a usable
@@ -149,6 +153,11 @@ REVIEWED_LICENSES = {
     # Its metadata says MIT, but the only license text upstream, which ships, is BSD-style
     # (Armin Ronacher, Jonathan Tushman).
     "proxy_tools": "BSD-2-Clause",
+    # Metadata "BSD, Public Domain"; its LICENSE.rst puts PyCrypto's code in the public domain by
+    # the Unlicense and later contributions under BSD-2-Clause.
+    "pycryptodomex": "BSD-2-Clause AND Unlicense",
+    # Metadata MIT; it is a fork of CPython's zipfile, and ships the PSF license for that part.
+    "pyzipper": "MIT AND PSF-2.0",
 }
 # License texts for distributions whose wheels ship none, from their upstream repositories
 # at the bundled versions.

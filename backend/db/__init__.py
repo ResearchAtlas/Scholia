@@ -3,6 +3,7 @@
 from backend.db.database import (
     APPLICATION_ID,
     DB_NAME,
+    BackupBusyError,
     Database,
     DatabaseClosedError,
     DatabaseDamagedError,
@@ -16,6 +17,7 @@ from backend.db.deletion import delete
 
 __all__ = [
     "APPLICATION_ID",
+    "BackupBusyError",
     "ContentCorruptError",
     "ContentStore",
     "DB_NAME",

@@ -475,3 +475,20 @@ def test_pyinstallers_stand_in_for_dots_in_folder_names():
         "python3.13/lib-dynload/_json.so"
     )
     assert la._inner("Contents/Frameworks/a/b__dot__c.dylib") == "a/b__dot__c.dylib"
+
+
+def test_the_zip_encryption_packages_are_reviewed_and_ship_their_licenses(bundle):
+    assert la.component("pyzipper")[0] == "MIT AND PSF-2.0" and la.allowed("MIT AND PSF-2.0")
+    assert la.component("pycryptodomex")[0] == "BSD-2-Clause AND Unlicense" and la.allowed("BSD-2-Clause AND Unlicense")
+    for name, expected in (("pyzipper", {"LICENSE", "LICENSE.python"}), ("pycryptodomex", {"LICENSE.rst"})):
+        assert expected <= {dest for _, dest in la.component(name)[1]}, name
+    # Every native file of the installed pycryptodomex is covered by its review, and no other.
+    # The review is of this version: another one is reviewed again before it ships.
+    assert metadata.version("pycryptodomex") == "3.23.0"
+    natives = [f.as_posix() for f in metadata.distribution("pycryptodomex").files if f.suffix == ".so"]
+    assert len(natives) == 40
+    for native in natives:
+        _put(bundle, f"Contents/Frameworks/{native}", MACHO)
+    _ship(bundle, "pycryptodomex")
+    found, problems = la.audit(bundle)
+    assert problems == [] and len(found["pycryptodomex"]) == 40

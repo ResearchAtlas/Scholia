@@ -1,0 +1,315 @@
+"""Where the data folder is, whether the live database may be opened there, and choosing another place.
+
+The default folder is desktop.data_folder(). A place the researcher chose instead is recorded
+in LOCATION_FILE beside the default folder (in ~/Library/Application Support), owner-only, where
+the desktop entry reads it before it opens anything else. It is never inside the default folder,
+which may be the refused one (synced, or a link). A data folder inside iCloud Drive, a File Provider sync folder
+(~/Library/CloudStorage: OneDrive, Dropbox, Google Drive and others), ~/Dropbox, or on a network
+file system is refused (synced): syncing copies a live database file by file and can corrupt it.
+The desktop entry then serves only limited_app, which says why (the interface's data-folder
+screen, S2) and records another place for the next launch.
+"""
+
+import ctypes
+import json
+import logging
+import os
+import platform
+import stat
+import sys
+import unicodedata
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+from backend import APP_VERSION
+from backend.db.database import (DB_NAME, DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError,
+                                  check_identity)
+from backend.desktop import UnsafeDataFolderError, _acl_problem, _check_ancestors, _check_folder
+from backend.settings import write_private
+
+LOCATION_FILE = "Scholia data folder.json"  # beside the default data folder: {"path": "<the chosen folder>"}
+NETWORK_FILE_SYSTEMS = frozenset({"smbfs", "afpfs", "nfs", "webdav"})
+SYNCED = {  # under the home folder
+    "Library/Mobile Documents": "iCloud Drive",
+    "Library/CloudStorage": "a cloud storage folder (OneDrive, Dropbox, Google Drive or another)",
+    "Dropbox": "Dropbox",
+}
+log = logging.getLogger(__name__)
+
+
+def located(default) -> Path:
+    """The data folder: the place recorded in LOCATION_FILE beside the default folder, else the default.
+
+    The record is read without following a link, under folders no other account can change, and
+    only if it is a regular file of this account's that no other account could have written;
+    otherwise, or when it is unreadable or not an absolute path, UnsafeDataFolderError.
+    """
+    record = _record(default)
+    try:
+        fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return Path(default)
+    except OSError:
+        raise UnsafeDataFolderError("Scholia will not open its data folder: its location record cannot be read")
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022
+                or _acl_problem(record)):
+            raise UnsafeDataFolderError("Scholia will not open its data folder: its location record is not its own")
+        with os.fdopen(os.dup(fd), "rb") as file:
+            text = json.loads(file.read()).get("path")
+    except (ValueError, AttributeError):
+        raise UnsafeDataFolderError("Scholia will not open its data folder: its location record cannot be read")
+    finally:
+        os.close(fd)
+    if not isinstance(text, str) or not os.path.isabs(text) or ".." in Path(text).parts:
+        raise UnsafeDataFolderError("Scholia will not open its data folder: its location record cannot be read")
+    return Path(text)
+
+
+def synced(path, *, home=None, fs_type=None) -> str | None:
+    """Why path may not hold the live database, or None: it is inside a synced folder, or on a
+    network file system. home and fs_type (path -> file system type name) are for tests."""
+    home = Path(home or Path.home())
+    places = {Path(os.path.abspath(path)), Path(os.path.realpath(path))}  # as written, and with links followed
+    for base in {home, Path(os.path.realpath(home))}:
+        for folder, name in SYNCED.items():
+            if any(_inside(place, base / folder) for place in places):
+                return f"it is inside {name}, which syncs its files"
+    existing = Path(os.path.realpath(path))
+    while not existing.exists():  # a folder not made yet sits on its nearest existing parent's file system
+        existing = existing.parent
+    kind = (fs_type or file_system_type)(existing)
+    if kind in NETWORK_FILE_SYSTEMS:
+        return f"it is on a network file system ({kind})"
+    return None
+
+
+def _inside(place, folder):
+    """Whether place is folder or inside it, ignoring case and Unicode normalization as macOS's
+    file systems usually do."""
+    def folded(path):
+        return Path(unicodedata.normalize("NFC", str(path)).casefold())
+    return folded(place).is_relative_to(folded(folder))
+
+
+_FINDER_FILES = {".DS_Store", ".localized"}  # what Finder leaves in a folder it shows as empty
+
+
+class _StatFS(ctypes.Structure):  # macOS struct statfs, 64-bit inodes
+    _fields_ = [("f_bsize", ctypes.c_uint32), ("f_iosize", ctypes.c_int32), ("f_blocks", ctypes.c_uint64),
+                ("f_bfree", ctypes.c_uint64), ("f_bavail", ctypes.c_uint64), ("f_files", ctypes.c_uint64),
+                ("f_ffree", ctypes.c_uint64), ("f_fsid", ctypes.c_int32 * 2), ("f_owner", ctypes.c_uint32),
+                ("f_type", ctypes.c_uint32), ("f_flags", ctypes.c_uint32), ("f_fssubtype", ctypes.c_uint32),
+                ("f_fstypename", ctypes.c_char * 16), ("f_mntonname", ctypes.c_char * 1024),
+                ("f_mntfromname", ctypes.c_char * 1024), ("f_flags_ext", ctypes.c_uint32),
+                ("f_reserved", ctypes.c_uint32 * 7)]
+
+
+def file_system_type(path) -> str | None:
+    """The type name of the file system holding path (apfs, smbfs, ...), or None off macOS or when unknown."""
+    if sys.platform != "darwin":
+        return None
+    libc = ctypes.CDLL(None, use_errno=True)
+    statfs = libc["statfs$INODE64"] if platform.machine() == "x86_64" else libc.statfs
+    statfs.argtypes = [ctypes.c_char_p, ctypes.POINTER(_StatFS)]
+    info = _StatFS()
+    if statfs(os.fsencode(path), ctypes.byref(info)) != 0:
+        return None
+    return info.f_fstypename.decode(errors="replace")
+
+
+def database_problem(folder):
+    """("foreign", "newer" or "unchecked", why) when folder holds a scholia.sqlite3 that is another
+    application's, Scholia's from a newer version, or one that could not be checked (it cannot be
+    read, or no private copy of it and its log could be made; logged), read without writing
+    anything there; None otherwise (none there, or a damaged one, which the app opens in its
+    damaged-database mode, offering restore). The existing folder is checked first, as taking its
+    lock would (UnsafeDataFolderError when another account could change it, or it, the database or
+    its log is a link), so nothing another account could have put there is read."""
+    folder = Path(folder)
+    _check_ancestors(folder)
+    if os.path.islink(folder):
+        raise UnsafeDataFolderError("Scholia will not open its data folder: the folder itself is a link")
+    _check_folder(folder, os.getuid())
+    path = folder / DB_NAME
+    if path.is_symlink() or path.with_name(DB_NAME + "-wal").is_symlink():
+        raise UnsafeDataFolderError("Scholia will not open its data folder: its database or its log is a link")
+    if not os.path.lexists(path):
+        return None
+    if not path.is_file():  # a folder, a FIFO or another non-file under the database's name: never opened
+        return "unchecked", "something that is not a database file has its name"
+    try:
+        check_identity(path)
+    except ForeignDatabaseError:
+        return "foreign", "it holds a database that is not Scholia's"
+    except NewerDatabaseError:
+        return "newer", "it holds data from a newer version of Scholia"
+    except DatabaseDamagedError:
+        return None
+    except OSError as error:  # cannot tell whether Scholia may open it: it is not opened
+        log.warning("the database in a chosen data folder could not be checked (%s, errno %s)",
+                    type(error).__name__, error.errno)
+        return "unchecked", "its database could not be checked"
+    return None
+
+
+class FolderRefused(ValueError):
+    """A place that cannot hold the data folder; code is stable for the interface."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def choose(default, path, *, home=None, fs_type=None) -> Path:
+    """Record path as the data folder for the next launch, after checking it as the desktop entry
+    will: an absolute path, not synced or on a network, a folder (made here, owner-only, under an
+    existing one) of this account's that it can write in and no other account can change, and empty
+    or holding Scholia's data already
+    (the next launch narrows everything in it to owner-only). Choosing the default removes the record.
+    Raises FolderRefused, or UnsafeDataFolderError, saying why it cannot be used."""
+    if not os.path.isabs(path) or ".." in Path(path).parts:
+        raise FolderRefused("data_folder_invalid", "Choose a folder by its full path")
+    path, default = Path(path), Path(default)
+    if _names_record(path, _record(default)):  # the note of the chosen place cannot be the place
+        raise FolderRefused("data_folder_invalid", "That is where Scholia notes its data folder's place")
+    problem = synced(path, home=home, fs_type=fs_type)
+    if problem:
+        raise FolderRefused("data_folder_synced", f"Scholia cannot keep its data there: {problem}")
+    _check_ancestors(path)
+    if not path.parent.is_dir():
+        raise FolderRefused("data_folder_not_found", "The folder above it does not exist")
+    existing = path.is_dir() and not path.is_symlink()
+    # A default folder that is a link is refused at launch, so the folder it leads to is recorded instead.
+    is_default = not default.is_symlink() and (
+        path == default or (existing and default.is_dir() and os.path.samefile(path, default)))
+    if existing and not is_default and any(entry.name not in _FINDER_FILES for entry in path.iterdir()) \
+            and not (path / DB_NAME).is_file():
+        raise FolderRefused("data_folder_not_empty", "Choose an empty folder, or one that holds Scholia's data")
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    if path.is_symlink() or not path.is_dir():
+        raise FolderRefused("data_folder_invalid", "That is not a folder")
+    if os.lstat(path).st_uid != os.getuid() or not os.access(path, os.W_OK | os.X_OK):  # its lock is made there
+        raise FolderRefused("data_folder_not_writable", "Choose a folder of your own that Scholia can write in")
+    held = database_problem(path)  # checks the folder, then its scholia.sqlite3 (not just its name)
+    if held:
+        raise FolderRefused(f"data_folder_{held[0]}", f"Scholia cannot use that folder: {held[1]}")
+    record = _record(default)
+    _clear_record(record)
+    if is_default:
+        record.unlink(missing_ok=True)
+    else:
+        write_private(record, json.dumps({"path": str(path)}).encode())
+    return path
+
+
+def _clear_record(record):
+    """Readies the record's name for a new record. A file stays until the new one replaces it (so a
+    failed write keeps the earlier choice), made owner-only so the new one is too, even one Scholia
+    could not read; a link or an empty folder, never a usable record, is removed; a folder with
+    something in it is never removed, and the choice is refused."""
+    try:
+        if record.is_symlink():
+            record.unlink()
+        elif record.is_dir():
+            record.rmdir()
+        elif record.exists():
+            os.chmod(record, 0o600)
+    except OSError:
+        raise FolderRefused("data_folder_record", "Scholia cannot replace the record of its data folder") from None
+
+
+def _names_record(path, record):
+    """Whether path names the location record, in any spelling the file system takes for it: the same
+    file, or the same name (as a case-insensitive volume compares it) in the same folder, however that
+    folder is reached (a link to it included)."""
+    try:
+        if os.path.samefile(path, record):
+            return True
+    except OSError:  # one of them is not there
+        pass
+    try:
+        same_folder = os.path.samefile(path.parent, record.parent)
+    except OSError:
+        same_folder = str(path.parent).casefold() == str(record.parent).casefold()
+    return same_folder and path.name.casefold() == record.name.casefold()
+
+
+def _record(default):
+    """Where the choice is recorded: beside the default folder, never in it, under folders checked
+    as a data folder's are (another account cannot swap them)."""
+    default = Path(default)
+    _check_ancestors(default)
+    return default.parent / LOCATION_FILE
+
+
+class Chosen(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+
+def limited_app(default, data_dir, problem, reason, *, origin, session, frontend_dir=None):
+    """The app the desktop entry serves when it will not open the data folder: the interface,
+    /api/health saying why (data_folder_problem: "synced", "unsafe", "missing", "foreign",
+    "newer" or "unchecked"), and
+    POST /api/data-folder to choose another place, used from the next launch. It opens nothing
+    in the data folder. The interface's first reads of setup and settings get neutral answers
+    (the defaults; nothing is read from the folder), so it shows the data-folder screen; every
+    other API request is refused (503 data_folder_problem)."""
+    from backend.app import static_file
+    from backend.local_guard import LocalRequestGuard
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.scholia = {}  # nothing for the desktop entry to stop
+    frontend = Path(frontend_dir).resolve() if frontend_dir else None
+
+    def error(status, code, message):
+        return JSONResponse({"code": code, "message": message}, status_code=status)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid(request, failure):
+        return error(400, "invalid_request", "The request is not valid")
+
+    @app.get("/api/health")
+    async def health():
+        return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir),
+                "data_folder_problem": problem, "data_folder_reason": reason}
+
+    @app.get("/api/setup")
+    async def setup_status():
+        return {"needed": False}  # the data-folder screen comes first
+
+    @app.get("/api/settings")
+    async def settings():
+        return {"values": {}, "warnings": [], "hash": None}  # the defaults: the interface follows the system
+
+    @app.post("/api/data-folder")
+    def choose_another(body: Chosen):  # a plain function: FastAPI runs it off the event loop
+        try:
+            chosen = choose(default, body.path)
+        except FolderRefused as failure:
+            return error(400, failure.code, str(failure))
+        except UnsafeDataFolderError as failure:
+            return error(400, "data_folder_unsafe", str(failure))
+        except (OSError, ValueError):  # such as a path with a NUL character
+            return error(400, "data_folder_invalid", "That folder cannot be used")
+        return {"ok": True, "data_folder": str(chosen), "restart": True}
+
+    @app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def refused(rest: str):
+        return error(503, "data_folder_problem", "Scholia has not opened its data folder")
+
+    @app.get("/{path:path}")
+    async def interface(path: str):
+        file = static_file(frontend, path)
+        return FileResponse(file, headers={"Cache-Control": "no-cache"}) if file else error(404, "not_found",
+                                                                                              "Not found")
+
+    return LocalRequestGuard(app, origin=origin, session=session)
