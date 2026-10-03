@@ -23,3 +23,21 @@ export function moveTargets(projects, from) {
 export function continuable(turn) {
   return turn.status === 'interrupted' || (turn.status === 'cancelled' && ['limit', 'revoked'].includes(turn.cancel_reason));
 }
+
+// The answers to what a project holds (slice-1 spec F1): my own research (Normal), unpublished
+// work or personal data (Private, the suggested answer), or someone else's submission (the
+// review-lock preset: Local only with the lock, and its venue).
+export const HOLDS = ['own', 'private', 'review'];
+export const SUGGESTED_HOLDS = 'private';
+
+// A new project's protection for an answer, as POST /api/projects takes it.
+export function holdsBody(holds, venue) {
+  if (holds === 'review') return { sensitivity: 'local_only', review_lock: true, review_venue: venue?.trim() || null };
+  return { sensitivity: holds === 'private' ? 'private' : 'normal' };
+}
+
+// The answer a project's protection gives, or null for Local only without the lock.
+export function holdsOf(project) {
+  if (project?.review_lock) return 'review';
+  return { normal: 'own', private: 'private' }[project?.sensitivity] ?? null;
+}

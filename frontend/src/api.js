@@ -11,10 +11,11 @@ export function startSession(win = window) {
 }
 
 export class ApiError extends Error {
-  constructor(status, code) {
+  constructor(status, code, data = null) {
     super(code);
     this.status = status;
     this.code = code;
+    this.data = data; // the whole answer, such as a confirmation's token
   }
 }
 
@@ -40,7 +41,7 @@ export async function api(method, path, body, { signal } = {}) {
     throw new ApiError(0, 'unreachable');
   }
   const data = await response.json().catch(() => null);
-  if (!response.ok) throw new ApiError(response.status, data?.code ?? 'http_error');
+  if (!response.ok) throw new ApiError(response.status, data?.code ?? 'http_error', data);
   return data;
 }
 
@@ -93,5 +94,18 @@ async function saveNow(updates, projectId) {
   } catch (error) {
     if (error instanceof ApiError && error.code === 'settings_changed') return null;
     throw error;
+  }
+}
+
+// A change that may need the researcher's confirmation (a less strict level, lifting the review
+// lock, clearing the audit log): it is sent as is; when the backend asks for confirmation, ask()
+// is awaited with the change's token, and resolves to whether the researcher confirmed; the
+// change is then sent again with it. Resolves to the answer, or null when not confirmed.
+export async function confirmedChange(send, ask) {
+  try {
+    return await send(null);
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.code !== 'confirmation_required') throw error;
+    return (await ask()) ? send(error.data.token) : null;
   }
 }

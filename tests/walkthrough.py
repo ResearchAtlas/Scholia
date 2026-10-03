@@ -75,7 +75,7 @@ def main(argv=None):
     parser.add_argument("--dev", action="store_true")
     args = parser.parse_args(argv)
 
-    provider = SyntheticProvider()
+    provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]])  # half have zero retention
     provider.replies = [synthetic] * 1000
     provider.title_replies = [synthetic] * 1000
     data_dir = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-"))

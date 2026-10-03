@@ -1,11 +1,13 @@
 // i18n: migrated
 // First-run setup (S1): one screen for the OpenRouter key, with a link to how to get one,
-// then the first project's name (F1). Other providers are added later in Settings.
+// then the first project's name and what it will hold (F1). Other providers are added later in Settings.
 import { useState } from 'react';
 import { ArrowRight, KeyRound } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, post } from '../api.js';
 import { errorText } from '../text.js';
+import { SUGGESTED_HOLDS, holdsBody } from '../projects.js';
+import { HoldsChoice } from './Governance.jsx';
 import { Mark } from './Mark.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -17,6 +19,8 @@ export function FirstRun({ onDone }) {
   const [step, setStep] = useState('key');
   const [key, setKey] = useState('');
   const [name, setName] = useState('');
+  const [holds, setHolds] = useState(SUGGESTED_HOLDS);
+  const [venue, setVenue] = useState('');
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState(null);
   const [warning, setWarning] = useState(null);
@@ -42,7 +46,7 @@ export function FirstRun({ onDone }) {
     setBusy(true);
     setProblem(null);
     try {
-      if (name.trim()) await post('/api/projects', { name });
+      if (name.trim()) await post('/api/projects', { name, ...holdsBody(holds, venue) });
       onDone();
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
@@ -82,6 +86,9 @@ export function FirstRun({ onDone }) {
             <label htmlFor="project" className="mt-5 block text-sm font-medium">{t('project.nameLabel')}</label>
             <Input id="project" value={name} maxLength={200} onChange={(event) => setName(event.target.value)}
               placeholder={t('project.namePlaceholder')} className="mt-1.5 h-10" autoFocus />
+            <div className="mt-5">
+              <HoldsChoice value={holds} onChange={setHolds} venue={venue} onVenue={setVenue} name="first-project-holds" />
+            </div>
             {problem && <p role="alert" className="mt-4 text-sm text-destructive">{problem}</p>}
             <div className="mt-6 flex gap-2">
               <Button type="submit" className="flex-1" disabled={busy || !name.trim()}>{t('project.create')}</Button>
