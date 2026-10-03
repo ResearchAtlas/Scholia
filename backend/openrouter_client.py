@@ -207,6 +207,12 @@ def catalog_status(provider, key):
             "error": state["error"]}
 
 
+def catalog_read(route) -> bool:
+    """Whether the route's provider has a catalog read and cached. Never performs network I/O."""
+    return any(name == route.provider.name and base_url == route.provider.base_url and state["models"]
+               for (name, base_url, _), state in _caches.items())
+
+
 def get_model_metadata(route):
     """The cached catalog row for a route's model, or None. Never performs network I/O."""
     for (name, base_url, _), state in _caches.items():

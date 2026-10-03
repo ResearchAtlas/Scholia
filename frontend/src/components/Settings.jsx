@@ -395,10 +395,14 @@ function BackgroundRuns() {
   const t = useT();
   const language = useContext(LanguageContext);
   const [runs, setRuns] = useState(null);
-  const [problem, setProblem] = useState(null);
+  const [problem, setProblem] = useState(null); // a cancel that failed; the next cancel clears it
+  const [polled, setPolled] = useState(null); // the last read's error; a read that succeeds clears it
 
-  const load = useCallback(() => get('/api/activity').then((data) => setRuns(data.runs)).catch((error) => {
-    setProblem(error instanceof ApiError ? error.code : 'internal');
+  const load = useCallback(() => get('/api/activity').then((data) => {
+    setRuns(data.runs);
+    setPolled(null);
+  }).catch((error) => {
+    setPolled(error instanceof ApiError ? error.code : 'internal');
   }), []);
 
   useEffect(() => {
@@ -408,6 +412,7 @@ function BackgroundRuns() {
   }, [load]);
 
   async function cancel(runId) {
+    setProblem(null);
     try {
       await post(`/api/runs/${runId}/cancel`);
     } catch (error) {
@@ -419,7 +424,7 @@ function BackgroundRuns() {
   const dates = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
   return (
     <Section title={t('settings.backgroundRuns')} hint={t('settings.backgroundRunsHint')}>
-      <Problem code={problem} />
+      <Problem code={problem ?? polled} />
       {runs?.length === 0 && <p className="text-sm text-muted-foreground">{t('settings.noRuns')}</p>}
       {runs?.length > 0 && (
         <ul className="divide-y rounded-lg border">

@@ -251,14 +251,15 @@ async def test_auto_and_a_chosen_model_keep_to_usable_windows(tmp_path):
     rows = [{"id": "x/small", "context_length": 2048}, {"id": "x/unknown"}, {"id": "x/good", "context_length": 32768}]
     provider = CatalogProvider(rows)
     async with started(tmp_path / "data", provider) as client:
-        await save(client, {"providers.openrouter.models": ["x/small", "x/unknown", "x/good"]})
+        await save(client, {"providers.openrouter.models": ["x/gone", "x/small", "x/unknown", "x/good"]})
         await client.get("/api/providers/openrouter/models")  # the catalog, read as the picker reads it
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
-        for model in ("x/small", "x/unknown"):  # too small; no window reported or set (section 8)
+        for model, code in (("x/small", "model_window"), ("x/unknown", "model_window"),  # section 8
+                            ("x/gone", "model_not_offered")):  # picked, but no longer in the catalog
             refused = await client.post(f"/api/conversations/{conversation}/message/stream",
                                         json={"content": "hi", "model": model})
-            assert (refused.status_code, refused.json()["code"]) == (400, "model_window"), model
-        await send(client, conversation, model="auto")  # Auto passes over both
+            assert (refused.status_code, refused.json()["code"]) == (400, code), model
+        await send(client, conversation, model="auto")  # Auto passes over all three
         assert provider.answers[-1]["model"] == "x/good"
         await save(client, {"providers.openrouter.windows": {"x/unknown": 8192}})
         await send(client, conversation, model="x/unknown")  # a window set makes it usable
