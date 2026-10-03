@@ -124,13 +124,13 @@ def file_system_type(path) -> str | None:
 
 
 def database_problem(folder):
-    """("foreign" or "newer", why) when folder holds a scholia.sqlite3 that is another application's,
-    or Scholia's from a newer version, read without writing anything there; None otherwise (none
-    there, or one that cannot be read, which the app opens as it would anyway: a damaged one in its
-    damaged-database mode, offering restore; one that could not be checked, logged, which opening
-    it checks again). The existing folder is checked first, as taking its lock would
-    (UnsafeDataFolderError when another account could change it, or it, the database or its log is
-    a link), so nothing another account could have put there is read."""
+    """("foreign", "newer" or "unchecked", why) when folder holds a scholia.sqlite3 that is another
+    application's, Scholia's from a newer version, or one that could not be checked (it cannot be
+    read, or no private copy of it and its log could be made; logged), read without writing
+    anything there; None otherwise (none there, or a damaged one, which the app opens in its
+    damaged-database mode, offering restore). The existing folder is checked first, as taking its
+    lock would (UnsafeDataFolderError when another account could change it, or it, the database or
+    its log is a link), so nothing another account could have put there is read."""
     folder = Path(folder)
     _check_ancestors(folder)
     if os.path.islink(folder):
@@ -149,10 +149,10 @@ def database_problem(folder):
         return "newer", "it holds data from a newer version of Scholia"
     except DatabaseDamagedError:
         return None
-    except OSError as error:  # cannot tell here: opening the database checks it again
+    except OSError as error:  # cannot tell whether Scholia may open it: it is not opened
         log.warning("the database in a chosen data folder could not be checked (%s, errno %s)",
                     type(error).__name__, error.errno)
-        return None
+        return "unchecked", "its database could not be checked"
     return None
 
 
@@ -217,8 +217,8 @@ class Chosen(BaseModel):
 
 def limited_app(default, data_dir, problem, reason, *, origin, session, frontend_dir=None):
     """The app the desktop entry serves when it will not open the data folder: the interface,
-    /api/health saying why (data_folder_problem: "synced", "unsafe", "missing", "foreign" or
-    "newer"), and
+    /api/health saying why (data_folder_problem: "synced", "unsafe", "missing", "foreign",
+    "newer" or "unchecked"), and
     POST /api/data-folder to choose another place, used from the next launch. It opens nothing
     in the data folder. The interface's first reads of setup and settings get neutral answers
     (the defaults; nothing is read from the folder), so it shows the data-folder screen; every

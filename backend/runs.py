@@ -249,6 +249,12 @@ class Harness:
                 log.warning("%d tasks did not stop within %s s of shutdown; closing the database", len(pending), timeout)
         return len(pending)
 
+    async def resume(self) -> None:
+        """Admit again after a shutdown the database outlives (a restore that did not go ahead).
+        Work still running stays this harness's; background runs it stopped start again."""
+        self.registry.closed = False
+        await self.kick_background()
+
     # Cancel
 
     def _request_cancel(self, active: ActiveRun, reason: str) -> None:

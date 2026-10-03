@@ -147,13 +147,13 @@ async def test_a_restore_whose_undo_fails_starts_nothing_and_the_launch_puts_it_
             raise OSError(errno.EIO, "I/O error")
         real_fsync(path)
 
-    def failing_back(data_dir, journal):  # and putting it back fails partway, once
+    def failing_back(data_dir, journal, audit=False):  # and putting it back fails partway, once
         undone.append(journal["direction"])
         if len(undone) == 1:
             write_private(data_dir / "backups" / backups_module.JOURNAL,
                           json.dumps({**journal, "direction": "back"}).encode())
             raise OSError(errno.EIO, "I/O error")
-        real_back(data_dir, journal)
+        return real_back(data_dir, journal, audit)
 
     async with started(data, setup=False) as client:
         monkeypatch.setattr(backups_module, "_fsync", failing_fsync)
@@ -173,7 +173,8 @@ async def test_a_restore_whose_undo_fails_starts_nothing_and_the_launch_puts_it_
     async with started(data, setup=False) as client:
         rows = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
             "SELECT data FROM audit_log WHERE event = 'restore'").fetchall())
-    assert [json.loads(row) for (row,) in rows] == [{"interrupted": True, "finished": "back"}]
+    [record] = [json.loads(row) for (row,) in rows]
+    assert (record["interrupted"], record["finished"]) == (True, "back") and record["id"]
 
 
 async def test_putting_the_previous_state_back_twice_keeps_its_wal(tmp_path):
@@ -238,7 +239,7 @@ async def test_a_replay_that_can_be_neither_run_nor_undone_keeps_its_journal_and
         from backend.db import DatabaseDamagedError
         raise DatabaseDamagedError("quick_check failed")
 
-    def cannot_undo(data_dir):
+    def cannot_undo(data_dir, audit=False):
         raise OSError("I/O error")
 
     monkeypatch.setattr(backups_module, "Database", damaged)
@@ -432,3 +433,99 @@ async def test_a_restore_done_whose_bookkeeping_fails_twice_lists_both_and_logs_
     logged = [r.getMessage() for r in caplog.records if r.name == backups_module.log.name]
     assert any("missing_files" in m for m in logged) and any("schema_version" in m for m in logged)
     assert str(tmp_path) not in caplog.text  # what failed is logged, never where
+
+
+def project_names(data):
+    import sqlite3
+    from backend.db import DB_NAME
+    conn = sqlite3.connect((data / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    try:
+        return {name for (name,) in conn.execute("SELECT name FROM projects")}
+    finally:
+        conn.close()
+
+
+def restore_audits(client):
+    import json
+    return asyncio.to_thread(client.state["db"].read, lambda conn: [json.loads(data) for (data,) in conn.execute(
+        "SELECT data FROM audit_log WHERE event = 'restore'")])
+
+
+def failing_recovery(monkeypatch, times):
+    from backend.runs import Harness
+    real, recovered = Harness.recover, []
+
+    async def recover(self):
+        recovered.append(self)
+        if len(recovered) <= times:
+            raise RuntimeError("recovery failed")
+        await real(self)
+
+    monkeypatch.setattr(Harness, "recover", recover)
+    return lambda: monkeypatch.setattr(Harness, "recover", real)
+
+
+async def test_a_finished_restore_whose_journal_was_not_ended_is_never_put_back_over_later_work(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_end, failed = backups_module.end_journal, []
+
+    def failing_once(data_dir):
+        if not failed:
+            failed.append(True)
+            raise OSError("I/O error")
+        real_end(data_dir)
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "end_journal", failing_once)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200 and response.json()["not_recorded"] == ["journal"]
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # new work
+    restore_recovery = failing_recovery(monkeypatch, 1)  # the next launch cannot recover its harness, once
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "database_unavailable"  # limited, offering restore
+    assert project_names(data) == {"General", "Kept", "After"}  # never put back: the work since is in place
+    restore_recovery()
+
+    names, text, folders, projects = await state_after_launch(data)
+    assert names == {"General", "Kept", "After"}
+    assert not (data / "backups" / backups_module.JOURNAL).exists()
+    async with started(data, setup=False) as client:
+        assert len(await restore_audits(client)) == 1  # its audit row once, though the journal outlived it
+
+
+async def test_a_replay_put_back_whose_previous_database_cannot_run_either_leaves_the_app_limited(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+    restore_recovery = failing_recovery(monkeypatch, 2)  # the restored database, then the previous one
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "database_unavailable"
+        restore_recovery()
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text  # restore stays the way out
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept"}
+
+
+async def test_a_replayed_restore_whose_audit_row_cannot_be_written_keeps_its_journal_to_write_it(tmp_path, monkeypatch):
+    from backend.db import Database
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+    real_write, failed = Database.write, []
+
+    def write(self, fn):
+        if fn.__module__ == "backend.backups" and not failed:  # the replay's audit row, once
+            failed.append(True)
+            raise OSError("I/O error")
+        return real_write(self, fn)
+
+    monkeypatch.setattr(Database, "write", write)
+    async with started(data, setup=False) as client:
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept"}
+        assert await restore_audits(client) == []
+    assert failed and (data / "backups" / backups_module.JOURNAL).exists()  # the evidence is kept
+    async with started(data, setup=False) as client:
+        [record] = await restore_audits(client)
+        assert (record["interrupted"], record["finished"]) == (True, "forward")
+    assert not (data / "backups" / backups_module.JOURNAL).exists()

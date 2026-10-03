@@ -447,12 +447,14 @@ async def _replace(state, body, staging, purges):
     # A database a failed restore closed, or none at all, is treated as damaged: moved aside, never copied.
     damaged = db is None or db.closed or db.damaged is not None
     if harness is not None:  # admission stops, and running work stops and drains, before anything is copied
-        if await harness.shutdown():
-            await _resume(state, db, damaged)
+        if await harness.shutdown():  # the harness keeps what still runs, and admits again
+            await _resume(state, db, harness, damaged)
             raise BackupError(409, "work_running", "Some running work did not stop in time; try again")
     async with state["writers"].alone(), state["backups_lock"]:  # no other request is left inside
+        if not damaged:  # nor any write: a worker a cancelled task left running included, until the swap
+            await asyncio.to_thread(db.hold_writes)
         if not damaged and await _purges(state) != purges:
-            await _resume(state, db, damaged)  # Delete everywhere purged the backups meanwhile: not this one
+            await _resume(state, db, harness, damaged)  # Delete everywhere purged the backups meanwhile: not this one
             raise BackupError(404, "not_found", "No such backup")
         safety = None
         if not damaged:  # first a safety copy of the current database, as an automatic backup
@@ -461,7 +463,7 @@ async def _replace(state, body, staging, purges):
             except DatabaseDamagedError:
                 damaged = True
             except Exception as error:
-                await _resume(state, db, damaged)
+                await _resume(state, db, harness, damaged)
                 if isinstance(error, BackupBusyError):
                     raise BackupError(409, "backup_busy", "Settings kept changing during the safety copy; try again") \
                         from None
@@ -473,11 +475,23 @@ async def _replace(state, body, staging, purges):
         aside = data_dir / "backups" / DAMAGED / stamp if damaged else staging / "replaced"
         restored = None
         try:
-            await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside)
+            journal = await asyncio.to_thread(_put_in_place, data_dir, staging / "restore", aside)
             restored = await asyncio.to_thread(Database, data_dir)  # its checks and migrations
-            await state["start"](restored)  # its harness recovered, then serving
+            await state["start"](restored)  # its harness recovered; nothing is served before this returns
+            record = {
+                "id": journal["id"],
+                "source": "automatic" if body.generation else "full",
+                "backup": body.generation or str(Path(body.file)),
+                "safety_copy": f"daily/{safety.name}" if safety else None,
+                "damaged_copy": f"{DAMAGED}/{stamp}" if damaged else None,
+                "missing_files": None,
+            }
+            # Committed, before anything is served: from here no launch puts the previous state back
+            await asyncio.to_thread(_commit_journal, data_dir, journal, record)
         except Exception as error:
             log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
+            if restored is not None and state.get("db") is restored:  # it started: stopped before it served anything
+                await _stop(state, restored)
             if not await _roll_back(state, restored, damaged):
                 _limit(state, "restore_interrupted", "A restore could neither be finished nor undone; restore a backup")
                 _forget(state)
@@ -486,7 +500,8 @@ async def _replace(state, body, staging, purges):
             raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
                 from error
         # The restore is done and runs: it is never reported as failed from here. What could not be
-        # recorded is said (not_recorded) and logged; a journal not ended is replayed harmlessly at launch.
+        # recorded is said (not_recorded) and logged; the journal, kept until the audit row is written,
+        # lets the next launch write it and end the journal (_finish_journal).
         not_recorded = []
 
         async def recorded(name, fn, *args):
@@ -497,27 +512,32 @@ async def _replace(state, body, staging, purges):
                 not_recorded.append(name)
                 return None
 
-        await recorded("journal", end_journal, data_dir)
         missing = await recorded("missing_files", _missing_files, restored)
-        record = {
-            "source": "automatic" if body.generation else "full",
-            "backup": body.generation or str(Path(body.file)),
-            "safety_copy": f"daily/{safety.name}" if safety else None,
-            "damaged_copy": f"{DAMAGED}/{stamp}" if damaged else None,
-            "missing_files": None if missing is None else len(missing),
-        }
-        await recorded("audit", restored.write, lambda conn: conn.execute(
-            "INSERT INTO audit_log (event, data) VALUES ('restore', ?)", (json.dumps(record),)))
+        record["missing_files"] = None if missing is None else len(missing)
+        await recorded("audit", restored.write, lambda conn: _audit_restore(conn, record))
+        if "audit" not in not_recorded:
+            await recorded("journal", end_journal, data_dir)
         version = await recorded("schema_version", restored.read, lambda conn: conn.execute(
             "PRAGMA user_version").fetchone()[0])
         return {"ok": True, **record, "schema_version": version, "missing_files": missing,
                 "not_recorded": not_recorded}
 
 
-async def _resume(state, db, damaged):
-    """A restore that stopped before it changed anything: the app runs on its database again."""
+async def _resume(state, db, harness, damaged):
+    """A restore that stopped before it changed anything: the app runs on as it was, its writes
+    admitted again and its harness, which keeps any work still running, admitting again."""
     if not damaged:
-        await state["start"](db)
+        db.release_writes()
+    if harness is not None:
+        await harness.resume()
+
+
+async def _stop(state, db):
+    """Stop the app started on db, before it served anything: its harness, then the database."""
+    if state.get("db") is db and state.get("harness") is not None:
+        await state["harness"].shutdown()
+    await asyncio.to_thread(db.close)
+    _forget(state)
 
 
 def _forget(state):
@@ -567,11 +587,14 @@ async def _roll_back(state, restored, damaged):
             _limit(state, "database_damaged" if damaged_now else "database_unavailable",
                    "The database could not be opened again after a failed restore; restore a backup")
             _forget(state)
+    elif "damaged" not in state:  # the restored app had started and ran no more: limited again, as before
+        _limit(state, "database_damaged", "The database is damaged; restore a backup")
     return True
 
 
-def _back_from_journal(data_dir):
-    _back(data_dir, json.loads((data_dir / "backups" / JOURNAL).read_bytes()))
+def _back_from_journal(data_dir, audit=False):
+    """Put the previous state back as the journal says; audit as for _back."""
+    return _back(data_dir, json.loads((data_dir / "backups" / JOURNAL).read_bytes()), audit)
 
 
 def _stage(data_dir, body, staging):
@@ -673,8 +696,8 @@ def _put_in_place(data_dir, staged, aside):
     staged files and every folder involved are synced, then a journal (JOURNAL, synced) records the
     plan; each move is synced as it is made, and every step can be taken again, so a launch after a
     crash or a power loss finishes what was begun (finish_interrupted_restore). After a failure,
-    _back puts back what was moved, from the journal. The caller ends the journal (end_journal)
-    once the restore has succeeded.
+    _back puts back what was moved, from the journal. Returns the journal: the caller commits it
+    (_commit_journal) once the restored app has started, and ends it once its audit row is written.
     """
     _mkdir_private(aside.parent)
     _mkdir_private(aside)
@@ -682,6 +705,7 @@ def _put_in_place(data_dir, staged, aside):
     for folder in (aside, aside.parent, staged.parent, staged.parent.parent, data_dir / "backups"):
         _fsync(folder)
     journal = {
+        "id": str(uuid.uuid4()),  # in the restore's audit row, which is written once
         "direction": "forward",
         "staged": staged.relative_to(data_dir).as_posix(),
         "aside": aside.relative_to(data_dir).as_posix(),
@@ -691,6 +715,22 @@ def _put_in_place(data_dir, staged, aside):
     }
     write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
     _forward(data_dir, journal)
+    return journal
+
+
+def _commit_journal(data_dir, journal, audit):
+    """The restore is committed (direction "done"), synced, before its app serves anything: a launch
+    never replays or undoes it any more; it only writes the restore's audit row (audit) and ends
+    the journal (_finish_journal). The swap's files stay where the journal says until then."""
+    committed = {**journal, "direction": "done", "audit": audit}
+    write_private(data_dir / "backups" / JOURNAL, json.dumps(committed).encode())
+
+
+def _audit_restore(conn, record):
+    """The restore's audit row, once: record["id"] is its journal's."""
+    conn.execute("INSERT INTO audit_log (event, data) SELECT 'restore', ? WHERE NOT EXISTS ("
+                 "SELECT 1 FROM audit_log WHERE event = 'restore' AND json_extract(data, '$.id') = ?)",
+                 (json.dumps(record), record["id"]))
 
 
 def _forward(data_dir, journal):
@@ -713,9 +753,11 @@ def _forward(data_dir, journal):
             _move(staged / name, data_dir / name)
 
 
-def _back(data_dir, journal):
+def _back(data_dir, journal, audit=False):
     """Put back what _forward moved, from wherever it stopped, and end the journal. Recorded as
-    the journal's direction first, so a crash meanwhile is finished backwards too."""
+    the journal's direction first, so a crash meanwhile is finished backwards too. With audit (at
+    launch), the journal is committed instead, holding the audit row the launch writes once the
+    database runs, and returned."""
     journal = {**journal, "direction": "back"}
     write_private(data_dir / "backups" / JOURNAL, json.dumps(journal).encode())
     staged, aside, live = data_dir / journal["staged"], data_dir / journal["aside"], data_dir / DB_NAME
@@ -742,7 +784,12 @@ def _back(data_dir, journal):
     _fsync(data_dir)
     with contextlib.suppress(OSError):  # empty now; one that is not is kept
         aside.rmdir()
+    if audit:
+        record = {"id": journal.get("id"), "interrupted": True, "finished": "back"}
+        _commit_journal(data_dir, journal, record)
+        return {**journal, "direction": "done", "audit": record}
     end_journal(data_dir)
+    return None
 
 
 def _move(source, target):
@@ -767,13 +814,15 @@ def end_journal(data_dir):
     _fsync(data_dir / "backups")
 
 
-def finish_interrupted_restore(data_dir) -> str | None:
+def finish_interrupted_restore(data_dir) -> dict | None:
     """Replay a restore a crash interrupted while it put a backup in place, or put the previous
     state back: forward or back as its journal says. Run at launch, before the database opens and
-    before staging is emptied (see open_at_launch). Returns the direction taken, or None when there
-    was none. Forward keeps the journal: it ends only once the restored database runs, and is what
-    puts the previous state back if it cannot. A journal that cannot be read, or that names folders
-    outside backups/, is left with staging as they are, and raises."""
+    before staging is emptied (see open_at_launch). Returns the journal as it then is, or None when
+    there was none. Forward keeps it: it is committed only once the restored database runs, and is
+    what puts the previous state back if it cannot. Back commits it, with the audit row still to
+    write. A committed one ("done": its restore's app ran) is never replayed or undone: it is
+    returned as it is. A journal that cannot be read, or that names folders outside backups/, is
+    left with staging as they are, and raises."""
     data_dir = Path(data_dir)
     path = data_dir / "backups" / JOURNAL
     if not path.is_file():
@@ -783,55 +832,71 @@ def finish_interrupted_restore(data_dir) -> str | None:
         folder = PurePosixPath(journal[key])
         if folder.is_absolute() or ".." in folder.parts or folder.parts[0] != "backups":
             raise RuntimeError("the restore journal names a folder outside backups/")
+    if journal["direction"] == "done":
+        return journal
     if journal["direction"] == "forward":
         _forward(data_dir, journal)
         log.warning("a restore interrupted by a crash was replayed at launch")
-    else:
-        _back(data_dir, journal)
-        log.warning("a restore interrupted by a crash was undone at launch")
-    return journal["direction"]
+        return journal
+    journal = _back(data_dir, journal, audit=True)
+    log.warning("a restore interrupted by a crash was undone at launch")
+    return journal
 
 
 async def open_at_launch(state, maintenance):
     """Open the data folder's database and run the app on it (state["start"]), first replaying a
     restore a crash interrupted. The replay and the opening run inside maintenance() (the desktop
-    entry's start deadline does not count them); starting the harness does not. A restore replayed forward keeps its journal until the restored
-    database is open and its harness has recovered; if either fails, the previous state is put
-    back from the journal and opened instead. Returns the database, or None when the app stays
-    limited (state["damaged"] says why): a damaged database, or a restore that could neither be
-    finished nor undone. Audits a replayed restore once a database runs."""
+    entry's start deadline does not count them); starting the harness does not. A restore replayed
+    forward keeps its journal until the restored database is open and its harness has recovered,
+    then commits it before anything is served; if any of that fails, the previous state is put back
+    from the journal and opened instead. A committed restore is never put back: its database is
+    opened as it is. Returns the database, or None when the app stays limited (state["damaged"]
+    says why): a damaged database, a restore that could neither be finished nor undone, or, after
+    a restore, a database that cannot run. A finished restore's audit row is written, then its
+    journal ends (_finish_journal)."""
     data_dir = state["data_dir"]
     try:
         with maintenance():
-            direction = await asyncio.to_thread(finish_interrupted_restore, data_dir)
+            journal = await asyncio.to_thread(finish_interrupted_restore, data_dir)
     except Exception as error:
         log.error("a restore interrupted by a crash could not be replayed (%s)", type(error).__name__)
         _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be finished; restore a backup")
         return None
-    if direction == "forward":
+    if journal is None:
+        return await _open(state, maintenance)
+    if journal["direction"] == "forward":
+        db = None
         try:
             db = await _open(state, maintenance)
             if db is None:
                 raise DatabaseDamagedError("the restored database failed its check")
+            audit = {"id": journal.get("id"), "interrupted": True, "finished": "forward"}
+            await asyncio.to_thread(_commit_journal, data_dir, journal, audit)  # before anything is served
         except Exception as error:
             log.warning("the restored database could not run (%s); the previous state is put back",
                         type(error).__name__)
+            if db is not None:
+                await _stop(state, db)
             state.pop("damaged", None)
             state.pop("damaged_code", None)
             try:
                 with maintenance():
-                    await asyncio.to_thread(_back_from_journal, data_dir)
+                    journal = await asyncio.to_thread(_back_from_journal, data_dir, True)
             except Exception as failure:
                 log.error("putting the previous state back failed (%s)", type(failure).__name__)
                 _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be undone; restore a backup")
                 return None
-            direction = "back"
         else:
-            await _audit_replay(db, direction, end=True)
+            await _finish_journal(db, audit)
             return db
-    db = await _open(state, maintenance)
-    if db is not None and direction:
-        await _audit_replay(db, direction)
+    try:  # committed, or put back: opened as it is, and limited, offering a restore, if it cannot run
+        db = await _open(state, maintenance)
+    except Exception as error:
+        log.error("the database could not run after a restore was finished at launch (%s)", type(error).__name__)
+        _limit(state, "database_unavailable", "The database could not be opened; restore a backup")
+        return None
+    if db is not None:
+        await _finish_journal(db, journal.get("audit"))
     return db
 
 
@@ -854,18 +919,15 @@ async def _open(state, maintenance):
         raise
 
 
-async def _audit_replay(db, direction, end=False):
-    """Audit a replayed restore once its database runs, ending its journal first when end. A failure
-    here leaves the app running: an ended journal's replay is not repeated, and one not ended is
-    replayed as a no-op at the next launch."""
+async def _finish_journal(db, audit):
+    """Write a finished restore's audit row (once), then end its journal. A failure leaves the
+    app running and the committed journal in place, so the next launch tries again; it is logged."""
     try:
-        if end:
-            await asyncio.to_thread(end_journal, db.data_dir)
-        await asyncio.to_thread(db.write, lambda conn: conn.execute(
-            "INSERT INTO audit_log (event, data) VALUES ('restore', ?)",
-            (json.dumps({"interrupted": True, "finished": direction}),)))
+        if audit is not None:
+            await asyncio.to_thread(db.write, lambda conn: _audit_restore(conn, audit))
+        await asyncio.to_thread(end_journal, db.data_dir)
     except Exception as error:
-        log.warning("recording a restore replayed at launch failed (%s)", type(error).__name__)
+        log.warning("recording a finished restore failed (%s); the next launch tries again", type(error).__name__)
 
 
 def _exists(path):

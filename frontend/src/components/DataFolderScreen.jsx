@@ -1,7 +1,7 @@
 // i18n: migrated
 // The data-folder screen (S2): shown only when Scholia will not open its data folder. The
 // backend reports why in /api/health (data_folder_problem: "synced", "unsafe", "missing",
-// "foreign" or "newer"), and records another place for the next launch (POST /api/data-folder,
+// "foreign", "newer" or "unchecked"), and records another place for the next launch (POST /api/data-folder,
 // backend/data_folder.py).
 import { useState } from 'react';
 import { CheckCircle2, FolderX } from 'lucide-react';
@@ -12,7 +12,7 @@ import { FolderField } from './FolderField.jsx';
 import { Button } from '@/components/ui/button';
 
 const REASONS = { synced: 'dataFolder.synced', unsafe: 'dataFolder.unsafe', missing: 'dataFolder.missing',
-  foreign: 'dataFolder.foreign', newer: 'dataFolder.newer' };
+  foreign: 'dataFolder.foreign', newer: 'dataFolder.newer', unchecked: 'dataFolder.unchecked' };
 
 export function DataFolderScreen({ health }) {
   const t = useT();

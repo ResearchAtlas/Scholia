@@ -708,3 +708,75 @@ async def test_a_listing_writing_its_audit_row_when_a_restore_starts_is_waited_f
         assert conn.execute("SELECT count(*) FROM audit_log WHERE event = 'outbound'").fetchone()[0] >= 1
     finally:
         conn.close()
+
+
+async def test_a_restore_refused_for_work_that_does_not_stop_leaves_that_work_with_its_harness(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        harness, release = client.state["harness"], asyncio.Event()
+        stuck = harness._detach(release.wait())  # detached work that outlasts the shutdown's wait
+        real = Harness.shutdown
+        monkeypatch.setattr(Harness, "shutdown", lambda self, timeout=10.0: real(self, 0.05))
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "work_running")
+        assert client.state["harness"] is harness and stuck in harness._tasks  # not replaced: it still owns the work
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # admitting again
+        release.set()
+        await stuck
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text  # nothing left running: it goes ahead
+
+
+async def test_a_write_a_cancelled_task_left_running_never_lands_after_the_safety_copy(tmp_path, monkeypatch):
+    import time
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        db = client.state["db"]
+        running, go, outcome = threading.Event(), threading.Event(), []
+
+        def late_write():  # a worker its cancelled task no longer waits for, paused before its write
+            running.set()
+            go.wait(5)
+            try:
+                db.write(lambda conn: conn.execute("INSERT INTO audit_log (event, data) VALUES ('late', '{}')"))
+                outcome.append("committed")
+            except Exception as error:
+                outcome.append(type(error).__name__)
+
+        task = asyncio.create_task(asyncio.to_thread(late_write))
+        await asyncio.to_thread(running.wait, 5)
+        task.cancel()  # the task ends; its worker thread goes on
+        real_backup = Database.backup
+
+        def safety_copy_then_the_late_write(self, *args, **kwargs):
+            generation = real_backup(self, *args, **kwargs)
+            go.set()
+            deadline = time.monotonic() + 5
+            while not outcome and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return generation
+
+        monkeypatch.setattr(Database, "backup", safety_copy_then_the_late_write)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text
+    conn = sqlite3.connect((data / "backups" / response.json()["safety_copy"] / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    try:
+        in_copy = conn.execute("SELECT count(*) FROM audit_log WHERE event = 'late'").fetchone()[0]
+    finally:
+        conn.close()
+    assert outcome == ["DatabaseClosedError"] and in_copy == 0  # refused, never committed after the copy
+
+
+async def test_a_restore_whose_safety_copy_fails_leaves_the_app_writing(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+
+        def failing(self, *args, **kwargs):
+            raise OSError("I/O error")
+
+        monkeypatch.setattr(Database, "backup", failing)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "safety_copy_failed")
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # its writes admitted

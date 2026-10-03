@@ -353,13 +353,31 @@ def test_the_default_folders_newer_database_is_still_refused_at_launch(tmp_path)
 
 
 @pytest.mark.skipif(os.getuid() == 0, reason="root reads any file")
-def test_a_folder_whose_database_cannot_be_read_is_left_to_open_as_it_would(tmp_path, monkeypatch):
+def test_a_folder_whose_database_cannot_be_read_is_not_recorded(tmp_path, monkeypatch):
     monkeypatch.setattr(data_folder, "file_system_type", apfs)
     chosen = tmp_path / "Other"
     another_apps_database(chosen)
     (chosen / "scholia.sqlite3").chmod(0)
-    assert data_folder.database_problem(chosen) is None  # not a crash, at launch or here
-    assert data_folder.choose(tmp_path / "default", str(chosen)) == chosen
+    assert data_folder.database_problem(chosen)[0] == "unchecked"  # neither a crash nor taken for damaged
+    with pytest.raises(data_folder.FolderRefused) as refused:
+        data_folder.choose(tmp_path / "default", str(chosen))
+    assert refused.value.code == "data_folder_unchecked"
+    assert not (tmp_path / data_folder.LOCATION_FILE).exists()
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root reads any file")
+def test_a_chosen_folder_whose_database_cannot_be_checked_is_explained_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default, chosen = tmp_path / "default", tmp_path / "Other"
+    chosen.mkdir()
+    data_folder.choose(default, str(chosen))
+    another_apps_database(chosen)
+    (chosen / "scholia.sqlite3").chmod(0)
+    before = sorted((p.name, p.stat().st_mtime_ns, mode(p)) for p in chosen.iterdir())
+    seen = []
+    assert desktop.run(default, _window(seen), listening=register_server) == 1
+    assert seen[0]["data_folder_problem"] == "unchecked"
+    assert sorted((p.name, p.stat().st_mtime_ns, mode(p)) for p in chosen.iterdir()) == before  # no lock, log or mode change
 
 
 def test_choosing_the_default_folder_back_checks_its_database(tmp_path, monkeypatch):
@@ -431,7 +449,7 @@ def test_the_log_is_read_from_an_owner_only_copy(tmp_path, monkeypatch):
     assert modes == [0o600, 0o600]
 
 
-def test_a_database_whose_check_fails_is_logged_and_left_to_open_as_it_would(tmp_path, monkeypatch, caplog):
+def test_a_database_whose_check_fails_is_logged_and_not_opened(tmp_path, monkeypatch, caplog):
     import errno
     from backend.db import database
     a_newer_scholia_database_in_its_log(tmp_path / "Other")
@@ -441,7 +459,7 @@ def test_a_database_whose_check_fails_is_logged_and_left_to_open_as_it_would(tmp
 
     monkeypatch.setattr(database.shutil, "copyfile", full)
     caplog.set_level("WARNING", logger=data_folder.log.name)
-    assert data_folder.database_problem(tmp_path / "Other") is None
+    assert data_folder.database_problem(tmp_path / "Other")[0] == "unchecked"  # fails closed
     assert [r.getMessage() for r in caplog.records] == [
         f"the database in a chosen data folder could not be checked (OSError, errno {errno.ENOSPC})"]  # no path
 

@@ -97,6 +97,7 @@ class Database:
         self._readers = []
         self._readers_lock = threading.Lock()
         self._closed = False  # set when close() starts, under _readers_lock; later reads and writes are refused
+        self._held = False  # set by hold_writes(), under _readers_lock: later writes are refused
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
@@ -132,11 +133,27 @@ class Database:
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("write() cannot be called from inside a write")
-        with self._readers_lock:  # admitted and queued in one step, so never queued behind close()
-            if self._closed:
+        with self._readers_lock:  # admitted and queued in one step, so never queued behind close() or a hold
+            if self._closed or self._held:
                 raise DatabaseClosedError("the database is closed")
             future = self._writer.submit(self._transaction, fn)
         return future.result()
+
+    def hold_writes(self):
+        """Refuse every write from now on (DatabaseClosedError) and wait for those already queued
+        to commit, whatever thread queued them: after it, nothing commits until release_writes().
+        A restore holds them from its safety copy until the database closes."""
+        _refuse_event_loop()
+        with self._readers_lock:
+            if self._closed:
+                raise DatabaseClosedError("the database is closed")
+            self._held = True
+        self._writer.submit(lambda: None).result()  # the single writer runs in order: every earlier write is done
+
+    def release_writes(self):
+        """Admit writes again after hold_writes()."""
+        with self._readers_lock:
+            self._held = False
 
     def read(self, fn):
         """Run fn(conn) in one read transaction on this thread's read-only connection."""
@@ -557,10 +574,11 @@ def check_identity(path, latest=len(MIGRATIONS)):
     (after a crash) is read too, from an owner-only copy of both in a private temporary folder,
     since it may hold the newest schema.
     Raises ForeignDatabaseError for another application's file, NewerDatabaseError for a newer
-    schema, DatabaseDamagedError for a file SQLite cannot read as a database, and OSError when the
-    copy cannot be made."""
+    schema, DatabaseDamagedError for a file SQLite cannot read as a database, and OSError when it
+    could not be checked: the file cannot be read, or the copy cannot be made."""
     _refuse_event_loop()
     path = Path(path).resolve()
+    path.open("rb").close()  # one this account cannot read is not checked, rather than taken for damaged
     wal = path.with_name(path.name + "-wal")
     if wal.is_symlink() or not wal.is_file() or not wal.stat().st_size:
         return _check_identity(path.as_uri() + "?mode=ro&immutable=1", latest)  # immutable: no log is read
