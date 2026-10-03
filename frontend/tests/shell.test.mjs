@@ -9,6 +9,7 @@ import { continuable, moveTargets, projectName } from '../src/projects.js';
 import { errorText, money } from '../src/text.js';
 import { apply, send, subscribe, unsavedAnswer } from '../src/live.js';
 import { packageRoot } from '../licenses.mjs';
+import { saveSettings, valueAt } from '../src/api.js';
 
 const open = (width, extra = {}) => columns({ width, ...DEFAULTS, panelOpen: false, ...extra });
 
@@ -156,4 +157,24 @@ test('the license plugin finds the package a module belongs to', () => {
   assert.deepEqual(packageRoot('\0/a/node_modules/x/node_modules/@radix-ui/react-id/dist/index.mjs?v=1'),
     { name: '@radix-ui/react-id', root: '/a/node_modules/x/node_modules/@radix-ui/react-id' });
   assert.equal(packageRoot('/a/src/App.jsx'), null);
+});
+
+test('a settings conflict never overwrites a key that changed on disk', async (t) => {
+  assert.equal(valueAt({ ui: { layout: { sidebar_width: 300 } } }, 'ui.layout.sidebar_width'), 300);
+  assert.equal(valueAt({ ui: {} }, 'ui.layout.sidebar_width'), undefined);
+  const disk = [
+    { hash: 'h1', values: { ui: { panel: 'none', layout: { sidebar_width: 248 } } } },
+    { hash: 'h2', values: { ui: { panel: 'library', layout: { sidebar_width: 248 } } } }, // panel changed on disk
+  ];
+  const puts = [];
+  t.mock.method(globalThis, 'fetch', async (path, { method, body }) => {
+    if (method === 'GET') return Response.json(disk.shift());
+    puts.push(JSON.parse(body));
+    return puts.length === 1 ? Response.json({ code: 'settings_changed' }, { status: 409 }) : Response.json({ ok: true });
+  });
+  await saveSettings({ 'ui.panel': 'manuscript', 'ui.layout.sidebar_width': 300 });
+  assert.deepEqual(puts.map((p) => [p.hash, p.updates]), [
+    ['h1', { 'ui.panel': 'manuscript', 'ui.layout.sidebar_width': 300 }],
+    ['h2', { 'ui.layout.sidebar_width': 300 }], // the changed key keeps the file's value
+  ]);
 });

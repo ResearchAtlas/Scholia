@@ -24,6 +24,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const [turns, setTurns] = useState(conversation ? null : []);
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);
+  const [reads, setReads] = useState(0); // each read, failed or not, so polling goes on
   const end = useRef(null);
 
   const load = useCallback(async () => {
@@ -33,6 +34,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       setFailed(false);
     } catch {
       setFailed(true);
+    } finally {
+      setReads((n) => n + 1);
     }
   }, [id]);
 
@@ -51,7 +54,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     if (!waiting) return undefined;
     const timer = setTimeout(load, POLL_MS);
     return () => clearTimeout(timer);
-  }, [waiting, turns, load]);
+  }, [waiting, reads, load]);
 
   useEffect(() => {
     const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;

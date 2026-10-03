@@ -127,7 +127,9 @@ export function Shell({ health, settings }) {
     const next = panel === which ? 'none' : which;
     if (from) opener.current = from;
     setPanel(next);
-    if (next === 'none') requestAnimationFrame(() => opener.current?.isConnected && opener.current.focus());
+    if (next === 'none') { // focus goes back where it came from, or to the message box
+      requestAnimationFrame(() => (opener.current?.isConnected ? opener.current : document.getElementById('composer'))?.focus());
+    }
     if (projectId) saveSettings({ 'ui.panel': next }, projectId).catch(fail);
   }, [panel, projectId, fail]);
 

@@ -72,17 +72,30 @@ export async function stream(path, body, onEvent, signal) {
 }
 
 // Saves the keys of one direct action (the layout, the open panel) with the file-hash
-// precondition: it reads the file, writes only those keys, and on a conflict reads again and
-// retries once. Every other key keeps the value on disk, so nothing the researcher has not
-// just set is overwritten. Settings forms reload and ask instead (ticket 14; S1-10).
+// precondition. On a conflict it reads the file again and writes only the keys that did not
+// change on disk meanwhile: a changed key keeps the file's value, since the app never
+// overwrites a change it has not shown (ticket 14). Every other key is left as the file has
+// it. Settings forms reload and ask instead (S1-10).
 export async function saveSettings(updates, projectId) {
   const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+  const scope = projectId ? { project_id: projectId } : {};
+  let read = await get(`/api/settings${query}`);
+  let pending = updates;
   for (let attempt = 0; ; attempt += 1) {
-    const current = await get(`/api/settings${query}`);
     try {
-      return await put('/api/settings', { hash: current.hash, updates, ...(projectId ? { project_id: projectId } : {}) });
+      return await put('/api/settings', { hash: read.hash, updates: pending, ...scope });
     } catch (error) {
       if (!(error instanceof ApiError && error.code === 'settings_changed') || attempt > 0) throw error;
+      const fresh = await get(`/api/settings${query}`);
+      pending = Object.fromEntries(Object.entries(pending)
+        .filter(([key]) => JSON.stringify(valueAt(read.values, key)) === JSON.stringify(valueAt(fresh.values, key))));
+      read = fresh;
+      if (!Object.keys(pending).length) return fresh;
     }
   }
+}
+
+// A dotted settings key's value ("ui.layout.sidebar_width"), or undefined.
+export function valueAt(values, key) {
+  return key.split('.').reduce((node, part) => (node && typeof node === 'object' ? node[part] : undefined), values);
 }
