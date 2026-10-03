@@ -19,6 +19,12 @@ export function deletePath(kind, id, { everywhere = false, removeAllTrace = fals
   return text ? `${base}?${text}` : base;
 }
 
+// What a deletion that succeeded must still say, as catalog keys: older backups it could not
+// clear (Delete everywhere), and files of the project it could not remove (retried at launch).
+export function deletionNotices(result) {
+  return [result?.purge_failed && 'delete.purgeFailed', result?.files_left && 'delete.filesLeft'].filter(Boolean);
+}
+
 // A restore request: an automatic backup by its id, or a full backup file with its passphrase.
 export function restoreBody({ generation, file, passphrase }) {
   if (generation) return { generation };

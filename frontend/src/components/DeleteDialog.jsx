@@ -6,7 +6,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { useT } from '../i18n/index.js';
 import { api } from '../api.js';
-import { deletePath } from '../backups.js';
+import { deletePath, deletionNotices } from '../backups.js';
 import { useAction } from '../action.js';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -16,26 +16,27 @@ export function DeleteDialog({ target, onClose, onDone }) {
   const t = useT();
   const traceId = useId();
   const [removeAllTrace, setRemoveAllTrace] = useState(false);
-  const [purgeFailed, setPurgeFailed] = useState(false);
+  const [notices, setNotices] = useState([]); // what a deletion that succeeded must still say
   const { busy, problem, run, reset } = useAction();
   const shown = useRef(target); // the last target, so the dialog keeps its text while it closes
   if (target) shown.current = target;
   const key = target ? `${target.kind}:${target.id}` : null;
   useEffect(() => { // each deletion starts afresh; a closing dialog keeps what it shows
-    if (key) { setRemoveAllTrace(false); setPurgeFailed(false); }
+    if (key) { setRemoveAllTrace(false); setNotices([]); }
   }, [key]);
 
   async function remove(everywhere) {
     const result = await run(() => api('DELETE', deletePath(target.kind, target.id, { everywhere, removeAllTrace })));
     if (!result) return;
-    if (result.purge_failed) setPurgeFailed(true); // deleted, but still in older backups: say so first
+    const said = deletionNotices(result);
+    if (said.length) setNotices(said); // deleted, but not wholly: say so before it closes
     else onDone(target.id);
   }
 
   function close() {
     if (busy) return;
     reset();
-    if (purgeFailed) onDone(target.id);
+    if (notices.length) onDone(target.id);
     else onClose();
   }
 
@@ -46,9 +47,11 @@ export function DeleteDialog({ target, onClose, onDone }) {
           <DialogTitle>{shown.current?.title}</DialogTitle>
           <DialogDescription>{shown.current?.body}</DialogDescription>
         </DialogHeader>
-        {purgeFailed ? (
+        {notices.length > 0 ? (
           <>
-            <p role="alert" className="text-sm text-warning">{t('delete.purgeFailed')}</p>
+            <div role="alert" className="grid gap-2 text-sm text-warning">
+              {notices.map((notice) => <p key={notice}>{t(notice)}</p>)}
+            </div>
             <DialogFooter><Button type="button" onClick={close}>{t('common.close')}</Button></DialogFooter>
           </>
         ) : (

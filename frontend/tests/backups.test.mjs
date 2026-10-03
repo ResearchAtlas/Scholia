@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
-import { deletePath, fileSize, folderPicker, needsPassphrase, restoreBody } from '../src/backups.js';
+import { deletePath, deletionNotices, fileSize, folderPicker, needsPassphrase, restoreBody } from '../src/backups.js';
 import { errorText } from '../src/text.js';
 
 test('a deletion asks for the backups and the trace only when chosen', () => {
@@ -16,6 +16,16 @@ test('a deletion asks for the backups and the trace only when chosen', () => {
   assert.equal(deletePath('project', 'p1', { removeAllTrace: true }), '/api/projects/p1?remove_all_trace=true');
   assert.equal(deletePath('conversation', 'a/b', { everywhere: true, removeAllTrace: true }),
     '/api/conversations/a%2Fb?purge_backups=true&remove_all_trace=true');
+});
+
+test('a deletion that succeeded says what it could not finish', () => {
+  assert.deepEqual(deletionNotices({ ok: true }), []);
+  assert.deepEqual(deletionNotices({ ok: true, files_left: true }), ['delete.filesLeft']);
+  assert.deepEqual(deletionNotices({ ok: true, purge_failed: true, files_left: true }),
+    ['delete.purgeFailed', 'delete.filesLeft']);
+  for (const key of deletionNotices({ purge_failed: true, files_left: true })) {
+    assert.ok(Object.hasOwn(en, key), key);
+  }
 });
 
 test('a restore names one automatic backup, or a file with its passphrase when there is one', () => {
