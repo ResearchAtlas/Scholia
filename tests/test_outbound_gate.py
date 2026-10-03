@@ -1541,7 +1541,8 @@ def test_the_listener_check_is_the_real_one_only_when_requests_reach_the_network
     ("v6", "::1", "::1", True),
     ("v6", "::1", "127.0.0.1", False),
     ("v4", "0.0.0.0", "127.0.0.1", True),
-    ("v6", "::", "127.0.0.1", True),  # dual-stack
+    ("v6", "::", "127.0.0.1", False),  # it may be IPv6-only, which lsof does not show
+    ("v6", "::", "::1", True),
     ("v4", "127.0.0.1", "localhost", False),  # a name may reach ::1 too
 ])
 def test_lsof_finds_this_accounts_listener_at_the_destination_address(family, bound, asked, ours):

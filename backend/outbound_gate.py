@@ -380,7 +380,8 @@ def listener_is_ours(host, port) -> bool:
     """Whether a process of this account listens at host:port: on that address, or on its
     family's wildcard. A name (localhost) needs both 127.0.0.1 and ::1, since either may be
     reached. lsof run as this account lists only its processes (-u narrows it in any case).
-    ponytail: an IPv6 wildcard counts for IPv4 too (dual-stack, macOS's default)."""
+    A wildcard counts only for its own family: lsof cannot tell a dual-stack IPv6 socket
+    from an IPv6-only one, so a dual-stack server is reached at its IPv6 address."""
     result = subprocess.run(
         ["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()), f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-F", "tn"],
         capture_output=True, timeout=5, check=False)
@@ -400,7 +401,7 @@ def listener_is_ours(host, port) -> bool:
     def covers(listener, address):
         family, bound = listener
         if bound == "*":
-            return family == address.version or (family == 6 and address.version == 4)
+            return family == address.version
         try:
             return ipaddress.ip_address(bound) == address
         except ValueError:
