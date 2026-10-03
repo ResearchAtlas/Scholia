@@ -268,14 +268,6 @@ class OutboundGate:
             public_problem = "not_a_fetch"
         else:
             public_problem = None
-        # Whose process listens on a plain-HTTP loopback port, asked outside the transaction.
-        owned = None
-        if self._local_listener is not None and target is not None and target[0] == "http" \
-                and _is_this_host(target[1]):
-            try:
-                owned = bool(self._local_listener(target[1], target[2]))
-            except Exception:  # unknown counts as not ours
-                owned = False
         # The inputs are called outside the transaction, and the Private checks only
         # when the project is Private now. The level is read again in the transaction.
         seen = self._db.read(lambda conn: _level(conn, scope.project_id))
@@ -291,6 +283,15 @@ class OutboundGate:
                 private_problem = "sensitivity_changed"  # used only if it became Private since
         except Exception as caught:  # recorded as a refusal below, and chained to it
             error = caught
+        # Whose process listens at a plain-HTTP local provider, asked outside the transaction
+        # (not for the helper, the app's own child).
+        owned = None
+        if self._local_listener is not None and target is not None and target[0] == "http" \
+                and _is_this_host(target[1]) and target in providers and target != helper:
+            try:
+                owned = bool(self._local_listener(target[1], target[2]))
+            except Exception:  # unknown counts as not ours
+                owned = False
 
         def decide(conn):
             # The level is read in the transaction that records the decision, so a
@@ -376,12 +377,36 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
 
 
 def listener_is_ours(host, port) -> bool:
-    """Whether a process of this account listens on this TCP port. lsof run as this account
-    lists only this account's processes (-u narrows it to them in any case)."""
+    """Whether a process of this account listens at host:port: on that address, or on its
+    family's wildcard. A name (localhost) needs both 127.0.0.1 and ::1, since either may be
+    reached. lsof run as this account lists only its processes (-u narrows it in any case).
+    ponytail: an IPv6 wildcard counts for IPv4 too (dual-stack, macOS's default)."""
     result = subprocess.run(
-        ["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()), f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+        ["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()), f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-F", "tn"],
         capture_output=True, timeout=5, check=False)
-    return result.returncode == 0 and bool(result.stdout.strip())
+    if result.returncode != 0:
+        return False
+    listeners, family = [], None
+    for line in result.stdout.decode("ascii", "replace").splitlines():
+        if line.startswith("t"):
+            family = {"IPv4": 4, "IPv6": 6}.get(line[1:])
+        elif line.startswith("n") and family:
+            listeners.append((family, line[1:].rsplit(":", 1)[0].strip("[]")))
+    try:
+        wanted = [ipaddress.ip_address(host)]
+    except ValueError:
+        wanted = [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")]
+
+    def covers(listener, address):
+        family, bound = listener
+        if bound == "*":
+            return family == address.version or (family == 6 and address.version == 4)
+        try:
+            return ipaddress.ip_address(bound) == address
+        except ValueError:
+            return False
+
+    return all(any(covers(listener, address) for listener in listeners) for address in wanted)
 
 
 def _dispatched(request):

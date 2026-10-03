@@ -1524,7 +1524,7 @@ def test_a_plain_http_local_provider_gets_a_request_only_from_this_accounts_list
                     headers=AUTH)
         client.get(f"{HELPER}/health")  # the helper is this app's own child: not asked
         client.post("https://127.0.0.1:8443/v1/chat/completions", json=chat(), headers=AUTH)  # TLS: not asked
-    assert asked[0] == ("127.0.0.1", 11434) and ("127.0.0.1", 8443) not in asked
+    assert asked == [("127.0.0.1", 11434)]  # neither the helper nor the TLS provider is asked
     assert [r.url.port for r in remote.received] == ([11434] if allowed else []) + [8765, 8443]
     assert (("deny", "local_server_not_yours") in decisions(db)) is not allowed
 
@@ -1535,18 +1535,27 @@ def test_the_listener_check_is_the_real_one_only_when_requests_reach_the_network
     assert OutboundGate(db, GateInputs, transport=httpx.MockTransport(lambda r: None))._local_listener is None
 
 
-def test_lsof_finds_this_accounts_listener_and_nothing_on_a_free_port():
+@pytest.mark.parametrize("family, bound, asked, ours", [
+    ("v4", "127.0.0.1", "127.0.0.1", True),
+    ("v4", "127.0.0.1", "::1", False),  # another account could hold [::1] on this port
+    ("v6", "::1", "::1", True),
+    ("v6", "::1", "127.0.0.1", False),
+    ("v4", "0.0.0.0", "127.0.0.1", True),
+    ("v6", "::", "127.0.0.1", True),  # dual-stack
+    ("v4", "127.0.0.1", "localhost", False),  # a name may reach ::1 too
+])
+def test_lsof_finds_this_accounts_listener_at_the_destination_address(family, bound, asked, ours):
     import socket as socket_module
     from backend.outbound_gate import listener_is_ours
     from network_guard import allow_subprocess
-    listening = socket_module.socket()
-    listening.bind(("127.0.0.1", 0))
+    listening = socket_module.socket(socket_module.AF_INET if family == "v4" else socket_module.AF_INET6)
+    listening.bind((bound, 0))
     listening.listen()
     port = listening.getsockname()[1]
     try:
         with allow_subprocess("/usr/sbin/lsof"):
-            assert listener_is_ours("127.0.0.1", port) is True
+            assert listener_is_ours(asked, port) is ours
             listening.close()
-            assert listener_is_ours("127.0.0.1", port) is False
+            assert listener_is_ours(asked, port) is False  # nothing listens now
     finally:
         listening.close()
