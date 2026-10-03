@@ -139,8 +139,10 @@ def database_problem(folder):
     path = folder / DB_NAME
     if path.is_symlink() or path.with_name(DB_NAME + "-wal").is_symlink():
         raise UnsafeDataFolderError("Scholia will not open its data folder: its database or its log is a link")
-    if not path.is_file():
+    if not os.path.lexists(path):
         return None
+    if not path.is_file():  # a folder, a FIFO or another non-file under the database's name: never opened
+        return "unchecked", "something that is not a database file has its name"
     try:
         check_identity(path)
     except ForeignDatabaseError:

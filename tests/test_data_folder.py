@@ -142,6 +142,15 @@ def test_the_records_name_cannot_be_chosen_through_a_link_to_its_folder(tmp_path
     assert not (tmp_path / data_folder.LOCATION_FILE).exists()
 
 
+@pytest.mark.parametrize("entry", ["folder", "fifo"])
+def test_a_non_file_under_the_databases_name_is_never_opened(tmp_path, entry):
+    folder = tmp_path / "Scholia"
+    folder.mkdir(mode=0o700)
+    target = folder / data_folder.DB_NAME
+    target.mkdir() if entry == "folder" else os.mkfifo(target)
+    assert data_folder.database_problem(folder)[0] == "unchecked"
+
+
 def test_a_record_name_holding_a_folder_with_something_in_it_is_never_removed(tmp_path, monkeypatch):
     monkeypatch.setattr(data_folder, "file_system_type", apfs)
     default, chosen = tmp_path / "default", tmp_path / "Research" / "Scholia"

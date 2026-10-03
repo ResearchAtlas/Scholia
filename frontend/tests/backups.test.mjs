@@ -11,7 +11,7 @@ import { makeT } from '../src/i18n/index.js';
 import { deletePath, deletionNotices, fileSize, folderPicker, needsPassphrase, restoreBody, restoreNotes }
   from '../src/backups.js';
 import { errorText } from '../src/text.js';
-import { get } from '../src/api.js';
+import { get, post } from '../src/api.js';
 
 test('a deletion asks for the backups and the trace only when chosen', () => {
   assert.equal(deletePath('conversation', 'c1'), '/api/conversations/c1');
@@ -113,5 +113,7 @@ test('a request that finds the app limited tells the window, so it can offer the
   await assert.rejects(get('/api/settings'), (error) => error.code === 'settings_changed');
   answer = { status: 503, code: 'restoring' }; // a restore under way is not a limited app
   await assert.rejects(get('/api/projects'));
-  assert.deepEqual(seen, ['scholia:limited']);
+  answer = { status: 409, code: 'database_damaged' }; // Back up now, whose check found the damage first
+  await assert.rejects(post('/api/backups'));
+  assert.deepEqual(seen, ['scholia:limited', 'scholia:limited']);
 });

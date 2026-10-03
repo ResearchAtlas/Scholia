@@ -31,7 +31,8 @@ export function headers(json) {
 const LIMITED = new Set(['database_damaged', 'restore_interrupted', 'database_unavailable']);
 
 function failure(status, code) {
-  if (status === 503 && LIMITED.has(code)) globalThis.dispatchEvent?.(new Event('scholia:limited'));
+  // by code, whatever the status: a backup that first finds the damage answers 409 database_damaged
+  if (LIMITED.has(code)) globalThis.dispatchEvent?.(new Event('scholia:limited'));
   return new ApiError(status, code);
 }
 
