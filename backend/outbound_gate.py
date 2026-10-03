@@ -53,8 +53,10 @@ deletion or a tightened project, or one in a review-locked project, sends nothin
 more, retries and same-origin redirect hops included ("revoked").
 
 No request enters the transport after a revocation commits. Every write that revokes
-a project's runs (a deletion, a tightened or review-locked project) is marked on the
-event loop before it starts and after it ends (`revoking`, `revoking_from_thread`).
+a project's runs or takes away a route (a tightened or review-locked project; a
+deletion, a withdrawn declaration or a change to the Private allowlist, for every
+project) is marked on the event loop before it starts and after it ends (`revoking`,
+`revoking_from_thread`).
 An async client decides a request when no revocation of its project is under way, and
 on the loop, in the same step in which it calls the transport, finds that none began
 meanwhile, or else decides again once it has ended. So a request entered the transport
@@ -93,6 +95,7 @@ CDN, say) needs a change here when it is wired in.
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import ipaddress
 import json
@@ -101,6 +104,7 @@ import re
 import socket
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Collection, Mapping
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from dataclasses import dataclass, field
@@ -161,6 +165,7 @@ _KNOWN = SCHOLARLY_APIS | MODEL_SOURCES | {OPENROUTER}
 # value is a one-time token from _Scope.expect, bound to the next URL.
 _HOP = object()
 MAX_PENDING_HOPS = 16  # per client
+MARK_SECONDS = 30  # how long a revoking write in a thread waits for a running loop to mark it
 # A request extension holding a callable the gate calls, with the retention terms it applied,
 # once the request has passed its check and is handed to the network, so a caller can tell a
 # request that left from one that was refused or cancelled before it left.
@@ -290,8 +295,9 @@ class OutboundGate:
 
     @contextlib.asynccontextmanager
     async def revoking(self, project_id):
-        """Around a write, made from the event loop, that revokes a project's runs (None: runs of
-        any project): marked before it starts and after it ends (see the module's docstring)."""
+        """Around a write, made from the event loop, that revokes a project's runs or takes away a
+        route it may use (None: every project): marked before it starts and after it ends (see the
+        module's docstring)."""
         self._begin(project_id)
         try:
             yield
@@ -301,26 +307,48 @@ class OutboundGate:
     @contextlib.contextmanager
     def revoking_from_thread(self, project_id):
         """revoking() for a write in a worker thread: the mark is on the loop before the write
-        starts. Marking never waits for anything, so the thread waits only for the loop to run it."""
+        starts. Marking never waits for anything, so the thread waits only for the loop to run it,
+        a slice at a time: once the loop is no longer running (or closed), no request can enter a
+        transport on it, and the write goes on unmarked. A loop that runs but never answers
+        within MARK_SECONDS refuses the write."""
         loop = self._loop
         try:
             on_loop = asyncio.get_running_loop() is loop
         except RuntimeError:
             on_loop = False
-        if loop is None or not (on_loop or loop.is_running()):  # no loop runs a request to order with
-            yield
-            return
+        marked = on_loop
         if on_loop:
             self._begin(project_id)
-        else:
-            asyncio.run_coroutine_threadsafe(_call(self._begin, project_id), loop).result()
+        elif loop is not None and loop.is_running():
+            marking = concurrent.futures.Future()
+
+            def mark():  # on the loop; nothing once the thread has given up on it
+                if marking.set_running_or_notify_cancel():
+                    self._begin(project_id)
+                    marking.set_result(None)
+
+            try:
+                loop.call_soon_threadsafe(mark)
+            except RuntimeError:  # closed meanwhile: nothing will dispatch on it
+                marking.cancel()
+            deadline = time.monotonic() + MARK_SECONDS
+            while not marked and not marking.cancelled():
+                try:
+                    marking.result(timeout=0.05)
+                    marked = True
+                except concurrent.futures.TimeoutError:
+                    stopped, late = not loop.is_running(), time.monotonic() > deadline
+                    # Given up on only before the loop ran it; once it runs, its result follows.
+                    if (stopped or late) and marking.cancel() and late and not stopped:
+                        raise RuntimeError("the event loop did not mark a revocation") from None
         try:
             yield
         finally:
-            if on_loop:
+            if marked and on_loop:
                 self._end(project_id)
-            else:
-                loop.call_soon_threadsafe(self._end, project_id)
+            elif marked:
+                with contextlib.suppress(RuntimeError):  # a loop closed meanwhile dispatches nothing more
+                    loop.call_soon_threadsafe(self._end, project_id)
 
     def client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
                admit: Callable | None = None, **options) -> httpx.Client:
@@ -346,14 +374,18 @@ class OutboundGate:
                                     self._transport or httpx.AsyncHTTPTransport(trust_env=False))
         return httpx.AsyncClient(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
-    def _check(self, request: httpx.Request, scope: _Scope) -> None:
-        """Decide one request and record the decision. Raises OutboundDenied."""
+    def _check(self, request: httpx.Request, scope: _Scope, hop=None):
+        """Decide one request and record the decision; returns (its kind, the terms applied,
+        whether it is a redirect hop the client may take). Raises OutboundDenied. hop, when the
+        request is decided again, is what its first decision found, so its one-time redirect
+        token is not spent twice."""
         target = _origin(request.url)
         # A Host header or TLS name other than the URL's could reach another site
         # behind the same server or CDN.
         addressed = (request.headers.get("host") == request.url.netloc.decode("ascii")
                      and "sni_hostname" not in request.extensions and "target" not in request.extensions)
-        hop = scope.use(request.extensions.get(_HOP), (target, request.url.raw_path))
+        if hop is None:
+            hop = scope.use(request.extensions.get(_HOP), (target, request.url.raw_path))
         # What a scholarly, open-access or download request may not be. User info in
         # the URL is a credential too: httpx turns it into Authorization only for a
         # first request, never for a redirect hop.
@@ -434,7 +466,7 @@ class OutboundGate:
         kind, reason, shown, terms = self._db.write(decide)
         if reason:
             raise OutboundDenied(reason, shown) from error
-        return kind, terms
+        return kind, terms, hop
 
     def _refuse_redirect(self, request: httpx.Request, scope: _Scope, target) -> None:
         try:
@@ -455,7 +487,7 @@ class _Transport(httpx.BaseTransport):
         self._gate, self._scope, self._inner = gate, scope, inner
 
     def handle_request(self, request):
-        kind, terms = self._gate._check(request, self._scope)
+        kind, terms, _ = self._gate._check(request, self._scope)
         _dispatched(request, terms)
         response = self._inner.handle_request(request)
         leaves, target = _redirect(request, response)
@@ -477,11 +509,12 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
         gate, project_id = self._gate, self._scope.project_id
         gate._loop = gate._loop or asyncio.get_running_loop()
+        hop = None
         while True:  # decided when no revocation of the project is under way, and again if one began
             await gate._settled(project_id)
             begun = gate._begun_for(project_id)
             # The database blocks, so it is reached off the event loop.
-            kind, terms = await asyncio.to_thread(gate._check, request, self._scope)
+            kind, terms, hop = await asyncio.to_thread(gate._check, request, self._scope, hop)
             if gate._begun_for(project_id) == begun:
                 break
         # In this same step, with no revocation begun since the decision, the request enters the transport.
@@ -549,10 +582,6 @@ def _dispatched(request, terms=None):
     notify = request.extensions.get(DISPATCHED)
     if callable(notify):
         notify(terms)
-
-
-async def _call(fn, *args):
-    return fn(*args)
 
 
 def _terms(conn, level, kind, target, entries):

@@ -18,7 +18,7 @@ import pytest
 from backend import governance, openrouter, openrouter_client
 from backend.db import new_id
 from backend.runs import may_dispatch
-from scholia_app import FakeKeyring, MockProvider, background_idle, confirm_key, events, send, started
+from scholia_app import FakeKeyring, MockProvider, background_idle, confirm_key, declare, events, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -424,8 +424,8 @@ async def test_a_revocation_committed_after_a_decision_means_the_request_is_deci
             row = db.read(lambda conn: conn.execute("SELECT cancel_reason FROM runs WHERE kind = 'turn'").fetchone())
             return row is None or row[0] == "revoked"
 
-        def check_then_revoke(self, request_, scope):
-            decided = real_check(self, request_, scope)
+        def check_then_revoke(self, request_, scope, *args):
+            decided = real_check(self, request_, scope, *args)
             if scope.project_id == project and "revoked" not in order:  # the turn's call, decided and allowed
                 asyncio.run_coroutine_threadsafe(request(), loop)
                 deadline = time.monotonic() + 1
@@ -497,8 +497,8 @@ async def test_a_revocation_elsewhere_in_the_project_has_the_request_decided_aga
         loop = asyncio.get_running_loop()
         real_check = outbound_gate.OutboundGate._check
 
-        def check_then_delete_other(self, request_, scope):
-            decided = real_check(self, request_, scope)
+        def check_then_delete_other(self, request_, scope, *args):
+            decided = real_check(self, request_, scope, *args)
             if scope.project_id == project and "revoked" not in order:
                 asyncio.run_coroutine_threadsafe(client.delete(f"/api/conversations/{other}"), loop).result(timeout=2)
             return decided
@@ -529,3 +529,105 @@ async def test_revocations_and_dispatches_never_wait_for_each_others_workers(tmp
         done = await asyncio.wait_for(asyncio.gather(*work), timeout=10)
         assert done[0][-1]["status"] == "succeeded"
         await background_idle(client)
+
+
+async def test_a_deletion_orders_the_requests_of_whatever_project_its_records_belong_to(tmp_path, monkeypatch):
+    # The conversation being deleted moves from project A to project B after the deletion began,
+    # a turn in B is decided before the deletion commits, and this process hears of the deletion
+    # only later: the request never enters the transport after the deletion.
+    import contextlib
+    import threading
+    from backend import outbound_gate
+    from backend.db import deletion
+    from backend.runs import Harness
+    order = []
+    provider = MockProvider()
+    async with started(tmp_path / "data", recording(monkeypatch, provider, order)) as client:
+        a, b = await new_project(client), await new_project(client)
+        conversation = await new_conversation(client, a)
+        loop, db, gate = asyncio.get_running_loop(), client.state["db"], client.state["gate"]
+        real_check, decided, sent = outbound_gate.OutboundGate._check, threading.Event(), {}
+
+        def gone():
+            return db.read(lambda conn: conn.execute("SELECT count(*) FROM conversations WHERE id = ?",
+                                                     (conversation,)).fetchone()) == (0,)
+
+        @contextlib.contextmanager
+        def barrier_then_move(*args):
+            with gate.revoking_from_thread(*args):
+                async def move_and_send():
+                    await client.post(f"/api/conversations/{conversation}/move", json={"project_id": b})
+                    sent["stream"] = asyncio.ensure_future(client.post(
+                        f"/api/conversations/{conversation}/message/stream", json={"content": "hi"}))
+                asyncio.run_coroutine_threadsafe(move_and_send(), loop).result(timeout=2)
+                decided.wait(1)  # B's request decided before the deletion writes, when it may be
+                yield
+
+        def check_then_wait(self, request_, scope, *args):
+            found = real_check(self, request_, scope, *args)
+            if scope.project_id == b:
+                decided.set()
+                deadline = time.monotonic() + 1
+                while not gone() and time.monotonic() < deadline:  # the deletion commits meanwhile
+                    time.sleep(0.01)
+            return found
+
+        real_harness_revoke = Harness.revoke
+        monkeypatch.setitem(deletion.REVOKING, db, barrier_then_move)
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_wait)
+        monkeypatch.setattr(Harness, "revoke", lambda self, ids: loop.call_later(0.3, real_harness_revoke, self, ids))
+        assert (await client.delete(f"/api/conversations/{conversation}")).status_code == 200
+        await sent["stream"]
+        await asyncio.sleep(0.4)
+        await background_idle(client)
+        assert "revoked" in order and "entered" not in order[order.index("revoked"):]
+        assert provider.chats == []
+
+
+@pytest.mark.parametrize("change", ["withdraw", "disable"])
+async def test_a_route_taken_away_between_a_decision_and_entry_means_the_request_is_decided_again(
+        tmp_path, monkeypatch, change):
+    # A declaration withdrawn, or the allowlist entry turned off, after a Private project's request
+    # was decided and before it entered the transport: it is decided again, and refused.
+    from backend import outbound_gate, openrouter_client
+    openrouter_client.clear_cache()
+    order = []
+    provider = MockProvider(catalog=["example/zdr-model"], zero_retention=["example/zdr-model"])
+    async with started(tmp_path / "data", recording(monkeypatch, provider, order)) as client:
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+            "providers.local.kind": "openai-compatible", "providers.local.base_url": LOCAL,
+            "providers.local.models": "all", "providers.openrouter.models": "all"}})
+        await client.put("/api/keys/local", json={"key": "local"})
+        assert (await declare(client, "local")).status_code == 200
+        assert (await confirm_key(client)).status_code == 200
+        project = await new_project(client, "private")
+        conversation = await new_conversation(client, project)
+        loop, db = asyncio.get_running_loop(), client.state["db"]
+        real_check = outbound_gate.OutboundGate._check
+        take_away = {
+            "withdraw": (lambda: client.delete("/api/local-declarations/local"),
+                         lambda conn: conn.execute("SELECT count(*) FROM local_declarations").fetchone() == (0,)),
+            "disable": (lambda: client.put("/api/private-routes/openrouter:*", json={"enabled": False}),
+                        lambda conn: conn.execute("SELECT count(*) FROM private_routes").fetchone() == (1,)),
+        }[change]
+
+        def check_then_take_away(self, request_, scope, *args):
+            found = real_check(self, request_, scope, *args)
+            if scope.project_id == project and "taken away" not in order:
+                asyncio.run_coroutine_threadsafe(take_away[0](), loop)
+                deadline = time.monotonic() + 1
+                while not db.read(take_away[1]) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                order.append("taken away")
+            return found
+
+        monkeypatch.setattr(outbound_gate.OutboundGate, "_check", check_then_take_away)
+        route = {"model": "llama", "provider": "local"} if change == "withdraw" else {"model": "example/zdr-model"}
+        stream = await send(client, conversation, **route)
+        await background_idle(client)
+        assert order[0] == "taken away" and "entered" not in order and provider.chats == []
+        reasons = await rows(client, "SELECT data ->> 'decision', data ->> 'reason' FROM audit_log"
+                                     " WHERE event = 'outbound' AND project_id = ? ORDER BY seq", project)
+        assert reasons == [("allow", None), ("deny", "not_declared" if change == "withdraw" else "route_not_allowed")]
+        assert stream[-1]["status"] == "failed"

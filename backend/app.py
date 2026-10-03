@@ -797,7 +797,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             found = providers.configured(data_dir, include_off=True).get(provider)
             if found is None:
                 raise ApiError(404, "unknown_provider", "That provider is not set up")
-            if not await _to_end(write(lambda conn: governance.withdraw(conn, found.name, found.base_url))):
+            # Every project's requests that could use the server are ordered with the withdrawal.
+            async with state["gate"].revoking(None):
+                withdrawn = await _to_end(write(lambda conn: governance.withdraw(conn, found.name, found.base_url)))
+            if not withdrawn:
                 raise ApiError(404, "not_found", "That server is not declared")
         return {"ok": True}
 
@@ -834,7 +837,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             governance.record(conn, "private_route_changed", route=key, enabled=body.enabled,
                               rechecked=body.rechecked)
 
-        await write(change)
+        async with state["gate"].revoking(None):  # every Private project's requests are ordered with it
+            await write(change)
         return await private_routes()
 
     @app.get("/api/audit")

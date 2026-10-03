@@ -23,8 +23,9 @@ import weakref
 log = logging.getLogger(__name__)
 
 # The outbound gate open over a database, if any, by database: delete() marks its write with the
-# gate's revoking_from_thread, for the project of what it deletes, so that no request of that
-# project enters the transport after the deletion commits (slice-1 spec section 10).
+# gate's revoking_from_thread, so that no request enters the transport after the deletion commits
+# (slice-1 spec section 10). It marks every project: what it deletes may belong, by the time it
+# commits, to another project than one read beforehand (a conversation moved meanwhile, say).
 REVOKING = weakref.WeakKeyDictionary()
 
 # What can be deleted: kind -> (table, column holding the tombstone's title).
@@ -159,8 +160,7 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
     if kind not in KINDS:
         raise ValueError(f"cannot delete a {kind!r}")
     barrier = REVOKING.get(db)
-    project_id = db.read(lambda conn: _project_of(conn, kind, object_id)) if barrier else None
-    with barrier(project_id) if barrier else contextlib.nullcontext():
+    with barrier(None) if barrier else contextlib.nullcontext():  # None: every project (see REVOKING)
         revoked = db.write(lambda conn: _delete(conn, kind, object_id, remove_all_trace))
     if on_committed is not None:
         on_committed(revoked)
@@ -177,15 +177,6 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
     except Exception as error:
         log.warning("WAL truncation after a deletion failed (%s)", type(error).__name__)
     return revoked
-
-
-def _project_of(conn, kind, object_id):
-    """The project whose runs deleting the object may revoke; None (any project) for a personal
-    memory record, or an object that does not exist."""
-    table, _ = KINDS[kind]
-    row = conn.execute(f"SELECT {'id' if kind == 'project' else 'project_id'} FROM {table} WHERE id = ?",
-                       (object_id,)).fetchone()
-    return row[0] if row else None
 
 
 def _delete(conn, kind, object_id, remove_all_trace):

@@ -1659,3 +1659,86 @@ def test_the_dispatch_check_covers_a_same_origin_redirect_hop(db, remote, setup)
         refused(client, "POST", CHAT, "revoked", json=chat(), headers=AUTH)
     assert [str(r.url) for r in remote.received] == [CHAT]
     assert decisions(db) == [("allow", None), ("deny", "revoked")]
+
+
+def test_a_redirect_hop_decided_again_after_a_revocation_keeps_its_one_time_authorization(db, remote, setup,
+                                                                                           monkeypatch):
+    # An unrelated revocation in the project begins while the hop is decided: the hop is decided
+    # again, and its redirect token, spent once by the first decision, still authorizes it.
+    project_id = project(db)
+    remote.redirects[OA_LINK] = (302, "/files/moved.pdf")
+    candidate_id = candidate(db, project_id)
+    real, revoked = OutboundGate._check, []
+
+    def check_then_revoke(self, request, scope, *args):
+        found = real(self, request, scope, *args)
+        if request.url.path == "/files/moved.pdf" and not revoked:
+            revoked.append(True)
+            with self.revoking_from_thread(project_id):  # e.g. another conversation of it deleted
+                pass
+        return found
+
+    monkeypatch.setattr(OutboundGate, "_check", check_then_revoke)
+
+    async def fetch():
+        async with setup.gate.async_client(project_id, candidate_id=candidate_id, follow_redirects=True) as client:
+            return await client.get(OA_LINK)
+
+    assert asyncio.run(fetch()).status_code == 200
+    assert [str(r.url) for r in remote.received] == [OA_LINK, "https://repository.example.org/files/moved.pdf"]
+    assert decisions(db) == [("allow", None), ("allow", None), ("allow", None)]  # the hop, decided twice
+
+
+def test_a_deletion_does_not_wait_for_a_loop_that_stopped(db):
+    # A deletion in a thread marks itself on the gate's loop; once that loop is no longer running
+    # (here it stops just after the deletion looked), nothing can dispatch on it, and the deletion
+    # goes on without the mark instead of waiting for ever.
+    loop = asyncio.new_event_loop()
+    answers = iter([True])
+    loop.is_running = lambda: next(answers, False)  # running when looked at, stopped right after
+    gate = OutboundGate(db, GateInputs)
+    gate._loop = loop
+    project_id = project(db)
+    finished = []
+    worker = threading.Thread(target=lambda: finished.append(delete(db, ContentStore(db), "project", project_id)),
+                              daemon=True)
+    worker.start()
+    worker.join(5)
+    loop.close()
+    assert finished == [[]] and gate._under_way == {}
+
+
+def test_a_deletion_goes_on_without_a_mark_once_the_gates_loop_has_closed(db):
+    async def make():
+        return OutboundGate(db, GateInputs)
+
+    gate = asyncio.run(make())  # its loop, closed once this returns
+    project_id = project(db)
+    assert delete(db, ContentStore(db), "project", project_id) == []
+    assert gate._under_way == {}
+
+
+def test_a_deletion_is_refused_when_a_running_loop_never_marks_it(db, monkeypatch):
+    from backend import outbound_gate
+    monkeypatch.setattr(outbound_gate, "MARK_SECONDS", 0.2)
+    loop = asyncio.new_event_loop()
+    loop.is_running = lambda: True  # running, but it never gets to the mark
+    gate = OutboundGate(db, GateInputs)
+    gate._loop = loop
+    project_id = project(db)
+    errors = []
+
+    def deleting():
+        try:
+            delete(db, ContentStore(db), "project", project_id)
+        except RuntimeError as error:
+            errors.append(str(error))
+
+    worker = threading.Thread(target=deleting, daemon=True)
+    worker.start()
+    worker.join(5)  # bounded: refused, not waiting for ever
+    del loop.is_running
+    loop.close()
+    assert errors == ["the event loop did not mark a revocation"]
+    assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects WHERE id = ?", (project_id,)).fetchone()) == (1,)
+    assert gate._under_way == {}
