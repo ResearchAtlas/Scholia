@@ -22,6 +22,8 @@ DISTRIBUTIONS = [
     "typing-inspection", "typing_extensions", "anyio", "sniffio", "idna", "uvicorn", "h11", "click",
     "python-multipart", "httpx", "httpcore", "certifi", "tomlkit", "keyring", "jaraco.classes",
     "jaraco.context", "jaraco.functools", "more-itertools", "platformdirs",
+    # Encrypted backups and exports
+    "pyzipper", "pycryptodomex",
     # The window
     "pywebview", "bottle", "proxy_tools", "pyobjc-framework-WebKit", "pyobjc-framework-UniformTypeIdentifiers",
 ]

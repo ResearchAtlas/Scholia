@@ -11,6 +11,8 @@ import { projectName } from '../projects.js';
 import { BUDGET_SUGGESTIONS, loadModels, useInstructions, useSettingsFile, utf8Bytes, valueAt } from '../settings.js';
 import { CommitField, Field, FileProblems, LoadState, Restore, Section, Segmented } from './fields.jsx';
 import { Providers } from './Providers.jsx';
+import { BackupsSection } from './Backups.jsx';
+import { ProjectExportSection } from './ProjectExport.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
@@ -318,6 +320,9 @@ function ThisProject({ project, onProjectChanged }) {
       <Section title={t('settings.projectLimits')} hint={t('settings.projectLimitsHint')}>
         <LimitFields file={own} inherited={personal.values.limits} onProblem={setProblem} prefix="project-limit" />
       </Section>
+      <Section title={t('export.title')} hint={t('export.hint')}>
+        <ProjectExportSection project={project} />
+      </Section>
     </div>
   );
 }
@@ -384,6 +389,9 @@ function Advanced({ health }) {
       </Section>
       <Section title={t('settings.localServers')} hint={t('settings.localServersHint')} />
       <BackgroundRuns />
+      <Section title={t('settings.backups')}>
+        <BackupsSection />
+      </Section>
       <Section title={t('settings.dataFolder')} hint={t('settings.dataFolderHint')}>
         <p className="break-all rounded-md bg-muted px-3 py-2 font-mono text-xs">{health.data_folder}</p>
       </Section>

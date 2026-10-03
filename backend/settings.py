@@ -573,6 +573,30 @@ def load_settings(data_root, project_id=None):
     return settings
 
 
+def known_only(raw, personal=False):
+    """A config.toml's bytes (the personal one, or a project's) with only the settings the app
+    knows: each key its schema defines, holding a valid value, written anew without comments.
+    Unknown keys, the open sections whose shape is not defined yet, and comments are left out, so
+    nothing typed in by hand leaves with it, a key under an ordinary name or in a comment
+    included. For settings files that leave the data folder (full backups, exports). None when
+    the bytes are not valid TOML in UTF-8."""
+    schema = PERSONAL if personal else PROJECT
+    try:
+        leaves = list(_leaves(tomlkit.parse(raw.decode("utf-8")).unwrap()))
+    except (UnicodeDecodeError, tomlkit.exceptions.ParseError, RecursionError):
+        return None
+    kept = {}
+    for path, value in leaves:
+        pattern, _ = _match(schema, path)
+        if pattern not in schema or schema[pattern][1] is None or _check(schema, path, value)[1] is not None:
+            continue
+        node = kept
+        for part in path[:-1]:
+            node = node.setdefault(part, {})
+        node[path[-1]] = value
+    return tomlkit.dumps(kept).encode("utf-8")
+
+
 INSTRUCTIONS_CAP = 32 * 1024  # bytes of UTF-8, personal and project combined
 
 

@@ -252,70 +252,110 @@ def frontend_folder() -> Path:
 
 
 def run(data_dir, open_window, *, keyring_backend=None, transport=None, listening=lambda sock: None) -> int:
-    """Run the app on data_dir until open_window(url) returns (the window closed). url
-    carries this launch's session in its fragment (see local_guard).
+    """Run the app until open_window(url) returns (the window closed). url carries this
+    launch's session in its fragment (see local_guard). data_dir is the default data
+    folder, which may record that the researcher chose another (see data_folder).
 
-    Returns 0, or 1 when another instance holds the data folder. The keyword
-    arguments are for tests: a credential store, a transport for outbound requests,
-    and a hook given the listening socket.
+    A data folder Scholia will not open (synced, on a network, unsafe, or a chosen one
+    that is not there, holds another application's or a newer version's database, or
+    holds one that could not be checked) is not touched: the window shows why, through
+    data_folder's limited app, and the researcher can choose another place for the next
+    launch. The default folder's
+    database is checked as it opens, as before (a newer one is refused).
+
+    Returns 0, or 1 when the data folder was not opened (another instance holds it, or
+    it was refused). The keyword arguments are for tests: a credential store, a
+    transport for outbound requests, and a hook given the listening socket.
     """
+    from backend import data_folder
+
+    default = Path(data_dir)
     try:
+        data_dir = data_folder.located(default)
+        problem = data_folder.synced(data_dir)
+        if problem:
+            return _serve_limited(default, data_dir, "synced", problem, open_window, listening)
+        if data_dir != default and not data_dir.is_dir():  # a disk that is not connected: never made anew
+            return _serve_limited(default, data_dir, "missing", "the folder is not there", open_window, listening)
+        held = data_folder.database_problem(data_dir) if data_dir != default else None
+        if held:  # before the lock: nothing is written there
+            return _serve_limited(default, data_dir, *held, open_window, listening)
         lock = take_lock(data_dir)
-    except UnsafeDataFolderError as error:  # ponytail: said on stderr; S1-12's data-folder screen explains it
-        print(f"Scholia: {error}", file=sys.stderr)
-        return 1
+    except UnsafeDataFolderError as error:
+        return _serve_limited(default, data_dir, "unsafe", str(error), open_window, listening)
     if lock is None:
         open_window(None)  # shows that the app is already open
         return 1
     try:
         narrow_tree(data_dir)
-        return _serve(Path(data_dir), open_window, keyring_backend, transport, listening)
-    except UnsafeDataFolderError as error:  # ponytail: said on stderr; S1-12's data-folder screen explains it
-        print(f"Scholia: {error}", file=sys.stderr)
-        return 1
+    except UnsafeDataFolderError as error:
+        os.close(lock)
+        return _serve_limited(default, data_dir, "unsafe", str(error), open_window, listening)
+    try:
+        return _serve(data_dir, open_window, keyring_backend, transport, listening)
     finally:
         os.close(lock)
 
 
 def _serve(data_dir, open_window, keyring_backend, transport, listening):
-    import uvicorn
-
     from backend import logs
     from backend.app import create_app
     from backend.settings import write_private
 
+    def app_for(origin, session):
+        write_private(data_dir / SESSION_FILE, json.dumps({"origin": origin, "session": session}).encode())
+        return create_app(data_dir, origin=origin, session=session, frontend_dir=frontend_folder(),
+                          keyring_backend=keyring_backend, transport=transport)
+
     handler = logs.configure(data_dir)
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", 0))
-        sock.listen(64)
-        listening(sock)
-        origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
-        session = secrets.token_urlsafe(32)  # this launch's: the window and this account's native clients
-        write_private(data_dir / SESSION_FILE, json.dumps({"origin": origin, "session": session}).encode())
-        app = create_app(data_dir, origin=origin, session=session, frontend_dir=frontend_folder(),
-                         keyring_backend=keyring_backend, transport=transport)
-        server = uvicorn.Server(uvicorn.Config(
-            app, lifespan="on", loop="asyncio", http="h11", ws="none", log_config=None, access_log=False,
-            timeout_graceful_shutdown=5))
-        loop = {}
-        thread = threading.Thread(target=_run_server, args=(server, sock, loop), name="scholia-server", daemon=True)
-        thread.start()
-        if not _wait_started(server, thread, app.app.state.scholia):
-            log.error("the backend did not start")
-            server.should_exit = True
-            thread.join(STOP_SECONDS)
-            return 1
-        try:
-            open_window(f"{origin}/#session={session}")  # a fragment never reaches a server
-        finally:
-            _stop(app, server, thread, loop)
-        return 0
+        return _run_app(app_for, open_window, listening)
     finally:
         with contextlib.suppress(FileNotFoundError):  # this launch's session ends with it
             os.unlink(data_dir / SESSION_FILE)
         logging.getLogger().removeHandler(handler)
         handler.close()
+
+
+def _serve_limited(default, data_dir, problem, reason, open_window, listening):
+    """Show why the data folder was not opened, writing nothing there (no log, no session file).
+    Returns 1."""
+    from backend.data_folder import limited_app
+
+    print(f"Scholia: {reason}", file=sys.stderr)
+    _run_app(lambda origin, session: limited_app(default, data_dir, problem, reason, origin=origin, session=session,
+                                                 frontend_dir=frontend_folder()), open_window, listening)
+    return 1
+
+
+def _run_app(app_for, open_window, listening):
+    """Serve app_for(origin, session) on a loopback port, open the window on it, and stop
+    the server once the window closes. Returns 0, or 1 when the server did not start."""
+    import uvicorn
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(64)
+    listening(sock)
+    origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    session = secrets.token_urlsafe(32)  # this launch's: the window and this account's native clients
+    app = app_for(origin, session)
+    server = uvicorn.Server(uvicorn.Config(
+        app, lifespan="on", loop="asyncio", http="h11", ws="none", log_config=None, access_log=False,
+        timeout_graceful_shutdown=5))
+    loop = {}
+    thread = threading.Thread(target=_run_server, args=(server, sock, loop), name="scholia-server", daemon=True)
+    thread.start()
+    if not _wait_started(server, thread, app.app.state.scholia):
+        log.error("the backend did not start")
+        server.should_exit = True
+        thread.join(STOP_SECONDS)
+        return 1
+    try:
+        open_window(f"{origin}/#session={session}")  # a fragment never reaches a server
+    finally:
+        _stop(app, server, thread, loop)
+    return 0
 
 
 def _run_server(server, sock, loop):
@@ -359,13 +399,26 @@ def _stop(app, server, thread, loop):
         log.warning("the backend did not stop within %s s; the process exits anyway", STOP_SECONDS)
 
 
+class WindowApi:
+    """What the interface may ask of the window (pywebview's js_api, as window.pywebview.api):
+    only to choose a folder, for a full backup, an export or the data folder. A browser has no
+    such bridge; there the interface takes a typed path."""
+
+    def choose_folder(self):
+        """The folder the researcher picked in the system's dialog, or None if cancelled."""
+        import webview
+
+        chosen = webview.windows[0].create_file_dialog(webview.FileDialog.FOLDER)
+        return chosen[0] if chosen else None
+
+
 def _webview_window(url):
     import webview  # the window's own network use is loading this app's pages
 
     if url is None:
         webview.create_window(APP_NAME, html=ALREADY_OPEN, width=420, height=200)
     else:
-        webview.create_window(APP_NAME, url, width=1280, height=820, min_size=(720, 520))
+        webview.create_window(APP_NAME, url, width=1280, height=820, min_size=(720, 520), js_api=WindowApi())
     webview.start()
 
 

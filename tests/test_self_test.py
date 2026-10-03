@@ -34,6 +34,18 @@ def test_the_interface_check_serves_the_page_and_what_it_names(tmp_path):
         st.check_interface(tmp_path / "missing")
 
 
+def test_the_encrypted_zip_check_writes_and_reads_back_an_aes_zip():
+    assert st.check_encrypted_zip() == {"aes": True}
+
+
+def test_the_encrypted_zip_check_fails_on_a_zip_that_is_not_encrypted(monkeypatch):
+    from backend import backups
+    real = backups._write_zip
+    monkeypatch.setattr(backups, "_write_zip", lambda *args, **options: real(*args[:3], None, **options))
+    with pytest.raises(RuntimeError, match="not AES-encrypted"):
+        st.check_encrypted_zip()
+
+
 def test_sqlite_checks_refuse_a_version_before_secure_delete(monkeypatch):
     monkeypatch.setattr(st, "MIN_SQLITE", (99, 0, 0))
     with pytest.raises(RuntimeError, match="older than 3.42"):
@@ -129,7 +141,8 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
         calls.append("embedding")
         raise RuntimeError("no helper")
 
-    for name in ("check_sqlite", "check_index", "check_backend", "check_interface", "check_ocr"):
+    for name in ("check_sqlite", "check_index", "check_backend", "check_interface", "check_encrypted_zip",
+                 "check_ocr"):
         monkeypatch.setattr(st, name, passing(name))
     monkeypatch.setattr(st, "check_embedding", failing)
     argv = ["--self-test", "--model", str(tmp_path / "m.gguf")]
@@ -138,7 +151,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
     assert result["ok"] is False
     assert result["checks"]["embedding"] == {"ok": False, "error": "RuntimeError: no helper"}
     assert result["checks"]["ocr"] == {"ok": True}
-    assert len(calls) == 6
+    assert len(calls) == 7
     monkeypatch.setattr(st, "check_embedding", passing("embedding"))
     assert st.main(argv) == 0
 

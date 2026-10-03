@@ -790,3 +790,19 @@ def test_a_provider_base_url_is_https_or_plain_http_only_to_this_machine(tmp_pat
     else:
         with pytest.raises(ValueError, match="providers.local.base_url"):
             personal.save({"providers.local.kind": "openai-compatible", "providers.local.base_url": url})
+
+
+def test_settings_that_leave_the_data_folder_keep_only_what_the_app_knows():
+    from backend.settings import known_only
+    personal = (b'# a key in a comment: sk-or-in-a-comment\n[ui]\nlanguage = "en"  # trailing note\n'
+                b'[providers."my lab"]\nkind = "openai-compatible"\nbase_url = "https://lab.example/v1"\n'
+                b'api_key = "sk-or-named"\n[misc]\nopenrouter = "sk-or-ordinary-name"\n'
+                b'[zotero]\nlibrary = "open section"\n[budget]\nconversation_usd = -1\n')
+    kept = tomlkit.parse(known_only(personal, personal=True).decode()).unwrap()
+    assert kept == {"ui": {"language": "en"},
+                    "providers": {"my lab": {"kind": "openai-compatible", "base_url": "https://lab.example/v1"}}}
+    assert b"#" not in known_only(personal, personal=True)
+    project = b'[project]\ncitation_style = "apa7"\n[ui]\nlanguage = "en"\npanel = "library"\n'
+    assert tomlkit.parse(known_only(project).decode()).unwrap() == {
+        "project": {"citation_style": "apa7"}, "ui": {"panel": "library"}}  # a personal setting is not a project's
+    assert known_only(b"not = = toml") is None and known_only(b"\xff") is None

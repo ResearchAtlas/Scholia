@@ -27,7 +27,8 @@ from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
-from backend.db import ContentStore, Database, delete, new_id, utc_now
+from backend import backups
+from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
 from backend.runs import AdmissionError, Harness, _through, derived_status
@@ -230,38 +231,75 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 state["maintenance_seconds"] = state.get("maintenance_seconds", 0.0) + time.monotonic() - started
                 del state["maintenance_started"]
 
-    @contextlib.asynccontextmanager
-    async def lifespan(app):
-        # Opening the database (its checks, the backup before a migration, migrations) and the
-        # daily backup are local maintenance: the desktop entry's start deadline does not count
-        # them (see maintenance), since on a large folder they are progress, not a hang.
-        with maintenance():
-            db = await asyncio.to_thread(Database, data_dir)
-        content = ContentStore(db)
+    async def start(db, kick=True):
+        """Run the app on db: its content store, outbound gate and harness, recovered before any
+        request reaches them. A restore calls it again with the database it put in place, with
+        kick false: nothing runs on its own (background runs) until the restore has committed."""
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
-        state.update(db=db, content=content, gate=gate, harness=harness)
+        loop = asyncio.get_running_loop()
+
+        def damaged():  # a backup's full check found it damaged: the app is limited, so its work stops too
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(harness.shutdown()))
+
+        db.on_damage = damaged
         try:
-            await harness.recover()
+            await (harness.recover() if kick else harness.recover(kick=False))
+        except BaseException:
+            await harness.shutdown()
+            raise
+        state.update(db=db, content=ContentStore(db), gate=gate, harness=harness)
+        state.pop("damaged", None)
+        state.pop("damaged_code", None)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app):
+        state.update(data_dir=data_dir, start=start)
+        # Finishing a restore a crash interrupted, opening the database (its checks, the backup
+        # before a migration, migrations) and the daily backup are local maintenance: the desktop
+        # entry's start deadline does not count them (see maintenance), since on a large folder
+        # they are progress, not a hang. Never reset: when the database is damaged, or a restore
+        # can be neither finished nor undone, the app serves health, the backups and restore only
+        # (backups.Gate) until a restore puts a backup in place; the backups router closes what
+        # that opens.
+        db = await backups.open_at_launch(state, maintenance)
+        if db is None:
+            try:
+                yield
+            finally:
+                state.clear()
+            return
+        try:
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
             # The daily backup runs at launch, before the app accepts a request, so the
             # database and the settings files it copies show one state. Backups while the app
             # is open and idle are S1-12's.
             with maintenance():
                 await asyncio.to_thread(_daily_backup, db)
+            # Background runs start only now, once that backup's full check has passed: on a
+            # database it found damaged (the app is then limited) nothing runs on its own.
+            if db.damaged is None:
+                await backups.start_background(state)
             yield
-        finally:
-            await harness.shutdown()
+        finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
+            if state.get("harness") is not None:
+                await state["harness"].shutdown()
             await asyncio.to_thread(db.close)
             state.clear()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown
+    app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
+    app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)
     @app.exception_handler(AdmissionError)
     async def known_error(request, error):
         return _error(error.status, error.code, error.message)
+
+    @app.exception_handler(DatabaseClosedError)
+    async def closed(request, error):  # while the app closes, or a restore swaps the database
+        return _error(503, "database_unavailable", "The database is not open; try again")
 
     @app.exception_handler(RequestValidationError)
     async def invalid(request, error):
@@ -272,10 +310,19 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         codes = {404: "not_found", 405: "method_not_allowed"}
         return _error(error.status_code, codes.get(error.status_code, "http_error"), "The request was not handled")
 
+    def unavailable():
+        if "damaged" in state:  # damaged at startup and not restored yet
+            return ApiError(503, "database_damaged", "The database failed its check; restore a backup")
+        return ApiError(503, "database_unavailable", "The database is not open; try again")  # closing
+
     def db() -> Database:
+        if "db" not in state:
+            raise unavailable()
         return state["db"]
 
     def harness() -> Harness:
+        if "harness" not in state:
+            raise unavailable()
         return state["harness"]
 
     async def read(fn):
@@ -288,7 +335,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir)}
+        why = backups.limited(state)
+        return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir),
+                **({"database_damaged": why[1]} if why else {})}
 
     async def provider_list():
         configured = providers.configured(data_dir, include_off=True)
@@ -559,25 +608,48 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         return project_dict(await project_row(project_id))
 
     @app.delete("/api/projects/{project_id}")
-    async def delete_project(project_id: str):
+    async def delete_project(project_id: str, purge_backups: bool = False, remove_all_trace: bool = False):
+        """purge_backups: "Delete everywhere including backups"; remove_all_trace drops the titles from
+        the tombstones. Otherwise an automatic backup is taken first, as before every bulk deletion."""
         row = await project_row(project_id)
         if row[2] == "general":
             raise ApiError(400, "general_project", "The General project cannot be deleted")
-        async def deleting():  # the record, the stopping of its runs and its folder, to their end
-            revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id,
-                                              on_committed=revoke_soon())
-            harness().revoke(revoked)
-            return await asyncio.to_thread(_remove_folder, data_dir / "projects" / project_id)
-
-        async with project_files:
+        if not purge_backups:  # outside the project-files lock, which it would hold for its whole copy
             try:
-                removed = await _to_end(deleting())
-            except LookupError:  # deleted meanwhile by another request
-                raise ApiError(404, "not_found", "No such project") from None
-        if not removed:  # the record is gone; its tombstone makes the next launch retry the files
-            log.warning("a deleted project's folder could not be removed fully; it is retried at the next launch")
-            return {"ok": True, "files_left": True}
-        return {"ok": True}
+                async with state["backups_lock"]:  # as every backup: never under a restore staging one
+                    await _finished(backups.backup_before_deletion, db())
+            except Exception as error:
+                log.warning("the backup before a project deletion failed (%s)", type(error).__name__)
+                raise ApiError(503, "backup_failed", "The backup before the deletion failed; nothing was deleted")
+
+        async def deleting():  # the record, the stopping of its runs, its folder and the purge, to their end
+            async with project_files:
+                revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id,
+                                                  remove_all_trace=remove_all_trace, on_committed=revoke_soon())
+                harness().revoke(revoked)
+                removed = await asyncio.to_thread(_remove_folder, data_dir / "projects" / project_id)
+            result = {"ok": True}
+            if not removed:  # the record is gone; its tombstone makes the next launch retry the files
+                log.warning("a deleted project's folder could not be removed fully; it is retried at the next launch")
+                result["files_left"] = True
+            if purge_backups:  # after the folder is gone, so the fresh backup holds none of it
+                result.update(await purge(project_id, {"kind": "project", "object_id": project_id}))
+            return result
+
+        try:
+            return await _to_end(deleting())  # a cancelled request still purges: its object is gone for good
+        except LookupError:  # deleted meanwhile by another request
+            raise ApiError(404, "not_found", "No such project") from None
+
+    async def purge(project_id, deleted):
+        """Take deleted data out of the automatic backups; a failure leaves the deletion as it is. It
+        waits for a restore, full backup or export in progress, so none of them meets it halfway."""
+        try:
+            async with state["backups_lock"]:
+                return await _finished(backups.purge, db(), project_id, deleted)
+        except Exception as error:
+            log.warning("purging the backups after a deletion failed (%s)", type(error).__name__)
+            return {"purge_failed": True}
 
     # Conversations
 
@@ -691,17 +763,22 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         return await get_conversation(conversation_id)
 
     @app.delete("/api/conversations/{conversation_id}")
-    async def delete_conversation(conversation_id: str):
-        async def deleting():  # the deletion and the stopping of its runs, together, to their end
+    async def delete_conversation(conversation_id: str, purge_backups: bool = False, remove_all_trace: bool = False):
+        project = await read(lambda conn: conn.execute(
+            "SELECT project_id FROM conversations WHERE id = ?", (conversation_id,)).fetchone())
+
+        async def deleting():  # the deletion, the stopping of its runs and the purge, together, to their end
             revoked = await asyncio.to_thread(delete, db(), state["content"], "conversation", conversation_id,
-                                              on_committed=revoke_soon())
+                                              remove_all_trace=remove_all_trace, on_committed=revoke_soon())
             harness().revoke(revoked)
+            if purge_backups:
+                return {"ok": True, **await purge(project[0], {"kind": "conversation", "object_id": conversation_id})}
+            return {"ok": True}
 
         try:
-            await _to_end(deleting())
+            return await _to_end(deleting())  # a cancelled request still purges: its object is gone for good
         except LookupError:
             raise ApiError(404, "not_found", "No such conversation") from None
-        return {"ok": True}
 
     # Turns and runs
 

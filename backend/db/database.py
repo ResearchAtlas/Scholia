@@ -5,12 +5,14 @@ asyncio event loop; async code uses asyncio.to_thread.
 """
 
 import asyncio
+import errno
 import fcntl
 import json
 import logging
 import os
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -28,9 +30,13 @@ DB_NAME = "scholia.sqlite3"
 APPLICATION_ID = 0x5343484C  # "SCHL", written by migration 0001
 DAILY_KEPT = 7
 WEEKLY_KEPT = 4
+KINDS = ("daily", "weekly")  # the automatic backups, by folder under backups/
 SETTINGS_FILES = ("config.toml", "AGENTS.md")  # copied into each backup: personal and per project
 _STAMP = "%Y%m%dT%H%M%S%fZ"  # backup generation folder names, oldest sorts first
 BUSY_TIMEOUT_MS = 5000  # how long a connection waits for another's lock
+COPY_ATTEMPTS = 3  # a copy that settings or projects changed under is taken again, at most this often in all
+STOP_SECONDS = 3  # how long closing waits for a running backup to stop
+_PROGRESS_STEPS = 1000  # SQLite instructions between checks for a stop
 
 _PRAGMAS = (
     "foreign_keys = ON",
@@ -61,6 +67,10 @@ class DatabaseDamagedError(RuntimeError):
     """An integrity check failed. Writing stops and the file is left as it is."""
 
 
+class BackupBusyError(RuntimeError):
+    """Settings or projects changed under every attempt to copy them with the database. Nothing was kept."""
+
+
 def new_id() -> str:
     return str(uuid.uuid4())
 
@@ -84,10 +94,12 @@ class Database:
         self.path = self.data_dir / DB_NAME
         self.backups_dir = self.data_dir / "backups"
         self._damaged = None  # why writing stopped, once an integrity check fails
+        self.on_damage = None  # called once, from the thread whose check found the database damaged
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
         self._closed = False  # set when close() starts, under _readers_lock; later reads and writes are refused
+        self._held = False  # set by hold_writes(), under _readers_lock: later writes are refused
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
@@ -123,11 +135,28 @@ class Database:
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("write() cannot be called from inside a write")
-        with self._readers_lock:  # admitted and queued in one step, so never queued behind close()
-            if self._closed:
+        with self._readers_lock:  # admitted and queued in one step, so never queued behind close() or a hold
+            if self._closed or self._held:
                 raise DatabaseClosedError("the database is closed")
             future = self._writer.submit(self._transaction, fn)
         return future.result()
+
+    def hold_writes(self):
+        """Refuse every write from now on (DatabaseClosedError) and wait for those already queued
+        to commit, whatever thread queued them: after it, nothing commits until release_writes().
+        A restore holds them from its safety copy until the database closes."""
+        _refuse_event_loop()
+        with self._readers_lock:
+            if self._closed:
+                raise DatabaseClosedError("the database is closed")
+            self._held = True
+        self._writer.submit(lambda: None).result()  # the single writer runs in order: every earlier write is done
+
+    def release_writes(self):
+        """Admit writes again after hold_writes()."""
+        _refuse_event_loop()
+        with self._readers_lock:
+            self._held = False
 
     def read(self, fn):
         """Run fn(conn) in one read transaction on this thread's read-only connection."""
@@ -154,20 +183,36 @@ class Database:
                 self._reads -= 1
                 self._reads_done.notify_all()
 
+    @property
+    def closed(self):
+        """Whether close() has started. A backup in progress stops at its next check."""
+        return self._closed
+
+    @property
+    def damaged(self):
+        """Why writing stopped (a failed integrity check), or None."""
+        return self._damaged
+
     def backup(self, now=None):
         """Check the database, write a backup generation and rotate old ones.
 
         A generation holds a copy of the database, backup.json (app, schema and
         SQLite versions) and the settings files that exist (SETTINGS_FILES, at
-        the top of the data folder and in each projects/<id>/ folder).
+        the top of the data folder and in the projects/<id>/ folder of each
+        project in the copy), as one state of the data folder even while the app
+        changes it (see _copy).
 
         now, an aware UTC datetime, names the generation and defaults to the
         current time. Returns the new generation's folder. A failed integrity
-        check stops all later writes and raises DatabaseDamagedError.
+        check stops all later writes and raises DatabaseDamagedError. Closing
+        stops a backup in progress, which then raises DatabaseClosedError and
+        leaves no generation.
         """
         _refuse_event_loop()
         with self._backup_lock:
-            return self._backup(now or datetime.now(UTC))
+            generation = self._backup(now or datetime.now(UTC))
+        self._retry_truncation()
+        return generation
 
     def backup_if_due(self, now=None):
         """Back up unless the latest backup is less than a day old. Returns the folder or None.
@@ -182,7 +227,41 @@ class Database:
             if latest and timedelta(0) <= now - _stamp_of(latest[0]) < timedelta(days=1):
                 self._apply_retention()
                 return None
-            return self._backup(now)
+            generation = self._backup(now)
+        self._retry_truncation()
+        return generation
+
+    def purge_backups(self, now=None):
+        """Take a fresh backup, then delete every other automatic backup, daily and weekly.
+
+        Data deleted before this call is then in no automatic backup. Older
+        generations are deleted only once the fresh one is published, so a failed
+        backup deletes nothing. Returns (the fresh generation, how many were deleted).
+        """
+        _refuse_event_loop()
+        with self._backup_lock:
+            older = sum(len(_generations(self.backups_dir / kind)) for kind in KINDS)
+            generation = self._backup(now or datetime.now(UTC))  # its rotation may move or remove some of them
+            for old in [old for kind in KINDS for old in _generations(self.backups_dir / kind) if old != generation]:
+                shutil.rmtree(old)
+        self._retry_truncation()
+        return generation, older
+
+    def snapshot(self, target):
+        """Write into target, a new folder, what a backup generation holds, without publishing it.
+
+        Returns backup.json's fields. Used for full backups, which add the content
+        store. Raises as backup() does.
+        """
+        _refuse_event_loop()
+        with self._backup_lock:
+            source = self._checked_source()
+            try:
+                info = self._copy(source, Path(target))
+            finally:
+                source.close()
+        self._retry_truncation()
+        return info
 
     def checkpoint(self):
         """Copy the WAL into the database file and truncate it to zero bytes.
@@ -190,7 +269,9 @@ class Database:
         Deleted content stays in old WAL frames until then. Waits up to the busy
         timeout for readers, and returns False if one still needed the WAL. The
         truncation is then retried, without waiting, after each later write until
-        it succeeds. Refused once writing has stopped.
+        it succeeds. While a backup reads, which can take longer than that, it does
+        not wait, so writes are not held up behind it; the backup retries it when it
+        ends. Refused once writing has stopped.
         """
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
@@ -198,28 +279,34 @@ class Database:
         with self._readers_lock:
             if self._closed:
                 raise DatabaseClosedError("the database is closed")
-            future = self._writer.submit(self._truncate_wal, True)
+            future = self._writer.submit(self._truncate_wal, not self._backup_lock.locked())
         return future.result()
 
     def close(self):
         """Close the database. Reads and writes that start after this are refused
         (DatabaseClosedError); reads in progress finish first, and a write already
         submitted runs before the writer connection closes. So work still running when
-        the app stops gets an error, never a connection closed under it."""
+        the app stops gets an error, never a connection closed under it. A backup in
+        progress is stopped, and waited for up to STOP_SECONDS."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")
         with self._readers_lock:
             if self._closed:  # closed already, or closing in another thread
                 return
-            self._closed = True
+            self._closed = True  # a backup's progress handler and step checks see this and stop
             while self._reads:
                 self._reads_done.wait()
             readers, self._readers = self._readers, []
         for conn in readers:
             conn.close()
+        if self._backup_lock.acquire(timeout=STOP_SECONDS):
+            self._backup_lock.release()
+        else:
+            log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
         self._writer.submit(self._close_writer).result()
         self._writer.shutdown()
+        self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
 
     # Writer thread
 
@@ -306,34 +393,14 @@ class Database:
         _mkdir_private(daily)
         for stale in daily.glob(".*.tmp"):  # left by a crash during an earlier backup
             shutil.rmtree(stale)
-        try:
-            source = _open_checked(self.path, "integrity_check")
-        except DatabaseDamagedError as error:
-            with self._commit_lock:
-                self._damaged = str(error)
-            raise
+        source = self._checked_source()
         try:
             stamp = now.strftime(_STAMP)
             tmp = daily / f".{stamp}.tmp"
-            os.mkdir(tmp, 0o700)
             published = None
             try:
-                copy, info = tmp / DB_NAME, tmp / "backup.json"
-                _create_private(copy)
-                source.execute("VACUUM INTO ?", (str(copy),))
-                try:
-                    check = _open_checked(copy, "quick_check")
-                except DatabaseDamagedError as error:
-                    raise RuntimeError(f"the backup copy failed its check: {error}") from error
-                with closing(check):
-                    schema_version = check.execute("PRAGMA user_version").fetchone()[0]
-                _create_private(info, json.dumps({
-                    "app_version": APP_VERSION,
-                    "schema_version": schema_version,
-                    "sqlite_version": sqlite3.sqlite_version,
-                }).encode())
-                settings = _copy_settings(self.data_dir, tmp)
-                for path in (copy, info, *reversed(settings), tmp):  # files before their folders
+                self._copy(source, tmp)
+                for path in (*sorted(tmp.rglob("*"), key=lambda p: -len(p.parts)), tmp):  # files before their folders
                     _fsync(path)
                 generation = daily / stamp
                 os.rename(tmp, generation)
@@ -347,6 +414,86 @@ class Database:
             source.close()
         self._apply_retention(keep=generation)
         return generation
+
+    def _checked_source(self):
+        """The live database, open read-only after a full integrity check. A failed check stops
+        all later writes (DatabaseDamagedError). Closing stops the check and every statement on it."""
+        try:
+            return _open_checked(self.path, "integrity_check", stop=self._stop_requested)
+        except DatabaseDamagedError as error:
+            with self._commit_lock:
+                first, self._damaged = self._damaged is None, str(error)
+            if first and self.on_damage is not None:
+                try:
+                    self.on_damage()
+                except Exception as failure:  # the check's own answer stands
+                    log.warning("reporting a damaged database failed (%s)", type(failure).__name__)
+            raise
+        except sqlite3.OperationalError:
+            self._raise_if_closed()
+            raise
+
+    def _copy(self, source, target):
+        """Copy the database (VACUUM INTO, then checked) and the settings files into target, a new
+        folder, as one state of the data folder. Returns backup.json's fields, written there too.
+
+        The app may create or delete a project or save a setting meanwhile, without waiting for
+        this. So the settings files copied are the personal ones and those of each project in the
+        copy (never a folder whose record is not committed yet), and the settings files and project
+        folders are checked unchanged from before the database was copied to after the files were:
+        then the files are those of the moment the copy read. Otherwise the copy is taken again, up
+        to COPY_ATTEMPTS in all, and then BackupBusyError. ponytail: retried, not locked out, since
+        such changes are rare; a folder changing faster than the copy takes keeps it from finishing.
+        """
+        os.mkdir(target, 0o700)
+        for _ in range(COPY_ATTEMPTS):
+            before = _file_state(self.data_dir)
+            copy = target / DB_NAME
+            _create_private(copy)
+            try:
+                source.execute("VACUUM INTO ?", (str(copy),))
+                check = _open_checked(copy, "quick_check", stop=self._stop_requested)
+            except DatabaseDamagedError as error:
+                raise RuntimeError(f"the backup copy failed its check: {error}") from error
+            except sqlite3.OperationalError:
+                self._raise_if_closed()
+                raise
+            with closing(check):
+                schema_version = check.execute("PRAGMA user_version").fetchone()[0]
+                has_projects = check.execute("SELECT 1 FROM sqlite_schema WHERE name = 'projects'").fetchone()
+                projects = {project_id for (project_id,) in check.execute("SELECT id FROM projects")} \
+                    if has_projects else set()  # before migration 0001
+            self._raise_if_closed()
+            _copy_settings(self.data_dir, target, projects)
+            if _file_state(self.data_dir) == before:
+                info = {"app_version": APP_VERSION, "schema_version": schema_version,
+                        "sqlite_version": sqlite3.sqlite_version}
+                _create_private(target / "backup.json", json.dumps(info).encode())
+                return info
+            self._raise_if_closed()
+            for entry in target.iterdir():  # changed meanwhile: start again from an empty folder
+                shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+        raise BackupBusyError("settings or projects changed during every attempt to back them up")
+
+    def _stop_requested(self):
+        return self._closed  # a progress handler: nonzero stops the running statement
+
+    def _raise_if_closed(self):
+        if self._closed:
+            raise DatabaseClosedError("the database is closing; the backup stopped")
+
+    def _retry_truncation(self):
+        """Retry a WAL truncation a backup's reading held off (see checkpoint)."""
+        if not self._truncation_pending:
+            return
+        with self._readers_lock:
+            if self._closed:
+                return
+            future = self._writer.submit(self._truncate_wal, False)
+        try:
+            future.result()
+        except Exception as error:  # the next write retries it
+            log.warning("retrying the WAL truncation after a backup failed (%s)", type(error).__name__)
 
     def _apply_retention(self, keep=None):
         """Rotate old generations, never keep. A failure is logged, not raised: the
@@ -395,7 +542,7 @@ def _switch_to_wal(conn):
         time.sleep(0.01)
 
 
-def _open_checked(path, check, latest=None):
+def _open_checked(path, check, latest=None, stop=None):
     """Open path read-only and run PRAGMA check (quick_check or integrity_check).
 
     Returns the open connection. Raises DatabaseDamagedError when the file is
@@ -404,10 +551,14 @@ def _open_checked(path, check, latest=None):
     database, unless it is new and empty, and NewerDatabaseError when
     user_version is above latest; and a database that will be migrated gets
     integrity_check instead of check. Nothing is written to the file or its WAL.
+    stop, if given, is the connection's progress handler: when it returns true,
+    the running statement stops with an "interrupted" OperationalError.
     """
     conn = None
     try:
         conn = _connect(path, readonly=True)
+        if stop is not None:
+            conn.set_progress_handler(stop, _PROGRESS_STEPS)
         if latest is not None:  # the live database at startup
             version, has_schema = _usable_state(conn, latest)
             if has_schema and version < latest:
@@ -419,10 +570,55 @@ def _open_checked(path, check, latest=None):
     except BaseException as error:
         if conn is not None:
             conn.close()
-        # Corrupt or not a database, as opposed to busy, locked or unreadable.
-        if (getattr(error, "sqlite_errorcode", None) or 0) & 0xFF in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+        if _is_damage(error):
             raise DatabaseDamagedError(f"{check} failed: {error}") from error
         raise
+
+
+def _is_damage(error):
+    """Whether an SQLite error says the file is corrupt or not a database, as opposed to busy,
+    locked or unreadable."""
+    return (getattr(error, "sqlite_errorcode", None) or 0) & 0xFF in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB)
+
+
+def check_identity(path, latest=len(MIGRATIONS)):
+    """Check the database file at path as opening it would (see _usable_state), writing nothing
+    beside it: no lock, WAL or shared-memory file is made there. A write-ahead log left beside it
+    (after a crash) is read too, from an owner-only copy of both in a private temporary folder,
+    since it may hold the newest schema.
+    Raises ForeignDatabaseError for another application's file, NewerDatabaseError for a newer
+    schema, DatabaseDamagedError for a file SQLite reads as corrupt or not a database, and OSError
+    when it could not be checked: the file cannot be read, the copy cannot be made, or SQLite
+    failed for another reason (such as an I/O error)."""
+    _refuse_event_loop()
+    path = Path(path).resolve()
+    path.open("rb").close()  # one this account cannot read is not checked, rather than taken for damaged
+    wal = path.with_name(path.name + "-wal")
+    if wal.is_symlink() or not wal.is_file() or not wal.stat().st_size:
+        return _check_identity(path.as_uri() + "?mode=ro&immutable=1", latest)  # immutable: no log is read
+    # ponytail: copies the whole database (only when a crash left a log); link instead if that is too slow
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+        copy = Path(folder) / path.name
+        for source, target in ((path, copy), (wal, copy.with_name(copy.name + "-wal"))):
+            _create_private(target)  # owner-only, as the database it copies; copyfile keeps that mode
+            shutil.copyfile(source, target)
+        return _check_identity(copy.as_uri() + "?mode=ro", latest)
+
+
+def _check_identity(uri, latest):
+    conn = None
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        _usable_state(conn, latest)
+    except (ForeignDatabaseError, NewerDatabaseError):
+        raise
+    except sqlite3.DatabaseError as error:
+        if not _is_damage(error):
+            raise OSError(errno.EIO, "the database could not be checked") from error  # such as an I/O error
+        raise DatabaseDamagedError(f"the file cannot be read as a database: {error}") from error
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _usable_state(conn, latest):
@@ -470,19 +666,40 @@ def _rotate(backups, keep):
         shutil.rmtree(old)
 
 
-def _copy_settings(data_dir, target):
-    """Copy the settings files that exist into target at the same relative paths, owner-only.
-
-    Only SETTINGS_FILES, at the top of the data folder and in each projects/<id>/
-    folder; symbolic links are skipped. Returns the paths created, each folder
-    before the files in it.
-    """
+def _settings_folders(data_dir):
+    """The folders that hold settings files: the data folder, then each projects/<id>/ folder.
+    Symbolic links are skipped."""
     folders = [data_dir]
     projects = data_dir / "projects"
     if projects.is_dir() and not projects.is_symlink():
         folders += sorted(path for path in projects.iterdir() if path.is_dir() and not path.is_symlink())
-    created = []
-    for folder in folders:
+    return folders
+
+
+def _file_state(data_dir):
+    """What a backup copies from outside the database, as it is now: each settings file's identity,
+    size and change times, or None where there is none, in the data folder and every project folder.
+    Any save (a replaced file), project folder made or removed, or edit changes it."""
+    state = {}
+    for folder in _settings_folders(data_dir):
+        for name in SETTINGS_FILES:
+            try:
+                info = os.lstat(folder / name)
+                state[folder / name] = (info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            except FileNotFoundError:
+                state[folder / name] = None
+    return state
+
+
+def _copy_settings(data_dir, target, projects):
+    """Copy the settings files that exist into target at the same relative paths, owner-only.
+
+    Only SETTINGS_FILES, at the top of the data folder and in the projects/<id>/
+    folder of each id in projects; symbolic links are skipped.
+    """
+    for folder in _settings_folders(data_dir):
+        if folder != data_dir and folder.name not in projects:
+            continue  # a project's folder is written before its record, so this one is not committed yet
         for name in SETTINGS_FILES:
             source = folder / name
             if source.is_symlink() or not source.is_file():
@@ -495,10 +712,31 @@ def _copy_settings(data_dir, target):
             for parent in reversed(relative.parents[:-1]):  # e.g. projects, then projects/<id>
                 if not (target / parent).exists():
                     _mkdir_private(target / parent)
-                    created.append(target / parent)
             _create_private(target / relative, content)
-            created.append(target / relative)
-    return created
+
+
+def list_generations(data_dir):
+    """The automatic backups in a data folder, newest first: each one's kind, name, folder, time, app
+    and schema versions (None when its backup.json cannot be read) and size in bytes."""
+    listed = []
+    for kind in KINDS:
+        for folder in _generations(Path(data_dir) / "backups" / kind):
+            try:
+                info = json.loads((folder / "backup.json").read_bytes())
+            except (OSError, ValueError):
+                info = {}
+            info = info if isinstance(info, dict) else {}
+            try:
+                size = sum(path.lstat().st_size for path in folder.rglob("*") if path.is_file())
+            except FileNotFoundError:  # rotated or purged while listed
+                continue
+            listed.append({
+                "kind": kind, "name": folder.name, "folder": folder,
+                "time": _stamp_of(folder).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                "app_version": info.get("app_version"), "schema_version": info.get("schema_version"),
+                "size": size,
+            })
+    return sorted(listed, key=lambda generation: generation["time"], reverse=True)
 
 
 def _generations(folder):

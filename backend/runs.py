@@ -221,9 +221,10 @@ class Harness:
 
     # Startup and shutdown
 
-    async def recover(self) -> None:
-        """Record what a crash left behind, then restart the background runs. Call once
-        at startup, before serving requests."""
+    async def recover(self, kick=True) -> None:
+        """Record what a crash left behind, then restart the background runs (unless kick is
+        false: a restore starts them once it has committed, see kick_background). Call once at
+        startup, before serving requests."""
 
         def record(conn):
             in_flight = {run_id for (run_id,) in conn.execute(
@@ -242,7 +243,8 @@ class Harness:
                     (json.dumps(_accounting(conn, run_id, complete=run_id not in in_flight)), run_id))
 
         await self._write(record)
-        await self.kick_background()
+        if kick:
+            await self.kick_background()
 
     async def shutdown(self, timeout: float = 10.0) -> int:
         """Stop admitting, cancel what is running and wait for it, up to timeout seconds.
@@ -263,13 +265,23 @@ class Harness:
                 log.warning("%d tasks did not stop within %s s of shutdown; closing the database", len(pending), timeout)
         return len(pending)
 
+    async def resume(self) -> None:
+        """Admit again after a shutdown the database outlives (a restore that did not go ahead).
+        Work still running stays this harness's; background runs it stopped start again."""
+        self.registry.closed = False
+        await self.kick_background()
+
     # Cancel
 
     def _request_cancel(self, active: ActiveRun, reason: str) -> None:
         """Cancel a run once; repeating it changes nothing, so a cancellation in progress
-        is never interrupted. A claim whose response never started has run nothing: it is
-        released and recorded at once."""
+        is never interrupted. A background run stopping for a shutdown it would restart after
+        (a refused restore) is the exception: a later Cancel or revocation becomes its reason,
+        without interrupting its cleanup, so it ends instead. A claim whose response never
+        started has run nothing: it is released and recorded at once."""
         if active.cancel_requested.is_set():
+            if active.kind == "background" and active.cancel_reason == "shutdown" and reason != "shutdown":
+                active.cancel_reason = reason
             return
         active.cancel_reason = reason
         active.cancel_requested.set()
@@ -752,20 +764,31 @@ class Harness:
             await self._write(lambda conn: self._finish_background(
                 conn, active, "succeeded" if output is not None else "failed", output, inputs))
         except asyncio.CancelledError:
-            call, shutdown = active.call, active.cancel_reason == "shutdown"
-            cancel_reason = "revoked" if active.cancel_reason == "revoked" else "researcher"
+            call = active.call
 
-            def stop(conn):
+            def cancelled(conn):
+                reason = "revoked" if active.cancel_reason == "revoked" else "researcher"
+                self._finish_background(conn, active, "cancelled", None, None, cancel_reason=reason)
+
+            def stop(conn):  # the reason is read as it commits: a Cancel meanwhile overrides a shutdown
                 _close_call(conn, call)
-                if not shutdown:  # at shutdown it stays running and restarts next time
-                    self._finish_background(conn, active, "cancelled", None, None, cancel_reason=cancel_reason)
-            await _through(self._write(stop))
+                if active.cancel_reason == "shutdown":  # it stays running and restarts next time
+                    return True
+                cancelled(conn)
+                return False
+            (running, _) = await _through(self._write(stop))
+            if running and active.cancel_reason != "shutdown":  # a Cancel came once that had committed
+                await _through(self._write(cancelled))
         except spending.BudgetExceeded:
             await _through(self._write(lambda conn: self._finish_background(conn, active, "failed", None, None)))
         except Exception as error:
             log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
         finally:
             self.registry.release(active)
+            if active.cancel_reason == "shutdown" and not self.registry.closed:  # admitting again (resume)
+                again = self.registry.add_background(active.run_id)  # at once: a Cancel always finds it active
+                if again is not None:
+                    again.task = asyncio.create_task(self._background(again))
 
     async def _background_call(self, active, project_id, workflow, inputs):
         """One model call for a background run. Returns its output, or None if it failed."""
