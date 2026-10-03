@@ -7,11 +7,11 @@ Full backups and project exports are zip files in a folder the researcher chose,
 written under a temporary name and renamed when complete. One that holds a Private
 or Local only project is AES-encrypted with the researcher's passphrase (pyzipper)
 and refused without one; others are plain zip files. Neither holds a stored key, the
-logs or the lock file, and every config.toml in them leaves out the entries the app
-ignores, keys typed in by hand among them (by their names: a secret under an ordinary
-name is the researcher's own text). A restore saves a safety copy, stops running work,
-puts a backup's database and settings files in place, reopens the database and starts
-the harness again in the same process, then reports referenced content files that are
+logs or the lock file, and every config.toml in them keeps only the settings the app
+knows, without comments (settings.known_only), so nothing typed into it by hand leaves.
+A restore stops running work, waits out every other request, saves a safety copy, puts
+a backup's database and settings files in place, reopens the database and starts the
+harness again in the same process, then reports referenced content files that are
 missing. Every one of these is audited, a restore finished at launch after a crash too.
 
 Database and file work runs off the event loop.
@@ -45,7 +45,7 @@ from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _
     list_generations
 from backend.db.migrations import MIGRATIONS
 from backend.runs import _through
-from backend.settings import without_ignored, write_private
+from backend.settings import known_only, write_private
 
 log = logging.getLogger(__name__)
 
@@ -85,15 +85,14 @@ class _Route(APIRoute):
         return handle
 
 
-# What a database damaged at startup leaves served (see Gate).
+# What a limited app (a damaged database, or a restore neither finished nor undone) and a restore in
+# progress leave served (see Gate): health, the backups list and restore.
 LIMITED = {("GET", "/api/health"), ("GET", "/api/backups"), ("POST", "/api/backups/restore")}
-RESTORE = ("POST", "/api/backups/restore")
-_TURN_STREAM = re.compile(r"/api/(conversations/[^/]+/message/stream|runs/[^/]+/continue)")
 
 
 class Writers:
-    """What a restore excludes: every API request that can change something takes it shared; a
-    restore takes it alone. A waiting restore goes first, so new changes queue behind it."""
+    """What a restore waits out: every API request but LIMITED is inside it, shared; a restore
+    takes it alone. A waiting restore goes first, so new requests queue behind it."""
 
     def __init__(self):
         self._changed = asyncio.Condition()
@@ -121,6 +120,7 @@ class Writers:
                 await self._changed.wait_for(lambda: not self._alone and not self._shared)
             finally:
                 self._waiting -= 1
+                self._changed.notify_all()  # one that leaves without entering (cancelled) lets the queue on
             self._alone = True
         try:
             yield
@@ -130,33 +130,42 @@ class Writers:
                 self._changed.notify_all()
 
 
+def _limit(state, code, reason):
+    """Put the app in the limited state: only LIMITED is served (see Gate), and health says why."""
+    state["damaged"], state["damaged_code"] = reason, code
+
+
 class Gate:
     """Every API request passes it (pure ASGI, so streamed responses pass through untouched).
 
-    While the database is damaged at startup ("damaged" in the app's state), only LIMITED is
-    served; every other API request gets 503 database_damaged. A request that can change
-    anything (any method but GET and HEAD) runs inside state["writers"] shared, so a restore,
-    which holds it alone, never meets a settings or instructions save, a project's creation or
-    deletion, or a deletion and its purge halfway. Turn streams are not held: they write only
-    through the harness, which a restore stops before it swaps anything."""
+    Only LIMITED is served while the app is limited (state["damaged"]: a database damaged at
+    startup, or a restore that could neither be finished nor undone; 503 with state["damaged_code"])
+    and while a restore runs (state["restoring"]; 503 restoring): nothing else reads or writes then,
+    GET routes that write an audit row and turn admissions included. Every other request runs
+    inside state["writers"] shared, so a restore, once it has stopped admissions, waits until none
+    is left before it copies or swaps anything; the state is checked again once a request is
+    inside, since it may have changed while the request waited."""
 
     def __init__(self, app, state):
         self.app, self.state = app, state
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not scope["path"].startswith("/api/"):
+        if (scope["type"] != "http" or not scope["path"].startswith("/api/")
+                or (scope["method"], scope["path"]) in LIMITED):
             return await self.app(scope, receive, send)
-        request = (scope["method"], scope["path"])
-        if "damaged" in self.state and request not in LIMITED:
-            response = JSONResponse({"code": "database_damaged",
-                                     "message": "The database failed its check; restore a backup"}, status_code=503)
-            return await response(scope, receive, send)
         writers = self.state.get("writers")
-        if (writers is None or scope["method"] in ("GET", "HEAD") or request == RESTORE
-                or _TURN_STREAM.fullmatch(scope["path"])):
-            return await self.app(scope, receive, send)
+        if (refused := self._refused()) is not None or writers is None:
+            return await (refused or self.app)(scope, receive, send)
         async with writers.shared():
-            return await self.app(scope, receive, send)
+            return await (self._refused() or self.app)(scope, receive, send)
+
+    def _refused(self):
+        if "damaged" in self.state:
+            return JSONResponse({"code": self.state.get("damaged_code", "database_damaged"),
+                                 "message": "Scholia can only restore a backup now"}, status_code=503)
+        if self.state.get("restoring"):
+            return JSONResponse({"code": "restoring", "message": "A backup is being restored"}, status_code=503)
+        return None
 
 
 class FullBackup(BaseModel):
@@ -181,6 +190,7 @@ async def lifespan(app):
     at closing close the database and harness a restore opened (the app closes the ones it did)."""
     state = app.state.scholia
     state["backups_lock"] = asyncio.Lock()  # one backup, restore or export at a time
+    state["restore_lock"] = asyncio.Lock()  # one restore at a time
     state["writers"] = Writers()  # see Gate
     opened = state.get("db"), state.get("harness")
     if not (state["data_dir"] / "backups" / JOURNAL).exists():  # else a restore is still to be finished
@@ -363,8 +373,8 @@ def _write_full_backup(db, destination, passphrase):
             name = path.relative_to(staging / "copy").as_posix()
             if not path.is_file():
                 continue
-            if path.name == "config.toml":  # never a key typed into it by hand
-                raw = without_ignored(path.read_bytes(), personal=name == "config.toml")
+            if path.name == "config.toml":  # only what the app reads: nothing typed in by hand
+                raw = known_only(path.read_bytes(), personal=name == "config.toml")
                 if raw is None:  # not valid TOML, so it cannot be checked
                     left_out.append(name)
                 else:
@@ -397,8 +407,11 @@ async def restore(body: Restore, request: Request):
     if (body.generation is None) == (body.file is None):
         raise BackupError(400, "invalid_request", "Name one automatic backup or one backup file")
     state = request.app.state.scholia
-    # No other change runs meanwhile (see Gate): its requests wait until the restore ends.
-    async with state["writers"].alone(), state["backups_lock"]:
+    if state["restore_lock"].locked():
+        raise BackupError(409, "restoring", "A backup is being restored")
+    if (state["data_dir"] / "backups" / JOURNAL).exists():  # the next launch finishes the last one first
+        raise BackupError(409, "restore_interrupted", "Open Scholia again to finish the last restore")
+    async with state["restore_lock"]:
         return await _to_end(_restore(state, body))
 
 
@@ -407,24 +420,43 @@ async def _restore(state, body):
     with _file_errors(500, "restore_failed", "The backup could not be put in place; nothing was changed"):
         staging = await asyncio.to_thread(_staging, data_dir)
     try:
-        with _file_errors(400, "backup_unreadable", "The backup could not be read"):
-            await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
-        db, harness = state.get("db"), state.get("harness")
+        async with state["backups_lock"]:  # checked and copied while the app runs on; no rotation meanwhile
+            with _file_errors(400, "backup_unreadable", "The backup could not be read"):
+                await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
+        state["restoring"] = True  # from here only health, the backups list and this restore are served
+        try:
+            return await _replace(state, body, staging)
+        finally:
+            state.pop("restoring", None)
+    finally:
+        if not (data_dir / "backups" / JOURNAL).exists():  # else the next launch still needs what it holds
+            await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
+
+
+async def _replace(state, body, staging):
+    """Stop the running work and wait out every other request, take the safety copy, then put the
+    staged backup in place and run on it; or put everything back."""
+    data_dir, db, harness = state["data_dir"], state.get("db"), state.get("harness")
+    if harness is not None:  # admission stops, and running work stops and drains, before anything is copied
+        await harness.shutdown()
+    async with state["writers"].alone(), state["backups_lock"]:  # no other request is left inside
         damaged = db is None or db.damaged is not None
+        if body.generation and not _generation_folder(data_dir, body.generation).is_dir():
+            await _resume(state, db, damaged)  # purged while it was being checked (Delete everywhere)
+            raise BackupError(404, "not_found", "No such backup")
         safety = None
         if not damaged:  # first a safety copy of the current database, as an automatic backup
             try:
                 safety = await asyncio.to_thread(db.backup)
             except DatabaseDamagedError:
                 damaged = True
-            except BackupBusyError:
-                raise BackupError(409, "backup_busy", "Settings kept changing during the safety copy; try again") \
-                    from None
             except Exception as error:
+                await _resume(state, db, damaged)
+                if isinstance(error, BackupBusyError):
+                    raise BackupError(409, "backup_busy", "Settings kept changing during the safety copy; try again") \
+                        from None
                 raise BackupError(500, "safety_copy_failed",
                                   "The current database could not be backed up first; nothing was changed") from error
-        if harness is not None:  # stop running work as closing the app does
-            await harness.shutdown()
         if db is not None:
             await asyncio.to_thread(db.close)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -437,6 +469,7 @@ async def _restore(state, body):
         except Exception as error:
             log.warning("a restore failed (%s); the previous state is put back", type(error).__name__)
             if not await _roll_back(state, restored, damaged):
+                _limit(state, "restore_interrupted", "A restore could neither be finished nor undone; open Scholia again")
                 raise BackupError(500, "restore_interrupted",
                                   "The restore could not be finished or undone; open Scholia again to finish it") from error
             raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
@@ -455,9 +488,12 @@ async def _restore(state, body):
         version = await asyncio.to_thread(restored.read, lambda conn: conn.execute(
             "PRAGMA user_version").fetchone()[0])
         return {"ok": True, **record, "schema_version": version, "missing_files": missing}
-    finally:
-        if not (data_dir / "backups" / JOURNAL).exists():  # else the next launch still needs what it holds
-            await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
+
+
+async def _resume(state, db, damaged):
+    """A restore that stopped before it changed anything: the app runs on its database again."""
+    if not damaged:
+        await state["start"](db)
 
 
 async def _roll_back(state, restored, damaged):
@@ -488,6 +524,9 @@ async def _roll_back(state, restored, damaged):
                       type(error).__name__)
             if previous is not None:
                 await asyncio.to_thread(previous.close)
+            damaged_now = isinstance(error, DatabaseDamagedError)
+            _limit(state, "database_damaged" if damaged_now else "database_unavailable",
+                   "The database could not be opened again after a failed restore; restore a backup")
     return True
 
 
@@ -514,11 +553,18 @@ def _stage(data_dir, body, staging):
             raise BackupError(400, "backup_damaged", "The backup's database is empty")
 
 
-def _stage_generation(data_dir, generation, staging):
+def _generation_folder(data_dir, generation):
+    """An automatic backup's folder by its listed id ("daily/<stamp>" or "weekly/<stamp>"), or
+    BackupError not_found for anything else."""
     kind, _, name = generation.partition("/")
-    folder = data_dir / "backups" / kind / name
-    if kind not in KINDS or name != Path(name).name or not _stamp_of(Path(name)) or folder.is_symlink() \
-            or not folder.is_dir():
+    if kind not in KINDS or name != Path(name).name or not _stamp_of(Path(name)):
+        raise BackupError(404, "not_found", "No such backup")
+    return data_dir / "backups" / kind / name
+
+
+def _stage_generation(data_dir, generation, staging):
+    folder = _generation_folder(data_dir, generation)
+    if folder.is_symlink() or not folder.is_dir():
         raise BackupError(404, "not_found", "No such backup")
     for path in sorted(folder.rglob("*")):
         relative = path.relative_to(folder).as_posix()
@@ -583,14 +629,18 @@ def _put_in_place(data_dir, staged, aside):
 
     The live database keeps its name until the staged one replaces it in one rename, so a crash
     never leaves the folder without one; aside (made here) keeps a link to it, its WAL files and
-    the live settings files. Content files are added, never removed. Before anything moves, a
-    journal (JOURNAL, synced) records the plan; every step can be taken again, so a launch after a
-    crash finishes what was begun (finish_interrupted_restore). After a failure, _back puts back
-    what was moved, from the journal. The caller ends the journal (end_journal) once the restore
-    has succeeded.
+    the live settings files. Content files are added, never removed. Before anything moves, the
+    staged files and every folder involved are synced, then a journal (JOURNAL, synced) records the
+    plan; each move is synced as it is made, and every step can be taken again, so a launch after a
+    crash or a power loss finishes what was begun (finish_interrupted_restore). After a failure,
+    _back puts back what was moved, from the journal. The caller ends the journal (end_journal)
+    once the restore has succeeded.
     """
     _mkdir_private(aside.parent)
     _mkdir_private(aside)
+    _sync_tree(staged)
+    for folder in (aside, aside.parent, staged.parent, staged.parent.parent, data_dir / "backups"):
+        _fsync(folder)
     journal = {
         "direction": "forward",
         "staged": staged.relative_to(data_dir).as_posix(),
@@ -609,19 +659,18 @@ def _forward(data_dir, journal):
     if (staged / DB_NAME).exists():  # the backup's database is not in place yet
         if live.exists() and not (aside / DB_NAME).exists():
             os.link(live, aside / DB_NAME)
+            _fsync(aside)
         for sidecar in SIDECARS:  # a damaged database's WAL holds committed work: it goes with it
             if (data_dir / sidecar).exists():
-                os.replace(data_dir / sidecar, aside / sidecar)
+                _move(data_dir / sidecar, aside / sidecar)
         if (staged / "content").is_dir():
             _add_content(staged / "content", data_dir / "content")
-        os.replace(staged / DB_NAME, live)
+        _move(staged / DB_NAME, live)
     for name in SWAPPED:  # the live one aside first, so one found in place with none aside is the live one
         if name in journal["live"] and not _exists(aside / name) and _exists(data_dir / name):
-            os.replace(data_dir / name, aside / name)
+            _move(data_dir / name, aside / name)
         if name in journal["backup"] and _exists(staged / name):
-            os.replace(staged / name, data_dir / name)
-    _fsync(aside)
-    _fsync(data_dir)
+            _move(staged / name, data_dir / name)
 
 
 def _back(data_dir, journal):
@@ -633,14 +682,14 @@ def _back(data_dir, journal):
     for name in reversed(SWAPPED):
         if _exists(aside / name):
             _remove(data_dir / name)
-            os.replace(aside / name, data_dir / name)
+            _move(aside / name, data_dir / name)
         elif name not in journal["live"]:  # there was none: one in place came from the backup
             _remove(data_dir / name)
     if not (staged / DB_NAME).exists():  # the backup's database went in
         if (aside / DB_NAME).exists():  # and is still there: its own sidecars go, then the previous one is back
             for sidecar in SIDECARS:
                 _remove(data_dir / sidecar)
-            os.replace(aside / DB_NAME, live)
+            _move(aside / DB_NAME, live)
         elif not journal["live_database"]:  # there was none before
             for sidecar in SIDECARS:
                 _remove(data_dir / sidecar)
@@ -649,11 +698,27 @@ def _back(data_dir, journal):
         (aside / DB_NAME).unlink(missing_ok=True)  # only a second link to the live one
     for sidecar in SIDECARS:
         if (aside / sidecar).exists():
-            os.replace(aside / sidecar, data_dir / sidecar)
+            _move(aside / sidecar, data_dir / sidecar)
     _fsync(data_dir)
     with contextlib.suppress(OSError):  # empty now; one that is not is kept
         aside.rmdir()
     end_journal(data_dir)
+
+
+def _move(source, target):
+    """Rename source to target and sync both folders, so the move outlives a power loss."""
+    os.replace(source, target)
+    _fsync(target.parent)
+    if source.parent != target.parent:
+        _fsync(source.parent)
+
+
+def _sync_tree(root):
+    """Sync every file and folder under root, and root: what a journal will point at is on disk."""
+    for path in sorted(root.rglob("*"), key=lambda p: -len(p.parts)):  # files before their folders
+        if not path.is_symlink():
+            _fsync(path)
+    _fsync(root)
 
 
 def end_journal(data_dir):
@@ -663,11 +728,12 @@ def end_journal(data_dir):
 
 
 def finish_interrupted_restore(data_dir) -> str | None:
-    """Finish a restore a crash interrupted while it put a backup in place, or put the previous
+    """Replay a restore a crash interrupted while it put a backup in place, or put the previous
     state back: forward or back as its journal says. Run at launch, before the database opens and
-    before staging is emptied. Returns the direction taken, or None when there was none. A journal
-    that cannot be read, or that names folders outside backups/, is left with staging as they
-    are, and raises."""
+    before staging is emptied (see open_at_launch). Returns the direction taken, or None when there
+    was none. Forward keeps the journal: it ends only once the restored database runs, and is what
+    puts the previous state back if it cannot. A journal that cannot be read, or that names folders
+    outside backups/, is left with staging as they are, and raises."""
     data_dir = Path(data_dir)
     path = data_dir / "backups" / JOURNAL
     if not path.is_file():
@@ -679,12 +745,80 @@ def finish_interrupted_restore(data_dir) -> str | None:
             raise RuntimeError("the restore journal names a folder outside backups/")
     if journal["direction"] == "forward":
         _forward(data_dir, journal)
-        end_journal(data_dir)
-        log.warning("a restore interrupted by a crash was finished at launch")
+        log.warning("a restore interrupted by a crash was replayed at launch")
     else:
         _back(data_dir, journal)
         log.warning("a restore interrupted by a crash was undone at launch")
     return journal["direction"]
+
+
+async def open_at_launch(state, maintenance):
+    """Open the data folder's database and run the app on it (state["start"]), first replaying a
+    restore a crash interrupted. The replay and the opening run inside maintenance() (the desktop
+    entry's start deadline does not count them); starting the harness does not. A restore replayed forward keeps its journal until the restored
+    database is open and its harness has recovered; if either fails, the previous state is put
+    back from the journal and opened instead. Returns the database, or None when the app stays
+    limited (state["damaged"] says why): a damaged database, or a restore that could neither be
+    finished nor undone. Audits a replayed restore once a database runs."""
+    data_dir = state["data_dir"]
+    try:
+        with maintenance():
+            direction = await asyncio.to_thread(finish_interrupted_restore, data_dir)
+    except Exception as error:
+        log.error("a restore interrupted by a crash could not be replayed (%s)", type(error).__name__)
+        _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be finished; restore a backup")
+        return None
+    if direction == "forward":
+        try:
+            db = await _open(state, maintenance)
+            if db is None:
+                raise DatabaseDamagedError("the restored database failed its check")
+        except Exception as error:
+            log.warning("the restored database could not run (%s); the previous state is put back",
+                        type(error).__name__)
+            state.pop("damaged", None)
+            state.pop("damaged_code", None)
+            try:
+                with maintenance():
+                    await asyncio.to_thread(_back_from_journal, data_dir)
+            except Exception as failure:
+                log.error("putting the previous state back failed (%s)", type(failure).__name__)
+                _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be undone; restore a backup")
+                return None
+            direction = "back"
+        else:
+            await asyncio.to_thread(end_journal, data_dir)
+            await _audit_replay(db, direction)
+            return db
+    db = await _open(state, maintenance)
+    if db is not None and direction:
+        await _audit_replay(db, direction)
+    return db
+
+
+async def _open(state, maintenance):
+    """The database opened and the app started on it, or None when it is damaged (the app is then
+    limited). Any other failure closes what was opened and is raised."""
+    db = None
+    try:
+        with maintenance():
+            db = await asyncio.to_thread(Database, state["data_dir"])
+        await state["start"](db)
+        return db
+    except DatabaseDamagedError as error:
+        log.error("the database failed its check at startup; only a restore is offered")
+        _limit(state, "database_damaged", str(error))
+        return None
+    except BaseException:
+        if db is not None:
+            await asyncio.to_thread(db.close)
+        raise
+
+
+async def _audit_replay(db, direction):
+    await asyncio.to_thread(db.write, lambda conn: conn.execute(
+        "INSERT INTO audit_log (event, data) VALUES ('restore', ?)",
+        (json.dumps({"interrupted": True, "finished": direction}),)))
 
 
 def _exists(path):
@@ -778,7 +912,7 @@ def _write_export(db, project_id, destination, passphrase):
         path = folder / name
         if path.is_file() and not path.is_symlink():
             raw = path.read_bytes()
-            raw = without_ignored(raw) if name == "config.toml" else raw  # never a key typed into it by hand
+            raw = known_only(raw) if name == "config.toml" else raw  # only what the app reads: nothing typed in by hand
             if raw is not None:
                 entries.append((f"settings/{name}", raw))
     record = {"encrypted": passphrase is not None, "conversations": len(data["conversations"]),

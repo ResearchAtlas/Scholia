@@ -164,16 +164,23 @@ async def test_a_full_backup_never_holds_a_key_typed_into_a_settings_file(tmp_pa
     async with started(data) as client:
         project = await new_project(client)
         personal, project_config = data / "config.toml", data / "projects" / project / "config.toml"
-        personal.write_text(personal.read_text() + '\n[ui]\nlanguage = "en"\n'
+        personal.write_text("# my key is sk-or-typed-into-a-comment\n" + personal.read_text() + '\n[ui]\nlanguage = "en"\n'
+                            '[misc]\nopenrouter = "sk-or-typed-into-an-ordinary-name"\n'
                             '[providers.extra]\nkind = "openai-compatible"\napi_key = "sk-or-typed-into-personal"\n')
-        project_config.write_text(project_config.read_text() + 'token = "sk-or-typed-into-project"\n')
+        project_config.write_text(project_config.read_text() + 'token = "sk-or-typed-into-project"\n'
+                                  'openrouter = "sk-or-typed-into-a-project-name"  # and sk-or-typed-into-a-note\n')
         (data / "projects" / project / "AGENTS.md").write_text("Use APA.")
         response = await client.post("/api/backups/full", json={"destination": str(destination)})
         assert response.status_code == 200, response.text
+        exported = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
+        assert exported.status_code == 200, exported.text
     path = destination / response.json()["file"].rsplit("/", 1)[1]
-    assert not any(b"sk-or-typed-into" in read(path, name) for name in names(path))  # read, not as compressed
+    export = destination / exported.json()["file"].rsplit("/", 1)[1]
+    for archive in (path, export):  # read, not as compressed bytes
+        assert not any(b"sk-or-typed-into" in read(archive, name) for name in names(archive)), archive.name
     assert b'language = "en"' in read(path, "config.toml") and b"citation_style" in read(
         path, f"projects/{project}/config.toml")  # what the app reads stays
+    assert b"citation_style" in read(export, "settings/config.toml") and b"#" not in read(export, "settings/config.toml")
 
 
 async def test_a_full_backup_is_recorded_before_anything_is_written_and_removed_if_it_fails(tmp_path, monkeypatch):
@@ -526,40 +533,94 @@ def hold(monkeypatch, owner, name):
     return started_, release
 
 
-async def test_a_settings_save_during_a_restore_waits_and_lands_after_it(tmp_path, monkeypatch):
-    async with started(tmp_path / "data") as client:
+async def test_during_a_restore_only_health_the_backups_and_the_restore_are_served(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    async with started(data) as client:
+        conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
         backup = (await client.post("/api/backups")).json()["id"]
         read = (await client.get("/api/settings")).json()["hash"]
         swapping, release = hold(monkeypatch, backups_module, "_put_in_place")
         restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
         await asyncio.to_thread(swapping.wait, 10)
-        save = asyncio.create_task(client.put("/api/settings", json={"hash": read, "updates": {"ui.language": "zh-CN"}}))
-        await asyncio.sleep(0.2)
-        assert not save.done()  # it waits for the restore, which would otherwise swap it away
+        refused = [
+            await client.put("/api/settings", json={"hash": read, "updates": {"ui.language": "zh-CN"}}),
+            await client.put("/api/instructions", json={"text": "Written during the restore"}),
+            await client.post("/api/projects", json={"name": "Created during the restore"}),
+            await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"}),
+            await client.get("/api/projects"),  # reads, and GET routes that write an audit row, too
+            await client.get("/api/providers/openrouter/models"),
+            await client.post("/api/backups/restore", json={"generation": backup}),  # one restore at a time
+        ]
+        assert [(r.status_code, r.json()["code"]) for r in refused] == [(503, "restoring")] * 6 + [(409, "restoring")]
+        assert (await client.get("/api/health")).status_code == 200
+        assert (await client.get("/api/backups")).status_code == 200
         release.set()
         assert (await restore).status_code == 200
-        assert (await save).status_code == 200
-        assert (await client.get("/api/settings")).json()["values"]["ui"]["language"] == "zh-CN"
+        assert (await client.get("/api/instructions")).json()["text"] == ""  # nothing landed in the swap
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General"}
+        assert (await client.put("/api/instructions", json={"text": "After"})).status_code == 200  # served again
 
 
-async def test_an_instructions_save_and_a_project_creation_during_a_restore_land_after_it(tmp_path, monkeypatch):
+async def test_a_turn_running_when_a_restore_starts_ends_before_the_safety_copy(tmp_path, monkeypatch):
     data = tmp_path / "data"
     async with started(data) as client:
         backup = (await client.post("/api/backups")).json()["id"]
-        swapping, release = hold(monkeypatch, backups_module, "_put_in_place")
-        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
-        await asyncio.to_thread(swapping.wait, 10)
-        save = asyncio.create_task(client.put("/api/instructions", json={"text": "Written during the restore"}))
-        create = asyncio.create_task(client.post("/api/projects", json={"name": "Created during the restore"}))
-        await asyncio.sleep(0.2)
-        assert not save.done() and not create.done()
-        release.set()
-        assert (await restore).status_code == 200
-        assert (await save).status_code == 200 and (await create).status_code == 201
-        assert (await client.get("/api/instructions")).json()["text"] == "Written during the restore"
-        project = (await create).json()["id"]
-        assert (await client.get(f"/api/projects/{project}")).status_code == 200  # its record and its folder
-        assert (data / "projects" / project / "config.toml").is_file()
+        client.provider.hold = asyncio.Event()
+        conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
+        turn = asyncio.create_task(send(client, conversation))
+        await client.provider.started.wait()
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200
+        assert (await turn)[-1]["status"] == "interrupted"
+        client.provider.hold.set()
+        safety = data / "backups" / response.json()["safety_copy"] / DB_NAME
+    conn = sqlite3.connect(safety.as_uri() + "?mode=ro", uri=True)
+    try:  # the safety copy holds the turn as it ended, nothing it could commit after the copy
+        assert conn.execute("SELECT status FROM runs WHERE kind = 'turn'").fetchall() == [("interrupted",)]
+    finally:
+        conn.close()
+
+
+async def test_a_request_let_in_before_the_app_was_limited_is_refused_once_inside(tmp_path):
+    data = tmp_path / "data"
+    async with started(data) as client:
+        state = client.state
+        async with state["writers"].alone():  # as a restore holds it
+            save = asyncio.create_task(client.put("/api/instructions", json={"text": "Queued"}))
+            await asyncio.sleep(0.1)
+            assert not save.done()  # it passed the first check and waits inside the gate
+            backups_module._limit(state, "restore_interrupted", "a restore could neither be finished nor undone")
+        response = await save
+        assert (response.status_code, response.json()["code"]) == (503, "restore_interrupted")
+        assert not (data / "AGENTS.md").exists()
+
+
+async def test_a_cancelled_restore_waiting_its_turn_lets_every_queued_request_in():
+    writers = backups_module.Writers()
+    release = asyncio.Event()
+    entered = []
+
+    async def request(name):  # a request that stays inside, as a slow save does
+        async with writers.shared():
+            entered.append(name)
+            await release.wait()
+
+    async def restoring():
+        async with writers.alone():
+            pass
+
+    async with writers.shared():
+        restore = asyncio.create_task(restoring())  # waits for the request inside
+        await asyncio.sleep(0)
+        queued = [asyncio.create_task(request(name)) for name in ("first", "second")]  # behind the restore
+        await asyncio.sleep(0)
+        assert entered == []
+        restore.cancel()  # the restore's request went away: both are eligible now
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+        assert sorted(entered) == ["first", "second"]
+    release.set()
+    await asyncio.gather(*queued)
 
 
 async def test_a_restore_waits_for_a_deletion_and_its_purge(tmp_path, monkeypatch):

@@ -555,25 +555,28 @@ def load_settings(data_root, project_id=None):
     return settings
 
 
-def without_ignored(raw, personal=False):
-    """A config.toml's bytes (a project's, or the personal one) with every entry the app ignores
-    left out: keys and other secrets a researcher typed by hand, settings of the other scope and
-    invalid values. Comments and the entries the app reads stay. For files that leave the data
-    folder (exports, full backups), which never carry keys. None when the bytes are not valid
-    TOML in UTF-8, since then nothing in them can be checked."""
+def known_only(raw, personal=False):
+    """A config.toml's bytes (the personal one, or a project's) with only the settings the app
+    knows: each key its schema defines, holding a valid value, written anew without comments.
+    Unknown keys, the open sections whose shape is not defined yet, and comments are left out, so
+    nothing typed in by hand leaves with it, a key under an ordinary name or in a comment
+    included. For settings files that leave the data folder (full backups, exports). None when
+    the bytes are not valid TOML in UTF-8."""
     schema = PERSONAL if personal else PROJECT
     try:
-        doc = tomlkit.parse(raw.decode("utf-8"))
-        leaves = list(_leaves(doc.unwrap()))
+        leaves = list(_leaves(tomlkit.parse(raw.decode("utf-8")).unwrap()))
     except (UnicodeDecodeError, tomlkit.exceptions.ParseError, RecursionError):
         return None
+    kept = {}
     for path, value in leaves:
-        if _check(schema, path, value)[1] is not None:
-            node = doc
-            for part in path[:-1]:
-                node = node[part]
-            del node[path[-1]]
-    return doc.as_string().encode("utf-8")
+        pattern, _ = _match(schema, path)
+        if pattern not in schema or schema[pattern][1] is None or _check(schema, path, value)[1] is not None:
+            continue
+        node = kept
+        for part in path[:-1]:
+            node = node.setdefault(part, {})
+        node[path[-1]] = value
+    return tomlkit.dumps(kept).encode("utf-8")
 
 
 INSTRUCTIONS_CAP = 32 * 1024  # bytes of UTF-8, personal and project combined

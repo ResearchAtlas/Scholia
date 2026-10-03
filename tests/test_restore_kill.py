@@ -46,10 +46,6 @@ def replacing(source, target, *args, **kwargs):
 
 
 backups.os.replace = replacing
-if scenario == "back":  # the restored database cannot be opened, so the previous state goes back
-    def failing(*args, **kwargs):
-        raise RuntimeError("the restored database cannot be opened")
-    backups.Database = failing
 
 
 class Keyring:
@@ -69,6 +65,10 @@ app = create_app(data, origin="http://127.0.0.1:8765", keyring_backend=Keyring()
 async def main():
     inner = app.app
     async with inner.router.lifespan_context(inner):
+        if scenario == "back":  # the restored database cannot be opened, so the previous state goes back
+            def failing(*args, **kwargs):
+                raise RuntimeError("the restored database cannot be opened")
+            backups.Database = failing
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765",
                                      headers={"X-Scholia-Client": "local"}) as client:
             await client.post("/api/backups/restore", json={"generation": generation})
@@ -142,8 +142,8 @@ async def test_a_restore_whose_undo_fails_starts_nothing_and_the_launch_puts_it_
     backup, kept, later = await prepare(data)
     real_fsync, real_back, undone = backups_module._fsync, backups_module._back, []
 
-    def failing_fsync(path):  # the swap fails once everything is in place
-        if "/replaced" in str(path):
+    def failing_fsync(path):  # the swap fails once it has begun (the journal is written)
+        if "/replaced" in str(path) and (data / "backups" / backups_module.JOURNAL).exists():
             raise OSError(errno.EIO, "I/O error")
         real_fsync(path)
 
@@ -160,8 +160,12 @@ async def test_a_restore_whose_undo_fails_starts_nothing_and_the_launch_puts_it_
         monkeypatch.setattr(backups_module, "_back", failing_back)
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
-        projects = await client.get("/api/projects")  # nothing runs on the half-restored folder
-        assert (projects.status_code, projects.json()["code"]) == (503, "database_unavailable")
+        for method, path, body in (("GET", "/api/projects", None), ("PUT", "/api/instructions", {"text": "x"}),
+                                   ("PUT", "/api/settings", {"hash": None, "updates": {"ui.language": "en"}}),
+                                   ("POST", "/api/backups/restore", {"generation": backup})):
+            refused = await client.request(method, path, json=body)  # nothing reads or writes the half-restored folder
+            assert refused.json()["code"] == "restore_interrupted", path
+        assert "restore" in (await client.get("/api/health")).json()["database_damaged"]
         monkeypatch.setattr(backups_module, "_fsync", real_fsync)
 
     names, text, folders, projects = await state_after_launch(data)  # the launch finishes putting it back
@@ -201,6 +205,87 @@ async def test_a_journal_that_cannot_be_read_leaves_the_folder_unopened_and_offe
     before = (data / DB_NAME).read_bytes()
     async with started(data, setup=False) as client:
         assert "restore a backup" in (await client.get("/api/health")).json()["database_damaged"]
-        assert (await client.get("/api/projects")).json()["code"] == "database_damaged"
+        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"
         assert (await client.get("/api/backups")).status_code == 200
     assert (data / DB_NAME).read_bytes() == before  # never opened
+
+
+async def test_a_replayed_restore_whose_harness_cannot_start_is_put_back_from_its_journal(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+    real, recovered = Harness.recover, []
+
+    async def failing_once(self):  # the replayed, restored database opens, but its harness cannot recover
+        recovered.append(self)
+        if len(recovered) == 1:
+            raise RuntimeError("recovery failed")
+        await real(self)
+
+    monkeypatch.setattr(Harness, "recover", failing_once)
+    names, text, folders, projects = await state_after_launch(data)
+    assert names == {"General", "Kept", "Later"} and text == "After the backup"  # the previous state, running
+    assert sorted(folders) == sorted([kept, later])
+    assert not (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_a_replay_that_can_be_neither_run_nor_undone_keeps_its_journal_and_staging(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+
+    def damaged(*args, **kwargs):
+        from backend.db import DatabaseDamagedError
+        raise DatabaseDamagedError("quick_check failed")
+
+    def cannot_undo(data_dir):
+        raise OSError("I/O error")
+
+    monkeypatch.setattr(backups_module, "Database", damaged)
+    monkeypatch.setattr(backups_module, "_back_from_journal", cannot_undo)
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"
+    assert (data / "backups" / backups_module.JOURNAL).exists()
+    assert any((data / "backups" / backups_module.STAGING).iterdir())  # what the journal points at is kept
+
+
+async def test_a_restore_syncs_what_its_journal_points_at_and_each_move(tmp_path, monkeypatch):
+    import json
+    import os as os_module
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    events = []
+    real_fsync, real_write, real_replace = backups_module._fsync, backups_module.write_private, os_module.replace
+
+    def fsync(path):
+        events.append(("fsync", Path(path)))
+        real_fsync(path)
+
+    def write(path, payload):
+        path = Path(path)
+        if path.name == backups_module.JOURNAL and json.loads(payload)["direction"] == "forward":
+            staged = data / json.loads(payload)["staged"]
+            events.append(("journal", {staged, *staged.rglob("*")}))
+        real_write(path, payload)
+
+    def replace(source, target, *args, **kwargs):
+        events.append(("replace", Path(target)))
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(backups_module, "_fsync", fsync)
+    monkeypatch.setattr(backups_module, "write_private", write)
+    monkeypatch.setattr(os_module, "replace", replace)
+    async with started(data, setup=False) as client:
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+    monkeypatch.setattr(os_module, "replace", real_replace)
+    [at] = [i for i, (kind, _) in enumerate(events) if kind == "journal"]
+    synced = {path for kind, path in events[:at] if kind == "fsync"}
+    assert events[at][1] <= synced  # every staged file and folder was on disk before the journal named them
+    moves = [(i, path) for i, (kind, path) in enumerate(events)
+             if kind == "replace" and i > at and path.is_relative_to(data) and path.name != backups_module.JOURNAL
+             and not path.name.startswith(".")]
+    assert len(moves) >= 4
+    for i, target in moves:
+        following = next((j for j in range(i + 1, len(events)) if events[j][0] == "replace"), len(events))
+        assert ("fsync", target.parent) in events[i + 1:following], target  # synced before the next move

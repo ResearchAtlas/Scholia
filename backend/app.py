@@ -27,7 +27,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
-from backend.db import ContentStore, Database, DatabaseClosedError, DatabaseDamagedError, delete, new_id, utc_now
+from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
 from backend.runs import AdmissionError, Harness, _through, derived_status
@@ -240,28 +240,19 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise
         state.update(db=db, content=ContentStore(db), gate=gate, harness=harness)
         state.pop("damaged", None)
+        state.pop("damaged_code", None)
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
         state.update(data_dir=data_dir, start=start)
-        db = finished = None
-        try:  # a restore a crash interrupted is finished before anything opens the database
-            finished = await asyncio.to_thread(backups.finish_interrupted_restore, data_dir)
-        except Exception as error:  # the folder may hold two states: never opened, only a restore is offered
-            log.error("a restore interrupted by a crash could not be finished (%s)", type(error).__name__)
-            state["damaged"] = "a restore interrupted by a crash could not be finished; restore a backup"
-        # Opening the database (its checks, the backup before a migration, migrations) and the
-        # daily backup are local maintenance: the desktop entry's start deadline does not count
-        # them (see maintenance), since on a large folder they are progress, not a hang.
-        with maintenance():
-            try:
-                if "damaged" not in state:
-                    db = await asyncio.to_thread(Database, data_dir)
-            except DatabaseDamagedError as error:
-                # Never reset: the app serves health, the backups and restore (see db()) until a
-                # restore puts a backup in place; the backups router closes what that opens.
-                log.error("the database failed its check at startup; only a restore is offered")
-                state["damaged"] = str(error)
+        # Finishing a restore a crash interrupted, opening the database (its checks, the backup
+        # before a migration, migrations) and the daily backup are local maintenance: the desktop
+        # entry's start deadline does not count them (see maintenance), since on a large folder
+        # they are progress, not a hang. Never reset: when the database is damaged, or a restore
+        # can be neither finished nor undone, the app serves health, the backups and restore only
+        # (backups.Gate) until a restore puts a backup in place; the backups router closes what
+        # that opens.
+        db = await backups.open_at_launch(state, maintenance)
         if db is None:
             try:
                 yield
@@ -269,10 +260,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 state.clear()
             return
         try:
-            await start(db)
-            if finished:  # audited once the database is open: which way the interrupted restore went
-                await write(lambda conn: conn.execute("INSERT INTO audit_log (event, data) VALUES ('restore', ?)",
-                                                      (json.dumps({"interrupted": True, "finished": finished}),)))
             await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
             # The daily backup runs at launch, before the app accepts a request, so the
             # database and the settings files it copies show one state. Backups while the app

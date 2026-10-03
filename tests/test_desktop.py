@@ -552,3 +552,20 @@ def test_the_window_offers_the_interface_only_a_folder_picker(monkeypatch):
     assert api.choose_folder() == "/Users/researcher/Backups"
     assert api.choose_folder() is None  # cancelled
     assert chosen == ["folder", "folder"]
+
+
+def test_finishing_an_interrupted_restore_does_not_count_against_the_start_deadline(tmp_path, monkeypatch):
+    import time
+    from backend import backups
+    real = backups.finish_interrupted_restore
+
+    def slow(data_dir):  # a large restore's files, replayed at launch
+        time.sleep(1.5)
+        return real(data_dir)
+
+    monkeypatch.setattr(backups, "finish_interrupted_restore", slow)
+    monkeypatch.setattr(desktop, "START_SECONDS", 1)
+    seen = []
+    assert desktop.run(tmp_path / "data", _open_and_close(seen), keyring_backend=FakeKeyring(),
+                       listening=register_server) == 0
+    assert seen == [True]

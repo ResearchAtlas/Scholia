@@ -62,7 +62,8 @@ test('every new error code reads in each language, never as the backend\'s messa
     'closing', 'backup_failed', 'write_failed', 'disk_full', 'destination_not_writable', 'destination_not_found',
     'destination_in_data_folder', 'invalid_destination', 'not_a_backup', 'backup_damaged', 'backup_unreadable',
     'newer_schema', 'restore_failed', 'safety_copy_failed', 'data_folder_problem', 'data_folder_synced',
-    'data_folder_not_empty', 'data_folder_not_found', 'data_folder_unsafe', 'data_folder_invalid'];
+    'data_folder_not_empty', 'data_folder_not_found', 'data_folder_unsafe', 'data_folder_invalid',
+    'restore_interrupted', 'restoring'];
   for (const language of ['en', 'zh-CN']) {
     const t = makeT(language);
     for (const code of codes) assert.notEqual(errorText(t, code), t('errors.internal'), `${language}: ${code}`);
