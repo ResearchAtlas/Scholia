@@ -84,10 +84,13 @@ function useCatalog(open, projectId, chosenModel) {
       if (mine !== latest.current || !here.current) return;
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
         defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto' };
-      // Only a complete, current listing says a chosen model is gone.
-      const complete = listings.every((l) => l.status === 'fulfilled' && !l.value.status?.error);
-      if (choice?.model && complete && !models.some((m) => m.provider === choice.provider && m.id === choice.model)) {
-        setChoice(null);
+      // A chosen model is dropped when its provider is no longer ready (the provider list says
+      // so), or when its own provider's current listing no longer offers it.
+      if (choice?.model) {
+        const at = ready.findIndex((p) => p.name === choice.provider);
+        const own = at >= 0 ? listings[at] : null;
+        const listed = own?.status === 'fulfilled' && !own.value.status?.error;
+        if (at < 0 || (listed && !own.value.models.some((m) => m.offered && m.id === choice.model))) setChoice(null);
       }
       setCatalog(next);
     } catch {

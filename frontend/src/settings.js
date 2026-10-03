@@ -124,7 +124,8 @@ export function loadModels(provider, { refresh = false } = {}) {
     const query = refresh ? '?refresh=true' : '';
     const listing = get(`/api/providers/${encodeURIComponent(provider)}/models${query}`);
     listings.set(provider, listing);
-    listing.catch(() => listings.delete(provider));
+    const drop = () => { if (listings.get(provider) === listing) listings.delete(provider); };
+    listing.then((read) => { if (read?.status?.error) drop(); }, drop); // a failed listing is read again next time
   }
   return listings.get(provider);
 }

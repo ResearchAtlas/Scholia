@@ -192,7 +192,7 @@ async def test_recent_models_survive_many_repeats_of_one(tmp_path):
                              " SELECT ?, project_id, id, 'turn', 'agent', 'succeeded' FROM conversations WHERE id = ?",
                              (run, conversation))
                 conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'route', ?)",
-                             (run, '{"route": "openrouter:a/one", "plan": {"policy_reason": "chosen_model"}}'))
+                             (run, '{"route": "openrouter:a/one", "plan": {"policy_reason": "chosen_model", "model": "a/one"}}'))
         await asyncio.to_thread(client.state["db"].write, repeat)
         recent = (await client.get("/api/models/recent")).json()["models"]
         assert [m["model"] for m in recent] == ["a/one", "b/two", "c/three"]
@@ -296,9 +296,16 @@ async def test_recent_models_keep_a_provider_name_with_a_colon(tmp_path):
                          " SELECT ?, project_id, id, 'turn', 'agent', 'succeeded' FROM conversations WHERE id = ?",
                          (run, conversation))
             conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'route', ?)",
-                         (run, '{"route": "lab:v2:llama3:8b", "plan": {"policy_reason": "chosen_model"}}'))
+                         (run, '{"route": "lab:v2:llama3:8b", "plan": {"policy_reason": "chosen_model", "model": "llama3:8b"}}'))
+            other = new_id()  # provider "lab", model "v2:llama3:8b": the same route text
+            conn.execute("INSERT INTO runs (id, project_id, conversation_id, kind, workflow, status, started_at)"
+                         " SELECT ?, project_id, id, 'turn', 'agent', 'succeeded', '2020-01-01T00:00:00.000Z'"
+                         " FROM conversations WHERE id = ?", (other, conversation))
+            conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'route', ?)",
+                         (other, '{"route": "lab:v2:llama3:8b", "plan": {"policy_reason": "chosen_model", "model": "v2:llama3:8b"}}'))
         await asyncio.to_thread(client.state["db"].write, record)
-        assert (await client.get("/api/models/recent")).json()["models"] == [{"provider": "lab:v2", "model": "llama3:8b"}]
+        assert (await client.get("/api/models/recent")).json()["models"] == [
+            {"provider": "lab:v2", "model": "llama3:8b"}, {"provider": "lab", "model": "v2:llama3:8b"}]
 
 
 async def test_the_personal_editor_is_measured_with_the_projects_instructions(tmp_path):

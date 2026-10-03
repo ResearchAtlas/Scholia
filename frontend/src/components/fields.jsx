@@ -55,13 +55,13 @@ export function CommitField({ id, value, onCommit, type = 'text', min, above, st
   className, inputMode }) {
   const listId = useId();
   const [draft, setDraft] = useState(value ?? '');
-  const shown = useRef(value); // the value the draft last came from
+  const edited = useRef(false); // typed in since the last commit
   useEffect(() => { // a new value replaces the draft unless the researcher has typed since
-    setDraft((current) => (String(current) === String(shown.current ?? '') ? value ?? '' : current));
-    shown.current = value;
+    if (!edited.current) setDraft(value ?? '');
   }, [value]);
 
   function commit() {
+    edited.current = false;
     const text = String(draft).trim();
     if (text === String(value ?? '')) return;
     if (!text) {
@@ -87,7 +87,7 @@ export function CommitField({ id, value, onCommit, type = 'text', min, above, st
     <>
       <Input id={id} type={type === 'number' ? 'text' : type} inputMode={inputMode ?? (type === 'number' ? 'decimal' : undefined)}
         value={draft} placeholder={placeholder} list={suggestions ? listId : undefined} className={cn('h-9', className)}
-        onChange={(event) => setDraft(event.target.value)} onBlur={commit}
+        onChange={(event) => { edited.current = true; setDraft(event.target.value); }} onBlur={commit}
         onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); commit(); } }} />
       {suggestions && (
         <datalist id={listId}>

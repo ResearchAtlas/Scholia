@@ -397,16 +397,17 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def recent_models():
         """The last three models the researcher chose (not Auto's picks), newest first."""
         rows = await read(lambda conn: conn.execute(
-            "SELECT json_extract(e.data, '$.route') AS route FROM run_events e JOIN runs r ON r.id = e.run_id"
+            "SELECT json_extract(e.data, '$.route') AS route, json_extract(e.data, '$.plan.model')"
+            " FROM run_events e JOIN runs r ON r.id = e.run_id"
             " WHERE e.type = 'route' AND json_extract(e.data, '$.plan.policy_reason') = 'chosen_model'"
-            " GROUP BY route ORDER BY max(r.started_at) DESC LIMIT 3").fetchall())
-        names = sorted(providers.configured(data_dir, include_off=True), key=len, reverse=True)
+            " GROUP BY 1, 2 ORDER BY max(r.started_at) DESC LIMIT 3").fetchall())
 
-        def split(route):  # "<provider>:<model>", where a provider's name may itself hold a colon
-            name = next((n for n in names if isinstance(route, str) and route.startswith(n + ":")), None)
-            return name and {"provider": name, "model": route[len(name) + 1:]}
+        def split(route, model):  # "<provider>:<model>": the plan records the model, so the rest is the provider
+            if not (isinstance(route, str) and isinstance(model, str) and route.endswith(":" + model)):
+                return None
+            return {"provider": route[:-len(model) - 1], "model": model}
 
-        return {"models": [found for (route,) in rows if (found := split(route))]}
+        return {"models": [found for route, model in rows if (found := split(route, model))]}
 
     # Settings and instructions
 

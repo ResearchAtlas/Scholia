@@ -86,6 +86,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
   const [keyProblem, setKeyProblem] = useState(null);
   const [notice, setNotice] = useState(null);
   const [open, setOpen] = useState(false);
+  const [choosing, setChoosing] = useState(false);
   const openrouter = provider.kind === 'openrouter';
   const choice = Array.isArray(table.models) ? 'pick' : table.models ?? (openrouter ? 'recommended' : 'all');
   const ready = groupOf(provider) === 'ready';
@@ -103,18 +104,23 @@ function ProviderCard({ provider, table, save, onChanged }) {
     }
   }
 
-  async function setChoice(next) {
-    if (next === 'pick') { // starts from the models offered now; a listing that failed changes nothing
-      const listing = await loadModels(provider.name).catch(() => null);
-      if (!listing || listing.status?.error) {
-        setKeyProblem(listing?.status?.error ?? 'network');
-        return;
+  async function setChoice(next) { // one at a time: the control waits while Pick reads the listing
+    setChoosing(true);
+    try {
+      if (next === 'pick') { // starts from the models offered now; a listing that failed changes nothing
+        const listing = await loadModels(provider.name).catch(() => null);
+        if (!listing || listing.status?.error) {
+          setKeyProblem(listing?.status?.error ?? 'network');
+          return;
+        }
+        await save({ [settingKey('providers', provider.name, 'models')]: listing.models.filter((m) => m.offered).map((m) => m.id) });
+      } else {
+        await save({ [settingKey('providers', provider.name, 'models')]: next });
       }
-      await save({ [settingKey('providers', provider.name, 'models')]: listing.models.filter((m) => m.offered).map((m) => m.id) });
-    } else {
-      await save({ [settingKey('providers', provider.name, 'models')]: next });
+      forgetModels();
+    } finally {
+      setChoosing(false);
     }
-    forgetModels();
   }
 
   return (
@@ -148,7 +154,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
         <div className="mt-5 grid gap-5">
           <Field label={t('providers.models')} hint={t(`providers.modelsHint.${choice}`)}>
             <div>
-              <Segmented label={t('providers.models')} value={choice} onChange={setChoice}
+              <Segmented label={t('providers.models')} value={choice} onChange={setChoice} disabled={choosing}
                 options={[...(openrouter ? [{ value: 'recommended', label: t('providers.recommended') }] : []),
                   { value: 'all', label: t('providers.all') }, { value: 'pick', label: t('providers.pick') }]} />
             </div>

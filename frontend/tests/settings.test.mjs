@@ -105,3 +105,14 @@ test('a change to the providers is announced; a reader that clears the cache its
   forgetModels();
   assert.equal(heard, 1);
 });
+
+test('a listing that reports an error is read again the next time', async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => (++calls === 1
+    ? Response.json({ models: [], status: { error: 'refresh_failed' } }) : Response.json({ models: [{ id: 'a' }], status: {} })));
+  forgetModels({ quiet: true });
+  assert.equal((await loadModels('local')).status.error, 'refresh_failed');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual((await loadModels('local')).models, [{ id: 'a' }]);
+  assert.equal(calls, 2);
+});
