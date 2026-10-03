@@ -58,10 +58,13 @@ def take_lock(data_dir) -> int | None:
     the app runs, or None when another instance holds it. The folder is checked first
     (no other account can replace what it holds), and the lock file is opened without
     following a link; one that is not a regular file of this account's, or carries an
-    access rule letting others in, is refused (UnsafeDataFolderError). Scholia keeps its
-    lock file owner-only, so one another account could open is narrowed first, and if it is
-    then found held, another account holds it: refused too, not taken for another Scholia."""
+    access rule letting others in, is refused (UnsafeDataFolderError); so is one another
+    account could open, left as it is so every launch refuses it, since such an account
+    could hold the lock: Scholia keeps its lock file owner-only, so it is never another
+    Scholia's. Removing it lets the next launch make a new one."""
     data_dir = Path(data_dir)
+    if ".." in data_dir.parts:  # checked as written, so walked as written: no parts that go back
+        raise UnsafeDataFolderError("Scholia will not open its data folder: its path goes back up (..)")
     _check_ancestors(data_dir)  # before anything is made
     data_dir.parent.mkdir(parents=True, exist_ok=True)
     _check_ancestors(data_dir)  # and the folders just made
@@ -81,16 +84,14 @@ def take_lock(data_dir) -> int | None:
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or _acl_problem(data_dir / LOCK_FILE):
         os.close(fd)
         raise UnsafeDataFolderError("Scholia will not open its data folder: its lock file is not its own")
-    opened_to_others = stat.S_IMODE(info.st_mode) & 0o077
-    if opened_to_others:
-        os.fchmod(fd, stat.S_IMODE(info.st_mode) & 0o600)
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        os.close(fd)
+        raise UnsafeDataFolderError(
+            f"Scholia will not open its data folder: other accounts could open its lock file; remove {LOCK_FILE}")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        if opened_to_others:
-            raise UnsafeDataFolderError(
-                "Scholia will not open its data folder: its lock file was open to other accounts and is held") from None
         return None
     return fd
 

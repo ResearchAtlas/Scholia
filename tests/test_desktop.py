@@ -485,7 +485,7 @@ def test_nothing_is_made_under_a_folder_others_could_change(tmp_path):
         os.chmod(unsafe, 0o755)
 
 
-def test_a_lock_file_open_to_others_and_held_is_refused_not_taken_for_another_scholia(tmp_path):
+def test_a_lock_file_open_to_others_is_refused_at_every_launch_until_removed(tmp_path):
     data = tmp_path / "data"
     data.mkdir(mode=0o700)
     lock = data / desktop.LOCK_FILE
@@ -494,14 +494,23 @@ def test_a_lock_file_open_to_others_and_held_is_refused_not_taken_for_another_sc
     held = os.open(lock, os.O_RDONLY)
     fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
-        with pytest.raises(desktop.UnsafeDataFolderError):
-            desktop.take_lock(data)
-        assert stat.S_IMODE(lock.stat().st_mode) == 0o600  # narrowed for the next launch
+        for _ in range(2):  # the evidence stays: every launch refuses, none reports another Scholia
+            with pytest.raises(desktop.UnsafeDataFolderError):
+                desktop.take_lock(data)
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o644
+        lock.unlink()  # the researcher removes it
+        fd = desktop.take_lock(data)  # a new, owner-only lock file
+        assert fd is not None and stat.S_IMODE(lock.stat().st_mode) == 0o600
+        os.close(fd)
     finally:
         os.close(held)
-    fd = desktop.take_lock(data)
-    assert fd is not None
-    os.close(fd)
+
+
+def test_a_data_folder_path_that_goes_back_up_is_refused(tmp_path):
+    (tmp_path / "a").mkdir()
+    with pytest.raises(desktop.UnsafeDataFolderError):
+        desktop.take_lock(tmp_path / "a" / ".." / "data")
+    assert not (tmp_path / "data").exists()
 
 
 def test_a_data_folder_others_could_write_is_refused_before_its_lock_is_opened(tmp_path):
