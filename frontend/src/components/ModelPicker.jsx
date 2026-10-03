@@ -20,8 +20,10 @@ const listeners = new Set();
 const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh']; // backend/budget_router.py
 let choice = null; // read from the personal settings ([ui] model) once per window
 let reading = null;
+let picks = 0; // every choice made and every pick, in any picker: a window save completes its pick only if none came after
 
 function publish(next) {
+  picks += 1;
   choice = next;
   listeners.forEach((listener) => listener());
 }
@@ -126,7 +128,6 @@ export function ModelPicker({ projectId }) {
   const [catalog, setCatalog, reload] = useCatalog(open, projectId, chosen?.model ? `${chosen.provider}:${chosen.model}` : null);
   const [fixing, setFixing] = useState(null); // a model whose window is asked for before it is chosen
   const [fixProblem, setFixProblem] = useState(null);
-  const picks = useRef(0); // each pick counts; a window save completes its choice only if none came after
   const model = catalog?.models.find((m) => m.provider === chosen?.provider && m.id === chosen?.model);
 
   const results = useMemo(() => {
@@ -138,7 +139,7 @@ export function ModelPicker({ projectId }) {
     .filter(Boolean);
 
   function pick(m) {
-    picks.current += 1;
+    picks += 1;
     if (m?.window.status === 'needed') { // a window can be set only where none is reported
       setFixing(m);
       return;
@@ -168,7 +169,7 @@ export function ModelPicker({ projectId }) {
   }
 
   async function setWindow(m, value) {
-    const asked = picks.current;
+    const asked = picks;
     setFixProblem(null);
     try {
       if (await saveSettings({ [settingKey('providers', m.provider, 'windows', m.id)]: value }) === null) {
@@ -179,7 +180,7 @@ export function ModelPicker({ projectId }) {
       setFixProblem(error instanceof ApiError ? error.code : 'internal');
       return; // the field stays, with the reason
     }
-    if (picks.current === asked) choose(m); // its window is set, so the choice it was asked for completes (unless a newer pick came); the catalog's check confirms it
+    if (picks === asked) choose(m); // its window is set, so the choice it was asked for completes (unless a newer pick came); the catalog's check confirms it
     await reload();
   }
 

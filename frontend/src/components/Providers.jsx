@@ -177,7 +177,10 @@ function ProviderCard({ provider, table, save, onChanged }) {
           {choice === 'pick' && <Picker provider={provider} picked={table.models} save={save} />}
           <Field label={t('providers.defaultWindow')} htmlFor={`window-${provider.name}`} hint={t('providers.defaultWindowHint')}
             aside={<Restore disabled={table.default_window == null}
-              onClick={() => save({ [settingKey('providers', provider.name, 'default_window')]: null }).then(forgetModels)} />}>
+              onClick={() => {
+                setModelsProblem(null);
+                save({ [settingKey('providers', provider.name, 'default_window')]: null }).then(forgetModels);
+              }} />}>
             <div className="max-w-48">
               <CommitField id={`window-${provider.name}`} type="number" min={MIN_WINDOW} step={1} inputMode="numeric"
                 value={table.default_window} suggestions={WINDOW_PRESETS} allowEmpty placeholder={t('providers.windowReported')}
@@ -203,7 +206,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
 function Picker({ provider, picked, save }) {
   const t = useT();
   const [models, setModels] = useState(null);
-  const [problem, setProblem] = useState(null); // a listing that failed with nothing to show: Try again reads it again
+  const [problem, setProblem] = useState(null); // a listing that failed: Try again reads it again
   const [query, setQuery] = useState('');
   const retry = useRef(() => {});
   useEffect(() => { // read again whenever a provider or its models change; only the newest read counts
@@ -212,12 +215,8 @@ function Picker({ provider, picked, save }) {
       const mine = ++newest;
       loadModels(provider.name).then((listing) => {
         if (mine !== newest) return;
-        if (listing.status?.error && !listing.models.length) {
-          setProblem(listing.status.error);
-        } else {
-          setProblem(null);
-          setModels(listing.models);
-        }
+        setProblem(listing.status?.error ?? null); // a failed refresh is shown, with Try again
+        if (listing.models.length || !listing.status?.error) setModels(listing.models); // rows it still holds stay
       }).catch((error) => mine === newest && setProblem(error instanceof ApiError ? error.code : 'internal'));
     };
     retry.current = () => { setProblem(null); read(); }; // a failed listing is not kept, so this reads it anew
@@ -237,27 +236,30 @@ function Picker({ provider, picked, save }) {
       ? [...chosen].filter((m) => m !== id) : [...chosen, id] }).then(forgetModels).finally(() => setBusy(false));
   };
   return (
-    <div className="rounded-lg border">
-      <div className="relative border-b">
-        <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
-        <label htmlFor={`pick-${provider.name}`} className="sr-only">{t('providers.search')}</label>
-        <input id={`pick-${provider.name}`} value={query} onChange={(event) => setQuery(event.target.value)}
-          placeholder={t('providers.search')}
-          className="h-9 w-full rounded-t-lg bg-transparent pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring" />
+    <div className="space-y-2">
+      {problem && <LoadState problem={problem} onRetry={() => retry.current()} />}
+      <div className="rounded-lg border">
+        <div className="relative border-b">
+          <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+          <label htmlFor={`pick-${provider.name}`} className="sr-only">{t('providers.search')}</label>
+          <input id={`pick-${provider.name}`} value={query} onChange={(event) => setQuery(event.target.value)}
+            placeholder={t('providers.search')}
+            className="h-9 w-full rounded-t-lg bg-transparent pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring" />
+        </div>
+        <ul className="scroll-thin max-h-56 overflow-y-auto py-1">
+          {shown.map((m) => (
+            <li key={m.id}>
+              <label className="flex cursor-pointer items-center gap-2.5 px-3 py-1.5 text-sm hover:bg-accent">
+                <input type="checkbox" checked={chosen.has(m.id)} disabled={busy} onChange={() => toggle(m.id)} className="accent-[hsl(var(--brand))]" />
+                <span className="min-w-0 flex-1 truncate">{m.name}</span>
+                <span className="truncate font-mono text-xs text-muted-foreground">{m.id}</span>
+              </label>
+            </li>
+          ))}
+          {shown.length === 0 && <li className="px-3 py-2 text-sm text-muted-foreground">{t('providers.noModels')}</li>}
+        </ul>
+        <p className="border-t px-3 py-1.5 text-xs text-muted-foreground">{t('providers.pickedCount', { count: chosen.size })}</p>
       </div>
-      <ul className="scroll-thin max-h-56 overflow-y-auto py-1">
-        {shown.map((m) => (
-          <li key={m.id}>
-            <label className="flex cursor-pointer items-center gap-2.5 px-3 py-1.5 text-sm hover:bg-accent">
-              <input type="checkbox" checked={chosen.has(m.id)} disabled={busy} onChange={() => toggle(m.id)} className="accent-[hsl(var(--brand))]" />
-              <span className="min-w-0 flex-1 truncate">{m.name}</span>
-              <span className="truncate font-mono text-xs text-muted-foreground">{m.id}</span>
-            </label>
-          </li>
-        ))}
-        {shown.length === 0 && <li className="px-3 py-2 text-sm text-muted-foreground">{t('providers.noModels')}</li>}
-      </ul>
-      <p className="border-t px-3 py-1.5 text-xs text-muted-foreground">{t('providers.pickedCount', { count: chosen.size })}</p>
     </div>
   );
 }

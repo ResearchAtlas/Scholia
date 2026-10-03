@@ -280,5 +280,6 @@
   "settings.instructionsReplaceConfirm": "Save, replacing them",
   "errors.model_not_offered": "That model is not offered for this provider. Choose it under Providers and models, or pick another.",
   "errors.model_window": "That model has no usable context window. Set one under Providers and models, or pick another model.",
+  "errors.refresh_failed": "The provider's model list could not be read. Check its connection, then try again.",
   "settings.instructionsUnreadable": "This file could not be read, so it cannot be edited here. Check its permissions in the data folder."
 }

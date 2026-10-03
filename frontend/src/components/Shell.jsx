@@ -65,10 +65,17 @@ export function Shell({ health, settings, onLanguage }) {
     setNotice(errorText(t, error instanceof ApiError ? error.code : 'internal'));
   }, [t]);
 
+  // Only the newest read of the projects is shown, with the newest project asked for.
+  const projectReads = useRef({ count: 0, prefer: undefined });
   const loadProjects = useCallback(async (prefer) => {
+    const reads = projectReads.current;
+    const read = ++reads.count;
+    if (prefer !== undefined) reads.prefer = prefer;
     const { projects: listed } = await get('/api/projects');
+    if (read !== reads.count) return listed; // a newer read is under way
+    const wanted = reads.prefer ?? remembered();
+    reads.prefer = undefined;
     setProjects(listed);
-    const wanted = prefer ?? remembered();
     const chosen = listed.find((p) => p.id === wanted) ?? listed.find((p) => p.kind !== 'general') ?? listed[0];
     setProjectId(chosen?.id ?? null);
     return listed;

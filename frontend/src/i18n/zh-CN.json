@@ -278,5 +278,6 @@
   "settings.instructionsReplaceConfirm": "保存并替换",
   "errors.model_not_offered": "此服务商未提供该模型。请在“服务商与模型”中启用它，或选择其他模型。",
   "errors.model_window": "该模型没有可用的上下文窗口。请在“服务商与模型”中设置窗口，或选择其他模型。",
+  "errors.refresh_failed": "无法读取服务商的模型列表。请检查连接，然后重试。",
   "settings.instructionsUnreadable": "无法读取此文件，因此不能在此编辑。请检查数据文件夹中该文件的权限。"
 }
