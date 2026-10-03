@@ -138,11 +138,23 @@ def _limit(state, code, reason):
     state["damaged"], state["damaged_code"] = reason, code
 
 
+def limited(state):
+    """(code, why) when only LIMITED is served, else None: the app was limited (_limit), or the
+    database it runs on found itself damaged since it opened (the full check of a backup, at
+    launch, while idle or asked for), which stops its writes."""
+    if "damaged" in state:
+        return state.get("damaged_code", "database_damaged"), state["damaged"]
+    db = state.get("db")
+    if db is not None and db.damaged is not None:
+        return "database_damaged", "A check found the database damaged; restore a backup"
+    return None
+
+
 class Gate:
     """Every API request passes it (pure ASGI, so streamed responses pass through untouched).
 
-    Only LIMITED is served while the app is limited (state["damaged"]: a database damaged at
-    startup, or a restore that could neither be finished nor undone; 503 with state["damaged_code"])
+    Only LIMITED is served while the app is limited (see limited: a database damaged at startup or
+    found damaged since, or a restore that could neither be finished nor undone; 503 with its code)
     and while a restore runs (state["restoring"]; 503 restoring): nothing else reads or writes then,
     GET routes that write an audit row and turn admissions included. Every other request runs
     inside state["writers"] shared, so a restore, once it has stopped admissions, waits until none
@@ -163,9 +175,8 @@ class Gate:
             return await (self._refused() or self.app)(scope, receive, send)
 
     def _refused(self):
-        if "damaged" in self.state:
-            return JSONResponse({"code": self.state.get("damaged_code", "database_damaged"),
-                                 "message": "Scholia can only restore a backup now"}, status_code=503)
+        if (why := limited(self.state)) is not None:
+            return JSONResponse({"code": why[0], "message": "Scholia can only restore a backup now"}, status_code=503)
         if self.state.get("restoring"):
             return JSONResponse({"code": "restoring", "message": "A backup is being restored"}, status_code=503)
         return None
@@ -1261,19 +1272,44 @@ def _staging(data_dir):
     return folder
 
 
+def _free_name(destination, prefix, stamp):
+    name, n = f"{prefix}-{stamp}.zip", 1
+    while _exists(destination / name) or _exists(destination / f".{name}.tmp"):
+        n += 1
+        name = f"{prefix}-{stamp}-{n}.zip"
+    return destination / name
+
+
+def _publish(tmp, final):
+    """Give the written file tmp the name final too, or raise FileExistsError when something is
+    there, leaving nothing of its own at final when it raises: a hard link; on a file system
+    without them (exFAT, some shares), final is taken first, exclusively, then replaced by tmp."""
+    try:
+        os.link(tmp, final)
+    except FileExistsError:
+        raise
+    except OSError as error:
+        if error.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK):
+            raise
+        os.close(os.open(final, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+        try:
+            os.rename(tmp, final)
+        except BaseException:
+            final.unlink(missing_ok=True)  # its own empty file
+            raise
+
+
 def _write_zip(destination, prefix, entries, passphrase, *, stop, audit):
     """Write entries [(name, bytes or a file's path)] to a new zip file in destination, owner-only:
     AES-encrypted with passphrase when given. audit(path) records it first, before anything is
     written there, so no file ever leaves the data folder unrecorded; a failure afterwards leaves
-    the record of an attempt. It is written under a temporary name and renamed when complete and
-    synced; on any failure, what was written there is removed. stop() is checked as it goes; when
-    true (the app is closing), it stops with 503 closing. Returns the file's path."""
+    the record of an attempt. It is written under a temporary name and given its name when complete
+    and synced, never replacing a file that appeared there meanwhile (it takes the next free name,
+    recorded too); on any failure, what was written there is removed. stop() is checked as it goes;
+    when true (the app is closing), it stops with 503 closing. Returns the file's path."""
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    name, n = f"{prefix}-{stamp}.zip", 1
-    while (destination / name).exists() or (destination / f".{name}.tmp").exists():
-        n += 1
-        name = f"{prefix}-{stamp}-{n}.zip"
-    final, tmp = destination / name, destination / f".{name}.tmp"
+    final = _free_name(destination, prefix, stamp)
+    tmp, published = destination / f".{final.name}.tmp", False
     audit(final)
     pyzipper = _pyzipper()
     options = {"encryption": pyzipper.WZ_AES} if passphrase else {}
@@ -1299,11 +1335,20 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop, audit):
                     if stop():
                         raise DatabaseClosedError("the app is closing; the file was not finished")
         _fsync(tmp)
-        os.rename(tmp, final)
+        while True:
+            try:
+                _publish(tmp, final)
+                published = True
+                tmp.unlink(missing_ok=True)  # its other name, when linked
+                break
+            except FileExistsError:  # a file someone put there meanwhile: never replaced
+                final = _free_name(destination, prefix, stamp)
+                audit(final)
         _fsync(destination)
     except BaseException as error:
         tmp.unlink(missing_ok=True)
-        final.unlink(missing_ok=True)  # published, but its folder could not be synced: not a backup
+        if published:  # but its folder could not be synced: not a backup
+            final.unlink(missing_ok=True)
         if isinstance(error, DatabaseClosedError):
             raise BackupError(503, "closing", "The app is closing") from None
         raise

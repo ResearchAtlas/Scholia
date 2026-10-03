@@ -117,3 +117,22 @@ async def test_a_database_damaged_at_startup_is_never_reset_and_only_restore_is_
         assert (await send(client, conversation))[-1]["status"] == "succeeded"  # the harness runs
         restored = client.state["db"]
     assert restored.closed
+
+
+async def test_a_database_a_backup_finds_damaged_leaves_the_app_offering_only_a_restore(tmp_path):
+    data, project = tmp_path / "data", new_id()
+
+    def a_backup_then_damage():
+        with Database(data) as db:
+            db.write(lambda conn: conn.execute(
+                "INSERT INTO projects (id, name, kind) VALUES (?, 'Good', 'research')", (project,)))
+            db.backup(now=START)  # an earlier day's backup, so the launch backs up again
+        damage_the_projects_table(data, project)
+
+    await asyncio.to_thread(a_backup_then_damage)
+    async with started(data, setup=False) as client:  # quick_check passes; the launch backup's full check does not
+        assert client.state["db"].damaged and "damaged" not in client.state
+        assert "restore a backup" in (await client.get("/api/health")).json()["database_damaged"]
+        refused = await client.post("/api/projects", json={"name": "After"})
+        assert (refused.status_code, refused.json()["code"]) == (503, "database_damaged")  # not a 500 per write
+        assert (await client.get("/api/backups")).status_code == 200  # restore stays offered

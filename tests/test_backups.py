@@ -929,3 +929,54 @@ async def test_a_cancel_while_a_refused_restore_still_stops_a_title_run_ends_it(
         assert len(calls) == 1  # never started again
         [(status, reason)] = await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", run_id)
         assert (status, reason) == ("cancelled", "researcher")
+
+
+async def test_the_backup_before_a_project_deletion_waits_for_a_restore_staging_its_backup(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    async with started(data) as client:
+        project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+        backup = (await client.post("/api/backups")).json()["id"]
+        staging, release = hold(monkeypatch, backups_module, "_stage")
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        await asyncio.to_thread(staging.wait, 10)
+        backed_up = threading.Event()
+        real = backups_module.backup_before_deletion
+
+        def backup_before_deletion(db):
+            backed_up.set()
+            return real(db)
+
+        monkeypatch.setattr(backups_module, "backup_before_deletion", backup_before_deletion)
+        deletion = asyncio.create_task(client.delete(f"/api/projects/{project}"))
+        await asyncio.sleep(0.3)
+        assert not backed_up.is_set()  # its retention could move the generation being staged
+        release.set()
+        assert (await restore).status_code == 200
+        await deletion
+        assert backed_up.is_set()
+
+
+@pytest.mark.parametrize("hard_links", [True, False])
+async def test_a_file_that_appears_at_a_backups_name_meanwhile_is_never_replaced(tmp_path, monkeypatch, hard_links):
+    import errno
+    destination, audited, theirs = tmp_path / "Backups", [], b"the researcher's own file"
+    destination.mkdir()
+    if not hard_links:  # such as an exFAT drive
+        def no_links(source, target, **kwargs):
+            raise OSError(errno.ENOTSUP, "Operation not supported")
+        monkeypatch.setattr(backups_module.os, "link", no_links)
+
+    def stop():  # while it is written, a file appears at the name it was to take
+        if not (audited[0]).exists():
+            audited[0].write_bytes(theirs)
+        return False
+
+    source = tmp_path / "a.txt"
+    source.write_bytes(b"x")
+    path = await asyncio.to_thread(backups_module._write_zip, destination, "scholia-backup", [("a.txt", source)],
+                                   None, stop=stop, audit=audited.append)
+    assert audited[0].read_bytes() == theirs and path != audited[0]
+    assert audited == [audited[0], path]  # the name it took instead is recorded too
+    with zipfile.ZipFile(path) as archive:
+        assert archive.read("a.txt") == b"x" and mode(path) == 0o600
+    assert sorted(p.name for p in destination.iterdir()) == sorted([audited[0].name, path.name])  # no temporary left

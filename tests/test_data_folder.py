@@ -493,3 +493,31 @@ def test_a_scholia_database_whose_first_page_is_damaged_can_still_be_chosen(tmp_
     good = path.read_bytes()
     path.write_bytes(good[:100] + b"\xff" * 4000 + good[4100:])  # SQLite reads it as malformed (corrupt)
     assert data_folder.database_problem(chosen) is None  # damaged: the app offers a restore there
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root writes anywhere")
+def test_a_folder_scholia_cannot_write_in_is_not_recorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    chosen = tmp_path / "Other"
+    chosen.mkdir()
+    chosen.chmod(0o500)
+    try:
+        with pytest.raises(data_folder.FolderRefused) as refused:
+            data_folder.choose(tmp_path / "default", str(chosen))
+    finally:
+        chosen.chmod(0o700)
+    assert refused.value.code == "data_folder_not_writable"  # the next launch could not make its lock there
+    assert not (tmp_path / data_folder.LOCATION_FILE).exists()
+
+
+SYSTEM_EMPTY = Path("/var/empty")  # macOS: an empty folder of root's
+
+
+@pytest.mark.skipif(os.getuid() == 0 or not SYSTEM_EMPTY.is_dir() or any(SYSTEM_EMPTY.iterdir())
+                    or SYSTEM_EMPTY.stat().st_uid != 0, reason="needs an empty folder of root's")
+def test_a_folder_of_roots_is_not_recorded(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    with pytest.raises(data_folder.FolderRefused) as refused:
+        data_folder.choose(tmp_path / "default", str(SYSTEM_EMPTY))
+    assert refused.value.code == "data_folder_not_writable"
+    assert not (tmp_path / data_folder.LOCATION_FILE).exists()

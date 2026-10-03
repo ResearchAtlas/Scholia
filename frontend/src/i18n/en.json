@@ -176,6 +176,7 @@
   "errors.data_folder_foreign": "That folder holds a database that is not Scholia's.",
   "errors.data_folder_newer": "That folder holds data from a newer version of Scholia.",
   "errors.data_folder_unchecked": "Scholia could not check the database in that folder.",
+  "errors.data_folder_not_writable": "That folder is not yours, or Scholia cannot write in it.",
   "status.running": "Running",
   "status.succeeded": "Done",
   "status.failed": "Failed",

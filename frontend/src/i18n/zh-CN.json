@@ -175,6 +175,7 @@
   "errors.data_folder_foreign": "该文件夹中有一个不属于 Scholia 的数据库。",
   "errors.data_folder_newer": "该文件夹中存放着更新版本 Scholia 的数据。",
   "errors.data_folder_unchecked": "Scholia 无法检查该文件夹中的数据库。",
+  "errors.data_folder_not_writable": "该文件夹不属于你的账户，或者 Scholia 无法写入。",
   "status.running": "运行中",
   "status.succeeded": "已完成",
   "status.failed": "失败",

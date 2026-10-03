@@ -167,7 +167,8 @@ class FolderRefused(ValueError):
 def choose(default, path, *, home=None, fs_type=None) -> Path:
     """Record path as the data folder for the next launch, after checking it as the desktop entry
     will: an absolute path, not synced or on a network, a folder (made here, owner-only, under an
-    existing one) that no other account can change, and empty or holding Scholia's data already
+    existing one) of this account's that it can write in and no other account can change, and empty
+    or holding Scholia's data already
     (the next launch narrows everything in it to owner-only). Choosing the default removes the record.
     Raises FolderRefused, or UnsafeDataFolderError, saying why it cannot be used."""
     if not os.path.isabs(path) or ".." in Path(path).parts:
@@ -192,6 +193,8 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
         pass
     if path.is_symlink() or not path.is_dir():
         raise FolderRefused("data_folder_invalid", "That is not a folder")
+    if os.lstat(path).st_uid != os.getuid() or not os.access(path, os.W_OK | os.X_OK):  # its lock is made there
+        raise FolderRefused("data_folder_not_writable", "Choose a folder of your own that Scholia can write in")
     held = database_problem(path)  # checks the folder, then its scholia.sqlite3 (not just its name)
     if held:
         raise FolderRefused(f"data_folder_{held[0]}", f"Scholia cannot use that folder: {held[1]}")

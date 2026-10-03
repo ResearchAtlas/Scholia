@@ -322,8 +322,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @app.get("/api/health")
     async def health():
+        why = backups.limited(state)
         return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir),
-                **({"database_damaged": state["damaged"]} if "damaged" in state else {})}
+                **({"database_damaged": why[1]} if why else {})}
 
     async def provider_list():
         configured = providers.configured(data_dir)
@@ -546,7 +547,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(400, "general_project", "The General project cannot be deleted")
         if not purge_backups:  # outside the project-files lock, which it would hold for its whole copy
             try:
-                await _finished(backups.backup_before_deletion, db())
+                async with state["backups_lock"]:  # as every backup: never under a restore staging one
+                    await _finished(backups.backup_before_deletion, db())
             except Exception as error:
                 log.warning("the backup before a project deletion failed (%s)", type(error).__name__)
                 raise ApiError(503, "backup_failed", "The backup before the deletion failed; nothing was deleted")
