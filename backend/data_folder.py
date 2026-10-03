@@ -1,8 +1,9 @@
 """Where the data folder is, whether the live database may be opened there, and choosing another place.
 
 The default folder is desktop.data_folder(). A place the researcher chose instead is recorded
-in LOCATION_FILE inside the default folder, owner-only, where the desktop entry reads it before
-it opens anything else. A data folder inside iCloud Drive, a File Provider sync folder
+in LOCATION_FILE beside the default folder (in ~/Library/Application Support), owner-only, where
+the desktop entry reads it before it opens anything else. It is never inside the default folder,
+which may be the refused one (synced, or a link). A data folder inside iCloud Drive, a File Provider sync folder
 (~/Library/CloudStorage: OneDrive, Dropbox, Google Drive and others), ~/Dropbox, or on a network
 file system is refused (synced): syncing copies a live database file by file and can corrupt it.
 The desktop entry then serves only limited_app, which says why (the interface's data-folder
@@ -28,7 +29,7 @@ from backend.db.database import DB_NAME
 from backend.desktop import UnsafeDataFolderError, _acl_problem, _check_ancestors, _check_folder
 from backend.settings import write_private
 
-LOCATION_FILE = "data-folder.json"  # in the default data folder: {"path": "<the chosen folder>"}
+LOCATION_FILE = "Scholia data folder.json"  # beside the default data folder: {"path": "<the chosen folder>"}
 NETWORK_FILE_SYSTEMS = frozenset({"smbfs", "afpfs", "nfs", "webdav"})
 SYNCED = {  # under the home folder
     "Library/Mobile Documents": "iCloud Drive",
@@ -38,13 +39,13 @@ SYNCED = {  # under the home folder
 
 
 def located(default) -> Path:
-    """The data folder: the place recorded in the default folder's LOCATION_FILE, else the default.
+    """The data folder: the place recorded in LOCATION_FILE beside the default folder, else the default.
 
-    The record is read without following a link, and only if it is a regular file of this account's
-    that no other account could have written; otherwise, or when it is unreadable or not an absolute
-    path, UnsafeDataFolderError.
+    The record is read without following a link, under folders no other account can change, and
+    only if it is a regular file of this account's that no other account could have written;
+    otherwise, or when it is unreadable or not an absolute path, UnsafeDataFolderError.
     """
-    record = Path(default) / LOCATION_FILE
+    record = _record(default)
     try:
         fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -154,14 +155,20 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     if path.is_symlink() or not path.is_dir():
         raise FolderRefused("data_folder_invalid", "That is not a folder")
     _check_folder(path, os.getuid())
-    if default.is_symlink():
-        raise UnsafeDataFolderError("Scholia will not record it: its default folder is a link")
-    os.makedirs(default, 0o700, exist_ok=True)
+    record = _record(default)
     if is_default:
-        (default / LOCATION_FILE).unlink(missing_ok=True)
+        record.unlink(missing_ok=True)
     else:
-        write_private(default / LOCATION_FILE, json.dumps({"path": str(path)}).encode())
+        write_private(record, json.dumps({"path": str(path)}).encode())
     return path
+
+
+def _record(default):
+    """Where the choice is recorded: beside the default folder, never in it, under folders checked
+    as a data folder's are (another account cannot swap them)."""
+    default = Path(default)
+    _check_ancestors(default)
+    return default.parent / LOCATION_FILE
 
 
 class Chosen(BaseModel):

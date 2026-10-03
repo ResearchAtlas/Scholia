@@ -75,14 +75,14 @@ def test_without_a_record_the_default_folder_is_used(tmp_path):
     assert data_folder.located(tmp_path / "default") == tmp_path / "default"
 
 
-def test_a_chosen_place_is_recorded_owner_only_in_the_default_folder(tmp_path, monkeypatch):
+def test_a_chosen_place_is_recorded_owner_only_beside_the_default_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(data_folder, "file_system_type", apfs)
     default, chosen = tmp_path / "default", tmp_path / "Research" / "Scholia"
     chosen.parent.mkdir()
     assert data_folder.choose(default, str(chosen)) == chosen
-    record = default / data_folder.LOCATION_FILE
+    record = default.parent / data_folder.LOCATION_FILE
     assert json.loads(record.read_text()) == {"path": str(chosen)}
-    assert (mode(default), mode(record), mode(chosen)) == (0o700, 0o600, 0o700)
+    assert (mode(record), mode(chosen)) == (0o600, 0o700) and not default.exists()  # nothing made in it
     assert data_folder.located(default) == chosen
     data_folder.choose(default, str(default))  # back to the default: no record
     assert not record.exists() and data_folder.located(default) == default
@@ -103,7 +103,7 @@ def test_a_place_that_cannot_hold_the_data_is_not_recorded(tmp_path, monkeypatch
     with pytest.raises(data_folder.FolderRefused, match=message) as refused:
         data_folder.choose(tmp_path / "default", path.format(tmp=str(tmp_path).lstrip("/")))
     assert refused.value.code == code
-    assert not (tmp_path / "default" / data_folder.LOCATION_FILE).exists()
+    assert not (tmp_path / data_folder.LOCATION_FILE).exists()
 
 
 def test_a_folder_others_could_change_is_not_recorded(tmp_path, monkeypatch):
@@ -113,14 +113,34 @@ def test_a_folder_others_could_change_is_not_recorded(tmp_path, monkeypatch):
     os.chmod(chosen, 0o777)
     with pytest.raises(UnsafeDataFolderError):
         data_folder.choose(tmp_path / "default", str(chosen))
-    assert not (tmp_path / "default" / data_folder.LOCATION_FILE).exists()
+    assert not (tmp_path / data_folder.LOCATION_FILE).exists()
+
+
+@pytest.mark.parametrize("default_is", ["a link", "synced"])
+def test_another_place_is_chosen_without_writing_into_a_refused_default_folder(tmp_path, monkeypatch, default_is):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    home = tmp_path / "home"
+    synced = home / "Dropbox" / "Scholia"
+    synced.mkdir(parents=True)
+    support = home / "Library" / "Application Support"
+    support.mkdir(parents=True)
+    if default_is == "a link":
+        default = support / "Scholia"
+        os.symlink(synced, default)  # the default folder leads into Dropbox
+    else:
+        default = synced
+    chosen = tmp_path / "Local" / "Scholia"
+    chosen.parent.mkdir()
+    assert data_folder.choose(default, str(chosen), home=home) == chosen
+    assert list(synced.iterdir()) == []  # the refused folder is never written
+    assert data_folder.located(default) == chosen
 
 
 @pytest.mark.parametrize("problem", ["writable by others", "a link", "not json", "relative", "goes back up"])
 def test_a_record_that_cannot_be_trusted_or_read_refuses_the_data_folder(tmp_path, problem):
     default = tmp_path / "default"
     default.mkdir()
-    record = default / data_folder.LOCATION_FILE
+    record = default.parent / data_folder.LOCATION_FILE
     text = {"not json": "{", "relative": '{"path": "Scholia"}', "goes back up": '{"path": "/tmp/../etc"}'}.get(
         problem, json.dumps({"path": str(tmp_path / "elsewhere")}))
     if problem == "a link":
@@ -171,7 +191,7 @@ def test_a_data_folder_on_a_network_share_is_never_opened_and_another_place_is_c
     assert answers["refused"]["code"] == "data_folder_synced"
     assert answers["odd"] == ["data_folder_invalid", "invalid_request", "invalid_request"]
     assert answers["chosen"] == {"ok": True, "data_folder": str(chosen), "restart": True}
-    assert sorted(p.name for p in share.iterdir()) == [data_folder.LOCATION_FILE]  # no lock, log or database
+    assert list(share.iterdir()) == []  # nothing written there: no lock, log, database or record
 
     seen.clear()  # the next launch opens the chosen place, and never the share
     assert desktop.run(share, _window(seen), keyring_backend=FakeKeyring(), listening=register_server) == 0
@@ -200,7 +220,7 @@ def test_only_an_empty_folder_or_one_holding_scholias_data_is_recorded(tmp_path,
     os.chmod(documents / "run.sh", 0o755)
     with pytest.raises(data_folder.FolderRefused, match="empty folder"):  # its files would be narrowed to owner-only
         data_folder.choose(default, str(documents))
-    assert mode(documents / "run.sh") == 0o755 and not (default / data_folder.LOCATION_FILE).exists()
+    assert mode(documents / "run.sh") == 0o755 and not (default.parent / data_folder.LOCATION_FILE).exists()
     moved.mkdir()
     (moved / "scholia.sqlite3").write_bytes(b"")  # a data folder the researcher moved there
     assert data_folder.choose(default, str(moved)) == moved
@@ -224,11 +244,12 @@ def test_the_default_chosen_again_by_another_spelling_removes_the_record(tmp_pat
     default, other = tmp_path / "default", tmp_path / "other"
     other.mkdir()
     data_folder.choose(default, str(other))
+    default.mkdir()  # it holds the earlier data, and something else
     (default / "notes.txt").write_text("not Scholia's")
     spelled = str(default)[:-len("default")] + "DEFAULT"  # the same folder on a case-insensitive volume
     assert os.path.samefile(spelled, default)
     data_folder.choose(default, spelled)
-    assert not (default / data_folder.LOCATION_FILE).exists()
+    assert not (default.parent / data_folder.LOCATION_FILE).exists()
 
 
 def test_the_synced_check_ignores_unicode_normalization(tmp_path):
