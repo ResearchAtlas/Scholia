@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -551,19 +552,37 @@ def _open_checked(path, check, latest=None, stop=None):
 
 
 def check_identity(path, latest=len(MIGRATIONS)):
-    """Check the database file at path as opening it would (see _usable_state), reading only the
-    file itself: no lock, WAL or shared-memory file is made beside it. Raises ForeignDatabaseError
-    for another application's file, NewerDatabaseError for a newer schema, and DatabaseDamagedError
-    for a file SQLite cannot read as a database."""
-    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    """Check the database file at path as opening it would (see _usable_state), writing nothing
+    beside it: no lock, WAL or shared-memory file is made there. A write-ahead log left beside it
+    (after a crash) is read too, from a private copy of both, since it may hold the newest schema.
+    Raises ForeignDatabaseError for another application's file, NewerDatabaseError for a newer
+    schema, DatabaseDamagedError for a file SQLite cannot read as a database, and OSError when the
+    copy cannot be made."""
+    _refuse_event_loop()
+    path = Path(path).resolve()
+    wal = path.with_name(path.name + "-wal")
+    if wal.is_symlink() or not wal.is_file() or not wal.stat().st_size:
+        return _check_identity(path.as_uri() + "?mode=ro&immutable=1", latest)  # immutable: no log is read
+    # ponytail: copies the whole database (only when a crash left a log); link instead if that is too slow
+    with tempfile.TemporaryDirectory() as folder:
+        copy = Path(folder) / path.name
+        shutil.copyfile(path, copy)
+        shutil.copyfile(wal, copy.with_name(copy.name + "-wal"))
+        return _check_identity(copy.as_uri() + "?mode=ro", latest)
+
+
+def _check_identity(uri, latest):
+    conn = None
     try:
+        conn = sqlite3.connect(uri, uri=True)
         _usable_state(conn, latest)
     except (ForeignDatabaseError, NewerDatabaseError):
         raise
-    except sqlite3.DatabaseError as error:
+    except sqlite3.DatabaseError as error:  # an unreadable file included
         raise DatabaseDamagedError(f"the file cannot be read as a database: {error}") from error
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def _usable_state(conn, latest):

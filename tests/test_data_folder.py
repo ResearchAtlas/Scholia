@@ -287,8 +287,26 @@ def a_newer_scholia_database(folder):
     conn.close()
 
 
+def a_newer_scholia_database_in_its_log(folder):
+    """As a newer Scholia that stopped mid-way leaves it: its schema only in the write-ahead log."""
+    import shutil
+    import sqlite3
+    from backend.db import Database
+    source = folder.parent / "source"
+    Database(source).close()
+    conn = sqlite3.connect(source / "scholia.sqlite3")
+    conn.execute("PRAGMA wal_autocheckpoint = 0")
+    conn.execute("PRAGMA user_version = 999")
+    conn.commit()
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in ("scholia.sqlite3", "scholia.sqlite3-wal"):
+        shutil.copyfile(source / name, folder / name)  # copied while it is open, as a crash leaves them
+    conn.close()
+
+
 @pytest.mark.parametrize("held, code", [(another_apps_database, "data_folder_foreign"),
-                                         (a_newer_scholia_database, "data_folder_newer")])
+                                         (a_newer_scholia_database, "data_folder_newer"),
+                                         (a_newer_scholia_database_in_its_log, "data_folder_newer")])
 def test_a_folder_whose_database_scholia_cannot_open_is_not_recorded(tmp_path, monkeypatch, held, code):
     monkeypatch.setattr(data_folder, "file_system_type", apfs)
     chosen = tmp_path / "Other"
@@ -309,7 +327,8 @@ def test_a_folder_with_a_damaged_scholia_database_can_be_chosen(tmp_path, monkey
     assert data_folder.choose(tmp_path / "default", str(chosen)) == chosen
 
 
-@pytest.mark.parametrize("held, problem", [(another_apps_database, "foreign"), (a_newer_scholia_database, "newer")])
+@pytest.mark.parametrize("held, problem", [(another_apps_database, "foreign"), (a_newer_scholia_database, "newer"),
+                                            (a_newer_scholia_database_in_its_log, "newer")])
 def test_a_chosen_folder_holding_a_database_scholia_cannot_open_is_explained_untouched(tmp_path, monkeypatch,
                                                                                        held, problem):
     monkeypatch.setattr(data_folder, "file_system_type", apfs)
@@ -330,3 +349,58 @@ def test_the_default_folders_newer_database_is_still_refused_at_launch(tmp_path)
     seen = []
     assert desktop.run(default, _window(seen), keyring_backend=FakeKeyring(), listening=register_server) == 1
     assert seen == []  # as S1-08 refuses it: the app does not open
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root reads any file")
+def test_a_folder_whose_database_cannot_be_read_is_left_to_open_as_it_would(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    chosen = tmp_path / "Other"
+    another_apps_database(chosen)
+    (chosen / "scholia.sqlite3").chmod(0)
+    assert data_folder.database_problem(chosen) is None  # not a crash, at launch or here
+    assert data_folder.choose(tmp_path / "default", str(chosen)) == chosen
+
+
+def test_choosing_the_default_folder_back_checks_its_database(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default = tmp_path / "default"
+    a_newer_scholia_database(default)
+    with pytest.raises(data_folder.FolderRefused) as refused:
+        data_folder.choose(default, str(default))
+    assert refused.value.code == "data_folder_newer"
+
+
+def test_a_folder_others_could_change_is_refused_before_its_database_is_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    chosen = tmp_path / "Other"
+    another_apps_database(chosen)
+    chosen.chmod(0o777)
+    read = []
+    monkeypatch.setattr(data_folder, "check_identity", read.append)
+    with pytest.raises(UnsafeDataFolderError):
+        data_folder.choose(tmp_path / "default", str(chosen))
+    assert read == [] and not (tmp_path / data_folder.LOCATION_FILE).exists()
+
+
+def test_a_folder_whose_database_is_a_link_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    elsewhere, chosen = tmp_path / "elsewhere", tmp_path / "Other"
+    another_apps_database(elsewhere)
+    chosen.mkdir()
+    os.symlink(elsewhere / "scholia.sqlite3", chosen / "scholia.sqlite3")
+    with pytest.raises(UnsafeDataFolderError):
+        data_folder.choose(tmp_path / "default", str(chosen))
+    assert not (tmp_path / data_folder.LOCATION_FILE).exists()
+
+
+def test_a_chosen_folder_that_became_a_link_is_unsafe_whatever_it_leads_to(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default, chosen, real = tmp_path / "default", tmp_path / "Other", tmp_path / "Real"
+    chosen.mkdir()
+    data_folder.choose(default, str(chosen))
+    chosen.rename(real)
+    another_apps_database(real)
+    os.symlink(real, chosen)
+    seen = []
+    assert desktop.run(default, _window(seen), listening=register_server) == 1
+    assert seen[0]["data_folder_problem"] == "unsafe"  # the link is the problem, not what it leads to

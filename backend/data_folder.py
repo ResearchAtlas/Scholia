@@ -124,9 +124,19 @@ def file_system_type(path) -> str | None:
 def database_problem(folder):
     """("foreign" or "newer", why) when folder holds a scholia.sqlite3 that is another application's,
     or Scholia's from a newer version, read without writing anything there; None otherwise (none
-    there, or a damaged one, which the app opens in its damaged-database mode, offering restore)."""
-    path = Path(folder) / DB_NAME
-    if path.is_symlink() or not path.is_file():
+    there, or one that cannot be read, which the app opens as it would anyway: a damaged one in its
+    damaged-database mode, offering restore). The existing folder is checked first, as taking its
+    lock would (UnsafeDataFolderError when another account could change it, or it or the database
+    is a link), so nothing another account could have put there is read."""
+    folder = Path(folder)
+    _check_ancestors(folder)
+    if os.path.islink(folder):
+        raise UnsafeDataFolderError("Scholia will not open its data folder: the folder itself is a link")
+    _check_folder(folder, os.getuid())
+    path = folder / DB_NAME
+    if path.is_symlink():
+        raise UnsafeDataFolderError("Scholia will not open its data folder: its database is a link")
+    if not path.is_file():
         return None
     try:
         check_identity(path)
@@ -169,16 +179,15 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     if existing and not is_default and any(entry.name not in _FINDER_FILES for entry in path.iterdir()) \
             and not (path / DB_NAME).is_file():
         raise FolderRefused("data_folder_not_empty", "Choose an empty folder, or one that holds Scholia's data")
-    held = database_problem(path) if existing else None  # a scholia.sqlite3 is checked, not just its name
-    if held:
-        raise FolderRefused(f"data_folder_{held[0]}", f"Scholia cannot use that folder: {held[1]}")
     try:
         os.mkdir(path, 0o700)
     except FileExistsError:
         pass
     if path.is_symlink() or not path.is_dir():
         raise FolderRefused("data_folder_invalid", "That is not a folder")
-    _check_folder(path, os.getuid())
+    held = database_problem(path)  # checks the folder, then its scholia.sqlite3 (not just its name)
+    if held:
+        raise FolderRefused(f"data_folder_{held[0]}", f"Scholia cannot use that folder: {held[1]}")
     record = _record(default)
     if is_default:
         record.unlink(missing_ok=True)

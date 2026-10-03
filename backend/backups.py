@@ -109,7 +109,8 @@ class Writers:
             yield
         finally:
             self._shared -= 1  # at once, so a cancellation below cannot keep the slot
-            await asyncio.shield(self._notify())
+            if self._waiting:  # only a waiting restore waits for the slots; otherwise a request ends at once
+                await asyncio.shield(self._notify())
 
     async def _notify(self):
         async with self._changed:

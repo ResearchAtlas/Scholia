@@ -396,3 +396,39 @@ async def test_a_restore_done_whose_journal_cannot_be_ended_is_finished_harmless
     assert not (data / "backups" / backups_module.JOURNAL).exists()
     assert not (data / "backups" / backups_module.STAGING).exists() or \
         list((data / "backups" / backups_module.STAGING).iterdir()) == []
+
+
+async def test_a_restore_done_whose_bookkeeping_fails_twice_lists_both_and_logs_no_paths(tmp_path, monkeypatch,
+                                                                                      caplog):
+    from backend.db import Database
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_write, real_read, after_audit = Database.write, Database.read, []
+
+    def unreadable(db):
+        raise OSError(f"I/O error reading {data}")
+
+    def write(self, fn):
+        result = real_write(self, fn)
+        if fn.__qualname__.startswith("_replace"):  # the restore's audit row: the schema read comes next
+            after_audit.append(True)
+        return result
+
+    def read(self, fn):
+        if after_audit:
+            after_audit.clear()
+            raise OSError(f"I/O error reading {data}")
+        return real_read(self, fn)
+
+    caplog.set_level("WARNING", logger=backups_module.log.name)
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "_missing_files", unreadable)
+        monkeypatch.setattr(Database, "write", write)
+        monkeypatch.setattr(Database, "read", read)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text
+        assert response.json()["not_recorded"] == ["missing_files", "schema_version"]
+        assert response.json()["schema_version"] is None
+    logged = [r.getMessage() for r in caplog.records if r.name == backups_module.log.name]
+    assert any("missing_files" in m for m in logged) and any("schema_version" in m for m in logged)
+    assert str(tmp_path) not in caplog.text  # what failed is logged, never where
