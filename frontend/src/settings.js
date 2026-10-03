@@ -132,18 +132,20 @@ export function useInstructions(projectId, withProject) {
 // The bytes a text takes in UTF-8, as the 32 KiB instructions cap counts them.
 export const utf8Bytes = (text) => new TextEncoder().encode(text ?? '').length;
 
-// Each provider's model listing, read once per window and again after a provider changes.
+// Each provider's model listing, read once per window and again after a provider changes. With
+// a project, each model says whether the project allows it (the picker shows only those).
 const listings = new Map();
 
-export function loadModels(provider, { refresh = false } = {}) {
-  if (refresh || !listings.has(provider)) {
-    const query = refresh ? '?refresh=true' : '';
-    const listing = get(`/api/providers/${encodeURIComponent(provider)}/models${query}`);
-    listings.set(provider, listing);
-    const drop = () => { if (listings.get(provider) === listing) listings.delete(provider); };
+export function loadModels(provider, { refresh = false, projectId = null } = {}) {
+  const key = `${provider}\n${projectId ?? ''}`;
+  if (refresh || !listings.has(key)) {
+    const query = new URLSearchParams({ ...(refresh ? { refresh: 'true' } : {}), ...(projectId ? { project_id: projectId } : {}) });
+    const listing = get(`/api/providers/${encodeURIComponent(provider)}/models${query.size ? `?${query}` : ''}`);
+    listings.set(key, listing);
+    const drop = () => { if (listings.get(key) === listing) listings.delete(key); };
     listing.then((read) => { if (read?.status?.error) drop(); }, drop); // a failed listing is read again next time
   }
-  return listings.get(provider);
+  return listings.get(key);
 }
 
 const catalogListeners = new Set();
@@ -179,6 +181,16 @@ export function settingKey(...parts) {
 export function groupOf(provider) {
   if (!provider.enabled) return 'off';
   return provider.has_key ? 'ready' : 'setup';
+}
+
+// The picker's models after a read: the rows read now, and a provider's earlier rows when only
+// its listing failed, but never across a change of the project's protection (section 6.4: only
+// the routes the project allows are shown); with no read at all (failed), none.
+export function keptModels(current, next, unread) {
+  if (!next) return [];
+  const kept = current && current.protection === next.protection
+    ? current.models.filter((m) => unread.has(m.provider)) : [];
+  return [...next.models, ...kept];
 }
 
 // What a message or a Continue sends for the picker's choice: nothing for no choice (the

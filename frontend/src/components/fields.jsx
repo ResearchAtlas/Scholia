@@ -117,6 +117,15 @@ export function FileProblems({ problems }) {
   );
 }
 
+// A failed change or read, in the interface language.
+export function Problem({ code }) {
+  const t = useT();
+  if (!code) return null;
+  return <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
+    {code === 'settings_changed' ? t('settings.changedOnDisk') : errorText(t, code)}
+  </p>;
+}
+
 // Loading, or, when the first read failed, why, with a way to try again.
 export function LoadState({ problem, onRetry }) {
   const t = useT();

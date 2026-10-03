@@ -11,6 +11,7 @@ import { ApiError, get, put } from '../api.js';
 import { errorText } from '../text.js';
 import { WINDOW_PRESETS, forgetModels, groupOf, loadModels, onCatalogChange, settingKey, useSettingsFile } from '../settings.js';
 import { CommitField, Field, FileProblems, LoadState, Restore, Section, Segmented } from './fields.jsx';
+import { KeyConfirmation, LocalDeclaration } from './Governance.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
@@ -163,6 +164,8 @@ function ProviderCard({ provider, table, save, onChanged }) {
         {keyProblem && <p role="alert" className="text-xs text-destructive">{errorText(t, keyProblem)}</p>}
         {notice && <p role="status" className="text-xs text-warning">{notice}</p>}
       </form>
+      {openrouter && provider.has_key && <KeyConfirmation provider={provider} onChanged={onChanged} />}
+      <LocalDeclaration provider={provider} onChanged={onChanged} />
 
       {ready && (
         <div className="mt-5 grid gap-5">

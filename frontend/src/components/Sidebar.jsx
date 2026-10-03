@@ -17,6 +17,8 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger }
   from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
+import { SUGGESTED_HOLDS, holdsBody } from '../projects.js';
+import { HoldsChoice } from './Governance.jsx';
 
 export function Sidebar({ projects, projectId, conversations, conversationId, onProject, onProjectsChanged,
   onConversation, onConversationsChanged, onNewConversation, onSettings, onHide }) {
@@ -138,15 +140,22 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
 function NewProjectDialog({ open, onClose, onCreated }) {
   const t = useT();
   const [name, setName] = useState('');
+  const [holds, setHolds] = useState(SUGGESTED_HOLDS); // the question, with its suggested answer (F1)
+  const [venue, setVenue] = useState('');
   const { busy, problem, run, reset } = useAction();
   async function submit(event) {
     event.preventDefault();
-    const created = await run(() => post('/api/projects', { name }));
-    if (created) { setName(''); onCreated(created); }
+    const created = await run(() => post('/api/projects', { name, ...holdsBody(holds, venue) }));
+    if (created) {
+      setName('');
+      setHolds(SUGGESTED_HOLDS);
+      setVenue('');
+      onCreated(created);
+    }
   }
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next) { reset(); onClose(); } }}>
-      <DialogContent className="max-w-md">
+      <DialogContent className="max-h-[90vh] max-w-md overflow-y-auto">
         <form onSubmit={submit} className="grid gap-4">
           <DialogHeader><DialogTitle>{t('project.newTitle')}</DialogTitle></DialogHeader>
           <div className="grid gap-1.5">
@@ -154,6 +163,7 @@ function NewProjectDialog({ open, onClose, onCreated }) {
             <Input id="new-project" value={name} maxLength={200} autoFocus placeholder={t('project.namePlaceholder')}
               onChange={(event) => setName(event.target.value)} />
           </div>
+          <HoldsChoice value={holds} onChange={setHolds} venue={venue} onVenue={setVenue} name="new-project-holds" />
           {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>

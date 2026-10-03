@@ -15,10 +15,18 @@ After the commit, the WAL is checkpointed and truncated, so deleted content does
 not stay in old WAL frames, and unreferenced content files are collected.
 """
 
+import contextlib
 import json
 import logging
+import weakref
 
 log = logging.getLogger(__name__)
+
+# The outbound gate open over a database, if any, by database: delete() marks its write with the
+# gate's revoking_from_thread, so that no request enters the transport after the deletion commits
+# (slice-1 spec section 10). It marks every project: what it deletes may belong, by the time it
+# commits, to another project than one read beforehand (a conversation moved meanwhile, say).
+REVOKING = weakref.WeakKeyDictionary()
 
 # What can be deleted: kind -> (table, column holding the tombstone's title).
 KINDS = {
@@ -151,7 +159,9 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
     """
     if kind not in KINDS:
         raise ValueError(f"cannot delete a {kind!r}")
-    revoked = db.write(lambda conn: _delete(conn, kind, object_id, remove_all_trace))
+    barrier = REVOKING.get(db)
+    with barrier(None) if barrier else contextlib.nullcontext():  # None: every project (see REVOKING)
+        revoked = db.write(lambda conn: _delete(conn, kind, object_id, remove_all_trace))
     if on_committed is not None:
         on_committed(revoked)
     # The deletion is committed. These finish removing its traces, and the next

@@ -105,3 +105,26 @@ async function saveNow(updates, projectId) {
     throw error;
   }
 }
+
+// A change that may need the researcher's confirmation (a less strict level, lifting the review
+// lock, clearing the audit log): it is sent as is; when the backend answers 409
+// confirmation_required with a token, ask() resolves to whether the researcher confirmed, and the
+// change is sent again with the token (in the body, or the query of a DELETE). Resolves to the
+// answer, or null when not confirmed; other refusals throw as api() does.
+export async function confirmedChange(method, path, body, ask) {
+  let response;
+  try {
+    response = await fetch(path, { method, headers: headers(body !== undefined),
+      body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch {
+    throw new ApiError(0, 'unreachable');
+  }
+  const data = await response.json().catch(() => null);
+  if (response.ok) return data;
+  if (data?.code !== 'confirmation_required' || typeof data.token !== 'string') {
+    throw new ApiError(response.status, data?.code ?? 'http_error');
+  }
+  if (!(await ask())) return null;
+  return body === undefined ? api(method, `${path}?token=${encodeURIComponent(data.token)}`)
+    : api(method, path, { ...body, token: data.token });
+}

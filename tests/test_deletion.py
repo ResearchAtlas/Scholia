@@ -555,7 +555,7 @@ def test_a_database_at_schema_1_gets_the_guard_for_its_earlier_deletions(tmp_pat
                 "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (x["c1"], x["project"])))
         db.write(lambda conn: conn.execute(
             "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), x["project"])))
-    [generation] = sorted((data / "backups" / "daily").iterdir())  # taken before the migration
+    generation = sorted((data / "backups" / "daily").iterdir())[0]  # taken before the first migration it ran
     backup = sqlite3.connect(f"{(generation / DB_NAME).as_uri()}?mode=ro", uri=True)
     try:
         assert backup.execute("PRAGMA user_version").fetchone() == (1,)

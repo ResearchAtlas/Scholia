@@ -551,4 +551,26 @@ BEGIN
 END;
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002)
+# The audit log is append-only (ticket 18): a row never changes, and is deleted only by
+# clearing the log, which first writes the record of the clearing; so every deleted row is
+# older than the latest 'audit_cleared' row, and a clearing record is never deleted, nor a
+# purge's record (backup_purge), which a restore compares to tell a purge from rotation. The
+# indexes keep that check, the view by project and the clearing itself fast on a long log.
+_0003 = r"""
+CREATE INDEX audit_log_by_event ON audit_log (event, seq);
+CREATE INDEX audit_log_by_project ON audit_log (project_id, seq);
+
+CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only');
+END;
+
+CREATE TRIGGER audit_log_cleared_only BEFORE DELETE ON audit_log
+WHEN OLD.event IN ('audit_cleared', 'backup_purge')
+    OR OLD.seq >= coalesce((SELECT max(seq) FROM audit_log WHERE event = 'audit_cleared'), 0)
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log rows are deleted only by clearing the log, after its record');
+END;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003)

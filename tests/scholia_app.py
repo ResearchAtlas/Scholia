@@ -39,9 +39,13 @@ class FakeKeyring:
 class MockProvider:
     """Answers chat completions like OpenRouter. Each call takes the next reply from
     `replies` (a function of the request body, or a (status, body) pair), or a
-    default answer. Set `hold` to an asyncio.Event to keep calls waiting until it is set."""
+    default answer. Set `hold` to an asyncio.Event to keep calls waiting until it is set.
+    Its model listing holds the ids in `catalog` (each with a 128K window), and its
+    zero-retention endpoints those in `zero_retention`; both are empty by default."""
 
-    def __init__(self, *replies, cost=0.002):
+    def __init__(self, *replies, cost=0.002, catalog=(), zero_retention=()):
+        self.catalog = list(catalog)
+        self.zero_retention = list(zero_retention)
         self.replies = list(replies)
         self.title_replies = []  # replies for title calls, which never take from `replies`
         self.requests = []
@@ -60,8 +64,10 @@ class MockProvider:
         self.started.set()
         if self.hold is not None:
             await self.hold.wait()
-        if request.url.path.endswith("/models") or "/endpoints/" in request.url.path:
-            return httpx.Response(200, json={"data": []})
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000} for m in self.catalog]})
+        if "/endpoints/" in request.url.path:
+            return httpx.Response(200, json={"data": [{"model_id": m} for m in self.zero_retention]})
         title = _is_title(body)
         queue = self.title_replies if title else self.replies
         reply = queue.pop(0) if queue else None
@@ -161,3 +167,17 @@ async def background_idle(client, timeout=5.0):
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("background work did not finish")
         await asyncio.sleep(0.01)
+
+
+async def confirm_key(client, provider="openrouter"):
+    """Confirm a provider's key's data settings as the card does: for the key and statement it showed."""
+    [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == provider]
+    confirmation = shown["key_confirmation"]
+    return await client.post("/api/key-attestations", json={
+        "provider": provider, "statement": confirmation["statement"], "key": confirmation["key"]})
+
+
+async def declare(client, provider):
+    """Declare a provider on this Mac as the card does: for the origin it showed."""
+    [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == provider]
+    return await client.post("/api/local-declarations", json={"provider": provider, "origin": shown["origin"]})

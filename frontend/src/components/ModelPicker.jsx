@@ -5,13 +5,15 @@
 // steps, remembered per model in [models] efforts; a model not yet checked shows "Default",
 // and one without reasoning control shows no slider. A model with no usable window is marked,
 // and choosing it asks for its window first (section 8). With nothing chosen, the project's or
-// the personal [models] default applies; choosing Auto overrides it.
+// the personal [models] default applies; choosing Auto overrides it. Only the models the
+// project's protection allows are listed (section 6.4); a choice kept from another project that
+// this one does not allow is marked, and admission refuses it.
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { errorText, visible } from '../text.js';
-import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, onCatalogChange, listingToJudge, settingKey, stillUsable } from '../settings.js';
+import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, keptModels, loadModels, onCatalogChange, listingToJudge, settingKey, stillUsable } from '../settings.js';
 import { CommitField, LoadState } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
@@ -63,10 +65,10 @@ export function useModelChoice() {
   }, () => choice);
 }
 
-// Every model the ready providers offer, with the recent ones, the remembered efforts and the
-// personal default; read each time the picker opens, and once at first for a chosen model's
-// effort steps. A chosen model no longer offered (its provider off, or no longer picked) is
-// dropped, so it is never sent.
+// Every model the ready providers offer and the project allows, with the recent ones, the
+// remembered efforts and the personal default; read each time the picker opens, and once at
+// first for a chosen model's effort steps. A chosen model no longer offered (its provider off,
+// or no longer picked) is dropped, so it is never sent.
 function useCatalog(open, projectId, chosenModel) {
   const [catalog, setCatalog] = useState(null);
   const latest = useRef(0); // the newest load; an older one that finishes later is dropped
@@ -78,22 +80,25 @@ function useCatalog(open, projectId, chosenModel) {
       await readChoice(); // a kept choice is checked against the catalog like any other
       forgetModels({ quiet: true }); // the offers and windows as the settings hold them now
       const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
-      const [{ providers }, { models: recent }, settings, project] = await Promise.all([
+      const [{ providers }, { models: recent }, settings, project, protection] = await Promise.all([
         get('/api/providers'), get('/api/models/recent'), get('/api/settings'),
-        projectId ? get(`/api/settings${query}`) : Promise.resolve(null)]);
+        projectId ? get(`/api/settings${query}`) : Promise.resolve(null),
+        projectId ? get(`/api/projects/${encodeURIComponent(projectId)}`) : Promise.resolve(null)]);
       const ready = providers.filter((p) => p.enabled && p.has_key);
-      const listings = await Promise.allSettled(ready.map((p) => loadModels(p.name)));
+      const listings = await Promise.allSettled(ready.map((p) => loadModels(p.name, { projectId })));
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
-        ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
+        ? listing.value.models.filter((m) => m.offered && m.allowed !== false).map((m) => ({ ...m, provider: ready[i].name }))
+        : []));
       // A provider whose listing failed is reported with Try again; one that could not be read
-      // at all keeps the rows shown before.
+      // at all keeps the rows shown before, while the project's protection is the same.
       const failed = listings.map((listing) => (listing.status === 'rejected'
         ? (listing.reason instanceof ApiError ? listing.reason.code : 'internal') : listing.value.status?.error ?? null));
       const unread = new Set(ready.filter((p, i) => listings[i].status === 'rejected').map((p) => p.name));
       if (mine !== latest.current || !here.current) return;
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
         defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto',
-        problem: failed.find(Boolean) ?? null };
+        problem: failed.find(Boolean) ?? null,
+        protection: protection?.review_lock ? 'locked' : protection?.sensitivity ?? 'normal' };
       // A chosen model is dropped when its provider is no longer ready (the provider list says
       // so), or when its own provider's current listing no longer offers it.
       if (choice?.model) {
@@ -101,11 +106,12 @@ function useCatalog(open, projectId, chosenModel) {
         const own = at >= 0 && listings[at].status === 'fulfilled' ? listings[at].value : null;
         if (at < 0 || !stillUsable(own, choice.model)) setChoice(null); // its provider gone, or no longer offered or usable
       }
-      setCatalog((current) => ({ ...next, models: [...next.models, ...(current?.models ?? []).filter((m) => unread.has(m.provider))] }));
-    } catch (error) { // shown with Try again; what was read before stays
+      setCatalog((current) => ({ ...next, models: keptModels(current, next, unread) }));
+    } catch (error) { // shown with Try again; no model is offered meanwhile, since what the project allows is unknown
       if (mine === latest.current && here.current) {
         const problem = error instanceof ApiError ? error.code : 'internal';
-        setCatalog((current) => ({ ...(current ?? { models: [], recent: [], efforts: {}, several: false, defaultModel: 'auto' }), problem }));
+        setCatalog((current) => ({ ...(current ?? { recent: [], efforts: {}, several: false, defaultModel: 'auto' }),
+          models: keptModels(current, null), problem }));
       }
     }
   }, [projectId]);
@@ -202,6 +208,9 @@ export function ModelPicker({ projectId }) {
             className="flex min-w-0 max-w-56 items-center gap-1.5 rounded-lg px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
             {auto && <Sparkles className="size-3.5 shrink-0 text-brand" aria-hidden="true" />}
             <span className="truncate">{label}</span>
+            {chosen?.model && catalog && !model && !catalog.problem && (
+              <span className="shrink-0 rounded bg-warning/10 px-1.5 py-0.5 text-[11px] text-warning">{t('picker.notAllowed')}</span>
+            )}
             <ChevronDown className="size-3.5 shrink-0" aria-hidden="true" />
           </button>
         </PopoverTrigger>
@@ -225,6 +234,9 @@ export function ModelPicker({ projectId }) {
             {catalog?.problem && <div className="p-1"><LoadState problem={catalog.problem} onRetry={reload} /></div>}
             {catalog && !catalog.problem && results.length === 0 && <p className="px-2 py-3 text-sm text-muted-foreground">{t('picker.none')}</p>}
           </div>
+          {catalog && catalog.protection !== 'normal' && (
+            <p className="border-t px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">{t(`picker.protected.${catalog.protection}`)}</p>
+          )}
           {fixing && (
             <form className="space-y-1.5 border-t p-2" onSubmit={(event) => event.preventDefault()}>
               <label htmlFor="picker-window" className="block text-xs font-medium">{t('picker.setWindow', { model: fixing.name })}</label>

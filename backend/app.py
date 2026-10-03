@@ -11,18 +11,20 @@ import contextlib
 import hashlib
 import json
 import logging
+import secrets
 import shutil
 import stat
 import threading
 import time
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 import anyio
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -30,7 +32,8 @@ from backend import APP_VERSION, credentials, openrouter, openrouter_client, pro
 from backend import backups
 from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
-from backend.outbound_gate import OutboundGate
+from backend.outbound_gate import OutboundGate, local_origin
+from backend import governance
 from backend.runs import AdmissionError, Harness, _through, derived_status
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instruction_file_size, instructions_size,
                               load_instructions, load_settings, visible, write_private)
@@ -94,9 +97,56 @@ def _visible(text):
     return visible(text)
 
 
+Level = Literal["normal", "private", "local_only"]
+
+
 class NewProject(BaseModel):
+    """A project and the answer to what it will hold (F1): Normal, Private, or someone else's
+    submission, the review-lock preset (Local only with the lock, and the venue if known)."""
     name: str = Field(min_length=1, max_length=200)
+    sensitivity: Level = "normal"
+    review_lock: bool = False
+    review_venue: str | None = Field(default=None, max_length=200)
     _name = field_validator("name")(classmethod(lambda cls, v: _visible(v)))
+
+    @model_validator(mode="after")
+    def _preset(self):
+        if self.review_lock and self.sensitivity != "local_only":
+            raise ValueError("the review lock comes with Local only")
+        if not self.review_lock:
+            self.review_venue = None
+        return self
+
+
+class SensitivityChange(BaseModel):
+    level: Level
+    token: str | None = Field(default=None, max_length=100)  # the confirmation a less strict level needs
+
+
+class ReviewLock(BaseModel):
+    locked: bool
+    venue: str | None = Field(default=None, max_length=200)
+    token: str | None = Field(default=None, max_length=100)  # the confirmation lifting the lock needs
+
+
+class Declaration(BaseModel):
+    provider: str = Field(min_length=1, max_length=1000)
+    origin: str = Field(min_length=1, max_length=300)  # the server's origin as the researcher saw it
+
+
+class KeyConfirmation(BaseModel):
+    provider: str = Field(min_length=1, max_length=1000)
+    statement: str = Field(min_length=1, max_length=100)  # the version of the statement the researcher saw
+    key: str = Field(min_length=1, max_length=100)  # the reference to the key the card showed
+
+
+class PrivateRouteChange(BaseModel):
+    enabled: bool | None = None
+    rechecked: bool = False  # the researcher checked the entry's terms again today
+
+
+class AuditExport(BaseModel):
+    project_id: str | None = None
 
 
 class ProjectChange(BaseModel):
@@ -123,6 +173,8 @@ class Move(BaseModel):
 # Sensitivity levels from least to most strict (ticket 14: a conversation moves only to a
 # project at an equal or stricter level).
 _STRICTNESS = {"normal": 0, "private": 1, "local_only": 2}
+
+CONFIRM_SECONDS = 600  # how long a confirmation token stays good
 
 # The interface's pages load only its own files. Images in model output are never fetched
 # from elsewhere (hardening PR02A): the interface shows them as links, and this refuses any
@@ -331,6 +383,24 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def write(fn):
         return await asyncio.to_thread(db().write, fn)
 
+    # One-time confirmation tokens for changes that need the researcher's confirmation: what each
+    # confirms, and until when. ponytail: in memory, so a restart asks again.
+    confirmations = {}
+
+    def confirmation_needed(*what):
+        """409 confirmation_required, with a token that confirms exactly `what` once."""
+        now = time.monotonic()
+        for token in [t for t, (_, until) in confirmations.items() if until < now]:
+            del confirmations[token]
+        token = secrets.token_urlsafe(18)
+        confirmations[token] = (what, now + CONFIRM_SECONDS)
+        return JSONResponse({"code": "confirmation_required", "message": "Confirm this change", "token": token},
+                            status_code=409)
+
+    def confirmed(token, *what):
+        entry = confirmations.pop(token, None) if token else None
+        return entry is not None and entry[0] == what and entry[1] >= time.monotonic()
+
     # Health and setup
 
     @app.get("/api/health")
@@ -344,8 +414,15 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         on = providers.configured(data_dir)
         keys = await asyncio.gather(*(asyncio.to_thread(credentials.load_key, data_dir, name, keyring_backend)
                                       for name in configured))
+        # A server on this Mac and when it was declared; an OpenRouter key's data-settings confirmation.
+        governed = await read(lambda conn: [
+            (governance.declaration(conn, p.base_url),
+             governance.confirmation(conn, data_dir, p.name, key) if key is not None and p.is_openrouter else None)
+            for p, key in zip(configured.values(), keys)])
         return [{"name": p.name, "kind": p.kind, "base_url": p.base_url, "has_key": key is not None,
-                 "enabled": p.name in on} for p, key in zip(configured.values(), keys)]
+                 "enabled": p.name in on, "local": local_origin(p.base_url) is not None,
+                 "origin": local_origin(p.base_url), "declared_at": declared, "key_confirmation": confirmation}
+                for p, key, (declared, confirmation) in zip(configured.values(), keys, governed)]
 
     @app.get("/api/setup")
     async def setup_status():
@@ -380,6 +457,11 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(409, "active_run", "A running task uses this provider; stop it or wait")
 
     async def _save_key(provider, key):
+        """_store_key, ordered with every project's dispatch: a key change ends the provider's
+        confirmations, which its requests may be using."""
+        return await state["gate"].ordered(None, _store_key(provider, key))
+
+    async def _store_key(provider, key):
         """Store a key, clear what was learned with the old one, and audit the change.
         Callers run it to its end (_to_end), so a stored key is always followed through.
         A save that fails may still have changed the key (a file replaced before its
@@ -392,9 +474,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(500, "key_not_saved", "The key could not be saved") from None
         finally:
             forget_providers()
-            await write(lambda conn: conn.execute(  # which provider's key changed and where it went; never the key
-                "INSERT INTO audit_log (event, data) VALUES ('key_changed', ?)",
-                (json.dumps({"provider": provider, "stored_in": stored_in}),)))
+            def changed(conn):  # which provider's key changed and where it went; never the key
+                conn.execute("INSERT INTO audit_log (event, data) VALUES ('key_changed', ?)",
+                             (json.dumps({"provider": provider, "stored_in": stored_in}),))
+                # A changed key is asked about again (section 6.4), even when an earlier key returns.
+                conn.execute("DELETE FROM key_attestations WHERE provider = ?", (provider,))
+            await write(changed)
         return "credential_store_unavailable" if warning else None
 
     @app.get("/api/providers")
@@ -410,37 +495,44 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             return {"ok": True, "warning": await _to_end(_save_key(provider, body.key))}
 
     @app.get("/api/providers/{provider:name}/models")
-    async def provider_models(provider: str, refresh: bool = False):
+    async def provider_models(provider: str, refresh: bool = False, project_id: str | None = None):
+        """A provider's models. With project_id, each says whether that project allows it (the
+        model selector shows only those), and why not."""
+        policy = None
+        if project_id is not None:
+            policy = await read(lambda conn: governance.policy(conn, project_id))
+            if policy is None:
+                raise ApiError(404, "not_found", "No such project")
         async with harness().settings_lock:  # a snapshot of the provider and its key, and its generation
             configured = providers.configured(data_dir)
             if provider not in configured:
                 raise ApiError(404, "unknown_provider", "That provider is not set up")
             key = await asyncio.to_thread(credentials.load_key, data_dir, provider, keyring_backend)
             generation = openrouter_client.generation()
-        general = await read(lambda conn: conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
-        async with state["gate"].async_client(general) as client:
-            # A snapshot older than a provider change caches nothing (its refresh is refused).
-            models = await openrouter_client.models(client, configured[provider], key, force=refresh,
-                                                    generation=generation)
+        # A snapshot older than a provider change caches nothing (its refresh is refused).
+        models = await harness().catalog(configured[provider], key, force=refresh, generation=generation)
         status = openrouter_client.catalog_status(configured[provider], key)
         if openrouter_client.generation() != generation:  # after everything this answer reports
             raise ApiError(409, "settings_changed", "The provider changed while its models were listed")
         table = (load_settings(data_dir).values.get("providers") or {}).get(provider) or {}
         records = reasoning_capability.load_capabilities()
-        return {"models": [describe_model(configured[provider], table, m, records)
+        return {"models": [describe_model(configured[provider], table, m, records, policy, key)
                            for m in sorted((models or {}).values(), key=lambda m: m["id"])], "status": status}
 
-    def describe_model(provider, table, model, records):
+    def describe_model(provider, table, model, records, policy=None, key=None):
         """A catalog row with what the settings and the picker need: its window as reported
-        and in use, whether it is offered and recommended, and its effort steps."""
+        and in use, whether it is offered and recommended, and its effort steps; with a
+        project's policy, whether the project allows it."""
         capability = reasoning_capability.get_capability(records, model["id"], model)
         surface = capability.get("control_surface") or "unknown"
         steps = (capability.get("levels") or []) if surface == "levels" else \
             list(budget_router.EFFORT_LEVELS) if surface == "budget" else []
+        refusal = policy.problem(provider, model["id"], key) if policy is not None else None
         return {**model, "window": providers.window(table, model["id"], model.get("context_length")),
                 "offered": providers.offered(table, provider, model["id"], budget_router.RECOMMENDED),
                 "recommended": provider.is_openrouter and model["id"] in budget_router.RECOMMENDED,
-                "effort": {"surface": surface, "steps": [s for s in steps if s in budget_router.EFFORT_LEVELS]}}
+                "effort": {"surface": surface, "steps": [s for s in steps if s in budget_router.EFFORT_LEVELS]},
+                **({"allowed": refusal is None, "refusal": refusal} if policy is not None else {})}
 
     @app.get("/api/models/recent")
     async def recent_models():
@@ -485,7 +577,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         changed = _providers_changed(body.updates, providers.configured(data_dir, include_off=True))
         refuse_if_busy(changed)  # before any field is written
         try:
-            await _finished(loaded.save, body.updates)  # under the project-files lock to its end
+            saving = _finished(loaded.save, body.updates)  # under the project-files lock to its end
+            # A provider turned off, moved or removed takes routes away: ordered with dispatch.
+            await (state["gate"].ordered(None, saving) if changed else saving)
         except SettingsChanged:
             raise ApiError(409, "settings_changed", "The settings changed since they were read") from None
         except ValueError:
@@ -547,12 +641,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     # Projects
 
     def project_dict(row):
-        keys = ("id", "name", "kind", "sensitivity", "review_lock", "target_venue", "created_at", "updated_at")
+        keys = ("id", "name", "kind", "sensitivity", "review_lock", "target_venue", "created_at", "updated_at",
+                "review_venue")
         project = dict(zip(keys, row))
         project["review_lock"] = bool(project["review_lock"])
         return project
 
-    _PROJECT_COLUMNS = "id, name, kind, sensitivity, review_lock, target_venue, created_at, updated_at"
+    _PROJECT_COLUMNS = "id, name, kind, sensitivity, review_lock, target_venue, created_at, updated_at, review_venue"
 
     async def project_row(project_id):
         row = await read(lambda conn: conn.execute(
@@ -573,9 +668,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         folder = data_dir / "projects" / project_id
 
         def insert(conn):
-            conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, ?, 'research')", (project_id, body.name))
-            conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('project_created', ?, '{}')",
-                         (project_id,))
+            conn.execute(
+                "INSERT INTO projects (id, name, kind, sensitivity, review_lock, review_venue)"
+                " VALUES (?, ?, 'research', ?, ?, ?)",
+                (project_id, body.name, body.sensitivity, int(body.review_lock), visible(body.review_venue)))
+            governance.record(conn, "project_created", project_id, sensitivity=body.sensitivity,
+                              review_lock=body.review_lock)
 
         async def creating():  # the folder, then the record; a folder with no record is removed
             try:
@@ -650,6 +748,248 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         except Exception as error:
             log.warning("purging the backups after a deletion failed (%s)", type(error).__name__)
             return {"purge_failed": True}
+
+    async def revoking(project_id, change):
+        """Write a change that returns the project's runs it revoked, marked with the outbound gate
+        so that no request of the project enters the transport after it commits, and stop them,
+        both to their end."""
+        async def change_and_stop():
+            harness().revoke(await state["gate"].ordered(project_id, write(change)))
+        await _to_end(change_and_stop())
+
+    def unchanged(conn, project_id, level, locked):
+        """Refuse a change made on a project whose level or lock changed since they were read."""
+        now = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if now is None:
+            raise ApiError(404, "not_found", "No such project")
+        if (now[0], bool(now[1])) != (level, locked):
+            raise ApiError(409, "project_changed", "The project's protection changed meanwhile")
+
+    @app.post("/api/projects/{project_id}/sensitivity")
+    async def set_sensitivity(project_id: str, body: SensitivityChange):
+        """Change a project's level. A stricter level applies at once and revokes the project's
+        running work, in the same transaction; a less strict one needs the researcher's
+        confirmation: the first request answers 409 confirmation_required with a token, which
+        the second sends. Both are audited. The General project stays Normal, and a
+        review-locked project stays Local only until its lock is lifted."""
+        row = await project_row(project_id)
+        if row[2] == "general":
+            raise ApiError(400, "general_project", "The General project stays Normal")
+        level, locked = row[3], bool(row[4])
+        if body.level == level:
+            return project_dict(row)
+        looser = _STRICTNESS[body.level] < _STRICTNESS[level]
+        if looser and locked:
+            raise ApiError(409, "review_locked", "Lift the review lock first")
+        if looser and not confirmed(body.token, "sensitivity", project_id, level, body.level):
+            return confirmation_needed("sensitivity", project_id, level, body.level)
+
+        def change(conn):
+            unchanged(conn, project_id, level, locked)
+            conn.execute("UPDATE projects SET sensitivity = ?, updated_at = ? WHERE id = ?",
+                         (body.level, utc_now(), project_id))
+            revoked = [] if looser else governance.revoke_running(conn, project_id)
+            governance.record(conn, "sensitivity_changed", project_id, **{"from": level, "to": body.level},
+                              revoked_runs=len(revoked))
+            return revoked
+
+        await revoking(project_id, change)
+        return project_dict(await project_row(project_id))
+
+    @app.post("/api/projects/{project_id}/review-lock")
+    async def set_review_lock(project_id: str, body: ReviewLock):
+        """Lock a project that holds someone else's submission (the review-lock preset): Local
+        only, and every generative function refused, which in M1 holds whatever the venue,
+        until the venue rules relax it. Locking applies at once and revokes the project's running
+        work; an already locked project only takes the venue. Lifting the lock needs confirmation
+        (as a less strict level does) and leaves the project Local only. Both are audited; the
+        venue, which the researcher typed, is not written to the audit log."""
+        row = await project_row(project_id)
+        if row[2] == "general":
+            raise ApiError(400, "general_project", "The General project stays Normal")
+        level, locked = row[3], bool(row[4])
+        if not body.locked:
+            if not locked:
+                return project_dict(row)
+            if not confirmed(body.token, "review_lock", project_id):
+                return confirmation_needed("review_lock", project_id)
+        venue = visible(body.venue) if body.locked else None
+
+        def change(conn):
+            unchanged(conn, project_id, level, locked)
+            conn.execute("UPDATE projects SET sensitivity = ?, review_lock = ?, review_venue = ?, updated_at = ?"
+                         " WHERE id = ?", ("local_only", int(body.locked), venue, utc_now(), project_id))
+            revoked = governance.revoke_running(conn, project_id) if body.locked and not locked else []
+            governance.record(conn, "review_lock_changed", project_id, locked=body.locked, **{"from": level},
+                              venue_set=venue is not None, revoked_runs=len(revoked))
+            return revoked
+
+        await revoking(project_id, change)
+        return project_dict(await project_row(project_id))
+
+    # Governance: the key confirmation, declared local servers, the Private allowlist, the audit log
+
+    @app.post("/api/key-attestations")
+    async def confirm_key(body: KeyConfirmation):
+        """The researcher's confirmation that OpenRouter's data settings for the provider's key are
+        as the statement says (section 6.4). Scholia cannot verify them: it records the
+        confirmation with a fingerprint of the key, never the key, for six months. It names the
+        key the card showed (its reference), so a key changed since then is refused."""
+        async with harness().settings_lock:  # ordered with key changes, which hold it too
+            provider = providers.configured(data_dir, include_off=True).get(body.provider)
+            if provider is None:
+                raise ApiError(404, "unknown_provider", "That provider is not set up")
+            if not provider.is_openrouter:
+                raise ApiError(400, "not_openrouter", "Only an OpenRouter key is confirmed")
+            if body.statement != governance.KEY_STATEMENT:
+                raise ApiError(409, "statement_changed", "The statement changed; read it again")
+            key = await asyncio.to_thread(credentials.load_key, data_dir, provider.name, keyring_backend)
+            if key is None:
+                raise ApiError(400, "provider_key_missing", "The provider has no key")
+            shown = governance.key_reference(await asyncio.to_thread(governance.fingerprint, data_dir, key))
+            if not secrets.compare_digest(shown, body.key):
+                raise ApiError(409, "key_changed", "The key changed since it was shown; read it again")
+            await _to_end(write(lambda conn: governance.confirm_key(conn, data_dir, provider.name, key)))
+        return {"ok": True}
+
+    @app.post("/api/local-declarations")
+    async def declare_local(body: Declaration):
+        """The researcher's declaration that a provider on this Mac runs its models here, for the
+        exact origin the card showed (one that changed since is refused). Scholia cannot verify
+        it; for a Private project it is the researcher's assurance, not a retention guarantee.
+        Audited."""
+        async with harness().settings_lock:  # the provider's address as the settings hold it now
+            provider = providers.configured(data_dir, include_off=True).get(body.provider)
+            if provider is None:
+                raise ApiError(404, "unknown_provider", "That provider is not set up")
+            if local_origin(provider.base_url) is None:
+                raise ApiError(400, "not_local", "Only a server on this Mac can be declared")
+            if local_origin(provider.base_url) != body.origin:
+                raise ApiError(409, "target_changed", "The server's address changed since it was shown")
+            await _to_end(write(lambda conn: governance.declare(conn, provider.name, provider.base_url)))
+        return {"ok": True}
+
+    @app.delete("/api/local-declarations/{provider:name}")
+    async def withdraw_local(provider: str):
+        async with harness().settings_lock:
+            found = providers.configured(data_dir, include_off=True).get(provider)
+            if found is None:
+                raise ApiError(404, "unknown_provider", "That provider is not set up")
+            # Every project's requests that could use the server are ordered with the withdrawal.
+            withdrawn = await _to_end(state["gate"].ordered(
+                None, write(lambda conn: governance.withdraw(conn, found.name, found.base_url))))
+            if not withdrawn:
+                raise ApiError(404, "not_found", "That server is not declared")
+        return {"ok": True}
+
+    @app.get("/api/private-routes")
+    async def private_routes():
+        return {"routes": await read(governance.allowlist), "checked_on": governance.shipped()["checked_on"]}
+
+    @app.put("/api/private-routes/{key:name}")
+    async def change_private_route(key: str, body: PrivateRouteChange):
+        """Turn an allowlist entry off or on, add an OpenRouter route ("openrouter:<model id>",
+        always with provider.zdr = true), or record that its terms were checked again today.
+        Audited."""
+        model = key.removeprefix("openrouter:")
+        if model == key or not 0 < len(model) <= 200 or any(not "\x21" <= c <= "\x7e" for c in model):  # a model id
+            raise ApiError(400, "not_openrouter_route", "Only an OpenRouter route can be added")
+
+        def change(conn):
+            shipped = {e["route_key"]: e for e in governance.shipped()["entries"]}
+            known = {e["route_key"] for e in governance.allowlist(conn)}
+            if key not in known and body.enabled is None:
+                raise ApiError(404, "not_found", "No such route")
+            now = utc_now()
+            if body.enabled is not None:
+                base = shipped.get(key) or shipped["openrouter:*"]  # an added route keeps OpenRouter's terms
+                conn.execute(
+                    "INSERT INTO private_routes (route_key, source, required_flags, allowed_features, terms_url,"
+                    " checked_on, exceptions, enabled) VALUES (?, ?, ?, '[]', ?, ?, ?, ?)"
+                    " ON CONFLICT (route_key) DO UPDATE SET enabled = excluded.enabled",
+                    (key, "shipped" if key in shipped else "researcher", json.dumps(base["required_flags"]),
+                     base["terms_url"], now, json.dumps(base["exceptions"]), int(body.enabled)))
+            if body.rechecked:
+                conn.execute("INSERT OR REPLACE INTO list_checks (list, entry_id, checked_on)"
+                             " VALUES ('private_routes', ?, ?)", (key, now))
+            governance.record(conn, "private_route_changed", route=key, enabled=body.enabled,
+                              rechecked=body.rechecked)
+
+        await _to_end(state["gate"].ordered(None, write(change)))  # every Private project's requests ordered with it
+        return await private_routes()
+
+    @app.get("/api/audit")
+    async def audit_log(project_id: str | None = None, before: int | None = None, limit: int = 100):
+        """The audit log, newest first, a page at a time (before: the seq the last page ended
+        at); for one project, its own rows and every clearing of the log, with how many of its
+        requests the gate allowed off this Mac since the log began or was last cleared (a row
+        records the decision, not delivery: a request decided again and refused before it left counts)."""
+        limit = max(1, min(limit, 500))
+
+        def page(conn):
+            rows = conn.execute(
+                "SELECT seq, at, event, project_id, data FROM audit_log"
+                " WHERE (?1 IS NULL OR project_id = ?1 OR event = 'audit_cleared')"
+                " AND (?2 IS NULL OR seq < ?2) ORDER BY seq DESC LIMIT ?3", (project_id, before, limit)).fetchall()
+            sent = conn.execute(
+                "SELECT count(*) FROM audit_log WHERE project_id = ? AND event = 'outbound'"
+                " AND data ->> 'decision' = 'allow' AND data ->> 'kind' NOT IN ('local_helper', 'local_provider')",
+                (project_id,)).fetchone()[0] if project_id else None
+            return rows, sent
+
+        rows, sent = await read(page)
+        return {"entries": [{"seq": seq, "at": at, "event": event, "project_id": project, "data": json.loads(data)}
+                            for seq, at, event, project, data in rows],
+                "next": rows[-1][0] if len(rows) == limit else None, "allowed_off_this_mac": sent}
+
+    @app.post("/api/audit/export")
+    async def export_audit(body: AuditExport | None = None):
+        """Write the audit log (or one project's rows, with every clearing of the log) as a JSON
+        file in the data folder's exports folder, owner-only. The export is recorded with its
+        destination first, so no file is there unrecorded; a failure after that removes the file
+        and leaves the record of the attempt."""
+        project_id = (body or AuditExport()).project_id
+        if project_id is not None:
+            await project_row(project_id)  # an existing project's id, never other text, goes in the record
+        name = f"audit-log-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{secrets.token_hex(3)}.json"
+
+        async def exporting():
+            rows = await read(lambda conn: conn.execute(
+                "SELECT seq, at, event, project_id, data FROM audit_log"
+                " WHERE ?1 IS NULL OR project_id = ?1 OR event = 'audit_cleared' ORDER BY seq", (project_id,)).fetchall())
+            entries = [{"seq": seq, "at": at, "event": event, "project_id": project, "data": json.loads(data)}
+                       for seq, at, event, project, data in rows]
+            await write(lambda conn: governance.record(conn, "audit_exported", project_id,
+                                                       destination=f"exports/{name}", rows=len(entries)))
+            path = data_dir / "exports" / name
+            try:
+                await asyncio.to_thread(write_private, path, json.dumps(
+                    {"format": "scholia-audit-log", "version": 1, "entries": entries}, ensure_ascii=False,
+                    indent=1).encode())
+            except OSError:
+                await asyncio.to_thread(path.unlink, missing_ok=True)
+                raise ApiError(500, "export_failed", "The audit log could not be written") from None
+            return len(entries)
+
+        rows = await _to_end(exporting())
+        return {"path": str(data_dir / "exports" / name), "rows": rows}
+
+    @app.delete("/api/audit")
+    async def clear_audit(token: str | None = None):
+        """Clear the audit log, after the researcher confirms (a first request answers 409
+        confirmation_required with a token). A record of the clearing stays, and so do the
+        records of purged backups, which a restore compares (backups._purges)."""
+        if not confirmed(token, "audit_clear"):
+            return confirmation_needed("audit_clear")
+
+        def clear(conn):
+            (rows,) = conn.execute("SELECT count(*) FROM audit_log").fetchone()
+            governance.record(conn, "audit_cleared", rows=rows)
+            conn.execute("DELETE FROM audit_log WHERE seq < (SELECT max(seq) FROM audit_log)"
+                         " AND event NOT IN ('audit_cleared', 'backup_purge')")  # these stay on record
+            return rows
+
+        return {"ok": True, "rows": await _to_end(write(clear))}
 
     # Conversations
 
@@ -733,12 +1073,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
         def move(conn):
             row = conn.execute(
-                "SELECT c.project_id, p.sensitivity FROM conversations c JOIN projects p ON p.id = c.project_id"
-                " WHERE c.id = ?", (conversation_id,)).fetchone()
-            target = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (body.project_id,)).fetchone()
+                "SELECT c.project_id, p.sensitivity, p.review_lock FROM conversations c"
+                " JOIN projects p ON p.id = c.project_id WHERE c.id = ?", (conversation_id,)).fetchone()
+            target = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?",
+                                  (body.project_id,)).fetchone()
             if row is None or target is None:
                 raise ApiError(404, "not_found", "No such conversation or project")
-            source, level = row
+            source, level, locked = row
             if source == body.project_id:
                 return
             # Its turn, or a title run that would send its words over the old project's route;
@@ -747,7 +1088,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                             " OR source_turn_id IN (SELECT run_id FROM turns WHERE conversation_id = ?))",
                             (conversation_id, conversation_id)).fetchone():
                 raise ApiError(409, "active_run", "This conversation is running a turn")
-            if _STRICTNESS[target[0]] < _STRICTNESS[level]:
+            # A review-locked project counts as stricter than any unlocked one.
+            if (_STRICTNESS[target[0]], target[1]) < (_STRICTNESS[level], locked):
                 raise ApiError(409, "less_strict_project", "A conversation moves only to a project as strict or stricter")
             now = utc_now()
             conn.execute("UPDATE conversations SET project_id = ?, updated_at = ? WHERE id = ?",

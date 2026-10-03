@@ -9,7 +9,8 @@ import { ApiError, get, patch, post } from '../api.js';
 import { errorText, money } from '../text.js';
 import { projectName } from '../projects.js';
 import { BUDGET_SUGGESTIONS, loadModels, useInstructions, useSettingsFile, utf8Bytes, valueAt } from '../settings.js';
-import { CommitField, Field, FileProblems, LoadState, Restore, Section, Segmented } from './fields.jsx';
+import { CommitField, Field, FileProblems, LoadState, Problem, Restore, Section, Segmented } from './fields.jsx';
+import { AuditLog, PrivateAllowlist, ProjectProtection } from './Governance.jsx';
 import { Providers } from './Providers.jsx';
 import { BackupsSection } from './Backups.jsx';
 import { ProjectExportSection } from './ProjectExport.jsx';
@@ -50,7 +51,7 @@ export function Settings({ open, onOpenChange, health, project, onLanguage, onPr
           {open && page === 'providers' && <Providers />}
           {open && page === 'subagents' && <Subagents />}
           {open && page === 'project' && project && <ThisProject project={project} onProjectChanged={onProjectChanged} />}
-          {open && page === 'advanced' && <Advanced health={health} />}
+          {open && page === 'advanced' && <Advanced health={health} project={project} />}
         </div>
       </DialogContent>
     </Dialog>
@@ -59,14 +60,6 @@ export function Settings({ open, onOpenChange, health, project, onLanguage, onPr
 
 function PageTitle({ children }) {
   return <h2 className="mb-6 text-lg font-semibold tracking-tight">{children}</h2>;
-}
-
-function Problem({ code }) {
-  const t = useT();
-  if (!code) return null;
-  return <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-    {code === 'settings_changed' ? t('settings.changedOnDisk') : errorText(t, code)}
-  </p>;
 }
 
 function General({ onLanguage, projectId }) {
@@ -299,6 +292,8 @@ function ThisProject({ project, onProjectChanged }) {
           <CommitField id="project-name" value={project.name} onCommit={(name) => change({ name })} />
         </Field>
       )}
+      {general ? <p className="text-sm text-muted-foreground">{t('protection.generalNote')}</p>
+        : <ProjectProtection project={project} onProjectChanged={onProjectChanged} />}
       <div className="grid gap-5 sm:grid-cols-2">
         <Field label={t('project.venue')} htmlFor="project-venue" hint={t('project.venueHint')}>
           <CommitField id="project-venue" value={project.target_venue} allowEmpty placeholder={t('project.venuePlaceholder')}
@@ -356,7 +351,7 @@ function LimitFields({ file, inherited, onProblem, prefix }) {
   );
 }
 
-function Advanced({ health }) {
+function Advanced({ health, project }) {
   const t = useT();
   const personal = useSettingsFile();
   const offered = useOfferedModels();
@@ -388,6 +383,8 @@ function Advanced({ health }) {
         <LimitFields file={personal} onProblem={setProblem} prefix="limit" />
       </Section>
       <Section title={t('settings.localServers')} hint={t('settings.localServersHint')} />
+      <PrivateAllowlist />
+      <AuditLog project={project} />
       <BackgroundRuns />
       <Section title={t('settings.backups')}>
         <BackupsSection />

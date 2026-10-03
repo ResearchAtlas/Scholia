@@ -44,8 +44,8 @@ a = Analysis(
     excludes=EXCLUDES,
     # the license texts, of the npm packages the interface bundles too (build_app.sh builds it first)
     datas=notice_datas(DISTRIBUTIONS + [NPM + name for name in npm_packages()])
-    # the reasoning-capability record, which the provider adapter reads beside its module
-    + [(str(ROOT / "backend/reasoning_capabilities.json"), "backend")]
+    # the reasoning-capability record and the Private allowlist, which their modules read beside them
+    + [(str(ROOT / "backend/reasoning_capabilities.json"), "backend"), (str(ROOT / "backend/private_routes.json"), "backend")]
     # the built interface, which the desktop entry serves from here (backend/desktop.py)
     + [(str(ROOT / "frontend/dist"), "frontend")],
 )

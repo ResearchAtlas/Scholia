@@ -1,4 +1,4 @@
-"""Loopback is only transport: a local provider counts for Local only after the researcher's declaration.
+"""Loopback is only transport: a local provider counts for Private and Local only after the researcher's declaration.
 
 These tests send real requests to mock servers this process starts and
 registers with the test network block, and check what each server received.
@@ -139,23 +139,44 @@ def test_a_declaration_does_not_open_remote_providers_for_local_only(db):
         client.get("https://api.other-provider.example/v1/models")
 
 
-@pytest.mark.parametrize(("level", "reason"), [("normal", None), ("private", "not_allowed_at_level")])
-def test_other_levels_ignore_declarations(db, stack, level, reason):
+def test_normal_ignores_declarations(db, stack):
     base, received = server(stack)
     gate = gate_for(db, provider_urls=[f"{base}/v1"])
-    with gate.client(project(db, level)) as client:  # Normal: any model route, declared or not
-        if reason:
-            with pytest.raises(OutboundDenied, match=reason):
-                client.get(f"{base}/v1/models")
-        else:
-            client.get(f"{base}/v1/models")
+    with gate.client(project(db, "normal")) as client:  # any model route, declared or not
+        client.get(f"{base}/v1/models")
         declare(db, f"{base}/v1")
-        if reason:
-            with pytest.raises(OutboundDenied, match=reason):
-                client.get(f"{base}/v1/models")
-        else:
-            client.get(f"{base}/v1/models")
-    assert len(received) == (0 if reason else 2)
+        client.get(f"{base}/v1/models")
+    assert len(received) == 2
+
+
+def test_private_uses_a_declared_server_without_openrouters_flags_or_a_confirmed_key(db, stack):
+    # Ticket 64: the same declaration, audit record and dispatch checks as Local only; the
+    # Private allowlist and the key confirmation are OpenRouter's alone.
+    base, received = server(stack)
+    gate = OutboundGate(db, lambda: GateInputs(provider_urls=[f"{base}/v1"], private_route=lambda *args: None,
+                                               key_attested=lambda *args: False), local_listener=ours)
+    with gate.client(project(db, "private")) as client:
+        with pytest.raises(OutboundDenied, match="not_declared"):  # loopback alone is only transport
+            client.post(f"{base}/v1/chat/completions", json={"model": "local", "messages": []})
+        assert received == []
+        declare(db, f"{base}/v1")
+        client.post(f"{base}/v1/chat/completions", json={"model": "local", "messages": []},
+                    headers={"Authorization": "Bearer local"})
+    assert received == [("POST", "/v1/chat/completions")]
+    assert reasons(db) == ["not_declared", None]
+
+
+@pytest.mark.parametrize("follow", [True, False])
+def test_a_declared_server_cannot_redirect_elsewhere_from_a_private_project(db, stack, follow):
+    target, target_received = server(stack)
+    base, received = server(stack, redirect_to=target)
+    declare(db, base)
+    declare(db, target)
+    gate = gate_for(db, provider_urls=[f"{base}/v1", f"{target}/v1"])
+    with gate.client(project(db, "private"), follow_redirects=follow) as client, \
+            pytest.raises(OutboundDenied, match="cross_origin_redirect"):
+        client.post(f"{base}/v1/chat/completions", json={"messages": []})
+    assert target_received == []
 
 
 @pytest.mark.parametrize("level", ["normal", "private", "local_only"])
@@ -239,3 +260,69 @@ async def test_async_client_over_real_sockets(db, stack):
         await asyncio.to_thread(declare, db, f"{base}/v1")
         assert (await client.post(f"{base}/v1/chat/completions", json={"messages": []})).status_code == 200
     assert received == [("POST", "/v1/chat/completions")]
+
+
+# Declaring through the API (slice-1 spec section 6.4; ticket 64)
+
+
+@pytest.mark.asyncio
+async def test_a_declaration_is_one_per_exact_origin_audited_and_can_be_withdrawn(tmp_path):
+    from scholia_app import started
+
+    async with started(tmp_path / "data") as client:
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+            "providers.ollama.kind": "openai-compatible", "providers.ollama.base_url": "http://127.0.0.1:11434/v1",
+            "providers.again.kind": "openai-compatible", "providers.again.base_url": "http://127.0.0.1:11434/other",
+            "providers.cloud.kind": "openai-compatible", "providers.cloud.base_url": "https://api.example.com/v1"}})
+        for name in ("ollama", "again"):  # two names for one server: one declaration, the newer
+            response = await client.post("/api/local-declarations",
+                                         json={"provider": name, "origin": "http://127.0.0.1:11434"})
+            assert response.json() == {"ok": True}
+        db = client.state["db"]
+        stored = await asyncio.to_thread(db.read, lambda conn: conn.execute(
+            "SELECT provider, base_url, statement FROM local_declarations").fetchall())
+        assert stored == [("again", "http://127.0.0.1:11434/other", "2026-10-03")]
+        listed = {p["name"]: (p["local"], p["declared_at"] is not None)
+                  for p in (await client.get("/api/providers")).json()["providers"]}
+        assert listed == {"openrouter": (False, False), "ollama": (True, True), "again": (True, True),
+                          "cloud": (False, False)}
+        response = await client.post("/api/local-declarations",
+                                     json={"provider": "cloud", "origin": "https://api.example.com:443"})
+        assert (response.status_code, response.json()["code"]) == (400, "not_local")
+        response = await client.post("/api/local-declarations",
+                                     json={"provider": "nobody", "origin": "http://127.0.0.1:11434"})
+        assert response.status_code == 404
+
+        assert (await client.delete("/api/local-declarations/ollama")).json() == {"ok": True}  # its origin's
+        assert (await client.delete("/api/local-declarations/again")).status_code == 404
+        audit = await asyncio.to_thread(db.read, lambda conn: conn.execute(
+            "SELECT event, data FROM audit_log WHERE event LIKE 'local_%' ORDER BY seq").fetchall())
+        assert [(event, json.loads(data)) for event, data in audit] == [
+            ("local_declared", {"provider": "ollama", "origin": "http://127.0.0.1:11434", "statement": "2026-10-03"}),
+            ("local_declared", {"provider": "again", "origin": "http://127.0.0.1:11434", "statement": "2026-10-03"}),
+            ("local_declaration_withdrawn", {"provider": "ollama", "origin": "http://127.0.0.1:11434"})]
+
+
+@pytest.mark.asyncio
+async def test_a_declaration_names_the_origin_the_researcher_saw(tmp_path):
+    from scholia_app import started
+
+    async with started(tmp_path / "data") as client:
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+            "providers.ollama.kind": "openai-compatible", "providers.ollama.base_url": "http://127.0.0.1:11434/v1"}})
+        [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == "ollama"]
+        assert shown["origin"] == "http://127.0.0.1:11434"
+        current = (await client.get("/api/settings")).json()  # its address changes after the card was shown
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+            "providers.ollama.base_url": "http://127.0.0.1:1234/v1"}})
+        stale = await client.post("/api/local-declarations", json={"provider": "ollama", "origin": shown["origin"]})
+        assert (stale.status_code, stale.json()["code"]) == (409, "target_changed")
+        assert (await client.post("/api/local-declarations", json={"provider": "ollama"})).status_code == 400
+        db = client.state["db"]
+        assert await asyncio.to_thread(db.read, lambda conn: conn.execute(
+            "SELECT count(*) FROM local_declarations").fetchone()) == (0,)
+        fresh = await client.post("/api/local-declarations",
+                                  json={"provider": "ollama", "origin": "http://127.0.0.1:1234"})
+        assert fresh.status_code == 200

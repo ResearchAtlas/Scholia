@@ -35,6 +35,7 @@
     --radius: 0.625rem;
   }
   .dark {
+    color-scheme: dark; /* native controls (radios, scrollbars) drawn for a dark page */
     --background: 240 6% 7%;
     --foreground: 0 0% 96%;
     --sidebar: 240 6% 5%;

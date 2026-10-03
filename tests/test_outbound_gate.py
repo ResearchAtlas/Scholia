@@ -29,6 +29,13 @@ ROUTES = {"example/model-a", "example/model-b"}
 KEY = "sk-or-v1-confirmed-key"
 AUTH = {"Authorization": f"Bearer {KEY}"}
 ZDR_ONLY = {"provider": {"zdr": True}}
+CONFIRMED_UNTIL = "2999-01-01T00:00:00.000Z"  # when a confirmed key's confirmation lapses
+
+
+def entry(flags):
+    """An allowlist entry with these request flags, as GateInputs.private_route returns it."""
+    return {"route_key": "openrouter:*", "required_flags": flags, "terms_url": "https://openrouter.ai/terms",
+            "checked_on": "2026-10-03T00:00:00.000Z"}
 
 
 def chat(**fields):
@@ -69,8 +76,8 @@ def setup(db, remote):
     state = {"inputs": GateInputs(
         provider_urls=(OPENROUTER_API, OTHER_PROVIDER, LOCAL_SERVER),
         helper_url=HELPER,
-        private_route=lambda model: ZDR_ONLY if model in ROUTES else None,
-        key_attested=lambda key: key == KEY,
+        private_route=lambda conn, provider, key, model: entry(ZDR_ONLY) if model in ROUTES else None,
+        key_attested=lambda conn, provider, key: CONFIRMED_UNTIL if key == KEY else None,
     )}
 
     class Setup:
@@ -138,7 +145,8 @@ KINDS = {
 }
 ALLOWED = {
     "normal": set(KINDS),
-    "private": {"model_provider", "scholarly_api", "open_access", "local_helper", "model_download"},
+    # A declared local server too (ticket 64), without OpenRouter's flags or key confirmation.
+    "private": {"model_provider", "scholarly_api", "open_access", "local_helper", "model_download", "local_provider"},
     "local_only": {"scholarly_api", "open_access", "local_helper", "local_provider"},
 }
 
@@ -1085,15 +1093,15 @@ def test_the_chat_completions_path_after_dot_segments_is_the_endpoint(db, remote
 
 
 def test_private_needs_the_allowlist_entrys_own_flags_and_always_zdr(db, remote, setup):
-    setup.change(private_route=lambda model: {"provider": {"zdr": True, "data_collection": "deny"}})
+    setup.change(private_route=lambda *args: entry({"provider": {"zdr": True, "data_collection": "deny"}}))
     with pytest.raises(OutboundDenied, match="missing_flags"):
         private_post(setup, db, chat())
     private_post(setup, db, chat(provider={"zdr": True, "data_collection": "deny"}))
-    setup.change(private_route=lambda model: {})  # an entry cannot waive provider.zdr
+    setup.change(private_route=lambda *args: entry({}))  # an entry cannot waive provider.zdr
     with pytest.raises(OutboundDenied, match="missing_flags"):
         private_post(setup, db, chat(provider={}))
-    for flags in (None, ["provider"], "zdr"):
-        setup.change(private_route=lambda model, flags=flags: flags)
+    for flags in (None, ["provider"], "zdr", entry(None), entry("zdr")):
+        setup.change(private_route=lambda *args, flags=flags: flags)
         with pytest.raises(OutboundDenied, match="route_not_allowed"):
             private_post(setup, db, chat())
     assert len(remote.received) == 1
@@ -1109,8 +1117,9 @@ def test_private_refuses_a_key_without_a_current_confirmation(db, remote, setup,
     assert remote.received == []
 
 
-def test_private_needs_a_confirmation_that_is_exactly_true(db, remote, setup):
-    setup.change(key_attested=lambda key: 1)
+@pytest.mark.parametrize("until", [1, True, "2000-01-01T00:00:00.000Z"])
+def test_private_needs_a_confirmation_that_lapses_later(db, remote, setup, until):
+    setup.change(key_attested=lambda *args: until)  # not a time, or one already past
     with pytest.raises(OutboundDenied, match="key_not_confirmed"):
         private_post(setup, db, chat())
     assert remote.received == []
@@ -1163,7 +1172,7 @@ async def test_failing_inputs_are_recorded_as_a_refusal_async(db, remote, setup)
 def test_private_checks_run_only_for_private_projects(db, remote, setup):
     calls = []
 
-    def route(model):
+    def route(conn, provider, key, model):
         calls.append("route")
         raise RuntimeError("allowlist unreadable")
 
@@ -1289,7 +1298,7 @@ REASONS = {
     "gate_inputs_unavailable", "cross_origin_redirect", "sensitivity_changed", "unsupported_method",
     "not_openrouter", "private_inputs_missing", "unchecked_request", "unsupported_endpoint", "unsupported_feature",
     "not_candidate_url",
-    "route_not_allowed", "missing_flags", "key_not_confirmed",
+    "route_not_allowed", "missing_flags", "key_not_confirmed", "revoked",
 }
 ORIGIN = re.compile(r"https?://(\[[0-9a-f:.%]+\]|[a-z0-9.-]+):[0-9]{1,5}")
 
@@ -1495,7 +1504,7 @@ async def test_async_client_checks_and_audits_the_same_way(db, remote, setup):
         assert (await client.post(CHAT, json=chat(), headers=AUTH)).status_code == 200
         with pytest.raises(OutboundDenied, match="missing_flags"):
             await client.post(CHAT, json=chat(provider={}), headers=AUTH)
-        with pytest.raises(OutboundDenied, match="not_allowed_at_level"):
+        with pytest.raises(OutboundDenied, match="not_declared"):
             await client.post(f"{LOCAL_SERVER}/chat/completions", json=chat())
         remote.redirects[f"{OPENROUTER_API}/models"] = (302, "https://evil.example/")
         with pytest.raises(OutboundDenied, match="unchecked_request"):
@@ -1505,7 +1514,7 @@ async def test_async_client_checks_and_audits_the_same_way(db, remote, setup):
             await client.get(f"{OPENROUTER_API}/models")
     assert [str(r.url) for r in remote.received] == [CHAT, f"{OPENROUTER_API}/models"]
     assert await asyncio.to_thread(decisions, db) == [
-        ("allow", None), ("deny", "missing_flags"), ("deny", "not_allowed_at_level"),
+        ("allow", None), ("deny", "missing_flags"), ("deny", "not_declared"),
         ("deny", "unchecked_request"), ("allow", None), ("deny", "cross_origin_redirect")]
 
 
@@ -1560,3 +1569,178 @@ def test_lsof_finds_this_accounts_listener_at_the_destination_address(family, bo
             assert listener_is_ours(asked, port) is False  # nothing listens now
     finally:
         listening.close()
+
+
+# The Private route and key confirmation, and the dispatch check, inside the decision transaction
+
+
+def _attest(db):
+    db.write(lambda conn: conn.execute(
+        "INSERT INTO key_attestations (id, provider, key_fingerprint, statement, confirmed_at, expires_at)"
+        " VALUES (?, 'openrouter', 'fp', 's', '2026-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z')", (new_id(),)))
+
+
+@pytest.mark.parametrize("withdrawn", ["route", "key"])
+def test_a_route_or_confirmation_withdrawn_after_the_inputs_were_read_refuses(db, remote, setup, withdrawn):
+    # The inputs are read before the decision; a confirmation or allowlist entry withdrawn in
+    # between is seen, because both are read again with the decision's own connection.
+    def route(conn, provider, key, model):
+        assert conn.in_transaction
+        return entry(ZDR_ONLY) if conn.execute("SELECT count(*) FROM private_routes").fetchone()[0] else None
+
+    def attested(conn, provider, key):
+        assert conn.in_transaction
+        return CONFIRMED_UNTIL if conn.execute("SELECT count(*) FROM key_attestations").fetchone()[0] else None
+
+    db.write(lambda conn: conn.execute(
+        "INSERT INTO private_routes (route_key, source, required_flags) VALUES ('openrouter:*', 'shipped', '{}')"))
+    _attest(db)
+    inputs = dataclasses.replace(setup.gate._inputs(), private_route=route, key_attested=attested)
+    table = "private_routes" if withdrawn == "route" else "key_attestations"
+
+    def read_then_withdraw():
+        db.write(lambda conn: conn.execute(f"DELETE FROM {table}"))
+        return inputs
+
+    gate = OutboundGate(db, read_then_withdraw, transport=httpx.MockTransport(remote))
+    with gate.client(project(db, "private")) as client:
+        refused(client, "POST", CHAT, "route_not_allowed" if withdrawn == "route" else "key_not_confirmed",
+                json=chat(), headers=AUTH)
+    assert remote.received == []
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+def test_the_dispatch_check_runs_in_the_decision_and_refuses_as_revoked(db, remote, setup, asynchronous):
+    allowed, seen = [True], []
+
+    def admit(conn):
+        seen.append(conn.in_transaction)
+        return allowed[0]
+
+    project_id = project(db)
+
+    def post():
+        if not asynchronous:
+            with setup.gate.client(project_id, admit=admit) as client:
+                return client.post(CHAT, json=chat(), headers=AUTH)
+
+        async def run():
+            async with setup.gate.async_client(project_id, admit=admit) as client:
+                return await client.post(CHAT, json=chat(), headers=AUTH)
+        return asyncio.run(run())
+
+    post()
+    allowed[0] = 1  # anything but True refuses
+    with pytest.raises(OutboundDenied, match="revoked"):
+        post()
+    assert seen == [True, True] and len(remote.received) == 1
+    assert decisions(db) == [("allow", None), ("deny", "revoked")]
+
+
+def test_the_dispatch_check_is_asked_only_when_the_policy_allows_and_its_failure_refuses(db, remote, setup):
+    calls = []
+
+    def admit(conn):
+        calls.append(1)
+        raise RuntimeError("SECRET-DETAIL")
+
+    with setup.gate.client(project(db, "local_only"), admit=admit) as client:
+        refused(client, "POST", CHAT, "not_allowed_at_level", json=chat(), headers=AUTH)
+        assert calls == []
+        with pytest.raises(OutboundDenied) as caught:
+            client.get(f"{HELPER}/health")
+    assert caught.value.reason == "revoked" and isinstance(caught.value.__cause__, RuntimeError)
+    assert calls == [1] and remote.received == []
+    assert "SECRET" not in json.dumps(audit(db))
+
+
+def test_the_dispatch_check_covers_a_same_origin_redirect_hop(db, remote, setup):
+    remote.redirects[CHAT] = (307, "/api/v1/other")
+    answers = iter([True, False])
+    with setup.gate.client(project(db), follow_redirects=True, admit=lambda conn: next(answers)) as client:
+        refused(client, "POST", CHAT, "revoked", json=chat(), headers=AUTH)
+    assert [str(r.url) for r in remote.received] == [CHAT]
+    assert decisions(db) == [("allow", None), ("deny", "revoked")]
+
+
+def test_a_redirect_hop_decided_again_after_a_revocation_keeps_its_one_time_authorization(db, remote, setup,
+                                                                                           monkeypatch):
+    # An unrelated revocation in the project begins while the hop is decided: the hop is decided
+    # again, and its redirect token, spent once by the first decision, still authorizes it.
+    project_id = project(db)
+    remote.redirects[OA_LINK] = (302, "/files/moved.pdf")
+    candidate_id = candidate(db, project_id)
+    real, revoked = OutboundGate._check, []
+
+    def check_then_revoke(self, request, scope, *args):
+        found = real(self, request, scope, *args)
+        if request.url.path == "/files/moved.pdf" and not revoked:
+            revoked.append(True)
+            with self.revoking_from_thread(project_id):  # e.g. another conversation of it deleted
+                pass
+        return found
+
+    monkeypatch.setattr(OutboundGate, "_check", check_then_revoke)
+
+    async def fetch():
+        async with setup.gate.async_client(project_id, candidate_id=candidate_id, follow_redirects=True) as client:
+            return await client.get(OA_LINK)
+
+    assert asyncio.run(fetch()).status_code == 200
+    assert [str(r.url) for r in remote.received] == [OA_LINK, "https://repository.example.org/files/moved.pdf"]
+    assert decisions(db) == [("allow", None), ("allow", None), ("allow", None)]  # the hop, decided twice
+
+
+def test_a_deletion_does_not_wait_for_a_loop_that_stopped(db):
+    # A deletion in a thread marks itself on the gate's loop; once that loop is no longer running
+    # (here it stops just after the deletion looked), nothing can dispatch on it, and the deletion
+    # goes on without the mark instead of waiting for ever.
+    loop = asyncio.new_event_loop()
+    answers = iter([True])
+    loop.is_running = lambda: next(answers, False)  # running when looked at, stopped right after
+    gate = OutboundGate(db, GateInputs)
+    gate._loop = loop
+    project_id = project(db)
+    finished = []
+    worker = threading.Thread(target=lambda: finished.append(delete(db, ContentStore(db), "project", project_id)),
+                              daemon=True)
+    worker.start()
+    worker.join(5)
+    loop.close()
+    assert finished == [[]] and gate._under_way == {}
+
+
+def test_a_deletion_goes_on_without_a_mark_once_the_gates_loop_has_closed(db):
+    async def make():
+        return OutboundGate(db, GateInputs)
+
+    gate = asyncio.run(make())  # its loop, closed once this returns
+    project_id = project(db)
+    assert delete(db, ContentStore(db), "project", project_id) == []
+    assert gate._under_way == {}
+
+
+def test_a_deletion_is_refused_when_a_running_loop_never_marks_it(db, monkeypatch):
+    from backend import outbound_gate
+    monkeypatch.setattr(outbound_gate, "MARK_SECONDS", 0.2)
+    loop = asyncio.new_event_loop()
+    loop.is_running = lambda: True  # running, but it never gets to the mark
+    gate = OutboundGate(db, GateInputs)
+    gate._loop = loop
+    project_id = project(db)
+    errors = []
+
+    def deleting():
+        try:
+            delete(db, ContentStore(db), "project", project_id)
+        except RuntimeError as error:
+            errors.append(str(error))
+
+    worker = threading.Thread(target=deleting, daemon=True)
+    worker.start()
+    worker.join(5)  # bounded: refused, not waiting for ever
+    del loop.is_running
+    loop.close()
+    assert errors == ["the event loop did not mark a revocation"]
+    assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects WHERE id = ?", (project_id,)).fetchone()) == (1,)
+    assert gate._under_way == {}
