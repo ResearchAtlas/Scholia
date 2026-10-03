@@ -839,6 +839,24 @@ def _audit_restore(conn, record):
                  (json.dumps(record), record["id"]))
 
 
+def _keep_aside(live, target):
+    """A second name for the live database, which stays in place until the backup's is moved over
+    it: a hard link, or where the file system has none (exFAT), an owner-only copy made complete
+    under another name before it takes target's, so a replay never finds half a copy there."""
+    try:
+        os.link(live, target)
+        return
+    except OSError as error:
+        if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM, errno.EXDEV, errno.EMLINK):
+            raise
+    part = target.with_name(target.name + ".part")
+    part.unlink(missing_ok=True)  # one an interrupted attempt left
+    with open(live, "rb") as source, open(part, "xb", opener=lambda path, flags: os.open(path, flags, 0o600)) as copy:
+        shutil.copyfileobj(source, copy, _CHUNK)
+    _fsync(part)
+    os.rename(part, target)
+
+
 def _forward(data_dir, journal):
     """Put the backup in place, from wherever an earlier attempt stopped."""
     staged, aside, live = data_dir / journal["staged"], data_dir / journal["aside"], data_dir / DB_NAME
@@ -848,7 +866,7 @@ def _forward(data_dir, journal):
         _fsync(aside.parent)
     if (staged / DB_NAME).exists():  # the backup's database is not in place yet
         if live.exists() and not (aside / DB_NAME).exists():
-            os.link(live, aside / DB_NAME)
+            _keep_aside(live, aside / DB_NAME)
             _fsync(aside)
         for sidecar in SIDECARS:  # a damaged database's WAL holds committed work: it goes with it
             if (data_dir / sidecar).exists():

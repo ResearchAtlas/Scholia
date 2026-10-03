@@ -319,6 +319,39 @@ async def test_restoring_an_automatic_backup_brings_back_its_state_and_runs_on(t
     assert restored_db.closed  # closing the app closed what the restore opened
 
 
+async def test_a_restore_works_where_the_file_system_has_no_hard_links(tmp_path, monkeypatch):
+    import errno
+
+    def no_links(source, target, **kwargs):  # such as an exFAT drive
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(backups_module.os, "link", no_links)
+    data = tmp_path / "data"
+    async with started(data) as client:
+        kept = await new_project(client, "Kept")
+        backup = (await client.post("/api/backups")).json()["id"]
+        await new_project(client, "Later")
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept"}
+        assert kept in {p["id"] for p in (await client.get("/api/projects")).json()["projects"]}
+        # A failed restore puts the database it kept aside (a copy here) back in place.
+        later = await new_project(client, "After")
+        real = Database.__init__
+        opened = []
+
+        def failing_once(self, data_dir, **options):
+            if not opened:
+                opened.append(True)
+                raise RuntimeError("a migration failed")
+            real(self, data_dir, **options)
+
+        monkeypatch.setattr(Database, "__init__", failing_once)
+        failed = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (failed.status_code, failed.json()["code"]) == (500, "restore_failed")
+        assert (await client.get(f"/api/projects/{later}")).status_code == 200
+
+
 async def test_a_restore_stops_a_running_turn(tmp_path):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
