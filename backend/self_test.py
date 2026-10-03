@@ -2,8 +2,10 @@
 
 The app runs it with `--self-test --model <embedding model>`. It checks, inside the frozen
 build, the native pieces the app ships: SQLite, FTS5 secure-delete, extension loading and
-sqlite-vec through APSW, the backend with one turn against an in-process provider, one
-embedding through the llama.cpp helper, and one OCR page through Vision. It prints the
+sqlite-vec through APSW, the backend with one turn against an in-process provider, an
+AES-encrypted zip file as backups and exports write them (pyzipper and pycryptodomex's native
+code, imported only when first used), one embedding through the llama.cpp helper, and one
+OCR page through Vision. It prints the
 results as JSON and exits non-zero when any check fails.
 
 The checks also run from source (tests/test_self_test.py), except the embedding, which
@@ -27,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 MIN_SQLITE = (3, 42, 0)  # the first SQLite with FTS5 secure-delete
@@ -405,12 +408,39 @@ def check_interface(folder: Path | None = None) -> dict:
         return {"assets": asyncio.run(drive(Path(folder_for_data) / "data"))}
 
 
+def check_encrypted_zip() -> dict:
+    """An AES-encrypted zip file written and read back as full backups and exports are: the
+    passphrase opens it, and nothing is read without it."""
+    from backend import backups
+
+    content = "Scholia self-test 学术研究平台".encode()
+    with tempfile.TemporaryDirectory() as folder:
+        path = backups._write_zip(Path(folder), "self-test", [("check.txt", content)], "self-test passphrase",
+                                  stop=lambda: False)
+        with zipfile.ZipFile(path) as plain:  # as other tools see it: 99 marks WinZip AES
+            info = plain.getinfo("check.txt")
+            if not info.flag_bits & 1 or info.compress_type != 99:
+                raise RuntimeError("the zip file is not AES-encrypted")
+        with backups._pyzipper().AESZipFile(path) as archive:
+            try:
+                archive.read("check.txt")
+            except RuntimeError:
+                pass
+            else:
+                raise RuntimeError("the zip file was read without its passphrase")
+            archive.setpassword(b"self-test passphrase")
+            if archive.read("check.txt") != content:
+                raise RuntimeError("the zip file does not read back what was written")
+    return {"aes": True}
+
+
 def run(helper: Path, model: Path) -> dict:
     checks = {
         "sqlite": check_sqlite,
         "index": check_index,
         "backend": check_backend,
         "interface": check_interface,
+        "encrypted_zip": check_encrypted_zip,
         "embedding": lambda: check_embedding(helper, model),
         "ocr": check_ocr,
     }
