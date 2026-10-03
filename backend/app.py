@@ -26,13 +26,14 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend import APP_VERSION, budget_router, credentials, openrouter, openrouter_client, providers, reasoning_capability
+from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
 from backend.runs import AdmissionError, Harness, _through, derived_status
 from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instructions_size, load_instructions,
                               load_settings, visible, write_private)
+from backend import budget_router, reasoning_capability
 
 log = logging.getLogger(__name__)
 

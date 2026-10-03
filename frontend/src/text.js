@@ -15,3 +15,13 @@ export function money(value, language) {
   return new Intl.NumberFormat(language, { style: 'currency', currency: 'USD', minimumFractionDigits: digits,
     maximumFractionDigits: digits }).format(value);
 }
+
+// The text trimmed, or null when it has no visible character, as the backend reads names and
+// defaults (backend/settings.py visible): only separators, format and control characters,
+// marks, or the few letters that draw nothing (Hangul fillers, the blank Braille pattern).
+const BLANK_LETTERS = new Set(['\u115f', '\u1160', '\u3164', '\uffa0', '\u2800']);
+
+export function visible(text) {
+  if (typeof text !== 'string' || ![...text].some((c) => !/[\p{C}\p{M}\p{Z}]/u.test(c) && !BLANK_LETTERS.has(c))) return null;
+  return text.trim();
+}

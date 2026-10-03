@@ -193,7 +193,10 @@ function Subagents() {
       if (!saved || pending.current === next) pending.current = null; // a refused change: the file read again is the base
     });
   };
-  const move = (from, to) => change((base) => {
+  const move = (id, by) => change((base) => { // by the model, in the list the last change left
+    const from = base.indexOf(id);
+    const to = from + by;
+    if (from < 0 || to < 0 || to >= base.length) return null;
     const next = [...base];
     next.splice(to, 0, next.splice(from, 1)[0]);
     return next;
@@ -219,9 +222,9 @@ function Subagents() {
             <li key={id} className="flex items-center gap-2 px-3 py-2 text-sm">
               <span className="w-5 text-xs tabular-nums text-muted-foreground">{i + 1}</span>
               <span className="min-w-0 flex-1 truncate font-mono text-[13px]" title={id}>{id}</span>
-              <Button variant="ghost" size="icon" className="size-7" disabled={i === 0} onClick={() => move(i, i - 1)}
+              <Button variant="ghost" size="icon" className="size-7" disabled={i === 0} onClick={() => move(id, -1)}
                 aria-label={t('subagents.up', { model: id })}><ArrowUp aria-hidden="true" /></Button>
-              <Button variant="ghost" size="icon" className="size-7" disabled={i === list.length - 1} onClick={() => move(i, i + 1)}
+              <Button variant="ghost" size="icon" className="size-7" disabled={i === list.length - 1} onClick={() => move(id, 1)}
                 aria-label={t('subagents.down', { model: id })}><ArrowDown aria-hidden="true" /></Button>
               <Button variant="ghost" size="icon" className="size-7" onClick={() => remove(id)}
                 aria-label={t('subagents.remove', { model: id })}><X aria-hidden="true" /></Button>
