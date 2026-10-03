@@ -25,8 +25,10 @@ test('a deletion that succeeded says what it could not finish', () => {
   assert.deepEqual(deletionNotices({ ok: true, files_left: true }), ['delete.filesLeft']);
   assert.deepEqual(deletionNotices({ ok: true, purge_failed: true, files_left: true }),
     ['delete.purgeFailed', 'delete.filesLeft']);
-  for (const key of deletionNotices({ purge_failed: true, files_left: true })) {
+  assert.deepEqual(deletionNotices({ ok: true, purged_backups: 3, staging_left: true }), ['delete.stagingLeft']);
+  for (const key of deletionNotices({ purge_failed: true, staging_left: true, files_left: true })) {
     assert.ok(Object.hasOwn(en, key), key);
+    assert.ok(Object.hasOwn(zhCN, key), key);
   }
 });
 

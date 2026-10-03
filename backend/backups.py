@@ -255,18 +255,46 @@ def backup_before_deletion(db):
 
 def purge(db, project_id, deleted):
     """"Delete everywhere including backups", after the deletion committed: a fresh automatic backup,
-    then no older one and no damaged copy a restore moved aside, audited. deleted says what was
-    deleted ({"kind", "object_id"}). Returns the number of backups and copies deleted. A failed
-    backup deletes nothing and raises. The caller orders it with restores (see backups_lock)."""
+    then no older one, no damaged copy a restore moved aside and nothing left in staging that no
+    restore still to be finished needs (see _purge_staging), audited. deleted says what was deleted
+    ({"kind", "object_id"}). Returns {"purged_backups": how many backups and copies were deleted},
+    with "staging_left": True when something in staging could not be removed. A failed backup
+    deletes nothing and raises. The caller orders it with restores (see backups_lock)."""
     generation, removed = db.purge_backups()
     copies = sorted((db.backups_dir / DAMAGED).glob("*")) if (db.backups_dir / DAMAGED).is_dir() else []
     for copy in copies:
         _remove(copy)
+    staged, left = _purge_staging(db.data_dir)
     db.write(lambda conn: conn.execute(
         "INSERT INTO audit_log (event, project_id, data) VALUES ('backup_purge', ?, ?)",
         (project_id, json.dumps({**deleted, "kept": f"daily/{generation.name}", "deleted_backups": removed,
-                                 "deleted_damaged_copies": len(copies)}))))
-    return removed + len(copies)
+                                 "deleted_damaged_copies": len(copies), "deleted_staging": staged,
+                                 "staging_left": left}))))
+    return {"purged_backups": removed + len(copies) + staged, **({"staging_left": True} if left else {})}
+
+
+def _purge_staging(data_dir):
+    """Remove each staging folder no restore still to be replayed or undone needs: copies of an
+    earlier state that a failed clean-up left. Returns (removed, left): left counts those that
+    could not be removed, or could not be told apart (a journal that cannot be read)."""
+    root = data_dir / "backups" / STAGING
+    folders = sorted(root.iterdir()) if root.is_dir() else []
+    journal = _read_journal(data_dir)
+    if journal == {}:
+        return 0, len(folders)
+    needed = [data_dir / journal[key] for key in ("staged", "aside")
+              if journal and journal.get("direction") != "done" and key in journal]
+    removed = left = 0
+    for folder in folders:
+        if any(path.is_relative_to(folder) for path in needed):
+            continue
+        try:
+            _remove(folder)
+            removed += 1
+        except OSError as error:
+            log.warning("a purge could not remove a copy in staging (%s)", type(error).__name__)
+            left += 1
+    return removed, left
 
 
 # Listing
@@ -423,19 +451,22 @@ async def restore(body: Restore, request: Request):
 
 
 async def _restore(state, body):
-    data_dir = state["data_dir"]
-    with _file_errors(500, "restore_failed", "The backup could not be put in place; nothing was changed"):
-        staging = await asyncio.to_thread(_staging, data_dir)
+    data_dir, staging = state["data_dir"], None
     try:
         purges = await _purges(state)
-        async with state["backups_lock"]:  # checked and copied while the app runs on; no rotation meanwhile
+        # Checked and copied while the app runs on; no rotation meanwhile, and its staging folder is
+        # made under the lock a purge of staging takes, so a purge never meets it half made.
+        async with state["backups_lock"]:
+            with _file_errors(500, "restore_failed", "The backup could not be put in place; nothing was changed"):
+                staging = await asyncio.to_thread(_staging, data_dir)
             with _file_errors(400, "backup_unreadable", "The backup could not be read"):
                 await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
         state["restoring"] = True  # from here only health, the backups list and this restore are served
         return await _replace(state, body, staging, purges)
     finally:  # before anything else is served again
         try:
-            if not await asyncio.to_thread(_replay_pending, data_dir):  # else the next launch still needs it
+            # A restore still to be replayed or undone keeps it: the next launch needs it
+            if staging is not None and not await asyncio.to_thread(_replay_pending, data_dir):
                 await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
         finally:
             state.pop("restoring", None)

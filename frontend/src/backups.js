@@ -22,7 +22,8 @@ export function deletePath(kind, id, { everywhere = false, removeAllTrace = fals
 // What a deletion that succeeded must still say, as catalog keys: older backups it could not
 // clear (Delete everywhere), and files of the project it could not remove (retried at launch).
 export function deletionNotices(result) {
-  return [result?.purge_failed && 'delete.purgeFailed', result?.files_left && 'delete.filesLeft'].filter(Boolean);
+  return [result?.purge_failed && 'delete.purgeFailed', result?.staging_left && 'delete.stagingLeft',
+    result?.files_left && 'delete.filesLeft'].filter(Boolean);
 }
 
 // What a restore that was done could not record, as catalog keys (the backend's not_recorded).

@@ -101,6 +101,7 @@
   "delete.removeAllTrace": "不留痕迹",
   "delete.removeAllTraceHint": "Scholia 会保留一条删除记录，其中包括标题。选中此项后，记录中也不再保留标题。",
   "delete.purgeFailed": "内容已删除，但未能替换旧备份。旧备份会保留它，直到它们陆续被替换。",
+  "delete.stagingLeft": "内容已删除，但 Scholia 在恢复备份时保留的一份早先数据的副本未能移除。Scholia 下次打开时会再次尝试。",
   "delete.filesLeft": "内容已删除，但它的部分文件未能移除。Scholia 下次打开时会移除它们。",
   "backups.title": "备份",
   "backups.hint": "Scholia 每天备份一次数据库和设置，在数据文件夹中保留 7 个每日备份和 4 个每周备份。这些备份不包含文件；完整备份才包含。",

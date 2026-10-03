@@ -575,7 +575,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         waits for a restore, full backup or export in progress, so none of them meets it halfway."""
         try:
             async with state["backups_lock"]:
-                return {"purged_backups": await _finished(backups.purge, db(), project_id, deleted)}
+                return await _finished(backups.purge, db(), project_id, deleted)
         except Exception as error:
             log.warning("purging the backups after a deletion failed (%s)", type(error).__name__)
             return {"purge_failed": True}

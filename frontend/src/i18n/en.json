@@ -101,6 +101,7 @@
   "delete.removeAllTrace": "Remove all trace",
   "delete.removeAllTraceHint": "Scholia keeps a record that something was deleted, with its title. With this, the record keeps no title either.",
   "delete.purgeFailed": "It was deleted, but the older backups could not be replaced. They keep it until they are replaced in turn.",
+  "delete.stagingLeft": "It was deleted, but a copy of earlier data that Scholia kept while restoring a backup could not be removed. Scholia tries again the next time it opens.",
   "delete.filesLeft": "It was deleted, but some of its files could not be removed. Scholia removes them the next time it opens.",
   "backups.title": "Backups",
   "backups.hint": "Scholia backs up its database and settings once a day and keeps 7 daily and 4 weekly backups in its data folder. They hold no files; a full backup does.",

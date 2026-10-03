@@ -63,7 +63,7 @@ def test_a_deleted_conversation_is_in_no_automatic_backup_after_a_purge(tmp_path
     db, project, conversation = a_project_with_a_conversation(data)
     try:
         delete(db, ContentStore(db), "conversation", conversation, remove_all_trace=remove_all_trace)
-        removed = backups.purge(db, project, {"kind": "conversation", "object_id": conversation})
+        removed = backups.purge(db, project, {"kind": "conversation", "object_id": conversation})["purged_backups"]
         [(event, audited_project, data_json)] = db.read(lambda conn: conn.execute(
             "SELECT event, project_id, data FROM audit_log WHERE event = 'backup_purge'").fetchall())
     finally:

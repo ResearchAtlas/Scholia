@@ -912,3 +912,55 @@ async def test_a_replay_that_cannot_be_committed_makes_no_call_for_the_backups_u
         await background_idle(client)
         assert commits == ["forward", "back"]
         assert title_calls() == []  # nothing ran on the replayed database
+
+
+async def test_delete_everywhere_removes_a_copy_a_failed_staging_cleanup_left(tmp_path, monkeypatch):
+    import errno
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_fsync = backups_module._fsync
+    staging = data / "backups" / backups_module.STAGING
+
+    def failing_fsync(path):  # the first restore's swap and its undo both fail: it is interrupted
+        if (data / "backups" / backups_module.JOURNAL).exists():
+            raise OSError(errno.EIO, "I/O error")
+        real_fsync(path)
+
+    def cannot_clear(data_dir, current):  # and the second one's clean-up of staging fails
+        raise OSError(errno.EIO, "I/O error")
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "_fsync", failing_fsync)
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).json()["code"] == \
+            "restore_interrupted"
+        monkeypatch.setattr(backups_module, "_fsync", real_fsync)
+        monkeypatch.setattr(backups_module, "_clear_staging", cannot_clear)
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+        assert any(staging.rglob("scholia.sqlite3"))  # a copy of an earlier database, listed nowhere
+        response = await client.delete(f"/api/projects/{kept}", params={"purge_backups": "true"})
+        assert response.status_code == 200 and "staging_left" not in response.json()
+        assert not staging.exists() or list(staging.iterdir()) == []
+
+
+async def test_a_purge_that_cannot_remove_a_copy_in_staging_says_so(tmp_path, monkeypatch):
+    import json
+    import shutil
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_remove = backups_module._remove
+
+    def remove(path):
+        if backups_module.STAGING in Path(path).parts:
+            raise OSError("I/O error")
+        real_remove(path)
+
+    async with started(data, setup=False) as client:  # what a failed clean-up left while the app ran
+        left = data / "backups" / backups_module.STAGING / "earlier" / "replaced"
+        left.mkdir(parents=True)
+        shutil.copyfile(data / "scholia.sqlite3", left / "scholia.sqlite3")
+        monkeypatch.setattr(backups_module, "_remove", remove)
+        response = await client.delete(f"/api/projects/{kept}", params={"purge_backups": "true"})
+        assert response.status_code == 200 and response.json()["staging_left"] is True  # the dialog says so
+        [(record,)] = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT data FROM audit_log WHERE event = 'backup_purge'").fetchall())
+        assert json.loads(record)["staging_left"] == 1
