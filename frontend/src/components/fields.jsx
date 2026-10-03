@@ -57,34 +57,30 @@ export function CommitField({ id, value, onCommit, type = 'text', min, above, st
   const listId = useId();
   const [draft, setDraft] = useState(value ?? '');
   const edited = useRef(false); // typed in since the last commit
-  const sent = useRef(null); // the text last committed, until the value catches up with it
-  useEffect(() => { // a new value replaces the draft unless the researcher has typed or committed since
-    if (edited.current || (sent.current !== null && String(value ?? '') !== sent.current)) return;
-    sent.current = null;
-    setDraft(value ?? '');
+  useEffect(() => { // a new value replaces the draft unless the researcher has typed since
+    if (!edited.current) setDraft(value ?? '');
   }, [value]);
 
-  function commit() {
+  // Saves what was typed. Leaving the field saves only after typing; Enter always saves, so a
+  // refused save can be tried again. Saving a value that did not change is harmless.
+  function commit(asked) {
+    if (!edited.current && !asked) return;
     edited.current = false;
-    const decided = commitDecision(String(draft).trim(), { sent: sent.current, value, type, min, above, step, allowEmpty });
+    const decided = commitDecision(String(draft).trim(), { type, min, above, step, allowEmpty });
     if (decided.reject) {
-      setDraft(sent.current ?? value ?? '');
+      setDraft(value ?? '');
       if (decided.invalid) onCommit(undefined, 'invalid_request');
       return;
     }
-    if (decided.same) return;
-    sent.current = decided.shown;
-    Promise.resolve(onCommit(decided.out)).then((saved) => { // not saved (refused): the same text may be committed again
-      if (saved === false && sent.current === decided.shown) sent.current = null;
-    });
+    onCommit(decided.out);
   }
 
   return (
     <>
       <Input id={id} type={type === 'number' ? 'text' : type} inputMode={inputMode ?? (type === 'number' ? 'decimal' : undefined)}
         value={draft} placeholder={placeholder} list={suggestions ? listId : undefined} className={cn('h-9', className)}
-        onChange={(event) => { edited.current = true; setDraft(event.target.value); }} onBlur={commit}
-        onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); commit(); } }} />
+        onChange={(event) => { edited.current = true; setDraft(event.target.value); }} onBlur={() => commit(false)}
+        onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); commit(true); } }} />
       {suggestions && (
         <datalist id={listId}>
           {suggestions.map((suggestion) => <option key={suggestion} value={suggestion} />)}

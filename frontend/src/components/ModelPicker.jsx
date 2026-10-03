@@ -90,7 +90,8 @@ function useCatalog(open, projectId, chosenModel) {
         const at = ready.findIndex((p) => p.name === choice.provider);
         const own = at >= 0 ? listings[at] : null;
         const listed = own?.status === 'fulfilled' && !own.value.status?.error;
-        if (at < 0 || (listed && !own.value.models.some((m) => m.offered && m.id === choice.model))) setChoice(null);
+        const usable = (m) => m.offered && m.id === choice.model && m.window.status === 'ok';
+        if (at < 0 || (listed && !own.value.models.some(usable))) setChoice(null); // gone, or its window unusable
       }
       setCatalog(next);
     } catch {
