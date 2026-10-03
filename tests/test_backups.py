@@ -170,6 +170,40 @@ async def test_a_folder_that_cannot_be_written_gets_a_code_and_no_path_in_the_lo
     assert str(destination) not in caplog.text and "PermissionError" in caplog.text
 
 
+async def test_a_full_disk_while_copying_the_database_is_disk_full(tmp_path, monkeypatch, caplog):
+    import sqlite3 as sqlite
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+
+    def full(self, source, target):
+        error = sqlite.OperationalError("database or disk is full")
+        error.sqlite_errorcode, error.sqlite_errorname = sqlite.SQLITE_FULL, "SQLITE_FULL"
+        raise error
+
+    async with started(tmp_path / "data") as client:
+        monkeypatch.setattr(Database, "_copy", full)
+        for path, body in (("/api/backups", None), ("/api/backups/full", {"destination": str(destination)})):
+            response = await client.post(path, json=body)
+            assert (response.status_code, response.json()["code"]) == (507, "disk_full"), path
+    assert "SQLITE_FULL" in caplog.text and str(tmp_path) not in caplog.text
+
+
+async def test_a_full_disk_while_reading_a_backup_file_is_not_called_damage(tmp_path, monkeypatch):
+    import errno
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        file = (await client.post("/api/backups/full", json={"destination": str(destination)})).json()["file"]
+
+        def full(staging, relative, source):
+            raise OSError(errno.ENOSPC, "No space left on device", str(staging))
+
+        monkeypatch.setattr(backups_module, "_write_staged", full)
+        response = await client.post("/api/backups/restore", json={"file": file})
+        assert (response.status_code, response.json()["code"]) == (507, "disk_full")
+        assert str(tmp_path) not in response.text and not client.state["db"].closed
+
+
 # Restore
 
 

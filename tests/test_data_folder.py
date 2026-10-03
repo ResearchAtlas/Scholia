@@ -203,3 +203,30 @@ def test_only_an_empty_folder_or_one_holding_scholias_data_is_recorded(tmp_path,
 def test_the_synced_check_ignores_case_as_the_file_system_does(tmp_path):
     for place in ("dropbox/Scholia", "library/cloudstorage/OneDrive-x/Scholia", "LIBRARY/Mobile Documents/x"):
         assert data_folder.synced(tmp_path / place, home=tmp_path, fs_type=apfs) is not None
+
+
+def test_a_folder_finder_shows_as_empty_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    chosen = tmp_path / "New folder"
+    chosen.mkdir()
+    (chosen / ".DS_Store").write_bytes(b"\0")
+    assert data_folder.choose(tmp_path / "default", str(chosen)) == chosen
+
+
+def test_the_default_chosen_again_by_another_spelling_removes_the_record(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default, other = tmp_path / "default", tmp_path / "other"
+    other.mkdir()
+    data_folder.choose(default, str(other))
+    (default / "notes.txt").write_text("not Scholia's")
+    spelled = str(default)[:-len("default")] + "DEFAULT"  # the same folder on a case-insensitive volume
+    assert os.path.samefile(spelled, default)
+    data_folder.choose(default, spelled)
+    assert not (default / data_folder.LOCATION_FILE).exists()
+
+
+def test_the_synced_check_ignores_unicode_normalization(tmp_path):
+    import unicodedata
+    home = tmp_path / unicodedata.normalize("NFC", "Zoë")
+    written = tmp_path / unicodedata.normalize("NFD", "Zoë") / "Dropbox" / "Scholia"
+    assert data_folder.synced(written, home=home, fs_type=apfs) is not None

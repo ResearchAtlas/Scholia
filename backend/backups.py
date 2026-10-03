@@ -198,31 +198,51 @@ async def back_up_now(request: Request):
     return {"ok": True, "id": f"daily/{generation.name}"}
 
 
+_FULL = (errno.ENOSPC, errno.EDQUOT)
+
+
 @contextlib.contextmanager
-def _file_errors(status=500, code="write_failed", message="The file could not be written"):
-    """A file system failure as a code, logged by kind only, never with its path."""
+def _file_errors(status, code, message, denied=None):
+    """A file system failure as (status, code, message), logged by kind only, never with its path.
+    A full disk is disk_full; a refused access is denied, (status, code, message), when given.
+    SQLite's own full-disk and I/O errors count too."""
     try:
         yield
     except OSError as error:
         log.warning("a backup, restore or export failed on a file (%s, errno %s)", type(error).__name__, error.errno)
-        if error.errno == errno.ENOSPC:
+        if error.errno in _FULL:
             raise BackupError(507, "disk_full", "The disk is full") from None
-        if error.errno in (errno.EACCES, errno.EPERM, errno.EROFS) and code == "write_failed":
-            raise BackupError(400, "destination_not_writable", "Scholia cannot write to that folder") from None
+        if denied and error.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise BackupError(*denied) from None
         raise BackupError(status, code, message) from None
+    except sqlite3.OperationalError as error:
+        kind = (error.sqlite_errorcode or 0) & 0xFF
+        if kind not in (sqlite3.SQLITE_FULL, sqlite3.SQLITE_IOERR):
+            raise
+        log.warning("a backup, restore or export failed on the database (%s)", error.sqlite_errorname)
+        if kind == sqlite3.SQLITE_FULL:
+            raise BackupError(507, "disk_full", "The disk is full") from None
+        raise BackupError(status, code, message) from None
+
+
+def _written():
+    """The file errors of a full backup or export, which write to the researcher's folder."""
+    return _file_errors(500, "write_failed", "The file could not be written",
+                        denied=(400, "destination_not_writable", "Scholia cannot write to that folder"))
 
 
 @contextlib.contextmanager
 def _backup_errors():
     """A backup's failures, as the interface reads them."""
-    try:
-        yield
-    except DatabaseDamagedError:
-        raise BackupError(409, "database_damaged", "The database failed its check; restore a backup") from None
-    except BackupBusyError:
-        raise BackupError(409, "backup_busy", "Settings kept changing during the backup; try again") from None
-    except DatabaseClosedError:
-        raise BackupError(503, "closing", "The app is closing") from None
+    with _file_errors(500, "backup_failed", "The backup could not be written"):
+        try:
+            yield
+        except DatabaseDamagedError:
+            raise BackupError(409, "database_damaged", "The database failed its check; restore a backup") from None
+        except BackupBusyError:
+            raise BackupError(409, "backup_busy", "Settings kept changing during the backup; try again") from None
+        except DatabaseClosedError:
+            raise BackupError(503, "closing", "The app is closing") from None
 
 
 # Full backups
@@ -238,7 +258,7 @@ async def full_backup(body: FullBackup, request: Request):
 
 
 def _full_backup(db, destination, passphrase):
-    with _file_errors():
+    with _written():
         return _write_full_backup(db, destination, passphrase)
 
 
@@ -288,7 +308,8 @@ async def restore(body: Restore, request: Request):
 
 async def _restore(state, body):
     data_dir = state["data_dir"]
-    staging = await asyncio.to_thread(_staging, data_dir)
+    with _file_errors(500, "restore_failed", "The backup could not be put in place; nothing was changed"):
+        staging = await asyncio.to_thread(_staging, data_dir)
     try:
         with _file_errors(400, "backup_unreadable", "The backup could not be read"):
             await asyncio.to_thread(_stage, data_dir, body, staging / "restore")
@@ -410,7 +431,7 @@ def _stage_file(path, passphrase, staging):
                     digest = _write_staged(staging, info.filename, source)
             except RuntimeError as error:  # pyzipper: a wrong password
                 raise BackupError(400, "wrong_passphrase", "The passphrase does not open this backup") from error
-            except (pyzipper.BadZipFile, OSError, EOFError) as error:
+            except (pyzipper.BadZipFile, EOFError) as error:  # an OSError, such as a full disk, is not its fault
                 raise BackupError(400, "backup_damaged", "The backup file is damaged") from error
             if info.filename.startswith("content/") and digest != info.filename.rsplit("/", 1)[1]:
                 raise BackupError(400, "backup_damaged", "A file in the backup is damaged")
@@ -529,7 +550,7 @@ async def export_project(project_id: str, body: Export, request: Request):
 
 
 def _export(db, project_id, destination, passphrase):
-    with _file_errors():
+    with _written():
         return _write_export(db, project_id, destination, passphrase)
 
 

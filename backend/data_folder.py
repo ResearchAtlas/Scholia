@@ -15,6 +15,7 @@ import os
 import platform
 import stat
 import sys
+import unicodedata
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -84,8 +85,14 @@ def synced(path, *, home=None, fs_type=None) -> str | None:
 
 
 def _inside(place, folder):
-    """Whether place is folder or inside it, ignoring case as macOS's file systems usually do."""
-    return Path(str(place).casefold()).is_relative_to(Path(str(folder).casefold()))
+    """Whether place is folder or inside it, ignoring case and Unicode normalization as macOS's
+    file systems usually do."""
+    def folded(path):
+        return Path(unicodedata.normalize("NFC", str(path)).casefold())
+    return folded(place).is_relative_to(folded(folder))
+
+
+_FINDER_FILES = {".DS_Store", ".localized"}  # what Finder leaves in a folder it shows as empty
 
 
 class _StatFS(ctypes.Structure):  # macOS struct statfs, 64-bit inodes
@@ -126,7 +133,9 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     _check_ancestors(path)
     if not path.parent.is_dir():
         raise ValueError("The folder above it does not exist")
-    if path != default and path.is_dir() and not path.is_symlink() and any(path.iterdir()) \
+    existing = path.is_dir() and not path.is_symlink()
+    is_default = path == default or (existing and default.is_dir() and os.path.samefile(path, default))
+    if existing and not is_default and any(entry.name not in _FINDER_FILES for entry in path.iterdir()) \
             and not (path / DB_NAME).is_file():
         raise ValueError("Choose an empty folder, or one that holds Scholia's data")
     try:
@@ -139,7 +148,7 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     if default.is_symlink():
         raise UnsafeDataFolderError("Scholia will not record it: its default folder is a link")
     os.makedirs(default, 0o700, exist_ok=True)
-    if path == default:
+    if is_default:
         (default / LOCATION_FILE).unlink(missing_ok=True)
     else:
         write_private(default / LOCATION_FILE, json.dumps({"path": str(path)}).encode())
