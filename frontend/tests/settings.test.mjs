@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { choiceUpdates, commitDecision, decodeChoice, onCatalogChange, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, utf8Bytes, valueAt } from '../src/settings.js';
+import { choiceUpdates, commitDecision, decodeChoice, onCatalogChange, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, stillUsable, utf8Bytes, valueAt } from '../src/settings.js';
 import { ApiError } from '../src/api.js';
 
 test('settings keys quote the parts that are not bare TOML keys', () => {
@@ -144,4 +144,36 @@ test('a read that succeeds after a failure clears the error, but a conflict keep
   assert.deepEqual(problems, ['unreachable', null]);
   await saver.save({ a: 1 });
   assert.equal(problems.at(-1), 'settings_changed'); // read again after the conflict, its message kept
+});
+
+test('reads of the file take turns, so an older read never lands after a newer one', async () => {
+  const pending = [];
+  const shown = [];
+  const saver = settingsSaver({
+    read: () => new Promise((resolve) => pending.push(resolve)),
+    write: async () => ({ hash: 'w', values: {} }),
+    onFile: (file) => shown.push(file.hash),
+    onProblem: () => {},
+  });
+  const first = saver.reload();
+  const second = saver.reload();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(pending.length, 1); // the second waits for the first
+  pending[0]({ hash: 'old', values: {} });
+  await first;
+  await new Promise((r) => setTimeout(r, 0));
+  pending[1]({ hash: 'new', values: {} });
+  await second;
+  assert.deepEqual(shown, ['old', 'new']);
+});
+
+test('a chosen model is sent only while its provider offers it with a usable window', () => {
+  const row = (status, offered = true) => ({ id: 'm', offered, window: { status } });
+  assert.equal(stillUsable({ models: [row('ok')] }, 'm'), true);
+  assert.equal(stillUsable({ models: [row('too_small')] }, 'm'), false);
+  assert.equal(stillUsable({ models: [row('needed')] }, 'm'), false);
+  assert.equal(stillUsable({ models: [row('ok', false)] }, 'm'), false);
+  assert.equal(stillUsable({ models: [] }, 'm'), false); // gone from a listing that read well
+  assert.equal(stillUsable({ models: [], status: { error: 'unreachable' } }, 'm'), true); // cannot be judged
+  assert.equal(stillUsable(null, 'm'), true);
 });

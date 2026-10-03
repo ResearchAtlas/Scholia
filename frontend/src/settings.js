@@ -21,7 +21,7 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
   let era = 0;
   // Reads the file again; a read that succeeds clears an earlier error, unless it follows a
   // conflict whose message stays (keep).
-  const reload = async ({ keep = false } = {}) => {
+  const refresh = async (keep) => {
     try {
       latest = await read();
       onFile(latest);
@@ -29,6 +29,12 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
     } catch (error) {
       onProblem(error instanceof ApiError ? error.code : 'internal');
     }
+  };
+  // Reads wait their turn behind saves and earlier reads, so an older one never lands last.
+  const reload = ({ keep = false } = {}) => {
+    const run = queue.then(() => refresh(keep));
+    queue = run.catch(() => {});
+    return run;
   };
   const save = (updates) => {
     const madeIn = era;
@@ -44,7 +50,7 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
         onProblem(code);
         if (code === 'settings_changed') {
           era += 1;
-          await reload({ keep: true });
+          await refresh(true);
         }
         return false;
       }
@@ -184,6 +190,14 @@ export function choiceUpdates(next) {
   if (!next) return { 'ui.model.id': null, 'ui.model.provider': null };
   if (next.auto) return { 'ui.model.id': 'auto', 'ui.model.provider': null };
   return { 'ui.model.id': next.model, 'ui.model.provider': next.provider };
+}
+
+// Whether a chosen model may still be sent, judged by its provider's listing as read now: a
+// listed model must be offered with a usable window (section 8); one missing from a listing
+// that read well is gone; with no listing, or one that reports an error, it cannot be judged.
+export function stillUsable(listing, model) {
+  const row = listing?.models?.find((m) => m.id === model);
+  return row ? Boolean(row.offered && row.window?.status === 'ok') : !(listing && !listing.status?.error);
 }
 
 export function decodeChoice(value) {

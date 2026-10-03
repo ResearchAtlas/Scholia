@@ -11,7 +11,7 @@ import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { errorText, visible } from '../text.js';
-import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, onCatalogChange, settingKey } from '../settings.js';
+import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, onCatalogChange, settingKey, stillUsable } from '../settings.js';
 import { CommitField } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
@@ -34,11 +34,13 @@ export function setChoice(next) {
 }
 
 // Reads the kept choice once per window, with its remembered effort (only a level a turn can
-// ask for); a message, and the catalog's check of what is offered, wait for it. A failed read
-// fails the message (the researcher is told) and is tried again the next time.
+// ask for); a message, and the catalog's check of what is offered, wait for it. A kept model
+// its provider no longer offers with a usable window is not restored. A failed read fails the
+// message (the researcher is told) and is tried again the next time.
 export function readChoice() {
-  reading ??= get('/api/settings').then((settings) => {
+  reading ??= get('/api/settings').then(async (settings) => {
     const kept = decodeChoice(settings.values?.ui?.model);
+    if (kept?.model && !stillUsable(await loadModels(kept.provider).catch(() => null), kept.model)) return;
     const effort = kept?.model ? settings.values?.models?.efforts?.[kept.model] : null;
     if (kept && !choice) publish(kept.model ? { ...kept, effort: EFFORT_LEVELS.includes(effort) ? effort : null } : kept);
   }).catch((error) => {
@@ -80,7 +82,7 @@ function useCatalog(open, projectId, chosenModel) {
       const ready = providers.filter((p) => p.enabled && p.has_key);
       const listings = await Promise.allSettled(ready.map((p) => loadModels(p.name)));
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
-        ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
+        ? listing.value.models.filter((m) => m.offered && m.id !== 'auto').map((m) => ({ ...m, provider: ready[i].name })) : []));
       if (mine !== latest.current || !here.current) return;
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
         defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto' };
@@ -89,9 +91,7 @@ function useCatalog(open, projectId, chosenModel) {
       if (choice?.model) {
         const at = ready.findIndex((p) => p.name === choice.provider);
         const own = at >= 0 && listings[at].status === 'fulfilled' ? listings[at].value : null;
-        const row = own?.models.find((m) => m.id === choice.model); // a row listed now is judged as it reads
-        const gone = row ? !(row.offered && row.window.status === 'ok') : Boolean(own && !own.status?.error);
-        if (at < 0 || gone) setChoice(null); // its provider gone, or it is no longer offered or usable
+        if (at < 0 || !stillUsable(own, choice.model)) setChoice(null); // its provider gone, or no longer offered or usable
       }
       setCatalog(next);
     } catch {

@@ -26,11 +26,16 @@ export function Providers() {
   const [problem, setProblem] = useState(null);
   const [adding, setAdding] = useState(false);
 
+  const reads = useRef(0); // only the newest read of the providers is shown
   const load = useCallback(async () => {
+    const read = ++reads.current;
     try {
-      setList((await get('/api/providers')).providers);
+      const { providers } = await get('/api/providers');
+      if (read !== reads.current) return;
+      setList(providers);
+      setProblem(null);
     } catch (error) {
-      setProblem(error instanceof ApiError ? error.code : 'internal');
+      if (read === reads.current) setProblem(error instanceof ApiError ? error.code : 'internal');
     }
   }, []);
 
