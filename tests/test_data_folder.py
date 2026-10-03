@@ -88,20 +88,21 @@ def test_a_chosen_place_is_recorded_owner_only_in_the_default_folder(tmp_path, m
     assert not record.exists() and data_folder.located(default) == default
 
 
-@pytest.mark.parametrize("path, message", [
-    ("Research/Scholia", "full path"),
-    ("/{tmp}/Research/../Scholia", "full path"),
-    ("/{tmp}/share/Scholia", "network file system"),
-    ("/{tmp}/missing/Scholia", "does not exist"),
-    ("/{tmp}/a-file", "not a folder"),
+@pytest.mark.parametrize("path, message, code", [
+    ("Research/Scholia", "full path", "data_folder_invalid"),
+    ("/{tmp}/Research/../Scholia", "full path", "data_folder_invalid"),
+    ("/{tmp}/share/Scholia", "network file system", "data_folder_synced"),
+    ("/{tmp}/missing/Scholia", "does not exist", "data_folder_not_found"),
+    ("/{tmp}/a-file", "not a folder", "data_folder_invalid"),
 ])
-def test_a_place_that_cannot_hold_the_data_is_not_recorded(tmp_path, monkeypatch, path, message):
+def test_a_place_that_cannot_hold_the_data_is_not_recorded(tmp_path, monkeypatch, path, message, code):
     monkeypatch.setattr(data_folder, "file_system_type",
                         lambda p: "smbfs" if "share" in str(p) else "apfs")
     (tmp_path / "share").mkdir()
     (tmp_path / "a-file").write_text("x")
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(data_folder.FolderRefused, match=message) as refused:
         data_folder.choose(tmp_path / "default", path.format(tmp=str(tmp_path).lstrip("/")))
+    assert refused.value.code == code
     assert not (tmp_path / "default" / data_folder.LOCATION_FILE).exists()
 
 
@@ -155,6 +156,7 @@ def test_a_data_folder_on_a_network_share_is_never_opened_and_another_place_is_c
     seen, answers = [], {}
 
     def on_the_screen(http):
+        answers["first"] = [http.get(path).json() for path in ("/api/setup", "/api/settings")]  # as the interface starts
         answers["other"] = http.get("/api/projects").json()
         answers["refused"] = http.post("/api/data-folder", json={"path": str(tmp_path / "share" / "Other")}).json()
         answers["chosen"] = http.post("/api/data-folder", json={"path": str(chosen)}).json()
@@ -162,8 +164,9 @@ def test_a_data_folder_on_a_network_share_is_never_opened_and_another_place_is_c
     assert desktop.run(share, _window(seen, on_the_screen), listening=register_server) == 1
     assert seen[0]["data_folder_problem"] == "synced" and seen[0]["data_folder"] == str(share)
     assert "network file system (smbfs)" in seen[0]["data_folder_reason"]
+    assert answers["first"] == [{"needed": False}, {"values": {}, "warnings": [], "hash": None}]
     assert answers["other"]["code"] == "data_folder_problem"
-    assert answers["refused"]["code"] == "invalid_data_folder"
+    assert answers["refused"]["code"] == "data_folder_synced"
     assert answers["chosen"] == {"ok": True, "data_folder": str(chosen), "restart": True}
     assert sorted(p.name for p in share.iterdir()) == [data_folder.LOCATION_FILE]  # no lock, log or database
 
@@ -192,7 +195,7 @@ def test_only_an_empty_folder_or_one_holding_scholias_data_is_recorded(tmp_path,
     documents.mkdir()
     (documents / "run.sh").write_text("echo hi\n")
     os.chmod(documents / "run.sh", 0o755)
-    with pytest.raises(ValueError, match="empty folder"):  # its files would be narrowed to owner-only
+    with pytest.raises(data_folder.FolderRefused, match="empty folder"):  # its files would be narrowed to owner-only
         data_folder.choose(default, str(documents))
     assert mode(documents / "run.sh") == 0o755 and not (default / data_folder.LOCATION_FILE).exists()
     moved.mkdir()

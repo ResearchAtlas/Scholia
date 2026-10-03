@@ -118,32 +118,40 @@ def file_system_type(path) -> str | None:
     return info.f_fstypename.decode(errors="replace")
 
 
+class FolderRefused(ValueError):
+    """A place that cannot hold the data folder; code is stable for the interface."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 def choose(default, path, *, home=None, fs_type=None) -> Path:
     """Record path as the data folder for the next launch, after checking it as the desktop entry
     will: an absolute path, not synced or on a network, a folder (made here, owner-only, under an
     existing one) that no other account can change, and empty or holding Scholia's data already
     (the next launch narrows everything in it to owner-only). Choosing the default removes the record.
-    Raises ValueError, or UnsafeDataFolderError, saying why it cannot be used."""
+    Raises FolderRefused, or UnsafeDataFolderError, saying why it cannot be used."""
     if not os.path.isabs(path) or ".." in Path(path).parts:
-        raise ValueError("Choose a folder by its full path")
+        raise FolderRefused("data_folder_invalid", "Choose a folder by its full path")
     path, default = Path(path), Path(default)
     problem = synced(path, home=home, fs_type=fs_type)
     if problem:
-        raise ValueError(f"Scholia cannot keep its data there: {problem}")
+        raise FolderRefused("data_folder_synced", f"Scholia cannot keep its data there: {problem}")
     _check_ancestors(path)
     if not path.parent.is_dir():
-        raise ValueError("The folder above it does not exist")
+        raise FolderRefused("data_folder_not_found", "The folder above it does not exist")
     existing = path.is_dir() and not path.is_symlink()
     is_default = path == default or (existing and default.is_dir() and os.path.samefile(path, default))
     if existing and not is_default and any(entry.name not in _FINDER_FILES for entry in path.iterdir()) \
             and not (path / DB_NAME).is_file():
-        raise ValueError("Choose an empty folder, or one that holds Scholia's data")
+        raise FolderRefused("data_folder_not_empty", "Choose an empty folder, or one that holds Scholia's data")
     try:
         os.mkdir(path, 0o700)
     except FileExistsError:
         pass
     if path.is_symlink() or not path.is_dir():
-        raise ValueError("That is not a folder")
+        raise FolderRefused("data_folder_invalid", "That is not a folder")
     _check_folder(path, os.getuid())
     if default.is_symlink():
         raise UnsafeDataFolderError("Scholia will not record it: its default folder is a link")
@@ -163,7 +171,9 @@ def limited_app(default, data_dir, problem, reason, *, origin, session, frontend
     """The app the desktop entry serves when it will not open the data folder: the interface,
     /api/health saying why (data_folder_problem: "synced", "unsafe" or "missing"), and
     POST /api/data-folder to choose another place, used from the next launch. It opens nothing
-    in the data folder. Every other API request is refused (503 data_folder_problem)."""
+    in the data folder. The interface's first reads of setup and settings get neutral answers
+    (the defaults; nothing is read from the folder), so it shows the data-folder screen; every
+    other API request is refused (503 data_folder_problem)."""
     from backend.app import static_file
     from backend.local_guard import LocalRequestGuard
 
@@ -179,13 +189,24 @@ def limited_app(default, data_dir, problem, reason, *, origin, session, frontend
         return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir),
                 "data_folder_problem": problem, "data_folder_reason": reason}
 
+    @app.get("/api/setup")
+    async def setup_status():
+        return {"needed": False}  # the data-folder screen comes first
+
+    @app.get("/api/settings")
+    async def settings():
+        return {"values": {}, "warnings": [], "hash": None}  # the defaults: the interface follows the system
+
     @app.post("/api/data-folder")
     def choose_another(body: Chosen):  # a plain function: FastAPI runs it off the event loop
         try:
             chosen = choose(default, body.path)
-        except (ValueError, UnsafeDataFolderError, OSError) as failure:
-            reason = str(failure) if not isinstance(failure, OSError) else "That folder cannot be used"
-            return error(400, "invalid_data_folder", reason)
+        except FolderRefused as failure:
+            return error(400, failure.code, str(failure))
+        except UnsafeDataFolderError as failure:
+            return error(400, "data_folder_unsafe", str(failure))
+        except OSError:
+            return error(400, "data_folder_invalid", "That folder cannot be used")
         return {"ok": True, "data_folder": str(chosen), "restart": True}
 
     @app.api_route("/api/{rest:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

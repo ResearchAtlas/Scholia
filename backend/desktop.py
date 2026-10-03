@@ -393,13 +393,26 @@ def _stop(app, server, thread, loop):
         log.warning("the backend did not stop within %s s; the process exits anyway", STOP_SECONDS)
 
 
+class WindowApi:
+    """What the interface may ask of the window (pywebview's js_api, as window.pywebview.api):
+    only to choose a folder, for a full backup, an export or the data folder. A browser has no
+    such bridge; there the interface takes a typed path."""
+
+    def choose_folder(self):
+        """The folder the researcher picked in the system's dialog, or None if cancelled."""
+        import webview
+
+        chosen = webview.windows[0].create_file_dialog(webview.FileDialog.FOLDER)
+        return chosen[0] if chosen else None
+
+
 def _webview_window(url):
     import webview  # the window's own network use is loading this app's pages
 
     if url is None:
         webview.create_window(APP_NAME, html=ALREADY_OPEN, width=420, height=200)
     else:
-        webview.create_window(APP_NAME, url, width=1280, height=820, min_size=(720, 520))
+        webview.create_window(APP_NAME, url, width=1280, height=820, min_size=(720, 520), js_api=WindowApi())
     webview.start()
 
 
