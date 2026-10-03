@@ -6,7 +6,7 @@
 // and one without reasoning control shows no slider. A model with no usable window is marked,
 // and choosing it asks for its window first (section 8). With nothing chosen, the project's or
 // the personal [models] default applies; choosing Auto overrides it.
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
@@ -54,9 +54,14 @@ export function useModelChoice() {
 // personal default; read each time the picker opens, and once at first for a chosen model's
 // effort steps. A chosen model no longer offered (its provider off, or no longer picked) is
 // dropped, so it is never sent.
+// A default as admission reads it: a value with nothing visible is passed over (backend/runs.py).
+const shown = (value) => (typeof value === 'string' && /[\p{L}\p{N}\p{P}\p{S}]/u.test(value) ? value.trim() : null);
+
 function useCatalog(open, projectId) {
   const [catalog, setCatalog] = useState(null);
+  const latest = useRef(0); // the newest load; an older one that finishes later is dropped
   const load = useCallback(async () => {
+    const mine = ++latest.current;
     try {
       forgetModels(); // the offers and windows as the settings hold them now
       const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
@@ -67,8 +72,9 @@ function useCatalog(open, projectId) {
       const listings = await Promise.allSettled(ready.map((p) => loadModels(p.name)));
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
         ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
+      if (mine !== latest.current) return;
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
-        defaultModel: project?.values?.models?.default || settings.values?.models?.default || 'auto' };
+        defaultModel: shown(project?.values?.models?.default) || shown(settings.values?.models?.default) || 'auto' };
       // Only a complete, current listing says a chosen model is gone.
       const complete = listings.every((l) => l.status === 'fulfilled' && !l.value.status?.error);
       if (choice?.model && complete && !models.some((m) => m.provider === choice.provider && m.id === choice.model)) {
@@ -76,7 +82,9 @@ function useCatalog(open, projectId) {
       }
       setCatalog(next);
     } catch {
-      setCatalog((current) => current ?? { models: [], recent: [], efforts: {}, several: false, defaultModel: 'auto' });
+      if (mine === latest.current) {
+        setCatalog((current) => current ?? { models: [], recent: [], efforts: {}, several: false, defaultModel: 'auto' });
+      }
     }
   }, [projectId]);
   useEffect(() => {
@@ -131,7 +139,10 @@ export function ModelPicker({ projectId }) {
   async function setWindow(m, value) {
     setFixProblem(null);
     try {
-      await saveSettings({ [settingKey('providers', m.provider, 'windows', m.id)]: value });
+      if (await saveSettings({ [settingKey('providers', m.provider, 'windows', m.id)]: value }) === null) {
+        setFixProblem('settings_changed'); // the file changed meanwhile: nothing was written
+        return;
+      }
     } catch (error) {
       setFixProblem(error instanceof ApiError ? error.code : 'internal');
       return; // the field stays, with the reason
