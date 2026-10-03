@@ -195,7 +195,8 @@ test('the license record keeps every bundled version of a package, once each', a
   const { join } = await import('node:path');
   const out = mkdtempSync(join(tmpdir(), 'scholia-licenses-'));
   try {
-    const here = new URL('..', import.meta.url).pathname;
+    const { fileURLToPath } = await import('node:url');
+    const here = fileURLToPath(new URL('..', import.meta.url));
     const roots = ['node_modules/@radix-ui/react-slot', 'node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-slot',
       'node_modules/@radix-ui/react-menu/node_modules/@radix-ui/react-slot'].map((path) => join(here, path));
     const recorded = record(roots, out).map((p) => `${p.name}@${p.version} ${p.path}`);
