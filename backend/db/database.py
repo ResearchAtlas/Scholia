@@ -550,6 +550,22 @@ def _open_checked(path, check, latest=None, stop=None):
         raise
 
 
+def check_identity(path, latest=len(MIGRATIONS)):
+    """Check the database file at path as opening it would (see _usable_state), reading only the
+    file itself: no lock, WAL or shared-memory file is made beside it. Raises ForeignDatabaseError
+    for another application's file, NewerDatabaseError for a newer schema, and DatabaseDamagedError
+    for a file SQLite cannot read as a database."""
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    try:
+        _usable_state(conn, latest)
+    except (ForeignDatabaseError, NewerDatabaseError):
+        raise
+    except sqlite3.DatabaseError as error:
+        raise DatabaseDamagedError(f"the file cannot be read as a database: {error}") from error
+    finally:
+        conn.close()
+
+
 def _usable_state(conn, latest):
     """(user_version, whether it has any schema), if this app can open and migrate it.
 

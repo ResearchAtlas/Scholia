@@ -25,6 +25,18 @@ export function deletionNotices(result) {
   return [result?.purge_failed && 'delete.purgeFailed', result?.files_left && 'delete.filesLeft'].filter(Boolean);
 }
 
+// What a restore that was done could not record, as catalog keys (the backend's not_recorded).
+// Its schema version alone is not the researcher's concern.
+const NOT_RECORDED = {
+  audit: 'backups.notRecordedAudit',
+  missing_files: 'backups.notRecordedMissingFiles',
+  journal: 'backups.notRecordedJournal',
+};
+
+export function restoreNotes(result) {
+  return (result?.not_recorded ?? []).map((name) => NOT_RECORDED[name]).filter(Boolean);
+}
+
 // A restore request: an automatic backup by its id, or a full backup file with its passphrase.
 export function restoreBody({ generation, file, passphrase }) {
   if (generation) return { generation };

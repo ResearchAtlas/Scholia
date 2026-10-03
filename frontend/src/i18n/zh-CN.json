@@ -85,6 +85,8 @@
   "folder.choose": "选择…",
   "folder.placeholder": "/Users/you/Documents",
   "dataFolder.missing": "Scholia 设定使用的文件夹现在不存在。如果它在未连接的磁盘上，请连接磁盘后重新打开 Scholia，或者选择其他位置。",
+  "dataFolder.foreign": "Scholia 设定使用的文件夹中有一个不属于 Scholia 的数据库。Scholia 没有改动它；请选择其他位置。",
+  "dataFolder.newer": "Scholia 设定使用的文件夹中存放着更新版本 Scholia 的数据。请更新 Scholia 后再打开，或者选择其他位置。",
   "dataFolder.chooseTitle": "选择其他位置",
   "dataFolder.chooseHint": "请选择这台 Mac 上一个不会同步到云端的空文件夹。如需保留原有内容，请先在“访达”中把原数据文件夹里的内容移到这个文件夹中，再在这里选择它。",
   "dataFolder.use": "使用这个文件夹",
@@ -127,6 +129,9 @@
   "backups.restoreDamagedBody": "Scholia 会把损坏的数据库移到一旁，和备份保存在一起，然后换上这个备份。",
   "backups.restoreConfirm": "恢复",
   "backups.restored": "已恢复。Scholia 正在使用这个备份运行。",
+  "backups.notRecordedAudit": "这次恢复未能记入审计日志。",
+  "backups.notRecordedMissingFiles": "Scholia 无法检查它引用的文件是否都在。",
+  "backups.notRecordedJournal": "Scholia 会在下次打开时完成这次恢复的记录。",
   "backups.missingFiles": {
     "other": "有 {count} 个引用的文件缺失。"
   },
@@ -165,6 +170,8 @@
   "errors.data_folder_not_found": "上一级文件夹不存在。",
   "errors.data_folder_unsafe": "这台 Mac 上的其他账户可以更改该文件夹。",
   "errors.data_folder_invalid": "无法使用该文件夹。请填写文件夹的完整路径。",
+  "errors.data_folder_foreign": "该文件夹中有一个不属于 Scholia 的数据库。",
+  "errors.data_folder_newer": "该文件夹中存放着更新版本 Scholia 的数据。",
   "status.running": "运行中",
   "status.succeeded": "已完成",
   "status.failed": "失败",

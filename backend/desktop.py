@@ -257,8 +257,10 @@ def run(data_dir, open_window, *, keyring_backend=None, transport=None, listenin
     folder, which may record that the researcher chose another (see data_folder).
 
     A data folder Scholia will not open (synced, on a network, unsafe, or a chosen one
-    that is not there) is not touched: the window shows why, through data_folder's
-    limited app, and the researcher can choose another place for the next launch.
+    that is not there or holds another application's or a newer version's database) is
+    not touched: the window shows why, through data_folder's limited app, and the
+    researcher can choose another place for the next launch. The default folder's
+    database is checked as it opens, as before (a newer one is refused).
 
     Returns 0, or 1 when the data folder was not opened (another instance holds it, or
     it was refused). The keyword arguments are for tests: a credential store, a
@@ -274,6 +276,9 @@ def run(data_dir, open_window, *, keyring_backend=None, transport=None, listenin
             return _serve_limited(default, data_dir, "synced", problem, open_window, listening)
         if data_dir != default and not data_dir.is_dir():  # a disk that is not connected: never made anew
             return _serve_limited(default, data_dir, "missing", "the folder is not there", open_window, listening)
+        held = data_folder.database_problem(data_dir) if data_dir != default else None
+        if held:  # before the lock: nothing is written there
+            return _serve_limited(default, data_dir, *held, open_window, listening)
         lock = take_lock(data_dir)
     except UnsafeDataFolderError as error:
         return _serve_limited(default, data_dir, "unsafe", str(error), open_window, listening)

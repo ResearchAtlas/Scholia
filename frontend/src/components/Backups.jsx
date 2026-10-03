@@ -7,7 +7,7 @@ import { useContext, useEffect, useRef, useState } from 'react';
 import { CheckCircle2, DatabaseBackup, History, TriangleAlert } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { get, post } from '../api.js';
-import { fileSize, restoreBody } from '../backups.js';
+import { fileSize, restoreBody, restoreNotes } from '../backups.js';
 import { useAction } from '../action.js';
 import { FolderField } from './FolderField.jsx';
 import { Button } from '@/components/ui/button';
@@ -197,6 +197,11 @@ function Restored({ result, onContinue }) {
       <div ref={heading} tabIndex={-1} className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <Saved text={t('backups.restored')} />
       </div>
+      {restoreNotes(result).length > 0 && (
+        <div role="alert" className="grid gap-1 rounded-md border border-warning/40 px-3 py-2 text-sm text-warning">
+          {restoreNotes(result).map((note) => <p key={note}>{t(note)}</p>)}
+        </div>
+      )}
       {missing.length > 0 && (
         <div role="alert" className="rounded-md border border-warning/40 px-3 py-2 text-sm">
           <p className="font-medium text-warning">{t('backups.missingFiles', { count: missing.length })}</p>

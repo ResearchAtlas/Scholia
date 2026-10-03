@@ -267,3 +267,66 @@ def test_the_synced_check_ignores_unicode_normalization(tmp_path):
     home = tmp_path / unicodedata.normalize("NFC", "Zoë")
     written = tmp_path / unicodedata.normalize("NFD", "Zoë") / "Dropbox" / "Scholia"
     assert data_folder.synced(written, home=home, fs_type=apfs) is not None
+
+
+def another_apps_database(folder):
+    import sqlite3
+    folder.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(folder / "scholia.sqlite3")
+    conn.execute("CREATE TABLE notes (text TEXT)")
+    conn.commit()
+    conn.close()
+
+
+def a_newer_scholia_database(folder):
+    from backend.db import Database
+    Database(folder).close()
+    conn = __import__("sqlite3").connect(folder / "scholia.sqlite3")
+    conn.execute("PRAGMA user_version = 999")
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("held, code", [(another_apps_database, "data_folder_foreign"),
+                                         (a_newer_scholia_database, "data_folder_newer")])
+def test_a_folder_whose_database_scholia_cannot_open_is_not_recorded(tmp_path, monkeypatch, held, code):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    chosen = tmp_path / "Other"
+    held(chosen)
+    before = sorted(p.name for p in chosen.iterdir())
+    with pytest.raises(data_folder.FolderRefused) as refused:
+        data_folder.choose(tmp_path / "default", str(chosen))
+    assert refused.value.code == code
+    assert not (tmp_path / data_folder.LOCATION_FILE).exists()
+    assert sorted(p.name for p in chosen.iterdir()) == before  # read without writing anything there
+
+
+def test_a_folder_with_a_damaged_scholia_database_can_be_chosen(tmp_path, monkeypatch):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    chosen = tmp_path / "Other"
+    chosen.mkdir()
+    (chosen / "scholia.sqlite3").write_bytes(b"not a database " * 400)  # the app offers a restore there
+    assert data_folder.choose(tmp_path / "default", str(chosen)) == chosen
+
+
+@pytest.mark.parametrize("held, problem", [(another_apps_database, "foreign"), (a_newer_scholia_database, "newer")])
+def test_a_chosen_folder_holding_a_database_scholia_cannot_open_is_explained_untouched(tmp_path, monkeypatch,
+                                                                                       held, problem):
+    monkeypatch.setattr(data_folder, "file_system_type", apfs)
+    default, chosen = tmp_path / "default", tmp_path / "Other"
+    chosen.mkdir()
+    data_folder.choose(default, str(chosen))  # empty when chosen
+    held(chosen)  # then it held another database: moved or copied there by hand
+    before = {p.name: p.read_bytes() for p in chosen.iterdir()}
+    seen = []
+    assert desktop.run(default, _window(seen), listening=register_server) == 1
+    assert seen[0]["data_folder_problem"] == problem and seen[0]["data_folder"] == str(chosen)
+    assert {p.name: p.read_bytes() for p in chosen.iterdir()} == before  # no lock, log or database written
+
+
+def test_the_default_folders_newer_database_is_still_refused_at_launch(tmp_path):
+    default = tmp_path / "default"
+    a_newer_scholia_database(default)
+    seen = []
+    assert desktop.run(default, _window(seen), keyring_backend=FakeKeyring(), listening=register_server) == 1
+    assert seen == []  # as S1-08 refuses it: the app does not open

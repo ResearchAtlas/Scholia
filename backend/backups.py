@@ -484,20 +484,33 @@ async def _replace(state, body, staging, purges):
                                   "The restore could not be finished or undone; open Scholia again to finish it") from error
             raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
                 from error
-        await asyncio.to_thread(end_journal, data_dir)  # restored for good: nothing to finish at launch
-        missing = await asyncio.to_thread(_missing_files, restored)
+        # The restore is done and runs: it is never reported as failed from here. What could not be
+        # recorded is said (not_recorded) and logged; a journal not ended is replayed harmlessly at launch.
+        not_recorded = []
+
+        async def recorded(name, fn, *args):
+            try:
+                return await asyncio.to_thread(fn, *args)
+            except Exception as error:
+                log.warning("after a restore, %s could not be recorded (%s)", name, type(error).__name__)
+                not_recorded.append(name)
+                return None
+
+        await recorded("journal", end_journal, data_dir)
+        missing = await recorded("missing_files", _missing_files, restored)
         record = {
             "source": "automatic" if body.generation else "full",
             "backup": body.generation or str(Path(body.file)),
             "safety_copy": f"daily/{safety.name}" if safety else None,
             "damaged_copy": f"{DAMAGED}/{stamp}" if damaged else None,
-            "missing_files": len(missing),
+            "missing_files": None if missing is None else len(missing),
         }
-        await asyncio.to_thread(restored.write, lambda conn: conn.execute(
+        await recorded("audit", restored.write, lambda conn: conn.execute(
             "INSERT INTO audit_log (event, data) VALUES ('restore', ?)", (json.dumps(record),)))
-        version = await asyncio.to_thread(restored.read, lambda conn: conn.execute(
+        version = await recorded("schema_version", restored.read, lambda conn: conn.execute(
             "PRAGMA user_version").fetchone()[0])
-        return {"ok": True, **record, "schema_version": version, "missing_files": missing}
+        return {"ok": True, **record, "schema_version": version, "missing_files": missing,
+                "not_recorded": not_recorded}
 
 
 async def _resume(state, db, damaged):

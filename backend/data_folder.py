@@ -25,7 +25,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from backend import APP_VERSION
-from backend.db.database import DB_NAME
+from backend.db.database import (DB_NAME, DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError,
+                                  check_identity)
 from backend.desktop import UnsafeDataFolderError, _acl_problem, _check_ancestors, _check_folder
 from backend.settings import write_private
 
@@ -120,6 +121,24 @@ def file_system_type(path) -> str | None:
     return info.f_fstypename.decode(errors="replace")
 
 
+def database_problem(folder):
+    """("foreign" or "newer", why) when folder holds a scholia.sqlite3 that is another application's,
+    or Scholia's from a newer version, read without writing anything there; None otherwise (none
+    there, or a damaged one, which the app opens in its damaged-database mode, offering restore)."""
+    path = Path(folder) / DB_NAME
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        check_identity(path)
+    except ForeignDatabaseError:
+        return "foreign", "it holds a database that is not Scholia's"
+    except NewerDatabaseError:
+        return "newer", "it holds data from a newer version of Scholia"
+    except (DatabaseDamagedError, OSError):
+        return None
+    return None
+
+
 class FolderRefused(ValueError):
     """A place that cannot hold the data folder; code is stable for the interface."""
 
@@ -150,6 +169,9 @@ def choose(default, path, *, home=None, fs_type=None) -> Path:
     if existing and not is_default and any(entry.name not in _FINDER_FILES for entry in path.iterdir()) \
             and not (path / DB_NAME).is_file():
         raise FolderRefused("data_folder_not_empty", "Choose an empty folder, or one that holds Scholia's data")
+    held = database_problem(path) if existing else None  # a scholia.sqlite3 is checked, not just its name
+    if held:
+        raise FolderRefused(f"data_folder_{held[0]}", f"Scholia cannot use that folder: {held[1]}")
     try:
         os.mkdir(path, 0o700)
     except FileExistsError:
@@ -179,7 +201,8 @@ class Chosen(BaseModel):
 
 def limited_app(default, data_dir, problem, reason, *, origin, session, frontend_dir=None):
     """The app the desktop entry serves when it will not open the data folder: the interface,
-    /api/health saying why (data_folder_problem: "synced", "unsafe" or "missing"), and
+    /api/health saying why (data_folder_problem: "synced", "unsafe", "missing", "foreign" or
+    "newer"), and
     POST /api/data-folder to choose another place, used from the next launch. It opens nothing
     in the data folder. The interface's first reads of setup and settings get neutral answers
     (the defaults; nothing is read from the folder), so it shows the data-folder screen; every

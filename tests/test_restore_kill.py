@@ -325,3 +325,74 @@ async def test_a_restore_works_after_a_failed_one_could_not_start_the_previous_d
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert response.status_code == 200, response.text  # the folder is treated as damaged: moved aside
         assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept"}
+
+
+async def test_a_restore_done_whose_audit_row_cannot_be_written_is_reported_done_and_says_so(tmp_path, monkeypatch):
+    import errno
+    from backend.db import Database
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_missing, real_write, full = backups_module._missing_files, Database.write, []
+
+    def then_the_disk_fills(db):
+        result = real_missing(db)
+        full.append(True)  # the next write is the restore's audit row
+        return result
+
+    def write(self, fn):
+        if full:
+            full.clear()
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(self, fn)
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "_missing_files", then_the_disk_fills)
+        monkeypatch.setattr(Database, "write", write)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text  # committed: never reported as failed
+        assert response.json()["not_recorded"] == ["audit"]
+        assert {p["name"] for p in (await client.get("/api/projects")).json()["projects"]} == {"General", "Kept"}
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # it runs
+
+
+async def test_a_restore_done_whose_missing_files_cannot_be_checked_is_reported_done(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+
+    def unreadable(db):
+        raise OSError("I/O error")
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "_missing_files", unreadable)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200, response.text
+        assert (response.json()["not_recorded"], response.json()["missing_files"]) == (["missing_files"], None)
+        [(record,)] = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT data FROM audit_log WHERE event = 'restore'").fetchall())
+        assert __import__("json").loads(record)["missing_files"] is None  # audited all the same
+
+
+async def test_a_restore_done_whose_journal_cannot_be_ended_is_finished_harmlessly_at_launch(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    real_end, failed = backups_module.end_journal, []
+
+    def failing_once(data_dir):
+        if not failed:
+            failed.append(True)
+            raise OSError("I/O error")
+        real_end(data_dir)
+
+    async with started(data, setup=False) as client:
+        monkeypatch.setattr(backups_module, "end_journal", failing_once)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert response.status_code == 200 and response.json()["not_recorded"] == ["journal"]
+        assert (data / "backups" / backups_module.JOURNAL).exists()
+        assert (await client.post("/api/projects", json={"name": "After"})).status_code == 201  # it runs
+    monkeypatch.setattr(backups_module, "end_journal", real_end)
+
+    names, text, folders, projects = await state_after_launch(data)  # replaying a finished swap changes nothing
+    assert names == {"General", "Kept", "After"} and text == "Backed up"
+    assert not (data / "backups" / backups_module.JOURNAL).exists()
+    assert not (data / "backups" / backups_module.STAGING).exists() or \
+        list((data / "backups" / backups_module.STAGING).iterdir()) == []

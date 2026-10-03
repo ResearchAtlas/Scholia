@@ -85,6 +85,8 @@
   "folder.choose": "Choose…",
   "folder.placeholder": "/Users/you/Documents",
   "dataFolder.missing": "Scholia was set to use a folder that is not there now. If it is on a disk that is not connected, connect the disk and open Scholia again, or choose another place.",
+  "dataFolder.foreign": "The folder Scholia was set to use holds a database that is not Scholia's. Scholia left it unchanged; choose another place.",
+  "dataFolder.newer": "The folder Scholia was set to use holds data from a newer version of Scholia. Update Scholia to open it, or choose another place.",
   "dataFolder.chooseTitle": "Choose another place",
   "dataFolder.chooseHint": "Choose an empty folder on this Mac that does not sync to the cloud. To keep your work, first move what is inside the old data folder into it in Finder, then choose it here.",
   "dataFolder.use": "Use this folder",
@@ -127,6 +129,9 @@
   "backups.restoreDamagedBody": "Scholia moves the damaged database aside, keeping it with the backups, then puts this backup in place.",
   "backups.restoreConfirm": "Restore",
   "backups.restored": "Restored. Scholia is running on the backup.",
+  "backups.notRecordedAudit": "This restore could not be recorded in the audit log.",
+  "backups.notRecordedMissingFiles": "Scholia could not check whether every file it refers to is there.",
+  "backups.notRecordedJournal": "Scholia finishes recording this restore the next time it opens.",
   "backups.missingFiles": {
     "one": "{count} file it refers to is missing.",
     "other": "{count} files it refers to are missing."
@@ -166,6 +171,8 @@
   "errors.data_folder_not_found": "The folder that would hold it does not exist.",
   "errors.data_folder_unsafe": "Another account on this Mac could change that folder.",
   "errors.data_folder_invalid": "That folder cannot be used. Choose a folder by its full path.",
+  "errors.data_folder_foreign": "That folder holds a database that is not Scholia's.",
+  "errors.data_folder_newer": "That folder holds data from a newer version of Scholia.",
   "status.running": "Running",
   "status.succeeded": "Done",
   "status.failed": "Failed",

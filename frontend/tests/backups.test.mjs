@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
-import { deletePath, deletionNotices, fileSize, folderPicker, needsPassphrase, restoreBody } from '../src/backups.js';
+import { deletePath, deletionNotices, fileSize, folderPicker, needsPassphrase, restoreBody, restoreNotes }
+  from '../src/backups.js';
 import { errorText } from '../src/text.js';
 
 test('a deletion asks for the backups and the trace only when chosen', () => {
@@ -26,6 +27,16 @@ test('a deletion that succeeded says what it could not finish', () => {
     ['delete.purgeFailed', 'delete.filesLeft']);
   for (const key of deletionNotices({ purge_failed: true, files_left: true })) {
     assert.ok(Object.hasOwn(en, key), key);
+  }
+});
+
+test('a restore that was done says what it could not record', () => {
+  assert.deepEqual(restoreNotes({ ok: true, not_recorded: [] }), []);
+  assert.deepEqual(restoreNotes({ ok: true }), []);
+  assert.deepEqual(restoreNotes({ ok: true, not_recorded: ['journal', 'missing_files', 'audit', 'schema_version'] }),
+    ['backups.notRecordedJournal', 'backups.notRecordedMissingFiles', 'backups.notRecordedAudit']);
+  for (const key of restoreNotes({ not_recorded: ['journal', 'missing_files', 'audit'] })) {
+    assert.ok(Object.hasOwn(en, key) && Object.hasOwn(zhCN, key), key);
   }
 });
 
@@ -64,7 +75,7 @@ test('every new error code reads in each language, never as the backend\'s messa
     'destination_in_data_folder', 'invalid_destination', 'not_a_backup', 'backup_damaged', 'backup_unreadable',
     'newer_schema', 'restore_failed', 'safety_copy_failed', 'data_folder_problem', 'data_folder_synced',
     'data_folder_not_empty', 'data_folder_not_found', 'data_folder_unsafe', 'data_folder_invalid',
-    'restore_interrupted', 'restoring', 'work_running'];
+    'restore_interrupted', 'restoring', 'work_running', 'data_folder_foreign', 'data_folder_newer'];
   for (const language of ['en', 'zh-CN']) {
     const t = makeT(language);
     for (const code of codes) assert.notEqual(errorText(t, code), t('errors.internal'), `${language}: ${code}`);
