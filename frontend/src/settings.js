@@ -19,10 +19,13 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
   let latest = null;
   let queue = Promise.resolve();
   let era = 0;
-  const reload = async () => {
+  // Reads the file again; a read that succeeds clears an earlier error, unless it follows a
+  // conflict whose message stays (keep).
+  const reload = async ({ keep = false } = {}) => {
     try {
       latest = await read();
       onFile(latest);
+      if (!keep) onProblem(null);
     } catch (error) {
       onProblem(error instanceof ApiError ? error.code : 'internal');
     }
@@ -41,7 +44,7 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
         onProblem(code);
         if (code === 'settings_changed') {
           era += 1;
-          await reload();
+          await reload({ keep: true });
         }
         return false;
       }
@@ -80,9 +83,10 @@ export function useInstructions(projectId, withProject) {
   const query = projectId ? `?project_id=${encodeURIComponent(projectId)}`
     : withProject ? `?with_project=${encodeURIComponent(withProject)}` : '';
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async ({ keep = false } = {}) => {
     try {
       setFile(await get(`/api/instructions${query}`));
+      if (!keep) setProblem(null); // a read that succeeds clears an earlier error, not a conflict's
     } catch (error) {
       setProblem(error instanceof ApiError ? error.code : 'internal');
     }
@@ -104,7 +108,7 @@ export function useInstructions(projectId, withProject) {
       setProblem(error instanceof ApiError ? error.code : 'internal');
       if (error instanceof ApiError && error.code === 'settings_changed') {
         onRejected?.();
-        await reload();
+        await reload({ keep: true });
       }
       return false;
     }

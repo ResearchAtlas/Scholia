@@ -128,3 +128,20 @@ test('a committed field saves its text as a number, a text or the default, or pu
   assert.deepEqual(commitDecision('a, b', {}), { out: 'a, b' });
   assert.deepEqual(commitDecision('2.5', { type: 'number', min: 1, step: 1 }), { reject: true, invalid: true });
 });
+
+test('a read that succeeds after a failure clears the error, but a conflict keeps its message', async () => {
+  let fail = true;
+  const problems = [];
+  const saver = settingsSaver({
+    read: async () => { if (fail) throw new ApiError(0, 'unreachable'); return { hash: 'h', values: {} }; },
+    write: async () => { throw new ApiError(409, 'settings_changed'); },
+    onFile: () => {},
+    onProblem: (code) => problems.push(code),
+  });
+  await saver.reload();
+  fail = false;
+  await saver.reload(); // Try again
+  assert.deepEqual(problems, ['unreachable', null]);
+  await saver.save({ a: 1 });
+  assert.equal(problems.at(-1), 'settings_changed'); // read again after the conflict, its message kept
+});

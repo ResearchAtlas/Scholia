@@ -4,7 +4,7 @@
 // All or picked models, and has a default window; under Advanced, each model shows its
 // window as reported and in use, with an override and Restore, its effort steps and its
 // price (slice-1 spec sections 4.4 and 8). Keys go to the credential store, never a file.
-import { useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight, KeyRound, Plus, Search } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, put } from '../api.js';
@@ -189,10 +189,16 @@ function Picker({ provider, picked, save }) {
   const t = useT();
   const [models, setModels] = useState(null);
   const [query, setQuery] = useState('');
-  useEffect(() => { // read again whenever a provider or its models change
-    const read = () => loadModels(provider.name).then((listing) => setModels(listing.models)).catch(() => setModels([]));
+  useEffect(() => { // read again whenever a provider or its models change; only the newest read counts
+    let newest = 0;
+    const read = () => {
+      const mine = ++newest;
+      loadModels(provider.name).then((listing) => mine === newest && setModels(listing.models))
+        .catch(() => mine === newest && setModels([]));
+    };
     read();
-    return onCatalogChange(read);
+    const stop = onCatalogChange(read);
+    return () => { newest += 1; stop(); };
   }, [provider.name]);
   const chosen = useMemo(() => new Set(picked ?? []), [picked]);
   const [busy, setBusy] = useState(false); // one change at a time, each from the list as saved
@@ -236,11 +242,16 @@ function PerModel({ provider, table, save }) {
   const language = useContext(LanguageContext);
   const [models, setModels] = useState(null);
   const [query, setQuery] = useState('');
-  const load = useCallback(() => loadModels(provider.name).then((listing) => setModels(listing.models.filter((m) => m.offered)))
-    .catch(() => setModels([])), [provider.name]);
+  const newest = useRef(0); // only the newest read counts, so an older one cannot overwrite it
+  const load = useCallback(() => {
+    const mine = ++newest.current;
+    return loadModels(provider.name).then((listing) => mine === newest.current && setModels(listing.models.filter((m) => m.offered)))
+      .catch(() => mine === newest.current && setModels([]));
+  }, [provider.name]);
   useEffect(() => {
     load();
-    return onCatalogChange(load); // a default window, offer or key changed: the rows read again
+    const stop = onCatalogChange(load); // a default window, offer or key changed: the rows read again
+    return () => { newest.current += 1; stop(); };
   }, [load]);
   if (!models) return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
   const numbers = new Intl.NumberFormat(language);
