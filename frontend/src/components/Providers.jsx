@@ -92,7 +92,8 @@ export function Providers() {
 function ProviderCard({ provider, table, save, onChanged }) {
   const t = useT();
   const [key, setKey] = useState('');
-  const [keyProblem, setKeyProblem] = useState(null);
+  const [keyProblem, setKeyProblem] = useState(null); // the key form's
+  const [modelsProblem, setModelsProblem] = useState(null); // the model policy's and the default window's
   const [notice, setNotice] = useState(null);
   const [open, setOpen] = useState(false);
   const [choosing, setChoosing] = useState(false);
@@ -115,12 +116,12 @@ function ProviderCard({ provider, table, save, onChanged }) {
 
   async function setChoice(next) { // one at a time: the control waits while Pick reads the listing
     setChoosing(true);
-    setKeyProblem(null); // an earlier failed change's message goes with the new attempt
+    setModelsProblem(null); // an earlier failed change's message goes with the new attempt
     try {
       if (next === 'pick') { // starts from the models offered now; a listing that failed changes nothing
         const listing = await loadModels(provider.name).catch(() => null);
         if (!listing || listing.status?.error) {
-          setKeyProblem(listing?.status?.error ?? 'network');
+          setModelsProblem(listing?.status?.error ?? 'network');
           return;
         }
         await save({ [settingKey('providers', provider.name, 'models')]: listing.models.filter((m) => m.offered).map((m) => m.id) });
@@ -165,6 +166,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
 
       {ready && (
         <div className="mt-5 grid gap-5">
+          {modelsProblem && <p role="alert" className="text-xs text-destructive">{errorText(t, modelsProblem)}</p>}
           <Field label={t('providers.models')} hint={t(`providers.modelsHint.${choice}`)}>
             <div>
               <Segmented label={t('providers.models')} value={choice} onChange={setChoice} disabled={choosing}
@@ -180,7 +182,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
               <CommitField id={`window-${provider.name}`} type="number" min={MIN_WINDOW} step={1} inputMode="numeric"
                 value={table.default_window} suggestions={WINDOW_PRESETS} allowEmpty placeholder={t('providers.windowReported')}
                 onCommit={(value, error) => {
-                  setKeyProblem(error ? 'window_too_small' : null);
+                  setModelsProblem(error ? 'window_too_small' : null);
                   if (!error) save({ [settingKey('providers', provider.name, 'default_window')]: value }).then(forgetModels);
                 }} />
             </div>
