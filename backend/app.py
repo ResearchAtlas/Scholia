@@ -237,6 +237,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         kick false: nothing runs on its own (background runs) until the restore has committed."""
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
+        loop = asyncio.get_running_loop()
+
+        def damaged():  # a backup's full check found it damaged: the app is limited, so its work stops too
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(harness.shutdown()))
+
+        db.on_damage = damaged
         try:
             await (harness.recover() if kick else harness.recover(kick=False))
         except BaseException:

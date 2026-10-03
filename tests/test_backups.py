@@ -775,6 +775,57 @@ async def test_background_runs_start_at_launch_only_once_the_launch_backup_has_c
         assert kicked == [True]  # a sound database's runs start after its launch backup
 
 
+async def test_damage_found_while_writes_are_released_leaves_the_harness_stopped(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        real, real_release, resumed = Harness.shutdown, Database.release_writes, []
+
+        async def stuck(self, timeout=10.0):
+            await real(self, timeout)
+            return 1  # a task still running after the timeout
+
+        def release_then_damaged(self):
+            real_release(self)
+            self._damaged = "integrity_check failed"  # found by a check that ran meanwhile
+
+        async def resume(self):
+            resumed.append(True)
+
+        monkeypatch.setattr(Harness, "shutdown", stuck)
+        monkeypatch.setattr(Harness, "resume", resume)
+        monkeypatch.setattr(Database, "release_writes", release_then_damaged)
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "work_running")
+        assert resumed == []
+
+
+async def test_a_backup_that_finds_the_database_damaged_stops_the_work_running_on_it(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        stopped = []
+        real = Harness.shutdown
+
+        async def shutdown(self, timeout=10.0):
+            stopped.append(True)
+            return await real(self, timeout)
+
+        import backend.db.database as database_module
+
+        def failing_check(path, check, **kwargs):
+            raise database_module.DatabaseDamagedError(f"{check} failed: synthetic")
+
+        monkeypatch.setattr(Harness, "shutdown", shutdown)
+        monkeypatch.setattr(database_module, "_open_checked", failing_check)
+        response = await client.post("/api/backups")  # Back up now: its full check fails
+        assert (response.status_code, response.json()["code"]) == (409, "database_damaged")
+        for _ in range(100):
+            if stopped:
+                break
+            await asyncio.sleep(0.01)
+        assert stopped and client.state["harness"].registry.closed  # nothing more is admitted or runs on it
+
+
 async def test_a_backup_rotated_away_while_staged_is_still_restored(tmp_path, monkeypatch):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]

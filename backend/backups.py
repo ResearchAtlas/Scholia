@@ -492,7 +492,8 @@ async def _replace(state, body, staging, purges):
     damaged = db is None or db.closed or db.damaged is not None
     if harness is not None:  # admission stops, and running work stops and drains, before anything is copied
         if await harness.shutdown():  # the harness keeps what still runs, and admits again
-            await _resume(db, harness, damaged)
+            async with state["backups_lock"]:  # no backup can find damage while it resumes
+                await _resume(db, harness, damaged)
             raise BackupError(409, "work_running", "Some running work did not stop in time; try again")
     async with state["writers"].alone(), state["backups_lock"]:  # no other request is left inside
         safety = None
@@ -585,10 +586,13 @@ async def _resume(db, harness, damaged):
     admitted again and its harness, which keeps any work still running, admitting again. A failure
     to restart background work is logged; the restore's own answer stands. A damaged database runs
     nothing: the app is limited to restoring, so its harness stays stopped."""
-    if damaged or db is None or db.closed or db.damaged is not None:  # as it is now: a backup may have found it
+    def sound():  # as it is now: a backup may have found damage meanwhile
+        return not (damaged or db is None or db.closed or db.damaged is not None)
+
+    if not sound():
         return
     await asyncio.to_thread(db.release_writes)
-    if harness is not None:
+    if harness is not None and sound():
         try:
             await harness.resume()
         except Exception as error:

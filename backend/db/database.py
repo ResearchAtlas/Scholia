@@ -94,6 +94,7 @@ class Database:
         self.path = self.data_dir / DB_NAME
         self.backups_dir = self.data_dir / "backups"
         self._damaged = None  # why writing stopped, once an integrity check fails
+        self.on_damage = None  # called once, from the thread whose check found the database damaged
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
@@ -421,7 +422,12 @@ class Database:
             return _open_checked(self.path, "integrity_check", stop=self._stop_requested)
         except DatabaseDamagedError as error:
             with self._commit_lock:
-                self._damaged = str(error)
+                first, self._damaged = self._damaged is None, str(error)
+            if first and self.on_damage is not None:
+                try:
+                    self.on_damage()
+                except Exception as failure:  # the check's own answer stands
+                    log.warning("reporting a damaged database failed (%s)", type(failure).__name__)
             raise
         except sqlite3.OperationalError:
             self._raise_if_closed()
