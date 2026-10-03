@@ -177,3 +177,24 @@ test('a chosen model is sent only while its provider offers it with a usable win
   assert.equal(stillUsable({ models: [], status: { error: 'unreachable' } }, 'm'), true); // cannot be judged
   assert.equal(stillUsable(null, 'm'), true);
 });
+
+test('a read asked for before a later save\'s conflict keeps that conflict\'s message', async () => {
+  let writes = 0;
+  const problems = [];
+  const saver = settingsSaver({
+    read: async () => ({ hash: 'h', values: {} }),
+    write: async () => {
+      writes += 1;
+      if (writes === 2) throw new ApiError(409, 'settings_changed');
+      return { hash: `h${writes}`, values: {} };
+    },
+    onFile: () => {},
+    onProblem: (code) => problems.push(code),
+  });
+  await saver.reload();
+  const first = saver.save({ a: 1 });
+  const second = saver.save({ b: 2 });
+  const afterFirst = first.then(() => saver.reload()); // the first change's own read, queued behind the second
+  await Promise.all([second, afterFirst]);
+  assert.equal(problems.at(-1), 'settings_changed');
+});

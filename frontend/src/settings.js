@@ -30,9 +30,11 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
       onProblem(error instanceof ApiError ? error.code : 'internal');
     }
   };
-  // Reads wait their turn behind saves and earlier reads, so an older one never lands last.
+  // Reads wait their turn behind saves and earlier reads, so an older one never lands last; a
+  // conflict met after a read was asked for keeps its message.
   const reload = ({ keep = false } = {}) => {
-    const run = queue.then(() => refresh(keep));
+    const asked = era;
+    const run = queue.then(() => refresh(keep || asked !== era));
     queue = run.catch(() => {});
     return run;
   };
