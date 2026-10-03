@@ -7,6 +7,9 @@ import zhCN from './zh-CN.json' with { type: 'json' };
 
 const CATALOGS = { en, 'zh-CN': zhCN };
 
+// The supported interface languages, each named in its own language (catalog key language.<code>).
+export const LANGUAGES = Object.keys(CATALOGS);
+
 // The [ui] language setting is "system", "en" or "zh-CN". "system" follows the
 // OS locale: any Chinese locale maps to zh-CN, every other locale to English.
 export function resolveLanguage(setting, systemLocale) {

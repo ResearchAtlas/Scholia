@@ -35,6 +35,37 @@ class Provider:
         return self.base_url.rstrip("/") + "/chat/completions"
 
 
+MIN_WINDOW = 4096  # the smallest supported window (slice-1 spec section 8)
+
+
+def window(table: dict, model: str, reported) -> dict:
+    """A model's window W (slice-1 spec section 8): the model's own setting, else its
+    provider's default window; a setting fills a window the provider does not report and
+    can lower a reported one, never raise it. status is "needed" with neither, and
+    "too_small" under MIN_WINDOW, the smallest window a step can use."""
+    reported = reported if type(reported) is int and reported > 0 else None
+    setting = ((table.get("windows") or {}).get(model)) or table.get("default_window")
+    in_use = min(reported, setting) if reported and setting else reported or setting
+    status = "needed" if not in_use else "too_small" if in_use < MIN_WINDOW else "ok"
+    return {"reported": reported, "setting": setting, "in_use": in_use, "status": status}
+
+
+def offered(table: dict, provider: "Provider", model: str, recommended) -> bool:
+    """Whether a provider's model is offered, by its `models` setting: Recommended (unset
+    on OpenRouter), All (unset elsewhere), or the models picked. A model whose id is "auto"
+    is never offered: the id means Auto (budget_router.AUTO)."""
+    if model == "auto":
+        return False
+    choice = table.get("models")
+    if choice is None:  # unset; an empty list is a Pick of nothing
+        choice = "recommended" if provider.is_openrouter else "all"
+    if choice == "all":
+        return True
+    if choice == "recommended":
+        return model in recommended if provider.is_openrouter else True
+    return model in choice
+
+
 @dataclass(frozen=True)
 class Route:
     provider: Provider
@@ -46,12 +77,15 @@ class Route:
         return f"{self.provider.name}:{self.model}"
 
 
-def configured(data_root, settings=None) -> dict[str, Provider]:
-    """The providers in the personal settings that have a kind and a base URL, by name."""
+def configured(data_root, settings=None, *, include_off=False) -> dict[str, Provider]:
+    """The providers in the personal settings that have a kind and a base URL, by name.
+    A provider turned off (`enabled = false`) is left out, so nothing calls it and the
+    outbound gate does not allow its origin, unless include_off asks for it."""
     values = (settings or load_settings(data_root)).values
     found = {}
     for name, table in (values.get("providers") or {}).items():
-        if isinstance(table, dict) and table.get("kind") and table.get("base_url"):
+        if isinstance(table, dict) and table.get("kind") and table.get("base_url") \
+                and (include_off or table.get("enabled") is not False):
             found[name] = Provider(name, table["kind"], table["base_url"])
     return found
 
