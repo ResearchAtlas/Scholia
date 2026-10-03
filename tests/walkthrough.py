@@ -29,6 +29,7 @@ import uvicorn  # noqa: E402
 from scholia_app import FakeKeyring, MockProvider  # noqa: E402
 
 from backend.app import create_app  # noqa: E402
+from backend.budget_router import MODEL_TIERS  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 ANSWER = """A cohort study follows a group of people over time to see who develops an outcome.
@@ -41,6 +42,24 @@ ANSWER = """A cohort study follows a group of people over time to see who develo
 A figure from the source would appear as a link: ![Survival curve](https://example.org/figure.png)
 
 队列研究的关键在于暴露先于结局被测量。"""
+
+
+# A synthetic model listing: the router's preferred models, with made-up windows and prices,
+# and two others (one with no reported window).
+CATALOG = [{"id": model, "name": model.split("/", 1)[1].replace("-", " ").title(), "context_length": 131072 * (i % 3 + 1),
+            "pricing": {"prompt": f"{0.0000002 * (i + 1):.10f}", "completion": f"{0.0000008 * (i + 1):.10f}"},
+            "supported_parameters": ["tools", "reasoning"]}
+           for i, model in enumerate(dict.fromkeys(m for tier in MODEL_TIERS.values() for m in tier))]
+CATALOG += [{"id": "example/long-context-mini", "name": "Long Context Mini", "context_length": 1000000,
+             "pricing": {"prompt": "0.0000001", "completion": "0.0000004"}},
+            {"id": "example/unlisted-window", "name": "Unlisted Window", "pricing": {"prompt": "0", "completion": "0"}}]
+
+
+class SyntheticProvider(MockProvider):
+    async def __call__(self, request):
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": CATALOG})
+        return await super().__call__(request)
 
 
 def synthetic(body):
@@ -56,7 +75,7 @@ def main(argv=None):
     parser.add_argument("--dev", action="store_true")
     args = parser.parse_args(argv)
 
-    provider = MockProvider()
+    provider = SyntheticProvider()
     provider.replies = [synthetic] * 1000
     provider.title_replies = [synthetic] * 1000
     data_dir = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-"))

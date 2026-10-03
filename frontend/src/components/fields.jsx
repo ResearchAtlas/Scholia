@@ -1,0 +1,104 @@
+// i18n: migrated
+// The settings pages' controls. Every choice has at most three options, or a text box
+// (slice-1 spec F12): a typed value with suggestions counts as a text box. A text or number
+// is saved when it is committed (Enter, or leaving the field), and a choice when it is made.
+import { useEffect, useId, useState } from 'react';
+import { RotateCcw } from 'lucide-react';
+import { useT } from '../i18n/index.js';
+import { Input } from '@/components/ui/input';
+import { cn } from '@/lib/utils';
+
+export function Section({ title, hint, children }) {
+  return (
+    <section className="space-y-4">
+      <div>
+        <h3 className="text-sm font-semibold">{title}</h3>
+        {hint && <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{hint}</p>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+export function Field({ label, hint, htmlFor, children, aside }) {
+  return (
+    <div className="grid gap-1.5">
+      <div className="flex items-baseline justify-between gap-3">
+        <label htmlFor={htmlFor} className="text-sm font-medium">{label}</label>
+        {aside}
+      </div>
+      {children}
+      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+// One choice among at most three, as a row of buttons.
+export function Segmented({ label, options, value, onChange, disabled }) {
+  return (
+    <div role="radiogroup" aria-label={label} className="inline-flex rounded-lg border bg-muted/40 p-0.5">
+      {options.map((option) => (
+        <button key={option.value} type="button" role="radio" aria-checked={value === option.value} disabled={disabled}
+          onClick={() => value !== option.value && onChange(option.value)}
+          className={cn('rounded-md px-3 py-1.5 text-sm transition-colors disabled:opacity-50',
+            value === option.value ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// A text or a whole number, committed on Enter or on leaving the field. suggestions are
+// offered under it; an empty field commits null (back to the default) when allowEmpty.
+export function CommitField({ id, value, onCommit, type = 'text', min, step, suggestions, placeholder, allowEmpty,
+  className, inputMode }) {
+  const listId = useId();
+  const [draft, setDraft] = useState(value ?? '');
+  useEffect(() => setDraft(value ?? ''), [value]);
+
+  function commit() {
+    const text = String(draft).trim();
+    if (text === String(value ?? '')) return;
+    if (!text) {
+      if (allowEmpty) onCommit(null);
+      else setDraft(value ?? '');
+      return;
+    }
+    if (type === 'number') {
+      const number = Number(text);
+      if (!Number.isFinite(number) || (min !== undefined && number < min) || (step === 1 && !Number.isInteger(number))) {
+        setDraft(value ?? '');
+        onCommit(undefined, 'invalid_request');
+        return;
+      }
+      onCommit(number);
+    } else {
+      onCommit(text);
+    }
+  }
+
+  return (
+    <>
+      <Input id={id} type={type === 'number' ? 'text' : type} inputMode={inputMode ?? (type === 'number' ? 'decimal' : undefined)}
+        value={draft} placeholder={placeholder} list={suggestions ? listId : undefined} className={cn('h-9', className)}
+        onChange={(event) => setDraft(event.target.value)} onBlur={commit}
+        onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); commit(); } }} />
+      {suggestions && (
+        <datalist id={listId}>
+          {suggestions.map((suggestion) => <option key={suggestion} value={suggestion} />)}
+        </datalist>
+      )}
+    </>
+  );
+}
+
+export function Restore({ onClick, disabled }) {
+  const t = useT();
+  return (
+    <button type="button" onClick={onClick} disabled={disabled}
+      className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground disabled:opacity-40">
+      <RotateCcw className="size-3" aria-hidden="true" />{t('settings.restore')}
+    </button>
+  );
+}

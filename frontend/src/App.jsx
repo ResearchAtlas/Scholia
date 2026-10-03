@@ -53,7 +53,8 @@ export function App() {
       {state.phase === 'error' && <Failure code={state.code} onRetry={load} />}
       {state.phase === 'dataFolder' && <DataFolderScreen health={state.health} />}
       {state.phase === 'setup' && <FirstRun onDone={load} />}
-      {state.phase === 'ready' && <Shell health={state.health} settings={state.settings} />}
+      {state.phase === 'ready' && <Shell health={state.health} settings={state.settings}
+        onLanguage={(setting) => setLanguage(resolveLanguage(setting, navigator.language))} />}
     </LanguageContext.Provider>
   );
 }
