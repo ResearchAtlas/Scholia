@@ -11,7 +11,7 @@ import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { errorText, visible } from '../text.js';
-import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, settingKey } from '../settings.js';
+import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, onCatalogChange, settingKey } from '../settings.js';
 import { CommitField } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
@@ -63,7 +63,7 @@ export function useModelChoice() {
 // personal default; read each time the picker opens, and once at first for a chosen model's
 // effort steps. A chosen model no longer offered (its provider off, or no longer picked) is
 // dropped, so it is never sent.
-function useCatalog(open, projectId) {
+function useCatalog(open, projectId, chosenModel) {
   const [catalog, setCatalog] = useState(null);
   const latest = useRef(0); // the newest load; an older one that finishes later is dropped
   const here = useRef(true); // a picker that has gone starts no load and publishes none
@@ -72,7 +72,7 @@ function useCatalog(open, projectId) {
     const mine = ++latest.current;
     try {
       await readChoice(); // a kept choice is checked against the catalog like any other
-      forgetModels(); // the offers and windows as the settings hold them now
+      forgetModels({ quiet: true }); // the offers and windows as the settings hold them now
       const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
       const [{ providers }, { models: recent }, settings, project] = await Promise.all([
         get('/api/providers'), get('/api/models/recent'), get('/api/settings'),
@@ -107,6 +107,10 @@ function useCatalog(open, projectId) {
   useEffect(() => {
     if (open) load();
   }, [open, load]);
+  useEffect(() => { // a choice restored or made later is checked against the catalog too
+    if (chosenModel) load();
+  }, [chosenModel, load]);
+  useEffect(() => onCatalogChange(() => load()), [load]); // a provider or its models changed in Settings
   return [catalog, setCatalog, load];
 }
 
@@ -115,7 +119,7 @@ export function ModelPicker({ projectId }) {
   const chosen = useModelChoice();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [catalog, setCatalog, reload] = useCatalog(open, projectId);
+  const [catalog, setCatalog, reload] = useCatalog(open, projectId, chosen?.model ? `${chosen.provider}:${chosen.model}` : null);
   const [fixing, setFixing] = useState(null); // a model whose window is asked for before it is chosen
   const [fixProblem, setFixProblem] = useState(null);
   const model = catalog?.models.find((m) => m.provider === chosen?.provider && m.id === chosen?.model);
@@ -131,9 +135,11 @@ export function ModelPicker({ projectId }) {
   function pick(m) {
     if (!m) {
       setChoice({ auto: true });
-    } else if (m.window.status !== 'ok') {
+    } else if (m.window.status === 'needed') { // a window can be set only where none is reported
       setFixing(m);
       return;
+    } else if (m.window.status !== 'ok') {
+      return; // reported below the smallest usable window: no setting can raise it
     } else {
       const remembered = catalog.efforts[m.id];
       setChoice({ provider: m.provider, model: m.id, name: m.name, effort: m.effort.steps.includes(remembered) ? remembered : null });
@@ -237,6 +243,7 @@ function ModelItem({ m, chosen, several, onPick }) {
   const usable = m.window.status === 'ok';
   return (
     <Item selected={chosen?.provider === m.provider && chosen?.model === m.id} onSelect={() => onPick(m)}
+      disabled={m.window.status === 'too_small'}
       title={m.name} detail={several ? `${m.provider} · ${m.id}` : m.id}
       badge={usable ? null : t(m.window.status === 'needed' ? 'picker.windowNeeded' : 'picker.windowTooSmall')} />
   );

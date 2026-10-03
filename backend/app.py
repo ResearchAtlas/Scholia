@@ -400,8 +400,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             "SELECT json_extract(e.data, '$.route') AS route FROM run_events e JOIN runs r ON r.id = e.run_id"
             " WHERE e.type = 'route' AND json_extract(e.data, '$.plan.policy_reason') = 'chosen_model'"
             " GROUP BY route ORDER BY max(r.started_at) DESC LIMIT 3").fetchall())
-        recent = [route for (route,) in rows if isinstance(route, str) and ":" in route]
-        return {"models": [dict(zip(("provider", "model"), route.split(":", 1))) for route in recent]}
+        names = sorted(providers.configured(data_dir, include_off=True), key=len, reverse=True)
+
+        def split(route):  # "<provider>:<model>", where a provider's name may itself hold a colon
+            name = next((n for n in names if isinstance(route, str) and route.startswith(n + ":")), None)
+            return name and {"provider": name, "model": route[len(name) + 1:]}
+
+        return {"models": [found for (route,) in rows if (found := split(route))]}
 
     # Settings and instructions
 
@@ -445,12 +450,17 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 "hash": loaded._digest}
 
     @app.get("/api/instructions")
-    async def get_instructions(project_id: str | None = None):
+    async def get_instructions(project_id: str | None = None, with_project: str | None = None):
+        """An AGENTS.md file to edit: the personal one, or project_id's. combined_bytes measures it
+        with the instructions it joins: for the personal file, with_project's, if given."""
         async with project_files:  # ordered with deletion and with saves
             path = await instructions_path(project_id)
+            joined = project_id or with_project
+            if with_project is not None:
+                await project_row(with_project)
             raw = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b"")
-            _, warnings = await asyncio.to_thread(load_instructions, data_dir, project_id)
-            combined = await asyncio.to_thread(instructions_size, data_dir, project_id)
+            _, warnings = await asyncio.to_thread(load_instructions, data_dir, joined)
+            combined = await asyncio.to_thread(instructions_size, data_dir, joined)
         text = raw.decode("utf-8", errors="replace")
         return {"text": text, "hash": hashlib.sha256(raw).hexdigest(), "combined_bytes": combined,
                 "replaced": text.encode("utf-8") != raw,  # not UTF-8: saving it back replaces those bytes

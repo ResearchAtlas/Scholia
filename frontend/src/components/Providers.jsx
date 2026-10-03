@@ -104,8 +104,12 @@ function ProviderCard({ provider, table, save, onChanged }) {
   }
 
   async function setChoice(next) {
-    if (next === 'pick') {
-      const listing = await loadModels(provider.name).catch(() => ({ models: [] }));
+    if (next === 'pick') { // starts from the models offered now; a listing that failed changes nothing
+      const listing = await loadModels(provider.name).catch(() => null);
+      if (!listing || listing.status?.error) {
+        setKeyProblem(listing?.status?.error ?? 'network');
+        return;
+      }
       await save({ [settingKey('providers', provider.name, 'models')]: listing.models.filter((m) => m.offered).map((m) => m.id) });
     } else {
       await save({ [settingKey('providers', provider.name, 'models')]: next });
@@ -181,10 +185,15 @@ function Picker({ provider, picked, save }) {
     loadModels(provider.name).then((listing) => setModels(listing.models)).catch(() => setModels([]));
   }, [provider.name]);
   const chosen = useMemo(() => new Set(picked ?? []), [picked]);
+  const [busy, setBusy] = useState(false); // one change at a time, each from the list as saved
   if (!models) return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
   const shown = models.filter((m) => `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase())).slice(0, 200);
-  const toggle = (id) => save({ [settingKey('providers', provider.name, 'models')]: chosen.has(id)
-    ? [...chosen].filter((m) => m !== id) : [...chosen, id] }).then(forgetModels);
+  const toggle = (id) => {
+    if (busy) return;
+    setBusy(true);
+    save({ [settingKey('providers', provider.name, 'models')]: chosen.has(id)
+      ? [...chosen].filter((m) => m !== id) : [...chosen, id] }).then(forgetModels).finally(() => setBusy(false));
+  };
   return (
     <div className="rounded-lg border">
       <div className="relative border-b">
@@ -198,7 +207,7 @@ function Picker({ provider, picked, save }) {
         {shown.map((m) => (
           <li key={m.id}>
             <label className="flex cursor-pointer items-center gap-2.5 px-3 py-1.5 text-sm hover:bg-accent">
-              <input type="checkbox" checked={chosen.has(m.id)} onChange={() => toggle(m.id)} className="accent-[hsl(var(--brand))]" />
+              <input type="checkbox" checked={chosen.has(m.id)} disabled={busy} onChange={() => toggle(m.id)} className="accent-[hsl(var(--brand))]" />
               <span className="min-w-0 flex-1 truncate">{m.name}</span>
               <span className="truncate font-mono text-xs text-muted-foreground">{m.id}</span>
             </label>

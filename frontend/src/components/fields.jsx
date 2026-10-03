@@ -2,7 +2,7 @@
 // The settings pages' controls. Every choice has at most three options, or a text box
 // (slice-1 spec F12): a typed value with suggestions counts as a text box. A text or number
 // is saved when it is committed (Enter, or leaving the field), and a choice when it is made.
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { RotateCcw } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { Input } from '@/components/ui/input';
@@ -51,11 +51,15 @@ export function Segmented({ label, options, value, onChange, disabled }) {
 
 // A text or a whole number, committed on Enter or on leaving the field. suggestions are
 // offered under it; an empty field commits null (back to the default) when allowEmpty.
-export function CommitField({ id, value, onCommit, type = 'text', min, step, suggestions, placeholder, allowEmpty,
+export function CommitField({ id, value, onCommit, type = 'text', min, above, step, suggestions, placeholder, allowEmpty,
   className, inputMode }) {
   const listId = useId();
   const [draft, setDraft] = useState(value ?? '');
-  useEffect(() => setDraft(value ?? ''), [value]);
+  const shown = useRef(value); // the value the draft last came from
+  useEffect(() => { // a new value replaces the draft unless the researcher has typed since
+    setDraft((current) => (String(current) === String(shown.current ?? '') ? value ?? '' : current));
+    shown.current = value;
+  }, [value]);
 
   function commit() {
     const text = String(draft).trim();
@@ -67,7 +71,8 @@ export function CommitField({ id, value, onCommit, type = 'text', min, step, sug
     }
     if (type === 'number') {
       const number = Number(text);
-      if (!Number.isFinite(number) || (min !== undefined && number < min) || (step === 1 && !Number.isInteger(number))) {
+      if (!Number.isFinite(number) || (min !== undefined && number < min) || (above !== undefined && number <= above)
+          || (step === 1 && !Number.isInteger(number))) {
         setDraft(value ?? '');
         onCommit(undefined, 'invalid_request');
         return;

@@ -74,10 +74,11 @@ export function useSettingsFile(projectId) {
 }
 
 // An AGENTS.md file: the personal one, or a project's.
-export function useInstructions(projectId) {
+export function useInstructions(projectId, withProject) {
   const [file, setFile] = useState(null); // { text, hash, combined_bytes, cap_bytes, warnings }
   const [problem, setProblem] = useState(null);
-  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}`
+    : withProject ? `?with_project=${encodeURIComponent(withProject)}` : '';
 
   const reload = useCallback(async () => {
     try {
@@ -91,7 +92,9 @@ export function useInstructions(projectId) {
     reload();
   }, [reload]);
 
-  const save = useCallback(async (text) => {
+  // Resolves true when saved. On a changed file it resolves false and the file is read again;
+  // the caller keeps the draft (onRejected runs before that read lands).
+  const save = useCallback(async (text, onRejected) => {
     setProblem(null);
     try {
       await put('/api/instructions', { text, hash: file?.hash, ...(projectId ? { project_id: projectId } : {}) });
@@ -99,7 +102,10 @@ export function useInstructions(projectId) {
       return true;
     } catch (error) {
       setProblem(error instanceof ApiError ? error.code : 'internal');
-      if (error instanceof ApiError && error.code === 'settings_changed') await reload();
+      if (error instanceof ApiError && error.code === 'settings_changed') {
+        onRejected?.();
+        await reload();
+      }
       return false;
     }
   }, [file?.hash, projectId, reload]);
@@ -123,8 +129,18 @@ export function loadModels(provider, { refresh = false } = {}) {
   return listings.get(provider);
 }
 
-export function forgetModels() {
+const catalogListeners = new Set();
+
+// Forgets the listings after a provider or its models changed, and tells those who show them;
+// quietly when it is the reader itself that wants fresh listings.
+export function forgetModels({ quiet = false } = {}) {
   listings.clear();
+  if (!quiet) catalogListeners.forEach((listener) => listener());
+}
+
+export function onCatalogChange(listener) {
+  catalogListeners.add(listener);
+  return () => catalogListeners.delete(listener);
 }
 
 // The window presets offered as suggestions under a window field (slice-1 spec section 13).

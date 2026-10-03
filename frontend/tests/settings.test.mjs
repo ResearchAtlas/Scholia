@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { choiceUpdates, decodeChoice, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, utf8Bytes, valueAt } from '../src/settings.js';
+import { choiceUpdates, decodeChoice, onCatalogChange, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, utf8Bytes, valueAt } from '../src/settings.js';
 import { ApiError } from '../src/api.js';
 
 test('settings keys quote the parts that are not bare TOML keys', () => {
@@ -94,4 +94,14 @@ test('the picker\'s choice is kept as settings and read back, colons and all', (
   assert.deepEqual(choiceUpdates(null), { 'ui.model.id': null, 'ui.model.provider': null });
   assert.equal(decodeChoice(undefined), null);
   assert.equal(decodeChoice({ id: 'm' }), null); // a model without its provider is no choice
+});
+
+test('a change to the providers is announced; a reader that clears the cache itself is not', () => {
+  let heard = 0;
+  const stop = onCatalogChange(() => { heard += 1; });
+  forgetModels();
+  forgetModels({ quiet: true });
+  stop();
+  forgetModels();
+  assert.equal(heard, 1);
 });

@@ -282,3 +282,30 @@ async def test_the_pickers_choice_is_a_validated_setting(tmp_path):
         assert "model" not in values or not values["model"]
         for bad in ({"ui.model.id": " "}, {"ui.model.provider": 3}, {"ui.model": "auto"}):
             assert (await save(client, bad)).json()["code"] == "invalid_setting", bad
+
+
+async def test_recent_models_keep_a_provider_name_with_a_colon(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        await save(client, {'providers."lab:v2".kind': "openai-compatible",
+                            'providers."lab:v2".base_url': "https://lab.example/v1"})
+
+        def record(conn):
+            run = new_id()
+            conn.execute("INSERT INTO runs (id, project_id, conversation_id, kind, workflow, status)"
+                         " SELECT ?, project_id, id, 'turn', 'agent', 'succeeded' FROM conversations WHERE id = ?",
+                         (run, conversation))
+            conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, 0, 'route', ?)",
+                         (run, '{"route": "lab:v2:llama3:8b", "plan": {"policy_reason": "chosen_model"}}'))
+        await asyncio.to_thread(client.state["db"].write, record)
+        assert (await client.get("/api/models/recent")).json()["models"] == [{"provider": "lab:v2", "model": "llama3:8b"}]
+
+
+async def test_the_personal_editor_is_measured_with_the_projects_instructions(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "P"})).json()["id"]
+        await client.put("/api/instructions", json={"text": "x" * 20_000})
+        await client.put("/api/instructions", json={"text": "y" * 20_000, "project_id": project})
+        read = (await client.get("/api/instructions", params={"with_project": project})).json()
+        assert (read["text"], read["combined_bytes"]) == ("x" * 20_000, 40_002)
+        assert (await client.get("/api/instructions", params={"with_project": "nope"})).status_code == 404

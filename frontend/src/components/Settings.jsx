@@ -2,7 +2,7 @@
 // Settings (S10; slice-1 spec F12 and the stage walk): General, Providers and models,
 // Subagents, This project and Advanced. Personal values live in the personal config.toml,
 // the project's in its own; keys live in the credential store (section 4.4).
-import { useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, X } from 'lucide-react';
 import { LANGUAGES, LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, patch, post } from '../api.js';
@@ -44,7 +44,7 @@ export function Settings({ open, onOpenChange, health, project, onLanguage, onPr
           ))}
         </nav>
         <div className="scroll-thin min-h-0 flex-1 overflow-y-auto px-6 py-6 sm:px-8">
-          {open && page === 'general' && <General onLanguage={onLanguage} />}
+          {open && page === 'general' && <General onLanguage={onLanguage} projectId={project?.id} />}
           {open && page === 'providers' && <Providers />}
           {open && page === 'subagents' && <Subagents />}
           {open && page === 'project' && project && <ThisProject project={project} onProjectChanged={onProjectChanged} />}
@@ -72,7 +72,7 @@ function Loading() {
   return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
 }
 
-function General({ onLanguage }) {
+function General({ onLanguage, projectId }) {
   const t = useT();
   const personal = useSettingsFile();
   const [problem, setProblem] = useState(null);
@@ -100,27 +100,30 @@ function General({ onLanguage }) {
       </Field>
       <Field label={t('settings.conversationBudget')} htmlFor="conversation-budget" hint={t('settings.conversationBudgetHint')}>
         <div className="max-w-40">
-          <CommitField id="conversation-budget" type="number" min={0} value={values.budget.conversation_usd}
+          <CommitField id="conversation-budget" type="number" above={0} value={values.budget.conversation_usd}
             suggestions={BUDGET_SUGGESTIONS}
             onCommit={(value, error) => (error ? setProblem(error) : personal.save({ 'budget.conversation_usd': value }))} />
         </div>
       </Field>
-      <InstructionsEditor label={t('settings.personalInstructions')} hint={t('settings.personalInstructionsHint')} />
+      <InstructionsEditor label={t('settings.personalInstructions')} hint={t('settings.personalInstructionsHint')}
+        withProject={projectId} />
     </div>
   );
 }
 
 // An AGENTS.md editor. The combined personal and project instructions are capped at 32 KiB;
 // the editor warns before that, as the text is typed.
-function InstructionsEditor({ projectId, label, hint }) {
+function InstructionsEditor({ projectId, withProject, label, hint }) {
   const t = useT();
-  const instructions = useInstructions(projectId);
+  const instructions = useInstructions(projectId, withProject);
+  const rejected = useRef(null); // a draft whose save met a changed file: kept to reconcile
   const [draft, setDraft] = useState(null);
   const [saving, setSaving] = useState(false); // the text cannot change while it is saved and read back
   const [confirming, setConfirming] = useState(false); // a file not in UTF-8 is rewritten only when confirmed
   const file = instructions.file;
   useEffect(() => {
-    setDraft(file?.text ?? null);
+    setDraft(rejected.current ?? file?.text ?? null);
+    rejected.current = null;
     setConfirming(false);
   }, [file?.text, file?.hash]);
   if (!file || draft === null) return <Loading />;
@@ -148,7 +151,7 @@ function InstructionsEditor({ projectId, label, hint }) {
             return;
           }
           setSaving(true);
-          await instructions.save(draft);
+          await instructions.save(draft, () => { rejected.current = draft; }); // on a changed file the draft stays
           setSaving(false);
         }}>{confirming ? t('settings.instructionsReplaceConfirm') : t('common.save')}</Button>
       </div>
@@ -306,7 +309,7 @@ function ThisProject({ project, onProjectChanged }) {
       </div>
       <Field label={t('project.budget')} htmlFor="project-budget" hint={t('project.budgetHint')}>
         <div className="max-w-40">
-          <CommitField id="project-budget" type="number" min={0} value={values.project.budget_usd}
+          <CommitField id="project-budget" type="number" above={0} value={values.project.budget_usd}
             suggestions={[25, 50, 100, 200]}
             onCommit={(value, error) => (error ? setProblem(error) : own.save({ 'project.budget_usd': value }))} />
         </div>
