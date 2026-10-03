@@ -280,7 +280,7 @@ async def test_a_request_the_gate_refuses_never_leaves_and_its_reservation_is_re
         project = (await client.post("/api/projects", json={"name": "Interviews", "sensitivity": "private"})).json()["id"]
         # Admission is told the route is allowed and the key confirmed; the gate, which reads the
         # allowlist and OpenRouter's catalog itself, refuses a model with no zero-retention endpoint.
-        monkeypatch.setattr(governance.Policy, "problem", lambda self, provider, model: None)
+        monkeypatch.setattr(governance.Policy, "problem", lambda self, provider, model, key=None: None)
         monkeypatch.setattr(governance, "key_attested", lambda *args: True)
         conversation = await new_conversation(client, project_id=project)
         await client.put("/api/settings", json={"hash": (await client.get("/api/settings")).json()["hash"],

@@ -376,3 +376,19 @@ async def test_a_stale_catalog_never_vouches_for_zero_retention(monkeypatch):
     assert governance.zero_retention(provider, ZDR_MODEL, KEY)
     monkeypatch.setattr(governance, "catalog_status", lambda p, key: {"stale": True})  # expired, or its refresh failed
     assert not governance.zero_retention(provider, ZDR_MODEL, KEY)
+
+
+async def test_a_failed_refresh_during_its_cooldown_is_refused_at_the_listing_and_admission_alike(tmp_path):
+    import time
+    provider = provider_for_private()
+    async with started(tmp_path / "data", provider) as client:
+        project, conversation = await private_conversation(client)
+        await client.get("/api/providers/openrouter/models", params={"project_id": project})  # a good read
+        for state in openrouter_client._caches.values():  # then a refresh that failed, still cooling down
+            state["error"], state["last_attempt"] = "refresh_failed", time.time()
+        listing = (await client.get("/api/providers/openrouter/models", params={"project_id": project})).json()
+        assert {m["id"]: m["allowed"] for m in listing["models"]}[ZDR_MODEL] is False
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "SECRET-INTERVIEW", "model": ZDR_MODEL})
+        assert (refused.status_code, refused.json()["code"]) == (403, "private_route_not_allowed")
+        assert provider.chats == [] and await rows(client, "SELECT count(*) FROM runs") == [(0,)]

@@ -261,8 +261,9 @@ class Policy:
         """Whether its OpenRouter requests carry provider.zdr = true."""
         return self.level == "private"
 
-    def problem(self, provider, model):
-        """Why the project may not send a step to this provider's model, or None."""
+    def problem(self, provider, model, key=None):
+        """Why the project may not send a step to this provider's model, or None; with key, its
+        zero retention judged as the gate judges it (by the catalog read with that key, fresh)."""
         if self.locked:
             return "review_locked"
         if self.level == "normal":
@@ -271,7 +272,7 @@ class Policy:
         if origin is not None:  # loopback is only transport until the researcher declares it
             return None if origin in self.declared else "not_declared"
         if self.level == "private" and provider.is_openrouter and is_openrouter(provider.base_url):
-            if private_flags(self.entries, model) is None or not zero_retention(provider, model):
+            if private_flags(self.entries, model) is None or not zero_retention(provider, model, key):
                 return "private_route_not_allowed"
             return None
         return "route_not_allowed"

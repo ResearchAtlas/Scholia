@@ -516,10 +516,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raise ApiError(409, "settings_changed", "The provider changed while its models were listed")
         table = (load_settings(data_dir).values.get("providers") or {}).get(provider) or {}
         records = reasoning_capability.load_capabilities()
-        return {"models": [describe_model(configured[provider], table, m, records, policy)
+        return {"models": [describe_model(configured[provider], table, m, records, policy, key)
                            for m in sorted((models or {}).values(), key=lambda m: m["id"])], "status": status}
 
-    def describe_model(provider, table, model, records, policy=None):
+    def describe_model(provider, table, model, records, policy=None, key=None):
         """A catalog row with what the settings and the picker need: its window as reported
         and in use, whether it is offered and recommended, and its effort steps; with a
         project's policy, whether the project allows it."""
@@ -527,7 +527,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         surface = capability.get("control_surface") or "unknown"
         steps = (capability.get("levels") or []) if surface == "levels" else \
             list(budget_router.EFFORT_LEVELS) if surface == "budget" else []
-        refusal = policy.problem(provider, model["id"]) if policy is not None else None
+        refusal = policy.problem(provider, model["id"], key) if policy is not None else None
         return {**model, "window": providers.window(table, model["id"], model.get("context_length")),
                 "offered": providers.offered(table, provider, model["id"], budget_router.RECOMMENDED),
                 "recommended": provider.is_openrouter and model["id"] in budget_router.RECOMMENDED,

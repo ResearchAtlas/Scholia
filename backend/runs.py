@@ -483,13 +483,13 @@ class Harness:
                 offered=lambda m: _unusable(table, provider_config, m) is None and allowed(m),
                 picked=table["models"] if isinstance(table.get("models"), list) else ())
 
-        plan = plan_among(lambda m: policy.problem(provider_config, m) is None)
+        plan = plan_among(lambda m: policy.problem(provider_config, m, key) is None)
         # Before anything is written or sent: a model the project does not allow is refused, and
         # when Auto found none, the project's rule is named if it ruled out the one Auto would pick.
         model_for_problem = plan.model or plan_among(lambda m: True).model
         if model_for_problem is None:
             raise AdmissionError(400, "model_needed", "Choose a model for this provider")
-        if problem := policy.problem(provider_config, model_for_problem):
+        if problem := policy.problem(provider_config, model_for_problem, key):
             raise AdmissionError(403, problem, "This project's protection does not allow that model")
         if zero_retention and not await self._read(lambda conn: governance.key_attested(
                 conn, self.data_dir, provider_config.name, key)):
