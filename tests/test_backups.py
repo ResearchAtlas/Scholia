@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import stat
+import threading
 import zipfile
 
 import pyzipper
@@ -415,3 +416,91 @@ async def test_a_restored_app_takes_requests_only_once_its_runs_are_recovered(tm
         monkeypatch.setattr(Harness, "recover", recover)
         assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
     assert seen == [False]
+
+
+# A restore excludes every other change
+
+
+def hold(monkeypatch, owner, name):
+    """Hold owner.name (run in a worker thread) until released: (started, release) events."""
+    started_, release = threading.Event(), threading.Event()
+    real = getattr(owner, name)
+
+    def held(*args, **kwargs):
+        started_.set()
+        assert release.wait(10)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, held)
+    return started_, release
+
+
+async def test_a_settings_save_during_a_restore_waits_and_lands_after_it(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        read = (await client.get("/api/settings")).json()["hash"]
+        swapping, release = hold(monkeypatch, backups_module, "_put_in_place")
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        await asyncio.to_thread(swapping.wait, 10)
+        save = asyncio.create_task(client.put("/api/settings", json={"hash": read, "updates": {"ui.language": "zh-CN"}}))
+        await asyncio.sleep(0.2)
+        assert not save.done()  # it waits for the restore, which would otherwise swap it away
+        release.set()
+        assert (await restore).status_code == 200
+        assert (await save).status_code == 200
+        assert (await client.get("/api/settings")).json()["values"]["ui"]["language"] == "zh-CN"
+
+
+async def test_an_instructions_save_and_a_project_creation_during_a_restore_land_after_it(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        swapping, release = hold(monkeypatch, backups_module, "_put_in_place")
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": backup}))
+        await asyncio.to_thread(swapping.wait, 10)
+        save = asyncio.create_task(client.put("/api/instructions", json={"text": "Written during the restore"}))
+        create = asyncio.create_task(client.post("/api/projects", json={"name": "Created during the restore"}))
+        await asyncio.sleep(0.2)
+        assert not save.done() and not create.done()
+        release.set()
+        assert (await restore).status_code == 200
+        assert (await save).status_code == 200 and (await create).status_code == 201
+        assert (await client.get("/api/instructions")).json()["text"] == "Written during the restore"
+        project = (await create).json()["id"]
+        assert (await client.get(f"/api/projects/{project}")).status_code == 200  # its record and its folder
+        assert (data / "projects" / project / "config.toml").is_file()
+
+
+async def test_a_restore_waits_for_a_deletion_and_its_purge(tmp_path, monkeypatch):
+    import backend.app as app_module
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={"title": "Participant 7"})).json()["id"]
+        older = (await client.post("/api/backups")).json()["id"]  # it holds the conversation
+        deleted, release = hold(monkeypatch, app_module, "delete")  # committed; the purge has not begun
+        deletion = asyncio.create_task(client.delete(f"/api/conversations/{conversation}",
+                                                     params={"purge_backups": "true"}))
+        await asyncio.to_thread(deleted.wait, 10)
+        restore = asyncio.create_task(client.post("/api/backups/restore", json={"generation": older}))
+        await asyncio.sleep(0.2)
+        assert not restore.done()  # it would bring the conversation back between the deletion and its purge
+        release.set()
+        assert (await deletion).json()["purged_backups"] >= 1
+        assert (await restore).status_code == 404  # the backup that held it was purged first
+        assert (await client.get(f"/api/conversations/{conversation}")).status_code == 404
+
+
+async def test_a_cancelled_deletion_still_purges_the_backups(tmp_path, monkeypatch):
+    import backend.app as app_module
+    async with started(tmp_path / "data") as client:
+        conversation = (await client.post("/api/conversations", json={"title": "Participant 7"})).json()["id"]
+        await client.post("/api/backups")
+        deleting, release = hold(monkeypatch, app_module, "delete")
+        deletion = asyncio.create_task(client.delete(f"/api/conversations/{conversation}",
+                                                     params={"purge_backups": "true"}))
+        await asyncio.to_thread(deleting.wait, 10)
+        deletion.cancel()  # the window closed
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await deletion
+        assert len(await audit(client, "backup_purge")) == 1  # its object is gone, so it could not be asked again
+        assert len((await client.get("/api/backups")).json()["backups"]) == 1

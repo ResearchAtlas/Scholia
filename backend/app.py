@@ -212,7 +212,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     # ponytail: one lock for every write to a project's folder and for deleting a project, so a
     # write can never recreate the folder of a project deleted meanwhile; such writes are rare.
     project_files = asyncio.Lock()
-    state["project_files"] = project_files  # a restore holds it while it swaps the folder
 
     @contextlib.contextmanager
     def maintenance():
@@ -281,7 +280,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown
     app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
-    app.add_middleware(backups.LimitedMode, state=state)  # a database damaged at startup: restore only
+    app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)
     @app.exception_handler(AdmissionError)
@@ -555,24 +554,24 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 log.warning("the backup before a project deletion failed (%s)", type(error).__name__)
                 raise ApiError(503, "backup_failed", "The backup before the deletion failed; nothing was deleted")
 
-        async def deleting():  # the record, the stopping of its runs and its folder, to their end
-            revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id,
-                                              remove_all_trace=remove_all_trace, on_committed=revoke_soon())
-            harness().revoke(revoked)
-            return await asyncio.to_thread(_remove_folder, data_dir / "projects" / project_id)
+        async def deleting():  # the record, the stopping of its runs, its folder and the purge, to their end
+            async with project_files:
+                revoked = await asyncio.to_thread(delete, db(), state["content"], "project", project_id,
+                                                  remove_all_trace=remove_all_trace, on_committed=revoke_soon())
+                harness().revoke(revoked)
+                removed = await asyncio.to_thread(_remove_folder, data_dir / "projects" / project_id)
+            result = {"ok": True}
+            if not removed:  # the record is gone; its tombstone makes the next launch retry the files
+                log.warning("a deleted project's folder could not be removed fully; it is retried at the next launch")
+                result["files_left"] = True
+            if purge_backups:  # after the folder is gone, so the fresh backup holds none of it
+                result.update(await purge(project_id, {"kind": "project", "object_id": project_id}))
+            return result
 
-        async with project_files:
-            try:
-                removed = await _to_end(deleting())
-            except LookupError:  # deleted meanwhile by another request
-                raise ApiError(404, "not_found", "No such project") from None
-        result = {"ok": True}
-        if not removed:  # the record is gone; its tombstone makes the next launch retry the files
-            log.warning("a deleted project's folder could not be removed fully; it is retried at the next launch")
-            result["files_left"] = True
-        if purge_backups:  # after the folder is gone, so the fresh backup holds none of it
-            result.update(await purge(project_id, {"kind": "project", "object_id": project_id}))
-        return result
+        try:
+            return await _to_end(deleting())  # a cancelled request still purges: its object is gone for good
+        except LookupError:  # deleted meanwhile by another request
+            raise ApiError(404, "not_found", "No such project") from None
 
     async def purge(project_id, deleted):
         """Take deleted data out of the automatic backups; a failure leaves the deletion as it is. It
@@ -700,18 +699,18 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         project = await read(lambda conn: conn.execute(
             "SELECT project_id FROM conversations WHERE id = ?", (conversation_id,)).fetchone())
 
-        async def deleting():  # the deletion and the stopping of its runs, together, to their end
+        async def deleting():  # the deletion, the stopping of its runs and the purge, together, to their end
             revoked = await asyncio.to_thread(delete, db(), state["content"], "conversation", conversation_id,
                                               remove_all_trace=remove_all_trace, on_committed=revoke_soon())
             harness().revoke(revoked)
+            if purge_backups:
+                return {"ok": True, **await purge(project[0], {"kind": "conversation", "object_id": conversation_id})}
+            return {"ok": True}
 
         try:
-            await _to_end(deleting())
+            return await _to_end(deleting())  # a cancelled request still purges: its object is gone for good
         except LookupError:
             raise ApiError(404, "not_found", "No such conversation") from None
-        if purge_backups:
-            return {"ok": True, **await purge(project[0], {"kind": "conversation", "object_id": conversation_id})}
-        return {"ok": True}
 
     # Turns and runs
 

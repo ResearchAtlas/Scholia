@@ -83,25 +83,78 @@ class _Route(APIRoute):
         return handle
 
 
-# What a database damaged at startup leaves served (see LimitedMode).
+# What a database damaged at startup leaves served (see Gate).
 LIMITED = {("GET", "/api/health"), ("GET", "/api/backups"), ("POST", "/api/backups/restore")}
+RESTORE = ("POST", "/api/backups/restore")
+_TURN_STREAM = re.compile(r"/api/(conversations/[^/]+/message/stream|runs/[^/]+/continue)")
 
 
-class LimitedMode:
-    """While the database is damaged at startup ("damaged" in the app's state), only health, the
-    backups list and restore are served; every other API request gets 503 database_damaged.
-    Pure ASGI, so streamed responses pass through it untouched."""
+class Writers:
+    """What a restore excludes: every API request that can change something takes it shared; a
+    restore takes it alone. A waiting restore goes first, so new changes queue behind it."""
+
+    def __init__(self):
+        self._changed = asyncio.Condition()
+        self._shared = 0
+        self._alone = False
+        self._waiting = 0
+
+    @contextlib.asynccontextmanager
+    async def shared(self):
+        async with self._changed:
+            await self._changed.wait_for(lambda: not self._alone and not self._waiting)
+            self._shared += 1
+        try:
+            yield
+        finally:
+            async with self._changed:
+                self._shared -= 1
+                self._changed.notify_all()
+
+    @contextlib.asynccontextmanager
+    async def alone(self):
+        async with self._changed:
+            self._waiting += 1
+            try:
+                await self._changed.wait_for(lambda: not self._alone and not self._shared)
+            finally:
+                self._waiting -= 1
+            self._alone = True
+        try:
+            yield
+        finally:
+            async with self._changed:
+                self._alone = False
+                self._changed.notify_all()
+
+
+class Gate:
+    """Every API request passes it (pure ASGI, so streamed responses pass through untouched).
+
+    While the database is damaged at startup ("damaged" in the app's state), only LIMITED is
+    served; every other API request gets 503 database_damaged. A request that can change
+    anything (any method but GET and HEAD) runs inside state["writers"] shared, so a restore,
+    which holds it alone, never meets a settings or instructions save, a project's creation or
+    deletion, or a deletion and its purge halfway. Turn streams are not held: they write only
+    through the harness, which a restore stops before it swaps anything."""
 
     def __init__(self, app, state):
         self.app, self.state = app, state
 
     async def __call__(self, scope, receive, send):
-        if (scope["type"] == "http" and "damaged" in self.state and scope["path"].startswith("/api/")
-                and (scope["method"], scope["path"]) not in LIMITED):
+        if scope["type"] != "http" or not scope["path"].startswith("/api/"):
+            return await self.app(scope, receive, send)
+        request = (scope["method"], scope["path"])
+        if "damaged" in self.state and request not in LIMITED:
             response = JSONResponse({"code": "database_damaged",
                                      "message": "The database failed its check; restore a backup"}, status_code=503)
             return await response(scope, receive, send)
-        return await self.app(scope, receive, send)
+        writers = self.state.get("writers")
+        if (writers is None or scope["method"] in ("GET", "HEAD") or request == RESTORE
+                or _TURN_STREAM.fullmatch(scope["path"])):
+            return await self.app(scope, receive, send)
+        async with writers.shared():
+            return await self.app(scope, receive, send)
 
 
 class FullBackup(BaseModel):
@@ -126,6 +179,7 @@ async def lifespan(app):
     at closing close the database and harness a restore opened (the app closes the ones it did)."""
     state = app.state.scholia
     state["backups_lock"] = asyncio.Lock()  # one backup, restore or export at a time
+    state["writers"] = Writers()  # see Gate
     opened = state.get("db"), state.get("harness")
     await asyncio.to_thread(shutil.rmtree, state["data_dir"] / "backups" / STAGING, ignore_errors=True)
     idle = asyncio.create_task(_idle_backups(state))
@@ -327,8 +381,8 @@ async def restore(body: Restore, request: Request):
     if (body.generation is None) == (body.file is None):
         raise BackupError(400, "invalid_request", "Name one automatic backup or one backup file")
     state = request.app.state.scholia
-    # Project folder writes wait (see backend.app's project-files lock) while the folder is swapped.
-    async with state["backups_lock"], state.get("project_files") or contextlib.nullcontext():
+    # No other change runs meanwhile (see Gate): its requests wait until the restore ends.
+    async with state["writers"].alone(), state["backups_lock"]:
         return await _to_end(_restore(state, body))
 
 
