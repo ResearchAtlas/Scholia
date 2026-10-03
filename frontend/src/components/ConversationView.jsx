@@ -26,6 +26,11 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const [problem, setProblem] = useState(null);
   const [reads, setReads] = useState(0); // each read, failed or not, so polling goes on
   const end = useRef(null);
+  const here = useRef(false); // still shown: a draft admitted after the researcher left selects nothing
+  useEffect(() => {
+    here.current = true;
+    return () => { here.current = false; };
+  }, []);
 
   const load = useCallback(async () => { // whether the conversation was read
     if (!id) return false;
@@ -69,7 +74,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       const target = id ?? (await post('/api/conversations', { project_id: projectId })).id;
       setDraft(target); // shown here from now on, so Stop works while it is admitted
       await send(target, `/api/conversations/${target}/message/stream`, { content: text }, text);
-      if (!conversation) onCreated(target);
+      if (!conversation && here.current) onCreated(target);
       return true;
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
