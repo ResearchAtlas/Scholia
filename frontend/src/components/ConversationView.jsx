@@ -14,7 +14,7 @@ import { continuable, conversationTitle } from '../projects.js';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
-const POLL_MS = 1000; // while a saved turn still reads running, until it settles
+const POLL_MS = 1000; // between reads while a turn is settling, and after a failed read
 
 export function ConversationView({ conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated }) {
   const t = useT();
@@ -27,13 +27,15 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const [reads, setReads] = useState(0); // each read, failed or not, so polling goes on
   const end = useRef(null);
 
-  const load = useCallback(async () => {
-    if (!id) return;
+  const load = useCallback(async () => { // whether the conversation was read
+    if (!id) return false;
     try {
       setTurns((await get(`/api/conversations/${id}`)).turns);
       setFailed(false);
+      return true;
     } catch {
       setFailed(true);
+      return false;
     } finally {
       setReads((n) => n + 1);
     }
@@ -43,18 +45,18 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     load();
   }, [load]);
 
-  useEffect(() => { // a finished live turn hands over to its saved record
-    if (live?.done) load().then(() => clear(id));
-  }, [live?.done, id, load]);
-
-  // A saved turn that still reads running (its stream ended early, or it is stopping) is
-  // read again until it settles.
-  const waiting = !live && (turns ?? []).some((turn) => turn.status === 'running');
+  // A finished live turn hands over to its saved record once that is read, and a saved turn
+  // that still reads running (its stream ended early, or it is stopping) is read again until
+  // it settles. A failed read is tried again after a pause.
+  const handoff = Boolean(live?.done);
+  const waiting = handoff || (!live && (turns ?? []).some((turn) => turn.status === 'running'));
   useEffect(() => {
     if (!waiting) return undefined;
-    const timer = setTimeout(load, POLL_MS);
+    const timer = setTimeout(async () => {
+      if ((await load()) && handoff) clear(id);
+    }, handoff && !failed ? 0 : POLL_MS);
     return () => clearTimeout(timer);
-  }, [waiting, reads, load]);
+  }, [waiting, handoff, failed, reads, id, load]);
 
   useEffect(() => {
     const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;

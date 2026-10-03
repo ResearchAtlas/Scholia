@@ -9,7 +9,7 @@ import { continuable, moveTargets, projectName } from '../src/projects.js';
 import { errorText, money } from '../src/text.js';
 import { apply, send, subscribe, unsavedAnswer } from '../src/live.js';
 import { packageRoot } from '../licenses.mjs';
-import { saveSettings, valueAt } from '../src/api.js';
+import { saveSettings } from '../src/api.js';
 
 const open = (width, extra = {}) => columns({ width, ...DEFAULTS, panelOpen: false, ...extra });
 
@@ -159,22 +159,16 @@ test('the license plugin finds the package a module belongs to', () => {
   assert.equal(packageRoot('/a/src/App.jsx'), null);
 });
 
-test('a settings conflict never overwrites a key that changed on disk', async (t) => {
-  assert.equal(valueAt({ ui: { layout: { sidebar_width: 300 } } }, 'ui.layout.sidebar_width'), 300);
-  assert.equal(valueAt({ ui: {} }, 'ui.layout.sidebar_width'), undefined);
-  const disk = [
-    { hash: 'h1', values: { ui: { panel: 'none', layout: { sidebar_width: 248 } } } },
-    { hash: 'h2', values: { ui: { panel: 'library', layout: { sidebar_width: 248 } } } }, // panel changed on disk
-  ];
+test('a settings conflict writes nothing, so a change on disk is never overwritten', async (t) => {
   const puts = [];
   t.mock.method(globalThis, 'fetch', async (path, { method, body }) => {
-    if (method === 'GET') return Response.json(disk.shift());
+    if (method === 'GET') return Response.json({ hash: 'h1', values: {} });
     puts.push(JSON.parse(body));
-    return puts.length === 1 ? Response.json({ code: 'settings_changed' }, { status: 409 }) : Response.json({ ok: true });
+    return Response.json({ code: 'settings_changed' }, { status: 409 });
   });
-  await saveSettings({ 'ui.panel': 'manuscript', 'ui.layout.sidebar_width': 300 });
-  assert.deepEqual(puts.map((p) => [p.hash, p.updates]), [
-    ['h1', { 'ui.panel': 'manuscript', 'ui.layout.sidebar_width': 300 }],
-    ['h2', { 'ui.layout.sidebar_width': 300 }], // the changed key keeps the file's value
-  ]);
+  assert.equal(await saveSettings({ 'ui.panel': 'library' }, 'p1'), null);
+  assert.deepEqual(puts, [{ hash: 'h1', updates: { 'ui.panel': 'library' }, project_id: 'p1' }]);
+  t.mock.method(globalThis, 'fetch', async (path, { method }) => (method === 'GET'
+    ? Response.json({ hash: 'h1', values: {} }) : Response.json({ code: 'invalid_setting' }, { status: 400 })));
+  await assert.rejects(saveSettings({ 'ui.panel': 'x' }), (error) => error.code === 'invalid_setting');
 });
