@@ -565,6 +565,7 @@ def load_settings(data_root, project_id=None):
         _parse(settings, None)
         settings._broken = True
         settings.warnings.append(f"{settings.label} could not be read; using the defaults")
+        settings.problems.append({"key": None, "line": None})
     return settings
 
 
@@ -573,6 +574,20 @@ INSTRUCTIONS_CAP = 32 * 1024  # bytes of UTF-8, personal and project combined
 
 def load_instructions(data_root, project_id=None):
     """Return (text, warnings): the personal AGENTS.md, then the project's, capped at 32 KiB."""
+    data, warnings = _joined_instructions(data_root, project_id)
+    if len(data) > INSTRUCTIONS_CAP:
+        warnings.append("Instructions exceed the 32 KiB combined cap; only the first 32 KiB are used")
+        data = data[:INSTRUCTIONS_CAP]
+    return data.decode("utf-8", errors="ignore"), warnings  # ignore drops a character cut in half
+
+
+def instructions_size(data_root, project_id=None) -> int:
+    """The combined instructions' size in UTF-8 bytes before the cap cuts them, as the cap counts it."""
+    return len(_joined_instructions(data_root, project_id)[0])
+
+
+def _joined_instructions(data_root, project_id):
+    """The personal and the project's AGENTS.md as one UTF-8 text, uncut, with warnings."""
     paths = [Path(data_root) / "AGENTS.md"]
     if project_id is not None:
         paths.append(_project_folder(data_root, project_id) / "AGENTS.md")
@@ -590,8 +605,4 @@ def load_instructions(data_root, project_id=None):
         except UnicodeDecodeError:
             parts.append(raw.decode("utf-8", errors="replace"))
             warnings.append(f"{path.name} is not UTF-8 text; unreadable characters were replaced")
-    data = "\n\n".join(parts).encode("utf-8")
-    if len(data) > INSTRUCTIONS_CAP:
-        warnings.append("Instructions exceed the 32 KiB combined cap; only the first 32 KiB are used")
-        data = data[:INSTRUCTIONS_CAP]
-    return data.decode("utf-8", errors="ignore"), warnings  # ignore drops a character cut in half
+    return "\n\n".join(parts).encode("utf-8"), warnings

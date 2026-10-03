@@ -102,3 +102,18 @@ export function Restore({ onClick, disabled }) {
     </button>
   );
 }
+
+// Values the file holds that cannot be used, by key and line; each falls back to its default
+// (ticket 14).
+export function FileProblems({ problems }) {
+  const t = useT();
+  if (!problems?.length) return null;
+  return (
+    <ul role="status" className="space-y-1 rounded-md bg-warning/10 px-3 py-2 text-sm text-warning">
+      {problems.map((problem, i) => (
+        <li key={i}>{problem.key ? t('settings.problemValue', { key: problem.key, line: problem.line })
+          : problem.line ? t('settings.problemFile', { line: problem.line }) : t('settings.problemFileUnread')}</li>
+      ))}
+    </ul>
+  );
+}

@@ -31,8 +31,8 @@ from backend.db import ContentStore, Database, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate
 from backend.runs import AdmissionError, Harness, _through, derived_status
-from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, load_instructions, load_settings,
-                              visible, write_private)
+from backend.settings import (INSTRUCTIONS_CAP, SettingsChanged, _split_key, instructions_size, load_instructions,
+                              load_settings, visible, write_private)
 
 log = logging.getLogger(__name__)
 
@@ -443,20 +443,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         return {"values": loaded.values, "warnings": loaded.warnings, "problems": loaded.problems,
                 "hash": loaded._digest}
 
-    def _instruction_bytes(project_id):
-        """The personal and the project's AGENTS.md together, as their combination is measured
-        against the cap before it is cut (settings.load_instructions joins them with a blank line)."""
-        sizes = [p.stat().st_size for p in (data_dir / "AGENTS.md",
-                 *([data_dir / "projects" / project_id / "AGENTS.md"] if project_id else [])) if p.is_file()]
-        return sum(sizes) + 2 * max(0, len(sizes) - 1)
-
     @app.get("/api/instructions")
     async def get_instructions(project_id: str | None = None):
         async with project_files:  # ordered with deletion and with saves
             path = await instructions_path(project_id)
             raw = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b"")
             _, warnings = await asyncio.to_thread(load_instructions, data_dir, project_id)
-            combined = await asyncio.to_thread(_instruction_bytes, project_id)
+            combined = await asyncio.to_thread(instructions_size, data_dir, project_id)
         return {"text": raw.decode("utf-8", errors="replace"), "hash": hashlib.sha256(raw).hexdigest(),
                 "combined_bytes": combined, "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
 

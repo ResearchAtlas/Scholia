@@ -9,7 +9,7 @@ import { ApiError, get, patch, post } from '../api.js';
 import { errorText, money } from '../text.js';
 import { projectName } from '../projects.js';
 import { BUDGET_SUGGESTIONS, loadModels, useInstructions, useSettingsFile, utf8Bytes, valueAt } from '../settings.js';
-import { CommitField, Field, Restore, Section, Segmented } from './fields.jsx';
+import { CommitField, Field, FileProblems, Restore, Section, Segmented } from './fields.jsx';
 import { Providers } from './Providers.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -65,21 +65,6 @@ function Problem({ code }) {
   return <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
     {code === 'settings_changed' ? t('settings.changedOnDisk') : errorText(t, code)}
   </p>;
-}
-
-// Values the file holds that cannot be used, by key and line; each falls back to its default
-// (ticket 14).
-function FileProblems({ problems }) {
-  const t = useT();
-  if (!problems?.length) return null;
-  return (
-    <ul role="status" className="space-y-1 rounded-md bg-warning/10 px-3 py-2 text-sm text-warning">
-      {problems.map((problem, i) => (
-        <li key={i}>{problem.key ? t('settings.problemValue', { key: problem.key, line: problem.line })
-          : problem.line ? t('settings.problemFile', { line: problem.line }) : t('settings.problemFileUnread')}</li>
-      ))}
-    </ul>
-  );
 }
 
 function Loading() {

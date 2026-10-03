@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, utf8Bytes, valueAt } from '../src/settings.js';
+import { groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, utf8Bytes, valueAt } from '../src/settings.js';
+import { ApiError } from '../src/api.js';
 
 test('settings keys quote the parts that are not bare TOML keys', () => {
   assert.equal(settingKey('providers', 'openrouter', 'models'), 'providers.openrouter.models');
@@ -58,4 +59,28 @@ test('a settings page saves against the file as it read it, never a fresher read
   await assert.rejects(saveAgainst({ hash: 'h-read' }, { 'limits.agent_steps': 20 }, 'p1'),
     (error) => error.code === 'settings_changed');
   assert.deepEqual(sent, [['PUT', '/api/settings', { hash: 'h-read', updates: { 'limits.agent_steps': 20 }, project_id: 'p1' }]]);
+});
+
+test('saves run in order against the latest file, and a conflict drops the saves made before it', async () => {
+  let disk = { hash: 'h0', values: {} };
+  const written = [];
+  const saver = settingsSaver({
+    read: async () => disk,
+    write: async (hash, updates) => {
+      if (hash !== disk.hash) throw new ApiError(409, 'settings_changed');
+      written.push(updates);
+      disk = { hash: `h${written.length}`, values: {} };
+      return disk;
+    },
+    onFile: () => {},
+    onProblem: () => {},
+  });
+  await saver.reload();
+  assert.deepEqual(await Promise.all([saver.save({ a: 1 }), saver.save({ b: 2 })]), [true, true]); // each on the last
+  disk = { hash: 'outside', values: {} }; // changed on disk
+  const results = await Promise.all([saver.save({ c: 3 }), saver.save({ d: 4 })]);
+  assert.deepEqual(results, [false, false]); // the conflict, and the save queued before it is known
+  assert.deepEqual(written, [{ a: 1 }, { b: 2 }]);
+  assert.equal(await saver.save({ e: 5 }), true); // a save made after the file was read again
+  assert.deepEqual(written.at(-1), { e: 5 });
 });

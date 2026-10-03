@@ -9,7 +9,8 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
-import { get, saveSettings } from '../api.js';
+import { ApiError, get, saveSettings } from '../api.js';
+import { errorText } from '../text.js';
 import { WINDOW_PRESETS, forgetModels, loadModels, settingKey } from '../settings.js';
 import { CommitField } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -53,38 +54,48 @@ export function useModelChoice() {
 // personal default; read each time the picker opens, and once at first for a chosen model's
 // effort steps. A chosen model no longer offered (its provider off, or no longer picked) is
 // dropped, so it is never sent.
-function useCatalog(open) {
+function useCatalog(open, projectId) {
   const [catalog, setCatalog] = useState(null);
   const load = useCallback(async () => {
     try {
-      const [{ providers }, { models: recent }, settings] = await Promise.all([
-        get('/api/providers'), get('/api/models/recent'), get('/api/settings')]);
+      forgetModels(); // the offers and windows as the settings hold them now
+      const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+      const [{ providers }, { models: recent }, settings, project] = await Promise.all([
+        get('/api/providers'), get('/api/models/recent'), get('/api/settings'),
+        projectId ? get(`/api/settings${query}`) : Promise.resolve(null)]);
       const ready = providers.filter((p) => p.enabled && p.has_key);
       const listings = await Promise.allSettled(ready.map((p) => loadModels(p.name)));
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
         ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
-        defaultModel: settings.values?.models?.default ?? 'auto' };
-      if (choice?.model && listings.every((l) => l.status === 'fulfilled')
-          && !models.some((m) => m.provider === choice.provider && m.id === choice.model)) setChoice(null);
+        defaultModel: project?.values?.models?.default || settings.values?.models?.default || 'auto' };
+      // Only a complete, current listing says a chosen model is gone.
+      const complete = listings.every((l) => l.status === 'fulfilled' && !l.value.status?.error);
+      if (choice?.model && complete && !models.some((m) => m.provider === choice.provider && m.id === choice.model)) {
+        setChoice(null);
+      }
       setCatalog(next);
     } catch {
       setCatalog((current) => current ?? { models: [], recent: [], efforts: {}, several: false, defaultModel: 'auto' });
     }
-  }, []);
+  }, [projectId]);
   useEffect(() => {
-    if (open || choice?.model) load();
+    load(); // at first, for the label and a chosen model's steps; then each time the picker opens
+  }, [load]);
+  useEffect(() => {
+    if (open) load();
   }, [open, load]);
   return [catalog, setCatalog, load];
 }
 
-export function ModelPicker() {
+export function ModelPicker({ projectId }) {
   const t = useT();
   const chosen = useModelChoice();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [catalog, setCatalog, reload] = useCatalog(open);
+  const [catalog, setCatalog, reload] = useCatalog(open, projectId);
   const [fixing, setFixing] = useState(null); // a model whose window is asked for before it is chosen
+  const [fixProblem, setFixProblem] = useState(null);
   const model = catalog?.models.find((m) => m.provider === chosen?.provider && m.id === chosen?.model);
 
   const results = useMemo(() => {
@@ -108,6 +119,7 @@ export function ModelPicker() {
     setOpen(false);
     setQuery('');
     setFixing(null);
+    setFixProblem(null);
   }
 
   function setEffort(level) {
@@ -117,8 +129,13 @@ export function ModelPicker() {
   }
 
   async function setWindow(m, value) {
-    await saveSettings({ [settingKey('providers', m.provider, 'windows', m.id)]: value }).catch(() => {});
-    forgetModels();
+    setFixProblem(null);
+    try {
+      await saveSettings({ [settingKey('providers', m.provider, 'windows', m.id)]: value });
+    } catch (error) {
+      setFixProblem(error instanceof ApiError ? error.code : 'internal');
+      return; // the field stays, with the reason
+    }
     setFixing(null);
     await reload();
   }
@@ -161,6 +178,7 @@ export function ModelPicker() {
               <label htmlFor="picker-window" className="block text-xs font-medium">{t('picker.setWindow', { model: fixing.name })}</label>
               <CommitField id="picker-window" type="number" min={4096} step={1} inputMode="numeric" suggestions={WINDOW_PRESETS}
                 placeholder={t('providers.window')} onCommit={(value, error) => (error ? null : setWindow(fixing, value))} />
+              {fixProblem && <p role="alert" className="text-xs text-destructive">{errorText(t, fixProblem)}</p>}
               <p className="text-[11px] leading-relaxed text-muted-foreground">{t('providers.windowTrust')}</p>
             </form>
           )}

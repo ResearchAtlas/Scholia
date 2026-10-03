@@ -2,7 +2,7 @@
 // section 4.4). Each change is saved on its own against the file as the page last read or
 // saved it: a file changed on disk since then is never overwritten; it is read again and the
 // researcher is told, so the change is made again on what the file now holds (ticket 14).
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiError, get, put } from './api.js';
 
 // Saves updates against `read`, the file as it was last read or saved: the backend refuses
@@ -11,49 +11,66 @@ export function saveAgainst(read, updates, projectId) {
   return put('/api/settings', { hash: read?.hash, updates, ...(projectId ? { project_id: projectId } : {}) });
 }
 
+// One page's saves of one settings file, one after another, each against the file as last
+// read or saved. A save the backend refuses because the file changed (settings_changed) writes
+// nothing, and the saves queued before that answer are dropped with it: they were made on the
+// file as it was. read() reads the file again; write(hash, updates) saves.
+export function settingsSaver({ read, write, onFile, onProblem }) {
+  let latest = null;
+  let queue = Promise.resolve();
+  let era = 0;
+  const reload = async () => {
+    try {
+      latest = await read();
+      onFile(latest);
+    } catch (error) {
+      onProblem(error instanceof ApiError ? error.code : 'internal');
+    }
+  };
+  const save = (updates) => {
+    const madeIn = era;
+    const run = queue.then(async () => {
+      if (madeIn !== era) return false;
+      onProblem(null);
+      try {
+        latest = await write(latest?.hash, updates);
+        onFile(latest);
+        return true;
+      } catch (error) {
+        const code = error instanceof ApiError ? error.code : 'internal';
+        onProblem(code);
+        if (code === 'settings_changed') {
+          era += 1;
+          await reload();
+        }
+        return false;
+      }
+    });
+    queue = run.catch(() => {});
+    return run;
+  };
+  return { reload, save };
+}
+
 // A settings file: the personal one, or a project's when projectId is given.
 export function useSettingsFile(projectId) {
   const [file, setFile] = useState(null); // { values, warnings, problems, hash }
   const [problem, setProblem] = useState(null); // an error code
-  const latest = useRef(null); // the file as last read or saved, whose hash a save is checked against
-  const queue = useRef(Promise.resolve()); // this page's saves, one after another
-  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
-
-  const reload = useCallback(async () => {
-    try {
-      const read = await get(`/api/settings${query}`);
-      latest.current = read;
-      setFile(read);
-    } catch (error) {
-      setProblem(error instanceof ApiError ? error.code : 'internal');
-    }
-  }, [query]);
+  const saver = useMemo(() => {
+    const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+    return settingsSaver({
+      read: () => get(`/api/settings${query}`),
+      write: (hash, updates) => saveAgainst({ hash }, updates, projectId),
+      onFile: setFile,
+      onProblem: setProblem,
+    });
+  }, [projectId]);
 
   useEffect(() => {
-    reload();
-  }, [reload]);
+    saver.reload();
+  }, [saver]);
 
-  // Saves {key: value} (null clears a key back to its default). Resolves true when saved.
-  const save = useCallback((updates) => {
-    const run = queue.current.then(async () => {
-      setProblem(null);
-      try {
-        const saved = await saveAgainst(latest.current, updates, projectId);
-        latest.current = saved;
-        setFile(saved);
-        return true;
-      } catch (error) {
-        const code = error instanceof ApiError ? error.code : 'internal';
-        setProblem(code);
-        if (code === 'settings_changed') await reload(); // nothing was written
-        return false;
-      }
-    });
-    queue.current = run.catch(() => {});
-    return run;
-  }, [projectId, reload]);
-
-  return { values: file?.values ?? null, problems: file?.problems ?? [], problem, save, reload };
+  return { values: file?.values ?? null, problems: file?.problems ?? [], problem, save: saver.save, reload: saver.reload };
 }
 
 // An AGENTS.md file: the personal one, or a project's.

@@ -194,3 +194,21 @@ async def test_recent_models_survive_many_repeats_of_one(tmp_path):
         await asyncio.to_thread(client.state["db"].write, repeat)
         recent = (await client.get("/api/models/recent")).json()["models"]
         assert [m["model"] for m in recent] == ["a/one", "b/two", "c/three"]
+
+
+async def test_the_size_counts_replaced_characters_as_the_cap_does(tmp_path):
+    async with started(tmp_path / "data") as client:
+        (tmp_path / "data" / "AGENTS.md").write_bytes(b"\xff" * 12_000)  # each becomes a 3-byte replacement
+        read = (await client.get("/api/instructions")).json()
+        assert read["combined_bytes"] == 36_000 > read["cap_bytes"]
+
+
+async def test_an_unreadable_settings_file_is_reported(tmp_path, monkeypatch):
+    from backend import settings as settings_module
+
+    def unreadable(path):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(settings_module, "_read", unreadable)
+    loaded = settings_module.load_settings(tmp_path)
+    assert loaded.problems == [{"key": None, "line": None}]

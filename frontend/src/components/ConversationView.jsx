@@ -134,7 +134,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
         </div>
       </div>
 
-      <Composer running={running} problem={problem} onSend={submit}
+      <Composer running={running} problem={problem} onSend={submit} projectId={projectId}
         onStop={() => Promise.resolve(stop(id, live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id))
           .then(load).catch(() => {})} />
     </section>
@@ -248,7 +248,7 @@ function Answer({ text }) {
   );
 }
 
-function Composer({ running, problem, onSend, onStop }) {
+function Composer({ running, problem, onSend, onStop, projectId }) {
   const t = useT();
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
@@ -286,7 +286,7 @@ function Composer({ running, problem, onSend, onStop }) {
             onChange={(event) => setText(event.target.value)} onKeyDown={key}
             className="scroll-thin block max-h-60 min-h-9 w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed outline-none placeholder:text-muted-foreground" />
           <div className="mt-1 flex items-center justify-between gap-2">
-          <ModelPicker />
+          <ModelPicker projectId={projectId} />
           {running ? (
             <Button type="button" size="icon" variant="secondary" className="size-9 shrink-0 rounded-xl" onClick={onStop} aria-label={t('composer.stop')}>
               <Square className="fill-current" aria-hidden="true" />

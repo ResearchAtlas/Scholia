@@ -10,7 +10,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, put } from '../api.js';
 import { errorText } from '../text.js';
 import { WINDOW_PRESETS, forgetModels, groupOf, loadModels, settingKey, useSettingsFile } from '../settings.js';
-import { CommitField, Field, Restore, Section, Segmented } from './fields.jsx';
+import { CommitField, Field, FileProblems, Restore, Section, Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
@@ -59,6 +59,7 @@ export function Providers() {
           {personal.problem === 'settings_changed' ? t('settings.changedOnDisk') : errorText(t, personal.problem ?? problem)}
         </p>
       )}
+      <FileProblems problems={personal.problems} />
       {adding && <AddEndpoint existing={list.map((p) => p.name)} onCancel={() => setAdding(false)}
         onAdded={async () => { setAdding(false); await changed(); }} />}
       {GROUPS.map((group) => {
