@@ -126,6 +126,7 @@ export function ModelPicker({ projectId }) {
   const [catalog, setCatalog, reload] = useCatalog(open, projectId, chosen?.model ? `${chosen.provider}:${chosen.model}` : null);
   const [fixing, setFixing] = useState(null); // a model whose window is asked for before it is chosen
   const [fixProblem, setFixProblem] = useState(null);
+  const picks = useRef(0); // each pick counts; a window save completes its choice only if none came after
   const model = catalog?.models.find((m) => m.provider === chosen?.provider && m.id === chosen?.model);
 
   const results = useMemo(() => {
@@ -137,6 +138,7 @@ export function ModelPicker({ projectId }) {
     .filter(Boolean);
 
   function pick(m) {
+    picks.current += 1;
     if (m?.window.status === 'needed') { // a window can be set only where none is reported
       setFixing(m);
       return;
@@ -166,6 +168,7 @@ export function ModelPicker({ projectId }) {
   }
 
   async function setWindow(m, value) {
+    const asked = picks.current;
     setFixProblem(null);
     try {
       if (await saveSettings({ [settingKey('providers', m.provider, 'windows', m.id)]: value }) === null) {
@@ -176,7 +179,7 @@ export function ModelPicker({ projectId }) {
       setFixProblem(error instanceof ApiError ? error.code : 'internal');
       return; // the field stays, with the reason
     }
-    choose(m); // its window is set now, so the choice it was asked for completes; the catalog's check confirms it
+    if (picks.current === asked) choose(m); // its window is set, so the choice it was asked for completes (unless a newer pick came); the catalog's check confirms it
     await reload();
   }
 

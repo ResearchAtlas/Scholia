@@ -203,21 +203,31 @@ function ProviderCard({ provider, table, save, onChanged }) {
 function Picker({ provider, picked, save }) {
   const t = useT();
   const [models, setModels] = useState(null);
+  const [problem, setProblem] = useState(null); // a listing that failed with nothing to show: Try again reads it again
   const [query, setQuery] = useState('');
+  const retry = useRef(() => {});
   useEffect(() => { // read again whenever a provider or its models change; only the newest read counts
     let newest = 0;
     const read = () => {
       const mine = ++newest;
-      loadModels(provider.name).then((listing) => mine === newest && setModels(listing.models))
-        .catch(() => mine === newest && setModels([]));
+      loadModels(provider.name).then((listing) => {
+        if (mine !== newest) return;
+        if (listing.status?.error && !listing.models.length) {
+          setProblem(listing.status.error);
+        } else {
+          setProblem(null);
+          setModels(listing.models);
+        }
+      }).catch((error) => mine === newest && setProblem(error instanceof ApiError ? error.code : 'internal'));
     };
+    retry.current = () => { setProblem(null); read(); }; // a failed listing is not kept, so this reads it anew
     read();
     const stop = onCatalogChange(read);
     return () => { newest += 1; stop(); };
   }, [provider.name]);
   const chosen = useMemo(() => new Set(picked ?? []), [picked]);
   const [busy, setBusy] = useState(false); // one change at a time, each from the list as saved
-  if (!models) return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
+  if (!models || (problem && !models.length)) return <LoadState problem={problem} onRetry={() => retry.current()} />;
   const shown = models.filter((m) => m.id !== 'auto' // the id means Auto, never a model (backend/providers.py)
     && `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase())).slice(0, 200);
   const toggle = (id) => {
