@@ -1,14 +1,16 @@
 // i18n: migrated
-// The sidebar (slice-1 spec section 3): the project switcher, a new conversation, the
-// project's conversations with rename, move and delete, and Settings.
+// The sidebar (slice-1 spec section 3): the project switcher, with deleting the current
+// project, a new conversation, the project's conversations with rename, move and delete
+// (the delete dialogs of S14), and Settings.
 import { useEffect, useState } from 'react';
 import { Check, ChevronsUpDown, Loader2, MoreHorizontal, PanelLeftClose, Pencil, Plus, Settings, SquarePen,
   Trash2, FolderInput } from 'lucide-react';
 import { useT } from '../i18n/index.js';
-import { ApiError, del, post, put } from '../api.js';
-import { errorText } from '../text.js';
+import { post, put } from '../api.js';
+import { useAction } from '../action.js';
 import { conversationTitle, moveTargets, projectName } from '../projects.js';
 import { Mark } from './Mark.jsx';
+import { DeleteDialog } from './DeleteDialog.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -45,6 +47,13 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
             <DropdownMenuItem onSelect={() => setDialog({ kind: 'project' })}>
               <Plus aria-hidden="true" />{t('sidebar.newProject')}
             </DropdownMenuItem>
+            {project && project.kind !== 'general' && (
+              <DropdownMenuItem className="text-destructive focus:text-destructive"
+                onSelect={() => setDialog({ kind: 'deleteProject', project })}>
+                <Trash2 aria-hidden="true" />
+                <span className="min-w-0 flex-1 truncate">{t('sidebar.deleteProject', { name: projectName(t, project) })}</span>
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
         {onHide && (
@@ -110,30 +119,20 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
         onDone={() => { setDialog(null); onConversationsChanged(); }} />
       <MoveDialog conversation={dialog?.kind === 'move' ? dialog.conversation : null} projects={projects} from={project}
         onClose={() => setDialog(null)} onDone={(moved) => { setDialog(null); onConversationsChanged(moved); }} />
-      <DeleteDialog conversation={dialog?.kind === 'delete' ? dialog.conversation : null} onClose={() => setDialog(null)}
-        onDone={(deleted) => { setDialog(null); onConversationsChanged(deleted); }} />
+      <DeleteDialog onClose={() => setDialog(null)}
+        target={dialog?.kind === 'delete' ? { kind: 'conversation', id: dialog.conversation.id,
+          title: t('conversation.deleteTitle'), body: t('conversation.deleteBody') }
+          : dialog?.kind === 'deleteProject' ? { kind: 'project', id: dialog.project.id,
+            title: t('project.deleteTitle', { name: projectName(t, dialog.project) }), body: t('project.deleteBody') }
+            : null}
+        onDone={(deleted) => {
+          const kind = dialog?.kind;
+          setDialog(null);
+          if (kind === 'deleteProject') onProjectsChanged(); // another project is shown
+          else onConversationsChanged(deleted);
+        }} />
     </nav>
   );
-}
-
-// A dialog whose action can fail: keeps the error inside the dialog, in the interface language.
-function useAction() {
-  const t = useT();
-  const [busy, setBusy] = useState(false);
-  const [problem, setProblem] = useState(null);
-  async function run(action) {
-    setBusy(true);
-    setProblem(null);
-    try {
-      return await action();
-    } catch (error) {
-      setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
-      return undefined;
-    } finally {
-      setBusy(false);
-    }
-  }
-  return { busy, problem, run, reset: () => setProblem(null) };
 }
 
 function NewProjectDialog({ open, onClose, onCreated }) {
@@ -243,33 +242,6 @@ function MoveDialog({ conversation, projects, from, onClose, onDone }) {
             <Button type="submit" disabled={busy || !target}>{t('common.move')}</Button>
           </DialogFooter>
         </form>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function DeleteDialog({ conversation, onClose, onDone }) {
-  const t = useT();
-  const { busy, problem, run, reset } = useAction();
-  async function confirm() {
-    if (await run(() => del(`/api/conversations/${conversation.id}`))) onDone(conversation.id);
-  }
-  return (
-    <Dialog open={Boolean(conversation)} onOpenChange={(next) => {
-      if (next) return;
-      reset();
-      onClose();
-    }}>
-      <DialogContent className="max-w-md">
-        <DialogHeader>
-          <DialogTitle>{t('conversation.deleteTitle')}</DialogTitle>
-          <DialogDescription>{t('conversation.deleteBody')}</DialogDescription>
-        </DialogHeader>
-        {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
-        <DialogFooter>
-          <Button type="button" variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
-          <Button type="button" variant="destructive" disabled={busy} onClick={confirm}>{t('common.delete')}</Button>
-        </DialogFooter>
       </DialogContent>
     </Dialog>
   );
