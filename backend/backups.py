@@ -278,6 +278,9 @@ async def _restore(state, body):
                 safety = await asyncio.to_thread(db.backup)
             except DatabaseDamagedError:
                 damaged = True
+            except BackupBusyError:
+                raise BackupError(409, "backup_busy", "Settings kept changing during the safety copy; try again") \
+                    from None
             except Exception as error:
                 raise BackupError(500, "safety_copy_failed",
                                   "The current database could not be backed up first; nothing was changed") from error
@@ -360,6 +363,8 @@ def _stage_generation(data_dir, generation, staging):
 
 
 def _stage_file(path, passphrase, staging):
+    if not path.is_absolute():
+        raise BackupError(400, "invalid_request", "Choose the backup file by its full path")
     pyzipper = _pyzipper()
     try:
         archive = pyzipper.AESZipFile(path)

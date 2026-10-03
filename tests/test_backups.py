@@ -224,6 +224,8 @@ async def test_only_a_listed_backup_can_be_restored(tmp_path, generation):
         assert (response.status_code, response.json()["code"]) == (404, "not_found")
         both = await client.post("/api/backups/restore", json={"generation": "daily/x", "file": "/x.zip"})
         assert (both.status_code, both.json()["code"]) == (400, "invalid_request")
+        relative = await client.post("/api/backups/restore", json={"file": "backup.zip"})
+        assert (relative.status_code, relative.json()["code"]) == (400, "invalid_request")
 
 
 async def test_restoring_an_encrypted_full_backup_needs_its_passphrase_and_brings_its_files(tmp_path):
