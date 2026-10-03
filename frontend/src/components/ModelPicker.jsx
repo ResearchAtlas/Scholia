@@ -11,7 +11,7 @@ import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { errorText, visible } from '../text.js';
-import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, onCatalogChange, settingKey, stillUsable } from '../settings.js';
+import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, onCatalogChange, listingToJudge, settingKey, stillUsable } from '../settings.js';
 import { CommitField } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
@@ -40,7 +40,7 @@ export function setChoice(next) {
 export function readChoice() {
   reading ??= get('/api/settings').then(async (settings) => {
     const kept = decodeChoice(settings.values?.ui?.model);
-    if (kept?.model && !stillUsable(await loadModels(kept.provider).catch(() => null), kept.model)) return;
+    if (kept?.model && !stillUsable(await listingToJudge(kept.provider), kept.model)) return;
     const effort = kept?.model ? settings.values?.models?.efforts?.[kept.model] : null;
     if (kept && !choice) publish(kept.model ? { ...kept, effort: EFFORT_LEVELS.includes(effort) ? effort : null } : kept);
   }).catch((error) => {
@@ -82,7 +82,7 @@ function useCatalog(open, projectId, chosenModel) {
       const ready = providers.filter((p) => p.enabled && p.has_key);
       const listings = await Promise.allSettled(ready.map((p) => loadModels(p.name)));
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
-        ? listing.value.models.filter((m) => m.offered && m.id !== 'auto').map((m) => ({ ...m, provider: ready[i].name })) : []));
+        ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
       if (mine !== latest.current || !here.current) return;
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
         defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto' };

@@ -72,6 +72,12 @@ async def test_the_models_a_provider_offers():
     assert providers.offered({}, LOCAL, "llama3", budget_router.RECOMMENDED)  # All by default elsewhere
     assert providers.offered({"models": ["llama3"]}, LOCAL, "llama3", budget_router.RECOMMENDED)
     assert not providers.offered({"models": ["llama3"]}, LOCAL, "qwen", budget_router.RECOMMENDED)
+    for table in ({}, {"models": "all"}, {"models": ["auto"]}):  # the id means Auto, never a model
+        assert not providers.offered(table, LOCAL, "auto", budget_router.RECOMMENDED)
+    plan = budget_router.create_run_plan("hi", "auto", lambda m: None, is_openrouter=False, picked=["auto"],
+                                         offered=lambda m: providers.offered({"models": ["auto"]}, LOCAL, m,
+                                                                             budget_router.RECOMMENDED))
+    assert plan.model is None  # Auto never resolves to a picked model named auto
 
 
 async def test_provider_model_choice_and_off_are_validated(tmp_path):

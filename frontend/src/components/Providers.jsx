@@ -178,8 +178,10 @@ function ProviderCard({ provider, table, save, onChanged }) {
             <div className="max-w-48">
               <CommitField id={`window-${provider.name}`} type="number" min={MIN_WINDOW} step={1} inputMode="numeric"
                 value={table.default_window} suggestions={WINDOW_PRESETS} allowEmpty placeholder={t('providers.windowReported')}
-                onCommit={(value, error) => (error ? setKeyProblem('window_too_small')
-                  : save({ [settingKey('providers', provider.name, 'default_window')]: value }).then(forgetModels))} />
+                onCommit={(value, error) => {
+                  setKeyProblem(error ? 'window_too_small' : null);
+                  if (!error) save({ [settingKey('providers', provider.name, 'default_window')]: value }).then(forgetModels);
+                }} />
             </div>
           </Field>
           <button type="button" onClick={() => setOpen(!open)} aria-expanded={open}
@@ -213,7 +215,8 @@ function Picker({ provider, picked, save }) {
   const chosen = useMemo(() => new Set(picked ?? []), [picked]);
   const [busy, setBusy] = useState(false); // one change at a time, each from the list as saved
   if (!models) return <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>;
-  const shown = models.filter((m) => `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase())).slice(0, 200);
+  const shown = models.filter((m) => m.id !== 'auto' // the id means Auto, never a model (backend/providers.py)
+    && `${m.id} ${m.name}`.toLowerCase().includes(query.toLowerCase())).slice(0, 200);
   const toggle = (id) => {
     if (busy) return;
     setBusy(true);

@@ -97,7 +97,7 @@ function General({ onLanguage, projectId }) {
         <div className="max-w-40">
           <CommitField id="conversation-budget" type="number" above={0} value={values.budget.conversation_usd}
             suggestions={BUDGET_SUGGESTIONS}
-            onCommit={(value, error) => (error ? setProblem(error) : personal.save({ 'budget.conversation_usd': value }))} />
+            onCommit={checked(setProblem, (value) => personal.save({ 'budget.conversation_usd': value }))} />
         </div>
       </Field>
       <InstructionsEditor label={t('settings.personalInstructions')} hint={t('settings.personalInstructionsHint')}
@@ -249,11 +249,11 @@ function Subagents() {
         <div className="grid gap-5 sm:grid-cols-3">
           <Field label={t('subagents.atOnce')} htmlFor="subagents-at-once">
             <CommitField id="subagents-at-once" type="number" min={1} step={1} value={values.subagents.at_once}
-              onCommit={(value, error) => (error ? setProblem(error) : personal.save({ 'subagents.at_once': value }))} />
+              onCommit={checked(setProblem, (value) => personal.save({ 'subagents.at_once': value }))} />
           </Field>
           <Field label={t('subagents.toolCalls')} htmlFor="subagents-tool-calls">
             <CommitField id="subagents-tool-calls" type="number" min={1} step={1} value={values.subagents.tool_calls}
-              onCommit={(value, error) => (error ? setProblem(error) : personal.save({ 'subagents.tool_calls': value }))} />
+              onCommit={checked(setProblem, (value) => personal.save({ 'subagents.tool_calls': value }))} />
           </Field>
           <Field label={t('subagents.effortCap')} htmlFor="subagents-effort-cap" hint={t('subagents.effortCapHint')}>
             <CommitField id="subagents-effort-cap" value={values.subagents.effort_cap} allowEmpty
@@ -311,7 +311,7 @@ function ThisProject({ project, onProjectChanged }) {
         <div className="max-w-40">
           <CommitField id="project-budget" type="number" above={0} value={values.project.budget_usd}
             suggestions={[25, 50, 100, 200]}
-            onCommit={(value, error) => (error ? setProblem(error) : own.save({ 'project.budget_usd': value }))} />
+            onCommit={checked(setProblem, (value) => own.save({ 'project.budget_usd': value }))} />
         </div>
       </Field>
       <InstructionsEditor projectId={project.id} label={t('settings.projectInstructions')} hint={t('settings.projectInstructionsHint')} />
@@ -324,6 +324,14 @@ function ThisProject({ project, onProjectChanged }) {
 
 // The turn limits (slice-1 spec section 13). In a project file each one overrides the
 // personal value, which an empty field inherits.
+// A checked field's commit: an invalid entry says so; a valid one clears that and is saved.
+function checked(setProblem, save) {
+  return (value, error) => {
+    setProblem(error ?? null);
+    if (!error) save(value);
+  };
+}
+
 function LimitFields({ file, inherited, onProblem, prefix }) {
   const t = useT();
   return (
@@ -335,7 +343,7 @@ function LimitFields({ file, inherited, onProblem, prefix }) {
             hint={inherited ? t(`settings.from.${value == null ? 'personal' : 'project'}`) : undefined}>
             <CommitField id={`${prefix}-${name}`} type="number" min={1} step={1} value={value} allowEmpty={Boolean(inherited)}
               placeholder={inherited ? String(inherited[name]) : undefined}
-              onCommit={(next, error) => (error ? onProblem(error) : file.save({ [`limits.${name}`]: next }))} />
+              onCommit={checked(onProblem, (next) => file.save({ [`limits.${name}`]: next }))} />
           </Field>
         );
       })}

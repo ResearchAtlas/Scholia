@@ -19,13 +19,15 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
   let latest = null;
   let queue = Promise.resolve();
   let era = 0;
+  let conflict = false; // a save was refused because the file changed; its message is owed
   // Reads the file again; a read that succeeds clears an earlier error, unless it follows a
-  // conflict whose message stays (keep).
+  // conflict whose message stays (keep), even after a failed read in between.
   const refresh = async (keep) => {
     try {
       latest = await read();
       onFile(latest);
-      if (!keep) onProblem(null);
+      if (!keep) conflict = false;
+      if (!keep || conflict) onProblem(conflict ? 'settings_changed' : null);
     } catch (error) {
       onProblem(error instanceof ApiError ? error.code : 'internal');
     }
@@ -42,6 +44,7 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
     const madeIn = era;
     const run = queue.then(async () => {
       if (madeIn !== era) return false;
+      conflict = false;
       onProblem(null);
       try {
         latest = await write(latest?.hash, updates);
@@ -51,6 +54,7 @@ export function settingsSaver({ read, write, onFile, onProblem }) {
         const code = error instanceof ApiError ? error.code : 'internal';
         onProblem(code);
         if (code === 'settings_changed') {
+          conflict = true;
           era += 1;
           await refresh(true);
         }
@@ -200,6 +204,12 @@ export function choiceUpdates(next) {
 export function stillUsable(listing, model) {
   const row = listing?.models?.find((m) => m.id === model);
   return row ? Boolean(row.offered && row.window?.status === 'ok') : !(listing && !listing.status?.error);
+}
+
+// A provider's listing to judge a kept choice by: a provider no longer set up (404) lists
+// nothing; a listing that cannot be read is null, which cannot be judged.
+export function listingToJudge(provider) {
+  return loadModels(provider).catch((error) => (error instanceof ApiError && error.status === 404 ? { models: [] } : null));
 }
 
 export function decodeChoice(value) {

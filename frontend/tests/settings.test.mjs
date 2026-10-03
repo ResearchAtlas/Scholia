@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { choiceUpdates, commitDecision, decodeChoice, onCatalogChange, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, stillUsable, utf8Bytes, valueAt } from '../src/settings.js';
+import { choiceUpdates, commitDecision, decodeChoice, onCatalogChange, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, listingToJudge, stillUsable, utf8Bytes, valueAt } from '../src/settings.js';
 import { ApiError } from '../src/api.js';
 
 test('settings keys quote the parts that are not bare TOML keys', () => {
@@ -197,4 +197,42 @@ test('a read asked for before a later save\'s conflict keeps that conflict\'s me
   const afterFirst = first.then(() => saver.reload()); // the first change's own read, queued behind the second
   await Promise.all([second, afterFirst]);
   assert.equal(problems.at(-1), 'settings_changed');
+});
+
+test('a conflict\'s message comes back when a failed read in between is followed by a good one', async () => {
+  let writes = 0;
+  let reads = 0;
+  const problems = [];
+  const saver = settingsSaver({
+    read: async () => {
+      reads += 1;
+      if (reads === 2) throw new ApiError(0, 'unreachable'); // the read right after the conflict
+      return { hash: 'h', values: {} };
+    },
+    write: async () => {
+      writes += 1;
+      if (writes === 2) throw new ApiError(409, 'settings_changed');
+      return { hash: `h${writes}`, values: {} };
+    },
+    onFile: () => {},
+    onProblem: (code) => problems.push(code),
+  });
+  await saver.reload();
+  const first = saver.save({ a: 1 });
+  const second = saver.save({ b: 2 });
+  const afterFirst = first.then(() => saver.reload());
+  await Promise.all([second, afterFirst]);
+  assert.deepEqual(problems.slice(-3), ['settings_changed', 'unreachable', 'settings_changed']);
+  await saver.reload(); // a plain read asked for after it all clears it
+  assert.equal(problems.at(-1), null);
+});
+
+test('a kept model whose provider is no longer set up is not restored; an unreadable listing cannot judge it', async (t) => {
+  let status = 404;
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ code: status === 404 ? 'unknown_provider' : 'network' }, { status }));
+  forgetModels();
+  assert.equal(stillUsable(await listingToJudge('gone'), 'm'), false);
+  status = 502;
+  forgetModels();
+  assert.equal(stillUsable(await listingToJudge('gone'), 'm'), true);
 });
