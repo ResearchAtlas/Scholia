@@ -1,7 +1,11 @@
 """The outbound gate: one module that every request leaving the app passes through.
 
-Not wired into the app yet. `OutboundGate.client()` and `async_client()` hand out
-httpx clients bound to one project. Their transport classifies each request's
+Every outgoing request of the app is sent with a client from `OutboundGate.client()`
+or `async_client()`: provider catalogs and model calls (backend/openrouter.py and
+backend/openrouter_client.py, through backend/runs.py and backend/app.py), and
+tests/test_no_bypass.py checks that no other module makes an HTTP client or a
+connection, so nothing (telemetry included) leaves another way. The clients are
+bound to one project. Their transport classifies each request's
 destination (scheme, host and port), allows or refuses it by the project's
 sensitivity level, and records the decision in `audit_log` before anything is
 sent. Every redirect hop goes through the same check, and a redirect to another
@@ -36,11 +40,17 @@ exact origins count there, and nothing else does. Names are never resolved, so
 - Private: model requests only to OpenRouter, on the Private allowlist, carrying
   provider.zdr = true and the entry's other flags, with no plugins or server-side
   features, sent with a key whose data-settings confirmation is current (see
-  `_private_problem`). Scholarly APIs, open-access hosts, the helper and model
-  downloads; no local providers.
+  `_private_problem`); and a local provider only after the researcher declared its
+  exact origin, as for Local only, without OpenRouter's flags or key confirmation
+  (ticket 64). Scholarly APIs, open-access hosts, the helper and model downloads.
 - Local only: the helper; a local provider only after the researcher declared
   its exact origin (`local_declarations`); scholarly APIs and open-access hosts
   only for a client marked as approved by the researcher. Nothing else.
+
+A client may also carry a dispatch check (`admit`), which the harness gives every
+model call: it is read in the same decision transaction, so a run revoked by a
+deletion or a tightened project, or one in a review-locked project, sends nothing
+more, retries and same-origin redirect hops included ("revoked").
 
 Audit rows hold the decision, reason, kind, destination origin, method, level
 and approval flag; never a path, query, header or body. Every field is from a
@@ -55,8 +65,9 @@ request that was never sent. If the row cannot be written, nothing is sent.
 
 Inputs that come from settings and the Private flows arrive through
 `GateInputs`; a missing one refuses, and one that fails is recorded as a refusal
-("gate_inputs_unavailable"). The Private checks call those inputs only for a
-project that is Private. Code in this process is trusted: the gate
+("gate_inputs_unavailable"). The Private route and key confirmation are read
+inside the decision transaction, with the level, and only for a project that is
+Private then. Code in this process is trusted: the gate
 guards against mistakes and model-driven requests, not against code that builds
 its own client or reaches into a client's private attributes.
 
@@ -159,15 +170,16 @@ class GateInputs:
 
     provider_urls: base URLs of the model providers configured in settings.
     helper_url: base URL of the running local helper, on loopback.
-    private_route: the request flags required by the enabled Private allowlist
-        entry covering an OpenRouter model id, or None if no entry covers it.
-    key_attested: whether a key has a current data-settings confirmation.
+    private_route(conn, model): the request flags required by the enabled Private
+        allowlist entry covering an OpenRouter model id, or None if none covers it.
+    key_attested(conn, key): whether a key has a current data-settings confirmation.
+    Both are called inside the decision transaction, with its connection.
     """
 
     provider_urls: Collection[str] = ()
     helper_url: str | None = None
-    private_route: Callable[[str], Mapping | None] | None = None
-    key_attested: Callable[[str], bool] | None = None
+    private_route: Callable[[object, str], Mapping | None] | None = None
+    key_attested: Callable[[object, str], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -175,6 +187,7 @@ class _Scope:
     project_id: str
     candidate_id: str | None
     approved: bool
+    admit: Callable | None = field(default=None, compare=False, repr=False)  # see OutboundGate.client
     # Redirect hops this client may still take: one-time token -> (origin, path and query as sent).
     hops: dict = field(default_factory=dict, compare=False, repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
@@ -230,24 +243,26 @@ class OutboundGate:
         self._local_listener = local_listener or (None if transport is not None else listener_is_ours)
 
     def client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
-               **options) -> httpx.Client:
+               admit: Callable | None = None, **options) -> httpx.Client:
         """A client for one project's requests.
 
         candidate_id names the candidate whose open-access link this client may
         fetch. approved means the researcher approved these requests, which Local
-        only projects need for scholarly APIs and open-access hosts. options are
+        only projects need for scholarly APIs and open-access hosts. admit(conn), if
+        given, is called in the decision transaction of every request the policy
+        allows; anything but True refuses it as "revoked". options are
         limited to base_url, follow_redirects, headers, max_redirects and timeout.
         Proxy and certificate settings in the environment are ignored: TLS uses
         certifi's CA bundle.
         """
-        transport = _Transport(self, _Scope(_project_id(project_id), candidate_id, approved),
+        transport = _Transport(self, _Scope(_project_id(project_id), candidate_id, approved, admit),
                                self._transport or httpx.HTTPTransport(trust_env=False))
         return httpx.Client(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
     def async_client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
-                     **options) -> httpx.AsyncClient:
+                     admit: Callable | None = None, **options) -> httpx.AsyncClient:
         """The async form of client()."""
-        transport = _AsyncTransport(self, _Scope(_project_id(project_id), candidate_id, approved),
+        transport = _AsyncTransport(self, _Scope(_project_id(project_id), candidate_id, approved, admit),
                                     self._transport or httpx.AsyncHTTPTransport(trust_env=False))
         return httpx.AsyncClient(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
@@ -268,17 +283,18 @@ class OutboundGate:
             public_problem = "not_a_fetch"
         else:
             public_problem = None
-        # The inputs are called outside the transaction, and the Private checks only
-        # when the project is Private now. The level is read again in the transaction.
+        # The inputs are called outside the transaction, and the request's own Private
+        # checks only when the project is Private now. The level is read again in the
+        # transaction, where the route and the key's confirmation are checked.
         seen = self._db.read(lambda conn: _level(conn, scope.project_id))
-        error, providers, helper = None, frozenset(), None
+        error, providers, helper, inputs = None, frozenset(), None, None
         try:
             inputs = self._inputs()
             providers, helper = _origins(inputs)
             if target != OPENROUTER:
                 private_problem = "not_openrouter"
             elif seen == "private":
-                private_problem = _private_problem(request, inputs)
+                private_problem = _private_request(request, inputs)
             else:
                 private_problem = "sensitivity_changed"  # used only if it became Private since
         except Exception as caught:  # recorded as a refusal below, and chained to it
@@ -295,23 +311,40 @@ class OutboundGate:
 
         def decide(conn):
             # The level is read in the transaction that records the decision, so a
-            # change of level is ordered entirely before or after it.
+            # change of level is ordered entirely before or after it; so are the Private
+            # route, the key's confirmation and the dispatch check, read here too.
+            nonlocal error
             level = _level(conn, scope.project_id)
             link = _candidate_link(conn, scope)
+            kind = None
             if request.method not in _METHODS:  # an arbitrary method string could carry content
-                kind, reason = None, "unsupported_method"
+                reason = "unsupported_method"
             elif error is not None:
-                kind, reason = None, "gate_inputs_unavailable"
+                reason = "gate_inputs_unavailable"
             else:
                 kind = _classify(target, providers, helper, link)
                 # An open-access fetch is bound to the candidate's exact link, as sent;
                 # other URLs on its origin only as redirects followed from it.
                 bound = hop or (link is not None and target == _origin(link) and request.url.raw_path == link.raw_path)
-                reason = _policy(conn, level, kind, target, scope, private_problem, public_problem, bound)
+                problem = private_problem
+                if isinstance(problem, tuple) and level == "private" and kind is Kind.MODEL_PROVIDER:
+                    try:
+                        problem = _private_problem(conn, inputs, *problem)
+                    except Exception as caught:  # recorded as a refusal, and chained to it
+                        error, kind, problem = caught, None, "gate_inputs_unavailable"
+                reason = "gate_inputs_unavailable" if error is not None else \
+                    _policy(conn, level, kind, target, scope, problem, public_problem, bound)
                 if reason is None and not addressed:
                     reason = "host_mismatch"
                 if reason is None and kind is Kind.LOCAL_PROVIDER and owned is False:
                     reason = "local_server_not_yours"
+                if reason is None and scope.admit is not None:
+                    try:
+                        admitted = scope.admit(conn)
+                    except Exception as caught:  # refused, and chained to it
+                        error, admitted = caught, False
+                    if admitted is not True:
+                        reason = "revoked"
             shown = _shown(conn, target, kind, link, providers, helper)
             _record(conn, request, scope, level, kind, shown, reason)
             return kind, reason, shown
@@ -408,6 +441,18 @@ def listener_is_ours(host, port) -> bool:
             return False
 
     return all(any(covers(listener, address) for listener in listeners) for address in wanted)
+
+
+def local_origin(url) -> str | None:
+    """For a URL on this machine, the origin a declaration of its server covers (one per exact
+    origin), as the audit log shows it; None for any other URL."""
+    origin = _origin_of(url)
+    return _show(origin) if origin is not None and _is_this_host(origin[1]) else None
+
+
+def is_openrouter(url) -> bool:
+    """Whether a URL is on OpenRouter's origin, the only one a Private model request may use."""
+    return _origin_of(url) == OPENROUTER
 
 
 def _dispatched(request):
@@ -594,22 +639,22 @@ def _policy(conn, level, kind, target, scope, private_problem, public_problem, b
         return "not_candidate_url"
     if level == "normal" or kind is Kind.LOCAL_HELPER:
         return None
+    if kind is Kind.LOCAL_PROVIDER and level in ("private", "local_only"):  # a declared server only (ticket 64)
+        declared = conn.execute("SELECT base_url FROM local_declarations").fetchall()
+        return None if any(_origin_of(url) == target for (url,) in declared) else "not_declared"
     if level == "private":
-        if kind is Kind.MODEL_PROVIDER:
-            return private_problem
-        return "not_allowed_at_level" if kind is Kind.LOCAL_PROVIDER else None
+        return private_problem if kind is Kind.MODEL_PROVIDER else None
     if level == "local_only":
-        if kind is Kind.LOCAL_PROVIDER:
-            declared = conn.execute("SELECT base_url FROM local_declarations").fetchall()
-            return None if any(_origin_of(url) == target for (url,) in declared) else "not_declared"
         if kind in (Kind.SCHOLARLY_API, Kind.OPEN_ACCESS):
             return None if scope.approved is True else "not_approved"
         return "not_allowed_at_level"
     return "unknown_level"
 
 
-def _private_problem(request: httpx.Request, inputs: GateInputs):
-    """Why a request to OpenRouter cannot go out from a Private project, or None."""
+def _private_request(request: httpx.Request, inputs: GateInputs):
+    """What a request to OpenRouter from a Private project carries, for _private_problem to
+    check in the decision transaction: (its models, its body, its key); or why it cannot go
+    out at all."""
     if inputs.private_route is None or inputs.key_attested is None:
         return "private_inputs_missing"
     if request.method != "POST":
@@ -641,16 +686,24 @@ def _private_problem(request: httpx.Request, inputs: GateInputs):
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "file" for p in content):
             return "unsupported_feature"  # files go through a parser plugin
+    _, _, key = request.headers.get("authorization", "").partition(" ")
+    return models, body, request.headers.get("authorization", ""), key.strip()
+
+
+def _private_problem(conn, inputs: GateInputs, models, body, authorization, key):
+    """Why a request to OpenRouter cannot go out from a Private project, or None: each model on
+    the allowlist with its entry's flags, provider.zdr = true, and a key whose data-settings
+    confirmation is current, read in the decision transaction."""
     for model in models:
-        flags = inputs.private_route(model)
+        flags = inputs.private_route(conn, model)
         if not isinstance(flags, Mapping):
             return "route_not_allowed"
         if not _carries(body, flags):
             return "missing_flags"
     if not _carries(body, ZDR):
         return "missing_flags"
-    scheme, _, key = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not key.strip() or inputs.key_attested(key.strip()) is not True:
+    scheme = authorization.partition(" ")[0]
+    if scheme.lower() != "bearer" or not key or inputs.key_attested(conn, key) is not True:
         return "key_not_confirmed"
     return None
 

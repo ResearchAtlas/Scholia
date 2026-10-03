@@ -1,4 +1,4 @@
-"""Loopback is only transport: a local provider counts for Local only after the researcher's declaration.
+"""Loopback is only transport: a local provider counts for Private and Local only after the researcher's declaration.
 
 These tests send real requests to mock servers this process starts and
 registers with the test network block, and check what each server received.
@@ -139,23 +139,44 @@ def test_a_declaration_does_not_open_remote_providers_for_local_only(db):
         client.get("https://api.other-provider.example/v1/models")
 
 
-@pytest.mark.parametrize(("level", "reason"), [("normal", None), ("private", "not_allowed_at_level")])
-def test_other_levels_ignore_declarations(db, stack, level, reason):
+def test_normal_ignores_declarations(db, stack):
     base, received = server(stack)
     gate = gate_for(db, provider_urls=[f"{base}/v1"])
-    with gate.client(project(db, level)) as client:  # Normal: any model route, declared or not
-        if reason:
-            with pytest.raises(OutboundDenied, match=reason):
-                client.get(f"{base}/v1/models")
-        else:
-            client.get(f"{base}/v1/models")
+    with gate.client(project(db, "normal")) as client:  # any model route, declared or not
+        client.get(f"{base}/v1/models")
         declare(db, f"{base}/v1")
-        if reason:
-            with pytest.raises(OutboundDenied, match=reason):
-                client.get(f"{base}/v1/models")
-        else:
-            client.get(f"{base}/v1/models")
-    assert len(received) == (0 if reason else 2)
+        client.get(f"{base}/v1/models")
+    assert len(received) == 2
+
+
+def test_private_uses_a_declared_server_without_openrouters_flags_or_a_confirmed_key(db, stack):
+    # Ticket 64: the same declaration, audit record and dispatch checks as Local only; the
+    # Private allowlist and the key confirmation are OpenRouter's alone.
+    base, received = server(stack)
+    gate = OutboundGate(db, lambda: GateInputs(provider_urls=[f"{base}/v1"], private_route=lambda conn, model: None,
+                                               key_attested=lambda conn, key: False), local_listener=ours)
+    with gate.client(project(db, "private")) as client:
+        with pytest.raises(OutboundDenied, match="not_declared"):  # loopback alone is only transport
+            client.post(f"{base}/v1/chat/completions", json={"model": "local", "messages": []})
+        assert received == []
+        declare(db, f"{base}/v1")
+        client.post(f"{base}/v1/chat/completions", json={"model": "local", "messages": []},
+                    headers={"Authorization": "Bearer local"})
+    assert received == [("POST", "/v1/chat/completions")]
+    assert reasons(db) == ["not_declared", None]
+
+
+@pytest.mark.parametrize("follow", [True, False])
+def test_a_declared_server_cannot_redirect_elsewhere_from_a_private_project(db, stack, follow):
+    target, target_received = server(stack)
+    base, received = server(stack, redirect_to=target)
+    declare(db, base)
+    declare(db, target)
+    gate = gate_for(db, provider_urls=[f"{base}/v1", f"{target}/v1"])
+    with gate.client(project(db, "private"), follow_redirects=follow) as client, \
+            pytest.raises(OutboundDenied, match="cross_origin_redirect"):
+        client.post(f"{base}/v1/chat/completions", json={"messages": []})
+    assert target_received == []
 
 
 @pytest.mark.parametrize("level", ["normal", "private", "local_only"])
