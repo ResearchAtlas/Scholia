@@ -555,18 +555,20 @@ def load_settings(data_root, project_id=None):
     return settings
 
 
-def without_ignored(raw):
-    """A project config.toml's bytes with every entry the app ignores left out: keys and other
-    secrets a researcher typed by hand, personal settings and invalid values. Comments and the
-    entries the app reads stay. For exports, which never carry keys. None when the bytes are
-    not valid TOML in UTF-8, since then nothing in them can be checked."""
+def without_ignored(raw, personal=False):
+    """A config.toml's bytes (a project's, or the personal one) with every entry the app ignores
+    left out: keys and other secrets a researcher typed by hand, settings of the other scope and
+    invalid values. Comments and the entries the app reads stay. For files that leave the data
+    folder (exports, full backups), which never carry keys. None when the bytes are not valid
+    TOML in UTF-8, since then nothing in them can be checked."""
+    schema = PERSONAL if personal else PROJECT
     try:
         doc = tomlkit.parse(raw.decode("utf-8"))
         leaves = list(_leaves(doc.unwrap()))
     except (UnicodeDecodeError, tomlkit.exceptions.ParseError, RecursionError):
         return None
     for path, value in leaves:
-        if _check(PROJECT, path, value)[1] is not None:
+        if _check(schema, path, value)[1] is not None:
             node = doc
             for part in path[:-1]:
                 node = node[part]

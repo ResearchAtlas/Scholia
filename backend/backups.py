@@ -351,11 +351,24 @@ def _write_full_backup(db, destination, passphrase):
         with closing(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro", uri=True)) as copy:
             sensitive, projects = copy.execute(
                 f"SELECT count(*) FILTER (WHERE sensitivity IN {SENSITIVE}), count(*) FROM projects").fetchone()
-            hashes = [sha256 for (sha256,) in copy.execute("SELECT sha256 FROM content_files ORDER BY sha256")]
+            # Only the files the copy's records refer to: one of a project deleted moments ago, which
+            # collection keeps for a while, would leave without the encryption its project needed.
+            hashes = [sha256 for sha256, *_ in _referenced_content(copy)]
         if sensitive and not passphrase:
             raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
-        entries = [(path.relative_to(staging / "copy").as_posix(), path)
-                   for path in sorted((staging / "copy").rglob("*")) if path.is_file()]
+        entries, left_out = [], []
+        for path in sorted((staging / "copy").rglob("*")):
+            name = path.relative_to(staging / "copy").as_posix()
+            if not path.is_file():
+                continue
+            if path.name == "config.toml":  # never a key typed into it by hand
+                raw = without_ignored(path.read_bytes(), personal=name == "config.toml")
+                if raw is None:  # not valid TOML, so it cannot be checked
+                    left_out.append(name)
+                else:
+                    entries.append((name, raw))
+            else:
+                entries.append((name, path))
         content, missing = db.data_dir / "content", 0
         for sha256 in hashes:  # content files never change; one deleted since the copy is left out
             path = content / sha256[:2] / sha256
@@ -363,15 +376,15 @@ def _write_full_backup(db, destination, passphrase):
                 entries.append((f"content/{sha256[:2]}/{sha256}", path))
             else:
                 missing += 1
-        path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=lambda: db.closed)
+        record = {"encrypted": passphrase is not None, "projects": projects, "content_files": len(hashes) - missing,
+                  "missing_files": missing, "settings_left_out": left_out, "schema_version": info["schema_version"]}
+        path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=lambda: db.closed,
+                          audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
+                              "INSERT INTO audit_log (event, data) VALUES ('full_backup', ?)",
+                              (json.dumps({"file": str(file), **record}),))))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    result = {"file": str(path), "encrypted": passphrase is not None, "projects": projects,
-              "content_files": len(hashes) - missing, "missing_files": missing, "size": path.stat().st_size,
-              "schema_version": info["schema_version"]}
-    db.write(lambda conn: conn.execute(  # the destination, never content
-        "INSERT INTO audit_log (event, data) VALUES ('full_backup', ?)", (json.dumps(result),)))
-    return {"ok": True, **result}
+    return {"ok": True, "file": str(path), **record, "size": path.stat().st_size}
 
 
 # Restore
@@ -675,12 +688,23 @@ def _add_content(staged, root):
 
 
 def _missing_files(db):
-    """The content files the database refers to that are not in the content store ("file missing")."""
-    rows = db.read(lambda conn: conn.execute(
-        "SELECT sha256, size, media_type FROM content_files ORDER BY sha256").fetchall())
+    """The content files the database's records refer to that are not in the content store ("file missing")."""
+    rows = db.read(_referenced_content)
     root = db.data_dir / "content"
     return [{"sha256": sha256, "size": size, "media_type": media_type} for sha256, size, media_type in rows
             if not (root / sha256[:2] / sha256).is_file()]
+
+
+def _referenced_content(conn):
+    """(sha256, size, media_type) of every content file a record refers to, through any foreign key
+    into content_files. A row nothing refers to any more (its records deleted, the file not yet
+    collected) is left out."""
+    references = conn.execute(
+        'SELECT m.name, f."from" FROM sqlite_schema m, pragma_foreign_key_list(m.name) f'
+        " WHERE m.type = 'table' AND f.\"table\" = 'content_files'").fetchall()
+    referenced = " UNION ".join(f'SELECT "{column}" FROM "{table}"' for table, column in references)
+    return conn.execute(f"SELECT sha256, size, media_type FROM content_files WHERE sha256 IN ({referenced})"
+                        " ORDER BY sha256").fetchall()
 
 
 # Project export
@@ -736,18 +760,18 @@ def _write_export(db, project_id, destination, passphrase):
             raw = without_ignored(raw) if name == "config.toml" else raw  # never a key typed into it by hand
             if raw is not None:
                 entries.append((f"settings/{name}", raw))
-    path = _write_zip(destination, f"scholia-project-{project_id[:8]}", entries, passphrase, stop=lambda: db.closed)
+    record = {"encrypted": passphrase is not None, "conversations": len(data["conversations"]),
+              "turns": sum(len(c["turns"]) for c in data["conversations"]), "artifacts": len(data["artifacts"]),
+              "materials": len(data["materials"])}
+    path = _write_zip(destination, f"scholia-project-{project_id[:8]}", entries, passphrase, stop=lambda: db.closed,
+                      audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
+                          "INSERT INTO audit_log (event, project_id, data) VALUES ('project_export', ?, ?)",
+                          (project_id, json.dumps({"file": str(file), **record})))))
     # The settings files were read while the project existed only if it still does: it is deleted record first.
     if not db.read(lambda conn: conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone()):
         path.unlink(missing_ok=True)
         raise BackupError(404, "not_found", "No such project")
-    result = {"file": str(path), "encrypted": passphrase is not None, "conversations": len(data["conversations"]),
-              "turns": sum(len(c["turns"]) for c in data["conversations"]), "artifacts": len(data["artifacts"]),
-              "materials": len(data["materials"]), "size": path.stat().st_size}
-    db.write(lambda conn: conn.execute(  # the destination, never content
-        "INSERT INTO audit_log (event, project_id, data) VALUES ('project_export', ?, ?)",
-        (project_id, json.dumps(result))))
-    return {"ok": True, **result}
+    return {"ok": True, "file": str(path), **record, "size": path.stat().st_size}
 
 
 def _project_records(conn, project_id):
@@ -852,17 +876,20 @@ def _staging(data_dir):
     return folder
 
 
-def _write_zip(destination, prefix, entries, passphrase, *, stop):
+def _write_zip(destination, prefix, entries, passphrase, *, stop, audit):
     """Write entries [(name, bytes or a file's path)] to a new zip file in destination, owner-only:
-    AES-encrypted with passphrase when given. It is written under a temporary name and renamed
-    when complete and synced. stop() is checked as it goes; when true (the app is closing), the
-    file is removed and DatabaseClosedError raised. Returns the file's path."""
+    AES-encrypted with passphrase when given. audit(path) records it first, before anything is
+    written there, so no file ever leaves the data folder unrecorded; a failure afterwards leaves
+    the record of an attempt. It is written under a temporary name and renamed when complete and
+    synced; on any failure, what was written there is removed. stop() is checked as it goes; when
+    true (the app is closing), it stops with 503 closing. Returns the file's path."""
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     name, n = f"{prefix}-{stamp}.zip", 1
     while (destination / name).exists() or (destination / f".{name}.tmp").exists():
         n += 1
         name = f"{prefix}-{stamp}-{n}.zip"
     final, tmp = destination / name, destination / f".{name}.tmp"
+    audit(final)
     pyzipper = _pyzipper()
     options = {"encryption": pyzipper.WZ_AES} if passphrase else {}
     try:
@@ -889,10 +916,10 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop):
         _fsync(tmp)
         os.rename(tmp, final)
         _fsync(destination)
-    except DatabaseClosedError:
+    except BaseException as error:
         tmp.unlink(missing_ok=True)
-        raise BackupError(503, "closing", "The app is closing") from None
-    except BaseException:
-        tmp.unlink(missing_ok=True)
+        final.unlink(missing_ok=True)  # published, but its folder could not be synced: not a backup
+        if isinstance(error, DatabaseClosedError):
+            raise BackupError(503, "closing", "The app is closing") from None
         raise
     return final

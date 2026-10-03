@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from scholia_app import started
+from scholia_app import started, stored_material
 
 pytestmark = pytest.mark.asyncio
 
@@ -13,11 +13,13 @@ pytestmark = pytest.mark.asyncio
 async def test_a_restore_reports_the_referenced_content_files_that_are_missing(tmp_path):
     data = tmp_path / "data"
     async with started(data) as client:
-        content = client.state["content"]
-        kept = await asyncio.to_thread(content.put, b"a paper that stays", "application/pdf")
-        lost = await asyncio.to_thread(content.put, b"a paper whose file is lost", "application/pdf")
+        project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+        kept = await stored_material(client, project, b"a paper that stays", "application/pdf")
+        lost = await stored_material(client, project, b"a paper whose file is lost", "application/pdf")
+        unreferenced = await asyncio.to_thread(client.state["content"].put, b"nothing refers to me", "text/plain")
         backup = (await client.post("/api/backups")).json()["id"]  # an automatic backup has no content files
         (data / "content" / lost[:2] / lost).unlink()
+        (data / "content" / unreferenced[:2] / unreferenced).unlink()  # no record needs it: not reported
 
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert response.status_code == 200, response.text

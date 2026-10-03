@@ -13,6 +13,7 @@ import json
 import httpx
 
 from backend.app import create_app
+from backend.db import new_id as _new_id
 
 ORIGIN = "http://127.0.0.1:8765"
 HEADERS = {"X-Scholia-Client": "local"}
@@ -117,6 +118,21 @@ async def started(data_dir, provider=None, *, keyring=None, setup=True, **option
             client.provider = provider
             client.keyring = keyring
             yield client
+
+
+async def stored_material(client, project, content, media_type):
+    """A material of project whose one version is content, stored: its file's SHA-256."""
+    sha256 = await asyncio.to_thread(client.state["content"].put, content, media_type)
+    material = _new_id()
+
+    def insert(conn):
+        conn.execute("INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, 'A paper', 'upload')",
+                     (material, project))
+        conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current)"
+                     " VALUES (?, ?, 0, ?, 1)", (_new_id(), material, sha256))
+
+    await asyncio.to_thread(client.state["db"].write, insert)
+    return sha256
 
 
 def events(response):

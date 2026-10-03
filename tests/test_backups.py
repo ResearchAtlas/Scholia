@@ -14,7 +14,7 @@ import pytest
 import backend.backups as backups_module
 from backend.db import DB_NAME, Database, new_id
 from backend.db.migrations import MIGRATIONS
-from scholia_app import background_idle, send, started
+from scholia_app import background_idle, send, started, stored_material
 
 pytestmark = pytest.mark.asyncio
 
@@ -97,7 +97,8 @@ async def test_a_full_backup_holds_the_database_content_and_settings_and_never_k
     async with started(data) as client:
         project = await new_project(client)
         await client.put("/api/instructions", json={"project_id": project, "text": "Use APA."})
-        sha256 = await asyncio.to_thread(client.state["content"].put, b"%PDF-1.7 a paper", "application/pdf")
+        sha256 = await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
+        await asyncio.to_thread(client.state["content"].put, b"nothing refers to me", "text/plain")
         (data / "credentials.json").write_text('{"openrouter": "sk-or-never-copied"}')
         (data / "scholia.lock").write_text("")
         (data / "logs").mkdir(exist_ok=True)
@@ -114,7 +115,7 @@ async def test_a_full_backup_holds_the_database_content_and_settings_and_never_k
     assert read(path, f"content/{sha256[:2]}/{sha256}") == b"%PDF-1.7 a paper"
     assert read(path, f"projects/{project}/AGENTS.md") == b"Use APA."
     assert json.loads(read(path, "backup.json"))["schema_version"] == len(MIGRATIONS)
-    assert b"sk-or-never-copied" not in path.read_bytes()
+    assert not any(b"sk-or-never-copied" in read(path, name) for name in names(path))
     assert mode(path) == 0o600
     assert sorted(p.name for p in destination.iterdir()) == [path.name]  # no temporary file left
     assert not list((data / "backups" / backups_module.STAGING).iterdir())  # nor its copy in the data folder
@@ -142,6 +143,71 @@ async def test_a_full_backup_holding_a_private_project_needs_a_passphrase_and_is
         assert conn.execute("SELECT name FROM projects WHERE sensitivity = 'private'").fetchall() == [("Interviews",)]
 
 
+async def test_a_full_backup_holds_no_file_of_a_project_deleted_moments_before(tmp_path):
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        private = await new_project(client, "Interviews", "private")
+        await stored_material(client, private, b"Participant 7 transcript", "text/plain")
+        assert (await client.delete(f"/api/projects/{private}")).status_code == 200  # its file is not collected yet
+        response = await client.post("/api/backups/full", json={"destination": str(destination)})
+        assert response.status_code == 200 and response.json()["encrypted"] is False  # no Private project is left
+        assert response.json()["content_files"] == 0
+    [path] = destination.iterdir()
+    assert not any(n.startswith("content/") for n in names(path))
+    assert not any(b"Participant 7" in read(path, name) for name in names(path))
+
+
+async def test_a_full_backup_never_holds_a_key_typed_into_a_settings_file(tmp_path):
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        project = await new_project(client)
+        personal, project_config = data / "config.toml", data / "projects" / project / "config.toml"
+        personal.write_text(personal.read_text() + '\n[ui]\nlanguage = "en"\n'
+                            '[providers.extra]\nkind = "openai-compatible"\napi_key = "sk-or-typed-into-personal"\n')
+        project_config.write_text(project_config.read_text() + 'token = "sk-or-typed-into-project"\n')
+        (data / "projects" / project / "AGENTS.md").write_text("Use APA.")
+        response = await client.post("/api/backups/full", json={"destination": str(destination)})
+        assert response.status_code == 200, response.text
+    path = destination / response.json()["file"].rsplit("/", 1)[1]
+    assert not any(b"sk-or-typed-into" in read(path, name) for name in names(path))  # read, not as compressed
+    assert b'language = "en"' in read(path, "config.toml") and b"citation_style" in read(
+        path, f"projects/{project}/config.toml")  # what the app reads stays
+
+
+async def test_a_full_backup_is_recorded_before_anything_is_written_and_removed_if_it_fails(tmp_path, monkeypatch):
+    import errno
+    import backend.db.database as database_module
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        real = database_module._fsync
+
+        def failing(path):  # the folder cannot be synced once the file is in it
+            if path == destination:
+                raise OSError(errno.EIO, "I/O error")
+            real(path)
+
+        monkeypatch.setattr(backups_module, "_fsync", failing)
+        response = await client.post("/api/backups/full", json={"destination": str(destination)})
+        assert response.json()["code"] == "write_failed"
+        assert list(destination.iterdir()) == []  # not left half published
+        [attempt] = await audit(client, "full_backup")
+        assert attempt["file"].startswith(str(destination))
+
+        monkeypatch.setattr(backups_module, "_fsync", real)
+        db = client.state["db"]
+
+        def unrecordable(fn):
+            raise OSError(errno.EIO, "I/O error")
+
+        monkeypatch.setattr(db, "write", unrecordable)
+        response = await client.post("/api/backups/full", json={"destination": str(destination)})
+        assert response.json()["code"] == "write_failed"
+        assert list(destination.iterdir()) == []  # nothing written where it could not be recorded
+
+
 @pytest.mark.parametrize("where, code", [("relative", "invalid_destination"), ("missing", "destination_not_found"),
                                          ("inside", "destination_in_data_folder")])
 async def test_a_full_backup_goes_only_to_an_existing_folder_outside_the_data_folder(tmp_path, where, code):
@@ -164,7 +230,8 @@ async def test_a_folder_that_cannot_be_written_gets_a_code_and_no_path_in_the_lo
             for path, body in (("/api/backups/full", {}), (f"/api/projects/{project}/export", {})):
                 response = await client.post(path, json={"destination": str(destination), **body})
                 assert (response.status_code, response.json()["code"]) == (400, "destination_not_writable")
-            assert await audit(client, "full_backup") == [] and await audit(client, "project_export") == []
+            # Each attempt was recorded before anything was written there, so nothing leaves unrecorded.
+            assert len(await audit(client, "full_backup")) == len(await audit(client, "project_export")) == 1
     finally:
         os.chmod(destination, 0o700)
     assert list(destination.iterdir()) == []
@@ -287,7 +354,7 @@ async def test_restoring_an_encrypted_full_backup_needs_its_passphrase_and_bring
     destination.mkdir()
     async with started(data) as client:
         project = await new_project(client, "Interviews", "private")
-        sha256 = await asyncio.to_thread(client.state["content"].put, b"transcript one", "text/plain")
+        sha256 = await stored_material(client, project, b"transcript one", "text/plain")
         file = (await client.post("/api/backups/full", json={"destination": str(destination),
                                                              "passphrase": PASSPHRASE})).json()["file"]
         await client.delete(f"/api/projects/{project}")
@@ -405,7 +472,7 @@ async def test_a_project_exports_as_markdown_json_its_files_and_settings_without
     assert read(path, f"materials/{material}/v0.pdf") == b"%PDF-1.7 a paper"
     assert read(path, "settings/AGENTS.md") == b"Use APA."
     assert b"sk-or-typed-by-hand" not in read(path, "settings/config.toml")
-    assert b"Elsewhere" not in path.read_bytes() and mode(path) == 0o600
+    assert not any(b"Elsewhere" in read(path, name) for name in names(path)) and mode(path) == 0o600
 
 
 async def test_a_private_project_exports_only_encrypted(tmp_path):
@@ -419,7 +486,7 @@ async def test_a_private_project_exports_only_encrypted(tmp_path):
         response = await client.post(f"/api/projects/{project}/export",
                                      json={"destination": str(destination), "passphrase": PASSPHRASE})
         assert response.status_code == 200 and response.json()["encrypted"] is True
-        missing = await client.post(f"/api/projects/{project[:-1]}0/export", json={"destination": str(destination)})
+        missing = await client.post(f"/api/projects/{new_id()}/export", json={"destination": str(destination)})
         assert missing.status_code == 404
     [path] = destination.iterdir()
     assert b"Participant 7" not in path.read_bytes()  # titles are inside, never in the names
