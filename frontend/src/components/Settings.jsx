@@ -2,7 +2,7 @@
 // Settings (S10; slice-1 spec F12 and the stage walk): General, Providers and models,
 // Subagents, This project and Advanced. Personal values live in the personal config.toml,
 // the project's in its own; keys live in the credential store (section 4.4).
-import { useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, X } from 'lucide-react';
 import { LANGUAGES, LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, patch, post } from '../api.js';
@@ -116,8 +116,13 @@ function InstructionsEditor({ projectId, label, hint }) {
   const t = useT();
   const instructions = useInstructions(projectId);
   const [draft, setDraft] = useState(null);
+  const [saving, setSaving] = useState(false); // the text cannot change while it is saved and read back
+  const [confirming, setConfirming] = useState(false); // a file not in UTF-8 is rewritten only when confirmed
   const file = instructions.file;
-  useEffect(() => setDraft(file?.text ?? null), [file?.text, file?.hash]);
+  useEffect(() => {
+    setDraft(file?.text ?? null);
+    setConfirming(false);
+  }, [file?.text, file?.hash]);
   if (!file || draft === null) return <Loading />;
   const combined = file.combined_bytes - utf8Bytes(file.text) + utf8Bytes(draft);
   const over = combined > file.cap_bytes;
@@ -128,14 +133,24 @@ function InstructionsEditor({ projectId, label, hint }) {
         aside={<span className={cn('text-xs tabular-nums', over ? 'text-destructive' : 'text-muted-foreground')}>
           {t('settings.instructionsSize', { used: Math.ceil(combined / 1024), cap: file.cap_bytes / 1024 })}
         </span>}>
-        <Textarea id={id} value={draft} onChange={(event) => setDraft(event.target.value)} rows={8}
+        <Textarea id={id} value={draft} onChange={(event) => setDraft(event.target.value)} rows={8} readOnly={saving}
           className="font-mono text-[13px] leading-relaxed" spellCheck={false} />
       </Field>
+      {file.replaced && <p role="alert" className="text-xs text-warning">{t('settings.instructionsReplaced')}</p>}
       {over && <p role="alert" className="text-xs text-destructive">{t('settings.instructionsOverCap')}</p>}
       <Problem code={instructions.problem} />
       <div className="flex justify-end gap-2">
-        <Button variant="ghost" size="sm" disabled={draft === file.text} onClick={() => setDraft(file.text)}>{t('common.cancel')}</Button>
-        <Button size="sm" disabled={draft === file.text} onClick={() => instructions.save(draft)}>{t('common.save')}</Button>
+        <Button variant="ghost" size="sm" disabled={saving || draft === file.text}
+          onClick={() => { setDraft(file.text); setConfirming(false); }}>{t('common.cancel')}</Button>
+        <Button size="sm" disabled={saving || draft === file.text} onClick={async () => {
+          if (file.replaced && !confirming) {
+            setConfirming(true);
+            return;
+          }
+          setSaving(true);
+          await instructions.save(draft);
+          setSaving(false);
+        }}>{confirming ? t('settings.instructionsReplaceConfirm') : t('common.save')}</Button>
       </div>
     </div>
   );
@@ -163,21 +178,30 @@ function Subagents() {
   const t = useT();
   const personal = useSettingsFile();
   const offered = useOfferedModels();
+  const pending = useRef(null); // the list as the latest change left it, until that is saved
   const [adding, setAdding] = useState('');
   const [problem, setProblem] = useState(null);
   const values = personal.values;
   if (!values) return <Loading />;
   const list = values.subagents.models ?? [];
-  const saveList = (next) => personal.save({ 'subagents.models': next });
-  const move = (from, to) => {
-    const next = [...list];
-    next.splice(to, 0, next.splice(from, 1)[0]);
-    saveList(next);
+  // Each change starts from the list as the last change left it, even before that is saved.
+  const change = (edit) => {
+    const next = edit(pending.current ?? list);
+    if (!next) return;
+    pending.current = next;
+    personal.save({ 'subagents.models': next }).then((saved) => {
+      if (!saved || pending.current === next) pending.current = null; // a refused change: the file read again is the base
+    });
   };
+  const move = (from, to) => change((base) => {
+    const next = [...base];
+    next.splice(to, 0, next.splice(from, 1)[0]);
+    return next;
+  });
+  const remove = (id) => change((base) => base.filter((m) => m !== id));
   function add() {
     const id = adding.trim();
-    if (!id || list.includes(id) || list.length >= MAX_SUBAGENT_MODELS) return;
-    saveList([...list, id]);
+    change((base) => (!id || base.includes(id) || base.length >= MAX_SUBAGENT_MODELS ? null : [...base, id]));
     setAdding('');
   }
   return (
@@ -199,7 +223,7 @@ function Subagents() {
                 aria-label={t('subagents.up', { model: id })}><ArrowUp aria-hidden="true" /></Button>
               <Button variant="ghost" size="icon" className="size-7" disabled={i === list.length - 1} onClick={() => move(i, i + 1)}
                 aria-label={t('subagents.down', { model: id })}><ArrowDown aria-hidden="true" /></Button>
-              <Button variant="ghost" size="icon" className="size-7" onClick={() => saveList(list.filter((m) => m !== id))}
+              <Button variant="ghost" size="icon" className="size-7" onClick={() => remove(id)}
                 aria-label={t('subagents.remove', { model: id })}><X aria-hidden="true" /></Button>
             </li>
           ))}

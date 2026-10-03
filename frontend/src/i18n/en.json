@@ -275,5 +275,7 @@
   "settings.problemValue": "Line {line}: {key} is not valid, so its default is used.",
   "settings.problemFile": "The settings file is not valid at line {line}, so the defaults are used.",
   "settings.problemFileUnread": "The settings file could not be read, so the defaults are used.",
-  "picker.setWindow": "Set the window of {model} to use it"
+  "picker.setWindow": "Set the window of {model} to use it",
+  "settings.instructionsReplaced": "This file is not UTF-8 text. Some characters could not be read and are shown as �; saving it replaces them for good.",
+  "settings.instructionsReplaceConfirm": "Save, replacing them"
 }

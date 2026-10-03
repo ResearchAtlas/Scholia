@@ -212,3 +212,11 @@ async def test_an_unreadable_settings_file_is_reported(tmp_path, monkeypatch):
     monkeypatch.setattr(settings_module, "_read", unreadable)
     loaded = settings_module.load_settings(tmp_path)
     assert loaded.problems == [{"key": None, "line": None}]
+
+
+async def test_an_instruction_file_not_in_utf8_is_flagged_before_it_is_rewritten(tmp_path):
+    async with started(tmp_path / "data") as client:
+        assert (await client.get("/api/instructions")).json()["replaced"] is False
+        (tmp_path / "data" / "AGENTS.md").write_bytes(b"caf\xe9")
+        read = (await client.get("/api/instructions")).json()
+        assert read["replaced"] is True and read["text"] == "caf�"

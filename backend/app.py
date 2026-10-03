@@ -450,8 +450,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             raw = await asyncio.to_thread(lambda: path.read_bytes() if path.is_file() else b"")
             _, warnings = await asyncio.to_thread(load_instructions, data_dir, project_id)
             combined = await asyncio.to_thread(instructions_size, data_dir, project_id)
-        return {"text": raw.decode("utf-8", errors="replace"), "hash": hashlib.sha256(raw).hexdigest(),
-                "combined_bytes": combined, "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
+        text = raw.decode("utf-8", errors="replace")
+        return {"text": text, "hash": hashlib.sha256(raw).hexdigest(), "combined_bytes": combined,
+                "replaced": text.encode("utf-8") != raw,  # not UTF-8: saving it back replaces those bytes
+                "warnings": warnings, "cap_bytes": INSTRUCTIONS_CAP}
 
     @app.put("/api/instructions")
     async def put_instructions(body: Instructions):
