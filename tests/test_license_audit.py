@@ -1,3 +1,4 @@
+import json
 import sys
 import zipfile
 from importlib import metadata
@@ -120,6 +121,87 @@ def test_base_library_members_must_all_be_known(bundle):
         "Contents/Resources/base_library.zip: member libfoo.dylib belongs to no known component",
         "Contents/Resources/base_library.zip: module unknownpkg.__init__ belongs to no known component",
     ]
+
+
+@pytest.fixture
+def interface(tmp_path, monkeypatch):
+    """A built interface bundling react, as frontend/licenses.mjs records a build."""
+    front = tmp_path / "frontend"
+    _put(front, "dist/index.html", b'<div id="root"></div>')
+    _put(front, "dist/assets/app.js", b"react's code")
+    _put(front, "dist-licenses/react/LICENSE", b"MIT License (react)")
+    packages = [{"name": "react", "version": "19.2.0", "license": "MIT", "files": ["LICENSE"]}]
+    (front / "dist-licenses/packages.json").write_text(json.dumps(packages))
+    lock = {"": {}, "node_modules/react": {}, "node_modules/vite": {"dev": True},
+            "node_modules/tailwindcss": {"dev": True}}
+    (front / "package-lock.json").write_text(json.dumps({"packages": lock}))
+    monkeypatch.setattr(la, "FRONTEND", front)
+    la.npm_packages.cache_clear()
+    la._npm_development.cache_clear()
+    yield front
+    la.npm_packages.cache_clear()
+    la._npm_development.cache_clear()
+
+
+def _ship_interface(bundle, front):
+    for rel in ("index.html", "assets/app.js"):
+        _put(bundle, f"Contents/Resources/frontend/{rel}", (front / "dist" / rel).read_bytes())
+    _ship(bundle, "Scholia")
+    _ship(bundle, "npm/react")
+
+
+def test_the_interface_belongs_to_scholia_and_the_npm_packages_it_bundles(bundle, interface):
+    _ship_interface(bundle, interface)
+    found, problems = la.audit(bundle)
+    assert problems == []
+    assert found["npm/react"] == {"Contents/Resources/frontend/index.html", "Contents/Resources/frontend/assets/app.js"}
+    assert "Contents/Resources/frontend/assets/app.js" in found["Scholia"]
+
+
+def test_the_interface_must_be_the_builds_and_ship_its_packages_licenses(bundle, interface):
+    _ship_interface(bundle, interface)
+    (bundle / "Contents/Resources/licenses/npm/react/LICENSE").unlink()
+    _put(bundle, "Contents/Resources/frontend/assets/extra.js", b"not built")
+    _put(bundle, "Contents/Resources/frontend/assets/app.js", b"changed after the build")
+    assert set(la.audit(bundle)[1]) == {
+        "Contents/Resources/frontend/assets/extra.js: belongs to no known component",
+        "Contents/Resources/frontend/assets/app.js: belongs to no known component",
+        "npm/react: license file LICENSE is not shipped in Contents/Resources/licenses/npm/react/",
+    }
+
+
+def test_a_development_package_in_the_interface_fails_apart_from_tailwinds_styles(bundle, interface):
+    packages = [{"name": name, "version": "1.0.0", "license": "MIT", "files": ["LICENSE"]}
+                for name in ("react", "vite", "tailwindcss")]
+    (interface / "dist-licenses/packages.json").write_text(json.dumps(packages))
+    for name in ("vite", "tailwindcss"):
+        _put(interface, f"dist-licenses/{name}/LICENSE", b"MIT License")
+    _ship_interface(bundle, interface)
+    _ship(bundle, "npm/vite")
+    _ship(bundle, "npm/tailwindcss")
+    assert la.audit(bundle)[1] == ["npm/vite: a development package ships in the interface"]
+
+
+def test_an_interface_without_the_builds_record_fails(bundle, interface):
+    _ship_interface(bundle, interface)
+    (interface / "dist-licenses/packages.json").unlink()
+    la.npm_packages.cache_clear()
+    problems = la.audit(bundle)[1]
+    assert "Contents/Resources/frontend/index.html: the build recorded no npm packages" \
+        " (frontend/dist-licenses/packages.json)" in problems
+    assert "Contents/Resources/frontend/index.html: belongs to no known component" in problems
+
+
+def test_npm_packages_without_license_files_get_upstreams(interface):
+    packages = [{"name": name, "version": "1.0.0", "license": "MIT", "files": []} for name in la.NPM_SUPPLIED]
+    (interface / "dist-licenses/packages.json").write_text(json.dumps(packages))
+    for name in la.NPM_SUPPLIED:
+        files = la.component(la.NPM + name)[1]
+        assert files and all(source.is_file() for source, _ in files), name
+    # The supplied Radix text is the one the monorepo's other packages ship.
+    radix = la.ROOT / "frontend/node_modules/@radix-ui/react-dialog/LICENSE"
+    if radix.is_file():
+        assert radix.read_bytes() == (la.ROOT / "tools/notices/npm/radix-ui-primitives/LICENSE").read_bytes()
 
 
 def test_missing_or_empty_bundle_fails(tmp_path, capsys):

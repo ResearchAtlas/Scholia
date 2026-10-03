@@ -76,7 +76,8 @@ async def test_the_first_answer_queues_one_title_run_that_counts_toward_the_proj
         assert await rows(client, "SELECT paying_conversation_id, settled_usd, basis FROM budget_reservations"
                                   " WHERE run_id = ?", run_id) == [(None, 0.0003, "reported")]
         activity = (await client.get("/api/activity")).json()["runs"]
-        assert [(r["workflow"], r["status"], r["cost_usd"]) for r in activity] == [("title", "succeeded", 0.0003)]
+        assert [(r["workflow"], r["status"], r["cost_usd"], r["project_kind"]) for r in activity] == [
+            ("title", "succeeded", 0.0003, "general")]
 
 
 async def test_a_conversation_named_by_the_researcher_gets_no_title_run(tmp_path):

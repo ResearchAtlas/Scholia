@@ -20,6 +20,20 @@ def test_the_backend_check_runs_a_turn_from_source():
     assert st.check_backend() == {"turn": "succeeded"}
 
 
+def test_the_interface_check_serves_the_page_and_what_it_names(tmp_path):
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets/app.js").write_text("console.log(1)")
+    (tmp_path / "assets/app.css").write_text("body{}")
+    page = '<script src="/assets/app.js"></script><link href="/assets/app.css"><div id="root"></div>'
+    (tmp_path / "index.html").write_text(page)
+    assert st.check_interface(tmp_path) == {"assets": 2}
+    (tmp_path / "assets/app.css").unlink()
+    with pytest.raises(RuntimeError, match="app.css is not served"):
+        st.check_interface(tmp_path)
+    with pytest.raises(RuntimeError, match="page is not served"):
+        st.check_interface(tmp_path / "missing")
+
+
 def test_sqlite_checks_refuse_a_version_before_secure_delete(monkeypatch):
     monkeypatch.setattr(st, "MIN_SQLITE", (99, 0, 0))
     with pytest.raises(RuntimeError, match="older than 3.42"):
@@ -115,7 +129,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
         calls.append("embedding")
         raise RuntimeError("no helper")
 
-    for name in ("check_sqlite", "check_index", "check_backend", "check_ocr"):
+    for name in ("check_sqlite", "check_index", "check_backend", "check_interface", "check_ocr"):
         monkeypatch.setattr(st, name, passing(name))
     monkeypatch.setattr(st, "check_embedding", failing)
     argv = ["--self-test", "--model", str(tmp_path / "m.gguf")]
@@ -124,7 +138,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
     assert result["ok"] is False
     assert result["checks"]["embedding"] == {"ok": False, "error": "RuntimeError: no helper"}
     assert result["checks"]["ocr"] == {"ok": True}
-    assert len(calls) == 5
+    assert len(calls) == 6
     monkeypatch.setattr(st, "check_embedding", passing("embedding"))
     assert st.main(argv) == 0
 

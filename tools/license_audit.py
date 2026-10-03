@@ -6,17 +6,19 @@ Run it with the environment that built the app:
 
 It lists every file in the app and every module archived inside it, and
 assigns each to a component: Scholia's own code, CPython with the third-party
-code python.org's build carries, PyInstaller, the llama.cpp helper, or an
-installed Python distribution. It fails when
+code python.org's build carries, PyInstaller, the llama.cpp helper, an
+installed Python distribution, or an npm package the interface bundles. It fails when
 - a file or module belongs to no known component,
 - a component's license is not on the allowed list,
 - a distribution's native code has not been reviewed for the libraries it embeds, or
-- a component's license text is not shipped in the app's Contents/Resources/licenses/ folder.
+- a component's license text is not shipped in the app's Contents/Resources/licenses/ folder, or
+- an npm package that only builds or tests the interface ships in it.
 
 A PyInstaller spec ships those texts with `notice_datas()`.
 """
 
 import fnmatch
+import json
 import re
 import sys
 import sysconfig
@@ -160,6 +162,26 @@ SUPPLIED_NOTICES = {
     "proxy_tools": ["proxy_tools/LICENSE.txt"],
 }
 
+# The interface. Vite builds frontend/dist, and its licenses plugin (frontend/licenses.mjs)
+# records the npm packages the build bundles in frontend/dist-licenses/packages.json, with
+# copies of their license files. The app ships frontend/dist as its frontend folder; each
+# file there must be the build's, byte for byte, and belongs to Scholia and to every bundled
+# package. A package is the component "npm/<name>".
+FRONTEND = ROOT / "frontend"
+NPM = "npm/"
+# Development packages whose code the build copies into what ships: Tailwind's base styles
+# (preflight) are in the built CSS. Any other development package that ships fails the audit.
+NPM_BUILD_CODE = {"tailwindcss"}
+# License texts for npm packages that ship none, from their upstream repositories.
+NPM_SUPPLIED = {
+    # The radix-ui/primitives monorepo's LICENSE, which its other packages ship
+    **{f"@radix-ui/{name}": ["npm/radix-ui-primitives/LICENSE"] for name in (
+        "react-compose-refs", "react-context", "react-direction", "react-id", "react-use-callback-ref",
+        "react-use-escape-keydown", "react-use-layout-effect", "react-use-size")},
+    # Upstream's LICENSE at commit 8ca9ba5ea52de03308fe8ced94f7b159a44d28ff; 2.3.8 is untagged.
+    "react-remove-scroll-bar": ["npm/react-remove-scroll-bar/LICENSE"],
+}
+
 CLASSIFIERS = {
     "MIT License": "MIT",
     "BSD License": "BSD",
@@ -254,8 +276,27 @@ def _dist_license(dist) -> str | None:
     return " AND ".join(names) or None
 
 
+@cache
+def npm_packages() -> dict[str, dict]:
+    """The npm packages the interface's build bundles, by name, as the build recorded them."""
+    path = FRONTEND / "dist-licenses/packages.json"
+    return {p["name"]: p for p in json.loads(path.read_text())} if path.is_file() else {}
+
+
+@cache
+def _npm_development() -> set[str]:
+    """The npm packages the interface's lockfile installs only for development."""
+    packages = json.loads((FRONTEND / "package-lock.json").read_text())["packages"]
+    return {path.rsplit("node_modules/", 1)[1] for path, p in packages.items() if path and p.get("dev")}
+
+
 def component(name: str):
     """(license, notice) for a component; notice as described at LIBRARIES."""
+    if name.startswith(NPM):
+        package = npm_packages()[name.removeprefix(NPM)]
+        own = [(FRONTEND / "dist-licenses" / package["name"] / file, file) for file in package["files"]]
+        supplied = [(ROOT / "tools/notices" / path, Path(path).name) for path in NPM_SUPPLIED.get(package["name"], [])]
+        return package["license"], own or supplied
     if name == "Scholia":
         return "MIT", [(ROOT / "LICENSE", "LICENSE")]
     if name == "CPython":
@@ -385,6 +426,14 @@ def assign_file(bundle: Path, rel: str, problems: list[str]):
         return cpython
     if len(parts) == 1 and inner.endswith(".dylib") and (CPYTHON_HOME / "lib" / inner).is_file():
         return CPYTHON_EMBEDDED.get(stem)  # a library the build ships; None if not reviewed
+    if parts[0] == "frontend":  # the built interface: the build's own files only
+        built = FRONTEND / "dist" / "/".join(parts[1:])
+        if not npm_packages():
+            problems.append(f"{rel}: the build recorded no npm packages (frontend/dist-licenses/packages.json)")
+            return None
+        if len(parts) == 1 or not built.is_file() or built.read_bytes() != path.read_bytes():
+            return None
+        return ["Scholia", *(NPM + name for name in npm_packages())]
     if parts[0] == "backend" and not _is_macho(path) and (ROOT / inner).is_file():
         return ["Scholia"]  # a data file of Scholia's own backend, such as its reasoning record
     owner = _record_owners().get(inner)
@@ -511,6 +560,8 @@ def _check(bundle: Path, name: str) -> list[str]:
             problems.append(f"{name}: license {license} is not allowed")
     except ValueError as error:
         problems.append(f"{name}: {error}")
+    if name.startswith(NPM) and name.removeprefix(NPM) in _npm_development() - NPM_BUILD_CODE:
+        problems.append(f"{name}: a development package ships in the interface")
     if name in RUST_NOTICES and metadata.version(name) != RUST_NOTICES[name]:
         problems.append(f"{name}: version {metadata.version(name)} has no Rust notices; generate them with "
                         "tools/rust_notices.py")

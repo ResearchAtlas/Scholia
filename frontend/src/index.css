@@ -1,0 +1,96 @@
+/* The shadcn/ui zinc tokens of the current app's stack, with round 2 of the product
+   prototype's indigo brand, sidebar surface, success and warning (slice-1 spec section 3).
+   Contrast of text on these surfaces meets WCAG 2.2 AA (docs/interface-criteria.md). */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --sidebar: 240 5% 97.3%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 240 5.9% 10%;
+    --primary-foreground: 0 0% 98%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 42%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 72% 46%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 86%;
+    --ring: 243 75% 59%;
+    --brand: 243 75% 56%;
+    --brand-foreground: 0 0% 100%;
+    --brand-soft: 243 100% 97%;
+    --success: 152 60% 30%;
+    --warning: 35 92% 33%;
+    --radius: 0.625rem;
+  }
+  .dark {
+    --background: 240 6% 7%;
+    --foreground: 0 0% 96%;
+    --sidebar: 240 6% 5%;
+    --card: 240 5% 10%;
+    --card-foreground: 0 0% 96%;
+    --popover: 240 5% 11%;
+    --popover-foreground: 0 0% 96%;
+    --primary: 0 0% 96%;
+    --primary-foreground: 240 6% 10%;
+    --secondary: 240 4% 16%;
+    --secondary-foreground: 0 0% 96%;
+    --muted: 240 4% 14%;
+    --muted-foreground: 240 5% 66%;
+    --accent: 240 4% 16%;
+    --accent-foreground: 0 0% 96%;
+    --destructive: 0 72% 62%;
+    --destructive-foreground: 240 10% 4%;
+    --border: 240 4% 18%;
+    --input: 240 4% 22%;
+    --ring: 239 84% 67%;
+    --brand: 239 84% 72%;
+    --brand-foreground: 240 10% 4%;
+    --brand-soft: 243 30% 16%;
+    --success: 152 55% 55%;
+    --warning: 38 92% 62%;
+  }
+  * { @apply border-border; }
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+    overflow: hidden;
+  }
+  ::selection { background: hsl(var(--brand) / .2); }
+  :focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 1ms !important; transition-duration: 1ms !important; }
+  }
+}
+
+@layer components {
+  .scroll-thin { scrollbar-width: thin; scrollbar-color: hsl(var(--border)) transparent; }
+  .divider-handle { @apply relative w-px shrink-0 cursor-col-resize bg-border outline-none; touch-action: none; }
+  .divider-handle::after { content: ""; @apply absolute inset-y-0 -left-1.5 -right-1.5 z-10; }
+  .divider-handle:hover, .divider-handle:focus-visible, body.dragging .divider-handle { @apply bg-brand; }
+  body.dragging { cursor: col-resize; user-select: none; }
+  .prose-answer { @apply text-[15px] leading-relaxed; }
+  .prose-answer p { @apply my-2; }
+  .prose-answer ul { @apply my-2 list-disc pl-5; }
+  .prose-answer ol { @apply my-2 list-decimal pl-5; }
+  .prose-answer code { @apply rounded bg-muted px-1 py-px font-mono text-[13px]; }
+  .prose-answer pre { @apply my-2 overflow-x-auto rounded-lg bg-muted p-3 font-mono text-[13px]; }
+  .prose-answer pre code { @apply bg-transparent p-0; }
+  .prose-answer a { @apply text-brand underline underline-offset-2; }
+  .prose-answer h1, .prose-answer h2, .prose-answer h3 { @apply mb-1 mt-3 font-semibold; }
+  .prose-answer blockquote { @apply border-l-2 pl-3 text-muted-foreground; }
+  .prose-answer table { @apply my-2 w-full border-collapse text-sm; }
+  .prose-answer th, .prose-answer td { @apply border px-2 py-1 text-left; }
+}
