@@ -420,3 +420,35 @@ def test_the_start_deadline_reads_the_clock_and_the_maintenance_times_together(m
     monkeypatch.setattr(desktop.time, "monotonic", clock)
     assert desktop._wait_started(server, Thread(), state) is True
     assert readings[1:] == [True] * (len(readings) - 1)  # every reading after the first, under the app's lock
+
+
+@pytest.mark.parametrize("mode, refused", [(0o777, True), (0o775, True), (0o1777, False), (0o755, False)])
+def test_a_data_folder_whose_parent_others_could_change_is_refused(tmp_path, mode, refused):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    os.chmod(parent, mode)
+    try:
+        if refused:
+            with pytest.raises(desktop.UnsafeDataFolderError):
+                desktop.take_lock(parent / "data")
+            assert desktop.run(parent / "data", [].append) == 1
+            assert not (parent / "data").exists()  # nothing made or opened under it
+        else:
+            fd = desktop.take_lock(parent / "data")
+            assert fd is not None
+            os.close(fd)
+    finally:
+        os.chmod(parent, 0o755)
+
+
+def test_a_data_folder_under_a_parent_with_an_access_rule_letting_others_in_is_refused(tmp_path):
+    from network_guard import allow_subprocess
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    with allow_subprocess("/bin/chmod"):
+        subprocess.run(["/bin/chmod", "+a", "everyone allow add_subdirectory,delete_child", str(parent)], check=True)
+        try:
+            with pytest.raises(desktop.UnsafeDataFolderError):
+                desktop.take_lock(parent / "data")
+        finally:
+            subprocess.run(["/bin/chmod", "-N", str(parent)], check=True)

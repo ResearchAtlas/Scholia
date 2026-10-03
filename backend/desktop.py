@@ -60,6 +60,7 @@ def take_lock(data_dir) -> int | None:
     opened before the folder is checked, so it is never followed."""
     data_dir = Path(data_dir)
     data_dir.parent.mkdir(parents=True, exist_ok=True)
+    _check_ancestors(data_dir)
     try:
         os.mkdir(data_dir, 0o700)
     except FileExistsError:
@@ -81,6 +82,24 @@ def take_lock(data_dir) -> int | None:
         os.close(fd)
         return None
     return fd
+
+
+def _check_ancestors(data_dir) -> None:
+    """Refuse a data folder another account could move or swap: every folder above it, as
+    written and as resolved, must be this account's or the system's, writable by no other
+    account unless sticky (as /tmp is: others cannot move what is not theirs), with no
+    access rule letting others in. Then the path names the folder that was checked."""
+    uid, path = os.getuid(), os.path.abspath(data_dir)
+    for ancestor in sorted(set(Path(path).parents) | set(Path(os.path.realpath(path)).parents)):
+        info = os.lstat(ancestor)
+        if info.st_uid not in (uid, 0):
+            raise UnsafeDataFolderError("Scholia will not open its data folder: a folder above it is another account's")
+        if stat.S_ISLNK(info.st_mode):
+            continue  # it is resolved: the folders it leads to are checked as resolved
+        if stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX:
+            raise UnsafeDataFolderError("Scholia will not open its data folder: other accounts could move it")
+        if _acl_problem(ancestor):
+            raise UnsafeDataFolderError("Scholia will not open its data folder: an access rule above it lets others in")
 
 
 def narrow_tree(data_dir) -> None:
