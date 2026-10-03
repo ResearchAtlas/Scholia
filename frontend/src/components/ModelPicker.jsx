@@ -17,6 +17,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { cn } from '@/lib/utils';
 
 const listeners = new Set();
+const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh']; // backend/budget_router.py
 let choice = null; // read from the personal settings ([ui] model) once per window
 let reading = null;
 
@@ -32,12 +33,18 @@ export function setChoice(next) {
   saveSettings(choiceUpdates(next)).catch(() => {});
 }
 
-// Reads the kept choice once per window, with its remembered effort; a message waits for it.
+// Reads the kept choice once per window, with its remembered effort (only a level a turn can
+// ask for); a message, and the catalog's check of what is offered, wait for it. A failed read
+// fails the message (the researcher is told) and is tried again the next time.
 export function readChoice() {
   reading ??= get('/api/settings').then((settings) => {
     const kept = decodeChoice(settings.values?.ui?.model);
-    if (kept && !choice) publish(kept.model ? { ...kept, effort: settings.values?.models?.efforts?.[kept.model] ?? null } : kept);
-  }).catch(() => {});
+    const effort = kept?.model ? settings.values?.models?.efforts?.[kept.model] : null;
+    if (kept && !choice) publish(kept.model ? { ...kept, effort: EFFORT_LEVELS.includes(effort) ? effort : null } : kept);
+  }).catch((error) => {
+    reading = null; // tried again next time; meanwhile nothing is sent on a guess
+    throw error;
+  });
   return reading;
 }
 
@@ -64,6 +71,7 @@ function useCatalog(open, projectId) {
     if (!here.current) return;
     const mine = ++latest.current;
     try {
+      await readChoice(); // a kept choice is checked against the catalog like any other
       forgetModels(); // the offers and windows as the settings hold them now
       const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
       const [{ providers }, { models: recent }, settings, project] = await Promise.all([
@@ -90,7 +98,6 @@ function useCatalog(open, projectId) {
   }, [projectId]);
   useEffect(() => {
     here.current = true;
-    readChoice();
     load(); // at first, for the label and a chosen model's steps; then each time the picker opens
     return () => { // a load still under way when the picker goes is dropped, and none starts after
       here.current = false;
