@@ -20,6 +20,10 @@ tar -xzf "$archive" -C build/llama.cpp --strip-components 1
 diff -u tools/notices/llama.cpp/LICENSES.txt <(build/llama.cpp/llama licenses) \
   || { echo "tools/notices/llama.cpp/LICENSES.txt differs from the release's notices" >&2; exit 1; }
 
+# The interface, from the lockfile; the build also records the npm packages it bundles,
+# whose licenses the spec ships.
+(cd frontend && npm ci && npm run build)
+
 python -m PyInstaller --noconfirm --clean --distpath build/dist --workpath build/work \
   tools/scholia.spec
 

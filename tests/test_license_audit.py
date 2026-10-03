@@ -1,3 +1,4 @@
+import json
 import sys
 import zipfile
 from importlib import metadata
@@ -120,6 +121,99 @@ def test_base_library_members_must_all_be_known(bundle):
         "Contents/Resources/base_library.zip: member libfoo.dylib belongs to no known component",
         "Contents/Resources/base_library.zip: module unknownpkg.__init__ belongs to no known component",
     ]
+
+
+@pytest.fixture
+def interface(tmp_path, monkeypatch):
+    """A built interface bundling react, as frontend/licenses.mjs records a build."""
+    front = tmp_path / "frontend"
+    _put(front, "dist/index.html", b'<div id="root"></div>')
+    _put(front, "dist/assets/app.js", b"react's code")
+    _put(front, "dist-licenses/react@19.2.0/LICENSE", b"MIT License (react)")
+    (front / "dist-licenses/packages.json").write_text(json.dumps([_npm("react", "19.2.0")]))
+    lock = {"": {}, "node_modules/react": {"version": "19.2.0"},
+            "node_modules/vite": {"version": "1.0.0", "dev": True},
+            "node_modules/tailwindcss": {"version": "1.0.0", "dev": True},
+            "node_modules/x": {"version": "2.0.0"}, "node_modules/y/node_modules/x": {"version": "1.0.0", "dev": True}}
+    (front / "package-lock.json").write_text(json.dumps({"packages": lock}))
+    monkeypatch.setattr(la, "FRONTEND", front)
+    la.npm_packages.cache_clear()
+    la._npm_lock.cache_clear()
+    yield front
+    la.npm_packages.cache_clear()
+    la._npm_lock.cache_clear()
+
+
+def _npm(name, version, path=None, files=("LICENSE",)):
+    return {"name": name, "version": version, "license": "MIT", "files": list(files),
+            "path": path or f"node_modules/{name}"}
+
+
+def _ship_interface(bundle, front):
+    for rel in ("index.html", "assets/app.js"):
+        _put(bundle, f"Contents/Resources/frontend/{rel}", (front / "dist" / rel).read_bytes())
+    _ship(bundle, "Scholia")
+    _ship(bundle, "npm/react@19.2.0")
+
+
+def test_the_interface_belongs_to_scholia_and_the_npm_packages_it_bundles(bundle, interface):
+    _ship_interface(bundle, interface)
+    found, problems = la.audit(bundle)
+    assert problems == []
+    assert found["npm/react@19.2.0"] == {"Contents/Resources/frontend/index.html", "Contents/Resources/frontend/assets/app.js"}
+    assert "Contents/Resources/frontend/assets/app.js" in found["Scholia"]
+
+
+def test_the_interface_must_be_the_builds_and_ship_its_packages_licenses(bundle, interface):
+    _ship_interface(bundle, interface)
+    (bundle / "Contents/Resources/licenses/npm/react@19.2.0/LICENSE").unlink()
+    _put(bundle, "Contents/Resources/frontend/assets/extra.js", b"not built")
+    _put(bundle, "Contents/Resources/frontend/assets/app.js", b"changed after the build")
+    assert set(la.audit(bundle)[1]) == {
+        "Contents/Resources/frontend/assets/extra.js: belongs to no known component",
+        "Contents/Resources/frontend/assets/app.js: belongs to no known component",
+        "npm/react@19.2.0: license file LICENSE is not shipped in Contents/Resources/licenses/npm/react@19.2.0/",
+    }
+
+
+def test_a_development_package_in_the_interface_fails_apart_from_tailwinds_styles(bundle, interface):
+    packages = [_npm("react", "19.2.0"), _npm("vite", "1.0.0"), _npm("tailwindcss", "1.0.0"),
+                _npm("x", "2.0.0"), _npm("x", "1.0.0", "node_modules/y/node_modules/x"), _npm("z", "1.0.0")]
+    (interface / "dist-licenses/packages.json").write_text(json.dumps(packages))
+    for key in ("vite@1.0.0", "tailwindcss@1.0.0", "x@2.0.0", "x@1.0.0", "z@1.0.0"):
+        _put(interface, f"dist-licenses/{key}/LICENSE", b"MIT License")
+    _ship_interface(bundle, interface)
+    for key in ("vite@1.0.0", "tailwindcss@1.0.0", "x@2.0.0", "x@1.0.0", "z@1.0.0"):
+        _ship(bundle, f"npm/{key}")
+    found, problems = la.audit(bundle)
+    assert {"npm/x@2.0.0", "npm/x@1.0.0"} <= set(found)  # each bundled version is its own component
+    assert problems == [  # the dev flag is read at each version's own install path
+        "npm/vite@1.0.0: a development package ships in the interface",
+        "npm/x@1.0.0: a development package ships in the interface",
+        "npm/z@1.0.0: not in the interface's lockfile at node_modules/z",
+    ]
+
+
+def test_an_interface_without_the_builds_record_fails(bundle, interface):
+    _ship_interface(bundle, interface)
+    (interface / "dist-licenses/packages.json").unlink()
+    la.npm_packages.cache_clear()
+    problems = la.audit(bundle)[1]
+    assert "Contents/Resources/frontend/index.html: the build recorded no npm packages" \
+        " (frontend/dist-licenses/packages.json)" in problems
+    assert "Contents/Resources/frontend/index.html: belongs to no known component" in problems
+
+
+def test_npm_packages_without_license_files_get_upstreams(interface):
+    packages = [_npm(name, "1.0.0", files=()) for name in la.NPM_SUPPLIED]
+    (interface / "dist-licenses/packages.json").write_text(json.dumps(packages))
+    for name in la.NPM_SUPPLIED:
+        files = la.component(f"{la.NPM}{name}@1.0.0")[1]
+        assert files and all(source.is_file() for source, _ in files), name
+    # The supplied Radix text is the one the monorepo's other packages ship.
+    radix = la.ROOT / "frontend/node_modules/@radix-ui/react-dialog/LICENSE"
+    if radix.is_file():
+        assert radix.read_bytes() == (la.ROOT / "tools/notices/npm/radix-ui-primitives/LICENSE").read_bytes()
 
 
 def test_missing_or_empty_bundle_fails(tmp_path, capsys):

@@ -371,11 +371,46 @@ def check_backend() -> dict:
     return {"turn": "succeeded"}
 
 
+def check_interface(folder: Path | None = None) -> dict:
+    """The built interface the app bundles (or `folder`), served as the window loads it: its
+    page, with the Content-Security-Policy that refuses remote images, and the script and
+    stylesheet the page names."""
+    import asyncio
+
+    import httpx
+
+    from backend.app import create_app
+    from backend.desktop import frontend_folder
+
+    async def drive(data):
+        origin = "http://127.0.0.1:1"
+        app = create_app(data, origin=origin, session=secrets.token_urlsafe(32), keyring_backend=_Keys(),
+                         frontend_dir=folder or frontend_folder())
+        async with app.app.router.lifespan_context(app.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+                page = await client.get("/")
+                if page.status_code != 200 or '<div id="root">' not in page.text:
+                    raise RuntimeError(f"the interface's page is not served ({page.status_code})")
+                if "img-src 'self' data:" not in page.headers.get("content-security-policy", ""):
+                    raise RuntimeError("the page has no Content-Security-Policy refusing remote images")
+                files = re.findall(r'(?:src|href)="/(assets/[^"]+)"', page.text)
+                if not any(f.endswith(".js") for f in files) or not any(f.endswith(".css") for f in files):
+                    raise RuntimeError("the page names no script or no stylesheet")
+                for file in files:
+                    if (await client.get("/" + file)).status_code != 200:
+                        raise RuntimeError(f"{file} is not served")
+                return len(files)
+
+    with tempfile.TemporaryDirectory() as folder_for_data:
+        return {"assets": asyncio.run(drive(Path(folder_for_data) / "data"))}
+
+
 def run(helper: Path, model: Path) -> dict:
     checks = {
         "sqlite": check_sqlite,
         "index": check_index,
         "backend": check_backend,
+        "interface": check_interface,
         "embedding": lambda: check_embedding(helper, model),
         "ocr": check_ocr,
     }

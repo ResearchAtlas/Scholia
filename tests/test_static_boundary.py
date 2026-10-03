@@ -56,7 +56,11 @@ def test_without_a_build_nothing_is_served(tmp_path):
 @pytest.mark.asyncio
 async def test_over_http_traversal_is_refused_and_unknown_api_paths_never_fall_back(tmp_path, layout):
     async with started(tmp_path / "data", frontend_dir=layout) as client:
-        assert (await client.get("/")).text.startswith("<!doctype html>")
+        page = await client.get("/")
+        assert page.text.startswith("<!doctype html>")
+        policy = dict(part.strip().split(" ", 1) for part in page.headers["content-security-policy"].split(";"))
+        assert policy["img-src"] == "'self' data:" and policy["default-src"] == "'self'"  # PR02A: no remote images
+        assert "script-src" not in policy and "'unsafe-inline'" not in policy["default-src"]
         assert (await client.get("/projects/x")).text.startswith("<!doctype html>")
         for path in ("/%2e%2e/credentials.json", "/assets/%2e%2e/%2e%2e/credentials.json", "/.env",
                      "/assets/escape.json", "/assets/..%2f..%2fcredentials.json"):

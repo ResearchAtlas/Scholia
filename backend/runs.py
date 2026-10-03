@@ -395,6 +395,9 @@ class Harness:
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
 
         def admit(conn):
+            moved = conn.execute("SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone()
+            if moved is not None and moved[0] != project_id:  # moved since it was read: its settings were another's
+                raise AdmissionError(409, "conversation_moved", "The conversation moved to another project; send again")
             if claim.cancel_requested.is_set():  # stopped while it was admitted (shutdown): write nothing
                 raise AdmissionError(503, "shutting_down", "The app is closing") if claim.cancel_reason == "shutdown" \
                     else AdmissionError(409, "cancelled", "The message was cancelled")

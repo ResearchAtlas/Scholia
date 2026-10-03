@@ -28,4 +28,6 @@ uv run pytest
 cd frontend && npm ci && node --test
 ```
 
-CI (`.github/workflows/ci.yml`) runs on every pull request on macOS on Apple silicon, with python.org's CPython 3.13: the backend and frontend tests, a PyInstaller build of the app and its DMG (`tools/build_app.sh`, with the hash-verified llama.cpp helper), the app's self-test run inside the DMG, and a license audit of the app (`tools/license_audit.py`). The audit expects python.org's interpreter, the one the app ships.
+CI (`.github/workflows/ci.yml`) runs on every pull request on macOS on Apple silicon, with python.org's CPython 3.13: the backend and frontend tests, a PyInstaller build of the app and its DMG (`tools/build_app.sh`, with the hash-verified llama.cpp helper), the app's self-test run inside the DMG, and a license audit of the app and the npm packages its interface bundles (`tools/license_audit.py`). The audit expects python.org's interpreter, the one the app ships.
+
+To see the interface, build it (`cd frontend && npm run build`) and run `uv run python tests/walkthrough.py`. It serves the interface with synthetic answers, a temporary data folder and an in-memory key store, and makes no network connections. The interface is reviewed against [docs/interface-criteria.md](docs/interface-criteria.md).
