@@ -274,7 +274,11 @@ async def test_auto_records_the_tier_of_the_model_it_picked():
 
 async def test_the_pickers_choice_is_a_validated_setting(tmp_path):
     async with started(tmp_path / "data") as client:
-        for good in ("auto", "openrouter:google/gemini-2.5-flash", None):
-            assert (await save(client, {"ui.model": good})).status_code == 200, good
-        for bad in ("gemini", ":x", "openrouter:", 3):
-            assert (await save(client, {"ui.model": bad})).json()["code"] == "invalid_setting", bad
+        for good in ({"ui.model.id": "auto", "ui.model.provider": None},
+                     {"ui.model.id": "llama3:8b", "ui.model.provider": "lab:v2"},  # colons in either part
+                     {"ui.model.id": None, "ui.model.provider": None}):
+            assert (await save(client, good)).status_code == 200, good
+        values = (await client.get("/api/settings")).json()["values"]["ui"]
+        assert "model" not in values or not values["model"]
+        for bad in ({"ui.model.id": " "}, {"ui.model.provider": 3}, {"ui.model": "auto"}):
+            assert (await save(client, bad)).json()["code"] == "invalid_setting", bad

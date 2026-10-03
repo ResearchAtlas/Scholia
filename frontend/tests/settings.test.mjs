@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { decodeChoice, encodeChoice, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, utf8Bytes, valueAt } from '../src/settings.js';
+import { choiceUpdates, decodeChoice, groupOf, loadModels, forgetModels, messageRoute, saveAgainst, settingKey, settingsSaver, utf8Bytes, valueAt } from '../src/settings.js';
 import { ApiError } from '../src/api.js';
 
 test('settings keys quote the parts that are not bare TOML keys', () => {
@@ -85,11 +85,13 @@ test('saves run in order against the latest file, and a conflict drops the saves
   assert.deepEqual(written.at(-1), { e: 5 });
 });
 
-test('the picker\'s choice is kept as a setting and read back', () => {
-  for (const choice of [null, { auto: true }, { provider: 'openrouter', model: 'google/gemini-2.5-flash' },
-    { provider: 'local', model: 'llama3:8b' }]) {
-    assert.deepEqual(decodeChoice(encodeChoice(choice)), choice);
+test('the picker\'s choice is kept as settings and read back, colons and all', () => {
+  const asSettings = (updates) => ({ id: updates['ui.model.id'] ?? undefined, provider: updates['ui.model.provider'] ?? undefined });
+  for (const choice of [{ auto: true }, { provider: 'openrouter', model: 'google/gemini-2.5-flash' },
+    { provider: 'lab:v2', model: 'llama3:8b' }]) {
+    assert.deepEqual(decodeChoice(asSettings(choiceUpdates(choice))), choice);
   }
-  assert.equal(encodeChoice({ provider: 'local', model: 'llama3:8b', name: 'Llama', effort: 'low' }), 'local:llama3:8b');
-  assert.equal(decodeChoice('nonsense'), null);
+  assert.deepEqual(choiceUpdates(null), { 'ui.model.id': null, 'ui.model.provider': null });
+  assert.equal(decodeChoice(undefined), null);
+  assert.equal(decodeChoice({ id: 'm' }), null); // a model without its provider is no choice
 });

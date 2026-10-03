@@ -11,14 +11,14 @@ import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { errorText, visible } from '../text.js';
-import { WINDOW_PRESETS, decodeChoice, encodeChoice, forgetModels, loadModels, settingKey } from '../settings.js';
+import { WINDOW_PRESETS, choiceUpdates, decodeChoice, forgetModels, loadModels, settingKey } from '../settings.js';
 import { CommitField } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
 
 const listeners = new Set();
-let choice = null; // read from the personal settings ([ui] model) when the picker first loads
-let read = false;
+let choice = null; // read from the personal settings ([ui] model) once per window
+let reading = null;
 
 function publish(next) {
   choice = next;
@@ -29,8 +29,19 @@ function publish(next) {
 // changes at each launch, so the browser's storage would forget it).
 export function setChoice(next) {
   publish(next);
-  saveSettings({ 'ui.model': encodeChoice(next) }).catch(() => {});
+  saveSettings(choiceUpdates(next)).catch(() => {});
 }
+
+// Reads the kept choice once per window, with its remembered effort; a message waits for it.
+export function readChoice() {
+  reading ??= get('/api/settings').then((settings) => {
+    const kept = decodeChoice(settings.values?.ui?.model);
+    if (kept && !choice) publish(kept.model ? { ...kept, effort: settings.values?.models?.efforts?.[kept.model] ?? null } : kept);
+  }).catch(() => {});
+  return reading;
+}
+
+export const currentChoice = () => choice;
 
 // The model a message is sent with: { provider, model, effort }, { auto: true }, or null for the
 // settings' default.
@@ -63,13 +74,6 @@ function useCatalog(open, projectId) {
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
         ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
       if (mine !== latest.current || !here.current) return;
-      if (!read) { // the choice kept from an earlier launch
-        read = true;
-        const kept = decodeChoice(settings.values?.ui?.model);
-        const found = kept?.model && models.find((m) => m.provider === kept.provider && m.id === kept.model);
-        const effort = kept?.model ? settings.values?.models?.efforts?.[kept.model] : null;
-        if (kept && !choice) publish(kept.model ? { ...kept, name: found?.name, effort: found?.effort.steps.includes(effort) ? effort : null } : kept);
-      }
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
         defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto' };
       // Only a complete, current listing says a chosen model is gone.
@@ -86,6 +90,7 @@ function useCatalog(open, projectId) {
   }, [projectId]);
   useEffect(() => {
     here.current = true;
+    readChoice();
     load(); // at first, for the label and a chosen model's steps; then each time the picker opens
     return () => { // a load still under way when the picker goes is dropped, and none starts after
       here.current = false;

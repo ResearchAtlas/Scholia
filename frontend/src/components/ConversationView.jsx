@@ -11,7 +11,7 @@ import { clear, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
 import { imageAsLink, safeHref } from '../links.js';
 import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
-import { ModelPicker, useModelChoice } from './ModelPicker.jsx';
+import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -21,7 +21,6 @@ const POLL_MS = 1000; // between reads while a turn is settling, and after a fai
 export function ConversationView({ conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated }) {
   const t = useT();
   const [draft, setDraft] = useState(null); // a new conversation, made at its first message
-  const chosen = useModelChoice();
   const id = conversation?.id ?? draft;
   const live = useLiveTurn(id);
   const [turns, setTurns] = useState(conversation ? null : []);
@@ -76,7 +75,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     try {
       const target = id ?? (await post('/api/conversations', { project_id: projectId })).id;
       setDraft(target); // shown here from now on, so Stop works while it is admitted
-      await send(target, `/api/conversations/${target}/message/stream`, { content: text, ...messageRoute(chosen) }, text);
+      await readChoice(); // the model chosen at an earlier launch, before anything is sent
+      await send(target, `/api/conversations/${target}/message/stream`, { content: text, ...messageRoute(currentChoice()) }, text);
       if (!conversation && here.current) onCreated(target);
       return true;
     } catch (error) {
@@ -88,7 +88,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   async function resume(turn) {
     setProblem(null);
     try {
-      await send(id, `/api/runs/${turn.run_id}/continue`, messageRoute(chosen), turn.message?.text ?? '');
+      await readChoice();
+      await send(id, `/api/runs/${turn.run_id}/continue`, messageRoute(currentChoice()), turn.message?.text ?? '');
     } catch (error) {
       setProblem(errorText(t, error instanceof ApiError ? error.code : 'internal'));
     }

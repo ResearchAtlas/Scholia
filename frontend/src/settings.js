@@ -157,15 +157,16 @@ export function messageRoute(chosen) {
   return { model: chosen.model, provider: chosen.provider, ...(chosen.effort ? { effort: chosen.effort } : {}) };
 }
 
-// The picker's choice as the settings keep it: "auto" or "<provider>:<model id>".
-export function encodeChoice(next) {
-  if (!next) return null;
-  return next.auto ? 'auto' : `${next.provider}:${next.model}`;
+// The picker's choice as the personal settings keep it ([ui] model): the settings keys to
+// save for a choice (null clears both), and the choice the settings hold.
+export function choiceUpdates(next) {
+  if (!next) return { 'ui.model.id': null, 'ui.model.provider': null };
+  if (next.auto) return { 'ui.model.id': 'auto', 'ui.model.provider': null };
+  return { 'ui.model.id': next.model, 'ui.model.provider': next.provider };
 }
 
 export function decodeChoice(value) {
-  if (value === 'auto') return { auto: true };
-  if (typeof value !== 'string' || !value.includes(':')) return null;
-  const at = value.indexOf(':');
-  return { provider: value.slice(0, at), model: value.slice(at + 1) };
+  if (value?.id === 'auto') return { auto: true };
+  if (typeof value?.id !== 'string' || typeof value?.provider !== 'string') return null;
+  return { provider: value.provider, model: value.id };
 }
