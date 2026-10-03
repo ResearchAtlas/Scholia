@@ -895,3 +895,37 @@ async def test_a_title_run_still_stopping_when_a_restore_is_refused_runs_again_o
         await background_idle(client)
         assert len(calls) == 2  # started again once it had stopped, by the harness admitting again
         assert (await client.get(f"/api/conversations/{conversation}")).json()["title"] == "Cohort studies"
+
+
+async def test_a_cancel_while_a_refused_restore_still_stops_a_title_run_ends_it(tmp_path, monkeypatch):
+    from backend.runs import Harness
+    async with started(tmp_path / "data") as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        calling, stopping, calls = asyncio.Event(), asyncio.Event(), []
+
+        async def title(body):
+            calls.append(body)
+            calling.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:  # its cleanup outlasts the shutdown's wait
+                stopping.set()
+                await asyncio.sleep(0.5)
+                raise
+
+        client.provider.title_replies = [title, title]
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        await send(client, conversation)
+        await calling.wait()
+        [run_id] = [run for run, active in client.state["harness"].registry.runs.items() if active.kind == "background"]
+        real = Harness.shutdown
+        monkeypatch.setattr(Harness, "shutdown", lambda self, timeout=10.0: real(self, 0.1))
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "work_running")
+        assert stopping.is_set() and run_id in client.state["harness"].registry.runs  # still stopping
+        cancel = await client.post(f"/api/runs/{run_id}/cancel")  # the researcher's Cancel, admitted again
+        assert cancel.json()["status"] == "cancelled"
+        await background_idle(client)
+        assert len(calls) == 1  # never started again
+        [(status, reason)] = await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", run_id)
+        assert (status, reason) == ("cancelled", "researcher")
