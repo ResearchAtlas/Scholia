@@ -1,10 +1,11 @@
 // A Vite plugin that records the npm packages a build bundles, for the license audit
-// (tools/license_audit.py). It writes dist-licenses/packages.json, each package's name,
-// version, license and license files, and copies those files beside it. Only modules the
+// (tools/license_audit.py). It writes dist-licenses/packages.json, each bundled package's
+// name, version, license, license files and install path (every version that ships, so two
+// versions of one package are two entries), and copies the files to <name>@<version>/. Only modules the
 // bundle contains count, so development tools never appear, apart from the packages whose
 // code the stylesheet copies: Tailwind's base styles and tailwindcss-animate's keyframes.
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -25,7 +26,26 @@ function describe(root) {
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   const license = typeof manifest.license === 'string' ? manifest.license : manifest.license?.type ?? null;
   const files = readdirSync(root).filter((name) => NOTICE.test(name)).sort();
-  return { name: manifest.name, version: manifest.version, license, files };
+  const path = relative(HERE, root).replace(/\\/g, '/');
+  return { name: manifest.name, version: manifest.version, license, files, path };
+}
+
+// The manifest of the packages whose roots a bundle's modules lie in, one entry per name and
+// version, copying their license files under out/<name>@<version>/.
+export function record(roots, out) {
+  const packages = new Map();
+  for (const root of roots) {
+    const described = describe(root);
+    const key = `${described.name}@${described.version}`;
+    if (packages.has(key)) continue; // the same version installed twice is the same files
+    packages.set(key, described);
+    for (const file of described.files) {
+      const target = join(out, key, file);
+      mkdirSync(dirname(target), { recursive: true });
+      cpSync(join(root, file), target);
+    }
+  }
+  return [...packages.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, described]) => described);
 }
 
 export function licenses(out = join(HERE, 'dist-licenses')) {
@@ -33,24 +53,16 @@ export function licenses(out = join(HERE, 'dist-licenses')) {
     name: 'scholia-licenses',
     apply: 'build',
     generateBundle(_, bundle) {
-      const roots = new Map(IN_STYLES.map((name) => [name, join(HERE, 'node_modules', name)]));
+      const roots = new Set(IN_STYLES.map((name) => join(HERE, 'node_modules', name)));
       for (const chunk of Object.values(bundle)) {
         for (const id of Object.keys(chunk.modules ?? {})) {
           const found = packageRoot(id);
-          if (found && !roots.has(found.name)) roots.set(found.name, found.root);
+          if (found) roots.add(found.root);
         }
       }
       rmSync(out, { recursive: true, force: true });
       mkdirSync(out, { recursive: true });
-      const packages = [...roots.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, root]) => {
-        const described = describe(root);
-        for (const file of described.files) {
-          const target = join(out, name, file);
-          mkdirSync(dirname(target), { recursive: true });
-          cpSync(join(root, file), target);
-        }
-        return described;
-      });
+      const packages = record(roots, out);
       writeFileSync(join(out, 'packages.json'), JSON.stringify(packages, null, 1) + '\n');
       if (!existsSync(join(out, 'packages.json'))) this.error('the license manifest was not written');
     },

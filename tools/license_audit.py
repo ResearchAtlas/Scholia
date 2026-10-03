@@ -166,7 +166,7 @@ SUPPLIED_NOTICES = {
 # records the npm packages the build bundles in frontend/dist-licenses/packages.json, with
 # copies of their license files. The app ships frontend/dist as its frontend folder; each
 # file there must be the build's, byte for byte, and belongs to Scholia and to every bundled
-# package. A package is the component "npm/<name>".
+# package. Each version of a package is a component, "npm/<name>@<version>".
 FRONTEND = ROOT / "frontend"
 NPM = "npm/"
 # Development packages whose code the build copies into what ships: Tailwind's base styles
@@ -278,23 +278,25 @@ def _dist_license(dist) -> str | None:
 
 @cache
 def npm_packages() -> dict[str, dict]:
-    """The npm packages the interface's build bundles, by name, as the build recorded them."""
+    """The npm packages the interface's build bundles, by "<name>@<version>", as the build
+    recorded them."""
     path = FRONTEND / "dist-licenses/packages.json"
-    return {p["name"]: p for p in json.loads(path.read_text())} if path.is_file() else {}
+    packages = json.loads(path.read_text()) if path.is_file() else []
+    return {f"{p['name']}@{p['version']}": p for p in packages}
 
 
 @cache
-def _npm_development() -> set[str]:
-    """The npm packages the interface's lockfile installs only for development."""
-    packages = json.loads((FRONTEND / "package-lock.json").read_text())["packages"]
-    return {path.rsplit("node_modules/", 1)[1] for path, p in packages.items() if path and p.get("dev")}
+def _npm_lock() -> dict[str, dict]:
+    """The interface's lockfile entries, by install path."""
+    return json.loads((FRONTEND / "package-lock.json").read_text())["packages"]
 
 
 def component(name: str):
     """(license, notice) for a component; notice as described at LIBRARIES."""
     if name.startswith(NPM):
-        package = npm_packages()[name.removeprefix(NPM)]
-        own = [(FRONTEND / "dist-licenses" / package["name"] / file, file) for file in package["files"]]
+        key = name.removeprefix(NPM)
+        package = npm_packages()[key]
+        own = [(FRONTEND / "dist-licenses" / key / file, file) for file in package["files"]]
         supplied = [(ROOT / "tools/notices" / path, Path(path).name) for path in NPM_SUPPLIED.get(package["name"], [])]
         return package["license"], own or supplied
     if name == "Scholia":
@@ -560,8 +562,13 @@ def _check(bundle: Path, name: str) -> list[str]:
             problems.append(f"{name}: license {license} is not allowed")
     except ValueError as error:
         problems.append(f"{name}: {error}")
-    if name.startswith(NPM) and name.removeprefix(NPM) in _npm_development() - NPM_BUILD_CODE:
-        problems.append(f"{name}: a development package ships in the interface")
+    if name.startswith(NPM):  # checked at the path the build took it from
+        package = npm_packages()[name.removeprefix(NPM)]
+        entry = _npm_lock().get(package.get("path"))
+        if entry is None or entry.get("version") != package["version"]:
+            problems.append(f"{name}: not in the interface's lockfile at {package.get('path')}")
+        elif entry.get("dev") and package["name"] not in NPM_BUILD_CODE:
+            problems.append(f"{name}: a development package ships in the interface")
     if name in RUST_NOTICES and metadata.version(name) != RUST_NOTICES[name]:
         problems.append(f"{name}: version {metadata.version(name)} has no Rust notices; generate them with "
                         "tools/rust_notices.py")

@@ -8,7 +8,7 @@ import { EventReader } from '../src/sse.js';
 import { continuable, moveTargets, projectName } from '../src/projects.js';
 import { errorText, money } from '../src/text.js';
 import { apply, send, subscribe, unsavedAnswer } from '../src/live.js';
-import { packageRoot } from '../licenses.mjs';
+import { packageRoot, record } from '../licenses.mjs';
 import { saveSettings } from '../src/api.js';
 
 const open = (width, extra = {}) => columns({ width, ...DEFAULTS, panelOpen: false, ...extra });
@@ -187,4 +187,24 @@ test('this window\'s settings saves run one after another', async (t) => {
   });
   await Promise.all([saveSettings({ 'ui.panel': 'library' }), saveSettings({ 'ui.panel': 'none' })]);
   assert.deepEqual(order, ['library', 'none']); // the newer value is written last, not dropped
+});
+
+test('the license record keeps every bundled version of a package, once each', async () => {
+  const { mkdtempSync, existsSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const out = mkdtempSync(join(tmpdir(), 'scholia-licenses-'));
+  try {
+    const here = new URL('..', import.meta.url).pathname;
+    const roots = ['node_modules/@radix-ui/react-slot', 'node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-slot',
+      'node_modules/@radix-ui/react-menu/node_modules/@radix-ui/react-slot'].map((path) => join(here, path));
+    const recorded = record(roots, out).map((p) => `${p.name}@${p.version} ${p.path}`);
+    assert.deepEqual(recorded, [
+      '@radix-ui/react-slot@1.2.3 node_modules/@radix-ui/react-dialog/node_modules/@radix-ui/react-slot',
+      '@radix-ui/react-slot@1.2.4 node_modules/@radix-ui/react-slot',
+    ]);
+    assert.ok(existsSync(join(out, '@radix-ui/react-slot@1.2.3/LICENSE')) && existsSync(join(out, '@radix-ui/react-slot@1.2.4/LICENSE')));
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
 });
