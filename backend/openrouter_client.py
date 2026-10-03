@@ -209,8 +209,8 @@ def catalog_status(provider, key):
 
 def catalog_read(route) -> bool:
     """Whether the route's provider has a catalog read and cached. Never performs network I/O."""
-    return any(name == route.provider.name and base_url == route.provider.base_url and state["models"]
-               for (name, base_url, _), state in _caches.items())
+    return any(name == route.provider.name and base_url == route.provider.base_url and state["models"] is not None
+               for (name, base_url, _), state in _caches.items())  # an empty catalog read well lists nothing
 
 
 def get_model_metadata(route):

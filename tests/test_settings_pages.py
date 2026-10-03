@@ -266,6 +266,19 @@ async def test_auto_and_a_chosen_model_keep_to_usable_windows(tmp_path):
         assert provider.answers[-1]["model"] == "x/unknown"
 
 
+async def test_a_catalog_read_empty_lists_no_model(tmp_path):
+    provider = CatalogProvider([])
+    async with started(tmp_path / "data", provider) as client:
+        await save(client, {"providers.openrouter.models": ["x/gone"]})
+        assert (await client.get("/api/providers/openrouter/models")).json()["models"] == []
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        for model in ("x/gone", "auto"):
+            refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                        json={"content": "hi", "model": model})
+            assert refused.status_code == 400 and refused.json()["code"] in ("model_not_offered", "model_needed"), model
+        assert provider.answers == []
+
+
 async def test_a_title_run_does_not_call_a_model_no_longer_offered(tmp_path):
     data = tmp_path / "data"
     first = MockProvider()
