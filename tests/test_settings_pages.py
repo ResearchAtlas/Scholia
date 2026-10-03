@@ -11,7 +11,7 @@ import pytest
 from backend import budget_router, openrouter_client, providers
 from backend.db import new_id
 from backend.providers import MIN_WINDOW, Provider
-from scholia_app import MockProvider, send, started
+from scholia_app import MockProvider, background_idle, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -239,3 +239,42 @@ async def test_admission_keeps_to_the_models_a_provider_offers(tmp_path):
         await save(client, {"providers.openrouter.models": []})
         nothing = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
         assert (nothing.status_code, nothing.json()["code"]) == (400, "model_needed")
+
+
+async def test_a_title_run_does_not_call_a_model_no_longer_offered(tmp_path):
+    data = tmp_path / "data"
+    first = MockProvider()
+    held = asyncio.Event()
+
+    async def hold(body):  # the title call never finishes: shutdown interrupts it
+        await held.wait()
+
+    first.title_replies.append(hold)
+    async with started(data, first) as client:
+        keyring = client.keyring
+        await save(client, {"providers.openrouter.models": "all"})
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        await send(client, conversation, model="x/picked")
+        while not first.titles:
+            await asyncio.sleep(0.01)
+    config = data / "config.toml"  # while closed (a running call keeps its provider's settings fixed)
+    config.write_text(config.read_text().replace('models = "all"', 'models = ["y/other"]'))
+    second = MockProvider()
+    async with started(data, second, keyring=keyring, setup=False) as client:
+        await background_idle(client)  # recovery restarts the interrupted title run
+        assert second.titles == []  # ... which does not call a model its provider no longer offers
+
+
+async def test_auto_records_the_tier_of_the_model_it_picked():
+    plan = budget_router.create_run_plan("hello", "auto", lambda m: providers.Route(OPENROUTER, m),
+                                         offered=lambda m: m == budget_router.MODEL_TIERS["budget"][0])
+    assert (plan.model, plan.model_tier, plan.policy_reason) == (
+        budget_router.MODEL_TIERS["budget"][0], "budget", "auto_offered")
+
+
+async def test_the_pickers_choice_is_a_validated_setting(tmp_path):
+    async with started(tmp_path / "data") as client:
+        for good in ("auto", "openrouter:google/gemini-2.5-flash", None):
+            assert (await save(client, {"ui.model": good})).status_code == 200, good
+        for bad in ("gemini", ":x", "openrouter:", 3):
+            assert (await save(client, {"ui.model": bad})).json()["code"] == "invalid_setting", bad

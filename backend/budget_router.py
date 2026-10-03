@@ -106,7 +106,8 @@ def create_run_plan(query: str, model: str | None, route_for, *, effort: str | N
         chosen = next((m for m in [*preferred, *picked] if offered(m)), None)
         reason = ("auto_mid_tier" if chosen == MODEL_TIERS["mid"][0] else "auto_offered") if chosen else "model_needed"
     predicted = estimate_message_cost(signal, route_for(chosen), effort) if chosen else 0.0
-    return RunPlan(mode=signal, model_tier="mid", model=chosen, predicted_cost=predicted,
+    tier = next((name for name, models in MODEL_TIERS.items() if chosen in models), "mid")
+    return RunPlan(mode=signal, model_tier=tier, model=chosen, predicted_cost=predicted,
                    policy_reason=reason, task_signal=signal)
 
 

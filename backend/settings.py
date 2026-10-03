@@ -115,6 +115,10 @@ _RETRIEVAL = {
 PERSONAL = {
     ("ui", "language"): ("system", _choice("system", "en", "zh-CN")),
     ("ui", "follow_up"): ("steer", _choice("steer", "queue")),
+    # The model picker's choice, kept across launches: "auto" or "<provider>:<model id>"; unset,
+    # the [models] defaults apply.
+    ("ui", "model"): (None, lambda v: v == "auto"
+                      or (type(v) is str and ":" in v and all(map(visible, v.split(":", 1))))),
     ("ui", "layout", "sidebar_width"): (248, _int(180, 360)),
     ("ui", "layout", "sidebar_open"): (True, _flag),
     ("ui", "layout", "panel_share"): (0.5, _number(0, 1)),

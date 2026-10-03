@@ -765,6 +765,11 @@ class Harness:
             active.provider = inputs.get("provider")
             route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),
                                             inputs.get("model"))
+            if route is not None:  # a model its provider no longer offers is not called: no title
+                personal = await asyncio.to_thread(load_settings, self.data_dir)
+                table = (personal.values.get("providers") or {}).get(route.provider.name) or {}
+                if not providers.offered(table, route.provider, route.model, budget_router.RECOMMENDED):
+                    route = None
         key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
                                                 self.keyring_backend)
         if route is None or key is None:

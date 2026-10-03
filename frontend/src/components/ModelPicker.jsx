@@ -11,34 +11,25 @@ import { Check, ChevronDown, Sparkles } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { errorText, visible } from '../text.js';
-import { WINDOW_PRESETS, forgetModels, loadModels, settingKey } from '../settings.js';
+import { WINDOW_PRESETS, decodeChoice, encodeChoice, forgetModels, loadModels, settingKey } from '../settings.js';
 import { CommitField } from './fields.jsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
 
-const STORED = 'scholia.model';
 const listeners = new Set();
+let choice = null; // read from the personal settings ([ui] model) when the picker first loads
+let read = false;
 
-function readChoice() {
-  try {
-    const stored = JSON.parse(localStorage.getItem(STORED) ?? 'null');
-    if (stored?.auto === true) return { auto: true };
-    return stored && typeof stored.model === 'string' && typeof stored.provider === 'string' ? stored : null;
-  } catch {
-    return null; // ponytail: a private window forgets the choice; the settings' default applies
-  }
+function publish(next) {
+  choice = next;
+  listeners.forEach((listener) => listener());
 }
 
-let choice = readChoice();
-
+// Sets the choice and keeps it across launches in the personal settings (the window's origin
+// changes at each launch, so the browser's storage would forget it).
 export function setChoice(next) {
-  choice = next;
-  try {
-    localStorage.setItem(STORED, JSON.stringify(next));
-  } catch {
-    // remembered for this window only
-  }
-  listeners.forEach((listener) => listener());
+  publish(next);
+  saveSettings({ 'ui.model': encodeChoice(next) }).catch(() => {});
 }
 
 // The model a message is sent with: { provider, model, effort }, { auto: true }, or null for the
@@ -72,6 +63,13 @@ function useCatalog(open, projectId) {
       const models = listings.flatMap((listing, i) => (listing.status === 'fulfilled'
         ? listing.value.models.filter((m) => m.offered).map((m) => ({ ...m, provider: ready[i].name })) : []));
       if (mine !== latest.current || !here.current) return;
+      if (!read) { // the choice kept from an earlier launch
+        read = true;
+        const kept = decodeChoice(settings.values?.ui?.model);
+        const found = kept?.model && models.find((m) => m.provider === kept.provider && m.id === kept.model);
+        const effort = kept?.model ? settings.values?.models?.efforts?.[kept.model] : null;
+        if (kept && !choice) publish(kept.model ? { ...kept, name: found?.name, effort: found?.effort.steps.includes(effort) ? effort : null } : kept);
+      }
       const next = { models, recent, efforts: settings.values?.models?.efforts ?? {}, several: ready.length > 1,
         defaultModel: visible(project?.values?.models?.default) || visible(settings.values?.models?.default) || 'auto' };
       // Only a complete, current listing says a chosen model is gone.

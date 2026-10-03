@@ -156,3 +156,16 @@ export function messageRoute(chosen) {
   if (chosen.auto) return { model: 'auto' };
   return { model: chosen.model, provider: chosen.provider, ...(chosen.effort ? { effort: chosen.effort } : {}) };
 }
+
+// The picker's choice as the settings keep it: "auto" or "<provider>:<model id>".
+export function encodeChoice(next) {
+  if (!next) return null;
+  return next.auto ? 'auto' : `${next.provider}:${next.model}`;
+}
+
+export function decodeChoice(value) {
+  if (value === 'auto') return { auto: true };
+  if (typeof value !== 'string' || !value.includes(':')) return null;
+  const at = value.indexOf(':');
+  return { provider: value.slice(0, at), model: value.slice(at + 1) };
+}
