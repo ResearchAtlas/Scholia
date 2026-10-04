@@ -788,6 +788,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             unchanged(conn, project_id, level, locked)
             conn.execute("UPDATE projects SET sensitivity = ?, updated_at = ? WHERE id = ?",
                          (body.level, utc_now(), project_id))
+            if not looser:
+                state["archives"].stricter(project_id)  # a full backup or export without a passphrase stops
             revoked = [] if looser else governance.revoke_running(conn, project_id)
             governance.record(conn, "sensitivity_changed", project_id, **{"from": level, "to": body.level},
                               revoked_runs=len(revoked))
@@ -819,6 +821,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             unchanged(conn, project_id, level, locked)
             conn.execute("UPDATE projects SET sensitivity = ?, review_lock = ?, review_venue = ?, updated_at = ?"
                          " WHERE id = ?", ("local_only", int(body.locked), venue, utc_now(), project_id))
+            if body.locked and not locked:
+                state["archives"].stricter(project_id)  # a full backup or export without a passphrase stops
             revoked = governance.revoke_running(conn, project_id) if body.locked and not locked else []
             governance.record(conn, "review_lock_changed", project_id, locked=body.locked, **{"from": level},
                               venue_set=venue is not None, revoked_runs=len(revoked))
@@ -1091,6 +1095,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # A review-locked project counts as stricter than any unlocked one.
             if (_STRICTNESS[target[0]], target[1]) < (_STRICTNESS[level], locked):
                 raise ApiError(409, "less_strict_project", "A conversation moves only to a project as strict or stricter")
+            if target[0] in backups.SENSITIVE:  # its words leave the source's unencrypted backups and exports
+                state["archives"].stricter(source)
             now = utc_now()
             conn.execute("UPDATE conversations SET project_id = ?, updated_at = ? WHERE id = ?",
                          (body.project_id, now, conversation_id))

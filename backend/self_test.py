@@ -416,7 +416,7 @@ def check_encrypted_zip() -> dict:
     content = "Scholia self-test 学术研究平台".encode()
     with tempfile.TemporaryDirectory() as folder:
         path = backups._write_zip(Path(folder), "self-test", [("check.txt", content)], "self-test passphrase",
-                                  stop=lambda: False, audit=lambda path, create=None: create and create())
+                                  stop=lambda: False, audit=lambda path: None)
         with zipfile.ZipFile(path) as plain:  # as other tools see it: 99 marks WinZip AES
             info = plain.getinfo("check.txt")
             if not info.flag_bits & 1 or info.compress_type != 99:

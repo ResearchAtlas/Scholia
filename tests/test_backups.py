@@ -535,33 +535,127 @@ async def test_a_private_project_exports_only_encrypted(tmp_path):
     assert b"Participant 7" in read(path, "conversations.json", PASSPHRASE)
 
 
+def held_at(monkeypatch, name, after=False):
+    """Hold the archive's thread at its first call of backups.<name> (after it returns, when
+    after), until the returned Event is set; reached is set once it is held there."""
+    reached, go, real = threading.Event(), threading.Event(), getattr(backups_module, name)
+
+    def held(*args):
+        first = not reached.is_set()
+        result = real(*args) if after else None
+        if first:
+            reached.set()
+            go.wait(10)
+        return result if after else real(*args)
+
+    monkeypatch.setattr(backups_module, name, held)
+    return reached, go
+
+
+async def archived_while(client, monkeypatch, url, destination, point, change):
+    """Start an archive to destination without a passphrase, hold it at point, make change through
+    the API, let it go on, and return its response."""
+    reached, go = held_at(monkeypatch, *point)
+    task = asyncio.create_task(client.post(url, json={"destination": str(destination)}))
+    await asyncio.to_thread(reached.wait, 10)
+    changed = await change()
+    assert changed.status_code == 200, changed.text
+    go.set()
+    return await task
+
+
+POINTS = {"before its first write": ("_free_name",), "with its content written": ("_fsync",),
+          "once named": ("_publish", True)}
+
+
+@pytest.mark.parametrize("point", POINTS)
 @pytest.mark.parametrize("archive", ["export", "full backup"])
-async def test_a_project_made_stricter_after_it_was_read_is_never_written_without_a_passphrase(
-        tmp_path, monkeypatch, archive):
+async def test_a_project_made_stricter_while_an_archive_is_written_stops_it(tmp_path, monkeypatch, archive, point):
     destination = tmp_path / "chosen"
     destination.mkdir()
     async with started(tmp_path / "data") as client:
         project = await new_project(client, "Interviews")
-        db, real = client.state["db"], backups_module._free_name
-
-        def made_private_meanwhile(*args):  # after the project was read, before the file's first write
-            db.write(lambda conn: conn.execute("UPDATE projects SET sensitivity = 'private' WHERE id = ?",
-                                               (project,)))
-            return real(*args)
-
-        monkeypatch.setattr(backups_module, "_free_name", made_private_meanwhile)
+        await client.post("/api/conversations", json={"project_id": project, "title": "Participant 7"})
         url = f"/api/projects/{project}/export" if archive == "export" else "/api/backups/full"
-        refused = await client.post(url, json={"destination": str(destination)})
+        refused = await archived_while(client, monkeypatch, url, destination, POINTS[point], lambda: client.post(
+            f"/api/projects/{project}/sensitivity", json={"level": "private"}))
         assert (refused.status_code, refused.json()["code"]) == (400, "passphrase_required")
-        assert list(destination.iterdir()) == []  # nothing written there, not even a temporary file
-        assert await rows(client, "SELECT 1 FROM audit_log WHERE event IN ('project_export', 'full_backup')") == []
-        monkeypatch.setattr(backups_module, "_free_name", real)
+        assert list(destination.iterdir()) == []  # what it wrote is gone, named or not
         response = await client.post(url, json={"destination": str(destination), "passphrase": PASSPHRASE})
         assert response.status_code == 200 and response.json()["encrypted"] is True
 
 
+@pytest.mark.parametrize("change", ["review lock", "move into a Private project"])
+async def test_locking_or_moving_a_conversation_into_a_private_project_stops_an_export(tmp_path, monkeypatch, change):
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        project = await new_project(client, "Interviews")
+        private = await new_project(client, "Private", "private")
+        conversation = (await client.post("/api/conversations", json={"project_id": project,
+                                                                      "title": "Participant 7"})).json()["id"]
+        path, body = ((f"/api/projects/{project}/review-lock", {"locked": True}) if change == "review lock" else
+                      (f"/api/conversations/{conversation}/move", {"project_id": private}))
+        refused = await archived_while(client, monkeypatch, f"/api/projects/{project}/export", destination,
+                                       POINTS["with its content written"], lambda: client.post(path, json=body))
+        assert (refused.status_code, refused.json()["code"]) == (400, "passphrase_required")
+        assert list(destination.iterdir()) == []
+
+
+async def test_only_archives_holding_a_project_made_stricter_are_stopped(tmp_path):
+    def check():  # off the event loop, as the archives run
+        archives = backups_module.Archives()
+        with Database(tmp_path / "data") as db:
+            with archives.watching(db, {"a"}) as of_a, archives.watching(db, {"b"}) as of_b, \
+                    archives.watching(db, None) as of_all:
+                db.write(lambda conn: archives.stricter("a"))
+                assert (of_a.is_set(), of_b.is_set(), of_all.is_set()) == (True, False, True)
+            with archives.watching(db, {"a"}) as later:  # registered after the change: it reads the new level
+                assert not later.is_set()
+            assert not archives._writing  # each one leaves the register when it ends
+    await asyncio.to_thread(check)
+
+
+async def test_an_archive_of_text_alone_stops_when_the_app_closes_and_leaves_nothing(tmp_path):
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    closing = iter([False, False])  # the app closes once the first entry is written
+    with pytest.raises(backups_module.BackupError) as error:
+        await asyncio.to_thread(backups_module._write_zip, destination, "scholia-project",
+                                [("a.md", b"text"), ("b.md", b"more")], None, stop=lambda: next(closing, True),
+                                audit=lambda path: None)
+    assert (error.value.status, error.value.code) == (503, "closing")
+    assert list(destination.iterdir()) == []
+
+
+async def test_an_export_whose_last_check_fails_leaves_no_file(tmp_path, monkeypatch):
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        project = await new_project(client)
+        db, real, written = client.state["db"], backups_module._write_zip, threading.Event()
+
+        def write_zip(*args, **options):
+            path = real(*args, **options)
+            written.set()
+            return path
+
+        def read(fn, real_read=db.read):
+            if written.is_set():  # the check that the project still exists, once the file is there
+                raise backups_module.DatabaseClosedError("the database is closed")
+            return real_read(fn)
+
+        monkeypatch.setattr(backups_module, "_write_zip", write_zip)
+        monkeypatch.setattr(db, "read", read)
+        response = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
+        monkeypatch.undo()
+        assert response.status_code == 503
+    assert list(destination.iterdir()) == []
+
+
 @pytest.mark.parametrize("language, lines", [
-    ("en", ["# Untitled conversation", "## Researcher (t1)", "## From another conversation (t2)", "*No answer: Failed*"]),
+    ("en", ["# Untitled conversation", "## Researcher (t1)", "## From another conversation (t2)",
+            "*No answer: Failed*"]),
     ("zh-CN", ["# 未命名对话", "## 研究者 (t1)", "## 来自另一个对话 (t2)", "*没有回答：失败*"])])
 async def test_an_exports_headings_are_in_the_interface_language(language, lines):
     conversation = {"title": None, "turns": [
@@ -1167,9 +1261,8 @@ async def test_a_temporary_name_taken_by_someone_else_is_never_removed(tmp_path,
     source = tmp_path / "a.txt"
     source.write_bytes(b"x")
 
-    def audit(path, create):  # just before it creates its temporary file, another writer takes that name
+    def audit(path):  # just before it creates its temporary file, another writer takes that name
         (destination / f".{path.name}.00000000.tmp").write_bytes(theirs)
-        create()
 
     with pytest.raises(FileExistsError):
         await asyncio.to_thread(backups_module._write_zip, destination, "scholia-backup", [("a.txt", source)],
@@ -1192,15 +1285,10 @@ async def test_a_file_that_appears_at_a_backups_name_meanwhile_is_never_replaced
             audited[0].write_bytes(theirs)
         return False
 
-    def audit(path, create=None):
-        audited.append(path)
-        if create:
-            create()
-
     source = tmp_path / "a.txt"
     source.write_bytes(b"x")
     path = await asyncio.to_thread(backups_module._write_zip, destination, "scholia-backup", [("a.txt", source)],
-                                   None, stop=stop, audit=audit)
+                                   None, stop=stop, audit=audited.append)
     assert audited[0].read_bytes() == theirs and path != audited[0]
     assert audited == [audited[0], path]  # the name it took instead is recorded too
     with zipfile.ZipFile(path) as archive:

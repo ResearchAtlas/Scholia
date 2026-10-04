@@ -211,7 +211,6 @@ def written_events():
         source = path.read_text(encoding="utf-8")
         found |= set(re.findall(r"INSERT INTO audit_log \(event[^)]*\) (?:VALUES \(|SELECT )'(\w+)'", source))
         found |= set(re.findall(r"record\(conn, \"(\w+)\"", source))
-        found |= set(re.findall(r"_recorder\(db, \"(\w+)\"", source))  # a full backup's or an export's file
     return found
 
 
