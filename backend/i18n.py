@@ -13,10 +13,26 @@ TEMPLATES = {
     "en": {
         "disclosure.heading": "Statement on the use of AI tools",
         "import.report": "{imported} of {total} references imported",
+        "export.untitled": "Untitled conversation",
+        "export.researcher": "Researcher",
+        "export.other_conversation": "From another conversation",
+        "export.no_answer": "No answer: {status}",
+        "export.status.succeeded": "Done",
+        "export.status.failed": "Failed",
+        "export.status.cancelled": "Cancelled",
+        "export.status.interrupted": "Interrupted",
     },
     "zh-CN": {
         "disclosure.heading": "人工智能工具使用声明",
         "import.report": "已导入 {imported} 条参考文献，共 {total} 条",
+        "export.untitled": "未命名对话",
+        "export.researcher": "研究者",
+        "export.other_conversation": "来自另一个对话",
+        "export.no_answer": "没有回答：{status}",
+        "export.status.succeeded": "已完成",
+        "export.status.failed": "失败",
+        "export.status.cancelled": "已取消",
+        "export.status.interrupted": "已中断",
     },
 }
 

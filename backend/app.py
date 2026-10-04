@@ -749,12 +749,18 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             log.warning("purging the backups after a deletion failed (%s)", type(error).__name__)
             return {"purge_failed": True}
 
-    async def revoking(project_id, change):
+    async def revoking(project_id, change, stricter=False):
         """Write a change that returns the project's runs it revoked, marked with the outbound gate
         so that no request of the project enters the transport after it commits, and stop them,
-        both to their end."""
+        both to their end. A change that makes the project stricter first waits, under that mark,
+        until no full backup or export written without a passphrase can write any more of it
+        (backups.Archives)."""
+        async def written():
+            async with state["archives"].stricter(project_id) if stricter else contextlib.nullcontext():
+                return await write(change)
+
         async def change_and_stop():
-            harness().revoke(await state["gate"].ordered(project_id, write(change)))
+            harness().revoke(await state["gate"].ordered(project_id, written()))
         await _to_end(change_and_stop())
 
     def unchanged(conn, project_id, level, locked):
@@ -793,7 +799,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                               revoked_runs=len(revoked))
             return revoked
 
-        await revoking(project_id, change)
+        await revoking(project_id, change, stricter=not looser)
         return project_dict(await project_row(project_id))
 
     @app.post("/api/projects/{project_id}/review-lock")
@@ -824,7 +830,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                               venue_set=venue is not None, revoked_runs=len(revoked))
             return revoked
 
-        await revoking(project_id, change)
+        await revoking(project_id, change, stricter=body.locked and not locked)
         return project_dict(await project_row(project_id))
 
     # Governance: the key confirmation, declared local servers, the Private allowlist, the audit log
@@ -1071,7 +1077,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         if conversation_id in harness().registry.turns:
             raise ApiError(409, "active_run", "This conversation is running a turn")
 
-        def move(conn):
+        def move(conn, expected):
             row = conn.execute(
                 "SELECT c.project_id, p.sensitivity, p.review_lock FROM conversations c"
                 " JOIN projects p ON p.id = c.project_id WHERE c.id = ?", (conversation_id,)).fetchone()
@@ -1081,7 +1087,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 raise ApiError(404, "not_found", "No such conversation or project")
             source, level, locked = row
             if source == body.project_id:
-                return
+                return True
+            if source != expected:  # moved meanwhile: its new project's archives are stopped first
+                return False
             # Its turn, or a title run that would send its words over the old project's route;
             # ordered with admission by the single writer.
             if conn.execute("SELECT 1 FROM runs WHERE status = 'running' AND (conversation_id = ?"
@@ -1100,8 +1108,24 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 (body.project_id, conversation_id, conversation_id))
             conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('conversation_moved', ?, ?)",
                          (body.project_id, json.dumps({"conversation_id": conversation_id, "from": source})))
+            return True
 
-        await write(move)
+        async def moved_from(source):
+            # Its words leave the project: no full backup or export of it written without a
+            # passphrase writes any more of them (backups.Archives), wherever they go next; held
+            # until the move has ended, whatever happens to the request (see _to_end).
+            async with state["archives"].stricter(source):
+                return await write(lambda conn: move(conn, source))
+
+        while True:
+            row = await read(lambda conn: conn.execute(
+                "SELECT project_id FROM conversations WHERE id = ?", (conversation_id,)).fetchone())
+            if row is None:
+                raise ApiError(404, "not_found", "No such conversation or project")
+            if row[0] == body.project_id:
+                break
+            if await _to_end(moved_from(row[0])):
+                break
         return await get_conversation(conversation_id)
 
     @app.delete("/api/conversations/{conversation_id}")

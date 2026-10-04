@@ -394,6 +394,7 @@
   "protection.venuePlaceholder": "Optional; an unknown venue is treated as the strictest",
   "protection.title": "What this project holds",
   "protection.hint": "A stricter answer applies at once and stops work running in this project. A less strict one asks first. Every change is recorded in the audit log.",
+  "protection.applying": "Applying. A backup or export being written without a passphrase stops first, so this can take a moment.",
   "protection.current": "Protection: {level}",
   "protection.locked": "Review lock on",
   "protection.lockedVenue": "Review lock on, for {venue}",
