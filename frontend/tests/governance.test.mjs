@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { HOLDS, SUGGESTED_HOLDS, holdsBody, holdsOf, moveTargets, tightens } from '../src/projects.js';
 import { ApiError, confirmedChange } from '../src/api.js';
 import { forgetModels, keptModels, loadModels } from '../src/settings.js';
-import { auditDetail } from '../src/audit.js';
+import { auditDetail, auditEvent } from '../src/audit.js';
 import { makeT } from '../src/i18n/index.js';
 
 test('the three answers set the level, and the review answer the lock and its venue', () => {
@@ -94,6 +94,28 @@ test('a provider\'s earlier rows are kept when only its listing failed, never ac
   assert.deepEqual(keptModels(before, { protection: 'private', models: [b] }, new Set(['openrouter'])), [b]); // tightened
   assert.deepEqual(keptModels(before, null), []); // nothing could be read: nothing is offered
   assert.deepEqual(keptModels(null, { protection: 'private', models: [b] }, new Set(['openrouter'])), [b]);
+});
+
+test('an audit entry\'s heading says no more than its record knows, in each interface language', () => {
+  const dates = new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeZone: 'UTC' });
+  const zh = makeT('zh-CN');
+  const en = makeT('en');
+  const undone = { event: 'restore', data: { id: 'r1', interrupted: true, finished: 'back' } };
+  const finished = { event: 'restore', data: { id: 'r1', interrupted: true, finished: 'forward' } };
+  assert.equal(auditEvent(en, undone), 'Restore undone at launch');
+  assert.equal(auditEvent(zh, undone), '启动时撤销了恢复');
+  assert.equal(auditEvent(en, finished), 'Backup restored');
+  assert.equal(auditDetail(en, undone, dates), 'id: r1 · interrupted by a crash: yes · at the next launch: undone');
+  assert.equal(auditDetail(zh, finished, dates), 'ID：r1 · 因崩溃中断：是 · 下次启动时：已完成');
+  assert.equal(auditEvent(en, { event: 'key_changed', data: { provider: 'openrouter', stored_in: 'uncertain' } }),
+    'Key may have changed');
+  assert.equal(auditEvent(en, { event: 'key_changed', data: { provider: 'openrouter', stored_in: 'file' } }), 'Key changed');
+  // Recorded before anything is written, and kept when the writing fails: an attempt, not a result.
+  for (const event of ['full_backup', 'project_export', 'audit_exported']) {
+    assert.match(auditEvent(en, { event }), /started$/);
+    assert.match(auditEvent(zh, { event }), /^开始/);
+  }
+  assert.equal(auditEvent(en, { event: 'later_event' }), 'later_event');
 });
 
 test('audit details are shown in the interface language, codes this version does not name as they are', () => {

@@ -18,12 +18,23 @@ function shown(t, key, value, dates) {
   if (key === 'stored_in') return named(t, 'audit.storedIn', value);
   if (key === 'kind') return named(t, 'audit.object', value); // what a deletion deleted
   if (key === 'source') return named(t, 'audit.backupSource', value); // what a restore put in place
+  if (key === 'finished') return named(t, 'audit.finished', value); // how a launch ended an interrupted restore
   if (TIME_FIELDS.has(key) && typeof value === 'string') return dates.format(new Date(value));
   if (Array.isArray(value)) return String(value.length); // the settings files a full backup left out: how many
   if (value && typeof value === 'object') { // the records a deletion removed, by table: their count
     return String(Object.values(value).reduce((sum, n) => sum + (Number(n) || 0), 0));
   }
   return String(value);
+}
+
+// An entry's heading. It says no more than its record knows: a restore a launch undid was not
+// restored, and a key whose save failed may or may not have changed (backend: backups.py
+// _replay_pending, app.py _store_key).
+export function auditEvent(t, entry) {
+  const data = entry.data ?? {};
+  if (entry.event === 'restore' && data.finished === 'back') return t('audit.event.restore_undone');
+  if (entry.event === 'key_changed' && data.stored_in === 'uncertain') return t('audit.event.key_maybe_changed');
+  return named(t, 'audit.event', entry.event); // an event this version does not name, as it is
 }
 
 // One line of an entry's details: a request's decision, its reason, the kind of destination and
