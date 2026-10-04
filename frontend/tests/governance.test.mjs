@@ -2,7 +2,7 @@
 // (slice-1 spec F1, sections 5 and 6.4).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { HOLDS, SUGGESTED_HOLDS, holdsBody, holdsOf, moveTargets } from '../src/projects.js';
+import { HOLDS, SUGGESTED_HOLDS, holdsBody, holdsOf, moveTargets, tightens } from '../src/projects.js';
 import { ApiError, confirmedChange } from '../src/api.js';
 import { forgetModels, keptModels, loadModels } from '../src/settings.js';
 import { auditDetail } from '../src/audit.js';
@@ -22,6 +22,19 @@ test('a project reads back as its answer, and Local only without the lock as non
   assert.equal(holdsOf({ sensitivity: 'private', review_lock: false }), 'private');
   assert.equal(holdsOf({ sensitivity: 'local_only', review_lock: true }), 'review');
   assert.equal(holdsOf({ sensitivity: 'local_only', review_lock: false }), null);
+});
+
+test('only a stricter answer waits to apply, with its pending state shown', () => {
+  const normal = { sensitivity: 'normal', review_lock: false };
+  const privateProject = { sensitivity: 'private', review_lock: false };
+  const localOnly = { sensitivity: 'local_only', review_lock: false };
+  assert.equal(tightens(normal, 'private'), true);
+  assert.equal(tightens(normal, 'review'), true);
+  assert.equal(tightens(privateProject, 'review'), true);
+  assert.equal(tightens(localOnly, 'review'), true); // the lock on top of Local only
+  assert.equal(tightens(privateProject, 'own'), false);
+  assert.equal(tightens(localOnly, 'private'), false);
+  assert.equal(tightens({ sensitivity: 'local_only', review_lock: true }, 'review'), false);
 });
 
 test('a review-locked project\'s conversations move only to another locked project', () => {

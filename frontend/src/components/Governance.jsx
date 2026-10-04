@@ -7,7 +7,7 @@ import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { ExternalLink, Lock, ShieldCheck } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, confirmedChange, del, get, post, put } from '../api.js';
-import { HOLDS, holdsOf } from '../projects.js';
+import { HOLDS, holdsOf, tightens } from '../projects.js';
 import { forgetModels } from '../settings.js';
 import { auditDetail } from '../audit.js';
 import { CommitField, Field, LoadState, Problem, Section, Segmented } from './fields.jsx';
@@ -109,12 +109,18 @@ export function ProjectProtection({ project, onProjectChanged }) {
     forgetModels(); // what the model picker offers here follows the protection
     await onProjectChanged();
   });
+  const [applying, setApplying] = useState(false); // a stricter answer, until it has applied
   const base = `/api/projects/${project.id}`;
-  const choose = (holds) => run(() => {
-    if (holds === 'review') return post(`${base}/review-lock`, { locked: true });
-    const level = LEVEL_OF[holds];
-    return confirmedChange('POST', `${base}/sensitivity`, { level },
-      () => ask(t('protection.confirmTitle'), t(`protection.loosen.${level}`)));
+  const choose = (holds) => run(async () => {
+    setApplying(tightens(project, holds));
+    try {
+      if (holds === 'review') return await post(`${base}/review-lock`, { locked: true });
+      const level = LEVEL_OF[holds];
+      return await confirmedChange('POST', `${base}/sensitivity`, { level },
+        () => ask(t('protection.confirmTitle'), t(`protection.loosen.${level}`)));
+    } finally {
+      setApplying(false);
+    }
   });
   const unlock = () => run(() => confirmedChange('POST', `${base}/review-lock`, { locked: false },
     () => ask(t('protection.unlockTitle'), t('protection.unlockBody'))));
@@ -134,6 +140,7 @@ export function ProjectProtection({ project, onProjectChanged }) {
         )}
       </p>
       <Problem code={problem} />
+      {applying && <p role="status" className="text-xs text-muted-foreground">{t('protection.applying')}</p>}
       <HoldsChoice value={holds} onChange={choose} disabled={busy} name="project-holds"
         lockedOut={project.review_lock ? ['own', 'private'] : []} />
       {holds === null && <p className="text-xs text-muted-foreground">{t('protection.localOnlyNow')}</p>}

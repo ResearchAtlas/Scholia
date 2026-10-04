@@ -391,6 +391,7 @@
   "protection.venuePlaceholder": "可不填；未知的出版方按最严格的规则处理",
   "protection.title": "这个项目包含什么",
   "protection.hint": "更严格的选择会立即生效，并停止此项目中正在进行的工作。较宽松的选择会先征求确认。每次更改都会记入审计日志。",
+  "protection.applying": "正在应用。正在写入且未设密码短语的备份或导出会先停止，可能需要片刻。",
   "protection.current": "保护级别：{level}",
   "protection.locked": "评审锁定已开启",
   "protection.lockedVenue": "评审锁定已开启，用于 {venue}",

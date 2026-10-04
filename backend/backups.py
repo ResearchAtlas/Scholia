@@ -18,6 +18,7 @@ Database and file work runs off the event loop.
 """
 
 import asyncio
+import collections
 import contextlib
 import errno
 import hashlib
@@ -384,51 +385,107 @@ def _backup_errors():
             raise BackupError(503, "closing", "The app is closing") from None
 
 
+class _Stopped(Exception):
+    """An archive's write refused: a project it holds is being made stricter."""
+
+
+class _Archive:
+    """One full backup or project export being written without a passphrase (see Archives)."""
+
+    def __init__(self, projects, stopped):
+        self.projects, self.stopped, self.lock = projects, stopped, threading.Lock()
+
+    def holds(self, project_id):
+        return self.projects is None or project_id in self.projects
+
+    @contextlib.contextmanager
+    def writing(self):
+        """Hold it for one write to its destination, refused (_Stopped) once it is stopped."""
+        with self.lock:
+            if self.stopped:
+                raise _Stopped()
+            yield
+
+
 class Archives:
     """The full backups and project exports being written without a passphrase. Making a project
     stricter applies at once (ticket 14), and a file holding a Private or Local only project is
-    encrypted (ticket 16), so a change that makes a project they hold stricter, or moves its data
-    into a stricter project, stops them: they write nothing more and remove what they wrote.
+    encrypted (ticket 16), so such an archive must write nothing more once a change that makes a
+    project it holds stricter, or moves data out of it, has committed.
 
-    Both happen on the database's writer thread, inside its transactions: an archive registered
-    before such a change commits is stopped by it, and one registered after reads the new level."""
+    The change waits in stricter() until each of them can no longer write: every write one makes
+    to its destination (each at most _CHUNK bytes, the file unbuffered, the zip's closing records
+    and its naming included) holds its lock and is refused once it is stopped, and stopping takes
+    that lock. The wait is in a worker thread, outside any database transaction. Meanwhile the
+    change is pending, so an archive registered then starts stopped; one registered after it
+    reads what it committed."""
 
     def __init__(self):
-        self._lock, self._writing = threading.Lock(), {}
-
-    def stricter(self, project_id):
-        """Called inside the write that makes project_id stricter: stop every archive holding it."""
-        with self._lock:
-            for stopped, projects in self._writing.items():
-                if projects is None or project_id in projects:
-                    stopped.set()
+        self._lock, self._writing, self._pending = threading.Lock(), set(), collections.Counter()
 
     @contextlib.contextmanager
-    def watching(self, db, projects):
-        """Register an archive of projects (a set of ids; None: every project) before it reads
-        them; yields the Event its stopping sets."""
-        stopped = threading.Event()
-
-        def register(conn):  # ordered with every change's write by the single writer
-            with self._lock:
-                self._writing[stopped] = projects
-
-        db.write(register)
+    def watching(self, projects):
+        """Register an archive of projects (a set of ids; None: every project) before it reads them."""
+        with self._lock:
+            pending = any(projects is None or project_id in projects for project_id in self._pending)
+            archive = _Archive(projects, stopped=pending)
+            self._writing.add(archive)
         try:
-            yield stopped
+            yield archive
         finally:
             with self._lock:
-                del self._writing[stopped]
+                self._writing.discard(archive)
+
+    @contextlib.asynccontextmanager
+    async def stricter(self, project_id):
+        """Around the write that makes project_id stricter, or moves data out of it: every archive
+        holding it is stopped before the write (once its write in progress, if any, has finished),
+        and none is started until the write has ended."""
+        with self._lock:
+            self._pending[project_id] += 1
+            stopping = [archive for archive in self._writing if archive.holds(project_id)]
+        try:
+            await asyncio.to_thread(_stop_writing, stopping)
+            yield
+        finally:
+            with self._lock:
+                self._pending[project_id] -= 1
+                if not self._pending[project_id]:
+                    del self._pending[project_id]
+
+
+def _stop_writing(archives):
+    for archive in archives:
+        with archive.lock:  # after its write in progress
+            archive.stopped = True
+
+
+class _Guarded:
+    """An archive's destination file: each write goes out in pieces of at most _CHUNK bytes, each
+    one held by the archive and refused once it is stopped. Everything else is the file's own."""
+
+    def __init__(self, raw, archive):
+        self._raw, self._archive = raw, archive
+
+    def write(self, data):
+        view, done = memoryview(data).cast("B"), 0
+        while done < len(view):
+            with self._archive.writing():
+                done += self._raw.write(view[done:done + _CHUNK])
+        return done
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
 
 
 @contextlib.contextmanager
-def _watched(archives, db, projects, passphrase):
-    """archives.watching(db, projects) for a file written without a passphrase, else nothing to stop."""
+def _watched(archives, projects, passphrase):
+    """archives.watching(projects) for a file written without a passphrase; else nothing to stop."""
     if passphrase:
         yield None
     else:
-        with archives.watching(db, projects) as stopped:
-            yield stopped
+        with archives.watching(projects) as archive:
+            yield archive
 
 
 # Full backups
@@ -445,11 +502,11 @@ async def full_backup(body: FullBackup, request: Request):
 
 
 def _full_backup(db, destination, passphrase, archives):
-    with _written(), _watched(archives, db, None, passphrase) as stopped:
-        return _write_full_backup(db, destination, passphrase, stopped)
+    with _written(), _watched(archives, None, passphrase) as archive:
+        return _write_full_backup(db, destination, passphrase, archive)
 
 
-def _write_full_backup(db, destination, passphrase, stopped):
+def _write_full_backup(db, destination, passphrase, archive):
     staging = _staging(db.data_dir)
     try:
         with _backup_errors():
@@ -484,7 +541,7 @@ def _write_full_backup(db, destination, passphrase, stopped):
                 missing += 1
         record = {"encrypted": passphrase is not None, "projects": projects, "content_files": len(hashes) - missing,
                   "missing_files": missing, "settings_left_out": left_out, "schema_version": info["schema_version"]}
-        path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=lambda: db.closed, stopped=stopped,
+        path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=lambda: db.closed, archive=archive,
                           audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
                               "INSERT INTO audit_log (event, data) VALUES ('full_backup', ?)",
                               (json.dumps({"file": str(file), **record}),))))
@@ -1193,11 +1250,11 @@ async def export_project(project_id: str, body: Export, request: Request):
 
 
 def _export(db, project_id, destination, passphrase, language, archives):
-    with _written(), _watched(archives, db, {project_id}, passphrase) as stopped:
-        return _write_export(db, project_id, destination, passphrase, language, stopped)
+    with _written(), _watched(archives, {project_id}, passphrase) as archive:
+        return _write_export(db, project_id, destination, passphrase, language, archive)
 
 
-def _write_export(db, project_id, destination, passphrase, language, stopped):
+def _write_export(db, project_id, destination, passphrase, language, archive):
     data = db.read(lambda conn: _project_records(conn, project_id))
     if data is None:
         raise BackupError(404, "not_found", "No such project")
@@ -1237,7 +1294,7 @@ def _write_export(db, project_id, destination, passphrase, language, stopped):
               "turns": sum(len(c["turns"]) for c in data["conversations"]), "artifacts": len(data["artifacts"]),
               "materials": len(data["materials"])}
     path = _write_zip(destination, f"scholia-project-{project_id[:8]}", entries, passphrase, stop=lambda: db.closed,
-                      stopped=stopped,
+                      archive=archive,
                       audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
                           "INSERT INTO audit_log (event, project_id, data) VALUES ('project_export', ?, ?)",
                           (project_id, json.dumps({"file": str(file), **record})))))
@@ -1387,24 +1444,22 @@ def _publish(tmp, final):
             raise
 
 
-def _write_zip(destination, prefix, entries, passphrase, *, stop, audit, stopped=None):
+def _write_zip(destination, prefix, entries, passphrase, *, stop, audit, archive=None):
     """Write entries [(name, bytes or a file's path)] to a new zip file in destination, owner-only:
     AES-encrypted with passphrase when given. audit(path) records it first, before anything is
     written there, so no file ever leaves the data folder unrecorded; a failure afterwards leaves
     the record of an attempt. It is written under a temporary name and given its name when complete
     and synced, never replacing a file that appeared there meanwhile (it takes the next free name,
     recorded too); on any failure, what was written there is removed. stop() is checked before each
-    entry and chunk; when true (the app is closing), it stops with 503 closing. stopped (see
-    Archives) is checked then too, and before and after the file is named: once set, it stops with
-    400 passphrase_required and removes the file, named or not. Returns the file's path."""
-    def made_stricter():
-        if stopped is not None and stopped.is_set():
-            raise BackupError(400, "passphrase_required", "A project in it was made Private or Local only")
-
+    entry and chunk; when true (the app is closing), it stops with 503 closing. archive (see
+    Archives) is given when it is written without a passphrase: the file is made, written and named
+    only through it, unbuffered, and once it is stopped it writes nothing more and its file is
+    removed, with 400 passphrase_required. Returns the file's path."""
     def go_on():
         if stop():
             raise DatabaseClosedError("the app is closing; the file was not finished")
-        made_stricter()
+
+    held = archive.writing if archive is not None else contextlib.nullcontext
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     final = _free_name(destination, prefix, stamp)
@@ -1415,38 +1470,46 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop, audit, stopped
     options = {"encryption": pyzipper.WZ_AES} if passphrase else {}
     try:
         go_on()
-        with open(tmp, "xb", opener=lambda path, flags: os.open(path, flags, 0o600)) as raw:
+        with held():
+            raw = open(tmp, "xb", buffering=0 if archive is not None else -1,
+                       opener=lambda path, flags: os.open(path, flags, 0o600))
+        with raw:
             made = True
-            with pyzipper.AESZipFile(raw, "w", compression=pyzipper.ZIP_DEFLATED, **options) as archive:
-                if passphrase:
-                    archive.setpassword(passphrase.encode("utf-8"))
-                for entry_name, source in entries:
-                    go_on()
-                    info = archive.zipinfo_cls(entry_name, date_time=datetime.now().timetuple()[:6])
-                    info.external_attr = 0o600 << 16
-                    info.compress_type = pyzipper.ZIP_DEFLATED
-                    info.file_size = len(source) if isinstance(source, bytes) else source.stat().st_size
-                    with archive.open(info, "w") as target:
-                        if isinstance(source, bytes):
-                            target.write(source)
-                            continue
-                        with open(source, "rb") as file:
-                            while chunk := file.read(_CHUNK):
-                                go_on()
-                                target.write(chunk)
-                    go_on()
+            out = _Guarded(raw, archive) if archive is not None else raw
+            zipped = pyzipper.AESZipFile(out, "w", compression=pyzipper.ZIP_DEFLATED, **options)
+            try:
+                with zipped:
+                    if passphrase:
+                        zipped.setpassword(passphrase.encode("utf-8"))
+                    for entry_name, source in entries:
+                        go_on()
+                        info = zipped.zipinfo_cls(entry_name, date_time=datetime.now().timetuple()[:6])
+                        info.external_attr = 0o600 << 16
+                        info.compress_type = pyzipper.ZIP_DEFLATED
+                        info.file_size = len(source) if isinstance(source, bytes) else source.stat().st_size
+                        with zipped.open(info, "w") as target:
+                            if isinstance(source, bytes):
+                                target.write(source)
+                                continue
+                            with open(source, "rb") as file:
+                                while chunk := file.read(_CHUNK):
+                                    go_on()
+                                    target.write(chunk)
+                        go_on()
+            except BaseException:
+                zipped.fp = None  # failed: its file is removed, and nothing is written to it, even when collected
+                raise
         _fsync(tmp)
-        made_stricter()
         while True:
             try:
-                _publish(tmp, final)
+                with held():  # once named, it is complete: a change waiting for it comes after
+                    _publish(tmp, final)
                 published = True
                 tmp.unlink(missing_ok=True)  # its other name, when linked
                 break
             except FileExistsError:  # a file someone put there meanwhile: never replaced
                 final = _free_name(destination, prefix, stamp)
                 audit(final)
-        made_stricter()  # a change committed while it was named
         _fsync(destination)
     except BaseException as error:
         if made:
@@ -1455,5 +1518,7 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop, audit, stopped
             final.unlink(missing_ok=True)
         if isinstance(error, DatabaseClosedError):
             raise BackupError(503, "closing", "The app is closing") from None
+        if archive is not None and archive.stopped:  # whatever unwinding raised once its writes were refused
+            raise BackupError(400, "passphrase_required", "A project in it was made Private or Local only") from None
         raise
     return final

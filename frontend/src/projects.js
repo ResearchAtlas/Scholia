@@ -39,6 +39,12 @@ export function holdsBody(holds, venue) {
   return { sensitivity: holds === 'private' ? 'private' : 'normal' };
 }
 
+// Whether answering holds makes the project stricter: such a change applies once every backup or
+// export of it being written without a passphrase has stopped (backend/backups.py Archives).
+export function tightens(project, holds) {
+  return rank(holdsBody(holds)) > rank(project);
+}
+
 // The answer a project's protection gives, or null for Local only without the lock.
 export function holdsOf(project) {
   if (project?.review_lock) return 'review';
