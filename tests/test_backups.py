@@ -1,6 +1,7 @@
 """Backups, full backups, restore and project export through the API, on synthetic data."""
 
 import asyncio
+import contextlib
 import json
 import os
 import sqlite3
@@ -660,6 +661,39 @@ async def test_locking_or_moving_a_conversation_out_stops_an_export(tmp_path, mo
                                        POINTS["with its content written"], lambda: client.post(path, json=body))
         assert (refused.status_code, refused.json()["code"]) == (400, "passphrase_required")
         assert list(destination.iterdir()) == []
+
+
+async def test_a_move_whose_request_is_cancelled_still_stops_the_source_exports_until_it_ends(tmp_path, monkeypatch):
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        source, other = await new_project(client, "Interviews"), await new_project(client, "Other")
+        conversation = (await client.post("/api/conversations", json={"project_id": source,
+                                                                      "title": "Participant 7"})).json()["id"]
+        db, real, reached, go, holding = client.state["db"], client.state["db"].write, threading.Event(), \
+            threading.Event(), [True]
+
+        def write(fn):  # the move's write, held before it commits
+            if holding and holding.pop():
+                reached.set()
+                go.wait(10)
+            return real(fn)
+
+        monkeypatch.setattr(db, "write", write)
+        move = asyncio.create_task(client.post(f"/api/conversations/{conversation}/move", json={"project_id": other}))
+        await asyncio.to_thread(reached.wait, 10)
+        move.cancel()  # the request goes; the move it began is still under way
+        await asyncio.sleep(0.1)
+        export = asyncio.create_task(client.post(f"/api/projects/{source}/export",
+                                                 json={"destination": str(destination)}))
+        await asyncio.sleep(0.1)
+        go.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await move
+        response = await export
+        assert (response.status_code, response.json()["code"]) == (400, "passphrase_required")
+        assert list(destination.iterdir()) == []
+        assert await rows(client, "SELECT project_id FROM conversations WHERE id = ?", conversation) == [(other,)]
 
 
 async def test_an_archive_writes_at_most_a_chunk_at_a_time(tmp_path, monkeypatch):

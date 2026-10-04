@@ -1110,6 +1110,13 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                          (body.project_id, json.dumps({"conversation_id": conversation_id, "from": source})))
             return True
 
+        async def moved_from(source):
+            # Its words leave the project: no full backup or export of it written without a
+            # passphrase writes any more of them (backups.Archives), wherever they go next; held
+            # until the move has ended, whatever happens to the request (see _to_end).
+            async with state["archives"].stricter(source):
+                return await write(lambda conn: move(conn, source))
+
         while True:
             row = await read(lambda conn: conn.execute(
                 "SELECT project_id FROM conversations WHERE id = ?", (conversation_id,)).fetchone())
@@ -1117,11 +1124,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 raise ApiError(404, "not_found", "No such conversation or project")
             if row[0] == body.project_id:
                 break
-            # Its words leave the project: no full backup or export of it written without a
-            # passphrase writes any more of them (backups.Archives), wherever they go next.
-            async with state["archives"].stricter(row[0]):
-                if await write(lambda conn: move(conn, row[0])):
-                    break
+            if await _to_end(moved_from(row[0])):
+                break
         return await get_conversation(conversation_id)
 
     @app.delete("/api/conversations/{conversation_id}")
