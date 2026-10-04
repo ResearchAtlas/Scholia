@@ -43,7 +43,9 @@ export function auditDetail(t, entry, dates) {
   const data = entry.data ?? {};
   if (entry.event === 'outbound') {
     return [data.decision === 'allow' ? t('audit.allowed') : t('audit.refused', { reason: named(t, 'audit.reason', data.reason) }),
-      data.kind ? named(t, 'audit.kind', data.kind) : null, data.destination].filter(Boolean).join(' · ');
+      data.kind ? named(t, 'audit.kind', data.kind) : null,
+      // A destination the gate does not recognize is kept as "unknown", never by its own name.
+      data.destination === 'unknown' ? t('audit.destinationUnknown') : data.destination].filter(Boolean).join(' · ');
   }
   return Object.entries(data).filter(([, value]) => value !== null && value !== undefined)
     .map(([key, value]) => t('audit.pair', { field: named(t, 'audit.field', key), value: shown(t, key, value, dates) }))
