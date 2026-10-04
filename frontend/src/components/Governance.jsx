@@ -9,7 +9,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, confirmedChange, del, get, post, put } from '../api.js';
 import { HOLDS, holdsOf, tightens } from '../projects.js';
 import { forgetModels } from '../settings.js';
-import { auditDetail } from '../audit.js';
+import { auditDetail, auditEvent } from '../audit.js';
 import { CommitField, Field, LoadState, Problem, Section, Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -404,8 +404,7 @@ export function AuditLog({ project }) {
 
 function AuditEntry({ entry, dates }) {
   const t = useT();
-  const named = t(`audit.event.${entry.event}`);
-  const event = named === `audit.event.${entry.event}` ? entry.event : named; // an event this version does not name
+  const event = auditEvent(t, entry);
   const at = dates.format(new Date(entry.at));
   const detail = auditDetail(t, entry, dates);
   return (
