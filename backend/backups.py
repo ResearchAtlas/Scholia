@@ -32,13 +32,14 @@ import uuid
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
-from backend import APP_VERSION
+from backend import APP_VERSION, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseClosedError, DatabaseDamagedError,
                         ForeignDatabaseError, NewerDatabaseError, utc_now)
 from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
@@ -196,6 +197,7 @@ class Restore(BaseModel):
 class Export(BaseModel):
     destination: str = Field(min_length=1, max_length=4096)
     passphrase: str | None = Field(default=None, max_length=1024)
+    language: Literal[i18n.LANGUAGES] = "en"  # the interface's, for the headings the export writes
 
 
 @contextlib.asynccontextmanager
@@ -403,13 +405,13 @@ def _write_full_backup(db, destination, passphrase):
         with _backup_errors():
             info = db.snapshot(staging / "copy")
         with closing(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro", uri=True)) as copy:
-            sensitive, projects = copy.execute(
-                f"SELECT count(*) FILTER (WHERE sensitivity IN {SENSITIVE}), count(*) FROM projects").fetchone()
+            levels = copy.execute("SELECT id, sensitivity FROM projects").fetchall()
             # Only the files the copy's records refer to: one of a project deleted moments ago, which
             # collection keeps for a while, would leave without the encryption its project needed.
             hashes = [sha256 for sha256, *_ in _referenced_content(copy)]
-        if sensitive and not passphrase:
+        if any(level in SENSITIVE for _, level in levels) and not passphrase:
             raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
+        projects = len(levels)
         entries, left_out = [], []
         for path in sorted((staging / "copy").rglob("*")):
             name = path.relative_to(staging / "copy").as_posix()
@@ -433,9 +435,7 @@ def _write_full_backup(db, destination, passphrase):
         record = {"encrypted": passphrase is not None, "projects": projects, "content_files": len(hashes) - missing,
                   "missing_files": missing, "settings_left_out": left_out, "schema_version": info["schema_version"]}
         path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=lambda: db.closed,
-                          audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
-                              "INSERT INTO audit_log (event, data) VALUES ('full_backup', ?)",
-                              (json.dumps({"file": str(file), **record}),))))
+                          audit=_recorder(db, "full_backup", None, record, passphrase, [id for id, _ in levels]))
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return {"ok": True, "file": str(path), **record, "size": path.stat().st_size}
@@ -1136,15 +1136,16 @@ async def export_project(project_id: str, body: Export, request: Request):
     destination = await asyncio.to_thread(_destination, body.destination, state["data_dir"])
     async with state["backups_lock"]:
         db = _db(state)
-        return await _to_end(asyncio.to_thread(_export, db, project_id, destination, body.passphrase or None))
+        return await _to_end(asyncio.to_thread(_export, db, project_id, destination, body.passphrase or None,
+                                               body.language))
 
 
-def _export(db, project_id, destination, passphrase):
+def _export(db, project_id, destination, passphrase, language="en"):
     with _written():
-        return _write_export(db, project_id, destination, passphrase)
+        return _write_export(db, project_id, destination, passphrase, language)
 
 
-def _write_export(db, project_id, destination, passphrase):
+def _write_export(db, project_id, destination, passphrase, language="en"):
     data = db.read(lambda conn: _project_records(conn, project_id))
     if data is None:
         raise BackupError(404, "not_found", "No such project")
@@ -1155,7 +1156,7 @@ def _write_export(db, project_id, destination, passphrase):
                ("conversations.json", _json(data["conversations"]))]
     # Names in a zip are readable without its passphrase, so files are named by id, never by title.
     for conversation in data["conversations"]:
-        entries.append((f"conversations/{conversation['id']}.md", _conversation_markdown(conversation)))
+        entries.append((f"conversations/{conversation['id']}.md", _conversation_markdown(conversation, language)))
     if data["artifacts"]:
         entries.append(("artifacts.json", _json(data["artifacts"])))
         for artifact in data["artifacts"]:
@@ -1184,9 +1185,7 @@ def _write_export(db, project_id, destination, passphrase):
               "turns": sum(len(c["turns"]) for c in data["conversations"]), "artifacts": len(data["artifacts"]),
               "materials": len(data["materials"])}
     path = _write_zip(destination, f"scholia-project-{project_id[:8]}", entries, passphrase, stop=lambda: db.closed,
-                      audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
-                          "INSERT INTO audit_log (event, project_id, data) VALUES ('project_export', ?, ?)",
-                          (project_id, json.dumps({"file": str(file), **record})))))
+                      audit=_recorder(db, "project_export", project_id, record, passphrase, [project_id]))
     # The settings files were read while the project existed only if it still does: it is deleted record first.
     if not db.read(lambda conn: conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone()):
         path.unlink(missing_ok=True)
@@ -1232,15 +1231,20 @@ def _project_records(conn, project_id):
     return {"project": projects[0], "conversations": conversations, "materials": materials, "artifacts": artifacts}
 
 
-def _conversation_markdown(conversation):
-    lines = [f"# {conversation['title'] or 'Untitled conversation'}", ""]
+def _conversation_markdown(conversation, language="en"):
+    """A conversation as Markdown, its headings in language (section 12)."""
+    def text(key, **params):
+        return i18n.render(f"export.{key}", language, **params)
+
+    lines = [f"# {conversation['title'] or text('untitled')}", ""]
     for turn in conversation["turns"]:
-        author = "Researcher" if turn["author"] == "researcher" else "From another conversation"
+        author = text("researcher" if turn["author"] == "researcher" else "other_conversation")
         lines += [f"## {author} ({turn['started_at']})", "", (turn["message"] or {}).get("text", ""), ""]
         if turn["answer"]:
             lines += ["## Scholia", "", turn["answer"].get("text", ""), ""]
         elif turn["status"] != "running":
-            lines += [f"*No answer: {turn['status']}*", ""]
+            status = text(f"status.{turn['status']}")
+            lines += [f"*{text('no_answer', status=status)}*", ""]
     return "\n".join(lines).encode("utf-8")
 
 
@@ -1323,24 +1327,59 @@ def _publish(tmp, final):
             raise
 
 
+def _recorder(db, event, project_id, record, passphrase, projects):
+    """_write_zip's audit for a file holding projects (their ids): it records the file's destination,
+    never its content, and the first time, in the same transaction, checks that the file may still
+    be written and makes it. A file without a passphrase may not hold a project made Private or
+    Local only since it was read (making a project stricter applies at once): one made so before
+    that check refuses the file (400 passphrase_required), and one made so after it comes after the
+    file's first write there, as a request already sent does."""
+    def audit(file, create=None):
+        def record_it(conn):
+            if create is not None and passphrase is None and conn.execute(
+                    f"SELECT 1 FROM projects WHERE sensitivity IN {SENSITIVE}"
+                    " AND id IN (SELECT value FROM json_each(?))", (json.dumps(projects),)).fetchone():
+                raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
+            conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES (?, ?, ?)",
+                         (event, project_id, json.dumps({"file": str(file), **record})))
+            if create is not None:
+                try:
+                    create()
+                except OSError as error:  # nothing was written there, but the attempt stays recorded
+                    return error
+        failed = db.write(record_it)
+        if failed is not None:
+            raise failed
+    return audit
+
+
 def _write_zip(destination, prefix, entries, passphrase, *, stop, audit):
     """Write entries [(name, bytes or a file's path)] to a new zip file in destination, owner-only:
-    AES-encrypted with passphrase when given. audit(path) records it first, before anything is
-    written there, so no file ever leaves the data folder unrecorded; a failure afterwards leaves
-    the record of an attempt. It is written under a temporary name and given its name when complete
-    and synced, never replacing a file that appeared there meanwhile (it takes the next free name,
-    recorded too); on any failure, what was written there is removed. stop() is checked as it goes;
-    when true (the app is closing), it stops with 503 closing. Returns the file's path."""
+    AES-encrypted with passphrase when given. audit(path, create) records it first and calls
+    create() in the same transaction, which makes the file there: so no file ever leaves the data
+    folder unrecorded, and nothing the audit's transaction checked can change before the first
+    write; a failure afterwards leaves the record of an attempt. It is written under a temporary
+    name and given its name when complete and synced, never replacing a file that appeared there
+    meanwhile (it takes the next free name, recorded too, with audit(path)); on any failure, what
+    was written there is removed. stop() is checked as it goes; when true (the app is closing), it
+    stops with 503 closing. Returns the file's path."""
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     final = _free_name(destination, prefix, stamp)
     # A temporary name of its own, removed on failure only once this call has made it.
-    tmp, made, published = destination / f".{final.name}.{uuid.uuid4().hex[:8]}.tmp", False, False
-    audit(final)
+    tmp, raw, published = destination / f".{final.name}.{uuid.uuid4().hex[:8]}.tmp", None, False
+
+    def create():
+        # ponytail: made on the writer thread, inside its record's transaction, so a destination whose
+        # open hangs (an unresponsive network share) holds every write meanwhile; order it with the
+        # outbound gate's marks instead if that matters.
+        nonlocal raw
+        raw = open(tmp, "xb", opener=lambda path, flags: os.open(path, flags, 0o600))
+
     pyzipper = _pyzipper()
     options = {"encryption": pyzipper.WZ_AES} if passphrase else {}
     try:
-        with open(tmp, "xb", opener=lambda path, flags: os.open(path, flags, 0o600)) as raw:
-            made = True
+        audit(final, create)
+        with raw:
             with pyzipper.AESZipFile(raw, "w", compression=pyzipper.ZIP_DEFLATED, **options) as archive:
                 if passphrase:
                     archive.setpassword(passphrase.encode("utf-8"))
@@ -1372,7 +1411,8 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop, audit):
                 audit(final)
         _fsync(destination)
     except BaseException as error:
-        if made:
+        if raw is not None:  # made, though perhaps not committed with its record
+            raw.close()
             tmp.unlink(missing_ok=True)
         if published:  # but its folder could not be synced: not a backup
             final.unlink(missing_ok=True)

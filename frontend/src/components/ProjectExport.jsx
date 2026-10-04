@@ -2,8 +2,8 @@
 // Exporting a project, from its settings (S12; backend/backups.py): one zip file anyone can
 // open, with its conversations as Markdown, its records as JSON, its files and its settings,
 // never a key. A Private or Local only project's export is encrypted with a passphrase.
-import { useState } from 'react';
-import { useT } from '../i18n/index.js';
+import { useContext, useState } from 'react';
+import { LanguageContext, useT } from '../i18n/index.js';
 import { post } from '../api.js';
 import { needsPassphrase } from '../backups.js';
 import { useAction } from '../action.js';
@@ -13,6 +13,7 @@ import { Button } from '@/components/ui/button';
 
 export function ProjectExportSection({ project }) {
   const t = useT();
+  const language = useContext(LanguageContext); // the export's headings are written in it
   const [destination, setDestination] = useState('');
   const [passphrase, setPassphrase] = useState('');
   const [saved, setSaved] = useState(null);
@@ -23,7 +24,7 @@ export function ProjectExportSection({ project }) {
     event.preventDefault();
     setSaved(null);
     const result = await run(() => post(`/api/projects/${encodeURIComponent(project.id)}/export`,
-      { destination: destination.trim(), ...(passphrase ? { passphrase } : {}) }));
+      { destination: destination.trim(), language, ...(passphrase ? { passphrase } : {}) }));
     if (result) { setSaved(result.file); setPassphrase(''); }
   }
 
