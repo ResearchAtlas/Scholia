@@ -105,8 +105,8 @@ test('an audit entry\'s heading says no more than its record knows, in each inte
   assert.equal(auditEvent(en, undone), 'Restore undone at launch');
   assert.equal(auditEvent(zh, undone), '启动时撤销了恢复');
   assert.equal(auditEvent(en, finished), 'Backup restored');
-  assert.equal(auditDetail(en, undone, dates), 'id: r1 · interrupted by a crash: yes · at the next launch: undone');
-  assert.equal(auditDetail(zh, finished, dates), 'ID：r1 · 因崩溃中断：是 · 下次启动时：已完成');
+  assert.equal(auditDetail(en, undone, dates), 'id: r1 · interrupted: yes · at the next launch: undone');
+  assert.equal(auditDetail(zh, finished, dates), 'ID：r1 · 中断：是 · 下次启动时：已完成');
   assert.equal(auditEvent(en, { event: 'key_changed', data: { provider: 'openrouter', stored_in: 'uncertain' } }),
     'Key may have changed');
   assert.equal(auditEvent(en, { event: 'key_changed', data: { provider: 'openrouter', stored_in: 'file' } }), 'Key changed');
@@ -116,6 +116,17 @@ test('an audit entry\'s heading says no more than its record knows, in each inte
     assert.match(auditEvent(zh, { event }), /^开始/);
   }
   assert.equal(auditEvent(en, { event: 'later_event' }), 'later_event');
+  // Details say what the record knows: what a deletion left out, runs told to stop, what an
+  // archive was to hold, and a destination the gate kept no name for.
+  assert.equal(auditDetail(en, { event: 'deletion', data: { kind: 'project', remove_all_trace: true } }, dates),
+    'what: project · title left out of the record: yes');
+  assert.equal(auditDetail(en, { event: 'full_backup', data: { encrypted: true, content_files: 3 } }, dates),
+    'with a passphrase: yes · files to include: 3');
+  assert.equal(auditDetail(zh, { event: 'outbound', data: { decision: 'deny', reason: 'unknown_destination',
+    destination: 'unknown' } }, dates), '已拒绝：未知目的地 · 未记录地址');
+  assert.equal(auditDetail(en, { event: 'outbound', data: { decision: 'deny', reason: 'revoked',
+    destination: 'https://openrouter.ai:443' } }, dates), 'Refused: the run was told to stop · https://openrouter.ai:443');
+  assert.match(en('audit.hint'), /allowed or refused/);
 });
 
 test('audit details are shown in the interface language, codes this version does not name as they are', () => {
@@ -123,8 +134,8 @@ test('audit details are shown in the interface language, codes this version does
   const zh = makeT('zh-CN');
   const en = makeT('en');
   const change = { event: 'sensitivity_changed', data: { from: 'normal', to: 'private', revoked_runs: 0 } };
-  assert.equal(auditDetail(zh, change, dates), '从：普通 · 到：私密 · 停止的运行：0');
-  assert.equal(auditDetail(en, change, dates), 'from: Normal · to: Private · runs stopped: 0');
+  assert.equal(auditDetail(zh, change, dates), '从：普通 · 到：私密 · 要求停止的运行：0');
+  assert.equal(auditDetail(en, change, dates), 'from: Normal · to: Private · runs told to stop: 0');
   assert.equal(auditDetail(zh, { event: 'outbound', data: { decision: 'deny', reason: 'key_not_confirmed',
     kind: 'model_provider', destination: 'https://openrouter.ai:443' } }, dates),
   '已拒绝：密钥设置未确认 · 模型服务商 · https://openrouter.ai:443');
@@ -136,7 +147,7 @@ test('audit details are shown in the interface language, codes this version does
     'route: openrouter:x/y');
   assert.equal(auditDetail(zh, { event: 'project_export', data: { file: '/Users/me/out/p.zip', encrypted: false,
     conversations: 1, turns: 1, artifacts: 0, materials: 0 } }, dates),
-  '文件：/Users/me/out/p.zip · 已加密：否 · 对话：1 · 对话轮次：1 · 文稿：0 · 资料：0');
+  '文件：/Users/me/out/p.zip · 使用密码短语：否 · 对话：1 · 对话轮次：1 · 文稿：0 · 资料：0');
   assert.equal(auditDetail(en, { event: 'restore', data: { source: 'automatic', backup: 'daily/x', safety_copy: 'daily/y',
     damaged_copy: null, missing_files: 0 } }, dates),
   'restored from: an automatic backup · backup: daily/x · copy of the state before: daily/y · files missing: 0');
