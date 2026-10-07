@@ -94,7 +94,23 @@ def check(window, args):
     labels = catalog(args.lang)
     tag = f"{args.lang}-{args.theme}-{args.layout}"
     view = BrowserView.instances[window.uid].webview
-    js = lambda script: window.evaluate_js(script)  # noqa: E731
+    def js(script):
+        # The view's own evaluateJavaScript: pywebview's evaluate_js wraps the script in eval(),
+        # which the interface's Content-Security-Policy refuses, as it should.
+        done = threading.Event()
+        box = {}
+
+        def handler(result, error):
+            box["result"], box["error"] = result, error
+            done.set()
+
+        AppHelper.callAfter(lambda: view.evaluateJavaScript_completionHandler_(script, handler))
+        done.wait(30)
+        error = box.get("error")
+        if error is not None and "unsupported type" not in str(error.localizedDescription()):
+            raise RuntimeError(f"{script[:80]}: {error.localizedDescription()} {error.userInfo()}")
+        result = box.get("result")
+        return result if not isinstance(result, str) or not result[:1] in "[{n" else json.loads(result)
     properties = style_properties()
     record = {"tag": tag, "origin": origin, "user_agent": None, "steps": [], "motion": {}}
 
@@ -214,6 +230,7 @@ def main(argv=None):
 
     def run():
         try:
+            window.events.loaded.wait(30)
             check(window, args)
         except Exception as error:  # reported, and the window still closes
             print(f"FAILED: {error!r}", flush=True)

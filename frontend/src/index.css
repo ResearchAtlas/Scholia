@@ -73,7 +73,7 @@
   /* Tailwind 3's defaults that Tailwind 4 dropped, kept so nothing changes (S1-35): placeholders in
      gray-400 (the configuration keeps Tailwind 3's value), the pointer on enabled buttons, and the
      suggestion list's arrow placed as before. */
-  input::placeholder, textarea::placeholder { color: var(--color-gray-400); }
+  input::placeholder, textarea::placeholder { color: theme(colors.gray.400); }
   button:not(:disabled), [role="button"]:not(:disabled) { cursor: pointer; }
   ::-webkit-calendar-picker-indicator { line-height: inherit; }
   @media (prefers-reduced-motion: reduce) {
