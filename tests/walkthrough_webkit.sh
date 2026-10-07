@@ -64,7 +64,7 @@ for lang in en zh-CN; do for theme in light dark; do for layout in wide drawer; 
     lsof_out=$(lsof -nP -a -p "$pids" -i 2>"$out/lsof.err"); lsof_status=$?
     if { [ $lsof_status -ne 0 ] && [ $lsof_status -ne 1 ]; } || [ -s "$out/lsof.err" ] \
        || { [ -n "$lsof_out" ] && ! head -1 <<<"$lsof_out" | grep -q '^COMMAND'; }; then
-      kill -0 "$check" 2>/dev/null && { echo "socket check failed for $lang-$theme-$layout: $(cat "$out/lsof.err")"; status=1; }
+      echo "socket check failed for $lang-$theme-$layout: $(cat "$out/lsof.err")"; status=1
     else
       sockets=$(tail -n +2 <<<"$lsof_out" | awk '{ n = split($9, ends, "->"); for (i = 1; i <= n; i++) if (ends[i] !~ /^(127\.0\.0\.1|\[::1\]):/) { print; next } }')
       [ -n "$sockets" ] && { echo "NON-LOOPBACK SOCKET: $sockets"; status=1; }
