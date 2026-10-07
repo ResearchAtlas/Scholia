@@ -43,3 +43,26 @@ def test_a_page_that_never_loads_fails(webkit_check, monkeypatch, tmp_path):
                   "destroy": lambda self: None})())
     monkeypatch.setattr(webkit_check, "check", lambda window, args: None)
     assert webkit_check.main(["http://127.0.0.1:1/#session=s", "--out", str(tmp_path)]) == 1
+
+
+def test_a_callback_that_never_comes_fails(webkit_check):
+    import threading
+    event = threading.Event()
+    with pytest.raises(RuntimeError, match="timed out"):
+        webkit_check.finished(event, 0.01, "a snapshot")
+    event.set()
+    webkit_check.finished(event, 0.01, "a snapshot")  # a callback that came passes
+
+
+@pytest.mark.parametrize("box, size, fails", [
+    ({"error": "no image"}, 10, True), ({"written": False}, 10, True), ({"written": True}, 0, True),
+    ({"written": True}, None, True), ({"written": True}, 10, False)])
+def test_a_snapshot_not_written_fails(webkit_check, tmp_path, box, size, fails):
+    path = tmp_path / "shot.png"
+    if size is not None:
+        path.write_bytes(b"x" * size)
+    if fails:
+        with pytest.raises(RuntimeError, match="was not written"):
+            webkit_check.written(box, path)
+    else:
+        webkit_check.written(box, path)

@@ -83,6 +83,10 @@ for (const name of walk(baseline).filter((n) => n.endsWith('motion.json'))) {
       for (const phase of ['opened', 'closed']) {
         if (!x[phase] !== !y?.[phase]) { differences.push(`${key}.${phase}: present in one run only`); continue; }
         if (!x[phase]) continue;
+        if (x[phase].immediate || y[phase].immediate) {
+          if (!x[phase].immediate !== !y[phase].immediate) differences.push(`${key}.${phase}: immediate in one run only`);
+          continue;
+        }
         if (x[phase].duration !== y[phase].duration) differences.push(`${key}.${phase}.duration ${x[phase].duration} → ${y[phase].duration}`);
         x[phase].frames.forEach((f, i) => {
           const g = y[phase].frames[i];
@@ -90,6 +94,14 @@ for (const name of walk(baseline).filter((n) => n.endsWith('motion.json'))) {
           if (Math.abs(f.opacity - g.opacity) > 0.01) differences.push(`${key}.${phase} t=${f.t} opacity ${f.opacity} → ${g.opacity}`);
         });
       }
+    } else if (key === 'reducedMotion') {
+      // How many animations run at once varies; what matters is which elements were checked and that
+      // every animation lasted at most 1 ms.
+      // A closing element can be gone before it is read, so closing entries are not compared by presence.
+      const keys = (m) => Object.keys(m ?? {}).filter((k) => !k.endsWith(' closing')).sort().join(', ');
+      if (keys(x) !== keys(y)) differences.push(`reducedMotion: checked ${keys(x)} → ${keys(y)}`);
+      const over = Object.entries(y ?? {}).filter(([, list]) => list.some((d) => d > 1)).map(([k]) => k);
+      if (over.length) differences.push(`reducedMotion: over 1 ms in ${over.join(', ')}`);
     } else if (JSON.stringify(x) !== JSON.stringify(y)) {
       differences.push(`${key}: ${JSON.stringify(x)} → ${JSON.stringify(y)}`);
     }
@@ -100,8 +112,8 @@ for (const name of walk(baseline).filter((n) => n.endsWith('motion.json'))) {
 // Computed styles (--styles), element by element in document order: each changed property, counted
 // by its old and new value, with the first element it was seen on. Values that render the same
 // are compared as one: a color in oklab and in rgb (within 1 of 255 a channel), shadows without
-// their transparent layers, default gradient stops, any radius of 9999px or more, and an outline
-// that is not drawn. Margins, transforms and translations are not compared as values: the element's
+// their transparent layers, default gradient stops, any radius of 9999px or more, and the outline
+// properties of an outline drawn in neither run (a drawn one is compared in full). Margins, transforms and translations are not compared as values: the element's
 // box (within 0.5 px) shows what they do. Elements that take no space are skipped.
 function oklabToRgb(l, a, b) {
   const l_ = (l + 0.3963377774 * a + 0.2158037573 * b) ** 3;
@@ -151,6 +163,12 @@ for (const name of walk(baseline).filter((n) => n.endsWith('.styles.json'))) {
     const [rx, ry] = [relative(x, pa), relative(y, pb)];
     if (rx.some((v, k) => Math.abs(v - ry[k]) > 0.5)) note(`box ${rx.map((v) => Math.round(v * 10) / 10)} → ${ry.map((v) => Math.round(v * 10) / 10)}`, x.path);
     if (drawnOutline(x) !== drawnOutline(y)) note(`outline drawn ${drawnOutline(x)} → ${drawnOutline(y)}`, x.path);
+    if (drawnOutline(x) || drawnOutline(y)) {  // a drawn outline is compared in full
+      for (const key of ['outline-style', 'outline-width', 'outline-color', 'outline-offset']) {
+        const [a, b] = [normalize(key, x[key]), normalize(key, y[key])];
+        if (a !== b && !(key === 'outline-color' && sameColor(a, b))) note(`${key}: ${a} → ${b}`, x.path);
+      }
+    }
     for (const key of Object.keys(x)) {
       if (key === 'path' || key === 'box' || key.startsWith('outline') || SKIP.test(key)) continue;
       const [a, b] = [normalize(key, x[key]), normalize(key, y[key])];

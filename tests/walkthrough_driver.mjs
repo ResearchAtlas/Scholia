@@ -18,9 +18,10 @@
 // reduced motion. --mask covers text that differs between runs (times, ids, temporary paths) in
 // the screenshots, for comparing two runs (walkthrough_compare.mjs); --styles also records every
 // element's computed style at each step; --keyboard checks keyboard use (keyboard.json). --all
-// runs the eight combinations of language, theme and layout. --attach
-// drives an interface already served at URL (with its #session) instead, without building or
-// starting a server; the commit and digest are then the served build's own.
+// runs the eight combinations of language, theme and layout. --attach drives an app already
+// serving at URL (with its #session), such as the packaged app, instead of starting a server.
+// --no-build and --attach use frontend/dist only when it is this checkout's build as recorded at
+// its last build, and the served interface must be that build byte for byte.
 //
 // Dev-only: playwright-core (no browser download); the browser is a local Chromium, by default
 // the Chrome for Testing that Playwright's own tools installed.
@@ -63,20 +64,34 @@ function digest(dir) {
   return sha256(files(dir).map((path) => `${relative(dir, path)}\0${sha256(readFileSync(path))}\n`).join(''));
 }
 
-// The sockets a set of processes hold that are not loopback-only (lsof's NAME column).
+// The sockets a set of processes hold that are not loopback-only (lsof's NAME column). A listener on
+// every interface (*:port) is not loopback. lsof exits 1 with no output when there is nothing to
+// list; any other failure, or output it cannot read, throws: an unchecked process is never clean.
 function foreignSockets(pids) {
-  if (!pids.length) return [];
+  if (!pids.length) throw new Error('no launched process to check');
   let out = '';
-  try { out = execFileSync('lsof', ['-nP', '-a', '-p', pids.join(','), '-i'], { encoding: 'utf8' }); } catch { return []; }
-  return out.split('\n').slice(1).filter(Boolean).filter((line) => {
+  try {
+    out = execFileSync('lsof', ['-nP', '-a', '-p', pids.join(','), '-i'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    if (error.status === 1 && !String(error.stdout ?? '').trim() && !String(error.stderr ?? '').trim()) return [];
+    throw new Error(`lsof failed: ${error.message}`);
+  }
+  const lines = out.split('\n').filter(Boolean);
+  if (!/^COMMAND\s+PID/.test(lines[0] ?? '')) throw new Error(`unreadable lsof output: ${lines[0]}`);
+  return lines.slice(1).filter((line) => {
     const name = line.trim().split(/\s+/).slice(8).join(' ').replace(/ \(.*\)$/, '');
-    return !name.split('->').every((end) => LOOPBACK.test(end.replace(/:[^:]*$/, '').replace(/^\*$/, '127.0.0.1')));
+    if (!name) return true;
+    return !name.split('->').every((end) => LOOPBACK.test(end.replace(/:[^:]*$/, '')));
   });
 }
 
 function descendants(pid) {
   let children = [];
-  try { children = sh('pgrep', ['-P', String(pid)]).split('\n').filter(Boolean).map(Number); } catch { /* none */ }
+  try {
+    children = sh('pgrep', ['-P', String(pid)]).split('\n').filter(Boolean).map(Number);
+  } catch (error) {
+    if (error.status !== 1) throw error;  // 1: no child processes
+  }
   return [pid, ...children.flatMap(descendants)];
 }
 
@@ -242,14 +257,18 @@ async function m1(ctx) {
   await step('08-backup', async () => {
     await openSettings('settings.page.advanced'); await scrollTo('settings.backups');
     backups = (await get('/api/backups')).body.backups.length;
+    const rows = dialog().getByRole('button', { name: P('backups.restoreThis') });
+    const shown = await rows.count();
     await dialog().getByRole('button', { name: L('backups.backUpNow') }).click(); await page.waitForTimeout(2500);
     await scrollTo('settings.backups');
+    check('the new backup is shown', await rows.count() === shown + 1);
     check('the backup is listed', (await get('/api/backups')).body.backups.length === backups + 1);
   });
 
   await step('09-sensitivity', async () => {
     await openSettings('settings.page.project');
     await dialog().locator('input[name="project-holds"][value="private"]').click(); await page.waitForTimeout(2000);
+    check('Private is shown chosen', await dialog().locator('input[name="project-holds"][value="private"]').isChecked());
     check('the project is Private', (await project())?.sensitivity === 'private');
   });
   await step('10-audit', async () => {
@@ -282,6 +301,8 @@ async function m1(ctx) {
     await page.getByRole('dialog', { name: L('conversation.deleteTitle') })
       .getByRole('button', { name: L('common.delete'), exact: true }).click();
     await page.waitForTimeout(2000); await openSidebar();
+    check('the delete dialog closed', !(await page.getByRole('dialog', { name: L('conversation.deleteTitle') }).count()));
+    check('the conversation is gone from the list', !(await page.getByRole('button', { name: P('sidebar.conversationActions') }).count()));
     check('the conversation is deleted', (await get(`/api/conversations/${C.conversation}`)).status === 404);
   });
 }
@@ -308,6 +329,11 @@ async function sample(handle) {
 
 // The open and close animations of the drawer, a dialog, both menus and the popover, the dialog's
 // centering, and reduced motion (every animation cut to 1 ms).
+// The open and close animations of the drawer, the settings dialog, both menus and the popover,
+// with the overlays behind the drawer and the dialog; the notice (toast), rendered from its own
+// classes since the walkthrough raises no error; the dialog's centering; and reduced motion: each
+// of them opened again with prefers-reduced-motion, every animation then lasting at most 1 ms.
+// A close with no animation (the drawer's) is recorded as immediate.
 async function motion(ctx) {
   const { page, L, P, C } = ctx;
   const results = {};
@@ -317,44 +343,71 @@ async function motion(ctx) {
   await page.getByRole('button', { name: L('composer.send') }).click();
   await page.getByText('A cohort study follows a group of people').waitFor(); await page.waitForTimeout(1500);
   const showSidebar = page.getByRole('button', { name: L('sidebar.show') });
-  const drawer = async () => await showSidebar.count() && await showSidebar.isVisible();
+  const drawerLayout = page.viewportSize().width < 1000;
   const settle = () => page.waitForTimeout(500);
-  const record = async (name, open, target, close) => {
+  const durations = (handles) => Promise.all(handles.map((h) => h.evaluate((e) => (e.isConnected ? e.getAnimations({ subtree: true }) : []).map((a) => a.effect.getComputedTiming().duration))));
+  const reduced = {};
+  const record = async (name, open, targets, close) => {
     await open();
-    const handle = await target().elementHandle();
-    const opened = await sample(handle);
+    const handles = await Promise.all(targets.map((t) => t().elementHandle()));
+    if (page._reduced) {
+      reduced[name] = (await durations(handles)).flat();
+    } else {
+      for (const [i, handle] of handles.entries()) {
+        const key = i ? `${name}-overlay` : name;
+        const opened = await sample(handle);
+        results[key] = { opened };
+      }
+    }
     await settle();
-    const settled = await handle.evaluate((e) => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; });
+    if (!page._reduced) results[name].settled = await handles[0].evaluate((e) => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; });
     await close();
-    const closed = await handle.evaluate((e) => e.isConnected) ? await sample(handle) : null;
+    for (const [i, handle] of handles.entries()) {
+      const key = i ? `${name}-overlay` : name;
+      const connected = await handle.evaluate((e) => e.isConnected);
+      const closing = connected ? await sample(handle) : null;
+      if (page._reduced) { if (closing) reduced[`${name} closing`] = (await durations([handle])).flat(); continue; }
+      results[key].closed = closing && closing.duration > 0 ? closing : { immediate: true };
+    }
     await settle();
-    results[name] = { opened, settled, closed };
   };
-  if (await drawer()) {
-    await record('drawer', () => showSidebar.click(), () => page.getByRole('dialog').filter({ has: page.getByRole('navigation') }),
+  const openDrawer = async () => { if (drawerLayout && !(await page.getByRole('navigation').isVisible())) { await showSidebar.click(); await settle(); } };
+  const closeDrawer = async () => { if (drawerLayout && await page.getByRole('navigation').isVisible()) { await page.keyboard.press('Escape'); await settle(); } };
+  const sequence = async () => {
+    if (drawerLayout) {
+      await record('drawer', () => showSidebar.click(),
+        [() => page.getByRole('dialog').filter({ has: page.getByRole('navigation') }), () => page.locator('div.fixed.inset-0.z-40')],
+        () => page.keyboard.press('Escape'));
+    }
+    await record('settings-dialog', async () => { await openDrawer(); await page.getByRole('button', { name: L('sidebar.settings') }).click(); },
+      [() => page.getByRole('dialog', { name: L('sidebar.settings') }), () => page.locator('div.fixed.inset-0.z-50').first()],
       () => page.keyboard.press('Escape'));
-  }
-  const settingsButton = async () => { if (await drawer()) { await showSidebar.click(); await settle(); } };
-  await record('settings-dialog', async () => { await settingsButton(); await page.getByRole('button', { name: L('sidebar.settings') }).click(); },
-    () => page.getByRole('dialog', { name: L('sidebar.settings') }), () => page.keyboard.press('Escape'));
-  const closeDrawer = async () => { if (page.viewportSize().width < 1000 && await page.getByRole('navigation').isVisible()) { await page.keyboard.press('Escape'); await settle(); } };
-  await closeDrawer();
-  await record('project-menu', async () => { await settingsButton(); await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); },
-    () => page.getByRole('menu'), () => page.keyboard.press('Escape'));
-  await closeDrawer();
-  await record('conversation-menu', async () => { await settingsButton(); await page.getByRole('button', { name: P('sidebar.conversationActions') }).first().click(); },
-    () => page.getByRole('menu'), () => page.keyboard.press('Escape'));
-  await closeDrawer();
-  await record('model-popover', () => page.getByRole('button', { name: P('picker.label') }).click(),
-    () => page.getByRole('dialog').filter({ has: page.getByRole('textbox', { name: L('picker.search') }) }),
-    () => page.keyboard.press('Escape'));
+    await closeDrawer();
+    await record('project-menu', async () => { await openDrawer(); await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); },
+      [() => page.getByRole('menu')], () => page.keyboard.press('Escape'));
+    await closeDrawer();
+    await record('conversation-menu', async () => { await openDrawer(); await page.getByRole('button', { name: P('sidebar.conversationActions') }).first().click(); },
+      [() => page.getByRole('menu')], () => page.keyboard.press('Escape'));
+    await closeDrawer();
+    await record('model-popover', () => page.getByRole('button', { name: P('picker.label') }).click(),
+      [() => page.getByRole('dialog').filter({ has: page.getByRole('textbox', { name: L('picker.search') }) })],
+      () => page.keyboard.press('Escape'));
+    // The notice: Shell.jsx's classes on a probe element, removed afterwards.
+    await record('notice', () => page.evaluate(() => document.body.insertAdjacentHTML('beforeend',
+      '<div id="walkthrough-notice" role="alert" class="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 animate-fade-up rounded-lg border bg-card px-4 py-2.5 text-sm shadow-lg">Notice</div>')),
+      [() => page.locator('#walkthrough-notice')], () => page.evaluate(() => document.getElementById('walkthrough-notice').remove()));
+  };
+  await sequence();
   const box = results['settings-dialog'].settled;
   results.centering = { viewport: page.viewportSize(), dialogCenter: { x: box.x + box.width / 2, y: box.y + box.height / 2 } };
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await settingsButton(); await page.getByRole('button', { name: L('sidebar.settings') }).click();
-  results.reducedMotion = await page.evaluate(() => document.getAnimations().map((a) => a.effect.getComputedTiming().duration));
-  await page.keyboard.press('Escape'); await settle();
+  page._reduced = true;
+  await sequence();
+  page._reduced = false;
   await page.emulateMedia({ reducedMotion: 'no-preference' });
+  results.reducedMotion = reduced;
+  ctx.check('reduced motion: every animation lasts at most 1 ms', Object.values(reduced).flat().every((d) => d <= 1)
+    && Object.keys(reduced).length >= (drawerLayout ? 6 : 5));
   writeFileSync(join(C.out, 'motion.json'), JSON.stringify(results, null, 2));
 }
 
@@ -378,7 +431,8 @@ function focusState() {
   const changed = watched.flatMap((x, i) => (focused[i] !== unfocused[i] ? [i === 0 ? 'self' : `ancestor ${i}`] : []));
   const name = e.getAttribute('aria-label') || e.textContent.trim().slice(0, 40) || e.getAttribute('placeholder') || e.tagName;
   const box = e.getBoundingClientRect();
-  return { tag: e.tagName.toLowerCase(), role: e.getAttribute('role'), name, indicator: changed.length ? changed.join(', ') : null,
+  const path = []; for (let x = e; x && x !== document.body; x = x.parentElement) path.unshift(`${x.tagName}:${[...x.parentElement.children].indexOf(x)}`);
+  return { path: path.join('/'), tag: e.tagName.toLowerCase(), role: e.getAttribute('role'), name, indicator: changed.length ? changed.join(', ') : null,
            inDialog: Boolean(e.closest('[role=dialog]')), visible: box.width > 0 && box.height > 0 };
 }
 
@@ -403,43 +457,60 @@ async function keys(ctx, page, L, C, check, result) {
     const clip = { x, y, width: Math.min(width - x, Math.ceil(box[2] + 32)), height: Math.min(height - y, Math.ceil(box[3] + 32)) };
     if (clip.width > 0 && clip.height > 0) await page.screenshot({ path: join(C.out, `${C.tag}-focus-${name}.png`), clip });
   };
-  const tabStops = async (limit, inDialog) => {
-    const stops = [];
+  // Tab from where focus is until it comes back to the first stop: the traversal must find stops
+  // and complete its cycle within the limit, every stop must show a focus indicator, and within
+  // a container (a dialog or the drawer) every stop must stay inside it.
+  const tabStops = async (name, limit, inside) => {
+    const stops = []; let cycled = false;
     for (let i = 0; i < limit; i += 1) {
       await page.keyboard.press('Tab'); await page.waitForTimeout(60);
       const state = await page.evaluate(focusState);
       if (!state) continue;
-      if (stops.length && state.name === stops[0].name && state.tag === stops[0].tag) break;
+      if (inside) state.inside = await page.evaluate((selector) => Boolean(document.activeElement.closest(selector)), inside);
+      if (stops.length && state.path === stops[0].path) { cycled = true; break; }
       stops.push(state);
-      await shootFocus(`${inDialog ? 'dialog' : 'window'}-${String(stops.length).padStart(2, '0')}`);
+      await shootFocus(`${name}-${String(stops.length).padStart(2, '0')}`);
     }
-    check(`${inDialog ? 'dialog' : 'window'}: every Tab stop shows a focus indicator`, stops.every((s) => s.indicator));
-    if (inDialog) check('dialog: Tab stays inside', stops.every((s) => s.inDialog));
+    check(`${name}: Tab visits stops and comes back around`, stops.length > 0 && cycled);
+    check(`${name}: every Tab stop shows a focus indicator`, stops.every((s) => s.indicator));
+    if (inside) check(`${name}: Tab stays inside`, stops.every((s) => s.inside));
     return stops;
   };
   await page.keyboard.press('Escape'); await settle();
   await page.locator('body').click({ position: { x: 1, y: page.viewportSize().height - 2 } }).catch(() => {});
-  result.windowTabStops = await tabStops(40, false);
+  result.windowTabStops = await tabStops('window', 60, null);
 
-  // The settings dialog: focus kept inside, Escape closes it and returns focus to its button.
+  // The drawer keeps focus inside while open, and Escape closes it.
+  if (drawerLayout) {
+    await page.getByRole('button', { name: L('sidebar.show') }).focus(); await page.keyboard.press('Enter'); await settle();
+    check('Enter opens the drawer', await page.getByRole('navigation').isVisible());
+    result.drawerTabStops = await tabStops('drawer', 40, '[role=dialog]');
+    await page.keyboard.press('Escape'); await settle();
+    check('Escape closes the drawer', !(await page.getByRole('navigation').isVisible()));
+    result.focusAfterDrawer = await page.evaluate(focusState);  // recorded
+  }
+
+  // The settings dialog: Enter opens it, Tab stays inside on every page, Escape closes it.
   if (drawerLayout) { await page.getByRole('button', { name: L('sidebar.show') }).click(); await settle(); }
   const settings = page.getByRole('button', { name: L('sidebar.settings') });
   await settings.focus(); await page.keyboard.press('Enter'); await settle(600);
-  check('Enter opens the settings dialog', await page.getByRole('dialog', { name: L('sidebar.settings') }).isVisible());
-  result.dialogTabStops = await tabStops(60, true);
+  const dialog = page.getByRole('dialog', { name: L('sidebar.settings') });
+  check('Enter opens the settings dialog', await dialog.isVisible());
+  result.dialogTabStops = {};
+  for (const key of ['general', 'providers', 'subagents', 'project', 'advanced']) {
+    const button = dialog.getByRole('button', { name: L(`settings.page.${key}`), exact: true });
+    await button.focus(); await page.keyboard.press('Enter'); await settle(1000);
+    result.dialogTabStops[key] = await tabStops(`dialog-${key}`, 200, '[role=dialog]');
+  }
   await page.keyboard.press('Escape'); await settle(600);
-  check('Escape closes the settings dialog', !(await page.getByRole('dialog', { name: L('sidebar.settings') }).count()));
+  check('Escape closes the settings dialog', !(await dialog.count()));
   result.focusAfterDialog = await page.evaluate(focusState);  // recorded, not required by the criteria
   if (drawerLayout) {
     result.drawerOpenAfterDialog = await page.getByRole('navigation').isVisible();  // recorded
     if (!result.drawerOpenAfterDialog) { await page.getByRole('button', { name: L('sidebar.show') }).click(); await settle(); }
-    await page.keyboard.press('Escape'); await settle();
-    check('Escape closes the drawer', !(await page.getByRole('navigation').isVisible()));
-    result.focusAfterDrawer = await page.evaluate(focusState);
-    await page.getByRole('button', { name: L('sidebar.show') }).click(); await settle();
   }
 
-  // The project menu: arrow keys move between items, Escape closes and returns focus.
+  // The project menu: arrow keys move between items, Escape closes it.
   const trigger = page.getByRole('button', { name: L('sidebar.switchProject') });
   await trigger.focus(); await page.keyboard.press('Enter'); await settle();
   const first = await page.evaluate(focusState);
@@ -468,13 +539,23 @@ async function keys(ctx, page, L, C, check, result) {
 
   // The composer: Shift+Enter is a new line, Enter while composing does not send, Enter sends.
   const box = page.getByRole('textbox', { name: L('composer.label') });
+  const turns = async () => {
+    const listed = (await ctx.get('/api/conversations')).body.conversations;
+    const counts = await Promise.all(listed.map(async (c) => (await ctx.get(`/api/conversations/${c.id}`)).body.turns.filter((t) => t.result_saved).length));
+    return counts.reduce((a, b) => a + b, 0);
+  };
+  const before = await turns();
   await box.fill('');
   await box.focus(); await page.keyboard.type('line one'); await page.keyboard.press('Shift+Enter'); await page.keyboard.type('line two');
   await box.evaluate((e) => e.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229, isComposing: true, bubbles: true })));
   await settle(800);
   result.composer = { value: await box.inputValue() };
-  check('Shift+Enter starts a new line, and Enter while composing does not send', result.composer.value === 'line one\nline two');
-  await box.fill('');
+  check('Shift+Enter starts a new line, and Enter while composing does not send', result.composer.value === 'line one\nline two' && await turns() === before);
+  await page.keyboard.press('Enter');
+  await page.getByText('line two').first().waitFor();
+  await page.getByText('A cohort study follows a group of people').last().waitFor(); await settle(1500);
+  result.composer.sent = await turns() - before;
+  check('Enter sends, and the answer is saved', result.composer.sent === 1 && (await box.inputValue()) === '');
 }
 
 async function run(combo, build, outRoot) {
@@ -487,10 +568,9 @@ async function run(combo, build, outRoot) {
   const server = opts.attach ? null : await startServer(out);
   const origin = server ? server.origin : new URL(opts.attach).origin;
   const session = server ? server.session : new URL(opts.attach).hash.replace('#session=', '');
-  if (server) {
-    manifest.servedMismatches = await servedMatches(origin, join(FRONTEND, 'dist'));
-    if (manifest.servedMismatches.length) throw new Error(`the server does not serve this build: ${manifest.servedMismatches}`);
-  }
+  // The interface served (by the test server, or by the app attached to) must be this build.
+  manifest.servedMismatches = await servedMatches(origin, join(FRONTEND, 'dist'));
+  if (manifest.servedMismatches.length) throw new Error(`the server does not serve this build: ${manifest.servedMismatches}`);
   const browser = await chromium.launch({ executablePath: opts.browser, args: [
     '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1', '--disable-background-networking',
     '--disable-component-update', '--disable-sync', '--no-default-browser-check', '--no-first-run'] });
@@ -532,7 +612,10 @@ async function run(combo, build, outRoot) {
       await page.reload();
     }
     await m1(ctx);
-    if (opts.motion) await motion(ctx);
+    if (opts.motion) {
+      current = { name: 'motion', checks: [] }; manifest.steps.push(current);
+      await motion(ctx); current.ok = current.checks.every((c) => c.ok);
+    }
     if (opts.keyboard) {
       current = { name: 'keyboard', checks: [] }; manifest.steps.push(current);
       await keyboard(ctx); current.ok = current.checks.every((c) => c.ok);
@@ -543,7 +626,8 @@ async function run(combo, build, outRoot) {
     manifest.error = String(error.stack ?? error);
     await page.screenshot({ path: join(out, `${tag}-failed.png`) }).catch(() => {});
   } finally {
-    manifest.network.after = foreignSockets(pids());
+    try { manifest.network.after = foreignSockets(pids()); } catch (error) { manifest.network.after = [`not checked: ${error.message}`]; }
+    manifest.network.processes = pids();
     manifest.network.blockedRequests = blocked;
     manifest.console = consoleMessages;
     await browser.close();
@@ -560,10 +644,29 @@ async function run(combo, build, outRoot) {
   return clean;
 }
 
-const build = { commit: sh('git', ['rev-parse', 'HEAD']), dirty: sh('git', ['status', '--porcelain']) !== '' };
-if (!opts.attach) {
-  if (!opts['no-build']) execFileSync('npm', ['run', 'build'], { cwd: FRONTEND, stdio: 'inherit' });
+// The checkout's state: its commit, and a digest of every uncommitted change (empty when clean).
+function source() {
+  const status = sh('git', ['status', '--porcelain', '--untracked-files=all']);
+  return { commit: sh('git', ['rev-parse', 'HEAD']), dirty: status !== '',
+           changes: status ? sha256(status + sh('git', ['diff', 'HEAD', '--binary'])) : null };
+}
+
+// Each build records the checkout it was built from beside node_modules (outside what is served).
+// --no-build and --attach use the build in frontend/dist only if that record matches this checkout
+// and that build: a build from another commit or another state of the files is never evidence.
+const RECORD = join(FRONTEND, 'node_modules', '.walkthrough-build.json');
+const build = source();
+if (!opts['no-build'] && !opts.attach) {
+  execFileSync('npm', ['run', 'build'], { cwd: FRONTEND, stdio: 'inherit' });
   build.distDigest = digest(join(FRONTEND, 'dist'));
+  writeFileSync(RECORD, JSON.stringify(build));
+} else {
+  let recorded = null;
+  try { recorded = JSON.parse(readFileSync(RECORD, 'utf8')); } catch { /* no record */ }
+  build.distDigest = digest(join(FRONTEND, 'dist'));
+  if (!recorded || recorded.commit !== build.commit || recorded.changes !== build.changes || recorded.distDigest !== build.distDigest) {
+    throw new Error('frontend/dist is not a build of this checkout as it is now: run without --no-build or --attach first');
+  }
 }
 const combos = opts.all
   ? ['en', 'zh-CN'].flatMap((lang) => ['light', 'dark'].flatMap((theme) => ['wide', 'drawer'].map((layout) => ({ lang, theme, layout }))))
@@ -571,5 +674,5 @@ const combos = opts.all
 mkdirSync(opts.out, { recursive: true });
 let ok = true;
 for (const combo of combos) ok = (await run(combo, build, opts.out)) && ok;
-appendFileSync(join(opts.out, 'runs.txt'), `${new Date().toISOString()} ${build.commit}${build.dirty ? ' (dirty)' : ''} ${build.distDigest ?? 'attached'} ${ok ? 'ok' : 'FAILED'}\n`);
+appendFileSync(join(opts.out, 'runs.txt'), `${new Date().toISOString()} ${build.commit}${build.dirty ? ` (dirty ${build.changes})` : ''} ${build.distDigest}${opts.attach ? ` attached ${new URL(opts.attach).origin}` : ''} ${ok ? 'ok' : 'FAILED'}\n`);
 process.exit(ok ? 0 : 1);

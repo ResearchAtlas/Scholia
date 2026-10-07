@@ -84,6 +84,18 @@ def by_label(label, role="button"):
             f"(e.getAttribute('aria-label') || e.textContent.trim()) === {text})")
 
 
+def finished(event, seconds, what):
+    """Wait for a callback; one that never comes is a failed check, never a silent pass."""
+    if not event.wait(seconds):
+        raise RuntimeError(f"timed out after {seconds} s: {what}")
+
+
+def written(box, path):
+    """A snapshot's outcome: an error, or a file that was not written, fails the check."""
+    if "error" in box or not box.get("written") or not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"{path.name} was not written: {box.get('error', 'the write failed')}")
+
+
 def check(window, args):
     from AppKit import NSAppearance, NSBitmapImageRep, NSPNGFileType  # noqa: N811
     from PyObjCTools import AppHelper
@@ -106,7 +118,7 @@ def check(window, args):
             done.set()
 
         AppHelper.callAfter(lambda: view.evaluateJavaScript_completionHandler_(script, handler))
-        done.wait(30)
+        finished(done, 30, f"evaluating {script[:60]!r}")
         error = box.get("error")
         if error is not None and "unsupported type" not in str(error.localizedDescription()):
             raise RuntimeError(f"{script[:80]}: {error.localizedDescription()} {error.userInfo()}")
@@ -120,21 +132,30 @@ def check(window, args):
 
     def snapshot(name):
         done = threading.Event()
+        box = {}
 
         def handler(image, error):
-            if image is not None:
+            try:
+                if image is None:
+                    box["error"] = f"no image: {error}"
+                    return
                 bitmap = NSBitmapImageRep.imageRepWithData_(image.TIFFRepresentation())
-                bitmap.representationUsingType_properties_(NSPNGFileType, None).writeToFile_atomically_(
-                    str(out / f"{tag}-{name}.png"), True)
-            done.set()
+                data = bitmap.representationUsingType_properties_(NSPNGFileType, None)
+                box["written"] = bool(data is not None and data.writeToFile_atomically_(str(out / f"{tag}-{name}.png"), True))
+            finally:
+                done.set()
 
         AppHelper.callAfter(lambda: view.takeSnapshotWithConfiguration_completionHandler_(None, handler))
-        done.wait(10)
+        finished(done, 10, f"the snapshot {name}")
+        written(box, out / f"{tag}-{name}.png")
 
     def step(name):
         time.sleep(0.8)
         snapshot(name)
-        (out / f"{tag}-{name}.styles.json").write_text(json.dumps(js(STYLES_JS % properties)))
+        styles = js(STYLES_JS % properties)
+        if not isinstance(styles, list) or not styles:
+            raise RuntimeError(f"no computed styles at {name}")
+        (out / f"{tag}-{name}.styles.json").write_text(json.dumps(styles))
         record["steps"].append(name)
 
     def wait_for(expression, seconds=15):
