@@ -50,6 +50,9 @@ const { values: opts } = parseArgs({ options: {
   browser: { type: 'string', default: BROWSER }, attach: { type: 'string' },
 } });
 if (!opts.out) throw new Error('--out is required');
+if (!['en', 'zh-CN'].includes(opts.lang)) throw new Error(`--lang must be en or zh-CN, not ${opts.lang}`);
+if (!['light', 'dark'].includes(opts.theme)) throw new Error(`--theme must be light or dark, not ${opts.theme}`);
+if (!(opts.layout in SIZES)) throw new Error(`--layout must be wide or drawer, not ${opts.layout}`);
 
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 const sh = (cmd, args, cwd = ROOT) => execFileSync(cmd, args, { cwd, encoding: 'utf8' }).trim();
@@ -129,7 +132,8 @@ async function startServer(dir) {
     });
     child.on('exit', (code) => reject(new Error(`server exited ${code}: ${stderr}`)));
   });
-  const url = new URL(lines.open);
+  let url;
+  try { url = new URL(lines.open); } catch (error) { child.kill(); throw error; }
   let pid = 0;
   for (let tries = 0; !pid && tries < 100; tries += 1) {  // the address is printed before the server listens
     try { pid = Number(sh('lsof', ['-t', '-nP', `-iTCP:${url.port}`, '-sTCP:LISTEN'])); } catch { await new Promise((r) => setTimeout(r, 100)); }
@@ -606,7 +610,15 @@ async function run(combo, build, outRoot) {
       try { process.kill(server.pid); } catch { /* already gone */ }
     }
   };
-  let browser;
+  // Everything acquired from here on (the browser, its context and page) is released in the one
+  // finally below, and the server stopped, whatever fails and wherever it fails.
+  let browser = null;
+  let page = null;
+  let current;
+  const blocked = [];
+  const consoleMessages = [];
+  const pids = () => descendants(process.pid).slice(1);  // every process this run launched: the server's and the browser's
+  manifest.network = { before: ['not checked: the run did not reach the check'] };
   try {
     // The interface served (by the test server, or by the app attached to) must be this build.
     manifest.servedMismatches = await servedMatches(origin, join(FRONTEND, 'dist'));
@@ -614,43 +626,33 @@ async function run(combo, build, outRoot) {
     browser = await chromium.launch({ executablePath: opts.browser, args: [
       '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1', '--disable-background-networking',
       '--disable-component-update', '--disable-sync', '--no-default-browser-check', '--no-first-run'] });
-  } catch (error) {
-    stopServer();  // a run that cannot start never leaves its server behind
-    throw error;
-  }
-  manifest.browser = `${opts.browser.split('/').pop()} ${browser.version()}`;
-  const pids = () => descendants(process.pid).slice(1);  // every process this run launched: the server's and the browser's
-  manifest.network = {};
-  try { manifest.network.before = foreignSockets(pids()); } catch (error) { manifest.network.before = [`not checked: ${error.message}`]; }
-  const context = await browser.newContext({ viewport: SIZES[combo.layout], deviceScaleFactor: 1, colorScheme: combo.theme,
-                                             reducedMotion: 'no-preference' });
-  const blocked = [];
-  await context.route('**/*', (route) => {
-    const url = new URL(route.request().url());
-    return LOOPBACK.test(url.hostname) || url.protocol === 'data:' ? route.continue() : (blocked.push(url.href), route.abort());
-  });
-  const page = await context.newPage();
-  const consoleMessages = [];
-  page.on('console', (message) => { if (['error', 'warning'].includes(message.type())) consoleMessages.push(`${message.type()}: ${message.text()}`); });
-  page.on('pageerror', (error) => consoleMessages.push(`pageerror: ${error.message}`));
-  const { label, pattern } = labels(combo.lang);
-  const C = { out, tag, exports, project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
-              question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
-  let current;
-  const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
-  const step = async (name, body, before) => {
-    if (before) await before();
-    current = { name, checks: [] };
-    manifest.steps.push(current);
-    await body();
-    await page.waitForTimeout(500);
-    current.screenshot = `${tag}-${name}.png`;
-    await page.screenshot({ path: join(out, current.screenshot), ...(opts.mask ? { mask: await dynamic(page), maskColor: '#808080' } : {}) });
-    if (opts.styles) writeFileSync(join(out, `${tag}-${name}.styles.json`), JSON.stringify(await page.evaluate(computedStyles, STYLE_PROPERTIES)));
-    current.ok = current.checks.every((c) => c.ok);
-  };
-  const ctx = { page, L: label, P: pattern, C, step, check, get: api(origin, session), current: () => current };
-  try {
+    manifest.browser = `${opts.browser.split('/').pop()} ${browser.version()}`;
+    try { manifest.network.before = foreignSockets(pids()); } catch (error) { manifest.network.before = [`not checked: ${error.message}`]; }
+    const context = await browser.newContext({ viewport: SIZES[combo.layout], deviceScaleFactor: 1, colorScheme: combo.theme,
+                                               reducedMotion: 'no-preference' });
+    await context.route('**/*', (route) => {
+      const url = new URL(route.request().url());
+      return LOOPBACK.test(url.hostname) || url.protocol === 'data:' ? route.continue() : (blocked.push(url.href), route.abort());
+    });
+    page = await context.newPage();
+    page.on('console', (message) => { if (['error', 'warning'].includes(message.type())) consoleMessages.push(`${message.type()}: ${message.text()}`); });
+    page.on('pageerror', (error) => consoleMessages.push(`pageerror: ${error.message}`));
+    const { label, pattern } = labels(combo.lang);
+    const C = { out, tag, exports, project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
+                question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
+    const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
+    const step = async (name, body, before) => {
+      if (before) await before();
+      current = { name, checks: [] };
+      manifest.steps.push(current);
+      await body();
+      await page.waitForTimeout(500);
+      current.screenshot = `${tag}-${name}.png`;
+      await page.screenshot({ path: join(out, current.screenshot), ...(opts.mask ? { mask: await dynamic(page), maskColor: '#808080' } : {}) });
+      if (opts.styles) writeFileSync(join(out, `${tag}-${name}.styles.json`), JSON.stringify(await page.evaluate(computedStyles, STYLE_PROPERTIES)));
+      current.ok = current.checks.every((c) => c.ok);
+    };
+    const ctx = { page, L: label, P: pattern, C, step, check, get: api(origin, session), current: () => current };
     await page.goto(`${origin}/#session=${session}`);
     if (combo.lang !== 'en') {
       await ctx.get('/api/settings', { method: 'PUT', body: JSON.stringify({ updates: { 'ui.language': combo.lang } }) });
@@ -665,17 +667,17 @@ async function run(combo, build, outRoot) {
       current = { name: 'keyboard', checks: [] }; manifest.steps.push(current);
       await keyboard(ctx); current.ok = current.checks.every((c) => c.ok);
     }
-    manifest.ok = manifest.steps.every((s) => s.ok);
+    manifest.ok = manifest.steps.length > 0 && manifest.steps.every((s) => s.ok);
   } catch (error) {
     manifest.ok = false;
     manifest.error = String(error.stack ?? error);
-    await page.screenshot({ path: join(out, `${tag}-failed.png`) }).catch(() => {});
+    if (page) await page.screenshot({ path: join(out, `${tag}-failed.png`) }).catch(() => {});
   } finally {
     try { manifest.network.after = foreignSockets(pids()); } catch (error) { manifest.network.after = [`not checked: ${error.message}`]; }
     manifest.network.processes = pids();
     manifest.network.blockedRequests = blocked;
     manifest.console = consoleMessages;
-    await browser.close();
+    if (browser) await browser.close().catch((error) => { manifest.closeError = String(error); });
     if (server) manifest.serverErrors = server.stderr().split('\n').filter((line) => /error|traceback/i.test(line));
     stopServer();
     manifest.finished = new Date().toISOString();

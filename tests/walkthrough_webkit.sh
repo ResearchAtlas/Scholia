@@ -27,13 +27,19 @@ const record = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 process.exit(record.commit === sh('rev-parse', 'HEAD') && record.changes === changes && record.distDigest === process.argv[3] ? 0 : 1);
 JS
 echo "$(git rev-parse HEAD) $(digest)" > "$out/provenance.txt"
+# Whatever stops this script, the server and checker of the combination in progress are stopped.
+server_job=""; check=""
+trap 'kill $check $server_job 2>/dev/null' EXIT
 for lang in en zh-CN; do for theme in light dark; do for layout in wide drawer; do
   log="$out/server-$lang-$theme-$layout.log"
   uv run --no-sync python tests/walkthrough.py > "$log" 2>&1 &
+  server_job=$!
   for i in $(seq 1 100); do grep -q "open:" "$log" && break; sleep 0.2; done
   url=$(sed -n 's/^open: //p' "$log"); origin=${url%/#*}; port=${origin##*:}
   for i in $(seq 1 100); do lsof -t -iTCP:"$port" -sTCP:LISTEN >/dev/null && break; sleep 0.1; done
   pid=$(lsof -t -iTCP:"$port" -sTCP:LISTEN)
+  if ! [ "$pid" -gt 0 ] 2>/dev/null; then echo "server listener not found for $lang-$theme-$layout"; exit 1; fi
+  server_job="$server_job $pid"
   for f in $(cd frontend/dist && find . -type f | sed 's|^\./||'); do
     p=$f; [ "$f" = index.html ] && p=""
     [ "$(curl -s "$origin/$p" | shasum -a 256 | cut -d' ' -f1)" = "$(shasum -a 256 "frontend/dist/$f" | cut -d' ' -f1)" ] || { echo "served $f differs"; status=1; }
