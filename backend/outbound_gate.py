@@ -38,8 +38,10 @@ exact origins count there, and nothing else does. Names are never resolved, so
 
 - Normal: every kind.
 - Private: model requests only to OpenRouter, on the Private allowlist, carrying
-  provider.zdr = true and the entry's other flags, with no plugins or server-side
-  features, sent with a key whose data-settings confirmation is current (see
+  provider.zdr = true and the entry's other flags, `X-OpenRouter-Cache: false`, limited
+  to the model's zero-retention endpoints above the window where OpenRouter compresses
+  by default and ignoring its smaller ones, with no plugins or server-side features,
+  sent with a key whose data-settings confirmation is current (see
   `_private_problem`); and a local provider only after the researcher declared its
   exact origin, as for Local only, without OpenRouter's flags or key confirmation
   (ticket 64). Scholarly APIs, open-access hosts, the helper and model downloads.
@@ -152,6 +154,9 @@ PRIVATE_FIELDS = frozenset({
     "tools", "tool_choice", "parallel_tool_calls",
 })
 ZDR = {"provider": {"zdr": True}}  # every Private request carries it, whatever the allowlist says
+# Every Private request carries this header once: it turns off OpenRouter's response caching,
+# which provider.zdr alone does not (slice 1 section 6.4).
+NO_RESPONSE_CACHE = ("X-OpenRouter-Cache", "false")
 _CLIENT_OPTIONS = frozenset({"base_url", "follow_redirects", "headers", "max_redirects", "timeout"})
 # Methods as httpx sends them (upper case); any other is refused and audited as OTHER.
 _METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
@@ -196,7 +201,8 @@ class GateInputs:
     helper_url: base URL of the running local helper, on loopback.
     private_route(conn, provider, key, model): the enabled Private allowlist entry covering an
         OpenRouter model id (a mapping with its required_flags, route_key, terms_url and
-        checked_on) for a request through the named provider with key, or None if none does.
+        checked_on, and the model's zdr_endpoints as the catalog read with key lists
+        them) for a request through the named provider with key, or None if none does.
     key_attested(conn, provider, key): when the named provider's current data-settings
         confirmation of the key lapses (an ISO 8601 UTC time), or None when it has none; a
         request is dispatched only before then.
@@ -852,6 +858,8 @@ def _private_request(request: httpx.Request, inputs: GateInputs):
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "file" for p in content):
             return "unsupported_feature"  # files go through a parser plugin
+    if request.headers.get_list(NO_RESPONSE_CACHE[0]) != [NO_RESPONSE_CACHE[1]]:
+        return "missing_flags"
     _, _, key = request.headers.get("authorization", "").partition(" ")
     return models, body, request.headers.get("authorization", ""), key.strip()
 
@@ -860,15 +868,21 @@ def _private_problem(conn, inputs: GateInputs, provider, models, body, authoriza
     """(Why a request to OpenRouter cannot go out from a Private project, or None; the terms it
     goes out under: the allowlist entries and when the key's confirmation lapses): each model on
     the allowlist with its entry's flags and listed with a zero-retention endpoint by the
-    provider's catalog, provider.zdr = true, and a key whose data-settings confirmation by the
-    provider is current, read in the decision transaction."""
+    provider's catalog, provider.zdr = true, provider.only and provider.ignore keeping it to the
+    model's zero-retention endpoints above the window where OpenRouter compresses by default
+    (`_limited`), and a key whose data-settings confirmation by the provider is current, read in
+    the decision transaction."""
     entries = []
+    routing = body.get("provider") if isinstance(body.get("provider"), dict) else {}
+    only, ignore = routing.get("only"), routing.get("ignore", [])
     for model in models:
         entry = inputs.private_route(conn, provider, key, model)
         flags = entry.get("required_flags") if isinstance(entry, Mapping) else None
         if not isinstance(flags, Mapping):
             return "route_not_allowed", None
         if not _carries(body, flags):
+            return "missing_flags", None
+        if not _limited(only, ignore, entry.get("zdr_endpoints")):
             return "missing_flags", None
         entries.append(entry)
     if not _carries(body, ZDR):
@@ -878,6 +892,21 @@ def _private_problem(conn, inputs: GateInputs, provider, models, body, authoriza
     if not isinstance(until, str) or until <= utc_now():
         return "key_not_confirmed", None
     return None, {"entries": entries, "key_confirmed_until": until}
+
+
+def _limited(only, ignore, endpoints) -> bool:
+    """Whether a request's provider.only names only the model's usable zero-retention endpoints
+    (at least one) and its provider.ignore every smaller one, as the catalog read with its key
+    lists them (backend/openrouter_client.py, zdr_endpoints), so it reaches no endpoint where
+    OpenRouter compresses by default."""
+    if not (isinstance(endpoints, Mapping) and isinstance(endpoints.get("usable"), list)
+            and isinstance(endpoints.get("small"), list)):
+        return False
+    if not (isinstance(only, list) and only and all(isinstance(tag, str) for tag in only)):
+        return False
+    if not (isinstance(ignore, list) and all(isinstance(tag, str) for tag in ignore)):
+        return False
+    return set(only) <= set(endpoints["usable"]) and set(endpoints["small"]) <= set(ignore)
 
 
 def _body(request: httpx.Request):

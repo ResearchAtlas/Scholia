@@ -88,7 +88,8 @@ async def test_zdr_failure_is_visible_and_retries_after_the_cooldown(monkeypatch
     def serve(request):
         requests.append(request.url.path)
         if request.url.path.endswith("/zdr"):
-            return httpx.Response(200, json={"data": [{"model_id": "model/a"}]}) if zdr_ok else httpx.Response(503)
+            return httpx.Response(200, json={"data": [{"model_id": "model/a", "tag": "example", "context_length": 32768}]}) \
+                if zdr_ok else httpx.Response(503)
         return httpx.Response(200, json={"data": [{"id": "model/a"}]})
 
     client = client_for(serve)
@@ -294,3 +295,48 @@ def test_catalog_status_never_makes_or_drops_a_cache_entry():
     assert status["last_fetched"] is None and status["stale"] is True
     assert list(openrouter_client._caches) == [("openrouter", provider.base_url, b"current")]
     openrouter_client.clear_cache()
+
+
+def test_zero_retention_counts_only_endpoints_a_private_request_can_be_limited_to():
+    # OpenRouter compresses by default at 8,192 tokens or less; a Private request is limited to
+    # the larger endpoints and ignores the others (slice 1 section 6.4).
+    def row(model, tag, window):
+        return {"model_id": model, "tag": tag, "context_length": window}
+
+    found = catalog.zdr_endpoints([
+        row("a", "big", 131072), row("a", "small", 8192), row("a", "small-too", None),
+        row("b", "only-small", 4096),
+        row("c", "deepinfra/turbo", 32768), row("c", "deepinfra", 8192),  # the base slug covers the variant
+        row("d", "deepinfra", 32768), row("d", "deepinfra/turbo", 8192),  # and the variant is the base's
+        row("e", "big", 32768), row("e", None, 8192),  # a small endpoint no request could ignore
+        row("f", "big", 32768), row("f", "big", 8192),  # the same tag both ways
+        row("g", "x", 32768), row("g", " x", 32768), row("g", "y", 8193),
+    ])
+    assert found == {
+        "a": {"usable": ["big"], "small": ["small", "small-too"]},
+        "b": {"usable": [], "small": ["only-small"]},
+        "c": {"usable": [], "small": ["deepinfra"]},
+        "d": {"usable": [], "small": ["deepinfra/turbo"]},
+        "e": {"usable": [], "small": []},
+        "f": {"usable": [], "small": ["big"]},
+        "g": {"usable": ["x", "y"], "small": []},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_model_with_only_small_zero_retention_endpoints_has_no_zero_retention():
+    catalog.clear_cache()
+    def serve(request):
+        if request.url.path.endswith("/zdr"):
+            return httpx.Response(200, json={"data": [
+                {"model_id": "model/a", "tag": "small", "context_length": 8192},
+                {"model_id": "model/b", "tag": "big", "context_length": 8193},
+                {"model_id": "model/b", "tag": "small", "context_length": 4096}]})
+        return httpx.Response(200, json={"data": [{"id": "model/a"}, {"id": "model/b"}, {"id": "model/c"}]})
+
+    rows = await catalog.models(client_for(serve), OPENROUTER, KEY)
+    assert {model: (row["supports_zdr"], row["zdr_endpoints"]) for model, row in rows.items()} == {
+        "model/a": (False, {"usable": [], "small": ["small"]}),
+        "model/b": (True, {"usable": ["big"], "small": ["small"]}),
+        "model/c": (False, {"usable": [], "small": []}),
+    }

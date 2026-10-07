@@ -17,7 +17,8 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { cn } from '@/lib/utils';
 
 const KEY_SETTINGS = { privacyLink: 'https://openrouter.ai/settings/privacy',
-  observabilityLink: 'https://openrouter.ai/settings/observability' };
+  observabilityLink: 'https://openrouter.ai/settings/observability',
+  pluginsLink: 'https://openrouter.ai/settings/plugins' };
 const LEVEL_OF = { own: 'normal', private: 'private' };
 const codeOf = (error) => (error instanceof ApiError ? error.code : 'internal');
 
@@ -189,7 +190,7 @@ export function KeyConfirmation({ provider, onChanged }) {
       <div className="space-y-1.5 text-xs leading-relaxed text-muted-foreground">
         <p>{t('privacy.key.intro')}</p>
         <ul className="list-disc space-y-1 pl-5">
-          {['logging', 'improvement', 'broadcast'].map((item) => <li key={item}>{t(`privacy.key.${item}`)}</li>)}
+          {['logging', 'improvement', 'broadcast', 'plugins'].map((item) => <li key={item}>{t(`privacy.key.${item}`)}</li>)}
         </ul>
         <p>{t('privacy.key.unverifiable')}</p>
       </div>

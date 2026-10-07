@@ -24,7 +24,7 @@ CATALOGS = Path(__file__).resolve().parents[1] / "frontend" / "src" / "i18n"
 # Each statement version's digest over its texts in every catalog. A changed text needs a new
 # version in backend/governance.py (which asks again) and its digest here.
 STATEMENT_DIGESTS = {
-    ("privacy.key.", governance.KEY_STATEMENT): "620e5ca07776fb1592c0c2430cc10cceafb933dbc7fcafc7ac52f2ae9d0b8b38",
+    ("privacy.key.", governance.KEY_STATEMENT): "e8ee79b5ebe8740a679f6f22357ed6768a1235a45b1130d3414e0a090afcaba5",
     ("privacy.local.", governance.LOCAL_STATEMENT): "c83761d9b76d1cb6894fa6eca407a55d6cd54216de6d105bf7ce1e76a12076b5",
 }
 
@@ -215,7 +215,7 @@ async def test_a_private_title_run_resumed_after_a_restart_reads_the_catalog_fir
     provider = MockProvider(catalog=[MODEL], zero_retention=[MODEL])
     async with started(data, provider, keyring=keyring, setup=False) as client:
         await background_idle(client)
-        assert [body["provider"] for body in provider.titles] == [{"zdr": True}]
+        assert [body["provider"] for body in provider.titles] == [{"zdr": True, "only": ["example"]}]
         assert await rows(client, "SELECT status FROM runs WHERE workflow = 'title'") == [("succeeded",)]
 
 

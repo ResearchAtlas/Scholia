@@ -106,7 +106,8 @@ def gate_inputs(data_root) -> GateInputs:
         if chosen is None or not (chosen.is_openrouter and is_openrouter(chosen.base_url)):
             return None
         entry = governance.covering_entry(governance.allowlist(conn), model)
-        return entry if entry is not None and governance.zero_retention(chosen, model, key) else None
+        endpoints = governance.zero_retention_endpoints(chosen, model, key) if entry is not None else None
+        return {**entry, "zdr_endpoints": endpoints} if endpoints is not None else None
 
     return GateInputs(provider_urls=tuple(p.base_url for p in found.values()), private_route=private_route,
                       key_attested=lambda conn, provider, key: governance.key_confirmed_until(

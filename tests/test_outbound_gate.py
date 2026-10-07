@@ -27,20 +27,25 @@ LOCAL_SERVER = "http://127.0.0.1:11434/v1"
 OA_LINK = "https://repository.example.org/files/paper.pdf"
 ROUTES = {"example/model-a", "example/model-b"}
 KEY = "sk-or-v1-confirmed-key"
-AUTH = {"Authorization": f"Bearer {KEY}"}
+NO_CACHE = {"X-OpenRouter-Cache": "false"}  # every Private request carries it
+AUTH = {"Authorization": f"Bearer {KEY}", **NO_CACHE}
 ZDR_ONLY = {"provider": {"zdr": True}}
+# The models' zero-retention endpoints as the catalog lists them: a request is limited to the
+# usable ones and ignores the small ones, where OpenRouter compresses by default.
+ENDPOINTS = {"usable": ["example", "other/large"], "small": ["tiny", "other/small"]}
+LIMITED = {"zdr": True, "only": ["example"], "ignore": ["tiny", "other/small"]}
 CONFIRMED_UNTIL = "2999-01-01T00:00:00.000Z"  # when a confirmed key's confirmation lapses
 
 
 def entry(flags):
     """An allowlist entry with these request flags, as GateInputs.private_route returns it."""
     return {"route_key": "openrouter:*", "required_flags": flags, "terms_url": "https://openrouter.ai/terms",
-            "checked_on": "2026-10-03T00:00:00.000Z"}
+            "checked_on": "2026-10-03T00:00:00.000Z", "zdr_endpoints": ENDPOINTS}
 
 
 def chat(**fields):
     return {"model": "example/model-a", "messages": [{"role": "user", "content": "SECRET-PROMPT"}],
-            "provider": {"zdr": True}, **fields}
+            "provider": LIMITED, **fields}
 
 
 class Remote:
@@ -986,7 +991,7 @@ def private_post(setup, db, body=None, headers=AUTH, url=CHAT, **kwargs):
     with setup.gate.client(project(db, "private")) as client:
         if body is not None:
             kwargs["json"] = body
-        return client.post(url, headers=headers, **kwargs)
+        return client.post(url, headers={**NO_CACHE, **headers}, **kwargs)
 
 
 def test_private_request_with_zdr_and_function_tools_is_allowed(db, remote, setup):
@@ -1096,7 +1101,7 @@ def test_private_needs_the_allowlist_entrys_own_flags_and_always_zdr(db, remote,
     setup.change(private_route=lambda *args: entry({"provider": {"zdr": True, "data_collection": "deny"}}))
     with pytest.raises(OutboundDenied, match="missing_flags"):
         private_post(setup, db, chat())
-    private_post(setup, db, chat(provider={"zdr": True, "data_collection": "deny"}))
+    private_post(setup, db, chat(provider={**LIMITED, "data_collection": "deny"}))
     setup.change(private_route=lambda *args: entry({}))  # an entry cannot waive provider.zdr
     with pytest.raises(OutboundDenied, match="missing_flags"):
         private_post(setup, db, chat(provider={}))
@@ -1105,6 +1110,50 @@ def test_private_needs_the_allowlist_entrys_own_flags_and_always_zdr(db, remote,
         with pytest.raises(OutboundDenied, match="route_not_allowed"):
             private_post(setup, db, chat())
     assert len(remote.received) == 1
+
+
+@pytest.mark.parametrize("cache", [None, "true", "False", ["false", "false"]])
+def test_private_needs_the_response_cache_off_once(db, remote, setup, cache):
+    # X-OpenRouter-Cache: false, exactly once: provider.zdr does not turn response caching off.
+    headers = [("Authorization", f"Bearer {KEY}")] + [("X-OpenRouter-Cache", v) for v in (
+        [] if cache is None else cache if isinstance(cache, list) else [cache])]
+    with setup.gate.client(project(db, "private")) as client:
+        refused(client, "POST", CHAT, "missing_flags", json=chat(), headers=headers)
+    assert remote.received == []
+
+
+@pytest.mark.parametrize("routing", [
+    {"zdr": True},  # not limited at all
+    {"zdr": True, "ignore": ["tiny", "other/small"]},
+    {**LIMITED, "only": []},
+    {**LIMITED, "only": "example"},
+    {**LIMITED, "only": ["example", "tiny"]},  # a small endpoint
+    {**LIMITED, "only": ["example", "unlisted"]},  # one the catalog does not list as usable
+    {**LIMITED, "only": ["other"]},  # a base slug, which would also match other/small
+    {**LIMITED, "ignore": ["tiny"]},  # a small endpoint not ignored
+    {**LIMITED, "ignore": None},
+    {**LIMITED, "ignore": [1]},
+])
+def test_private_reaches_no_endpoint_where_openrouter_compresses_by_default(db, remote, setup, routing):
+    with pytest.raises(OutboundDenied, match="missing_flags"):
+        private_post(setup, db, chat(provider=routing))
+    assert remote.received == []
+    private_post(setup, db, chat(provider={**LIMITED, "only": ["example", "other/large"]}))
+    assert len(remote.received) == 1
+
+
+def test_private_refuses_a_model_whose_endpoints_the_catalog_does_not_list(db, remote, setup):
+    # Without the catalog's endpoints (none usable, or not read with this key) nothing goes out.
+    for endpoints in (None, {"usable": [], "small": []}, {"usable": ["example"]}, "example"):
+        setup.change(private_route=lambda *args, endpoints=endpoints: {**entry(ZDR_ONLY), "zdr_endpoints": endpoints})
+        with pytest.raises(OutboundDenied, match="missing_flags"):
+            private_post(setup, db, chat())
+    # Each model of a request with fallbacks is checked against its own endpoints.
+    setup.change(private_route=lambda conn, provider, key, model: {**entry(ZDR_ONLY), "zdr_endpoints": (
+        ENDPOINTS if model == "example/model-a" else {"usable": ["other/large"], "small": ["example"]})})
+    with pytest.raises(OutboundDenied, match="missing_flags"):
+        private_post(setup, db, chat(models=["example/model-b"]))
+    assert remote.received == []
 
 
 @pytest.mark.parametrize("headers", [

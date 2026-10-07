@@ -785,7 +785,10 @@ class Harness:
                                           provider=route.provider.name) as client:
             result = await openrouter.query_model(
                 client, route, key, messages, timeout=MODEL_CALL_SECONDS, effort=effort, max_tokens=max_tokens,
-                zdr_enabled=zero_retention, model_entry=get_model_metadata(route), on_dispatch=dispatched)
+                zdr_enabled=zero_retention, on_dispatch=dispatched,
+                # A Private call is limited to the endpoints the catalog read with its key lists,
+                # as the gate checks it.
+                model_entry=get_model_metadata(route, key) if zero_retention else get_model_metadata(route))
             finished = {"step": call.step, "outcome": result.error_kind or "ok"}
             if output is not None and result.ok:
                 finished["output"] = output(result)

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from backend import reasoning_capability
-from backend.outbound_gate import DISPATCHED, OutboundDenied
+from backend.outbound_gate import DISPATCHED, NO_RESPONSE_CACHE, OutboundDenied
 from backend.reasoning_control import resolve_reasoning_payload
 from backend.settings import visible
 from backend.spending import amount
@@ -203,6 +203,14 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
     provider = {}
     if zdr_enabled:
         provider["zdr"] = True  # never weakened
+        # Only the model's zero-retention endpoints above the window where OpenRouter compresses
+        # by default, and never its smaller ones (slice 1 section 6.4). Without them in the
+        # catalog's row, the gate refuses the request.
+        endpoints = (model_entry or {}).get("zdr_endpoints") or {}
+        if endpoints.get("usable"):
+            provider["only"] = list(endpoints["usable"])
+            if endpoints.get("small"):
+                provider["ignore"] = list(endpoints["small"])
     if pin and route.provider.is_openrouter:
         provider["order"] = [pin]
         provider["allow_fallbacks"] = False
@@ -238,6 +246,8 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
     if "reasoning" in payload and _skips_reasoning(route, key):
         del payload["reasoning"]
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if zdr_enabled:
+        headers[NO_RESPONSE_CACHE[0]] = NO_RESPONSE_CACHE[1]  # OpenRouter's response caching off (section 6.4)
     deadline = time.monotonic() + timeout
     attempts = []
     while True:
