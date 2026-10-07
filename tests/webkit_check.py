@@ -104,6 +104,7 @@ def check(window, args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     origin, session = args.url.split("#session=")
+    origin = origin.rstrip("/")
     labels = catalog(args.lang)
     tag = f"{args.lang}-{args.theme}-{args.layout}"
     view = BrowserView.instances[window.uid].webview

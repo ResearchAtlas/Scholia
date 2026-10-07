@@ -65,19 +65,22 @@ function digest(dir) {
 }
 
 // The sockets a set of processes hold that are not loopback-only (lsof's NAME column). A listener on
-// every interface (*:port) is not loopback. lsof exits 1 with no output when there is nothing to
-// list; any other failure, or output it cannot read, throws: an unchecked process is never clean.
+// every interface (*:port) is not loopback. lsof exits 1 when some process has nothing to list (or
+// has just exited), printing what it found for the others; any other exit, a message on stderr,
+// or output it cannot read throws: an unchecked process is never clean.
 function foreignSockets(pids) {
   if (!pids.length) throw new Error('no launched process to check');
   let out = '';
   try {
     out = execFileSync('lsof', ['-nP', '-a', '-p', pids.join(','), '-i'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (error) {
-    if (error.status === 1 && !String(error.stdout ?? '').trim() && !String(error.stderr ?? '').trim()) return [];
-    throw new Error(`lsof failed: ${error.message}`);
+    if (error.status !== 1 || String(error.stderr ?? '').trim()) {
+      throw new Error(`lsof failed (${error.status}): ${String(error.stderr ?? '').trim()}`);
+    }
+    out = String(error.stdout ?? '');
   }
   const lines = out.split('\n').filter(Boolean);
-  if (!/^COMMAND\s+PID/.test(lines[0] ?? '')) throw new Error(`unreadable lsof output: ${lines[0]}`);
+  if (lines.length && !/^COMMAND\s+PID/.test(lines[0])) throw new Error(`unreadable lsof output: ${lines[0]}`);
   return lines.slice(1).filter((line) => {
     const name = line.trim().split(/\s+/).slice(8).join(' ').replace(/ \(.*\)$/, '');
     if (!name) return true;
@@ -576,7 +579,8 @@ async function run(combo, build, outRoot) {
     '--disable-component-update', '--disable-sync', '--no-default-browser-check', '--no-first-run'] });
   manifest.browser = `${opts.browser.split('/').pop()} ${browser.version()}`;
   const pids = () => descendants(process.pid).slice(1);  // every process this run launched: the server's and the browser's
-  manifest.network = { before: foreignSockets(pids()) };
+  manifest.network = {};
+  try { manifest.network.before = foreignSockets(pids()); } catch (error) { manifest.network.before = [`not checked: ${error.message}`]; }
   const context = await browser.newContext({ viewport: SIZES[combo.layout], deviceScaleFactor: 1, colorScheme: combo.theme,
                                              reducedMotion: 'no-preference' });
   const blocked = [];

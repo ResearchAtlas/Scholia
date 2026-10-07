@@ -9,12 +9,17 @@ cd "$(dirname "$0")/.."
 out=$1; mkdir -p "$out"; status=0
 digest() { (cd frontend/dist && find . -type f | sed 's|^\./||' | LC_ALL=C sort | while read -r f; do printf '%s\0%s\n' "$f" "$(shasum -a 256 "$f" | cut -d' ' -f1)"; done | shasum -a 256 | cut -d' ' -f1); }
 record=frontend/node_modules/.walkthrough-build.json
-python3 - "$record" "$(git rev-parse HEAD)" "$(digest)" "$(git status --porcelain --untracked-files=all | wc -l | tr -d ' ')" <<'PY' || { echo "frontend/dist is not the recorded build of this checkout"; exit 1; }
-import json, sys
-r = json.load(open(sys.argv[1]))
-ok = r["commit"] == sys.argv[2] and r["distDigest"] == sys.argv[3] and (r["changes"] is None) == (sys.argv[4] == "0")
-sys.exit(0 if ok else 1)
-PY
+node --input-type=module - "$record" "$(digest)" <<'JS' || { echo "frontend/dist is not the recorded build of this checkout as it is now"; exit 1; }
+// The same check as walkthrough_driver.mjs: the record's commit, uncommitted changes and digest.
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+const sh = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
+const status = sh('status', '--porcelain', '--untracked-files=all');
+const changes = status ? createHash('sha256').update(status + sh('diff', 'HEAD', '--binary')).digest('hex') : null;
+const record = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+process.exit(record.commit === sh('rev-parse', 'HEAD') && record.changes === changes && record.distDigest === process.argv[3] ? 0 : 1);
+JS
 echo "$(git rev-parse HEAD) $(digest)" > "$out/provenance.txt"
 for lang in en zh-CN; do for theme in light dark; do for layout in wide drawer; do
   log="$out/server-$lang-$theme-$layout.log"
