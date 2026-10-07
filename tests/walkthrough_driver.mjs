@@ -687,14 +687,15 @@ async function run(combo, build, outRoot) {
         if (browser) await browser.close().catch((error) => { manifest.closeError = String(error); });
       } finally {
         stopServer();
+        // The run passes only if its network checks pass too: the manifest says what the run reports.
+        manifest.ok = manifest.ok && !manifest.network.before.length && !manifest.network.after.length && !blocked.length;
         manifest.finished = new Date().toISOString();
         writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest, null, 2));
       }
     }
   }
-  const clean = manifest.ok && !manifest.network.before.length && !manifest.network.after.length && !blocked.length;
-  console.log(`${tag}: ${clean ? 'ok' : 'FAILED'}${manifest.error ? ` (${manifest.error.split('\n')[0]})` : ''}`);
-  return clean;
+  console.log(`${tag}: ${manifest.ok ? 'ok' : 'FAILED'}${manifest.error ? ` (${manifest.error.split('\n')[0]})` : ''}`);
+  return manifest.ok;
 }
 
 // The checkout's state: its commit, and a digest of every uncommitted change (empty when clean).

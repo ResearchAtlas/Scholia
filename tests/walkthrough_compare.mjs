@@ -27,11 +27,15 @@ mkdirSync(out, { recursive: true });
 
 const walk = (dir) => readdirSync(dir, { recursive: true }).filter((name) => statSync(join(dir, name)).isFile());
 const pngs = walk(baseline).filter((name) => name.endsWith('.png') && !name.endsWith('-failed.png')).sort();
+// Each file below is compared from the baseline's list; one only the candidate has is a difference too.
+const compared = (name) => (name.endsWith('.png') && !name.endsWith('-failed.png')) || name.endsWith('motion.json') || name.endsWith('.styles.json');
+const baselineFiles = new Set(walk(baseline));
 
 const browser = await chromium.launch({ executablePath: process.env.SCHOLIA_BROWSER ?? BROWSER,
   args: ['--host-resolver-rules=MAP * ~NOTFOUND'] });
 const page = await browser.newPage();
-const summary = { baseline, candidate, screenshots: [], motion: [] };
+const summary = { baseline, candidate, screenshots: [], motion: [],
+                  candidateOnly: walk(candidate).filter((name) => compared(name) && !baselineFiles.has(name)).sort() };
 for (const name of pngs) {
   if (!existsSync(join(candidate, name))) { summary.screenshots.push({ name, missing: true }); continue; }
   const [a, b] = [baseline, candidate].map((dir) => readFileSync(join(dir, name)).toString('base64'));
@@ -195,5 +199,6 @@ const changed = summary.screenshots.filter((s) => s.count || s.missing || s.size
 console.log(`${summary.screenshots.length} screenshots compared, ${changed.length} differ`);
 for (const s of changed) console.log(`  ${s.name}: ${s.missing ? 'missing' : s.size ? `size ${JSON.stringify(s.size)}` : `${s.count} px in ${JSON.stringify(s.box)}`}`);
 for (const [change, { count, files, example }] of Object.entries(styleChanges)) console.log(`style ${change} (${count} elements in ${files} steps; ${example})`);
+console.log(`${summary.candidateOnly.length} files only in the candidate${summary.candidateOnly.map((name) => `\n  ${name}`).join('')}`);
 for (const m of summary.motion) console.log(`motion ${m.name}: ${m.missing ? 'missing' : m.differences.length ? m.differences.join('; ') : 'same'}`);
 
