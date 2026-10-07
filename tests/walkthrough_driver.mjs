@@ -28,7 +28,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -595,12 +595,23 @@ async function run(combo, build, outRoot) {
   const server = opts.attach ? null : await startServer(out);
   const origin = server ? server.origin : new URL(opts.attach).origin;
   const session = server ? server.session : new URL(opts.attach).hash.replace('#session=', '');
-  // The interface served (by the test server, or by the app attached to) must be this build.
-  manifest.servedMismatches = await servedMatches(origin, join(FRONTEND, 'dist'));
-  if (manifest.servedMismatches.length) throw new Error(`the server does not serve this build: ${manifest.servedMismatches}`);
-  const browser = await chromium.launch({ executablePath: opts.browser, args: [
-    '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1', '--disable-background-networking',
-    '--disable-component-update', '--disable-sync', '--no-default-browser-check', '--no-first-run'] });
+  const stopServer = () => {
+    if (!server) return;
+    server.child.kill();
+    try { process.kill(server.pid); } catch { /* already gone */ }
+  };
+  let browser;
+  try {
+    // The interface served (by the test server, or by the app attached to) must be this build.
+    manifest.servedMismatches = await servedMatches(origin, join(FRONTEND, 'dist'));
+    if (manifest.servedMismatches.length) throw new Error(`the server does not serve this build: ${manifest.servedMismatches}`);
+    browser = await chromium.launch({ executablePath: opts.browser, args: [
+      '--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1', '--disable-background-networking',
+      '--disable-component-update', '--disable-sync', '--no-default-browser-check', '--no-first-run'] });
+  } catch (error) {
+    stopServer();  // a run that cannot start never leaves its server behind
+    throw error;
+  }
   manifest.browser = `${opts.browser.split('/').pop()} ${browser.version()}`;
   const pids = () => descendants(process.pid).slice(1);  // every process this run launched: the server's and the browser's
   manifest.network = {};
@@ -659,11 +670,8 @@ async function run(combo, build, outRoot) {
     manifest.network.blockedRequests = blocked;
     manifest.console = consoleMessages;
     await browser.close();
-    if (server) {
-      manifest.serverErrors = server.stderr().split('\n').filter((line) => /error|traceback/i.test(line));
-      server.child.kill();
-      try { process.kill(server.pid); } catch { /* already gone */ }
-    }
+    if (server) manifest.serverErrors = server.stderr().split('\n').filter((line) => /error|traceback/i.test(line));
+    stopServer();
     manifest.finished = new Date().toISOString();
     writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest, null, 2));
   }
@@ -703,6 +711,9 @@ if (!opts['no-build'] && !opts.attach) {
 const combos = opts.all
   ? ['en', 'zh-CN'].flatMap((lang) => ['light', 'dark'].flatMap((theme) => ['wide', 'drawer'].map((layout) => ({ lang, theme, layout }))))
   : [{ lang: opts.lang, theme: opts.theme, layout: opts.layout }];
+// Every file in the output folder must come from this run: a folder that already holds files is
+// refused, so nothing from an earlier run can be compared as this run's.
+if (existsSync(opts.out) && readdirSync(opts.out).length) throw new Error(`${opts.out} is not empty: give each run a new folder`);
 mkdirSync(opts.out, { recursive: true });
 let ok = true;
 for (const combo of combos) ok = (await run(combo, build, opts.out)) && ok;

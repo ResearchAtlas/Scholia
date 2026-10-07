@@ -7,7 +7,10 @@
 #     tests/walkthrough_webkit.sh OUT
 set -u
 cd "$(dirname "$0")/.."
-out=$1; mkdir -p "$out"; status=0
+out=$1; status=0
+# Every file in OUT must come from this run.
+if [ -e "$out" ] && [ -n "$(ls -A "$out")" ]; then echo "$out is not empty: give each run a new folder"; exit 1; fi
+mkdir -p "$out"
 digest() { (cd frontend/dist && find . -type f | sed 's|^\./||' | LC_ALL=C sort | while read -r f; do printf '%s\0%s\n' "$f" "$(shasum -a 256 "$f" | cut -d' ' -f1)"; done | shasum -a 256 | cut -d' ' -f1); }
 record=frontend/node_modules/.walkthrough-build.json
 node --input-type=module - "$record" "$(digest)" <<'JS' || { echo "frontend/dist is not the recorded build of this checkout as it is now"; exit 1; }
