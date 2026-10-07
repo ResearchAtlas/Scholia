@@ -134,6 +134,10 @@ async function startServer(dir) {
   for (let tries = 0; !pid && tries < 100; tries += 1) {  // the address is printed before the server listens
     try { pid = Number(sh('lsof', ['-t', '-nP', `-iTCP:${url.port}`, '-sTCP:LISTEN'])); } catch { await new Promise((r) => setTimeout(r, 100)); }
   }
+  if (!Number.isInteger(pid) || pid <= 0) {  // never signal a pid that was not found (0 is the whole process group)
+    child.kill();
+    throw new Error(`the server's listener on port ${url.port} was not found`);
+  }
   return { child, pid, origin: url.origin, session: url.hash.replace('#session=', ''), dataFolder: lines['data folder'],
            log, stderr: () => stderr };
 }
@@ -598,7 +602,9 @@ async function run(combo, build, outRoot) {
   const stopServer = () => {
     if (!server) return;
     server.child.kill();
-    try { process.kill(server.pid); } catch { /* already gone */ }
+    if (Number.isInteger(server.pid) && server.pid > 0) {
+      try { process.kill(server.pid); } catch { /* already gone */ }
+    }
   };
   let browser;
   try {
