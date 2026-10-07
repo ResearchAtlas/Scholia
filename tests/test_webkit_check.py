@@ -72,3 +72,11 @@ def test_a_window_closed_before_the_check_finishes_fails(webkit_check, monkeypat
     # pywebview returns when the window closes, whether or not the check thread has finished.
     monkeypatch.setattr(webkit_check.webview, "start", lambda run: None)
     assert webkit_check.main(["http://127.0.0.1:1/#session=s", "--out", str(tmp_path)]) == 1
+
+
+def test_a_folder_that_already_holds_files_is_refused(webkit_check, monkeypatch, tmp_path):
+    (tmp_path / "en-light-wide-01-setup.png").write_bytes(b"from an earlier run")
+    monkeypatch.setattr(webkit_check.webview, "create_window", lambda *args, **kwargs: pytest.fail("a window was opened"))
+    with pytest.raises(SystemExit) as refused:
+        webkit_check.main(["http://127.0.0.1:1/#session=s", "--out", str(tmp_path)])
+    assert refused.value.code == 2

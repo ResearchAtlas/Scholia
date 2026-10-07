@@ -248,6 +248,9 @@ def main(argv=None):
     parser.add_argument("--theme", default="light")
     parser.add_argument("--layout", default="wide")
     args = parser.parse_args(argv)
+    # Every file in --out must come from this check: a folder that already holds files is refused.
+    if Path(args.out).exists() and any(Path(args.out).iterdir()):
+        parser.error(f"{args.out} is not empty: give each check a new folder")
     width, height = SIZES[args.layout]
     window = webview.create_window("Scholia WebKit check (synthetic)", args.url, width=width, height=height)
     passed = []  # set only when the whole check has finished without a failure
