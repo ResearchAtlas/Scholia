@@ -18,6 +18,7 @@ checked here: WebKit follows the system setting, which this does not change.
 import argparse
 import json
 import re
+import sys
 import threading
 import time
 import urllib.request
@@ -227,18 +228,22 @@ def main(argv=None):
     args = parser.parse_args(argv)
     width, height = SIZES[args.layout]
     window = webview.create_window("Scholia WebKit check (synthetic)", args.url, width=width, height=height)
+    failures = []
 
     def run():
         try:
-            window.events.loaded.wait(30)
+            if not window.events.loaded.wait(30):
+                raise RuntimeError("the interface did not load")
             check(window, args)
         except Exception as error:  # reported, and the window still closes
+            failures.append(error)
             print(f"FAILED: {error!r}", flush=True)
         finally:
             window.destroy()
 
     webview.start(run)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
