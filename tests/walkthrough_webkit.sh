@@ -1,9 +1,11 @@
 #!/bin/bash
 # Runs tests/webkit_check.py in each combination of language, theme and layout, each against a new
 # tests/walkthrough.py server, on the interface build the walkthrough driver last made and recorded
-# for this checkout as it is now; the server must serve that build byte for byte, and the server, the
-# checker and the WebKit processes started for it must hold no socket but loopback ones while the
-# check runs. Exits 1 if any of that fails.
+# for this checkout as it is now; the server must serve that build byte for byte; the checker runs in a
+# sandbox that refuses outgoing connections but loopback; and the server, the checker and the WebKit
+# processes started for it must hold no socket but loopback ones, sampled every second while the
+# check runs (a connection opened and closed between samples is not seen, which the sandbox and the
+# interface's Content-Security-Policy cover). Exits 1 if any of that fails.
 #     tests/walkthrough_webkit.sh OUT
 set -u
 cd "$(dirname "$0")/.."
@@ -47,24 +49,31 @@ for lang in en zh-CN; do for theme in light dark; do for layout in wide drawer; 
   # pgrep exits 1 when nothing matches; any other status is a failed discovery, never "none".
   discover() { local found; found=$(pgrep "$@"); local st=$?; if [ $st -gt 1 ]; then echo "pgrep $* failed ($st)" >&2; return 2; fi; echo "$found"; }
   webkit_before=$(discover -f 'com\.apple\.WebKit') || { echo "process discovery failed"; status=1; }
-  uv run --no-sync python tests/webkit_check.py "$origin/#${url#*#}" --out "$out/$lang-$theme-$layout" --lang $lang --theme $theme --layout $layout &
+  # The checker runs in a sandbox that refuses every outgoing connection but loopback, and while it
+  # runs, the server, the checker and its children, and the WebKit processes started since (its
+  # content and networking services, which launchd starts) are checked with lsof every second.
+  sandbox-exec -f tests/loopback-only.sb uv run --no-sync python tests/webkit_check.py "$origin/#${url#*#}" \
+    --out "$out/$lang-$theme-$layout" --lang $lang --theme $theme --layout $layout &
   check=$!
-  sleep 5
-  # Every process this check launched: the server, the checker and its children, and the WebKit
-  # processes started since (WebKit's content and networking services, which launchd starts).
-  webkit_after=$(discover -f 'com\.apple\.WebKit') || { echo "process discovery failed"; status=1; }
-  children=$(discover -P "$check") || { echo "process discovery failed"; status=1; }
-  webkit_new=$(comm -13 <(echo "$webkit_before" | sort) <(echo "$webkit_after" | sort))
-  pids=$(echo "$pid $check $children $webkit_new" | tr -s ' \n' ',' | sed 's/^,//; s/,$//')
-  lsof_out=$(lsof -nP -a -p "$pids" -i 2>"$out/lsof.err"); lsof_status=$?
-  if { [ $lsof_status -ne 0 ] && [ $lsof_status -ne 1 ]; } || [ -s "$out/lsof.err" ] \
-     || { [ -n "$lsof_out" ] && ! head -1 <<<"$lsof_out" | grep -q '^COMMAND'; }; then
-    echo "socket check failed for $lang-$theme-$layout: $(cat "$out/lsof.err")"; status=1
-  else
-    sockets=$(tail -n +2 <<<"$lsof_out" | awk '{ n = split($9, ends, "->"); for (i = 1; i <= n; i++) if (ends[i] !~ /^(127\.0\.0\.1|\[::1\]):/) { print; next } }')
-    [ -n "$sockets" ] && { echo "NON-LOOPBACK SOCKET: $sockets"; status=1; }
-  fi
-  echo "$lang-$theme-$layout processes checked: $pids" >> "$out/sockets.txt"
+  samples=0
+  while kill -0 "$check" 2>/dev/null; do
+    webkit_after=$(discover -f 'com\.apple\.WebKit') || { echo "process discovery failed"; status=1; }
+    children=$(discover -P "$check") || { echo "process discovery failed"; status=1; }
+    webkit_new=$(comm -13 <(echo "$webkit_before" | sort) <(echo "$webkit_after" | sort))
+    pids=$(echo "$pid $check $children $webkit_new" | tr -s ' \n' ',' | sed 's/^,//; s/,$//')
+    lsof_out=$(lsof -nP -a -p "$pids" -i 2>"$out/lsof.err"); lsof_status=$?
+    if { [ $lsof_status -ne 0 ] && [ $lsof_status -ne 1 ]; } || [ -s "$out/lsof.err" ] \
+       || { [ -n "$lsof_out" ] && ! head -1 <<<"$lsof_out" | grep -q '^COMMAND'; }; then
+      kill -0 "$check" 2>/dev/null && { echo "socket check failed for $lang-$theme-$layout: $(cat "$out/lsof.err")"; status=1; }
+    else
+      sockets=$(tail -n +2 <<<"$lsof_out" | awk '{ n = split($9, ends, "->"); for (i = 1; i <= n; i++) if (ends[i] !~ /^(127\.0\.0\.1|\[::1\]):/) { print; next } }')
+      [ -n "$sockets" ] && { echo "NON-LOOPBACK SOCKET: $sockets"; status=1; }
+      samples=$((samples + 1))
+    fi
+    sleep 1
+  done
+  [ $samples -gt 0 ] || { echo "no socket sample taken for $lang-$theme-$layout"; status=1; }
+  echo "$lang-$theme-$layout: $samples samples, last processes checked: $pids" >> "$out/sockets.txt"
   rm -f "$out/lsof.err"
   wait $check || status=1
   kill "$pid"; rm -f "$log"

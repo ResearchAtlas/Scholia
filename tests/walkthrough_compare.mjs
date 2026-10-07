@@ -21,6 +21,8 @@ const BROWSER = join(homedir(), 'Library/Caches/ms-playwright/chromium-1217/chro
   'Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing');
 const [baseline, candidate, out] = process.argv.slice(2);
 if (!out) throw new Error('usage: walkthrough_compare.mjs BASELINE CANDIDATE OUT');
+// Every file in OUT must come from this comparison: a folder that already holds files is refused.
+if (existsSync(out) && readdirSync(out).length) throw new Error(`${out} is not empty: give each comparison a new folder`);
 mkdirSync(out, { recursive: true });
 
 const walk = (dir) => readdirSync(dir, { recursive: true }).filter((name) => statSync(join(dir, name)).isFile());
