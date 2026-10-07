@@ -83,8 +83,10 @@ for (const name of walk(baseline).filter((n) => n.endsWith('motion.json'))) {
   if (!existsSync(join(candidate, name))) { summary.motion.push({ name, missing: true }); continue; }
   const [ma, mb] = [baseline, candidate].map((dir) => JSON.parse(readFileSync(join(dir, name), 'utf8')));
   const differences = [];
-  for (const key of Object.keys(ma)) {
+  // Every key and frame either run recorded: one only the candidate has is a difference too.
+  for (const key of [...new Set([...Object.keys(ma), ...Object.keys(mb)])]) {
     const [x, y] = [ma[key], mb[key]];
+    if (x === undefined || y === undefined) { differences.push(`${key}: present in one run only`); continue; }
     if (x?.opened !== undefined) {
       for (const phase of ['opened', 'closed']) {
         if (!x[phase] !== !y?.[phase]) { differences.push(`${key}.${phase}: present in one run only`); continue; }
@@ -94,6 +96,7 @@ for (const name of walk(baseline).filter((n) => n.endsWith('motion.json'))) {
           continue;
         }
         if (x[phase].duration !== y[phase].duration) differences.push(`${key}.${phase}.duration ${x[phase].duration} → ${y[phase].duration}`);
+        if (x[phase].frames.length !== y[phase].frames.length) { differences.push(`${key}.${phase}: ${x[phase].frames.length} → ${y[phase].frames.length} frames`); continue; }
         x[phase].frames.forEach((f, i) => {
           const g = y[phase].frames[i];
           for (const k of ['x', 'y', 'width', 'height']) if (Math.abs(f[k] - g[k]) > 0.5) differences.push(`${key}.${phase} t=${f.t} ${k} ${f[k].toFixed(1)} → ${g[k].toFixed(1)}`);
@@ -175,7 +178,7 @@ for (const name of walk(baseline).filter((n) => n.endsWith('.styles.json'))) {
         if (a !== b && !(key === 'outline-color' && sameColor(a, b))) note(`${key}: ${a} → ${b}`, x.path);
       }
     }
-    for (const key of Object.keys(x)) {
+    for (const key of new Set([...Object.keys(x), ...Object.keys(y)])) {
       if (key === 'path' || key === 'box' || key.startsWith('outline') || SKIP.test(key)) continue;
       const [a, b] = [normalize(key, x[key]), normalize(key, y[key])];
       if (a === b || (/color|placeholder/.test(key) && sameColor(a, b))) continue;
