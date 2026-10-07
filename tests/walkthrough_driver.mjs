@@ -673,15 +673,24 @@ async function run(combo, build, outRoot) {
     manifest.error = String(error.stack ?? error);
     if (page) await page.screenshot({ path: join(out, `${tag}-failed.png`) }).catch(() => {});
   } finally {
-    try { manifest.network.after = foreignSockets(pids()); } catch (error) { manifest.network.after = [`not checked: ${error.message}`]; }
-    manifest.network.processes = pids();
-    manifest.network.blockedRequests = blocked;
-    manifest.console = consoleMessages;
-    if (browser) await browser.close().catch((error) => { manifest.closeError = String(error); });
-    if (server) manifest.serverErrors = server.stderr().split('\n').filter((line) => /error|traceback/i.test(line));
-    stopServer();
-    manifest.finished = new Date().toISOString();
-    writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest, null, 2));
+    // What is recorded can fail (a process listing, say); the browser and the server are released
+    // in an inner finally that no such failure can skip, and the manifest is always written.
+    try {
+      manifest.network.after = ['not checked'];
+      try { manifest.network.processes = pids(); manifest.network.after = foreignSockets(manifest.network.processes); }
+      catch (error) { manifest.network.after = [`not checked: ${error.message}`]; }
+      manifest.network.blockedRequests = blocked;
+      manifest.console = consoleMessages;
+      if (server) manifest.serverErrors = server.stderr().split('\n').filter((line) => /error|traceback/i.test(line));
+    } finally {
+      try {
+        if (browser) await browser.close().catch((error) => { manifest.closeError = String(error); });
+      } finally {
+        stopServer();
+        manifest.finished = new Date().toISOString();
+        writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest, null, 2));
+      }
+    }
   }
   const clean = manifest.ok && !manifest.network.before.length && !manifest.network.after.length && !blocked.length;
   console.log(`${tag}: ${clean ? 'ok' : 'FAILED'}${manifest.error ? ` (${manifest.error.split('\n')[0]})` : ''}`);
