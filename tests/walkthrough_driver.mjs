@@ -348,13 +348,27 @@ async function motion(ctx) {
   const showSidebar = page.getByRole('button', { name: L('sidebar.show') });
   const drawerLayout = page.viewportSize().width < 1000;
   const settle = () => page.waitForTimeout(500);
-  const durations = (handles) => Promise.all(handles.map((h) => h.evaluate((e) => (e.isConnected ? e.getAnimations({ subtree: true }) : []).map((a) => a.effect.getComputedTiming().duration))));
+  // Under reduced motion, every animation that starts is recorded as it starts (animationstart),
+  // with its duration, so one that finishes before it could be read is still counted.
+  await page.evaluate(() => {
+    window.__walkthroughStarts = [];
+    document.addEventListener('animationstart', (event) => {
+      window.__walkthroughStarts.push({ target: event.target, name: event.animationName,
+                                        duration: parseFloat(getComputedStyle(event.target).animationDuration) * 1000 });
+    }, true);
+  });
+  const starts = (handles) => Promise.all(handles.map((h) => h.evaluate((e) => window.__walkthroughStarts
+    .filter((s) => e === s.target || e.contains(s.target)).map((s) => ({ name: s.name, duration: s.duration })))));
+  const clearStarts = () => page.evaluate(() => { window.__walkthroughStarts.length = 0; });
   const reduced = {};
   const record = async (name, open, targets, close) => {
+    if (page._reduced) await clearStarts();
     await open();
     const handles = await Promise.all(targets.map((t) => t().elementHandle()));
     if (page._reduced) {
-      reduced[name] = (await durations(handles)).flat();
+      await settle();
+      (await starts(handles)).forEach((list, i) => { reduced[i ? `${name}-overlay` : name] = list; });
+      await clearStarts();
     } else {
       for (const [i, handle] of handles.entries()) {
         const key = i ? `${name}-overlay` : name;
@@ -365,11 +379,15 @@ async function motion(ctx) {
     await settle();
     if (!page._reduced) results[name].settled = await handles[0].evaluate((e) => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; });
     await close();
+    if (page._reduced) {
+      await settle();
+      (await starts(handles)).forEach((list, i) => { reduced[`${i ? `${name}-overlay` : name} closing`] = list; });
+    }
     for (const [i, handle] of handles.entries()) {
       const key = i ? `${name}-overlay` : name;
       const connected = await handle.evaluate((e) => e.isConnected);
       const closing = connected ? await sample(handle) : null;
-      if (page._reduced) { if (closing) reduced[`${name} closing`] = (await durations([handle])).flat(); continue; }
+      if (page._reduced) continue;
       results[key].closed = closing && closing.duration > 0 ? closing : { immediate: true };
     }
     await settle();
@@ -409,8 +427,11 @@ async function motion(ctx) {
   page._reduced = false;
   await page.emulateMedia({ reducedMotion: 'no-preference' });
   results.reducedMotion = reduced;
-  ctx.check('reduced motion: every animation lasts at most 1 ms', Object.values(reduced).flat().every((d) => d <= 1)
-    && Object.keys(reduced).length >= (drawerLayout ? 6 : 5));
+  // Every element that animates when motion is allowed started at least one animation when opened,
+  // and every animation that started, opening or closing, lasted at most 1 ms.
+  const opened = Object.keys(results).filter((key) => results[key]?.opened?.duration > 0);
+  ctx.check('reduced motion: each animated element was measured opening', opened.every((key) => reduced[key]?.length > 0));
+  ctx.check('reduced motion: every animation lasts at most 1 ms', Object.values(reduced).flat().every((a) => a.duration <= 1));
   writeFileSync(join(C.out, 'motion.json'), JSON.stringify(results, null, 2));
 }
 
@@ -651,8 +672,11 @@ async function run(combo, build, outRoot) {
 // The checkout's state: its commit, and a digest of every uncommitted change (empty when clean).
 function source() {
   const status = sh('git', ['status', '--porcelain', '--untracked-files=all']);
+  // Untracked files' bytes as well as their names: git diff leaves them out.
+  const untracked = sh('git', ['ls-files', '--others', '--exclude-standard']).split('\n').filter(Boolean)
+    .map((path) => `${path}\0${sha256(readFileSync(join(ROOT, path)))}`).join('\n');
   return { commit: sh('git', ['rev-parse', 'HEAD']), dirty: status !== '',
-           changes: status ? sha256(status + sh('git', ['diff', 'HEAD', '--binary'])) : null };
+           changes: status ? sha256(`${status}\n${sh('git', ['diff', 'HEAD', '--binary'])}\n${untracked}`) : null };
 }
 
 // Each build records the checkout it was built from beside node_modules (outside what is served).

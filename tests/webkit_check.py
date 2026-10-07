@@ -250,21 +250,24 @@ def main(argv=None):
     args = parser.parse_args(argv)
     width, height = SIZES[args.layout]
     window = webview.create_window("Scholia WebKit check (synthetic)", args.url, width=width, height=height)
-    failures = []
+    passed = []  # set only when the whole check has finished without a failure
 
     def run():
         try:
             if not window.events.loaded.wait(30):
                 raise RuntimeError("the interface did not load")
             check(window, args)
+            passed.append(True)
         except Exception as error:  # reported, and the window still closes
-            failures.append(error)
             print(f"FAILED: {error!r}", flush=True)
         finally:
             window.destroy()
 
     webview.start(run)
-    return 1 if failures else 0
+    # A window closed before the check finished (the check still waiting) is a failure too.
+    if not passed:
+        print("FAILED: the check did not finish", flush=True)
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

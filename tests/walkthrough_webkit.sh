@@ -1,8 +1,9 @@
 #!/bin/bash
 # Runs tests/webkit_check.py in each combination of language, theme and layout, each against a new
 # tests/walkthrough.py server, on the interface build the walkthrough driver last made and recorded
-# for this checkout as it is now; the server must serve that build byte for byte, and must hold no
-# socket but loopback ones while the check runs. Exits 1 if any of that fails.
+# for this checkout as it is now; the server must serve that build byte for byte, and the server, the
+# checker and the WebKit processes started for it must hold no socket but loopback ones while the
+# check runs. Exits 1 if any of that fails.
 #     tests/walkthrough_webkit.sh OUT
 set -u
 cd "$(dirname "$0")/.."
@@ -16,7 +17,9 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 const sh = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
 const status = sh('status', '--porcelain', '--untracked-files=all');
-const changes = status ? createHash('sha256').update(status + sh('diff', 'HEAD', '--binary')).digest('hex') : null;
+const untracked = sh('ls-files', '--others', '--exclude-standard').split('\n').filter(Boolean)
+  .map((path) => `${path}\0${createHash('sha256').update(readFileSync(path)).digest('hex')}`).join('\n');
+const changes = status ? createHash('sha256').update(`${status}\n${sh('diff', 'HEAD', '--binary')}\n${untracked}`).digest('hex') : null;
 const record = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 process.exit(record.commit === sh('rev-parse', 'HEAD') && record.changes === changes && record.distDigest === process.argv[3] ? 0 : 1);
 JS
@@ -32,10 +35,24 @@ for lang in en zh-CN; do for theme in light dark; do for layout in wide drawer; 
     p=$f; [ "$f" = index.html ] && p=""
     [ "$(curl -s "$origin/$p" | shasum -a 256 | cut -d' ' -f1)" = "$(shasum -a 256 "frontend/dist/$f" | cut -d' ' -f1)" ] || { echo "served $f differs"; status=1; }
   done
+  webkit_before=$(pgrep -f 'com\.apple\.WebKit' | sort)
   uv run --no-sync python tests/webkit_check.py "$origin/#${url#*#}" --out "$out/$lang-$theme-$layout" --lang $lang --theme $theme --layout $layout &
   check=$!
-  sleep 5; sockets=$(lsof -nP -a -p "$pid" -i | tail -n +2 | awk '{ n = split($9, ends, "->"); for (i = 1; i <= n; i++) if (ends[i] !~ /^(127\.0\.0\.1|\[::1\]):/) { print; next } }')
-  [ -n "$sockets" ] && { echo "NON-LOOPBACK SOCKET: $sockets"; status=1; }
+  sleep 5
+  # Every process this check launched: the server, the checker and its children, and the WebKit
+  # processes started since (WebKit's content and networking services, which launchd starts).
+  webkit_new=$(comm -13 <(echo "$webkit_before") <(pgrep -f 'com\.apple\.WebKit' | sort))
+  pids=$(echo "$pid $check $(pgrep -P "$check") $webkit_new" | tr -s ' \n' ',' | sed 's/^,//; s/,$//')
+  lsof_out=$(lsof -nP -a -p "$pids" -i 2>"$out/lsof.err"); lsof_status=$?
+  if { [ $lsof_status -ne 0 ] && [ $lsof_status -ne 1 ]; } || [ -s "$out/lsof.err" ] \
+     || { [ -n "$lsof_out" ] && ! head -1 <<<"$lsof_out" | grep -q '^COMMAND'; }; then
+    echo "socket check failed for $lang-$theme-$layout: $(cat "$out/lsof.err")"; status=1
+  else
+    sockets=$(tail -n +2 <<<"$lsof_out" | awk '{ n = split($9, ends, "->"); for (i = 1; i <= n; i++) if (ends[i] !~ /^(127\.0\.0\.1|\[::1\]):/) { print; next } }')
+    [ -n "$sockets" ] && { echo "NON-LOOPBACK SOCKET: $sockets"; status=1; }
+  fi
+  echo "$lang-$theme-$layout processes checked: $pids" >> "$out/sockets.txt"
+  rm -f "$out/lsof.err"
   wait $check || status=1
   kill "$pid"; rm -f "$log"
 done; done; done

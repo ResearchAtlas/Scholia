@@ -100,7 +100,7 @@ for (const name of walk(baseline).filter((n) => n.endsWith('motion.json'))) {
       // A closing element can be gone before it is read, so closing entries are not compared by presence.
       const keys = (m) => Object.keys(m ?? {}).filter((k) => !k.endsWith(' closing')).sort().join(', ');
       if (keys(x) !== keys(y)) differences.push(`reducedMotion: checked ${keys(x)} → ${keys(y)}`);
-      const over = Object.entries(y ?? {}).filter(([, list]) => list.some((d) => d > 1)).map(([k]) => k);
+      const over = Object.entries(y ?? {}).filter(([, list]) => list.some((d) => (d?.duration ?? d) > 1)).map(([k]) => k);
       if (over.length) differences.push(`reducedMotion: over 1 ms in ${over.join(', ')}`);
     } else if (JSON.stringify(x) !== JSON.stringify(y)) {
       differences.push(`${key}: ${JSON.stringify(x)} → ${JSON.stringify(y)}`);

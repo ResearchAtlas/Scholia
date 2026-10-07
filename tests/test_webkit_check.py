@@ -66,3 +66,9 @@ def test_a_snapshot_not_written_fails(webkit_check, tmp_path, box, size, fails):
             webkit_check.written(box, path)
     else:
         webkit_check.written(box, path)
+
+
+def test_a_window_closed_before_the_check_finishes_fails(webkit_check, monkeypatch, tmp_path):
+    # pywebview returns when the window closes, whether or not the check thread has finished.
+    monkeypatch.setattr(webkit_check.webview, "start", lambda run: None)
+    assert webkit_check.main(["http://127.0.0.1:1/#session=s", "--out", str(tmp_path)]) == 1
