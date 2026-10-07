@@ -443,7 +443,7 @@
   "allowlist.recheck": "I checked the terms again",
   "allowlist.terms": "Terms",
   "allowlist.onOff": "{route} on or off",
-  "allowlist.exception.plugins_and_tools": "Zero retention covers model requests only, not plugins or server tools. Scholia sends none, and you confirmed that your key's account enables no plugin by default; Scholia cannot check that.",
+  "allowlist.exception.plugins_and_tools": "Zero retention covers model requests only, not plugins or server tools. Scholia sends none. Your key's account must also enable no plugin by default: you confirm this with the key's data settings, and Scholia cannot check it.",
   "allowlist.exception.in_memory_caching": "OpenRouter does not count in-memory prompt caching as retention.",
   "allowlist.exception.key_data_settings": "Your key's data settings must also be confirmed, under Providers and models.",
   "allowlist.add": "Add",

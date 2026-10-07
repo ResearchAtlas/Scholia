@@ -440,7 +440,7 @@
   "allowlist.recheck": "我已重新核对条款",
   "allowlist.terms": "条款",
   "allowlist.onOff": "{route} 开启或关闭",
-  "allowlist.exception.plugins_and_tools": "零数据保留只涵盖模型请求，不涵盖插件或服务器端工具。Scholia 不会使用它们；你已确认此密钥的账户没有默认启用任何插件，Scholia 无法核实这一点。",
+  "allowlist.exception.plugins_and_tools": "零数据保留只涵盖模型请求，不涵盖插件或服务器端工具。Scholia 不会使用它们。此密钥的账户也必须没有默认启用任何插件：你在确认此密钥的数据设置时确认这一点，Scholia 无法核实。",
   "allowlist.exception.in_memory_caching": "OpenRouter 不把内存中的提示缓存算作数据保留。",
   "allowlist.exception.key_data_settings": "还需要在“服务商与模型”中确认你的密钥的数据设置。",
   "allowlist.add": "添加",
