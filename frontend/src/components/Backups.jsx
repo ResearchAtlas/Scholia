@@ -194,7 +194,7 @@ function Restored({ result, onContinue }) {
   useEffect(() => heading.current?.focus(), []); // the dialog that had focus is gone
   return (
     <div className="grid gap-3">
-      <div ref={heading} tabIndex={-1} className="rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      <div ref={heading} tabIndex={-1} className="rounded-sm outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
         <Saved text={t('backups.restored')} />
       </div>
       {restoreNotes(result).length > 0 && (
@@ -206,7 +206,7 @@ function Restored({ result, onContinue }) {
         <div role="alert" className="rounded-md border border-warning/40 px-3 py-2 text-sm">
           <p className="font-medium text-warning">{t('backups.missingFiles', { count: missing.length })}</p>
           <ul tabIndex={0} aria-label={t('backups.missingFiles', { count: missing.length })}
-            className="mt-1 max-h-32 overflow-y-auto rounded-sm font-mono text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            className="mt-1 max-h-32 overflow-y-auto rounded-sm font-mono text-xs text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
             {missing.map((file) => <li key={file.sha256} className="truncate" title={file.sha256}>{file.sha256}</li>)}
           </ul>
         </div>

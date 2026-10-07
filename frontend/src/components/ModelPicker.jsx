@@ -219,7 +219,7 @@ export function ModelPicker({ projectId }) {
             <label htmlFor="picker-search" className="sr-only">{t('picker.search')}</label>
             <input id="picker-search" autoFocus value={query} onChange={(event) => setQuery(event.target.value)}
               placeholder={t('picker.search')}
-              className="h-8 w-full rounded-md bg-muted/60 px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+              className="h-8 w-full rounded-md bg-muted/60 px-2.5 text-sm outline-hidden focus-visible:ring-2 focus-visible:ring-ring" />
           </div>
           <div role="listbox" aria-label={t('picker.models')} className="scroll-thin max-h-80 overflow-y-auto p-1">
             {!query && (

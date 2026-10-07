@@ -311,7 +311,7 @@ export function PrivateAllowlist() {
         if (await change(`${MODEL}${adding.trim()}`, { enabled: true })) setAdding('');
       }}>
         <label htmlFor="allowlist-add" className="text-sm font-medium">{t('allowlist.addLabel')}</label>
-        <div className="flex gap-2">
+        <div className="mt-1.5 flex gap-2">
           <Input id="allowlist-add" value={adding} onChange={(event) => setAdding(event.target.value)}
             placeholder={t('allowlist.addPlaceholder')} className="h-9 font-mono text-[13px]" spellCheck={false} />
           <Button type="submit" variant="outline" size="sm" className="h-9" disabled={busy || !adding.trim()}>{t('allowlist.add')}</Button>

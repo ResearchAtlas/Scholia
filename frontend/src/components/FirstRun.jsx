@@ -55,7 +55,7 @@ export function FirstRun({ onDone }) {
   }
 
   return (
-    <main className="grid h-full place-items-center overflow-y-auto bg-gradient-to-b from-brand-soft via-background to-background p-6">
+    <main className="grid h-full place-items-center overflow-y-auto bg-linear-to-b/srgb from-brand-soft via-background to-background p-6">
       <div className="w-full max-w-md animate-fade-up rounded-2xl border bg-card p-8 shadow-xl shadow-brand/5">
         <Mark className="size-11 text-base shadow-lg shadow-brand/20" />
         {step === 'key' ? (

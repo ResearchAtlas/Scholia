@@ -59,7 +59,7 @@ export function Settings({ open, onOpenChange, health, project, onLanguage, onPr
 }
 
 function PageTitle({ children }) {
-  return <h2 className="mb-6 text-lg font-semibold tracking-tight">{children}</h2>;
+  return <h2 className="text-lg font-semibold tracking-tight">{children}</h2>;
 }
 
 function General({ onLanguage, projectId }) {
@@ -129,7 +129,7 @@ function InstructionsEditor({ projectId, withProject, label, hint }) {
           {t('settings.instructionsSize', { used: Math.ceil(combined / 1024), cap: file.cap_bytes / 1024 })}
         </span>}>
         <Textarea id={id} value={draft} onChange={(event) => setDraft(event.target.value)} rows={8} readOnly={saving || file.unreadable}
-          className="font-mono text-[13px] leading-relaxed" spellCheck={false} />
+          className="font-mono text-[13px] max-md:leading-relaxed" spellCheck={false} />
       </Field>
       {file.unreadable && <p role="alert" className="text-xs text-destructive">{t('settings.instructionsUnreadable')}</p>}
       {file.replaced && <p role="alert" className="text-xs text-warning">{t('settings.instructionsReplaced')}</p>}
@@ -232,7 +232,7 @@ function Subagents() {
             <label htmlFor="subagent-add" className="sr-only">{t('subagents.add')}</label>
             <input id="subagent-add" list="subagent-models" value={adding} onChange={(event) => setAdding(event.target.value)}
               placeholder={t('subagents.addPlaceholder')}
-              className="h-9 flex-1 rounded-md border border-input bg-transparent px-3 font-mono text-[13px] outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+              className="h-9 flex-1 rounded-md border border-input bg-transparent px-3 font-mono text-[13px] outline-hidden focus-visible:ring-1 focus-visible:ring-ring" />
             <datalist id="subagent-models">
               {offered.map((m) => <option key={`${m.provider}:${m.id}`} value={m.id}>{m.name}</option>)}
             </datalist>

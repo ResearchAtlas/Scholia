@@ -44,7 +44,7 @@ export function Segmented({ label, options, value, onChange, disabled }) {
         <button key={option.value} type="button" role="radio" aria-checked={value === option.value} disabled={disabled}
           onClick={() => value !== option.value && onChange(option.value)}
           className={cn('rounded-md px-3 py-1.5 text-sm transition-colors disabled:opacity-50',
-            value === option.value ? 'bg-background font-medium shadow-sm' : 'text-muted-foreground hover:text-foreground')}>
+            value === option.value ? 'bg-background font-medium shadow-xs' : 'text-muted-foreground hover:text-foreground')}>
           {option.label}
         </button>
       ))}

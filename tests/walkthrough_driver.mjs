@@ -1,7 +1,8 @@
 // Drives the rendered walkthrough: synthetic content only, never real data.
 //
 //     node tests/walkthrough_driver.mjs --out DIR [--lang en|zh-CN] [--theme light|dark]
-//         [--layout wide|drawer] [--all] [--motion] [--mask] [--no-build] [--browser PATH] [--attach URL]
+//         [--layout wide|drawer] [--all] [--motion] [--keyboard] [--mask] [--styles] [--no-build]
+//         [--browser PATH] [--attach URL]
 //
 // Each run builds the interface from the checkout (frontend/dist is not in git) and records the
 // commit and the build's digest; it then starts tests/walkthrough.py (a temporary data folder, the
@@ -15,7 +16,9 @@
 // checks), the provider's request log and, with --motion, motion.json: the open and close
 // animations of dialogs, menus, the popover and the drawer, sampled frame by frame, with
 // reduced motion. --mask covers text that differs between runs (times, ids, temporary paths) in
-// the screenshots, for comparing two runs (walkthrough_compare.mjs). --all runs the eight combinations of language, theme and layout. --attach
+// the screenshots, for comparing two runs (walkthrough_compare.mjs); --styles also records every
+// element's computed style at each step; --keyboard checks keyboard use (keyboard.json). --all
+// runs the eight combinations of language, theme and layout. --attach
 // drives an interface already served at URL (with its #session) instead, without building or
 // starting a server; the commit and digest are then the served build's own.
 //
@@ -42,7 +45,8 @@ const LOOPBACK = /^(127\.0\.0\.1|\[::1\]|localhost)$/;
 const { values: opts } = parseArgs({ options: {
   out: { type: 'string' }, lang: { type: 'string', default: 'en' }, theme: { type: 'string', default: 'light' },
   layout: { type: 'string', default: 'wide' }, all: { type: 'boolean' }, motion: { type: 'boolean' },
-  'no-build': { type: 'boolean' }, mask: { type: 'boolean' }, browser: { type: 'string', default: BROWSER }, attach: { type: 'string' },
+  'no-build': { type: 'boolean' }, mask: { type: 'boolean' }, styles: { type: 'boolean' }, keyboard: { type: 'boolean' },
+  browser: { type: 'string', default: BROWSER }, attach: { type: 'string' },
 } });
 if (!opts.out) throw new Error('--out is required');
 
@@ -144,6 +148,27 @@ async function dynamic(page) {
   const inputs = page.locator('input, textarea');
   const values = await inputs.evaluateAll((elements) => elements.map((e) => e.value));
   return [page.getByText(DYNAMIC), ...values.flatMap((value, i) => (DYNAMIC.test(value) ? [inputs.nth(i)] : []))];
+}
+
+// The computed style of every element on the page, with its box, for --styles: two builds of the
+// same commit's interface can then be compared property by property (walkthrough_compare.mjs).
+const STYLE_PROPERTIES = ['display', 'position', 'color', 'background-color', 'background-image', 'border-top-width',
+  'border-right-width', 'border-bottom-width', 'border-left-width', 'border-top-color', 'border-bottom-color',
+  'border-left-color', 'border-right-color', 'border-top-style', 'border-top-left-radius', 'border-bottom-right-radius',
+  'box-shadow', 'outline-style', 'outline-width', 'outline-color', 'outline-offset', 'margin-top', 'margin-right',
+  'margin-bottom', 'margin-left', 'padding-top', 'padding-right', 'padding-bottom', 'padding-left', 'gap', 'font-family',
+  'font-size', 'font-weight', 'line-height', 'letter-spacing', 'text-decoration-line', 'opacity', 'transform', 'translate',
+  'scale', 'cursor', 'z-index', 'overflow-x', 'overflow-y', 'visibility', 'white-space'];
+
+function computedStyles(properties) {
+  const path = (e) => { const parts = []; for (; e && e !== document.body; e = e.parentElement) parts.unshift(`${e.tagName.toLowerCase()}:${[...e.parentElement.children].indexOf(e)}`); return parts.join('/'); };
+  return [...document.body.querySelectorAll('*')].map((e) => {
+    const style = getComputedStyle(e); const box = e.getBoundingClientRect();
+    const record = { path: path(e), box: [box.x, box.y, box.width, box.height].map((v) => Math.round(v * 10) / 10) };
+    for (const property of properties) record[property] = style.getPropertyValue(property);
+    if (e.matches('input, textarea')) record.placeholder = getComputedStyle(e, '::placeholder').color;
+    return record;
+  });
 }
 
 // The M1 flows: setup, projects, conversations, settings, export, backup, a sensitivity change with
@@ -333,6 +358,125 @@ async function motion(ctx) {
   writeFileSync(join(C.out, 'motion.json'), JSON.stringify(results, null, 2));
 }
 
+// Keyboard use (docs/interface-criteria.md, Keyboard): every Tab stop shows a focus indicator,
+// dialogs and the drawer keep focus inside and Escape closes them, returning focus; menu items
+// move with the arrow keys; the divider moves with the arrow keys, Home and End; Enter sends,
+// Shift+Enter starts a new line, and Enter while composing does not send. Written to
+// keyboard.json; each failed expectation is also a failed check.
+function focusState() {
+  const e = document.activeElement;
+  if (!e || e === document.body) return null;
+  // The focus indicator: what changes on the element, or on the two elements around it (a field's
+  // frame), when it loses focus: an outline, a ring, a background or a border. The element then
+  // gets focus back, so Tab goes on from it.
+  const watched = [e, e.parentElement, e.parentElement?.parentElement].filter(Boolean);
+  const look = () => watched.map((x) => { const s = getComputedStyle(x); return [s.outlineStyle, s.outlineWidth, s.outlineColor, s.boxShadow, s.backgroundColor, s.borderTopColor].join('|'); });
+  const focused = look();
+  e.blur();
+  const unfocused = look();
+  e.focus();
+  const changed = watched.flatMap((x, i) => (focused[i] !== unfocused[i] ? [i === 0 ? 'self' : `ancestor ${i}`] : []));
+  const name = e.getAttribute('aria-label') || e.textContent.trim().slice(0, 40) || e.getAttribute('placeholder') || e.tagName;
+  const box = e.getBoundingClientRect();
+  return { tag: e.tagName.toLowerCase(), role: e.getAttribute('role'), name, indicator: changed.length ? changed.join(', ') : null,
+           inDialog: Boolean(e.closest('[role=dialog]')), visible: box.width > 0 && box.height > 0 };
+}
+
+async function keyboard(ctx) {
+  const { page, L, C, current } = ctx;
+  const check = (name, ok) => current().checks.push({ name, ok: Boolean(ok) });  // every check runs; failures are recorded
+  const result = {};
+  try { await keys(ctx, page, L, C, check, result); } finally {
+    writeFileSync(join(C.out, 'keyboard.json'), JSON.stringify(result, null, 2));
+  }
+}
+
+async function keys(ctx, page, L, C, check, result) {
+  const settle = (ms = 400) => page.waitForTimeout(ms);
+  const drawerLayout = page.viewportSize().width < 1000;
+  // The focused element and what is around it, as it looks: compared between builds by
+  // walkthrough_compare.mjs like any screenshot.
+  const shootFocus = async (name) => {
+    const box = await page.evaluate(() => { const r = document.activeElement.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; });
+    const { width, height } = page.viewportSize();
+    const x = Math.max(0, Math.floor(box[0] - 16)); const y = Math.max(0, Math.floor(box[1] - 16));
+    const clip = { x, y, width: Math.min(width - x, Math.ceil(box[2] + 32)), height: Math.min(height - y, Math.ceil(box[3] + 32)) };
+    if (clip.width > 0 && clip.height > 0) await page.screenshot({ path: join(C.out, `${C.tag}-focus-${name}.png`), clip });
+  };
+  const tabStops = async (limit, inDialog) => {
+    const stops = [];
+    for (let i = 0; i < limit; i += 1) {
+      await page.keyboard.press('Tab'); await page.waitForTimeout(60);
+      const state = await page.evaluate(focusState);
+      if (!state) continue;
+      if (stops.length && state.name === stops[0].name && state.tag === stops[0].tag) break;
+      stops.push(state);
+      await shootFocus(`${inDialog ? 'dialog' : 'window'}-${String(stops.length).padStart(2, '0')}`);
+    }
+    check(`${inDialog ? 'dialog' : 'window'}: every Tab stop shows a focus indicator`, stops.every((s) => s.indicator));
+    if (inDialog) check('dialog: Tab stays inside', stops.every((s) => s.inDialog));
+    return stops;
+  };
+  await page.keyboard.press('Escape'); await settle();
+  await page.locator('body').click({ position: { x: 1, y: page.viewportSize().height - 2 } }).catch(() => {});
+  result.windowTabStops = await tabStops(40, false);
+
+  // The settings dialog: focus kept inside, Escape closes it and returns focus to its button.
+  if (drawerLayout) { await page.getByRole('button', { name: L('sidebar.show') }).click(); await settle(); }
+  const settings = page.getByRole('button', { name: L('sidebar.settings') });
+  await settings.focus(); await page.keyboard.press('Enter'); await settle(600);
+  check('Enter opens the settings dialog', await page.getByRole('dialog', { name: L('sidebar.settings') }).isVisible());
+  result.dialogTabStops = await tabStops(60, true);
+  await page.keyboard.press('Escape'); await settle(600);
+  check('Escape closes the settings dialog', !(await page.getByRole('dialog', { name: L('sidebar.settings') }).count()));
+  result.focusAfterDialog = await page.evaluate(focusState);  // recorded, not required by the criteria
+  if (drawerLayout) {
+    result.drawerOpenAfterDialog = await page.getByRole('navigation').isVisible();  // recorded
+    if (!result.drawerOpenAfterDialog) { await page.getByRole('button', { name: L('sidebar.show') }).click(); await settle(); }
+    await page.keyboard.press('Escape'); await settle();
+    check('Escape closes the drawer', !(await page.getByRole('navigation').isVisible()));
+    result.focusAfterDrawer = await page.evaluate(focusState);
+    await page.getByRole('button', { name: L('sidebar.show') }).click(); await settle();
+  }
+
+  // The project menu: arrow keys move between items, Escape closes and returns focus.
+  const trigger = page.getByRole('button', { name: L('sidebar.switchProject') });
+  await trigger.focus(); await page.keyboard.press('Enter'); await settle();
+  const first = await page.evaluate(focusState);
+  await page.keyboard.press('ArrowDown'); await page.waitForTimeout(100);
+  const second = await page.evaluate(focusState);
+  await shootFocus('menu-item');
+  result.menu = { first, second };
+  check('menu items move with the arrow keys', first?.role === 'menuitem' && second?.role === 'menuitem' && first.name !== second.name);
+  await page.keyboard.press('Escape'); await settle();
+  result.focusAfterMenu = await page.evaluate(focusState);
+  check('Escape closes the menu', !(await page.getByRole('menu').count()));
+  if (drawerLayout) { await page.keyboard.press('Escape'); await settle(); }
+
+  // The divider (three columns only): arrow keys, Home and End move it.
+  if (!drawerLayout) {
+    const divider = page.getByRole('separator').first();
+    const width = () => page.getByRole('navigation').evaluate((e) => e.getBoundingClientRect().width);
+    await divider.focus(); const start = await width();
+    await page.keyboard.press('ArrowRight'); await page.waitForTimeout(150); const right = await width();
+    await page.keyboard.press('Home'); await page.waitForTimeout(150); const home = await width();
+    await page.keyboard.press('End'); await page.waitForTimeout(150); const end = await width();
+    await divider.dblclick(); await page.waitForTimeout(150); const reset = await width();
+    result.divider = { start, right, home, end, reset, focus: await page.evaluate(focusState) };
+    check('the divider moves with the arrow keys, Home and End, and resets', right > start && home === 180 && end === 360 && reset === start);
+  }
+
+  // The composer: Shift+Enter is a new line, Enter while composing does not send, Enter sends.
+  const box = page.getByRole('textbox', { name: L('composer.label') });
+  await box.fill('');
+  await box.focus(); await page.keyboard.type('line one'); await page.keyboard.press('Shift+Enter'); await page.keyboard.type('line two');
+  await box.evaluate((e) => e.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229, isComposing: true, bubbles: true })));
+  await settle(800);
+  result.composer = { value: await box.inputValue() };
+  check('Shift+Enter starts a new line, and Enter while composing does not send', result.composer.value === 'line one\nline two');
+  await box.fill('');
+}
+
 async function run(combo, build, outRoot) {
   const tag = `${combo.lang}-${combo.theme}-${combo.layout}`;
   const out = opts.all ? join(outRoot, tag) : outRoot;
@@ -365,7 +509,7 @@ async function run(combo, build, outRoot) {
   page.on('console', (message) => { if (['error', 'warning'].includes(message.type())) consoleMessages.push(`${message.type()}: ${message.text()}`); });
   page.on('pageerror', (error) => consoleMessages.push(`pageerror: ${error.message}`));
   const { label, pattern } = labels(combo.lang);
-  const C = { out, exports, project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
+  const C = { out, tag, exports, project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
               question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
   let current;
   const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
@@ -377,9 +521,10 @@ async function run(combo, build, outRoot) {
     await page.waitForTimeout(500);
     current.screenshot = `${tag}-${name}.png`;
     await page.screenshot({ path: join(out, current.screenshot), ...(opts.mask ? { mask: await dynamic(page), maskColor: '#808080' } : {}) });
+    if (opts.styles) writeFileSync(join(out, `${tag}-${name}.styles.json`), JSON.stringify(await page.evaluate(computedStyles, STYLE_PROPERTIES)));
     current.ok = current.checks.every((c) => c.ok);
   };
-  const ctx = { page, L: label, P: pattern, C, step, check, get: api(origin, session) };
+  const ctx = { page, L: label, P: pattern, C, step, check, get: api(origin, session), current: () => current };
   try {
     await page.goto(`${origin}/#session=${session}`);
     if (combo.lang !== 'en') {
@@ -388,6 +533,10 @@ async function run(combo, build, outRoot) {
     }
     await m1(ctx);
     if (opts.motion) await motion(ctx);
+    if (opts.keyboard) {
+      current = { name: 'keyboard', checks: [] }; manifest.steps.push(current);
+      await keyboard(ctx); current.ok = current.checks.every((c) => c.ok);
+    }
     manifest.ok = manifest.steps.every((s) => s.ok);
   } catch (error) {
     manifest.ok = false;

@@ -97,9 +97,83 @@ for (const name of walk(baseline).filter((n) => n.endsWith('motion.json'))) {
   summary.motion.push({ name, differences });
 }
 
+// Computed styles (--styles), element by element in document order: each changed property, counted
+// by its old and new value, with the first element it was seen on. Values that render the same
+// are compared as one: a color in oklab and in rgb (within 1 of 255 a channel), shadows without
+// their transparent layers, default gradient stops, any radius of 9999px or more, and an outline
+// that is not drawn. Margins, transforms and translations are not compared as values: the element's
+// box (within 0.5 px) shows what they do. Elements that take no space are skipped.
+function oklabToRgb(l, a, b) {
+  const l_ = (l + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m_ = (l - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s_ = (l - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+  const linear = [4.0767416621 * l_ - 3.3077115913 * m_ + 0.2309699292 * s_,
+    -1.2684380046 * l_ + 2.6097574011 * m_ - 0.3413193965 * s_,
+    -0.0041960863 * l_ - 0.7034186147 * m_ + 1.7076147010 * s_];
+  return linear.map((c) => 255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055));
+}
+function normalize(key, value) {
+  if (typeof value !== 'string') return value;
+  let v = value.replace(/oklab\(([-\d.e]+) ([-\d.e]+) ([-\d.e]+)(?: \/ ([\d.]+))?\)/g, (_, l, a, b, alpha) => {
+    const [r, g, bl] = oklabToRgb(Number(l), Number(a), Number(b)).map((c) => Math.round(Math.min(255, Math.max(0, c))));
+    return alpha === undefined ? `rgb(${r}, ${g}, ${bl})` : `rgba(${r}, ${g}, ${bl}, ${Number(alpha)})`;
+  });
+  if (key === 'box-shadow') v = v.split(/,(?![^(]*\))/).map((x) => x.trim()).filter((x) => x !== 'rgba(0, 0, 0, 0) 0px 0px 0px 0px').join(', ') || 'none';
+  if (key === 'background-image') v = v.replace(/ (0|50|100)%(?=[,)])/g, '');
+  if (key.endsWith('radius') && parseFloat(v) >= 9999) v = 'full';
+  return v;
+}
+function sameColor(x, y) {
+  const parse = (v) => (v.match(/[\d.]+/g) ?? []).map(Number);
+  const [a, b] = [parse(x), parse(y)];
+  return a.length === b.length && a.every((n, i) => Math.abs(n - b[i]) <= (i === 3 ? 0.01 : 1.01));
+}
+const SKIP = /^(margin|transform|translate|scale)/;
+const drawnOutline = (r) => r['outline-style'] !== 'none' && !/rgba\([^)]*, 0\)$/.test(r['outline-color']);
+summary.styles = {};
+for (const name of walk(baseline).filter((n) => n.endsWith('.styles.json'))) {
+  if (!existsSync(join(candidate, name))) { summary.styles[name] = 'missing'; continue; }
+  const [sa, sb] = [baseline, candidate].map((dir) => JSON.parse(readFileSync(join(dir, name), 'utf8')));
+  const [pa, pb] = [sa, sb].map((records) => new Map(records.map((r) => [r.path, r])));
+  const changes = {};
+  const note = (change, path) => { (changes[change] ??= { count: 0, example: path }).count += 1; };
+  if (sa.length !== sb.length) note(`element count ${sa.length} → ${sb.length}`, '');
+  sa.forEach((x, i) => {
+    const y = sb[i];
+    if (!y || y.path !== x.path) return note('element order', x.path);
+    if (x.box[2] === 0 && x.box[3] === 0 && y.box[2] === 0 && y.box[3] === 0) return;
+    // Position within the parent, and size: a change shows on the element that moved, not on
+    // everything after it.
+    const relative = (record, byPath) => {
+      const parent = byPath.get(record.path.split('/').slice(0, -1).join('/'));
+      return [record.box[0] - (parent?.box[0] ?? 0), record.box[1] - (parent?.box[1] ?? 0), record.box[2], record.box[3]];
+    };
+    const [rx, ry] = [relative(x, pa), relative(y, pb)];
+    if (rx.some((v, k) => Math.abs(v - ry[k]) > 0.5)) note(`box ${rx.map((v) => Math.round(v * 10) / 10)} → ${ry.map((v) => Math.round(v * 10) / 10)}`, x.path);
+    if (drawnOutline(x) !== drawnOutline(y)) note(`outline drawn ${drawnOutline(x)} → ${drawnOutline(y)}`, x.path);
+    for (const key of Object.keys(x)) {
+      if (key === 'path' || key === 'box' || key.startsWith('outline') || SKIP.test(key)) continue;
+      const [a, b] = [normalize(key, x[key]), normalize(key, y[key])];
+      if (a === b || (/color|placeholder/.test(key) && sameColor(a, b))) continue;
+      note(`${key}: ${a} → ${b}`, x.path);
+    }
+  });
+  summary.styles[name] = changes;
+}
+const styleChanges = {};
+for (const [name, changes] of Object.entries(summary.styles)) {
+  if (changes === 'missing') continue;
+  for (const [change, { count, example }] of Object.entries(changes)) {
+    (styleChanges[change] ??= { count: 0, files: 0, example: `${name} ${example}` }).count += count;
+    styleChanges[change].files += 1;
+  }
+}
+summary.styleChanges = styleChanges;
+
 writeFileSync(join(out, 'summary.json'), JSON.stringify(summary, null, 2));
 const changed = summary.screenshots.filter((s) => s.count || s.missing || s.size);
 console.log(`${summary.screenshots.length} screenshots compared, ${changed.length} differ`);
 for (const s of changed) console.log(`  ${s.name}: ${s.missing ? 'missing' : s.size ? `size ${JSON.stringify(s.size)}` : `${s.count} px in ${JSON.stringify(s.box)}`}`);
+for (const [change, { count, files, example }] of Object.entries(styleChanges)) console.log(`style ${change} (${count} elements in ${files} steps; ${example})`);
 for (const m of summary.motion) console.log(`motion ${m.name}: ${m.missing ? 'missing' : m.differences.length ? m.differences.join('; ') : 'same'}`);
 

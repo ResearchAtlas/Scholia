@@ -7,7 +7,7 @@ export function Mark({ className }) {
   const t = useT();
   return (
     <div aria-hidden="true"
-      className={cn('grid shrink-0 place-items-center rounded-lg bg-gradient-to-br from-brand to-violet-500 font-semibold text-white shadow-sm', className)}>
+      className={cn('grid shrink-0 place-items-center rounded-lg bg-linear-to-br/srgb from-brand to-violet-500 font-semibold text-white shadow-xs', className)}>
       {t('app.name').charAt(0)}
     </div>
   );
