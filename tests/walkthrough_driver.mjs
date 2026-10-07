@@ -427,10 +427,13 @@ async function motion(ctx) {
   page._reduced = false;
   await page.emulateMedia({ reducedMotion: 'no-preference' });
   results.reducedMotion = reduced;
-  // Every element that animates when motion is allowed started at least one animation when opened,
-  // and every animation that started, opening or closing, lasted at most 1 ms.
-  const opened = Object.keys(results).filter((key) => results[key]?.opened?.duration > 0);
-  ctx.check('reduced motion: each animated element was measured opening', opened.every((key) => reduced[key]?.length > 0));
+  // The elements that animate, fixed in advance (not taken from the samples above): each must have
+  // animated with motion allowed and started at least one animation when opened with reduced
+  // motion, and every animation that started, opening or closing, lasted at most 1 ms.
+  const animated = [...(drawerLayout ? ['drawer', 'drawer-overlay'] : []), 'settings-dialog', 'settings-dialog-overlay',
+    'project-menu', 'conversation-menu', 'model-popover', 'notice'];
+  ctx.check('motion: each animated element was sampled animating', animated.every((key) => results[key]?.opened?.duration > 0));
+  ctx.check('reduced motion: each animated element was measured opening', animated.every((key) => reduced[key]?.length > 0));
   ctx.check('reduced motion: every animation lasts at most 1 ms', Object.values(reduced).flat().every((a) => a.duration <= 1));
   writeFileSync(join(C.out, 'motion.json'), JSON.stringify(results, null, 2));
 }
@@ -673,7 +676,8 @@ async function run(combo, build, outRoot) {
 function source() {
   const status = sh('git', ['status', '--porcelain', '--untracked-files=all']);
   // Untracked files' bytes as well as their names: git diff leaves them out.
-  const untracked = sh('git', ['ls-files', '--others', '--exclude-standard']).split('\n').filter(Boolean)
+  const untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: ROOT, encoding: 'utf8' })
+    .split('\0').filter(Boolean)
     .map((path) => `${path}\0${sha256(readFileSync(join(ROOT, path)))}`).join('\n');
   return { commit: sh('git', ['rev-parse', 'HEAD']), dirty: status !== '',
            changes: status ? sha256(`${status}\n${sh('git', ['diff', 'HEAD', '--binary'])}\n${untracked}`) : null };

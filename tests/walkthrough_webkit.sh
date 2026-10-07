@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 const sh = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
 const status = sh('status', '--porcelain', '--untracked-files=all');
-const untracked = sh('ls-files', '--others', '--exclude-standard').split('\n').filter(Boolean)
+const untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard', '-z'], { encoding: 'utf8' }).split('\0').filter(Boolean)
   .map((path) => `${path}\0${createHash('sha256').update(readFileSync(path)).digest('hex')}`).join('\n');
 const changes = status ? createHash('sha256').update(`${status}\n${sh('diff', 'HEAD', '--binary')}\n${untracked}`).digest('hex') : null;
 const record = JSON.parse(readFileSync(process.argv[2], 'utf8'));
@@ -35,14 +35,18 @@ for lang in en zh-CN; do for theme in light dark; do for layout in wide drawer; 
     p=$f; [ "$f" = index.html ] && p=""
     [ "$(curl -s "$origin/$p" | shasum -a 256 | cut -d' ' -f1)" = "$(shasum -a 256 "frontend/dist/$f" | cut -d' ' -f1)" ] || { echo "served $f differs"; status=1; }
   done
-  webkit_before=$(pgrep -f 'com\.apple\.WebKit' | sort)
+  # pgrep exits 1 when nothing matches; any other status is a failed discovery, never "none".
+  discover() { local found; found=$(pgrep "$@"); local st=$?; if [ $st -gt 1 ]; then echo "pgrep $* failed ($st)" >&2; return 2; fi; echo "$found"; }
+  webkit_before=$(discover -f 'com\.apple\.WebKit') || { echo "process discovery failed"; status=1; }
   uv run --no-sync python tests/webkit_check.py "$origin/#${url#*#}" --out "$out/$lang-$theme-$layout" --lang $lang --theme $theme --layout $layout &
   check=$!
   sleep 5
   # Every process this check launched: the server, the checker and its children, and the WebKit
   # processes started since (WebKit's content and networking services, which launchd starts).
-  webkit_new=$(comm -13 <(echo "$webkit_before") <(pgrep -f 'com\.apple\.WebKit' | sort))
-  pids=$(echo "$pid $check $(pgrep -P "$check") $webkit_new" | tr -s ' \n' ',' | sed 's/^,//; s/,$//')
+  webkit_after=$(discover -f 'com\.apple\.WebKit') || { echo "process discovery failed"; status=1; }
+  children=$(discover -P "$check") || { echo "process discovery failed"; status=1; }
+  webkit_new=$(comm -13 <(echo "$webkit_before" | sort) <(echo "$webkit_after" | sort))
+  pids=$(echo "$pid $check $children $webkit_new" | tr -s ' \n' ',' | sed 's/^,//; s/,$//')
   lsof_out=$(lsof -nP -a -p "$pids" -i 2>"$out/lsof.err"); lsof_status=$?
   if { [ $lsof_status -ne 0 ] && [ $lsof_status -ne 1 ]; } || [ -s "$out/lsof.err" ] \
      || { [ -n "$lsof_out" ] && ! head -1 <<<"$lsof_out" | grep -q '^COMMAND'; }; then
