@@ -126,6 +126,7 @@ class ActiveRun:
     provider: str | None = None  # the provider its model calls go to
     closing: asyncio.Future | None = None  # the write that records a claim stopped before it started
     progress: dict | None = None  # local work's progress, live only: {"done", "total"}
+    follows: list = field(default_factory=list)  # runs its terminal transaction records (record_in), held till it commits
 
 
 class Registry:
@@ -1054,6 +1055,18 @@ class Harness:
             raise
         return result
 
+    def record_in(self, conn, active, project_id, workflow, inputs):
+        """Record a background run of the project in local work's terminal transaction (from its
+        effect, on the writer thread): held here from before that transaction commits, as
+        record_background holds its runs, and started by _local once it has (released if it did
+        not), so no read finds it running in the record and not held. While the app is closing it is
+        recorded unheld, and starts at the next launch."""
+        held = self.registry.add_background(new_id())
+        if held is not None:
+            active.follows.append(held)
+        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
+                     (held.run_id if held is not None else new_id(), project_id, workflow, json.dumps(inputs)))
+
     async def _local(self, active, project_id, workflow, inputs):
         try:
             summary, effect = await self.workflows[workflow](self, active, project_id, inputs)
@@ -1069,9 +1082,18 @@ class Harness:
         # in its transaction whether a cancellation came before an effect it still has to apply.
         try:
             await _through(self._write(lambda conn: self._finish_local(conn, active, *outcome, summary, effect)))
-        except RunOutcome as ended:  # its effect found it could not be applied: nothing of it was written
+        except BaseException as error:  # nothing of it was written, the runs its effect recorded neither
+            for held in active.follows:
+                self.registry.release(held)
+            active.follows.clear()
+            if not isinstance(error, RunOutcome):
+                raise
+            # Its effect found it could not be applied.
             await _through(self._write(lambda conn: self._finish_local(
-                conn, active, ended.status, ended.cancel_reason, {"reason": ended.reason} if ended.reason else None)))
+                conn, active, error.status, error.cancel_reason, {"reason": error.reason} if error.reason else None)))
+        for held in active.follows:  # recorded with its terminal record, which has committed
+            held.task = asyncio.create_task(self._background(held))
+        active.follows.clear()
 
     def _finish_local(self, conn, active, status, cancel_reason, summary, effect=None):
         """Local work's effect, terminal status and summary, in one transaction. A revocation in the

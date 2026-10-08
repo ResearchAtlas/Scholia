@@ -245,6 +245,7 @@
   "errors.invalid_answer": "请从给出的回答中选择一个。",
   "errors.lookup_locked": "评审锁定的项目从不查询标识符。",
   "errors.declined": "未查询：你选择了不查询。",
+  "errors.not_read": "未查询：有文件尚未读取。读取完成后会再查询。",
   "errors.empty_file": "该文件是空的。",
   "library.materialCount": {
     "other": "{count} 份材料"
@@ -311,6 +312,7 @@
   "library.source.projectChanged": "未查询：项目发生了变化",
   "library.source.declined": "未查询：你选择了不查询",
   "library.source.no_identifier": "来自文件：其中没有找到 DOI 或 arXiv 编号",
+  "library.source.not_read": "来自文件：文件尚未读取，因此尚未查询",
   "library.source.not_found": "来自文件：没有找到其标识符的记录",
   "library.source.unavailable": "来自文件：查询没有得到回应，信息可能不完整",
   "library.source.refused": "来自文件：本项目的保护级别不允许查询",

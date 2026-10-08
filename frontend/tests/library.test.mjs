@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -207,4 +207,11 @@ test('a selection is sent in as few requests as fit the backend\'s body limit, e
 
 test('a request over the body limit has its text in both catalogs', () => {
   assert.ok('errors.request_too_large' in en && 'errors.request_too_large' in zh);
+});
+
+test('every lookup outcome a paper\'s details name has its text in both catalogs, a file not read yet included', () => {
+  assert.ok(LOOKUP_OUTCOMES.includes('not_read'));
+  for (const key of [...LOOKUP_OUTCOMES.map((outcome) => `library.source.${outcome}`), 'errors.not_read']) {
+    assert.ok(key in en && key in zh, key);
+  }
 });

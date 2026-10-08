@@ -381,6 +381,12 @@ async function materials(ctx) {
     await row.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
     await row.getByText(L('ask.service.crossref'), { exact: false }).first().waitFor();
     check('its details name where they came from', await row.getByText(L('library.fact.retraction'), { exact: true }).count() === 1);
+    await row.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(300);
+    const damaged = panel().getByRole('listitem').filter({ hasText: 'damaged' });
+    await damaged.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    check('a file not read says it was not looked up yet', await damaged.getByText(L('library.source.not_read'), { exact: true }).count() === 1
+      && (await listing(projectId)).materials.find((m) => m.title === 'damaged')?.lookup.outcome === 'not_read');
+    await damaged.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(300);
   });
 
   await step('18-page-viewer', async () => {

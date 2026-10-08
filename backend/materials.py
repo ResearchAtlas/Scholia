@@ -28,10 +28,13 @@ the material's current file: a file replaced meanwhile makes the older lookup st
 identifier is not sent (its ask is closed) and its answer is not applied. Metadata the researcher
 edited is never replaced, though the retraction check is recorded while the details carry the DOI it
 was made for (a DOI the researcher changes or clears takes the old one's retraction check and source
-with it). A failed lookup leaves the material as it was. A reading tried again brings its version a
-lookup of its own, as at import (none in a review-locked project): the one made with it had no text
-to read. Both runs name their materials in `inputs.material_ids`, the deletion service's scope link
-(backend/db/deletion.py), so deleting a material revokes them.
+with it). A failed lookup leaves the material as it was. A version with no reading committed when
+its lookup reads its identifiers is not_read, never no_identifier, and that lookup fails and can be
+tried again; a reading of that version that commits later (tried again, one past its time limit, or
+another project's of the same file) records a lookup for it in the same transaction, as at import (a
+Local only project's asks first; none in a review-locked project). Both runs name their materials in
+`inputs.material_ids`, the deletion service's scope link (backend/db/deletion.py), so deleting a
+material revokes them.
 
 A paper reads Reading while its version's extraction runs, Ready once an extraction with text is
 committed, and Needs attention otherwise, with its reason.
@@ -60,6 +63,7 @@ log = logging.getLogger(__name__)
 EXTRACTION_SECONDS = 30 * 60  # per material version (section 13)
 MAX_FILES = 20  # per request
 WAIT_SECONDS = 0.5  # a lookup's look at whether its materials have been read, and at its ask
+LOOKUP_WAIT_SECONDS = EXTRACTION_SECONDS + 60  # how long a lookup waits for its readings, at most
 PASSAGE_PAGE = 500
 _WORKFLOWS = ("extract", "lookup")
 _SHARED = ("complete", "ocr_needed")  # an extraction's statuses: written whole, never partly
@@ -259,7 +263,8 @@ def register(harness, content):
         except (FileNotFoundError, ContentCorruptError):
             raise RunOutcome("failed", "file_missing") from None
         summary = {"passages": len(extracted.passages), "pages": extracted.pages, "ocr_pages": extracted.ocr_pages}
-        return summary, lambda conn: _store(conn, version_id, sha256, extracted)
+        return summary, lambda conn: _store(conn, version_id, sha256, extracted, lambda conn, project, follow: (
+            harness.record_in(conn, active, project, "lookup", follow)))
 
     async def lookup_run(harness, active, project_id, inputs):
         return await _look_up(harness, active, project_id, inputs, pace)
@@ -268,9 +273,11 @@ def register(harness, content):
     harness.workflows["lookup"] = lookup_run
 
 
-def _store(conn, version_id, sha256, extracted):
+def _store(conn, version_id, sha256, extracted, look_up):
     """The extraction, its passages and the project's index queue rows, in the run's terminal
-    transaction; an extraction of the same file and version written meanwhile is shared instead."""
+    transaction; an extraction of the same file and version written meanwhile is shared instead.
+    Every version this reading now gives text to, in any project, whose latest lookup concluded
+    without it (not_read) gets a lookup in the same transaction: look_up(conn, project id, inputs)."""
     found = conn.execute("SELECT m.project_id FROM material_versions v JOIN materials m ON m.id = v.material_id"
                          " WHERE v.id = ?", (version_id,)).fetchone()
     if found is None:
@@ -292,6 +299,27 @@ def _store(conn, version_id, sha256, extracted):
             [(new_id(), extraction_id, ordinal, p.page, json.dumps(p.section_path), p.kind, p.text, p.char_start,
               p.char_end, json.dumps(p.boxes) if p.boxes else None) for ordinal, p in enumerate(extracted.passages)])
     _queue_adds(conn, extraction_id, found[0])
+    _looked_up_unread(conn, sha256, extracted.extractor, look_up)
+
+
+def _looked_up_unread(conn, sha256, extractor, look_up):
+    """A reading of the file just committed: each current version it reads whose latest lookup
+    recorded not_read (it concluded before any reading of its file had) gets a lookup now, as at
+    import: a Local only project's asks first, a review-locked project's gets none. A lookup made
+    for that version since, or one that has still to read its identifiers, covers it."""
+    for material, version, kind, project, locked in conn.execute(
+            f"SELECT m.id, v.id, {_VERSION_TYPE}, m.project_id, p.review_lock FROM material_versions v"
+            " JOIN content_files c ON c.sha256 = v.file_sha256 JOIN materials m ON m.id = v.material_id"
+            " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
+        if locked or extraction.EXTRACTORS.get(kind, (None,))[0] != extractor:
+            continue
+        latest = conn.execute("SELECT r.id FROM runs r, json_each(r.inputs, '$.versions') j WHERE r.workflow = 'lookup'"
+                              " AND j.key = ? AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material, version)).fetchone()
+        if latest is not None and conn.execute(
+                "SELECT 1 FROM run_events WHERE run_id = ? AND type = 'step_finished'"
+                " AND json_extract(data, '$.material_id') = ? AND json_extract(data, '$.outcome') = 'not_read'",
+                (latest[0], material)).fetchone():
+            look_up(conn, project, {"material_ids": [material], "versions": {material: version}, "origin": None})
 
 
 # Looking up identifiers
@@ -312,17 +340,31 @@ async def _look_up(harness, active, project_id, inputs, pace):
             "SELECT id FROM runs WHERE workflow = 'extract' AND status = 'running'"
             " AND json_extract(inputs, '$.version_id') IN (SELECT value FROM json_each(?))",
             (json.dumps(list(versions.values())),)) if _live(run, harness.registry)]) \
-            and time.monotonic() - started < EXTRACTION_SECONDS + 60:
+            and time.monotonic() - started < LOOKUP_WAIT_SECONDS:
         await asyncio.sleep(WAIT_SECONDS)
 
-    wanted = await read(lambda conn: _identifiers(conn, project_id, _left_to(conn, run_id, materials, versions), versions))
-    distinct = list(dict.fromkeys(found for _, found in wanted.values() if found))
-    if not await _write_if_running(write, run_id, lambda conn: [
-            _event(conn, run_id, "step_finished", {"material_id": material, "identifier": None, "outcome": "no_identifier"})
-            for material, (_, found) in wanted.items() if found is None]):
-        return {"identifiers": len(distinct)}, None
+    def take(conn):
+        """Each version's identifier, and the outcome of those that give none, in one transaction: a
+        version with no reading committed is not_read, never no_identifier, so a reading that commits
+        later sees it (_looked_up_unread) and this run can be tried again."""
+        if not _running(conn, run_id) or _revoked(conn, run_id):
+            return None
+        found = _identifiers(conn, project_id, materials, versions)
+        for material, (_, identifier, read) in found.items():
+            if identifier is None:
+                _event(conn, run_id, "step_finished", {"material_id": material, "identifier": None,
+                                                       "outcome": "no_identifier" if read else "not_read"})
+        return found
+
+    wanted = await write(take)
+    if wanted is None:
+        return {"identifiers": 0}, None
+    distinct = list(dict.fromkeys(found for _, found, _ in wanted.values() if found))
+    unread = any(not read for _, _, read in wanted.values())
     active.progress = {"done": 0, "total": len(distinct)}
     if not distinct:
+        if unread:  # a version had no text yet: its lookup comes with its reading, or Retry
+            raise RunOutcome("failed", "not_read")
         return {"identifiers": 0}, None
     policy = await read(lambda conn: conn.execute(
         "SELECT sensitivity, review_lock FROM projects WHERE id = ?", (project_id,)).fetchone())
@@ -349,7 +391,7 @@ async def _look_up(harness, active, project_id, inputs, pace):
 
     async with harness.gate.async_client(project_id, approved=approved, admit=admit) as client:
         for done, (scheme, value) in enumerate(distinct, start=1):
-            mine = asking[0] = [(m, version) for m, (version, found) in wanted.items() if found == (scheme, value)]
+            mine = asking[0] = [(m, version) for m, (version, found, _) in wanted.items() if found == (scheme, value)]
             if not await read(lambda conn: _current(conn, mine)):  # every paper it was for has another file now
                 found, outcome = None, "replaced"
             else:
@@ -371,8 +413,9 @@ async def _look_up(harness, active, project_id, inputs, pace):
             resolved += found is not None
             missed += [outcome] if outcome in ("unavailable", "refused") else []
             active.progress = {"done": done, "total": len(distinct)}
-    if missed:  # a source gave no answer (or could not be asked): the run failed, and Retry asks again
-        raise RunOutcome("failed", "unavailable" if "unavailable" in missed else "refused")
+    if missed or unread:  # a source gave no answer (or could not be asked), or a version had no text yet:
+        # the run failed, and Retry asks again
+        raise RunOutcome("failed", "unavailable" if "unavailable" in missed else "refused" if missed else "not_read")
     return {"identifiers": len(distinct), "resolved": resolved}, None
 
 
@@ -387,8 +430,8 @@ async def _write_if_running(write, run_id, fn):
 
 
 def _identifiers(conn, project_id, materials, versions):
-    """{material id: (version id, (scheme, identifier) or None)}: the first DOI the version's own text
-    gives, else the first arXiv ID. The version is the one the lookup was made for (versions), or the
+    """{material id: (version id, (scheme, identifier) or None, whether the version has a committed
+    reading)}: the first DOI the version's own text gives, else the first arXiv ID. The version is the one the lookup was made for (versions), or the
     current one for a lookup that names none; materials gone since are left out. A result is about
     that version, and is sent and applied only while it is still the material's current file."""
     found = {}
@@ -406,18 +449,9 @@ def _identifiers(conn, project_id, materials, versions):
             "SELECT kind, text, page FROM passages WHERE extraction_id = ? ORDER BY ordinal",
             (extracted[0],))) if extracted else ()
         ids = extraction.identifiers(passages)
-        found[material] = (row[0], next((i for i in ids if i[0] == "doi"), None) or next(iter(ids), None))
+        found[material] = (row[0], next((i for i in ids if i[0] == "doi"), None) or next(iter(ids), None),
+                           extracted is not None)
     return found
-
-
-def _left_to(conn, run_id, materials, versions):
-    """Of a lookup's materials, those no later lookup was made for at the same version (a reading
-    tried again brings its version's own, see retry_run): that one looks it up, this one leaves it,
-    so an identifier is never looked up twice for one version."""
-    return [m for m in materials if not conn.execute(
-        "SELECT 1 FROM runs r, json_each(r.inputs, '$.versions') j WHERE r.workflow = 'lookup' AND j.key = ?"
-        " AND j.value = ? AND r.rowid > (SELECT rowid FROM runs WHERE id = ?)",
-        (m, versions.get(m), run_id)).fetchone()]
 
 
 def _current(conn, pairs):
@@ -434,7 +468,7 @@ async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
     restart, its paper's file replaced meanwhile) closes it and asks again. An ask whose papers all
     have another file since is closed (replaced): there is nothing left for it to send."""
     covers = sorted(f"{scheme}:{value}" for scheme, value in distinct)
-    asked_for = [(m, v) for m, (v, found) in wanted.items() if found]  # the papers whose identifiers it covers
+    asked_for = [(m, v) for m, (v, found, _) in wanted.items() if found]  # the papers whose identifiers it covers
     ask, answer = await read(lambda conn: asks.asked(conn, run_id))
     if not await read(lambda conn: _current(conn, asked_for)):  # every paper it was for has another file now
         if ask is not None:
@@ -867,9 +901,8 @@ def _retry(conn, run_id, registry):
 async def retry_run(run_id: str, request: Request):
     """Read a version again, or look a batch up again, after a run that failed, was stopped or was
     interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again.
-    A version read again gets a lookup of its own as well, as at import, unless its project is
-    review-locked: the lookup made with it found no text to read, and this one waits for the reading
-    (an older lookup still waiting leaves the version to it, see _left_to)."""
+    A version read again whose lookup concluded unread gets a lookup once the reading commits
+    (_looked_up_unread)."""
     state = _state(request)
 
     def again(conn, ids):
@@ -877,15 +910,8 @@ async def retry_run(run_id: str, request: Request):
         if refusal is not None:
             raise _refused(*refusal)
         project_id, workflow, inputs = retry
-        made = [(workflow, inputs)]
-        if workflow == "extract" and not conn.execute("SELECT review_lock FROM projects WHERE id = ?",
-                                                      (project_id,)).fetchone()[0]:
-            [material] = inputs["material_ids"]
-            made.append(("lookup", {"material_ids": [material], "versions": {material: inputs["version_id"]},
-                                    "origin": None}))
-        for new, (kind, made_inputs) in zip(ids, made):
-            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
-                         (new, project_id, kind, json.dumps(made_inputs)))
-        return ids[0], ids[:len(made)]
+        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
+                     (ids[0], project_id, workflow, json.dumps(inputs)))
+        return ids[0], ids
 
-    return {"run_id": await state["harness"].record_background(2, again)}
+    return {"run_id": await state["harness"].record_background(1, again)}

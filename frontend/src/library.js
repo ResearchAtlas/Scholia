@@ -93,6 +93,9 @@ export function stateKey(material) {
   return `library.state.${material.state}`;
 }
 
+// A finished lookup's outcome for a paper, each with its text (library.source.*): what its details say.
+export const LOOKUP_OUTCOMES = ['no_identifier', 'not_read', 'not_found', 'unavailable', 'refused'];
+
 const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file',
   'encrypted_file', 'file_missing', 'interrupted', 'not_found']);
 

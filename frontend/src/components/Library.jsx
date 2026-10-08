@@ -8,8 +8,8 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get } from '../api.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, MAX_FILES, addFiles, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey, typeKey,
-  unsettled, yearOf } from '../library.js';
+import { ACCEPT, LOOKUP_OUTCOMES, MAX_FILES, addFiles, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey,
+  typeKey, unsettled, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { Paper } from './Paper.jsx';
@@ -254,6 +254,5 @@ function detailsSource(t, material, project, date) {
     return t(lookup.cancel_reason === 'revoked' ? 'library.source.projectChanged' : 'library.source.declined');
   }
   const outcome = lookup.outcome;
-  return t(['no_identifier', 'not_found', 'unavailable', 'refused'].includes(outcome) ? `library.source.${outcome}`
-    : 'library.source.fromFile');
+  return t(LOOKUP_OUTCOMES.includes(outcome) ? `library.source.${outcome}` : 'library.source.fromFile');
 }

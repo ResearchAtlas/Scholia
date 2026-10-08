@@ -247,6 +247,7 @@
   "errors.invalid_answer": "Choose one of the answers offered.",
   "errors.lookup_locked": "A review-locked project never looks up identifiers.",
   "errors.declined": "Not looked up: you chose not to.",
+  "errors.not_read": "Not looked up: a file was not read yet. It is looked up once it is read.",
   "errors.empty_file": "The file is empty.",
   "library.materialCount": {
     "one": "{count} material",
@@ -317,6 +318,7 @@
   "library.source.projectChanged": "Not looked up: the project changed",
   "library.source.declined": "Not looked up: you chose not to",
   "library.source.no_identifier": "From the file: no DOI or arXiv ID was found in it",
+  "library.source.not_read": "From the file: not looked up yet, as the file has not been read",
   "library.source.not_found": "From the file: no record was found for its identifier",
   "library.source.unavailable": "From the file: the lookup got no answer, so details may be missing",
   "library.source.refused": "From the file: this project's protection did not allow the lookup",

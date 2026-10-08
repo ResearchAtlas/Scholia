@@ -97,7 +97,7 @@ async def test_a_reading_whose_terminal_write_fails_reads_interrupted_needs_atte
         assert (run["status"], run["retryable"]) == ("interrupted", True)  # as the list reads it, Retry offered
         [stopped] = await settled(client, project)  # its lookup did not wait for the abandoned reading
         assert (stopped["state"], stopped["reason"]) == ("needs_attention", "interrupted")
-        assert stopped["reading"]["status"] == "interrupted" and stopped["lookup"]["outcome"] == "no_identifier"
+        assert stopped["reading"]["status"] == "interrupted" and stopped["lookup"]["outcome"] == "not_read"
         again = await client.post(f"/api/runs/{paper['run_id']}/retry")
         assert again.status_code == 201, again.text
         assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
