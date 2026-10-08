@@ -558,6 +558,39 @@ async def test_a_researchers_edit_is_kept_and_its_retraction_still_checked(tmp_p
         assert (paper["title"], paper["checked_by"], paper["retraction"]) == ("My Own Title", "researcher", "retracted")
 
 
+@pytest.mark.parametrize("doi", ["changed", "cleared", "unchanged"])
+async def test_a_doi_the_researcher_changes_or_clears_takes_its_lookups_provenance_and_retraction_with_it(tmp_path, doi):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE, retracted=True)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [looked] = await settled(client, project)
+        assert (looked["retraction"], looked["source_key"], looked["csl"]["volume"]) == ("retracted", f"doi:{DOI}", "3")
+        material = result["materials"][0]["id"]
+        typed = {"changed": "10.5555/another.paper", "cleared": "", "unchanged": f"https://doi.org/{DOI.upper()}"}[doi]
+        saved = await client.patch(f"/api/materials/{material}", json={"title": "My Own Title", "doi": typed})
+        assert saved.status_code == 200, saved.text
+        paper = saved.json()
+        assert (paper["title"], paper["checked_by"]) == ("My Own Title", "researcher")
+        if doi == "unchanged":  # the lookup's record still describes it: all of it is kept
+            assert (paper["retraction"], paper["source_key"], paper["csl"]["DOI"]) == ("retracted", f"doi:{DOI}", DOI)
+            assert paper["resolved_at"] and paper["retraction_checked_at"] and paper["csl"]["volume"] == "3"
+        else:  # nothing of the old DOI's record stays: no retraction flag, no provenance, none of its fields
+            assert (paper["retraction"], paper["retraction_checked_at"]) == ("unknown", None)
+            assert (paper["source_key"], paper["resolved_at"]) == (None, None)
+            assert set(paper["csl"]) <= {"title", "author", "issued", "container-title", "DOI"}
+            assert paper["csl"].get("DOI") == (typed or None) and paper["csl"]["author"] == looked["csl"]["author"]
+            assert paper["evidence_type"] == looked["evidence_type"] == "full_text"  # the file's, not the lookup's
+        # The file's DOI looked up again: a retraction is recorded only for the DOI the details carry.
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'failed' WHERE id = ?", (result["lookup_run_id"],)))
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [later] = await settled(client, project)
+        assert later["retraction"] == ("retracted" if doi == "unchanged" else "unknown")
+        assert (later["title"], later["checked_by"]) == ("My Own Title", "researcher")
+
+
 # By level
 
 

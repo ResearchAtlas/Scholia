@@ -26,11 +26,12 @@ identifiers; the answer covers this run and its retries only. Each material's me
 its own transaction while the run is running and not revoked, and only while that version is still
 the material's current file: a file replaced meanwhile makes the older lookup stale, so its
 identifier is not sent (its ask is closed) and its answer is not applied. Metadata the researcher
-edited is never replaced, though the retraction check is recorded. A failed lookup leaves the
-material as it was. A reading tried again brings its version a lookup of its own, as at import (none
-in a review-locked project): the one made with it had no text to read. Both runs name their
-materials in `inputs.material_ids`, the deletion service's scope link (backend/db/deletion.py), so
-deleting a material revokes them.
+edited is never replaced, though the retraction check is recorded while the details carry the DOI it
+was made for (a DOI the researcher changes or clears takes the old one's retraction check and source
+with it). A failed lookup leaves the material as it was. A reading tried again brings its version a
+lookup of its own, as at import (none in a review-locked project): the one made with it had no text
+to read. Both runs name their materials in `inputs.material_ids`, the deletion service's scope link
+(backend/db/deletion.py), so deleting a material revokes them.
 
 A paper reads Reading while its version's extraction runs, Ready once an extraction with text is
 committed, and Needs attention otherwise, with its reason.
@@ -479,8 +480,9 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
     file was replaced meanwhile keeps what its newer file gives (outcome replaced)."""
     now = utc_now()
     for material, version in pairs:
-        row = conn.execute("SELECT m.checked_by, v.id = ? FROM materials m JOIN material_versions v"
-                           " ON v.material_id = m.id AND v.is_current = 1 WHERE m.id = ? AND m.project_id = ?",
+        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI') FROM materials m"
+                           " JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
+                           " WHERE m.id = ? AND m.project_id = ?",
                            (version, material, project_id)).fetchone()
         if row is None:
             continue
@@ -490,7 +492,9 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
                              (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
-            if mine.retracted is not None:
+            # A retraction check is about the DOI the paper's details carry: details the researcher
+            # saved with another DOI, or none, are not flagged for this one.
+            if mine.retracted is not None and (row[0] != "researcher" or row[2] == value):
                 conn.execute("UPDATE materials SET retraction = ?, retraction_checked_at = ? WHERE id = ?",
                              ("retracted" if mine.retracted else "none", now, material))
         _event(conn, run_id, "step_finished", {"material_id": material, "identifier": f"{scheme}:{value}",
@@ -617,7 +621,10 @@ async def get_material(material_id: str, request: Request):
 @router.patch("/api/materials/{material_id}")
 async def change_material(material_id: str, body: MaterialChange, request: Request):
     """The researcher's edit of a paper's details: kept as checked by the researcher, so no lookup
-    replaces it. Typed text needs a visible character; a DOI must fit the pattern."""
+    replaces it. Typed text needs a visible character; a DOI must fit the pattern. A DOI changed or
+    cleared takes what a lookup knew of the old one with it, in the same update: its source and when
+    it resolved, its retraction check, and the fields of its record the form does not show (type,
+    volume, issue, pages). The fields the form shows stay as saved; the file's evidence type stays."""
     state = _state(request)
     changes = body.model_dump(exclude_unset=True)
     if "title" in changes and visible(changes["title"]) is None:
@@ -633,6 +640,9 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
         if row is None:
             raise _refused(404, "not_found", "No such material")
         csl = json.loads(row[1]) if row[1] else {}
+        moved = "doi" in changes and doi != (csl.get("DOI") or None)  # changed or cleared
+        if moved:
+            csl = {key: value for key, value in csl.items() if key in _FORM_FIELDS}
         title = visible(changes["title"]) if "title" in changes else row[0]
         csl["title"] = title
         if "authors" in changes:
@@ -648,10 +658,14 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
             csl.pop("DOI", None) if doi is None else csl.__setitem__("DOI", doi)
         now = utc_now()
         conn.execute("UPDATE materials SET title = ?, csl = ?, checked_by = 'researcher', checked_at = ?, updated_at = ?"
-                     " WHERE id = ?", (title, json.dumps(csl), now, now, material_id))
+                     + (", source_key = NULL, resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL"
+                        if moved else "") + " WHERE id = ?", (title, json.dumps(csl), now, now, material_id))
         return _describe(conn, _material_row(conn, material_id), state["harness"].registry)
 
     return await _to_end(asyncio.to_thread(state["db"].write, update))
+
+
+_FORM_FIELDS = ("title", "author", "issued", "container-title", "DOI")  # the CSL fields the details form edits
 
 
 def _author(name):

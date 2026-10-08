@@ -434,6 +434,27 @@ async function materials(ctx) {
     await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
   });
 
+  await step('19b-doi-changed', async () => {
+    // The retracted paper's DOI corrected by the researcher: the old DOI's retraction flag and source go with it.
+    await paper(titles.docx).click();
+    const doi = panel().getByRole('textbox', { name: L('paper.field.doi'), exact: true });
+    await doi.waitFor();
+    check('the paper is flagged retracted before the change', await panel().getByText(L('library.retracted'), { exact: true }).count() === 1);
+    await doi.fill('10.5555/scholia.walkthrough.corrected');
+    await panel().getByRole('button', { name: L('common.save'), exact: true }).click();
+    await panel().getByText(L('paper.saved')).waitFor();
+    const saved = (await listing(projectId)).materials.find((m) => m.title === titles.docx);
+    check('the old DOI\'s retraction and source are cleared with it', saved?.csl.DOI === '10.5555/scholia.walkthrough.corrected'
+      && saved.retraction === 'unknown' && saved.retraction_checked_at === null && saved.source_key === null
+      && saved.checked_by === 'researcher');
+    check('the page no longer flags it or names the lookup', await panel().getByText(L('library.retracted'), { exact: true }).count() === 0
+      && await panel().getByText(L('library.retractionUnchecked'), { exact: true }).count() === 1
+      && await panel().getByText(L('library.source.edited').split('{date}')[0], { exact: false }).count() === 1
+      && await panel().getByText(L('ask.service.crossref'), { exact: false }).count() === 0);
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    check('nor does the Library', await panel().getByText(L('library.retracted'), { exact: true }).count() === 0);
+  });
+
   const local = C.lang === 'en' ? 'Interviews (synthetic, Local only)' : '访谈（合成数据，仅本机）';
   const created = await get('/api/projects', { method: 'POST', body: JSON.stringify({ name: local, sensitivity: 'local_only' }) });
   await step('20-local-only-ask', async () => {
