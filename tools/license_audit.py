@@ -105,6 +105,10 @@ LIBRARIES = {
     # under the Unlicense, which needs no notice.
     HELPER: ("MIT AND Apache-2.0 AND (MIT OR Unlicense) AND (Unlicense OR MIT-0)",
              [ROOT / "tools/notices/llama.cpp/LICENSES.txt"]),
+    # The search model's license files. The model never ships; the app installs these beside it
+    # when it is downloaded or imported (backend/local_helper.py; slice 1 section 18).
+    "Qwen3-Embedding-0.6B": ("Apache-2.0", [ROOT / "tools/notices/Qwen3-Embedding-0.6B/LICENSE",
+                                            ROOT / "tools/notices/Qwen3-Embedding-0.6B/SOURCE.txt"]),
     # The Rust crates and standard library compiled into pydantic-core's extension, with the
     # licenses tools/rust_notices.py found in its Cargo.lock (it prints this expression).
     PYDANTIC_CORE_CRATES: (
