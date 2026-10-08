@@ -21,6 +21,7 @@ function ids(source) {
         if (call.callee.name === 'useConversationAsks') found.asks = text(call.arguments[0]);
         if (call.callee.name === 'asksChanged') found.woken = text(call.arguments[0]);
         if (call.callee.name === 'followAsks') found.followed = text(call.arguments[0]);
+        if (['afterRead', 'pollsAsks'].includes(call.callee.name)) found[call.callee.name] = true;
         if (call.callee.name === 'addTo') {
           const visit = (node) => {
             if (node?.type === 'ObjectExpression') {
@@ -57,4 +58,9 @@ test('an upload that ends wakes the view showing its conversation, whichever ins
   const { attach, woken, followed } = ids(readFileSync(SOURCE, 'utf8'));
   assert.equal(woken, attach); // attach() says which conversation its files joined, by the id it tagged them with
   assert.equal(followed, 'conversationId'); // and useConversationAsks follows its own conversation's changes
+});
+
+test('the view keeps looking after a read that failed, as afterRead and pollsAsks decide', () => {
+  const found = ids(readFileSync(SOURCE, 'utf8'));
+  assert.ok(found.afterRead && found.pollsAsks); // useConversationAsks keeps its state and polls by them
 });

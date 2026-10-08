@@ -239,6 +239,17 @@ export function followAsks(conversationId, load) {
   return () => asksEvents.removeEventListener('changed', changed);
 }
 
+// What a conversation's view knows of its questions (useConversationAsks): the open ones, whether work
+// started there still runs, and whether its last read failed, so that it has not learned whether
+// work remains. A read's answer replaces it; a failed read (null) keeps what was shown and says so.
+export const NO_ASKS = { asks: [], working: false, unsure: false };
+export const afterRead = (known, found) => (found ? { asks: found.asks, working: found.working > 0, unsure: false }
+  : { ...known, unsure: true });
+
+// Whether the view reads its questions again: while its own attached files' lookup is watched, work
+// runs, a question is open, or its last read failed (a wake-up's included), until a read succeeds.
+export const pollsAsks = (known, watching) => Boolean(watching || known.working || known.asks.length || known.unsure);
+
 // One read of a conversation's open questions (ConversationView's useConversationAsks): show(found)
 // gets its answer, or null when the read failed, only while it is the newest read asked (newest()),
 // so an answer for a conversation left since, or overtaken by a later read, never shows there.

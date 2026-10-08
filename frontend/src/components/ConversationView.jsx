@@ -15,7 +15,7 @@ import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
-import { ACCEPT, asksChanged, followAsks, libraryChanged, newest, readAsks } from '../library.js';
+import { ACCEPT, afterRead, asksChanged, followAsks, libraryChanged, newest, NO_ASKS, pollsAsks, readAsks } from '../library.js';
 import { addTo } from './Library.jsx';
 import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
@@ -24,28 +24,26 @@ import { cn } from '@/lib/utils';
 const POLL_MS = 1000; // between reads while a turn is settling, and after a failed read
 const ASKS_MS = 1500; // between reads of this conversation's questions, while files attached here are looked up
 
-// The questions raised by work started in this conversation, read again while that work goes on.
-// Only the newest read's answer is shown, and a change of conversation clears what was shown.
+// The questions raised by work started in this conversation, read again while that work goes on, or
+// until a read succeeds after one failed (afterRead, pollsAsks). Only the newest read's answer is
+// shown, and a change of conversation clears what was shown.
 function useConversationAsks(conversationId, watching) {
-  const [asks, setAsks] = useState([]);
-  const [working, setWorking] = useState(false); // work started here still runs
+  const [known, setKnown] = useState(NO_ASKS);
   const [reads, setReads] = useState(0);
   const [asked] = useState(newest);
   const load = useCallback(() => readAsks(asked, conversationId, (found) => {
-    if (found) {
-      setAsks(found.asks);
-      setWorking(found.working > 0);
-    }
+    setKnown((current) => afterRead(current, found));
     setReads((n) => n + 1);
   }), [conversationId, asked]);
-  useEffect(() => { setAsks([]); setWorking(false); load(); }, [load]);
+  useEffect(() => { setKnown(NO_ASKS); load(); }, [load]);
   useEffect(() => followAsks(conversationId, load), [conversationId, load]); // files attached here were added
+  const polls = pollsAsks(known, watching);
   useEffect(() => {
-    if (!watching && !working && !asks.length) return undefined;
+    if (!polls) return undefined;
     const timer = setTimeout(load, ASKS_MS);
     return () => clearTimeout(timer);
-  }, [watching, working, asks.length, reads, load]);
-  return { asks, load };
+  }, [polls, reads, load]);
+  return { asks: known.asks, load };
 }
 
 export function ConversationView({ conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,

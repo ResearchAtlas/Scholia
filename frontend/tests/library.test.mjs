@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -338,4 +338,27 @@ test('a run stopped for a reason it recorded says that reason, and one stopped w
   assert.deepEqual(runOutcome({ status: 'cancelled', cancel_reason: 'researcher', result: null }), { ok: false, key: 'runs.stopped' });
   assert.deepEqual(runOutcome({ status: 'cancelled', cancel_reason: 'revoked', result: { reason: 'project_changed' } }),
     { ok: false, key: 'runs.revoked' }); // a project's change says so, as before
+});
+
+test('a read of a conversation\'s questions that fails keeps the view looking until a read succeeds', async () => {
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) throw new TypeError('the connection dropped'); // the wake-up's read fails
+    return new Response(JSON.stringify({ asks: [{ ask_id: 'the-lookups' }], working: 1 }), { status: 200 });
+  };
+  try {
+    const asked = newest();
+    let state = NO_ASKS; // as useConversationAsks keeps it
+    const load = () => readAsks(asked, 'c1', (found) => { state = afterRead(state, found); });
+    await load(); // woken by the upload: the read fails
+    assert.deepEqual(state.asks, []);
+    assert.equal(pollsAsks(state, null), true); // not known whether work remains: it looks again
+    await load(); // the next turn
+    assert.deepEqual(state.asks.map((a) => a.ask_id), ['the-lookups']);
+    assert.equal(pollsAsks(afterRead(state, { asks: [], working: 0 }), null), false); // a read saying none remains ends it
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
