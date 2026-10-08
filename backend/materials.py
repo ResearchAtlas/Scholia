@@ -6,7 +6,9 @@ content store, then one transaction writes, per file, the project's material and
 version (or a new version of a material being replaced), and the background runs that follow:
 - an `extract` run per new version whose file has no extraction yet. An extraction finished by
   another project is shared instead, and its passages are queued for this project's index at once.
-- one `lookup` run for the batch, unless the project is review-locked, which never looks up.
+- one `lookup` run for the batch, unless the project is review-locked, which never looks up. A
+  drop sent in several requests, each under the request body limit, is one batch: its earlier
+  requests defer the lookup (look_up false) and its last names the versions they added (batch).
 A request that fails validation writes nothing; the same file added again to the same project
 reports the paper it already is.
 
@@ -47,6 +49,7 @@ import binascii
 import json
 import logging
 import time
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
@@ -84,9 +87,14 @@ class NewFile(BaseModel):
 
 
 class Upload(BaseModel):
-    files: list[NewFile] = Field(min_length=1, max_length=MAX_FILES)
+    files: list[NewFile] = Field(default_factory=list, max_length=MAX_FILES)
     conversation_id: str | None = Field(default=None, max_length=100)  # attached in a conversation
     material_id: str | None = Field(default=None, max_length=100)  # a new version of this material
+    # A drop sent in several requests (each under the body limit) is one batch: its earlier requests
+    # add their files with look_up false, and its last names the versions they added (batch), so one
+    # lookup covers them all. A last request with no files of its own looks up the batch alone.
+    look_up: bool = True
+    batch: list[Annotated[str, Field(max_length=100)]] = Field(default_factory=list, max_length=MAX_FILES)
 
 
 class MaterialChange(BaseModel):
@@ -114,6 +122,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
     db, content, harness = state["db"], state["content"], state["harness"]
     if body.material_id is not None and len(body.files) != 1:
         raise _refused(400, "invalid_request", "A file replaces one material")
+    if not body.files and not body.batch:
+        raise _refused(400, "invalid_request", "No files to add")
     files = []
     for item in body.files:
         name = visible(item.name)
@@ -151,6 +161,11 @@ async def add_files(project_id: str, body: Upload, request: Request):
         ids, used = iter(ids), []
         locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
         added, looked_up = [], {}  # looked_up: {material id: the version its lookup is for}
+        for version in body.batch:  # added by the drop's earlier requests; one replaced since has its own
+            row = conn.execute("SELECT v.material_id FROM material_versions v JOIN materials m ON m.id = v.material_id"
+                               " WHERE v.id = ? AND m.project_id = ? AND v.is_current = 1", (version, project_id)).fetchone()
+            if row is not None:
+                looked_up[row[0]] = version
         for name, sha256, kind in stored:
             if body.material_id is not None:
                 material = body.material_id
@@ -188,7 +203,7 @@ async def add_files(project_id: str, body: Upload, request: Request):
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
             looked_up[material] = version
         lookup_run = None
-        if looked_up and not locked:  # a review-locked project never looks identifiers up
+        if body.look_up and looked_up and not locked:  # a review-locked project never looks identifiers up
             lookup_run = next(ids)
             used.append(lookup_run)
             origin = {"conversation_id": body.conversation_id} if body.conversation_id else None

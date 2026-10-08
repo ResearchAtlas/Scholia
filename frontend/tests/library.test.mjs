@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -213,5 +213,38 @@ test('every lookup outcome a paper\'s details name has its text in both catalogs
   assert.ok(LOOKUP_OUTCOMES.includes('not_read'));
   for (const key of [...LOOKUP_OUTCOMES.map((outcome) => `library.source.${outcome}`), 'errors.not_read']) {
     assert.ok(key in en && key in zh, key);
+  }
+});
+
+test('a drop sent in several requests is one batch: the last names the papers the others added, looked up once', async () => {
+  const MiB = 1024 * 1024;
+  const realFetch = globalThis.fetch;
+  const realReader = globalThis.FileReader;
+  globalThis.FileReader = class { // as the browser reads a file: a data URL of its bytes
+    readAsDataURL(blob) {
+      blob.arrayBuffer().then((bytes) => { this.result = `data:;base64,${Buffer.from(bytes).toString('base64')}`; this.onload(); });
+    }
+  };
+  const sent = [];
+  globalThis.fetch = async (path, init) => {
+    const body = JSON.parse(init.body);
+    sent.push({ path, size: init.body.length, body: { ...body, files: body.files.map((f) => f.name) } });
+    const n = sent.length;
+    const materials = body.files.map((f, i) => ({ id: `m${n}${i}`, existing: false, version_id: `v${n}${i}`, run_id: `r${n}${i}` }));
+    return new Response(JSON.stringify({ materials, lookup_run_id: body.look_up === false ? null : `lookup${n}` }), { status: 201 });
+  };
+  try {
+    const part = new Uint8Array(MiB);
+    const file = (name) => new File(Array.from({ length: 60 }, () => part), name); // 60 MiB each
+    const added = await addFiles('p1', [file('a.pdf'), file('b.pdf')]);
+    assert.deepEqual(sent.map((r) => r.body), [
+      { files: ['a.pdf'], look_up: false }, // recorded, its lookup left to the drop's last request
+      { files: ['b.pdf'], batch: ['v10'] }]); // which looks up both: one question in a Local only project
+    assert.ok(sent.every((r) => r.size <= REQUEST_FILE_BYTES + 64 * 1024)); // each under the backend's limit
+    assert.deepEqual(added.materials.map((m) => m.id), ['m10', 'm20']);
+    assert.equal(added.lookup_run_id, 'lookup2');
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.FileReader = realReader;
   }
 });

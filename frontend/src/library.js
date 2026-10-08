@@ -53,21 +53,30 @@ export function requestsOf(files) {
 // Adds files to a project: from a drop, Add files, or the conversation (conversationId), or as a
 // new version of a material (materialId). A file larger than Scholia reads refuses the selection,
 // as the backend would; the rest go in as few requests as fit (requestsOf), read one request at a
-// time. Resolves to the backend's answers together; a request that fails once others were added
-// ends the sending, its error code in `problem`.
+// time, and stay one batch: every request but the last leaves the lookup to it (look_up false),
+// and the last names the versions they added (batch), so a Local only project asks once, counting
+// every identifier the drop gave. Resolves to the backend's answers together; a request that fails
+// once others were added ends the sending, its error code in `problem`, and those added are still
+// looked up together.
 export async function addFiles(projectId, files, { conversationId, materialId } = {}) {
   if (files.some((file) => file.size > MAX_FILE_BYTES)) throw new ApiError(413, 'file_too_large');
+  const send = (body) => post(`/api/projects/${encodeURIComponent(projectId)}/materials`, {
+    ...body, ...(conversationId ? { conversation_id: conversationId } : {}), ...(materialId ? { material_id: materialId } : {}),
+  });
+  const groups = requestsOf(files);
   const added = { materials: [], lookup_run_id: null };
-  for (const group of requestsOf(files)) {
+  const batch = []; // the versions this drop's earlier requests added, looked up with its last
+  for (const [i, group] of groups.entries()) {
+    const last = i === groups.length - 1;
     try {
-      const answer = await post(`/api/projects/${encodeURIComponent(projectId)}/materials`, {
-        files: await Promise.all(group.map(readFile)), ...(conversationId ? { conversation_id: conversationId } : {}),
-        ...(materialId ? { material_id: materialId } : {}),
-      });
+      const ending = last ? (batch.length ? { batch } : {}) : { look_up: false };
+      const answer = await send({ files: await Promise.all(group.map(readFile)), ...ending });
       added.materials.push(...answer.materials);
+      batch.push(...answer.materials.filter((m) => m.version_id && !m.existing).map((m) => m.version_id));
       added.lookup_run_id = answer.lookup_run_id ?? added.lookup_run_id;
     } catch (error) {
       if (!added.materials.length) throw error;
+      if (batch.length) added.lookup_run_id = (await send({ batch }).catch(() => null))?.lookup_run_id ?? null;
       return { ...added, problem: error instanceof ApiError ? error.code : 'internal' };
     }
   }

@@ -747,6 +747,36 @@ async def test_a_local_only_project_asks_once_per_batch_and_the_answer_covers_th
         assert asked_again["run_id"] == retried.json()["run_id"]
 
 
+async def test_a_drop_sent_in_several_requests_asks_once_counting_every_identifier(tmp_path):
+    other = "10.5555/second.request"
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "Sent Second")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client, level="local_only")
+        first = await added(client, project, ("a.pdf", synthetic.paper_pdf()), look_up=False)
+        assert first["lookup_run_id"] is None  # left to the drop's last request
+        last = await added(client, project, ("b.md", f"# B\n\ndoi:{other}\n".encode()),
+                           batch=[first["materials"][0]["version_id"]])
+        [ask] = await ask_of(client, project)
+        assert ask["run_id"] == last["lookup_run_id"] and ask["params"]["identifiers"] == 2  # one question for both
+        assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200
+        papers = await settled(client, project)
+        assert sorted(p["title"] for p in papers) == sorted([TITLE, "Sent Second"])
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]
+
+
+async def test_a_drop_whose_later_request_failed_still_looks_up_what_was_added(tmp_path):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client)
+        first = await added(client, project, ("a.pdf", synthetic.paper_pdf()), look_up=False)
+        refused = await client.post(f"/api/projects/{project}/materials", json={"files": []})
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")  # nothing to add or look up
+        only = await added(client, project, batch=[first["materials"][0]["version_id"], new_id()])  # an unknown one: left out
+        assert only["materials"] == [] and only["lookup_run_id"]
+        [paper] = await settled(client, project)
+        assert paper["title"] == TITLE and paper["lookup"]["run_id"] == only["lookup_run_id"]
+
+
 async def test_a_local_only_lookup_cancelled_while_it_asks_closes_its_ask(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client, level="local_only")
