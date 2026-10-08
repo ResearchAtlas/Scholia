@@ -142,8 +142,15 @@ PERSONAL = {
     ("budget", "conversation_usd"): (10, _number(0)),
     ("budget", "notice_percents"): ([50, 85, 90], lambda v: type(v) is list and all(_int(1, 100)(x) for x in v)),
     ("privacy", "trim_bodies_after_days"): (0, _int(0)),
+    # The local model helper (backend/local_helper.py; section 13's lifecycle values).
     ("helper", "idle_stop_minutes"): (10, _int(1)),
-    ("helper", "model_source"): (None, _text),
+    ("helper", "model_source"): (None, _choice("huggingface", "modelscope")),
+    # Section 13's starting value was 30 s, below measured cold starts: 31 to 41 s on the CI runner's
+    # virtual GPU (S1-07; ticket 70); 16.4 s for the reranker's first launch on the reference Mac.
+    ("helper", "start_seconds"): (60, _number(0)),
+    ("helper", "health_seconds"): (30, _number(0)),
+    ("helper", "restart_backoff_seconds"): ([1, 5, 30], lambda v: type(v) is list and 0 < len(v) <= 10
+                                            and all(_number(0)(x) for x in v)),
     **{("limits", k): spec for k, spec in _LIMITS.items()},
     **{("context", k): spec for k, spec in _CONTEXT.items()},
     **{("retrieval", k): spec for k, spec in _RETRIEVAL.items()},

@@ -86,7 +86,7 @@ def ours(host, port):
 
 
 def gate_for(db, provider_urls=(), helper_url=None):
-    return OutboundGate(db, lambda: GateInputs(provider_urls=provider_urls, helper_url=helper_url),
+    return OutboundGate(db, lambda: GateInputs(provider_urls=provider_urls, helper_urls=(helper_url,) if helper_url else ()),
                         local_listener=ours)
 
 

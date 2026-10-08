@@ -4,8 +4,9 @@ The app runs it with `--self-test --model <embedding model>`. It checks, inside 
 build, the native pieces the app ships: SQLite, FTS5 secure-delete, extension loading and
 sqlite-vec through APSW, the backend with one turn against an in-process provider, an
 AES-encrypted zip file as backups and exports write them (pyzipper and pycryptodomex's native
-code, imported only when first used), one embedding through the llama.cpp helper, and one
-OCR page through Vision. It prints the
+code, imported only when first used), one embedding through the llama.cpp helper, whose binary and libraries are first checked against
+the build's SHA-256 manifest as the app checks them before every launch, and one OCR page through
+Vision. It prints the
 results as JSON and exits non-zero when any check fails.
 
 The checks also run from source (tests/test_self_test.py), except the embedding, which
@@ -13,7 +14,6 @@ needs the model and the helper binary.
 """
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -32,24 +32,15 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from backend.local_helper import EMBEDDING_MODEL, LISTENING, binary_problem, command, mismatch  # noqa: F401
+
 MIN_SQLITE = (3, 42, 0)  # the first SQLite with FTS5 secure-delete
 SQLITE_VEC_VERSION = "v0.1.9"
 DIMENSIONS = 1024
 
-# Qwen's own Q8_0 GGUF of Qwen3-Embedding-0.6B (Apache-2.0), at a pinned revision.
-EMBEDDING_MODEL = {
-    "file": "Qwen3-Embedding-0.6B-Q8_0.gguf",
-    "size": 639_150_592,
-    "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
-    "url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/"
-    "370f27d7550e0def9b39c1f16d3fbaa13aa67728/Qwen3-Embedding-0.6B-Q8_0.gguf",
-}
 # A bound for a cold start, not the app's start deadline, which is a separate setting: the
 # first start on a CI runner's virtual GPU spent about 35 s preparing Metal before the model loaded.
 HELPER_START_SECONDS = 120
-# Per helper process: context, physical batch and slots.
-HELPER_LIMITS = ["-c", "4096", "-ub", "2048", "-np", "2"]
-LISTENING = re.compile(r"listening on http://127\.0\.0\.1:(\d+)")
 # The OCR page: one English and one Simplified Chinese line.
 OCR_LINES = ["Scholia self-test 2026", "学术研究平台"]
 
@@ -126,20 +117,6 @@ def check_index() -> dict:
     return {"sqlite": version, "apsw": apsw.apsw_version(), "sqlite_vec": vec_version}
 
 
-def mismatch(path: Path, pin: dict) -> str | None:
-    """Why the file at `path` differs from `pin` (its size and SHA-256), or None."""
-    size = path.stat().st_size
-    if size != pin["size"]:
-        return f"{path.name}: {size} bytes, expected {pin['size']}"
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        while block := f.read(1 << 20):
-            digest.update(block)
-    if digest.hexdigest() != pin["sha256"]:
-        return f"{path.name}: SHA-256 {digest.hexdigest()}, expected {pin['sha256']}"
-    return None
-
-
 def verify_model(path: Path) -> None:
     """Refuse a model file that differs from the pin."""
     if error := mismatch(path, EMBEDDING_MODEL):
@@ -147,10 +124,7 @@ def verify_model(path: Path) -> None:
 
 
 def helper_command(helper: Path, model: Path) -> list[str]:
-    return [
-        str(helper), "-m", str(model), "--offline", "--host", "127.0.0.1", "--port", "0",
-        "--no-webui", "--embedding", "--pooling", "last", *HELPER_LIMITS,
-    ]
+    return command(helper, model)
 
 
 def wait_for_port(lines: "queue.Queue[str | None]", log: list[str], deadline: float) -> int:
@@ -163,7 +137,7 @@ def wait_for_port(lines: "queue.Queue[str | None]", log: list[str], deadline: fl
         if line is None:
             raise RuntimeError("the helper exited before it was ready")
         log.append(line)
-        if match := LISTENING.search(line):
+        if match := LISTENING.search(line.encode()):
             return int(match.group(1))
     raise RuntimeError(f"the helper was not ready within {HELPER_START_SECONDS} s")
 
@@ -206,6 +180,8 @@ def refused_without_key(port: int) -> bool:
 
 
 def check_embedding(helper: Path, model: Path) -> dict:
+    if problem := binary_problem(helper):
+        raise RuntimeError(f"the helper's binaries failed their check ({problem})")
     verify_model(model)
     key = secrets.token_urlsafe(32)
     env = {"LLAMA_API_KEY": key} | {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}

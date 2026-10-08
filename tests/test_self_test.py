@@ -63,7 +63,7 @@ def test_helper_flags():
     assert st.helper_command("/app/llama-server", "/models/m.gguf") == [
         "/app/llama-server", "-m", "/models/m.gguf", "--offline", "--host", "127.0.0.1",
         "--port", "0", "--no-webui", "--embedding", "--pooling", "last",
-        "-c", "4096", "-ub", "2048", "-np", "2",
+        "-c", "4096", "-ub", "2048", "-np", "2", "--cache-ram", "0",
     ]
 
 

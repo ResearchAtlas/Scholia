@@ -401,14 +401,21 @@ def _stop(app, server, thread, loop):
 
 class WindowApi:
     """What the interface may ask of the window (pywebview's js_api, as window.pywebview.api):
-    only to choose a folder, for a full backup, an export or the data folder. A browser has no
-    such bridge; there the interface takes a typed path."""
+    only to choose a folder, for a full backup, an export or the data folder, and a model file to
+    import. A browser has no such bridge; there the interface takes a typed path."""
 
     def choose_folder(self):
         """The folder the researcher picked in the system's dialog, or None if cancelled."""
         import webview
 
         chosen = webview.windows[0].create_file_dialog(webview.FileDialog.FOLDER)
+        return chosen[0] if chosen else None
+
+    def choose_model_file(self):
+        """The model file (GGUF) the researcher picked in the system's dialog, or None if cancelled."""
+        import webview
+
+        chosen = webview.windows[0].create_file_dialog(webview.FileDialog.OPEN, file_types=("GGUF (*.gguf)",))
         return chosen[0] if chosen else None
 
 

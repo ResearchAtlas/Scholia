@@ -38,9 +38,13 @@ cp build/llama.cpp/llama-server "$app/Contents/MacOS/"
 install_name_tool -rpath @loader_path @loader_path/../Frameworks/llama-cpp \
   "$app/Contents/MacOS/llama-server"
 
-# Ad-hoc signatures from the inside out, then the app's seal over everything.
+# Ad-hoc signatures from the inside out, then the app's seal over everything. Between them, the
+# SHA-256 of the helper and its libraries as signed, which the app checks before every launch of
+# the helper (backend/local_helper.py).
 codesign --force --sign - "$helper_libs"/*.dylib
 codesign --force --sign - "$app/Contents/MacOS/llama-server"
+python -c 'import sys; from backend.local_helper import write_manifest; print(write_manifest(sys.argv[1]))' \
+  "$app/Contents"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
