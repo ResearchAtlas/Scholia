@@ -145,7 +145,7 @@ async def test_a_body_over_the_limit_or_of_unknown_length_is_refused_before_anyt
         assert (await client.get(f"/api/projects/{project}/materials")).json()["materials"] == []
 
 
-def test_the_body_limit_admits_one_file_of_the_largest_size_and_no_more():
+async def test_the_body_limit_admits_one_file_of_the_largest_size_and_no_more():
     from backend import extraction, local_guard
     encoded = (extraction.MAX_FILE_BYTES + 2) // 3 * 4  # its bytes in base64
     around = json.dumps({"files": [{"name": "\u0001" * 255, "data": ""}], "conversation_id": "x" * 100,
