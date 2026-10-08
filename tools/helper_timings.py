@@ -3,7 +3,7 @@ calibration rule), for S1-16.
 
     sandbox-exec -f tests/loopback-only.sb uv run --no-sync python tools/helper_timings.py \\
         --helper <app>/Contents/MacOS/llama-server --model <Qwen3-Embedding-0.6B-Q8_0.gguf> \\
-        [--reranker <qwen3-reranker-0.6b-q8_0.gguf>] [--sustained SECONDS] [--out FILE]
+        [--reranker <qwen3-reranker-0.6b-q8_0.gguf>] [--sustained SECONDS] [--desktop] [--out FILE]
 
 The workload is named here, before anything runs (WORKLOAD), and printed with the results: synthetic
 English and Chinese passages shaped like section 7.1's (one paragraph of up to 2,000 characters,
@@ -18,10 +18,18 @@ sandbox so nothing leaves the Mac; it also lists the helpers' sockets with lsof.
 Recorded: the first start in this process (the model file not in the file cache: it is installed
 with caching off), warm starts, embedding latency per batch and per question (warm median and p95),
 a sustained run with questions during indexing, the share of questions over the hybrid retrieval
-deadline, failures, the whole app's peak memory (this backend process plus its helper processes;
-resident size sampled, and physical footprint at set points), memory pressure and swap. With
---reranker, ticket 70's cancellation test: 24 candidates reranked against a deadline, the reranker's
-own process ended at the deadline, and the time until it is gone, with embedding work running beside it.
+deadline, failures, peak memory (physical footprint and resident size, sampled every 0.5 s), memory
+pressure and swap. With --reranker, ticket 70's cancellation test: 24 candidates reranked against a
+deadline, the reranker's own process ended at the deadline, and the time until it is gone, with
+embedding work running beside it.
+
+Without --desktop the backend runs in this process, and memory covers it and its helper processes,
+from their launch. With --desktop the whole application runs as the desktop entry runs it
+(backend/desktop.py: the backend, its window and the interface in it), on a new temporary data
+folder, and the same workload is driven inside its backend; memory then also covers the window's
+WebKit processes (found as the WebKit processes this launch started, which the system attributes
+to the same responsible process), and every one of the app's processes is checked for sockets
+that are not loopback.
 """
 
 import argparse
@@ -177,6 +185,40 @@ def footprint(pid):
     return found[1] if found else None
 
 
+_libproc.proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+_libproc.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+_responsible = ctypes.CDLL("/usr/lib/libSystem.B.dylib").responsibility_get_pid_responsible_for_pid
+_responsible.argtypes, _responsible.restype = [ctypes.c_int], ctypes.c_int
+
+
+def _pids(listing, *args):
+    buffer = (ctypes.c_int * 8192)()
+    count = listing(*args, buffer, ctypes.sizeof(buffer))
+    return [pid for pid in buffer[:max(count, 0)] if pid > 0]
+
+
+def path_of(pid) -> str:
+    buffer = ctypes.create_string_buffer(4096)
+    return buffer.value.decode(errors="replace") if _libproc.proc_pidpath(pid, buffer, 4096) > 0 else ""
+
+
+def helpers_of(pid) -> list[int]:
+    """The llama-server processes this process started, from their launch (not only once ready)."""
+    return [child for child in _pids(_libproc.proc_listchildpids, pid) if path_of(child).endswith("/llama-server")]
+
+
+def webkit_processes() -> set[int]:
+    return {pid for pid in _pids(_libproc.proc_listallpids) if "/WebKit.framework/" in path_of(pid)}
+
+
+def webkit_of(pid, before: set[int]) -> list[int]:
+    """The WebKit processes started since `before` was taken and attributed to the same responsible
+    process as this one: the window's."""
+    ours = {pid, _responsible(pid)}
+    return sorted(other for other in webkit_processes() - before if _responsible(other) in ours)
+
+
 class Memory:
     """Samples the whole app's memory (this process and its helper processes) every 0.5 s, and the
     system's memory pressure level and free percentage every 2 s."""
@@ -201,8 +243,12 @@ class Memory:
     def peak(self):
         footprints = [sum(value[1] for value in sample.values()) for sample in self.samples]
         resident = [sum(value[0] for value in sample.values()) for sample in self.samples]
-        return {"whole_app_footprint_peak_bytes": max(footprints, default=None),
-                "whole_app_resident_peak_bytes": max(resident, default=None), "samples": len(footprints),
+        top = self.samples[footprints.index(max(footprints))] if footprints else {}
+        return {"footprint_peak_bytes": max(footprints, default=None),
+                "resident_peak_bytes": max(resident, default=None), "samples": len(footprints),
+                # the peak sample, process by process (by executable name)
+                "footprint_peak_by_process": {f"{Path(path_of(pid)).name} {pid}": value[1]
+                                              for pid, value in top.items()},
                 "pressure_level_max": max((level for level, _ in self.pressure), default=None),
                 "pressure_samples": len(self.pressure),
                 "free_percent_min": min((free for _, free in self.pressure if free is not None), default=None)}
@@ -221,6 +267,13 @@ def sockets(pid):
     return [line.split(None, 8)[-1] for line in out.splitlines()[1:]]
 
 
+def not_loopback(pids) -> list[str]:
+    """Any socket of these processes with an end that is not loopback."""
+    loopback = re.compile(r"^(127\.0\.0\.1|\[::1\]|localhost|\*)(:|$)")
+    return [f"{pid} {name}" for pid in pids for name in sockets(pid)
+            if not all(loopback.match(end) for end in name.split(" ")[0].split("->"))]
+
+
 def uncached_copy(source: Path, target: Path):
     """Copy a file with the file cache off for the copy, so the next read of it comes from disk."""
     with open(source, "rb") as src, open(target, "wb") as out:
@@ -237,124 +290,200 @@ async def timed(fn):
 
 
 async def run(args):
+    """The workload with the backend in this process."""
+    data = Path(tempfile.mkdtemp(prefix="scholia-timings-"))
+    app = create_app(data, origin=ORIGIN, keyring_backend=_Keys(), helper=local_helper.Config(binary=Path(args.helper)))
+    async with app.app.router.lifespan_context(app.app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN,
+                                     headers={"X-Scholia-Client": "local"}, timeout=600) as client:
+            results = await measure(args, app.app.state.scholia, client, data,
+                                    lambda: [os.getpid(), *helpers_of(os.getpid())])
+    results["memory"]["covers"] = "this backend process and its helper processes, from their launch"
+    return results
+
+
+def run_desktop(args):
+    """The workload inside the desktop application: its backend, its window and the interface,
+    started as backend/desktop.py starts them, on a new temporary data folder with an in-memory
+    credential store. The window closes when the workload ends."""
+    import webview
+
+    import backend.app
+    from backend import desktop
+
+    data = Path(tempfile.mkdtemp(prefix="scholia-timings-desktop-"))
+    found, before = {}, webkit_processes()
+    create_app_, run_server = backend.app.create_app, desktop._run_server
+
+    def create(*args_, **options):  # the desktop entry's app, with this helper binary (none from source)
+        found["app"] = create_app_(*args_, helper=local_helper.Config(binary=Path(args.helper)), **options)
+        return found["app"]
+
+    def serve(server, sock, loop):
+        found["loop"] = loop  # filled with the server's event loop once it runs
+        run_server(server, sock, loop)
+
+    def drive(url):
+        try:
+            origin, session = url.split("/#session=")
+            deadline = time.monotonic() + 30
+            while not any("WebContent" in path_of(pid) for pid in webkit_of(os.getpid(), before)):
+                if time.monotonic() > deadline:
+                    raise RuntimeError("the window's WebKit processes were not found")
+                time.sleep(0.2)
+            time.sleep(3)  # the interface loaded and settled
+
+            async def workload():
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=found["app"]), base_url=origin,
+                                             headers={"X-Scholia-Client": "local", "X-Scholia-Session": session},
+                                             timeout=600) as client:
+                    return await measure(args, found["app"].app.state.scholia, client, data, processes)
+
+            found["results"] = asyncio.run_coroutine_threadsafe(workload(), found["loop"]["loop"]).result()
+        except BaseException as error:  # reported once the window has closed
+            found["error"] = error
+        finally:
+            for window in list(webview.windows):
+                window.destroy()
+
+    def processes():
+        found["webkit"] = webkit_of(os.getpid(), before)
+        return [os.getpid(), *helpers_of(os.getpid()), *found["webkit"]]
+
+    def open_window(url):
+        threading.Thread(target=drive, args=(url,), daemon=True).start()
+        desktop._webview_window(url)
+
+    backend.app.create_app, desktop._run_server = create, serve
+    try:
+        code = desktop.run(data, open_window, keyring_backend=_Keys())
+    finally:
+        backend.app.create_app, desktop._run_server = create_app_, run_server
+    if "error" in found:
+        raise found["error"]
+    results = found["results"]
+    results["memory"]["covers"] = ("the desktop application: its process (backend, window and interface), its helper "
+                                   "processes from their launch, and its window's WebKit processes")
+    results["memory"]["webkit_processes"] = [Path(path_of(pid)).name for pid in found.get("webkit", [])]
+    results["desktop_exit_code"] = code
+    return results
+
+
+async def measure(args, state, client, data, processes):
+    """The workload, through the app whose state and API client are given; processes() lists the
+    process ids memory covers."""
     rng = random.Random(SEED)
     english = passages("en", 32 * 22, rng)
     chinese = passages("zh", 32 * 22, rng)
     asks = [("en", q) for q in questions("en", 50, rng)] + [("zh", q) for q in questions("zh", 50, rng)]
     results = {"workload": WORKLOAD, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     results["passage_chars"] = {lang: summary([n for _, n in items]) for lang, items in (("en", english), ("zh", chinese))}
-    data = Path(tempfile.mkdtemp(prefix="scholia-timings-"))
-    app = create_app(data, origin=ORIGIN, keyring_backend=_Keys(), helper=local_helper.Config(binary=Path(args.helper)))
-    state = app.app.state.scholia
-    async with app.app.router.lifespan_context(app.app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN,
-                                     headers={"X-Scholia-Client": "local"}, timeout=600) as client:
-            seconds, response = await timed(client.post("/api/helper/models/import",
-                                                        json={"model": EMBEDDING, "path": str(Path(args.model).resolve())}))
-            assert response.status_code == 200, response.text
-            results["import_seconds"] = round(seconds, 2)
-            installed = data / "models" / EMBEDDING / local_helper.EMBEDDING_MODEL["file"]
-            uncached_copy(Path(args.model), installed)  # the first start reads it from disk, as after a restart
-            local = state["local_helper"]
-            helper = local.helpers[EMBEDDING]
-            helper_pids = lambda: [h._process.pid for h in local.helpers.values() if h._process]  # noqa: E731
-            memory = Memory(lambda: [os.getpid(), *helper_pids()])
-            vm_before = vm_counters()
-            memory.thread.start()
+    seconds, response = await timed(client.post("/api/helper/models/import",
+                                                json={"model": EMBEDDING, "path": str(Path(args.model).resolve())}))
+    assert response.status_code == 200, response.text
+    results["import_seconds"] = round(seconds, 2)
+    installed = data / "models" / EMBEDDING / local_helper.EMBEDDING_MODEL["file"]
+    uncached_copy(Path(args.model), installed)  # the first start reads it from disk, as after a restart
+    local = state["local_helper"]
+    helper = local.helpers[EMBEDDING]
+    memory = Memory(processes)
+    vm_before = vm_counters()
+    memory.thread.start()
 
-            # Starts: the first (cold file cache), then warm ones.
-            seconds, _ = await timed(local_helper.embed(state, [asks[0][1]], query=True))
-            results["first_start"] = {"ready_seconds": helper.ready_seconds, "first_question_seconds": round(seconds, 3)}
-            warm = []
-            for _ in range(10):
-                await helper.stop()
-                seconds, _ = await timed(local_helper.embed(state, [asks[1][1]], query=True))
-                warm.append((helper.ready_seconds, seconds))
-            results["warm_start_ready_seconds"] = summary([r for r, _ in warm])
-            results["warm_start_first_question_seconds"] = summary([s for _, s in warm])
-            results["helper_sockets"] = sockets(helper._process.pid)
+    # Starts: the first (cold file cache), then warm ones.
+    seconds, _ = await timed(local_helper.embed(state, [asks[0][1]], query=True))
+    results["first_start"] = {"ready_seconds": helper.ready_seconds, "first_question_seconds": round(seconds, 3)}
+    warm = []
+    for _ in range(10):
+        await helper.stop()
+        seconds, _ = await timed(local_helper.embed(state, [asks[1][1]], query=True))
+        warm.append((helper.ready_seconds, seconds))
+    results["warm_start_ready_seconds"] = summary([r for r, _ in warm])
+    results["warm_start_first_question_seconds"] = summary([s for _, s in warm])
+    results["helper_sockets"] = sockets(helper._process.pid)
 
-            # Tokens per passage, as the helper counts them (each must fit one slot's 2,048).
-            tokens = {}
-            for lang, items in (("en", english), ("zh", chinese)):
-                counts = []
-                for text, _ in items[:64]:
-                    reply = await helper._post("/tokenize", {"content": text}, None)
-                    counts.append(len(reply["tokens"]))
-                tokens[lang] = summary(counts)
-            results["passage_tokens_sample_of_64"] = tokens
+    # Tokens per passage, as the helper counts them (each must fit one slot's 2,048).
+    tokens = {}
+    for lang, items in (("en", english), ("zh", chinese)):
+        counts = []
+        for text, _ in items[:64]:
+            reply = await helper._post("/tokenize", {"content": text}, None)
+            counts.append(len(reply["tokens"]))
+        tokens[lang] = summary(counts)
+    results["passage_tokens_sample_of_64"] = tokens
 
-            # Warm batches and questions.
-            batch_times, failures = {"en": [], "zh": []}, []
-            for lang, items in (("en", english), ("zh", chinese)):
-                for i in range(22):
-                    texts = [text for text, _ in items[i * 32:(i + 1) * 32]]
-                    try:
-                        seconds, vectors = await timed(local_helper.embed(state, texts))
-                        assert len(vectors) == 32 and len(vectors[0]) == 1024
-                        if i >= 2:
-                            batch_times[lang].append(seconds)
-                    except HelperUnavailable as error:
-                        failures.append(("batch", lang, i, error.reason))
-            results["batch_seconds"] = {lang: summary(values) for lang, values in batch_times.items()}
-            question_times = {"en": [], "zh": []}
-            for lang, question in asks:
-                seconds, _ = await timed(local_helper.embed(state, [question], query=True))
-                question_times[lang].append(seconds)
-            results["question_seconds"] = {lang: summary(values) for lang, values in question_times.items()}
-            results["footprint_after_warm_bytes"] = {"backend": footprint(os.getpid()),
-                                                     "helper": footprint(helper._process.pid)}
+    # Warm batches and questions.
+    batch_times, failures = {"en": [], "zh": []}, []
+    for lang, items in (("en", english), ("zh", chinese)):
+        for i in range(22):
+            texts = [text for text, _ in items[i * 32:(i + 1) * 32]]
+            try:
+                seconds, vectors = await timed(local_helper.embed(state, texts))
+                assert len(vectors) == 32 and len(vectors[0]) == 1024
+                if i >= 2:
+                    batch_times[lang].append(seconds)
+            except HelperUnavailable as error:
+                failures.append(("batch", lang, i, error.reason))
+    results["batch_seconds"] = {lang: summary(values) for lang, values in batch_times.items()}
+    question_times = {"en": [], "zh": []}
+    for lang, question in asks:
+        seconds, _ = await timed(local_helper.embed(state, [question], query=True))
+        question_times[lang].append(seconds)
+    results["question_seconds"] = {lang: summary(values) for lang, values in question_times.items()}
+    results["footprint_after_warm_bytes"] = {"backend": footprint(os.getpid()),
+                                             "helper": footprint(helper._process.pid)}
 
-            # Sustained: indexing back to back, a question every 0.25 s.
-            stop_at = time.monotonic() + args.sustained
-            sustained_q, sustained_b = [], []
+    # Sustained: indexing back to back, a question every 0.25 s.
+    stop_at = time.monotonic() + args.sustained
+    sustained_q, sustained_b = [], []
 
-            async def indexing():
-                i = 0
-                while time.monotonic() < stop_at:
-                    items = english if i % 2 == 0 else chinese
-                    start = (i // 2 % 22) * 32
-                    try:
-                        seconds, _ = await timed(local_helper.embed(state, [t for t, _ in items[start:start + 32]]))
-                        sustained_b.append(seconds)
-                    except HelperUnavailable as error:
-                        failures.append(("sustained batch", i, error.reason))
-                    i += 1
+    async def indexing():
+        i = 0
+        while time.monotonic() < stop_at:
+            items = english if i % 2 == 0 else chinese
+            start = (i // 2 % 22) * 32
+            try:
+                seconds, _ = await timed(local_helper.embed(state, [t for t, _ in items[start:start + 32]]))
+                sustained_b.append(seconds)
+            except HelperUnavailable as error:
+                failures.append(("sustained batch", i, error.reason))
+            i += 1
 
-            async def asking():
-                i = 0
-                while time.monotonic() < stop_at:
-                    try:
-                        seconds, _ = await timed(local_helper.embed(state, [asks[i % len(asks)][1]], query=True))
-                        sustained_q.append(seconds)
-                    except HelperUnavailable as error:
-                        failures.append(("sustained question", i, error.reason))
-                    i += 1
-                    await asyncio.sleep(0.25)
+    async def asking():
+        i = 0
+        while time.monotonic() < stop_at:
+            try:
+                seconds, _ = await timed(local_helper.embed(state, [asks[i % len(asks)][1]], query=True))
+                sustained_q.append(seconds)
+            except HelperUnavailable as error:
+                failures.append(("sustained question", i, error.reason))
+            i += 1
+            await asyncio.sleep(0.25)
 
-            await asyncio.gather(indexing(), asking())
-            deadline = WORKLOAD["deadline_ms"] / 1000
-            results["sustained"] = {
-                "seconds": args.sustained, "batches": summary(sustained_b), "questions": summary(sustained_q),
-                "questions_over_deadline": sum(1 for s in sustained_q if s > deadline),
-                "questions_over_1s": sum(1 for s in sustained_q if s > 1),
-                "passages_per_second": round(32 * len(sustained_b) / args.sustained, 1),
-            }
-            results["footprint_after_sustained_bytes"] = {"backend": footprint(os.getpid()),
-                                                          "helper": footprint(helper._process.pid)}
-            results["helper_lifetime_peak_footprint_bytes"] = usage(helper._process.pid)[2]
-            results["helper_sockets_after_sustained"] = sockets(helper._process.pid)
+    await asyncio.gather(indexing(), asking())
+    deadline = WORKLOAD["deadline_ms"] / 1000
+    results["sustained"] = {
+        "seconds": args.sustained, "batches": summary(sustained_b), "questions": summary(sustained_q),
+        "questions_over_deadline": sum(1 for s in sustained_q if s > deadline),
+        "questions_over_1s": sum(1 for s in sustained_q if s > 1),
+        "passages_per_second": round(32 * len(sustained_b) / args.sustained, 1),
+    }
+    results["footprint_after_sustained_bytes"] = {"backend": footprint(os.getpid()),
+                                                  "helper": footprint(helper._process.pid)}
+    results["helper_lifetime_peak_footprint_bytes"] = usage(helper._process.pid)[2]
+    results["helper_sockets_after_sustained"] = sockets(helper._process.pid)
 
-            if args.reranker:
-                results["reranker"] = await reranking(state, local, Path(args.reranker), english, chinese, asks)
-            results["failures"] = failures
-            memory.stop.set()
-            memory.thread.join()
-            results["memory"] = memory.peak()
-            results["vm_before"], results["vm_after"] = vm_before, vm_counters()
-            results["audit_rows"] = await asyncio.to_thread(state["db"].read, lambda conn: conn.execute(
-                "SELECT data ->> 'kind', data ->> 'decision', count(*) FROM audit_log WHERE event = 'outbound'"
-                " GROUP BY 1, 2").fetchall())
+    if args.reranker:
+        results["reranker"] = await reranking(state, local, Path(args.reranker), english, chinese, asks)
+    results["failures"] = failures
+    memory.stop.set()
+    memory.thread.join()
+    results["memory"] = memory.peak()
+    results["not_loopback_sockets"] = not_loopback(processes())  # every process of the app, at the end
+    results["vm_before"], results["vm_after"] = vm_before, vm_counters()
+    results["audit_rows"] = await asyncio.to_thread(state["db"].read, lambda conn: conn.execute(
+        "SELECT data ->> 'kind', data ->> 'decision', count(*) FROM audit_log WHERE event = 'outbound'"
+        " GROUP BY 1, 2").fetchall())
     return results
 
 
@@ -416,10 +545,11 @@ def main(argv=None):
     parser.add_argument("--model", required=True)
     parser.add_argument("--reranker")
     parser.add_argument("--sustained", type=int, default=180)
+    parser.add_argument("--desktop", action="store_true", help="run the workload inside the desktop app")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     print(json.dumps({"workload": WORKLOAD}, ensure_ascii=False, indent=2), flush=True)
-    results = asyncio.run(run(args))
+    results = run_desktop(args) if args.desktop else asyncio.run(run(args))
     text = json.dumps(results, ensure_ascii=False, indent=2)
     print(text)
     if args.out:

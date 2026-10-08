@@ -111,10 +111,10 @@ SOURCES = ("huggingface", "modelscope")
 LIMITS = ["-c", "4096", "-ub", "2048", "-np", "2", "--cache-ram", "0"]
 SLOTS = 2
 # Texts per indexing request. The server queues each text of a request as a task of its own, so a
-# question sent during indexing waits behind the texts already queued. Measured in S1-16 (questions
-# every 0.25 s during 120 s of indexing per size): 32 texts per request, question p95 4.5 s; 8, 1.2 s;
-# 4, 0.65 s; 1, 0.29 s with none over the 500 ms retrieval deadline, at 8.5 passages a second
-# against 11.2 with 32.
+# question sent during indexing waits behind the texts already queued. Measured in S1-16 (120 s of
+# indexing per size, with a question 0.25 s after each answer): 32 texts per request, question p95
+# 4.5 s; 8, 1.2 s; 4, 0.65 s; 1, 0.29 s with none over the 500 ms retrieval deadline, at 8.5
+# passages a second against 11.2 with 32.
 INDEXING_INPUTS = 1
 FLAGS = {"embedding": ["--embedding", "--pooling", "last"], "reranker": ["--reranking"]}
 LISTENING = re.compile(rb"listening on http://127\.0\.0\.1:(\d+)")
