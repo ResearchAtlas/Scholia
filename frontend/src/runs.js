@@ -24,10 +24,14 @@ export const cancelRun = (runId) => post(`/api/runs/${encodeURIComponent(runId)}
 export const retryRun = (runId) => post(`/api/runs/${encodeURIComponent(runId)}/retry`);
 
 // What a finished run's row says as catalog keys: done, or why not (its reason's errors.* entry, a
-// stop, or an interruption).
+// stop, or an interruption). A run stopped for a reason it recorded (a lookup the researcher chose
+// not to make, a reading past its time limit) says that reason; one stopped with none, a stop.
 export function runOutcome(row) {
   if (row.status === 'succeeded') return { ok: true };
-  if (row.status === 'cancelled') return { ok: false, key: row.cancel_reason === 'revoked' ? 'runs.revoked' : 'runs.stopped' };
+  if (row.status === 'cancelled') {
+    if (row.cancel_reason === 'revoked') return { ok: false, key: 'runs.revoked' };
+    return row.result?.reason ? { ok: false, code: row.result.reason } : { ok: false, key: 'runs.stopped' };
+  }
   if (row.status === 'interrupted') return { ok: false, key: 'runs.interrupted' };
   return { ok: false, code: row.result?.reason ?? 'internal' };
 }

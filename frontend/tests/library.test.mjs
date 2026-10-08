@@ -329,3 +329,13 @@ test('an upload that ends after its conversation\'s view was rebuilt wakes the v
     globalThis.fetch = realFetch;
   }
 });
+
+test('a run stopped for a reason it recorded says that reason, and one stopped with none says it was stopped', () => {
+  const declined = runOutcome({ status: 'cancelled', cancel_reason: 'researcher', result: { reason: 'declined' } });
+  const limited = runOutcome({ status: 'cancelled', cancel_reason: 'limit', result: { reason: 'time_limit' } });
+  assert.deepEqual([declined, limited], [{ ok: false, code: 'declined' }, { ok: false, code: 'time_limit' }]);
+  for (const { code } of [declined, limited]) assert.ok(`errors.${code}` in en && `errors.${code}` in zh, code);
+  assert.deepEqual(runOutcome({ status: 'cancelled', cancel_reason: 'researcher', result: null }), { ok: false, key: 'runs.stopped' });
+  assert.deepEqual(runOutcome({ status: 'cancelled', cancel_reason: 'revoked', result: { reason: 'project_changed' } }),
+    { ok: false, key: 'runs.revoked' }); // a project's change says so, as before
+});
