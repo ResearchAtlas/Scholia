@@ -12,7 +12,8 @@ BODY = ("Minimum wages raise the earnings of low-paid workers in the synthetic p
 
 
 def pdf(pages, *, scanned=(), size=(612, 792), rotation=0):
-    """A PDF whose pages hold [(x, y, font size, text), ...] lines in Helvetica; a page number in
+    """A PDF whose pages hold [(x, y, font size, text), ...] lines in Helvetica (or the standard font a
+    fifth item names, such as Helvetica-Bold); a page number in
     scanned holds only a full-page image (no text), as a scanned page does. With rotation (90, 180
     or 270), each page is stored turned and carries /Rotate, its text drawn turned back: it shows
     upright, size wide and high, with each line where (x, y) says, as a landscape scan or a
@@ -34,8 +35,8 @@ def pdf(pages, *, scanned=(), size=(612, 792), rotation=0):
             image.set_bitmap(bitmap)
             image.set_matrix(pdfium.PdfMatrix().scale(width, height))
             page.insert_obj(image)
-        for x, y, font_size, text in lines:
-            obj = raw.FPDFPageObj_NewTextObj(document, b"Helvetica", font_size)
+        for x, y, font_size, text, *font in lines:
+            obj = raw.FPDFPageObj_NewTextObj(document, (font[0] if font else "Helvetica").encode(), font_size)
             encoded = (text + "\0").encode("utf-16-le")
             raw.FPDFText_SetText(obj, ctypes.cast(ctypes.c_char_p(encoded), ctypes.POINTER(raw.FPDF_WCHAR)))
             raw.FPDFPageObj_Transform(obj, *place[rotation](x, y))

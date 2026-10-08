@@ -327,8 +327,8 @@ def _pdf(data, stop, progress):
 
 def _pdf_page(page, raw):
     """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, index, line) or None), "size",
-    "left", "right", "top", "bottom"}], its size, and whether it is scanned. Sizes, boxes and edges
-    are of the page as displayed and rendered, its rotation and crop applied (_displayed), in points
+    "left", "right", "top", "bottom", "bold"}], its size, and whether it is scanned. Sizes, boxes and
+    edges are of the page as displayed and rendered, its rotation and crop applied (_displayed), in points
     from its bottom left."""
     width, height = page.get_size()  # as displayed: a page turned a quarter is as wide as it was high
     shown = _displayed(page, raw, width, height)
@@ -360,6 +360,8 @@ def _pdf_page(page, raw):
             boxes.append(box)
         if chars:
             lines.append((chars, boxes))
+        # Whether each line is bold, by its first character with a box.
+        bold = [_bold(textpage, raw, next((b[4] for b in boxes if b), None)) for _, boxes in lines]
     finally:
         textpage.close()
     cover = 0.0
@@ -371,7 +373,21 @@ def _pdf_page(page, raw):
         unmapped > mapped
     if scanned:
         return [], (width, height), True
-    return [_line(chars, boxes) for chars, boxes in lines if "".join(chars).strip()], (width, height), False
+    return [dict(_line(chars, boxes), bold=heavy) for (chars, boxes), heavy in zip(lines, bold)
+            if "".join(chars).strip()], (width, height), False
+
+
+_BOLD_FONT = re.compile(r"bold|black|heavy|demi|cmbx", re.IGNORECASE)
+
+
+def _bold(textpage, raw, index):
+    """Whether a character is set in a bold font: by its weight, its font's ForceBold flag, or its font's name."""
+    if index is None:
+        return False
+    name, flags = ctypes.create_string_buffer(128), ctypes.c_int()
+    raw.FPDFText_GetFontInfo(textpage, index, name, len(name), ctypes.byref(flags))
+    return raw.FPDFText_GetFontWeight(textpage, index) >= 600 or bool(flags.value & (1 << 18)) or \
+        bool(_BOLD_FONT.search(name.value.decode("latin-1")))
 
 
 def _displayed(page, raw, width, height):
@@ -478,15 +494,22 @@ def _pdf_blocks(number, lines, size, body, sections):
 # line's characters set apart from the next by more than TABLE_GAP of its font size. A table is two
 # or more rows in a run of lines of one font size, none further below the one above than two
 # lines: its first line's cells set its columns, and a row has a cell lined up with each column (by
-# its left or its right edge). A line between two rows with fewer cells, each within one column's
-# span, continues those cells (a wrapped cell). What tells a table from text set in columns (two
-# columns of body text line up too) is a column of short cells: in at least one column, every row
-# after the first (which may be a header) holds at most TABLE_SHORT characters, as a column of
-# values or codes does, so a label of any length goes with it. Not found: a table with no such
-# column (every column long text), one whose cells sit closer than TABLE_GAP (ruled tables set
-# tight), a wrapped cell in the last row (its continuation reads as text after the table), a cell
-# spanning columns, rows of differing font size, and a table PDFium gives column by column.
+# its left or its right edge). A line with fewer cells, each within one column's span, set at line
+# spacing below the line above, continues those cells (a wrapped cell, the last row's too), unless
+# it reads as a heading: a section heading (References, Abstract and the like), or bold where the
+# row above is not. A section heading always ends a table. A table is told from text set in columns
+# (two columns of body text line up too) by its cells: every cell holds at most TABLE_CELL
+# characters, or one column (after the first row, which may be a header) holds only cells of at most
+# TABLE_SHORT, as a column of values or codes does, beside a label of any length.
+# Not found, by design: a table whose cells are all longer than TABLE_SHORT with one over TABLE_CELL
+# in every column; cells closer than TABLE_GAP (tight ruled tables); a cell spanning columns; rows of
+# differing font size or more than two lines apart; a table PDFium gives column by column; a
+# wrapped cell's line set further apart than the line spacing. Taken in wrongly: two columns of body
+# text whose lines are all TABLE_CELL characters or shorter; a short line set at line spacing under
+# a table's last row (a note, say) joins that row's cell; a same-font, non-bold heading that is not a
+# known section heading, set between rows at line spacing, joins a cell.
 TABLE_GAP = 1.5
+TABLE_CELL = 40
 TABLE_SHORT = 30
 
 
@@ -525,8 +548,11 @@ def _table_at(lines, cells, start):
 
     while end < len(lines):
         line, above = lines[end], lines[end - 1]
-        if abs(line["size"] - size) > 0.6 or above["bottom"] - line["top"] > 2 * max(above["top"] - above["bottom"], 1.0):
-            break
+        text = line["text"].strip()
+        gap, spacing = above["bottom"] - line["top"], max(above["top"] - above["bottom"], 1.0)
+        if abs(line["size"] - size) > 0.6 or gap > 2 * spacing or \
+                (len(text) < 40 and (_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))):
+            break  # another size, a gap, or a section heading (References always ends a table)
         row = cells[end]
         if len(row) == len(head) and all(abs(c[2] - h[2]) <= tolerance or abs(c[3] - h[3]) <= tolerance
                                          for c, h in zip(row, head)):
@@ -538,16 +564,20 @@ def _table_at(lines, cells, start):
         else:
             spans = [(column(c), (end, c[0], c[1])) for c in row]
             if not 1 <= len(row) < len(head) or any(k is None for k, _ in spans) or \
-                    len({k for k, _ in spans}) != len(spans):
+                    len({k for k, _ in spans}) != len(spans) or gap > spacing or \
+                    (line["bold"] and not lines[rows[-1][0][0][0]]["bold"]):  # a bold heading under plain rows
                 break
             pending.append((end, spans))
         end += 1
-    end -= len(pending)  # lines after the last row are not the table's
+    for _, spans in pending:  # the last row's wrapped cells
+        for k, piece in spans:
+            rows[-1][k].append(piece)
 
     def length(cell):
         return sum(e - f for _, f, e in cell) + len(cell) - 1
 
-    if len(rows) < 2 or not any(all(length(row[k]) <= TABLE_SHORT for row in rows[1:]) for k in range(len(head))):
+    if len(rows) < 2 or not (all(length(cell) <= TABLE_CELL for row in rows for cell in row) or any(
+            all(length(row[k]) <= TABLE_SHORT for row in rows[1:]) for k in range(len(head)))):
         return start, None
     return end, rows
 

@@ -105,9 +105,13 @@ def test_a_pdf_table_with_long_labels_and_a_wrapped_cell_is_one_passage_and_two_
             (72, 626, 10, "synthetic panel"),  # the cell above, wrapped
             *row(614, "South", "95", "0.32"),
             (72, 590, 10, "Text set in two columns lines up as well, but neither holds short cells."),
-            *row(570, "Minimum wages raise the earnings of low", "employment effects are small in most", at=(72, 320)),
-            *row(558, "paid workers in the synthetic panel and", "specifications that the synthetic data", at=(72, 320)),
-            *row(546, "the estimates are made up for testing", "allow, as the authors note in the text", at=(72, 320))]
+            # Body text lines of 50 characters (lines of 40 or fewer in both columns read as a table).
+            *row(570, "Minimum wages raise the earnings of low-paid staff", "employment effects are small in most of the panels",
+                 at=(60, 330)),
+            *row(558, "in the synthetic panel of regions studied for this", "specifications that the made-up data allow, as the",
+                 at=(60, 330)),
+            *row(546, "work, and the estimates were made up for the tests", "authors note in the text that follows these tables",
+                 at=(60, 330))]
     read = extract(synthetic.pdf([page]), extraction.PDF)
     tables = [p for p in read.passages if p.kind == "table"]
     assert [t.text for t in tables] == [
@@ -116,6 +120,64 @@ def test_a_pdf_table_with_long_labels_and_a_wrapped_cell_is_one_passage_and_two_
     assert [len(t.boxes["rects"]) for t in tables] == [3, 4]  # a box per line, the wrapped cell's own included
     assert "Between the tables." in [p.text for p in read.passages]
     assert not any("Minimum wages" in t.text for t in tables)  # two columns of body text stay paragraphs
+
+
+def test_a_same_font_references_heading_ends_a_table_and_its_dois_are_never_looked_up():
+    def row(y, *cells, at=(72, 330)):
+        return [(x, y, 10, cell) for x, cell in zip(at, cells)]
+
+    page = [(72, 750, 18, "A Paper With a Table"), (72, 720, 10, "A paragraph with no identifier of its own."),
+            *row(700, "Measure", "Value"), *row(688, "Employment rate", "0.81"), *row(676, "Coverage", "0.12"),
+            (72, 664, 10, "References"),  # the table's font, at its line spacing
+            *row(652, "[1]", "Smith, J. (2020). doi:10.5555/only.in.references"),  # lined up with its columns
+            *row(640, "[2]", "Doe, A. (2019). Another synthetic paper.")]
+    read = extract(synthetic.pdf([page]), extraction.PDF)
+    assert [p.text for p in read.passages if p.kind == "table"] == ["Measure | Value\nEmployment rate | 0.81\nCoverage | 0.12"]
+    references = [p for p in read.passages if p.section_path == ["References"]]
+    assert [p.kind for p in references] == ["reference", "reference"] and "doi:10.5555" in references[0].text
+    assert identifiers(read.passages) == []  # a DOI only in the references is never offered for lookup
+
+
+def test_a_bold_line_under_a_table_is_a_heading_not_a_wrapped_cell():
+    def row(y, *cells, at=(72, 330)):
+        return [(x, y, 10, cell) for x, cell in zip(at, cells)]
+
+    page = [(72, 750, 18, "A Paper With Notes"),
+            *row(700, "Measure", "Value"), *row(688, "Employment rate", "0.81"), *row(676, "Coverage", "0.12"),
+            (72, 664, 10, "Notes", "Helvetica-Bold"),  # same size, bold, at line spacing
+            *row(652, "Source", "Made up"), *row(640, "Years", "2020 to 2021")]
+    tables = [p.text for p in extract(synthetic.pdf([page]), extraction.PDF).passages if p.kind == "table"]
+    assert tables[0] == "Measure | Value\nEmployment rate | 0.81\nCoverage | 0.12"
+    assert not any("Notes" in table for table in tables)
+
+
+def test_a_table_of_36_character_ids_is_a_table():
+    def row(y, *cells):
+        return [(x, y, 10, cell) for x, cell in zip((72, 330), cells)]
+
+    ids = ["0b6f0e7a-3c1d-4f2a-9e57-1a2b3c4d5e6f", "5d4c3b2a-1f0e-4d9c-8b7a-6f5e4d3c2b1a",
+           "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "1c2d3e4f-5a6b-4c7d-9e8f-0a1b2c3d4e5f"]
+    assert all(len(i) == 36 for i in ids)  # no column of short cells, but no cell over 40 characters
+    page = [(72, 750, 18, "A Table of Codes"), *row(720, "Record", "Linked record"),
+            *row(708, ids[0], ids[1]), *row(696, ids[2], ids[3])]
+    read = extract(synthetic.pdf([page]), extraction.PDF)
+    assert [p.text for p in read.passages if p.kind == "table"] == [
+        f"Record | Linked record\n{ids[0]} | {ids[1]}\n{ids[2]} | {ids[3]}"]
+
+
+def test_a_wrapped_cell_in_a_tables_last_row_joins_its_row():
+    def row(y, *cells):
+        return [(x, y, 10, cell) for x, cell in zip((72, 330, 430), cells)]
+
+    page = [(72, 750, 18, "A Table That Ends Wrapped"),
+            *row(650, "Region", "Workers", "Share"), *row(638, "North", "120", "0.40"),
+            *row(626, "Western coastal districts of the", "88", "0.30"),
+            (72, 614, 10, "synthetic panel"),  # the last row's first cell, wrapped
+            (72, 588, 10, "Text after the table, further down.")]
+    read = extract(synthetic.pdf([page]), extraction.PDF)
+    assert [p.text for p in read.passages if p.kind == "table"] == [
+        "Region | Workers | Share\nNorth | 120 | 0.40\nWestern coastal districts of the synthetic panel | 88 | 0.30"]
+    assert "Text after the table, further down." in [p.text for p in read.passages]
 
 
 def pixels(image):
