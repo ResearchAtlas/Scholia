@@ -8,6 +8,7 @@ goes through the single writer; database calls run off the event loop.
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -30,6 +31,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
+from backend import local_helper
 from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
@@ -253,13 +255,14 @@ class EventStream(StreamingResponse):
 
 
 def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_dir=None, keyring_backend=None,
-               transport=None) -> FastAPI:
+               transport=None, helper=None) -> FastAPI:
     """The app for one data folder, served at origin (e.g. "http://127.0.0.1:53111").
 
     session is this launch's secret, which every API request must then carry (see
     local_guard; the desktop entry always sets one); frontend_dir holds the built interface; keyring_backend selects the credential
     store (None: the system's); transport is where the outbound gate sends checked
-    requests (None: the network; tests pass a mock).
+    requests (None: the network; tests pass a mock); helper is the local model helper's
+    local_helper.Config (None: the bundled helper and the offered models).
     """
     data_dir = Path(data_dir)
     frontend_dir = Path(frontend_dir).resolve() if frontend_dir else None
@@ -287,7 +290,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         """Run the app on db: its content store, outbound gate and harness, recovered before any
         request reaches them. A restore calls it again with the database it put in place, with
         kick false: nothing runs on its own (background runs) until the restore has committed."""
-        gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
+        gate = OutboundGate(db, lambda: dataclasses.replace(providers.gate_inputs(data_dir),
+                                                            helper_urls=local_helper.urls(state)), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
         loop = asyncio.get_running_loop()
 
@@ -306,7 +310,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        state.update(data_dir=data_dir, start=start)
+        state.update(data_dir=data_dir, start=start, helper_config=helper)
         # Finishing a restore a crash interrupted, opening the database (its checks, the backup
         # before a migration, migrations) and the daily backup are local maintenance: the desktop
         # entry's start deadline does not count them (see maintenance), since on a large folder
@@ -342,6 +346,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown
     app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
+    app.include_router(local_helper.router)  # the local model helper and its models, under Advanced
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)

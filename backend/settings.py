@@ -142,8 +142,13 @@ PERSONAL = {
     ("budget", "conversation_usd"): (10, _number(0)),
     ("budget", "notice_percents"): ([50, 85, 90], lambda v: type(v) is list and all(_int(1, 100)(x) for x in v)),
     ("privacy", "trim_bodies_after_days"): (0, _int(0)),
+    # The local model helper (backend/local_helper.py; section 13's lifecycle values).
     ("helper", "idle_stop_minutes"): (10, _int(1)),
-    ("helper", "model_source"): (None, _text),
+    ("helper", "model_source"): (None, _choice("huggingface", "modelscope")),
+    ("helper", "start_seconds"): (30, _number(0)),
+    ("helper", "health_seconds"): (30, _number(0)),
+    ("helper", "restart_backoff_seconds"): ([1, 5, 30], lambda v: type(v) is list and 0 < len(v) <= 10
+                                            and all(_number(0)(x) for x in v)),
     **{("limits", k): spec for k, spec in _LIMITS.items()},
     **{("context", k): spec for k, spec in _CONTEXT.items()},
     **{("retrieval", k): spec for k, spec in _RETRIEVAL.items()},
