@@ -15,8 +15,9 @@ client's disconnect, and it decides before any route parses a body.
   without a preflight. A read with no Origin must be same-origin by Fetch
   Metadata or carry that header. Fetch Metadata saying cross-site is refused.
 - A request body must be JSON, with a Content-Length of at most MAX_BODY, checked before anything
-  reads it: the server reads no more than that length, so nothing larger is ever held. A body
-  whose length is not known first (chunked) is refused; the app's pages always send one.
+  reads it: the server reads no more than that length, so nothing larger is ever held. A request
+  with any Transfer-Encoding is refused, with a Content-Length or without: the server frames such a
+  body by its encoding, not by the length checked here. The app's pages never send one.
 - CORS: the app's own pages are same-origin with the API and never need it. An
   explicitly configured development origin (a dev server on this machine) may call
   the API across origins: its preflight is checked (origin, method, and only the
@@ -125,7 +126,9 @@ class LocalRequestGuard:
                 return 403, "client_header_missing"
             if method not in _CHANGES and not (marked or fetch_site == b"same-origin"):
                 return 403, "client_header_missing"
-        has_body = headers.get(b"transfer-encoding") or headers.get(b"content-length", [b"0"])[-1] not in (b"0", b"")
+        if headers.get(b"transfer-encoding"):  # framed by its encoding, whatever Content-Length says
+            return 411, "length_required"
+        has_body = headers.get(b"content-length", [b"0"])[-1] not in (b"0", b"")
         if has_body:
             content_types = headers.get(b"content-type", [])
             if len(content_types) != 1 or content_types[0].lower().replace(b" ", b"") not in {

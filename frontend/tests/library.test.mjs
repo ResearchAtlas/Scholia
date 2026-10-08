@@ -206,7 +206,7 @@ test('a selection is sent in as few requests as fit the backend\'s body limit, e
 });
 
 test('a request over the body limit has its text in both catalogs', () => {
-  assert.ok('errors.request_too_large' in en && 'errors.request_too_large' in zh);
+  for (const key of ['errors.request_too_large', 'errors.length_required']) assert.ok(key in en && key in zh, key);
 });
 
 test('every lookup outcome a paper\'s details name has its text in both catalogs, a file not read yet included', () => {

@@ -140,6 +140,13 @@ async def test_a_body_over_the_limit_or_of_unknown_length_is_refused_before_anyt
         assert (status, body["code"]) == (413, "request_too_large")
         status, body = await raw(client.app, "POST", path, headers(SAME, JSON, (b"transfer-encoding", b"chunked")), b"{}")
         assert (status, body["code"]) == (411, "length_required")  # a length not known before it is read
+        both = headers(SAME, JSON, (b"transfer-encoding", b"chunked"), (b"content-length", b"1"))
+        status, body = await raw(client.app, "POST", path, both, b"{}")  # the server would read it by its chunks
+        assert (status, body["code"]) == (411, "length_required")
+        for encoding in (b"identity", b"gzip, chunked"):  # any transfer encoding: its framing is not the length's
+            status, body = await raw(client.app, "POST", path, headers(SAME, JSON, (b"transfer-encoding", encoding),
+                                                                       (b"content-length", b"2")), b"{}")
+            assert (status, body["code"]) == (411, "length_required")
         assert reached == []  # no route parsed either
         client.app.app = original
         assert (await client.get(f"/api/projects/{project}/materials")).json()["materials"] == []
