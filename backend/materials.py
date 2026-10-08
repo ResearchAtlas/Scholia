@@ -372,14 +372,21 @@ def _identifiers(conn, project_id, materials):
 async def _approval(read, write, run_id, project_id, inputs, distinct):
     """For a Local only project: the researcher's answer to this batch's ask, asked once. True to look
     up; the run ends cancelled when the researcher declines, and looks up without asking once the
-    project no longer needs it (made less strict), closing the ask."""
+    project no longer needs it (made less strict), closing the ask. The ask records the identifiers
+    it asked about, and its answer covers exactly those: a run that finds others to send (after a
+    restart, its paper's file replaced meanwhile) closes it and asks again."""
+    covers = sorted(f"{scheme}:{value}" for scheme, value in distinct)
     ask, answer = await read(lambda conn: asks.asked(conn, run_id))
-    if ask is None:
+    if ask is None or ask.get("covers") != covers:
         services = sorted({service for scheme, _ in distinct for service in lookup.SERVICES[scheme]})
+
+        def ask_again(conn):
+            if ask is not None:
+                asks.withdraw(conn, run_id, ask["ask_id"], "identifiers_changed")
+            return asks.raise_ask(conn, run_id, "identifier_lookup", ["lookup", "skip"],
+                                  {"services": services, "identifiers": len(distinct)}, inputs.get("origin"), covers)
         try:
-            ask_id = await write(lambda conn: asks.raise_ask(
-                conn, run_id, "identifier_lookup", ["lookup", "skip"],
-                {"services": services, "identifiers": len(distinct)}, inputs.get("origin")))
+            ask_id = await write(ask_again)
         except asks.AskRefused:  # revoked or ended meanwhile
             raise RunOutcome("cancelled", "project_changed", "revoked") from None
     else:

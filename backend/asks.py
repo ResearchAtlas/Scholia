@@ -41,8 +41,9 @@ class Answer(BaseModel):
     text: str | None = Field(default=None, max_length=4000)
 
 
-def raise_ask(conn, run_id, kind, options, params=None, origin=None):
-    """Ask, for a running run that is not revoked, in the caller's transaction. Returns its id."""
+def raise_ask(conn, run_id, kind, options, params=None, origin=None, covers=None):
+    """Ask, for a running run that is not revoked, in the caller's transaction. Returns its id.
+    covers, if given, records exactly what the answer will apply to (never shown or audited)."""
     if not 1 <= len(options) <= MAX_OPTIONS:
         raise ValueError("an ask offers one to three options")
     row = conn.execute("SELECT r.project_id, p.sensitivity, p.review_lock FROM runs r JOIN projects p"
@@ -54,7 +55,7 @@ def raise_ask(conn, run_id, kind, options, params=None, origin=None):
     _event(conn, run_id, "ask", {
         "ask_id": ask_id, "kind": kind, "project_id": row[0], "options": list(options),
         "text_box": kind not in NO_TEXT, "params": params or {}, "origin": origin,
-        "policy": {"level": row[1], "locked": bool(row[2])}})
+        "policy": {"level": row[1], "locked": bool(row[2])}, **({"covers": covers} if covers is not None else {})})
     conn.execute("UPDATE runs SET waiting = 'ask' WHERE id = ?", (run_id,))
     return ask_id
 

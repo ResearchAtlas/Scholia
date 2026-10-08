@@ -129,6 +129,36 @@ async def test_a_lookup_resumed_after_a_restart_keeps_its_answer(tmp_path, monke
         assert paper["title"] == TITLE
 
 
+async def test_a_restarted_lookup_whose_paper_now_gives_another_identifier_asks_again(tmp_path):
+    data, other = tmp_path / "data", "10.5555/replaced.version"
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Replaced Version")}
+    async with started(data, scholarly(openalex=records)) as client:
+        project = await project_of(client, level="local_only")
+        mock = client.provider.scholarly
+        mock.hold = asyncio.Event()
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200  # for the PDF's DOI alone
+        await asyncio.wait_for(mock.started.wait(), 10)
+        await added(client, project, ("v2.md", f"# Version two\n\ndoi:{other}\n".encode()),
+                    material_id=result["materials"][0]["id"])
+    first = result["lookup_run_id"]
+    async with started(data, scholarly(openalex=records), setup=False) as client:
+        mock = client.provider.scholarly
+        deadline = asyncio.get_running_loop().time() + 10
+        while not [a for a in (await listing(client, project))["asks"] if a["run_id"] == first]:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        [again] = [a for a in (await listing(client, project))["asks"] if a["run_id"] == first]
+        assert again["ask_id"] != ask["ask_id"] and again["params"]["identifiers"] == 1
+        assert mock.requests == []  # the earlier answer covered the PDF's DOI only: nothing went out
+        assert (await client.post(f"/api/runs/{first}/asks/{ask['ask_id']}", json={"option": "lookup"})).status_code == 404
+        assert (await client.post(f"/api/runs/{first}/asks/{again['ask_id']}", json={"option": "lookup"})).status_code == 200
+        assert (await run_finished(client, first))["status"] == "succeeded"
+        assert [path for _, path, _ in mock.requests][:1] == [f"/works/doi:{other}"]
+
+
 # What is sent, and where
 
 
