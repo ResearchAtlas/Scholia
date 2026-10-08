@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey } from '../src/library.js';
+  typeKey, viewOf, pointing, unionRect } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -105,4 +105,25 @@ test('a page image is fetched past the browser cache, so a deleted paper\'s page
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test('a paper shows its pages only while its version is a PDF', () => {
+  const pdf = { version: { id: 'v1', media_type: 'application/pdf' } };
+  const markdown = { version: { id: 'v2', media_type: 'text/markdown' } }; // its replacement, read already elsewhere
+  assert.equal(viewOf(pdf, 'pages'), 'pages');
+  assert.equal(viewOf(pdf, 'text'), 'text');
+  assert.equal(viewOf(markdown, 'pages'), 'text'); // the PDF's choice no longer applies: its passages show
+  assert.equal(viewOf({ version: null }, 'pages'), 'text');
+});
+
+test('a passage is reached by Tab and highlighted on focus as on hover, once on its page however many lines', () => {
+  const pointed = [];
+  const props = pointing('p1', (id) => pointed.push(id));
+  assert.equal(props.tabIndex, 0);
+  props.onFocus();
+  props.onBlur();
+  props.onMouseEnter();
+  props.onMouseLeave();
+  assert.deepEqual(pointed, ['p1', null, 'p1', null]);
+  assert.deepEqual(unionRect([[0.1, 0.2, 0.8, 0.22], [0.12, 0.23, 0.5, 0.25]]), [0.1, 0.2, 0.8, 0.25]);
 });

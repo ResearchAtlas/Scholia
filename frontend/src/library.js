@@ -48,6 +48,10 @@ const TYPES = { 'application/pdf': 'pdf', 'application/vnd.openxmlformats-office
 export const typeKey = (mediaType) => `library.type.${TYPES[mediaType] ?? 'other'}`;
 export const isPdf = (material) => material?.version?.media_type === 'application/pdf';
 
+// What a paper's page shows of its text: its pages when it is a PDF and they are chosen, else its
+// passages as text (whatever was chosen for an earlier version that was a PDF).
+export const viewOf = (material, chosen) => (isPdf(material) && chosen === 'pages' ? 'pages' : 'text');
+
 // A paper's state (reading, ready, needs_attention) and its reason, as catalog keys.
 export function stateKey(material) {
   return `library.state.${material.state}`;
@@ -114,6 +118,20 @@ export function validYear(text) {
 export function rectStyle([left, top, right, bottom]) {
   const pct = (value) => `${Math.round(value * 10000) / 100}%`;
   return { left: pct(left), top: pct(top), width: pct(Math.max(0, right - left)), height: pct(Math.max(0, bottom - top)) };
+}
+
+// The rectangle around all of a passage's line rectangles: where its one focusable region sits on
+// its page, so the keyboard reaches the passage once however many lines it has.
+export function unionRect(rects) {
+  return [Math.min(...rects.map((r) => r[0])), Math.min(...rects.map((r) => r[1])),
+    Math.max(...rects.map((r) => r[2])), Math.max(...rects.map((r) => r[3]))];
+}
+
+// A passage's props for pointing at it: hovering it or focusing it from the keyboard highlights it
+// (in the text and on its page alike), and Tab reaches it.
+export function pointing(id, onPoint) {
+  return { tabIndex: 0, onMouseEnter: () => onPoint(id), onMouseLeave: () => onPoint(null),
+    onFocus: () => onPoint(id), onBlur: () => onPoint(null) };
 }
 
 // Every passage of a version, read a page of the API at a time.

@@ -2,15 +2,16 @@
 // A paper's page (S7): its details for editing, its state and what is known of it, and its text. A
 // PDF's pages are images rendered by the backend (pypdfium2) with the passages' boxes drawn over
 // them; every format also shows its passages as text, in order. The cited passage's highlight comes
-// with S1-19's citations; here a passage is highlighted while it is pointed at.
+// with S1-19's citations; here a passage is highlighted while it is pointed at or focused, and Tab
+// reaches each passage, in the text and on the page.
 import { useEffect, useId, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
-import { ACCEPT, byPage, changes, detailsOf, isPdf, libraryChanged, loadPassages, pageImage, rectStyle, reasonKey,
-  validYear } from '../library.js';
+import { ACCEPT, byPage, changes, detailsOf, isPdf, libraryChanged, loadPassages, pageImage, pointing, rectStyle,
+  reasonKey, unionRect, validYear, viewOf } from '../library.js';
 import { addTo, Byline, Facts, Progress, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -62,7 +63,7 @@ export function Paper({ material, project, onBack, onChanged }) {
           <h4 className="font-semibold">{t('paper.about')}</h4>
           <Facts material={material} project={project} />
         </section>
-        {material.extraction && material.version && <Contents material={material} />}
+        {material.extraction && material.version && <Contents key={material.version.id} material={material} />}
       </div>
       <DeleteDialog target={deleting ? { kind: 'material', id: material.id, title: t('paper.deleteTitle', { title: material.title }),
         body: t('paper.deleteBody') } : null}
@@ -132,11 +133,13 @@ function Details({ material, onSaved }) {
   );
 }
 
-// The paper's text: a PDF's pages with their passages' boxes, or its passages in order.
+// The paper's text: a PDF's pages with their passages' boxes, or its passages in order. Each version
+// has its own (keyed by it), and the view follows the version's kind: only a PDF has pages.
 function Contents({ material }) {
   const t = useT();
   const pdf = isPdf(material);
-  const [view, setView] = useState(pdf ? 'pages' : 'text');
+  const [chosen, setChosen] = useState('pages');
+  const view = viewOf(material, chosen);
   const [passages, setPassages] = useState(null);
   const [failed, setFailed] = useState(false);
   const [pointed, setPointed] = useState(null);
@@ -151,7 +154,7 @@ function Contents({ material }) {
     <section className="grid gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h4 className="text-sm font-semibold">{t('paper.text')}</h4>
-        {pdf && <Segmented label={t('paper.view')} value={view} onChange={setView}
+        {pdf && <Segmented label={t('paper.view')} value={view} onChange={setChosen}
           options={[{ value: 'pages', label: t('paper.pages') }, { value: 'text', label: t('paper.passages') }]} />}
       </div>
       {failed && <p role="alert" className="text-sm text-destructive">{t('paper.loadFailed')}</p>}
@@ -202,6 +205,13 @@ function PageView({ version, number, passages, pointed, onPoint }) {
             pointed === passage.id ? 'bg-brand/25 ring-1 ring-brand/60' : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
           style={rectStyle(rect)} />
       )))}
+      {/* One focusable region per passage, around its lines: the keyboard's way to it, with the same highlight. */}
+      {src && passages.filter((passage) => passage.boxes?.rects?.length).map((passage) => (
+        <span key={passage.id} role="note" aria-label={passage.text} data-passage={passage.id}
+          {...pointing(passage.id, onPoint)}
+          className="pointer-events-none absolute rounded-[3px] outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+          style={rectStyle(unionRect(passage.boxes.rects))} />
+      ))}
       <figcaption className="absolute bottom-1 right-2 rounded bg-black/50 px-1.5 text-[11px] text-white">{number}</figcaption>
     </figure>
   );
@@ -227,7 +237,8 @@ function PassageList({ passages, pointed, onPoint }) {
         const heading = path && path !== section ? path : null;
         section = path || section;
         return (
-          <li key={passage.id} className="grid gap-1.5" onMouseEnter={() => onPoint(passage.id)} onMouseLeave={() => onPoint(null)}>
+          <li key={passage.id} data-passage={passage.id} {...pointing(passage.id, onPoint)}
+            className="grid gap-1.5 rounded-md outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
             {heading && <p className="pt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{heading}</p>}
             <div className={cn('rounded-md px-2 py-1 transition-colors duration-150', pointed === passage.id && 'bg-brand-soft')}>
               {passage.kind !== 'paragraph' && (
