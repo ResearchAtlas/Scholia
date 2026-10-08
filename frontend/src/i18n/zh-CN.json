@@ -594,6 +594,7 @@
   "audit.reason.not_candidate_url": "不是候选文献的链接",
   "audit.reason.route_not_allowed": "模型不在私密允许列表中",
   "audit.reason.missing_flags": "缺少零数据保留标志",
+  "audit.reason.not_general_project": "不在通用项目中的下载",
   "audit.reason.key_not_confirmed": "密钥设置未确认",
   "audit.reason.revoked": "该运行已被要求停止",
   "audit.reason.local_server_not_yours": "服务器不是由你的账户运行",

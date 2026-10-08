@@ -17,7 +17,9 @@ Destination kinds: a model provider (configured in settings), a scholarly API, a
 open-access link taken from a named candidate of the project (the exact link,
 then only the same-origin redirects httpx follows from that fetch; never a model
 provider's host), the local helper, a local provider on loopback, and a model
-download source. Only model providers, local providers and the helper take a
+download source, for the General project's client only: a model download is an
+explicit, app-wide action that carries no project's content (ticket 71). Only
+model providers, local providers and the helper take a
 request body or credentials (Authorization, Proxy-Authorization, Cookie, any
 header named like a key or token, or user info in the URL). The others are
 public fetches: a GET or HEAD with no body and no credentials, whatever the level,
@@ -752,6 +754,11 @@ def _show(origin):
     return f"{scheme}://[{host}]:{port}" if ":" in host else f"{scheme}://{host}:{port}"
 
 
+def _is_general(conn, project_id):
+    row = conn.execute("SELECT kind FROM projects WHERE id = ?", (project_id,)).fetchone()
+    return row is not None and row[0] == "general"
+
+
 def _level(conn, project_id):
     row = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
     return row[0] if row else None
@@ -825,6 +832,8 @@ def _policy(conn, level, kind, target, scope, private_problem, public_problem, b
             return public_problem
     if kind is Kind.OPEN_ACCESS and not bound:
         return "not_candidate_url"
+    if kind is Kind.MODEL_DOWNLOAD and not _is_general(conn, scope.project_id):
+        return "not_general_project"
     if level == "normal" or kind is Kind.LOCAL_HELPER:
         return None
     if kind is Kind.LOCAL_PROVIDER and level in ("private", "local_only"):  # a declared server only (ticket 64)

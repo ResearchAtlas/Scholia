@@ -598,6 +598,7 @@
   "audit.reason.not_candidate_url": "not the candidate's link",
   "audit.reason.route_not_allowed": "model not on the Private allowlist",
   "audit.reason.missing_flags": "zero-retention flags missing",
+  "audit.reason.not_general_project": "a download outside the General project",
   "audit.reason.key_not_confirmed": "key settings not confirmed",
   "audit.reason.revoked": "the run was told to stop",
   "audit.reason.local_server_not_yours": "server not run by your account",
