@@ -162,22 +162,29 @@ def _text(data):
 def identifiers(passages):
     """The identifiers a material's own text gives, in order: ("doi", "10.…") and ("arxiv", "…"),
     from a PDF's first pages or another format's first characters, outside reference passages,
-    each validated by its pattern and normalized (DOIs in lower case)."""
+    each validated by its pattern and normalized (DOIs in lower case). The characters' window ends
+    inside the passage that crosses it: an identifier there counts only if it ends before the edge,
+    so none past it is used and none is cut short by it."""
     found, seen, chars = [], set(), 0
     for passage in passages:
         if passage.page is not None and passage.page > IDENTIFIER_PAGES:
             break
-        if passage.page is None and chars > IDENTIFIER_CHARS:
+        if passage.page is None and chars >= IDENTIFIER_CHARS:
             break
+        edge = len(passage.text) if passage.page is not None else IDENTIFIER_CHARS - chars
         chars += len(passage.text)
         if passage.kind == "reference":
             continue
         for match in _DOI_FOUND.finditer(passage.text):
+            if match.end() > edge:
+                break
             doi = clean_doi(match.group(0))
             if doi and ("doi", doi) not in seen:
                 seen.add(("doi", doi))
                 found.append(("doi", doi))
         for match in _ARXIV_FOUND.finditer(passage.text):
+            if match.end() > edge:
+                break
             arxiv = match.group(1)
             if ARXIV.fullmatch(arxiv) and ("arxiv", arxiv) not in seen:
                 seen.add(("arxiv", arxiv))

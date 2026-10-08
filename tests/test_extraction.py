@@ -320,6 +320,18 @@ def test_identifiers_come_from_the_first_pages_outside_references_validated_and_
     assert extraction.clean_doi("10.5555/x).") == "10.5555/x" and extraction.clean_doi("10.12/too-short") is None
 
 
+def test_another_formats_identifiers_come_only_from_its_first_characters_even_inside_a_passage():
+    window = extraction.IDENTIFIER_CHARS
+    before = Passage("paragraph", "x" * (window - 100))  # the next passage starts 100 characters before the edge
+    inside = "doi:10.5555/inside.window"
+    straddling, past = "doi:10.5555/across.the.edge", "arXiv:2401.00002 and doi:10.5555/just.past"
+    text = f"{inside} {'y' * (96 - len(inside) - 1 - 10)} {straddling} {'z' * 200} {past}"
+    assert text.index(straddling) < 100 < text.index(straddling) + len(straddling)  # it crosses the edge
+    assert identifiers([before, Passage("paragraph", text)]) == [("doi", "10.5555/inside.window")]
+    pdf = [Passage("paragraph", "x" * (window + 1000), page=1), Passage("paragraph", f"{past}", page=2)]
+    assert [i for _, i in identifiers(pdf)] == ["10.5555/just.past", "2401.00002"]  # a PDF's window is its pages
+
+
 @pytest.mark.parametrize("name, data, expected", [
     ("a.pdf", b"%PDF-1.7 ...", extraction.PDF), ("a.PDF", b"%PDF-1.4", extraction.PDF), ("a.pdf", b"hello", None),
     ("a.docx", synthetic.docx([(None, "x")]), extraction.DOCX), ("a.docx", b"PK\x03\x04junk", None),
