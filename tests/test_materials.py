@@ -13,7 +13,7 @@ import pytest
 import backend.extraction as extraction
 import backend.materials as materials_module
 import synthetic_materials as synthetic
-from scholia_app import background_idle, run_finished, started
+from scholia_app import MockProvider, MockScholarly, background_idle, openalex_work, run_finished, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -301,6 +301,53 @@ async def test_two_projects_reading_the_same_file_at_once_queue_each_passage_onc
         assert await rows(client, "SELECT project_id, count(*), count(DISTINCT target_id) FROM index_queue"
                                   " WHERE op = 'add' GROUP BY project_id ORDER BY project_id") == sorted(
             [(first, passages, passages), (second, passages, passages)])
+
+
+async def test_a_reading_by_an_earlier_extractor_version_is_never_this_versions(tmp_path, monkeypatch):
+    doi = synthetic.DOI
+    notes = f"# Notes\n\ndoi:{doi}\n\nSynthetic text.\n".encode()
+    real = extraction.extract
+    scholarly = MockScholarly(openalex={doi: openalex_work(doi, "Notes, Resolved")})
+    async with started(tmp_path / "data", MockProvider(scholarly=scholarly)) as client:
+        project = await project_of(client)
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))  # an earlier Scholia
+        result = await added(client, project, ("notes.md", notes))
+        [paper] = result["materials"]
+        [earlier] = await settled(client, project)
+        assert earlier["state"] == "ready" and earlier["extraction"]["version"] == "markdown-0"
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))  # this one
+        [outdated] = await settled(client, project)  # read by the earlier version only: not Ready, and Retry reads it
+        assert (outdated["state"], outdated["reason"], outdated["extraction"]) == ("needs_attention", "outdated", None)
+        assert (await run_finished(client, paper["run_id"]))["retryable"] is True
+        version = outdated["version"]["id"]
+        assert (await client.get(f"/api/material-versions/{version}/passages")).json()["passages"] == []
+        # This version's reading fails: the paper needs attention for it, and is not Ready from the earlier one.
+        def unreadable(*args, **kwargs):
+            raise extraction.Unreadable()
+        monkeypatch.setattr(extraction, "extract", unreadable)
+        again = await client.post(f"/api/runs/{paper['run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "failed"
+        [failed] = await settled(client, project)
+        assert (failed["state"], failed["reason"], failed["extraction"]) == ("needs_attention", "unreadable_file", None)
+        # Its identifiers are not taken from the earlier reading's passages: nothing is sent.
+        sent = len(scholarly.requests)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'failed' WHERE id = ?", (result["lookup_run_id"],)))
+        looked = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, looked.json()["run_id"]))["result"] == {"reason": "not_read"}
+        assert len(scholarly.requests) == sent
+        [passage] = (await rows(client, "SELECT id FROM passages ORDER BY ordinal LIMIT 1"))[0]
+        assert (await client.get(f"/api/passages/{passage}")).json()["materials"] == []  # the earlier reading's: no owner
+        # A reading by this version is shared as before, and only it.
+        monkeypatch.setattr(extraction, "extract", real)
+        other = await project_of(client, "Other")
+        [theirs] = (await added(client, other, ("notes.md", notes)))["materials"]
+        assert theirs["run_id"]  # not the earlier version's: a reading of its own
+        assert (await run_finished(client, theirs["run_id"]))["status"] == "succeeded"
+        [shared] = (await added(client, await project_of(client, "Third"), ("notes.md", notes)))["materials"]
+        assert shared["run_id"] is None  # this version's reading, shared
+        [ready] = await settled(client, project)  # and the first paper reads Ready from it too
+        assert ready["state"] == "ready" and ready["extraction"]["version"] == "markdown-1"
 
 
 async def test_the_same_bytes_added_as_another_type_are_read_as_that_type(tmp_path):

@@ -278,6 +278,7 @@
   "library.reason.file_missing": "已保存的文件丢失或已损坏。请重新添加该文件。",
   "library.reason.interrupted": "读取被中断。",
   "library.reason.not_found": "该文件的记录已不存在。",
+  "library.reason.outdated": "由较早版本的 Scholia 读取。可在“设置”中的“高级”里重新读取。",
   "library.reason.other": "读取没有完成。",
   "library.readingLabel": "正在读取“{title}”",
   "library.retracted": "已撤稿",

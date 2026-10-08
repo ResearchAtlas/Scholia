@@ -283,6 +283,7 @@
   "library.reason.file_missing": "The stored file is missing or damaged. Add the file again.",
   "library.reason.interrupted": "Reading was interrupted.",
   "library.reason.not_found": "The file's record is gone.",
+  "library.reason.outdated": "Read by an earlier version of Scholia. Read it again from Settings, Advanced.",
   "library.reason.other": "Reading did not finish.",
   "library.readingLabel": "Reading {title}",
   "library.retracted": "Retracted",

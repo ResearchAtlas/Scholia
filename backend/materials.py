@@ -324,7 +324,7 @@ def _store(conn, version_id, sha256, extracted, look_up):
             [(new_id(), extraction_id, ordinal, p.page, json.dumps(p.section_path), p.kind, p.text, p.char_start,
               p.char_end, json.dumps(p.boxes) if p.boxes else None) for ordinal, p in enumerate(extracted.passages)])
     _queue_adds(conn, extraction_id, found[0])
-    _serve(conn, sha256, extracted.extractor, extraction_id, look_up)
+    _serve(conn, sha256, (extracted.extractor, extracted.version), extraction_id, look_up)
 
 
 def _serve(conn, sha256, extractor, extraction_id, look_up):
@@ -338,7 +338,7 @@ def _serve(conn, sha256, extractor, extraction_id, look_up):
             f"SELECT m.id, v.id, {_VERSION_TYPE}, m.project_id, p.review_lock FROM material_versions v"
             " JOIN content_files c ON c.sha256 = v.file_sha256 JOIN materials m ON m.id = v.material_id"
             " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
-        if extraction.EXTRACTORS.get(kind, (None,))[0] != extractor:
+        if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
         _queue_adds(conn, extraction_id, project)
         if locked:
@@ -580,15 +580,18 @@ _VERSION_TYPE = "coalesce(v.media_type, c.media_type)"
 
 
 def _extraction(conn, sha256, kind):
-    """The latest extraction of the file as a file of that media type (by its extractor): (id,
-    extractor, version, status, pages, ocr_pages, passages), or None."""
+    """The file's reading as a file of that media type: the extraction by this version of its
+    extractor (extraction.extractor_of, the parsing library's version included), as readings are
+    shared, or None: (id, extractor, version, status, pages, ocr_pages, passages). A reading by an
+    earlier version is not this one's: its paper needs attention (outdated) until it is read again
+    with Retry, and nothing (its state, its lookups, its passages) is taken from the earlier one."""
     if sha256 is None or kind not in extraction.EXTRACTORS:
         return None
     return conn.execute(
         "SELECT e.id, e.extractor, e.extractor_version, e.status, e.pages, e.ocr_pages,"
         " (SELECT count(*) FROM passages WHERE extraction_id = e.id) FROM extractions e"
-        f" WHERE e.file_sha256 = ? AND e.extractor = ? AND e.status IN {_SHARED} ORDER BY e.rowid DESC LIMIT 1",
-        (sha256, extraction.EXTRACTORS[kind][0])).fetchone()
+        f" WHERE e.file_sha256 = ? AND e.extractor = ? AND e.extractor_version = ? AND e.status IN {_SHARED}"
+        " ORDER BY e.rowid DESC LIMIT 1", (sha256, *extraction.extractor_of(kind))).fetchone()
 
 
 _MATERIAL_COLUMNS = ("m.id, m.project_id, m.title, m.csl, m.source, m.source_key, m.evidence_type, m.resolved_at,"
@@ -621,8 +624,8 @@ def _describe(conn, row, registry):
         state, reason = "needs_attention", "not_read"
     else:
         state = "needs_attention"
-        reason = (json.loads(run[3] or "{}").get("reason") or
-                  {"limit": "time_limit"}.get(run[2]) or ("stopped" if status == "cancelled" else status))
+        reason = (json.loads(run[3] or "{}").get("reason") or {"limit": "time_limit"}.get(run[2])
+                  or {"cancelled": "stopped", "succeeded": "outdated"}.get(status, status))  # read by an earlier version
     found = conn.execute(
         "SELECT r.id, r.status, r.cancel_reason, r.waiting FROM runs r, json_each(r.inputs, '$.material_ids') j"
         " WHERE r.workflow = 'lookup' AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material,)).fetchone()
@@ -840,11 +843,12 @@ async def get_passage(passage_id: str, request: Request):
                               (row[9], row[1] - 1)).fetchone()
         after = conn.execute("SELECT text FROM passages WHERE extraction_id = ? AND ordinal = ?",
                              (row[9], row[1] + 1)).fetchone()
-        materials = [(m, p, v) for m, p, v, kind, extractor in conn.execute(
-            f"SELECT m.id, m.project_id, v.id, {_VERSION_TYPE}, e.extractor FROM extractions e JOIN material_versions v"
+        materials = [(m, p, v) for m, p, v, kind, extractor, version in conn.execute(
+            f"SELECT m.id, m.project_id, v.id, {_VERSION_TYPE}, e.extractor, e.extractor_version FROM extractions e"
+            " JOIN material_versions v"
             " ON v.file_sha256 = e.file_sha256 AND v.is_current = 1 JOIN content_files c ON c.sha256 = v.file_sha256"
             " JOIN materials m ON m.id = v.material_id WHERE e.id = ? ORDER BY m.created_at", (row[9],))
-            if extraction.EXTRACTORS.get(kind, (None,))[0] == extractor]  # versions read by this extractor
+            if kind in extraction.EXTRACTORS and extraction.extractor_of(kind) == (extractor, version)]  # its reading
         return {**_passage(row[:9]), "selector": {"type": "TextQuoteSelector", "exact": row[5],
                                                    "prefix": before[0][-32:] if before else "",
                                                    "suffix": after[0][:32] if after else ""},
@@ -904,7 +908,9 @@ def _retry(conn, run_id, registry):
     (status, code, message)) saying why it cannot be tried again. The background-run list's Retry
     and the retry endpoint both ask this, so the list offers Retry exactly where the endpoint takes
     it: a run that failed, was stopped or was interrupted, whose papers are still here; a reading
-    whose version is still current, unread and not being read; a lookup in a project not locked.
+    whose version is still current, unread and not being read, a reading that succeeded with an
+    earlier extractor version included (its file has no reading by this one); a lookup in a
+    project not locked.
     Statuses are read as the list reads them (derived_status): a run left running in the record
     that this app does not hold is interrupted, so it may be tried again and is not being read."""
     row = conn.execute("SELECT project_id, workflow, status, inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -912,7 +918,9 @@ def _retry(conn, run_id, registry):
         return None, (404, "not_found", "No such run")
     project_id, workflow, status, inputs = row
     inputs = json.loads(inputs or "{}")
-    if workflow not in _WORKFLOWS or derived_status(status, run_id, registry) not in ("failed", "cancelled", "interrupted"):
+    status = derived_status(status, run_id, registry)
+    if workflow not in _WORKFLOWS or (status not in ("failed", "cancelled", "interrupted")
+                                      and (workflow, status) != ("extract", "succeeded")):  # read by an earlier version
         return None, (409, "not_retryable", "This run cannot be tried again")
     kept = [m for m in inputs.get("material_ids", []) if conn.execute(
         "SELECT 1 FROM materials WHERE id = ? AND project_id = ?", (m, project_id)).fetchone()]

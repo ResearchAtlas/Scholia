@@ -150,11 +150,12 @@ async def test_a_restarted_lookup_whose_identifiers_changed_asks_again(tmp_path)
         await asyncio.wait_for(mock.started.wait(), 10)
         version = result["materials"][0]["version_id"]
 
-        def read_again(conn):  # the same version read again (a newer extractor, say), giving another DOI
+        def read_again(conn):  # the same version read again by this extractor, giving another DOI
             (sha,) = conn.execute("SELECT file_sha256 FROM material_versions WHERE id = ?", (version,)).fetchone()
             extraction_id = new_id()
             conn.execute("INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status, pages,"
-                         " ocr_pages) VALUES (?, ?, 'pdf', 'pdf-later', 'complete', 1, 0)", (extraction_id, sha))
+                         " ocr_pages) VALUES (?, ?, ?, ?, 'complete', 1, 0)",
+                         (extraction_id, sha, *extraction.extractor_of(extraction.PDF)))
             conn.execute("INSERT INTO passages (id, extraction_id, ordinal, page, kind, text) VALUES (?, ?, 0, 1,"
                          " 'paragraph', ?)", (new_id(), extraction_id, f"doi:{other}"))
 

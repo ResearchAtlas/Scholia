@@ -106,7 +106,7 @@ export function stateKey(material) {
 export const LOOKUP_OUTCOMES = ['no_identifier', 'not_read', 'not_found', 'unavailable', 'refused'];
 
 const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file',
-  'encrypted_file', 'file_missing', 'interrupted', 'not_found']);
+  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated']);
 
 export function reasonKey(reason) {
   return reason ? `library.reason.${REASONS.has(reason) ? reason : 'other'}` : null;

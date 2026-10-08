@@ -19,7 +19,7 @@ test('only the formats Scholia reads are sent; the rest are named', () => {
 
 test('every state, reason and type the backend gives has its text in both catalogs', () => {
   const reasons = ['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file', 'encrypted_file',
-    'file_missing', 'interrupted', 'not_found', 'something new'];
+    'file_missing', 'interrupted', 'not_found', 'outdated', 'something new'];
   const keys = [...['reading', 'ready', 'needs_attention'].map((s) => `library.state.${s}`), ...reasons.map(reasonKey),
     ...['application/pdf', 'text/html', 'text/markdown', 'application/x-tex', 'x/unknown',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].map(typeKey)];
