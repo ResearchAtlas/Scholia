@@ -511,7 +511,9 @@ async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
 def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
     """An identifier's outcome for the papers it was found in, [(material id, version id)]: their
     metadata is written only while that version is still the material's current file; a paper whose
-    file was replaced meanwhile keeps what its newer file gives (outcome replaced)."""
+    file was replaced meanwhile keeps what its newer file gives (outcome replaced). A retraction
+    check is about one DOI: a record of another DOI, or of none, that says nothing on retraction
+    leaves the paper unchecked rather than keeping the old DOI's check."""
     now = utc_now()
     for material, version in pairs:
         row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI') FROM materials m"
@@ -526,6 +528,9 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
                              (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
+                if mine.retracted is None and row[2] != mine.csl.get("DOI"):  # another work, of which no check is known
+                    conn.execute("UPDATE materials SET retraction = 'unknown', retraction_checked_at = NULL WHERE id = ?",
+                                 (material,))
             # A retraction check is about the DOI the paper's details carry: details the researcher
             # saved with another DOI, or none, are not flagged for this one.
             if mine.retracted is not None and (row[0] != "researcher" or row[2] == value):

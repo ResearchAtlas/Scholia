@@ -658,6 +658,20 @@ async def test_a_doi_the_researcher_changes_or_clears_takes_its_lookups_provenan
         assert (later["title"], later["checked_by"]) == ("My Own Title", "researcher")
 
 
+async def test_a_retracted_papers_file_replaced_by_one_known_only_to_arxiv_reads_unchecked(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE, retracted=True)},
+                         arxiv={synthetic.ARXIV: "The Replacement Preprint"})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [retracted] = await settled(client, project)
+        assert (retracted["retraction"], retracted["source_key"]) == ("retracted", f"doi:{DOI}")
+        await added(client, project, ("v2.md", synthetic.paper_markdown()), material_id=result["materials"][0]["id"])
+        [replaced] = await settled(client, project)
+        assert (replaced["title"], replaced["source_key"]) == ("The Replacement Preprint", f"arxiv:{synthetic.ARXIV}")
+        assert (replaced["retraction"], replaced["retraction_checked_at"]) == ("unknown", None)  # arXiv says nothing
+
+
 # By level
 
 
