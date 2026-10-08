@@ -7,10 +7,12 @@ import asyncio
 import contextlib
 import gzip
 import json
+import threading
 
 import httpx
 import pytest
 
+import backend.extraction as extraction
 import backend.lookup as lookup
 from backend.db import new_id
 import backend.materials as materials_module
@@ -227,6 +229,34 @@ async def test_a_file_replaced_while_its_identifier_waits_for_its_turn_keeps_it_
         [(data,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'",
                                result["lookup_run_id"])
         assert json.loads(data)["outcome"] == "replaced"
+
+
+async def test_a_lookup_waits_only_for_the_reading_of_the_version_it_is_for(tmp_path, monkeypatch):
+    slow, real = synthetic.paper_pdf(), extraction.extract
+    reached, go = threading.Event(), threading.Event()
+
+    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):  # only the first file's reading waits
+        if data == slow:
+            reached.set()
+            while not go.wait(0.01):
+                stop()
+        return real(data, kind, stop, progress)
+
+    monkeypatch.setattr(extraction, "extract", held)
+    other = "10.5555/quick.replacement"
+    async with started(tmp_path / "data", scholarly(openalex={other: openalex_work(other, "The Quick Replacement")})) \
+            as client:
+        project = await project_of(client)
+        first = await added(client, project, ("large.pdf", slow))
+        await asyncio.to_thread(reached.wait, 10)  # version A is being read, and stays so
+        replaced = await added(client, project, ("v2.md", f"# Version two\n\ndoi:{other}\n".encode()),
+                               material_id=first["materials"][0]["id"])
+        run = await run_finished(client, replaced["lookup_run_id"], timeout=5)  # not behind A's reading
+        assert run["status"] == "succeeded"
+        [paper] = (await listing(client, project))["materials"]
+        assert paper["title"] == "The Quick Replacement"
+        go.set()
+        assert (await run_finished(client, first["lookup_run_id"]))["status"] == "succeeded"
 
 
 async def test_an_older_lookup_answered_after_its_file_was_replaced_writes_nothing(tmp_path):

@@ -17,18 +17,18 @@ Extractions are shared by file and extractor version; a run that finds one writt
 Each version is read as the type its file was detected as when it was added (its media_type), so
 the same bytes added as Markdown and as LaTeX are two extractions of one stored file.
 
-A `lookup` run waits for its materials' extractions, takes each material's first identifier from
-the text of the version it was made for (`inputs.versions`; extraction.identifiers), and resolves
-the distinct ones (backend/lookup.py) through the outbound gate with the dispatch check. A Local
-only project first asks once for the batch, through the shared confirmation (backend/asks.py),
-naming the services and the number of distinct identifiers; the answer covers this run and its
-retries only. Each material's metadata is written in its own transaction while the run is running
-and not revoked, and only while that version is still the material's current file: a file replaced
-meanwhile makes the older lookup stale, so its identifier is not sent (its ask is closed) and its
-answer is not applied. Metadata the researcher edited is never replaced, though the retraction
-check is recorded. A failed lookup leaves the material
-as it was. Both runs name their materials in `inputs.material_ids`, the deletion service's scope
-link (backend/db/deletion.py), so deleting a material revokes them.
+A `lookup` run waits for the extractions of the versions it was made for (`inputs.versions`; an
+older version's reading is not waited for), takes each material's first identifier from the text of
+that version (extraction.identifiers), and resolves the distinct ones (backend/lookup.py) through
+the outbound gate with the dispatch check. A Local only project first asks once for the batch,
+through the shared confirmation (backend/asks.py), naming the services and the number of distinct
+identifiers; the answer covers this run and its retries only. Each material's metadata is written in
+its own transaction while the run is running and not revoked, and only while that version is still
+the material's current file: a file replaced meanwhile makes the older lookup stale, so its
+identifier is not sent (its ask is closed) and its answer is not applied. Metadata the researcher
+edited is never replaced, though the retraction check is recorded. A failed lookup leaves the
+material as it was. Both runs name their materials in `inputs.material_ids`, the deletion service's
+scope link (backend/db/deletion.py), so deleting a material revokes them.
 
 A paper reads Reading while its version's extraction runs, Ready once an extraction with text is
 committed, and Needs attention otherwise, with its reason.
@@ -305,10 +305,11 @@ async def _look_up(harness, active, project_id, inputs, pace):
 
     materials = inputs.get("material_ids") or []
     started = time.monotonic()
-    while await read(lambda conn: conn.execute(  # its materials are read first
-            "SELECT count(*) FROM runs r, json_each(r.inputs, '$.material_ids') j WHERE r.workflow = 'extract'"
-            " AND r.status = 'running' AND r.project_id = ? AND j.value IN (SELECT value FROM json_each(?))",
-            (project_id, json.dumps(materials))).fetchone()[0]) and time.monotonic() - started < EXTRACTION_SECONDS + 60:
+    while await read(lambda conn: conn.execute(  # the versions it is for are read first, and only those
+            "SELECT count(*) FROM runs WHERE workflow = 'extract' AND status = 'running'"
+            " AND json_extract(inputs, '$.version_id') IN (SELECT value FROM json_each(?))",
+            (json.dumps(list((inputs.get("versions") or {}).values())),)).fetchone()[0]) \
+            and time.monotonic() - started < EXTRACTION_SECONDS + 60:
         await asyncio.sleep(WAIT_SECONDS)
 
     wanted = await read(lambda conn: _identifiers(conn, project_id, materials, inputs.get("versions") or {}))
