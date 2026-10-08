@@ -1009,11 +1009,14 @@ class Harness:
         except Exception as error:  # a defect: the run ends failed rather than starting again at each launch
             log.error("local background work failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
             summary, effect, outcome = {"reason": "internal"}, None, ("failed", None)
+        # The terminal record is written to its end whatever cancellations arrive meanwhile: work
+        # whose effect is done (a published archive) keeps its outcome, and _finish_local decides
+        # in its transaction whether a cancellation came before an effect it still has to apply.
         try:
-            await self._write(lambda conn: self._finish_local(conn, active, *outcome, summary, effect))
+            await _through(self._write(lambda conn: self._finish_local(conn, active, *outcome, summary, effect)))
         except RunOutcome as ended:  # its effect found it could not be applied: nothing of it was written
-            await self._write(lambda conn: self._finish_local(
-                conn, active, ended.status, ended.cancel_reason, {"reason": ended.reason} if ended.reason else None))
+            await _through(self._write(lambda conn: self._finish_local(
+                conn, active, ended.status, ended.cancel_reason, {"reason": ended.reason} if ended.reason else None)))
 
     def _finish_local(self, conn, active, status, cancel_reason, summary, effect=None):
         """Local work's effect, terminal status and summary, in one transaction. A revocation in the

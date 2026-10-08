@@ -94,6 +94,37 @@ async def test_cancel_stops_an_export_and_leaves_no_file(tmp_path, monkeypatch):
     assert list(destination.iterdir()) == []
 
 
+async def test_a_cancel_that_comes_once_the_archive_is_published_leaves_it_succeeded(tmp_path, monkeypatch):
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    published, real_publish = [], backups_module._publish
+
+    def publish(tmp, final):
+        real_publish(tmp, final)
+        published.append(final)
+
+    monkeypatch.setattr(backups_module, "_publish", publish)
+    async with started(tmp_path / "data") as client:
+        harness = client.state["harness"]
+        real_write, cancelled = harness._write, []
+
+        async def write(fn):  # the run's terminal record, queued once its file is published: a Cancel comes
+            if published and not cancelled:
+                [active] = [a for a in harness.registry.runs.values() if a.kind == "background"]
+                cancelled.append(active.run_id)
+                harness._request_cancel(active, "researcher")
+                await asyncio.sleep(0.05)  # still queued when the cancellation arrives
+            return await real_write(fn)
+
+        monkeypatch.setattr(harness, "_write", write)
+        run_id = (await client.post("/api/backups/full", json={"destination": str(destination)})).json()["run_id"]
+        run = await run_finished(client, run_id)
+        assert cancelled == [run_id]
+        assert (run["status"], run["cancel_reason"]) == ("succeeded", None)  # what the folder holds, it says
+        assert [path.name for path in destination.iterdir()] == [published[0].name]
+        assert run["result"]["file"] == str(published[0])
+
+
 async def test_a_backup_a_restart_left_unfinished_reads_interrupted_and_is_not_started_again(tmp_path, monkeypatch):
     data, destination = tmp_path / "data", tmp_path / "chosen"
     destination.mkdir()
