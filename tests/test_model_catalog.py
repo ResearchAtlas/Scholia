@@ -308,9 +308,11 @@ def test_zero_retention_counts_only_endpoints_a_private_request_can_be_limited_t
         row("b", "only-small", 4096),
         row("c", "deepinfra/turbo", 32768), row("c", "deepinfra", 8192),  # the base slug covers the variant
         row("d", "deepinfra", 32768), row("d", "deepinfra/turbo", 8192),  # and the variant is the base's
-        row("e", "big", 32768), row("e", None, 8192),  # a small endpoint no request could ignore
+        row("e", "big", 32768), row("e", None, 8192),  # an endpoint no request could name or ignore
         row("f", "big", 32768), row("f", "big", 8192),  # the same tag both ways
-        row("g", "x", 32768), row("g", " x", 32768), row("g", "y", 8193),
+        row("g", "x", 32768), row("g", "y", 8193),
+        row("h", "big", 32768), row("h", " big", 32768),  # a malformed tag, even on a large endpoint
+        row("i", "big", 32768), row("i", None, 65536),
     ])
     assert found == {
         "a": {"usable": ["big"], "small": ["small", "small-too"]},
@@ -320,6 +322,8 @@ def test_zero_retention_counts_only_endpoints_a_private_request_can_be_limited_t
         "e": {"usable": [], "small": []},
         "f": {"usable": [], "small": ["big"]},
         "g": {"usable": ["x", "y"], "small": []},
+        "h": {"usable": [], "small": []},
+        "i": {"usable": [], "small": []},
     }
 
 

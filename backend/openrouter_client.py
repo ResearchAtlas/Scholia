@@ -144,13 +144,14 @@ def zdr_endpoints(rows):
     is usable only if no smaller endpoint's tag is the same or is its base slug or variant (a
     base slug such as "deepinfra" matches every "deepinfra/..." variant when routing), so a request
     limited to the usable tags and ignoring the small ones can reach no small endpoint. A model
-    with a small endpoint that has no tag, which a request could not ignore, has none usable."""
+    with an endpoint whose tag is missing or malformed (one a request could neither name nor
+    ignore) has none usable, whatever that endpoint's window."""
     found = {}
     for row in rows:
         tag, window = row.get("tag"), row.get("context_length")
         sizes = found.setdefault(row["model_id"], {"usable": set(), "small": set(), "untagged": False})
         if not isinstance(tag, str) or not tag or tag != tag.strip() or len(tag) > 512 or any(ord(c) < 32 for c in tag):
-            sizes["untagged"] = sizes["untagged"] or not (type(window) is int and window > COMPRESSION_WINDOW)
+            sizes["untagged"] = True
         elif type(window) is int and window > COMPRESSION_WINDOW:
             sizes["usable"].add(tag)
         else:
