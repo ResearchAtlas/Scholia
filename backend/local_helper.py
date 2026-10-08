@@ -49,6 +49,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
+from backend.db import DatabaseClosedError
 from backend.outbound_gate import OutboundDenied
 from backend.runs import _through
 from backend.settings import SettingsChanged, _make_private_dirs, load_settings
@@ -297,6 +298,7 @@ class Helper:
         self._starting = self._watching = self._restarting = None
         self._slots, self._indexing = asyncio.Semaphore(SLOTS), asyncio.Semaphore(SLOTS - 1)
         self._in_use, self.last_used = 0, time.monotonic()
+        self.installs = 0  # model files installed in this process (see Local.verify_installed)
 
     @property
     def url(self) -> str | None:
@@ -332,7 +334,9 @@ class Helper:
         """Each document's relevance score, in order, or None when they are not back within deadline
         seconds (ticket 70's cancellation): the reranker's own process is then ended, so none of its
         work goes on, and the next call starts it again. Embedding work runs in another process,
-        which this never touches. Raises HelperUnavailable when the helper cannot serve."""
+        which this never touches. Raises HelperUnavailable when the helper cannot serve.
+        The deadline covers the reranking work only: a stopped reranker is started first (about 0.6 s
+        on the reference Mac), which a caller with an end-to-end deadline counts against its own."""
         documents = list(documents)
         await self._ready()
         self._in_use += 1
@@ -349,7 +353,7 @@ class Helper:
         for row in data.get("results", []) if isinstance(data, dict) else []:
             if isinstance(row, dict) and row.get("index") in range(len(documents)):
                 scores[row["index"]] = row.get("relevance_score")
-        if not all(isinstance(score, (int, float)) for score in scores):
+        if not all(isinstance(score, (int, float)) and math.isfinite(score) for score in scores):
             raise HelperUnavailable("request_failed")
         return scores
 
@@ -365,6 +369,8 @@ class Helper:
             return response.json()
         except (httpx.HTTPError, OutboundDenied, ValueError):
             raise HelperUnavailable("request_failed") from None
+        except DatabaseClosedError:  # the gate cannot record a decision: a restore, or the app closing
+            raise HelperUnavailable("closing") from None
 
     async def _ready(self):
         """Start the helper if it is stopped and wait for it; HelperUnavailable unless it runs."""
@@ -454,24 +460,35 @@ class Helper:
                 if not self._in_use and time.monotonic() >= self.last_used + times["idle"]:
                     break  # idle: stopped, not a failure
                 if time.monotonic() >= checked + times["health"]:
-                    if not await self._healthy():
+                    healthy = await self._healthy()
+                    if healthy is False:
                         problem = "unhealthy"
                         break
-                    self.failures, checked = 0, time.monotonic()
+                    checked = time.monotonic()
+                    if healthy:
+                        self.failures = 0
         finally:
             exited.cancel()
         self._watching = None
+        if problem:  # marked first: no request starts another process while this one is ended
+            self.state, self.problem = "restarting", problem
         await self.stop()
-        if problem:
+        if problem:  # then the backoff, from when it has ended
             self._failed(problem, times)
 
-    async def _healthy(self) -> bool:
+    async def _healthy(self) -> bool | None:
+        """Whether the server answers its health check; None when the check could not be made (the
+        gate could not decide it: a restore swapping the database, or the app closing), which is
+        neither a pass nor a failure."""
         url = self.url
         try:
             async with await self.local.client(timeout=HEALTH_TIMEOUT) as http:
                 return url is not None and (await http.get(f"{url}/health")).status_code == 200
-        except (httpx.HTTPError, OutboundDenied, HelperUnavailable):
+        except httpx.HTTPError:
             return False
+        except Exception as error:  # OutboundDenied, HelperUnavailable, DatabaseClosedError: not checked
+            log.warning("the local model helper's health check could not be made (%s)", type(error).__name__)
+            return None
 
     async def stop(self, kill=False):
         """End the running server, if any, as a stop rather than a failure (idle, or a cancelled
@@ -495,6 +512,7 @@ class Helper:
 
     def model_installed(self):
         """The model file was just installed: what the last check found no longer holds."""
+        self.installs += 1
         if self.state == "stopped" and self.problem in _CHECKS:
             self.problem = None
 
@@ -543,6 +561,22 @@ class Local:
         for part in (self.data_dir / "models").glob(f"*/*{PART}"):
             part.unlink(missing_ok=True)
         self.binary_problem = binary_problem(self.config.binary)
+
+    async def verify_installed(self):
+        """Once after launch, in the background: check each model file in place against its pin, so
+        the status says it needs replacing when it changed since it was installed, before any launch
+        finds it (every launch checks again)."""
+        for helper in list(self.helpers.values()):
+            installs = helper.installs
+            if not installed(helper.path, helper.pin):
+                continue
+            try:
+                changed = await asyncio.to_thread(mismatch, helper.path, helper.pin)
+            except OSError:
+                continue
+            # Only what was checked: not a file installed meanwhile, nor a helper that started since.
+            if changed and helper.installs == installs and helper.state == "stopped" and helper.problem is None:
+                helper.problem = "model_changed"
 
     def add(self, pin, path) -> Helper:
         """A helper for a model that is not offered (the reranker's test): its own process."""
@@ -622,10 +656,18 @@ class Local:
         helper = self.helpers[model_id]
         if installed(helper.path, pin) and helper.problem != "model_changed":
             raise Refused(409, "already_installed", "The model is already installed")
-        if await asyncio.to_thread(_free_bytes, helper.path.parent) < pin["size"]:
-            raise Refused(507, "disk_full", "The disk is full")
-        await asyncio.to_thread(self._remember, source)
-        download = self.download = Download(model_id, source, pin["size"])
+        # Claimed in the same step as the check: no other download or import starts from here on.
+        previous, download = self.download, Download(model_id, source, pin["size"])
+        self.download = download
+        try:
+            if await asyncio.to_thread(_free_bytes, helper.path.parent) < pin["size"]:
+                raise Refused(507, "disk_full", "The disk is full")
+            await asyncio.to_thread(self._remember, source)
+            if self.closed:
+                raise Refused(503, "closing", "The app is closing")
+        except BaseException:
+            self.download = previous
+            raise
         download.task = asyncio.create_task(self._download(download, pin, helper))
 
     def _remember(self, source):
@@ -640,17 +682,19 @@ class Local:
                 return
             except SettingsChanged:
                 continue
-            except (ValueError, OSError):
+            except (ValueError, OSError) as error:  # the settings pages show what is wrong with the file
+                log.warning("the model source chosen could not be saved (%s)", type(error).__name__)
                 return
 
     async def _download(self, download, pin, helper):
         part = helper.path.with_name(helper.path.name + PART)
+        url = pin["sources"][download.source]["url"]
         try:
             await asyncio.to_thread(_make_private_dirs, helper.path.parent)
             digest = hashlib.sha256()
             async with await self.client(timeout=DOWNLOAD_TIMEOUT, follow_redirects=True,
                                          max_redirects=MAX_REDIRECTS) as http:
-                async with http.stream("GET", pin["sources"][download.source]["url"]) as response:
+                async with http.stream("GET", url) as response:
                     if response.status_code != 200:
                         raise Refused(502, "source_refused", "The source did not serve the file")
                     # ponytail: written and hashed on the event loop, a network read at a time; a
@@ -667,22 +711,26 @@ class Local:
             if digest.hexdigest() != pin["sha256"]:
                 raise Refused(502, "hash_mismatch", "The file's SHA-256 differs from its pin")
             _install(part, helper.path)  # on the loop: no cancellation between the check and the install
-        except asyncio.CancelledError:
+        except asyncio.CancelledError:  # Cancel, or the app closing: ended here, so the task itself finishes
             download.state = "cancelled"
         except Refused as refusal:
             download.state, download.problem = "failed", refusal.code
         except OutboundDenied as denied:
             download.state = "failed"
             download.problem = "redirect_refused" if denied.reason == "cross_origin_redirect" else "download_refused"
-        except (httpx.ConnectError, httpx.ConnectTimeout):
+        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
             download.state, download.problem = "failed", "source_unreachable"
-            self.unreachable.add(download.source)
+            if _host(error) == httpx.URL(url).host:  # the source itself, not the file host it sent us to
+                self.unreachable.add(download.source)
         except httpx.HTTPError:
             download.state, download.problem = "failed", "download_interrupted"
-        except HelperUnavailable:
+        except (HelperUnavailable, DatabaseClosedError):  # the app closing, or a restore under way
             download.state, download.problem = "failed", "closing"
         except OSError as error:
             download.state, download.problem = "failed", "disk_full" if error.errno in _FULL else "write_failed"
+        except Exception as error:  # never left running: a download that failed in any other way says so
+            download.state, download.problem = "failed", "download_failed"
+            log.error("a model download failed unexpectedly (%s)", type(error).__name__)
         else:
             download.state = "done"
             self.unreachable.discard(download.source)
@@ -726,6 +774,14 @@ class Local:
             self.download.task.cancel()
             await asyncio.wait({self.download.task})
         await asyncio.gather(*(helper.close() for helper in self.helpers.values()))
+
+
+def _host(error: httpx.HTTPError) -> str | None:
+    """The host of the request an httpx error was raised for, if it names one."""
+    try:
+        return error.request.url.host
+    except RuntimeError:  # no request was attached to it
+        return None
 
 
 def _free_bytes(folder: Path) -> int:
@@ -824,9 +880,12 @@ async def lifespan(app):
     local = Local(state, state.get("helper_config") or Config())
     await asyncio.to_thread(local.prepare)
     state["local_helper"] = local
+    verifying = asyncio.create_task(local.verify_installed())
     try:
         yield
     finally:
+        verifying.cancel()
+        await asyncio.wait({verifying})
         await local.close()
         state.pop("local_helper", None)
 

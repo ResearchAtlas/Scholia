@@ -8,8 +8,10 @@ process through the outbound gate's mock transport. Models are synthetic bytes w
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import json
+import logging
 import os
 import stat
 import sys
@@ -101,6 +103,7 @@ class Remote:
         self.healthy = True
         self.hold = {}  # path -> asyncio.Event that requests wait for
         self.files = {}  # URL -> (status, headers, body or async iterator)
+        self.scores = None  # reranking scores to answer with, instead of 1 / (rank + 1)
 
     def key(self, port):
         """The key of the server that announced port (50000 + its launch's number)."""
@@ -131,22 +134,25 @@ class Remote:
             return httpx.Response(200, json={"data": [{"index": i, "embedding": [0.5, 0.5, 0.5, 0.5]}
                                                       for i, _ in reversed(list(enumerate(body["input"])))]})
         if request.url.path == "/v1/rerank":
-            return httpx.Response(200, json={"results": [{"index": i, "relevance_score": 1.0 / (i + 1)}
-                                                         for i, _ in enumerate(body["documents"])]})
+            scores = self.scores or [1.0 / (i + 1) for i, _ in enumerate(body["documents"])]
+            return httpx.Response(200, json={"results": [{"index": i, "relevance_score": score}
+                                                         for i, score in enumerate(scores)]})
         return httpx.Response(404)
 
 
 class Streamed(httpx.AsyncByteStream):
     """A download body sent in pieces, which can wait between pieces."""
 
-    def __init__(self, data, piece=64, gate=None):
-        self.data, self.piece, self.gate = data, piece, gate
+    def __init__(self, data, piece=64, gate=None, fail_after=None):
+        self.data, self.piece, self.gate, self.fail_after = data, piece, gate, fail_after
         self.sent = 0
 
     async def __aiter__(self):
         for start in range(0, len(self.data), self.piece):
             if self.gate is not None and start:
                 await self.gate.wait()
+            if self.sent == self.fail_after:
+                raise httpx.ReadError("the connection was reset")
             self.sent += 1
             yield self.data[start:start + self.piece]
 
@@ -267,10 +273,18 @@ async def test_a_crashing_helper_is_started_again_after_each_backoff_then_the_no
 
 @pytest.mark.asyncio
 async def test_a_running_helper_that_exits_is_restarted(tmp_path, fake, timings):
+    timings.update(backoff=[0.5, 0.5, 0.5])
     async with app(tmp_path, fake) as client:
         await local_helper.embed(client.state, ["text"])
         first = fake.launches[0]["pid"]
         os.kill(first, 9)  # a crash
+        await until(lambda: helper(client).state == "restarting")
+        # Meanwhile search is keyword-only and says why, and a request starts nothing before the backoff.
+        status = (await client.get("/api/helper")).json()
+        assert status["search"] == {"mode": "keyword_only", "reason": "crashed"}
+        with pytest.raises(HelperUnavailable, match="crashed"):
+            await local_helper.embed(client.state, ["text"], query=True)
+        assert len(fake.launches) == 1
         await until(lambda: len(fake.launches) == 2 and helper(client).state == "running")
         assert helper(client).failures == 1
         assert await local_helper.embed(client.state, ["text"]) == [[0.5] * 4]
@@ -280,14 +294,16 @@ async def test_a_running_helper_that_exits_is_restarted(tmp_path, fake, timings)
 
 @pytest.mark.asyncio
 async def test_a_helper_that_fails_its_health_check_is_restarted(tmp_path, fake, timings):
-    timings.update(health=0.1)
+    timings.update(health=0.1, backoff=[0.5, 0.5, 0.5])
     async with app(tmp_path, fake) as client:
         await local_helper.embed(client.state, ["text"])
         await until(lambda: any(path == "/health" for _, path, _ in client.remote.helper_requests))
         assert len(fake.launches) == 1 and helper(client).state == "running"
         client.remote.healthy = False
+        await until(lambda: not alive(fake.launches[0]["pid"]))
+        assert helper(client).state == "restarting" and len(fake.launches) == 1  # ended, then the backoff
+        assert (await client.get("/api/helper")).json()["search"] == {"mode": "keyword_only", "reason": "unhealthy"}
         await until(lambda: len(fake.launches) == 2)
-        assert not alive(fake.launches[0]["pid"])
         client.remote.healthy = True
         await until(lambda: helper(client).state == "running" and helper(client).failures == 0)
 
@@ -312,6 +328,57 @@ async def test_closing_the_app_stops_a_running_helper(tmp_path, fake, timings):
         await local_helper.embed(client.state, ["text"])
         pid = fake.launches[0]["pid"]
     assert not alive(pid)
+
+
+@pytest.mark.asyncio
+async def test_closing_the_app_during_a_restart_backoff_starts_nothing(tmp_path, fake, timings):
+    fake.behave("exit")
+    timings.update(backoff=[0.3])
+    async with app(tmp_path, fake) as client:
+        with pytest.raises(HelperUnavailable, match="start_failed"):
+            await local_helper.embed(client.state, ["text"])
+        assert helper(client).state == "restarting"
+    await asyncio.sleep(0.5)
+    assert len(fake.launches) == 1 and helper(client).state == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_a_health_check_the_gate_cannot_record_is_neither_a_pass_nor_a_failure(tmp_path, fake, timings):
+    """A restore holds the database's writes, so the gate cannot record a decision: the helper keeps
+    running and its checks resume once writes are admitted again; requests meanwhile cannot be sent."""
+    timings.update(health=0.05)
+    async with app(tmp_path, fake) as client:
+        await local_helper.embed(client.state, ["text"])
+        db = client.state["db"]
+        await asyncio.to_thread(db.hold_writes)
+        try:
+            client.remote.helper_requests.clear()
+            await asyncio.sleep(0.3)  # several checks' worth
+            assert client.remote.helper_requests == []  # none went out unrecorded
+            assert helper(client).state == "running" and helper(client).failures == 0
+            assert helper(client)._watching is not None and not helper(client)._watching.done()
+            with pytest.raises(HelperUnavailable, match="closing"):
+                await local_helper.embed(client.state, ["text"], query=True)
+        finally:
+            await asyncio.to_thread(db.release_writes)
+        await until(lambda: any(path == "/health" for _, path, _ in client.remote.helper_requests))
+        assert len(fake.launches) == 1 and helper(client).state == "running"
+
+
+@pytest.mark.asyncio
+async def test_a_model_file_that_changed_since_it_was_installed_is_found_at_launch(tmp_path, fake, timings):
+    path = model_file(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(WEIGHTS.replace(b"synthetic", b"Synthetic"))  # the pinned size, other bytes
+    async with app(tmp_path, fake, install=False) as client:
+        await until(lambda: helper(client).problem == "model_changed")
+        status = (await client.get("/api/helper")).json()
+        assert status["models"][0]["installed"] is True  # in place, by its size
+        assert status["search"] == {"mode": "keyword_only", "reason": "model_changed"}
+        assert fake.launches == [] and (await outbound(client)) == []
+        serve(client, HF_URL, WEIGHTS, via=HF_CDN)
+        status = await downloaded(client, source="huggingface")  # replaced, as a download
+        assert status["search"]["mode"] == "hybrid" and path.read_bytes() == WEIGHTS
 
 
 @pytest.mark.asyncio
@@ -365,6 +432,9 @@ async def test_a_helper_idle_for_the_set_time_is_stopped(tmp_path, fake, timings
         assert helper(client).failures == 0 and helper(client).problem is None
         await local_helper.embed(client.state, ["text"])  # started again on demand
         assert len(fake.launches) == 2
+        await until(lambda: helper(client).state == "stopped")
+        assert (await client.post("/api/helper/restart")).status_code == 200  # Start again, from stopped
+        await until(lambda: len(fake.launches) == 3 and helper(client).state == "running")
 
 
 @pytest.mark.asyncio
@@ -460,6 +530,18 @@ async def test_the_reranker_is_cancelled_by_ending_its_own_process(tmp_path, fak
         assert len(fake.launches) == 3
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), "0.9", None])
+async def test_a_reranking_score_that_is_not_a_finite_number_is_refused(tmp_path, fake, timings, score):
+    async with app(tmp_path, fake) as client:
+        path = tmp_path / "reranker.gguf"
+        path.write_bytes(RERANKER_WEIGHTS)
+        reranker = client.local.add(RERANKER_PIN, path)
+        client.remote.scores = [0.5, score]
+        with pytest.raises(HelperUnavailable, match="request_failed"):
+            await reranker.rerank("a question", ["one", "two"], deadline=2)
+
+
 def test_lifecycle_values_come_from_the_helper_settings(tmp_path):
     (tmp_path / "config.toml").write_text(
         "[helper]\nidle_stop_minutes = 2\nstart_seconds = 12.5\nhealth_seconds = 20\nrestart_backoff_seconds = [2, 4]\n")
@@ -534,6 +616,7 @@ async def test_a_download_cancelled_midway_leaves_nothing_installed(tmp_path, fa
         assert response.status_code == 202
         await until(lambda: body.sent == 1 and client.local.download.received == 256)
         assert leftovers(tmp_path) == [PIN["file"] + ".part"]
+        assert stat.S_IMODE((model_file(tmp_path).parent / (PIN["file"] + ".part")).stat().st_mode) == 0o600
         status = (await client.delete("/api/helper/models/download")).json()
         assert status["download"]["state"] == "cancelled" and status["models"][0]["installed"] is False
         assert leftovers(tmp_path) == []
@@ -574,6 +657,11 @@ async def test_a_source_that_cannot_be_reached_makes_modelscope_the_recommendati
     async with app(tmp_path, fake, install=False) as client:
         status = (await client.get("/api/helper")).json()
         assert status["recommended_source"] is None and status["model_source"] is None
+
+        client.remote.files[HF_URL] = (302, {"Location": HF_CDN}, b"")  # Hugging Face answers; its file host does not
+        client.remote.files[HF_CDN] = ("unreachable", {}, b"")
+        status = await downloaded(client, source="huggingface")
+        assert status["download"]["problem"] == "source_unreachable" and status["recommended_source"] is None
 
         client.remote.files[HF_URL] = ("unreachable", {}, b"")
         status = await downloaded(client, source="huggingface")
@@ -655,10 +743,13 @@ async def test_an_import_is_verified_like_a_download(tmp_path, fake, timings):
             (offline / "short.gguf", WEIGHTS[:-1], "size_mismatch"),
             (offline / "missing.gguf", None, "file_not_found"),
             (offline, None, "not_a_file"),
+            (offline / "unreadable.gguf", WEIGHTS, "file_unreadable"),
         ]
         for path, content, code in cases:
             if content is not None:
                 path.write_bytes(content)
+            if code == "file_unreadable":
+                path.chmod(0)
             response = await client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(path)})
             assert response.status_code == 400 and response.json()["code"] == code, path
             assert leftovers(tmp_path) == []
@@ -693,6 +784,93 @@ async def test_closing_the_app_during_a_download_leaves_nothing(tmp_path, fake, 
         await until(lambda: client.local.download.received > 0)
         download = client.local.download
     assert download.state == "cancelled" and leftovers(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_downloads_or_imports_asked_for_together_start_one(tmp_path, fake, timings):
+    async with app(tmp_path, fake, install=False) as client:
+        gate = asyncio.Event()
+        serve(client, HF_URL, Streamed(WEIGHTS, piece=256, gate=gate), via=HF_CDN)
+        offline = tmp_path / "Qwen3-Embedding-0.6B-Q8_0.gguf"
+        offline.write_bytes(WEIGHTS)
+        body = {"model": EMBEDDING, "source": "huggingface"}
+        answers = await asyncio.gather(*(client.post("/api/helper/models/download", json=body) for _ in range(2)))
+        assert sorted(response.status_code for response in answers) == [202, 409]
+        assert [r.json()["code"] for r in answers if r.status_code == 409] == ["download_running"]
+        refused = await client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(offline)})
+        assert refused.json()["code"] == "download_running"
+        gate.set()
+        await until(lambda: client.local.download.state == "done")
+        assert client.remote.source_requests == [HF_URL, HF_CDN]  # one download, from one request
+
+        model_file(tmp_path).unlink()
+        answers = await asyncio.gather(
+            client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(offline)}),
+            client.post("/api/helper/models/download", json=body))
+        assert sorted(response.status_code for response in answers) in ([200, 409], [202, 409])  # either one
+        assert [r.json()["code"] for r in answers if r.status_code == 409] == ["download_running"]
+        await until(lambda: not client.local._busy())
+        assert model_file(tmp_path).read_bytes() == WEIGHTS and leftovers(tmp_path) == [PIN["file"]]
+
+
+_private_file = local_helper._private_file
+
+
+class _Failing:
+    """The download's .part file, which fails at its first write."""
+
+    def __init__(self, path, error):
+        self.out, self.error = _private_file(path), error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.out.close()
+
+    def write(self, data):
+        self.out.write(data)
+        raise self.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure, problem", [
+    ("not_served", "source_refused"),
+    ("reset", "download_interrupted"),
+    (OSError(errno.ENOSPC, "No space left on device"), "disk_full"),
+    (OSError(errno.EIO, "Input/output error"), "write_failed"),
+    (RuntimeError("unexpected"), "download_failed"),
+    ("held", "closing"),  # a restore holds the database's writes: the gate cannot record the request
+])
+async def test_a_download_that_fails_on_the_way_installs_nothing_and_says_why(tmp_path, fake, timings, monkeypatch,
+                                                                              caplog, failure, problem):
+    async with app(tmp_path, fake, install=False) as client:
+        if failure == "not_served":
+            client.remote.files[HF_URL] = (302, {"Location": HF_CDN}, b"")
+            client.remote.files[HF_CDN] = (403, {}, b"denied")
+        else:
+            serve(client, HF_URL, Streamed(WEIGHTS, piece=256, fail_after=2 if failure == "reset" else None), via=HF_CDN)
+        if isinstance(failure, Exception):
+            monkeypatch.setattr(local_helper, "_private_file", lambda path: _Failing(path, failure))
+        db = client.state["db"]
+        if failure == "held":
+            await asyncio.to_thread(db.hold_writes)
+        try:
+            with caplog.at_level(logging.DEBUG):
+                status = await downloaded(client, source="huggingface")
+        finally:
+            await asyncio.to_thread(db.release_writes)
+        assert status["download"]["state"] == "failed" and status["download"]["problem"] == problem
+        assert status["models"][0]["installed"] is False and leftovers(tmp_path) == []
+        assert client.local.download.task.done()  # never left running: the next download may start
+        monkeypatch.setattr(local_helper, "_private_file", _private_file)
+        serve(client, HF_URL, WEIGHTS, via=HF_CDN)
+        assert (await downloaded(client, source="huggingface"))["download"]["state"] == "done"
+    # The app's own log says what failed, never where: no path, no file name, no URL.
+    logged = "\n".join(record.getMessage() for record in caplog.records if record.name.startswith("backend"))
+    assert problem in logged
+    for secret in (str(tmp_path), PIN["file"], "huggingface.co", "hf.co"):
+        assert secret not in logged
 
 
 def test_the_model_source_setting_takes_only_the_two_mirrors(tmp_path):
