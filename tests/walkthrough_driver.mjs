@@ -486,6 +486,28 @@ async function materials(ctx) {
       && audited.some((e) => e.event === 'outbound' && e.data.kind === 'scholarly_api' && e.data.approved === true));
   });
 
+  await step('21b-project-switch', async () => {
+    // A read of one project's papers that answers only after a switch to another is never shown there.
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    const slow = `**/api/projects/${projectId}/materials`;
+    await page.route(slow, async (route) => { await held; await route.continue(); });
+    const switchTo = async (name) => {
+      await openSidebar();
+      await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+      await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(800);
+      if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+    };
+    await switchTo(C.project); // its papers' read is held
+    await switchTo(local); // and the Local only project's answers at once
+    await paper('A Codebook for Synthetic Interviews').waitFor();
+    release();
+    await page.waitForTimeout(1500); // the first project's read answers now
+    await page.unroute(slow);
+    check('the Library shows only the papers of the project it is open on', await paper('A Codebook for Synthetic Interviews').count() === 1
+      && await paper(titles.pdf).count() === 0 && await panel().getByRole('list', { name: L('library.papers') }).getByRole('listitem').count() === 1);
+  });
+
   await step('22-background-runs', async () => {
     await openSidebar();
     await page.getByRole('button', { name: L('sidebar.settings') }).click(); await dialog().waitFor();

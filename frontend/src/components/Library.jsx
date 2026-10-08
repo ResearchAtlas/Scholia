@@ -8,8 +8,8 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get } from '../api.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, MAX_FILES, addFiles, authorNames, libraryEvents, reasonKey, sortFiles, stateKey, typeKey, unsettled,
-  yearOf } from '../library.js';
+import { ACCEPT, MAX_FILES, addFiles, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey, typeKey,
+  unsettled, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { Paper } from './Paper.jsx';
@@ -18,22 +18,27 @@ import { cn } from '@/lib/utils';
 
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
 
-// Reads the project's papers, again while anything is under way and whenever they change.
+// Reads the project's papers, again while anything is under way and whenever they change. Only the
+// newest read's answer is kept: one asked for another project, or before a later read, is dropped.
 export function useLibrary(projectId) {
   const [listing, setListing] = useState(null);
   const [problem, setProblem] = useState(null);
   const [reads, setReads] = useState(0);
+  const [asked] = useState(newest);
   const load = useCallback(async () => {
+    const current = asked();
     if (!projectId) return;
     try {
-      setListing(await get(`/api/projects/${encodeURIComponent(projectId)}/materials`));
+      const found = await get(`/api/projects/${encodeURIComponent(projectId)}/materials`);
+      if (!current()) return;
+      setListing(found);
       setProblem(null);
     } catch (error) {
-      setProblem(error instanceof ApiError ? error.code : 'internal');
+      if (current()) setProblem(error instanceof ApiError ? error.code : 'internal');
     } finally {
-      setReads((n) => n + 1);
+      if (current()) setReads((n) => n + 1);
     }
-  }, [projectId]);
+  }, [projectId, asked]);
   useEffect(() => { setListing(null); load(); }, [load]);
   useEffect(() => {
     const changed = (event) => { if (event.detail === projectId) load(); };
@@ -74,7 +79,6 @@ export function Library({ project }) {
   const [adding, setAdding] = useState(false);
   const [over, setOver] = useState(false);
   const input = useRef(null);
-  useEffect(() => { setOpen(null); setNotice(null); }, [project?.id]);
 
   async function add(files) {
     setNotice(null);

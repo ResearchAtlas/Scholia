@@ -24,7 +24,8 @@ export function SidePanel({ which, overlay, onClose, project }) {
           <X aria-hidden="true" />
         </Button>
       </header>
-      {library ? <div className="min-h-0 flex-1"><Library project={project} /></div> : (
+      {/* One Library per project: nothing of one project's (a read still under way, its open paper) reaches another's. */}
+      {library ? <div className="min-h-0 flex-1"><Library key={project?.id} project={project} /></div> : (
         <div className="grid flex-1 place-items-center p-8 text-center">
           <div className="max-w-xs">
             <FileText className="mx-auto size-8 text-muted-foreground/60" aria-hidden="true" />

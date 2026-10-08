@@ -168,6 +168,17 @@ export function pointing(id, onPoint) {
     onFocus: point(onPoint, 'focused', id, true), onBlur: point(onPoint, 'focused', id, false) };
 }
 
+// Reads of which only the newest counts: asked() starts one and returns whether it is still the
+// newest, so an answer that comes after a later read was asked (another project's, once the Library
+// shows that one, or the next poll) is dropped and never replaces what is shown.
+export function newest() {
+  let count = 0;
+  return () => {
+    const mine = ++count;
+    return () => mine === count;
+  };
+}
+
 // Every passage of a version, read a page of the API at a time.
 export async function loadPassages(versionId) {
   const all = [];

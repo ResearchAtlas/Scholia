@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -177,4 +177,16 @@ test('the form takes newly saved details against the ones it last took, however 
   const form = queued.reduce((current, update) => update(current), { ...blank, title: 'My Own Title' });
   assert.deepEqual(form, { ...corrected, title: 'My Own Title' }); // the blanks were not edits: they take what was saved
   assert.deepEqual(changes(corrected, form), { title: 'My Own Title' }); // a save sends only the field typed
+});
+
+test('a slow read of the first project that answers after the switch to another is not shown', async () => {
+  const asked = newest(); // as the Library's reads are made: each newest, or dropped
+  let shown = null;
+  const load = async (answer) => { const current = asked(); const found = await answer; if (current()) shown = found; };
+  let answerFirst;
+  const first = load(new Promise((resolve) => { answerFirst = resolve; })); // the first project's read, slow
+  await load(Promise.resolve('the second project\'s papers')); // the switch: the second project's read
+  answerFirst('the first project\'s papers');
+  await first;
+  assert.equal(shown, 'the second project\'s papers');
 });
