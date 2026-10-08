@@ -25,12 +25,18 @@ export const downloadOffered = (project) => project?.sensitivity !== 'local_only
 
 // What the section says of the last download once it ended without installing the model (failed or
 // cancelled), as a catalog key, or null. Downloads are app-wide, so one that ended in another project
-// is still shown; where no download is offered, any outcome says only that it did not install the
-// model and points to the import: no "try again", no other source.
+// is still shown. Where no download is offered, a cancel or a failure at the source or in the
+// transfer says only that it did not install the model and points to the import: no "try again", no
+// other source. Other causes (the disk, the license files, the app closing, the database) keep their
+// own text, whose advice is not a download.
+const TRANSFER_FAILURES = new Set(['source_unreachable', 'source_refused', 'size_mismatch', 'hash_mismatch',
+  'redirect_refused', 'download_refused', 'download_interrupted', 'download_failed']);
+
 export function downloadOutcome(download, offered = true) {
   if (!['failed', 'cancelled'].includes(download?.state)) return null;
-  if (!offered) return 'helper.downloadEndedImport';
-  return download.state === 'cancelled' ? 'helper.downloadCancelled' : `errors.${download.problem}`;
+  const cancelled = download.state === 'cancelled';
+  if (!offered && (cancelled || TRANSFER_FAILURES.has(download.problem))) return 'helper.downloadEndedImport';
+  return cancelled ? 'helper.downloadCancelled' : `errors.${download.problem}`;
 }
 
 // Why search is keyword-only, as a catalog key, or null when it can use the search model. Where no

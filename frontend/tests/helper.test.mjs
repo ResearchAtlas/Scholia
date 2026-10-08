@@ -59,17 +59,19 @@ test('where no download is offered, a missing or changed model is to be imported
   }
 });
 
-// Every code a download can end with (backend/local_helper.py Local._download).
-const DOWNLOAD_FAILURES = ['source_unreachable', 'source_refused', 'size_mismatch', 'hash_mismatch', 'redirect_refused',
-  'download_refused', 'download_interrupted', 'disk_full', 'write_failed', 'closing', 'database_unavailable',
-  'notice_missing', 'download_failed'];
+// Every code a download can end with (backend/local_helper.py Local._download): where no download is
+// offered, the source and transfer failures are told as the import-only line; the others keep their text.
+const TRANSFER_FAILURES = ['source_unreachable', 'source_refused', 'size_mismatch', 'hash_mismatch', 'redirect_refused',
+  'download_refused', 'download_interrupted', 'download_failed'];
+const OWN_TEXT = ['notice_missing', 'disk_full', 'write_failed', 'closing', 'database_unavailable'];
 
 test('a download that ended without installing the model gives its own advice only where downloads are offered', () => {
-  for (const code of DOWNLOAD_FAILURES) {
+  for (const code of [...TRANSFER_FAILURES, ...OWN_TEXT]) {
     const failed = { state: 'failed', problem: code };
     assert.equal(downloadOutcome(failed), `errors.${code}`, code);
     assert.equal(downloadOutcome(failed, true), `errors.${code}`, code);
-    assert.equal(downloadOutcome(failed, false), 'helper.downloadEndedImport', code);
+    assert.equal(downloadOutcome(failed, false), TRANSFER_FAILURES.includes(code) ? 'helper.downloadEndedImport'
+      : `errors.${code}`, code);
   }
   assert.equal(downloadOutcome({ state: 'cancelled', problem: null }, true), 'helper.downloadCancelled');
   assert.equal(downloadOutcome({ state: 'cancelled', problem: null }, false), 'helper.downloadEndedImport');
@@ -77,11 +79,18 @@ test('a download that ended without installing the model gives its own advice on
     assert.equal(downloadOutcome(download, true), null);
     assert.equal(downloadOutcome(download, false), null);
   }
-  // The one line for every outcome there: that the model is not installed, and the import; never a download.
+  // The import-only line: that the model is not installed, and the import; never a download.
   assert.match(en['helper.downloadEndedImport'], /did not install.*Import the model file/);
   assert.doesNotMatch(en['helper.downloadEndedImport'], /try|again|other source|download it/i);
   assert.match(zhCN['helper.downloadEndedImport'], /没有安装.*导入模型文件/);
   assert.doesNotMatch(zhCN['helper.downloadEndedImport'], /再试|重试|另一个来源|重新下载/);
+  // The causes that keep their own text there give no download advice: no download, no source.
+  for (const code of OWN_TEXT) {
+    assert.doesNotMatch(en[`errors.${code}`], /download|source/i, code);
+    assert.doesNotMatch(zhCN[`errors.${code}`], /下载|来源/, code);
+  }
+  assert.match(en['errors.notice_missing'], /Reinstall Scholia/);
+  assert.match(zhCN['errors.notice_missing'], /重新安装 Scholia/);
 });
 
 test('the Local only note points to the import under Settings, Advanced, never to a download or an install', () => {
