@@ -27,8 +27,10 @@ its own transaction while the run is running and not revoked, and only while tha
 the material's current file: a file replaced meanwhile makes the older lookup stale, so its
 identifier is not sent (its ask is closed) and its answer is not applied. Metadata the researcher
 edited is never replaced, though the retraction check is recorded. A failed lookup leaves the
-material as it was. Both runs name their materials in `inputs.material_ids`, the deletion service's
-scope link (backend/db/deletion.py), so deleting a material revokes them.
+material as it was. A reading tried again brings its version a lookup of its own, as at import (none
+in a review-locked project): the one made with it had no text to read. Both runs name their
+materials in `inputs.material_ids`, the deletion service's scope link (backend/db/deletion.py), so
+deleting a material revokes them.
 
 A paper reads Reading while its version's extraction runs, Ready once an extraction with text is
 committed, and Needs attention otherwise, with its reason.
@@ -312,7 +314,8 @@ async def _look_up(harness, active, project_id, inputs, pace):
             and time.monotonic() - started < EXTRACTION_SECONDS + 60:
         await asyncio.sleep(WAIT_SECONDS)
 
-    wanted = await read(lambda conn: _identifiers(conn, project_id, materials, inputs.get("versions") or {}))
+    versions = inputs.get("versions") or {}
+    wanted = await read(lambda conn: _identifiers(conn, project_id, _left_to(conn, run_id, materials, versions), versions))
     distinct = list(dict.fromkeys(found for _, found in wanted.values() if found))
     if not await _write_if_running(write, run_id, lambda conn: [
             _event(conn, run_id, "step_finished", {"material_id": material, "identifier": None, "outcome": "no_identifier"})
@@ -405,6 +408,16 @@ def _identifiers(conn, project_id, materials, versions):
         ids = extraction.identifiers(passages)
         found[material] = (row[0], next((i for i in ids if i[0] == "doi"), None) or next(iter(ids), None))
     return found
+
+
+def _left_to(conn, run_id, materials, versions):
+    """Of a lookup's materials, those no later lookup was made for at the same version (a reading
+    tried again brings its version's own, see retry_run): that one looks it up, this one leaves it,
+    so an identifier is never looked up twice for one version."""
+    return [m for m in materials if not conn.execute(
+        "SELECT 1 FROM runs r, json_each(r.inputs, '$.versions') j WHERE r.workflow = 'lookup' AND j.key = ?"
+        " AND j.value = ? AND r.rowid > (SELECT rowid FROM runs WHERE id = ?)",
+        (m, versions.get(m), run_id)).fetchone()]
 
 
 def _current(conn, pairs):
@@ -831,7 +844,10 @@ def _retry(conn, run_id):
 @router.post("/api/runs/{run_id}/retry", status_code=201)
 async def retry_run(run_id: str, request: Request):
     """Read a version again, or look a batch up again, after a run that failed, was stopped or was
-    interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again."""
+    interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again.
+    A version read again gets a lookup of its own as well, as at import, unless its project is
+    review-locked: the lookup made with it found no text to read, and this one waits for the reading
+    (an older lookup still waiting leaves the version to it, see _left_to)."""
     state = _state(request)
 
     def again(conn, ids):
@@ -839,8 +855,15 @@ async def retry_run(run_id: str, request: Request):
         if refusal is not None:
             raise _refused(*refusal)
         project_id, workflow, inputs = retry
-        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
-                     (ids[0], project_id, workflow, json.dumps(inputs)))
-        return ids[0], ids
+        made = [(workflow, inputs)]
+        if workflow == "extract" and not conn.execute("SELECT review_lock FROM projects WHERE id = ?",
+                                                      (project_id,)).fetchone()[0]:
+            [material] = inputs["material_ids"]
+            made.append(("lookup", {"material_ids": [material], "versions": {material: inputs["version_id"]},
+                                    "origin": None}))
+        for new, (kind, made_inputs) in zip(ids, made):
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
+                         (new, project_id, kind, json.dumps(made_inputs)))
+        return ids[0], ids[:len(made)]
 
-    return {"run_id": await state["harness"].record_background(1, again)}
+    return {"run_id": await state["harness"].record_background(2, again)}

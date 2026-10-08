@@ -259,6 +259,75 @@ async def test_a_lookup_waits_only_for_the_reading_of_the_version_it_is_for(tmp_
         assert (await run_finished(client, first["lookup_run_id"]))["status"] == "succeeded"
 
 
+@pytest.mark.parametrize("level", ["normal", "local_only", "review_locked"])
+async def test_a_reading_tried_again_brings_the_lookup_its_version_never_had(tmp_path, monkeypatch, level):
+    reached, go = hold_extraction(monkeypatch)
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        if level == "review_locked":
+            project = (await client.post("/api/projects", json={"name": "Review", "sensitivity": "local_only",
+                                                               "review_lock": True})).json()["id"]
+        else:
+            project = await project_of(client, level=level)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = result["materials"]
+        await asyncio.to_thread(reached.wait, 10)
+        assert (await client.post(f"/api/runs/{paper['run_id']}/cancel")).json()["status"] == "cancelled"
+        [stopped] = await settled(client, project)
+        if level != "review_locked":  # its lookup had no text to read: nothing found, and nothing to retry
+            assert (stopped["lookup"]["status"], stopped["lookup"]["outcome"]) == ("succeeded", "no_identifier")
+            assert (await run_finished(client, result["lookup_run_id"]))["retryable"] is False
+        go.set()
+        again = await client.post(f"/api/runs/{paper['run_id']}/retry")
+        assert again.status_code == 201
+        if level == "local_only":  # the version's lookup asks first, as at import
+            [ask] = await ask_of(client, project)
+            assert ask["params"]["identifiers"] == 1 and client.provider.scholarly.requests == []
+            assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                      json={"option": "lookup"})).status_code == 200
+        [read] = await settled(client, project)
+        assert read["state"] == "ready"
+        if level == "review_locked":  # never looks up
+            assert read["lookup"] is None and client.provider.scholarly.requests == []
+            assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(0,)]
+        else:
+            assert (read["title"], read["checked_by"]) == (TITLE, "lookup")
+            assert read["lookup"]["outcome"] == "resolved" and read["lookup"]["run_id"] != result["lookup_run_id"]
+            assert [path for _, path, _ in client.provider.scholarly.requests] == [f"/works/doi:{DOI}"]
+
+
+async def test_a_reading_tried_again_while_its_batchs_lookup_still_waits_is_looked_up_once(tmp_path, monkeypatch):
+    other = "10.5555/the.long.read"
+    long_read, paper = f"# The Long Read\n\ndoi:{other}\n".encode(), synthetic.paper_pdf()
+    real, release, readings = extraction.extract, threading.Event(), []
+
+    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):
+        readings.append(data)
+        if data == long_read or readings.count(paper) == 1:  # the long read, and the paper's first reading
+            while not release.wait(0.01):
+                stop()
+        return real(data, kind, stop, progress)
+
+    monkeypatch.setattr(extraction, "extract", held)
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Long Read, Resolved")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("long.md", long_read), ("paper.pdf", paper))
+        [_, first] = result["materials"]
+        while readings.count(paper) < 1:
+            await asyncio.sleep(0.01)
+        assert (await client.post(f"/api/runs/{first['run_id']}/cancel")).json()["status"] == "cancelled"
+        again = await client.post(f"/api/runs/{first['run_id']}/retry")  # the batch's lookup still waits
+        assert again.status_code == 201
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        release.set()
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        papers = {p["id"]: p for p in await settled(client, project)}
+        assert papers[first["id"]]["title"] == TITLE
+        assert papers[first["id"]]["lookup"]["run_id"] != result["lookup_run_id"]  # the version's own lookup
+        assert sorted(path for _, path, _ in client.provider.scholarly.requests) == [
+            f"/works/doi:{DOI}", f"/works/doi:{other}"]  # each identifier once
+
+
 async def test_an_older_lookup_answered_after_its_file_was_replaced_writes_nothing(tmp_path):
     mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)}, arxiv={synthetic.ARXIV: "The Replacement Preprint"})
     async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
