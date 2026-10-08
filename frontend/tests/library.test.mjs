@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, unionRect, refreshed, takeSaved } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -116,16 +116,40 @@ test('a paper shows its pages only while its version is a PDF', () => {
   assert.equal(viewOf({ version: null }, 'pages'), 'text');
 });
 
+// The passages' highlight as the page keeps it: a state set as React's setter sets it.
+function passages() {
+  let state = NOT_POINTED;
+  const set = (update) => { state = typeof update === 'function' ? update(state) : update; };
+  return { props: (id) => pointing(id, set), lit: (ids) => ids.filter((id) => isPointed(state, id)) };
+}
+
 test('a passage is reached by Tab and highlighted on focus as on hover, once on its page however many lines', () => {
-  const pointed = [];
-  const props = pointing('p1', (id) => pointed.push(id));
-  assert.equal(props.tabIndex, 0);
-  props.onFocus();
-  props.onBlur();
-  props.onMouseEnter();
-  props.onMouseLeave();
-  assert.deepEqual(pointed, ['p1', null, 'p1', null]);
+  const { props, lit } = passages();
+  assert.equal(props('p1').tabIndex, 0);
+  props('p1').onFocus();
+  assert.deepEqual(lit(['p1']), ['p1']);
+  props('p1').onBlur();
+  props('p1').onMouseEnter();
+  assert.deepEqual(lit(['p1']), ['p1']);
+  props('p1').onMouseLeave();
+  assert.deepEqual(lit(['p1']), []);
+  assert.deepEqual(Object.keys(hovering('p1', () => {})), ['onMouseEnter', 'onMouseLeave']); // a page's line boxes
   assert.deepEqual(unionRect([[0.1, 0.2, 0.8, 0.22], [0.12, 0.23, 0.5, 0.25]]), [0.1, 0.2, 0.8, 0.25]);
+});
+
+test('the pointer never takes the highlight from the passage with focus, nor focus from the one pointed at', () => {
+  const { props, lit } = passages();
+  props('A').onFocus(); // Tab reaches A, and the list scrolls B under the resting pointer
+  props('B').onMouseEnter();
+  assert.deepEqual(lit(['A', 'B']), ['A', 'B']); // B's own highlight, beside A's
+  props('B').onMouseLeave();
+  assert.deepEqual(lit(['A', 'B']), ['A']); // A keeps its highlight while it keeps focus
+  props('B').onMouseEnter();
+  props('A').onBlur(); // focus leaves A: the pointer is still on B
+  assert.deepEqual(lit(['A', 'B']), ['B']);
+  props('C').onMouseEnter(); // the pointer moves from B to C, and B's leave arrives late
+  props('B').onMouseLeave();
+  assert.deepEqual(lit(['A', 'B', 'C']), ['C']);
 });
 
 test('details a lookup saves while one field is edited fill the form, and a save sends only that field', () => {

@@ -10,8 +10,8 @@ import { useT } from '../i18n/index.js';
 import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
-import { ACCEPT, byPage, changes, detailsOf, isPdf, libraryChanged, loadPassages, pageImage, pointing, rectStyle,
-  reasonKey, takeSaved, unionRect, validYear, viewOf } from '../library.js';
+import { ACCEPT, byPage, changes, detailsOf, hovering, isPdf, isPointed, libraryChanged, loadPassages, NOT_POINTED,
+  pageImage, pointing, rectStyle, reasonKey, takeSaved, unionRect, validYear, viewOf } from '../library.js';
 import { addTo, Byline, Facts, Progress, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -141,11 +141,12 @@ function Contents({ material }) {
   const view = viewOf(material, chosen);
   const [passages, setPassages] = useState(null);
   const [failed, setFailed] = useState(false);
-  const [pointed, setPointed] = useState(null);
+  const [pointed, setPointed] = useState(NOT_POINTED); // the passages with focus and under the pointer
   const version = material.version.id;
   useEffect(() => {
     let live = true;
     setPassages(null);
+    setPointed(NOT_POINTED); // their elements go: no blur or leave may come for them
     loadPassages(version).then((found) => live && setPassages(found)).catch(() => live && setFailed(true));
     return () => { live = false; };
   }, [version, material.extraction?.passages]);
@@ -199,9 +200,9 @@ function PageView({ version, number, passages, pointed, onPoint }) {
         </div>}
       {src && passages.map((passage) => (passage.boxes?.rects ?? []).map((rect, i) => (
         <span key={`${passage.id}:${i}`} aria-hidden="true" title={passage.text}
-          onMouseEnter={() => onPoint(passage.id)} onMouseLeave={() => onPoint(null)}
+          {...hovering(passage.id, onPoint)}
           className={cn('absolute rounded-[2px] transition-colors duration-150',
-            pointed === passage.id ? 'bg-brand/25 ring-1 ring-brand/60' : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
+            isPointed(pointed, passage.id) ? 'bg-brand/25 ring-1 ring-brand/60' : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
           style={rectStyle(rect)} />
       )))}
       {/* One focusable region per passage, around its lines: the keyboard's way to it, with the same highlight. */}
@@ -239,7 +240,7 @@ function PassageList({ passages, pointed, onPoint }) {
           <li key={passage.id} data-passage={passage.id} {...pointing(passage.id, onPoint)}
             className="grid gap-1.5 rounded-md outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
             {heading && <p className="pt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{heading}</p>}
-            <div className={cn('rounded-md px-2 py-1 transition-colors duration-150', pointed === passage.id && 'bg-brand-soft')}>
+            <div className={cn('rounded-md px-2 py-1 transition-colors duration-150', isPointed(pointed, passage.id) && 'bg-brand-soft')}>
               {passage.kind !== 'paragraph' && (
                 <span className="mr-2 text-[11px] font-medium uppercase tracking-wide text-brand">{t(`paper.kind.${passage.kind}`)}</span>
               )}

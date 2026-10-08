@@ -143,11 +143,29 @@ export function unionRect(rects) {
     Math.max(...rects.map((r) => r[2])), Math.max(...rects.map((r) => r[3]))];
 }
 
-// A passage's props for pointing at it: hovering it or focusing it from the keyboard highlights it
-// (in the text and on its page alike), and Tab reaches it.
+// Which passages are highlighted (in the text and on its page alike): the one with focus and the one
+// under the pointer, kept apart and each highlighted. So the pointer never takes the highlight from
+// the passage with focus (a scroll can bring another under a resting pointer, and its leaving would
+// clear it), and Tab always shows where focus is, by its ring and its highlight. Each is cleared only
+// by its own passage's leave or blur, so a late leave never clears the passage now pointed at.
+export const NOT_POINTED = { focused: null, hovered: null };
+
+export const isPointed = (state, id) => state.focused === id || state.hovered === id;
+
+function point(onPoint, which, id, on) {
+  return () => onPoint((state) => (on ? { ...state, [which]: id }
+    : state[which] === id ? { ...state, [which]: null } : state));
+}
+
+// A passage's props for the pointer (each of its line boxes on a page). onPoint is the state's setter.
+export function hovering(id, onPoint) {
+  return { onMouseEnter: point(onPoint, 'hovered', id, true), onMouseLeave: point(onPoint, 'hovered', id, false) };
+}
+
+// A passage's props for pointing at it, by the pointer or by focus, and for Tab to reach it.
 export function pointing(id, onPoint) {
-  return { tabIndex: 0, onMouseEnter: () => onPoint(id), onMouseLeave: () => onPoint(null),
-    onFocus: () => onPoint(id), onBlur: () => onPoint(null) };
+  return { tabIndex: 0, ...hovering(id, onPoint),
+    onFocus: point(onPoint, 'focused', id, true), onBlur: point(onPoint, 'focused', id, false) };
 }
 
 // Every passage of a version, read a page of the API at a time.
