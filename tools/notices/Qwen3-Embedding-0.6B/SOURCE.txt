@@ -12,5 +12,5 @@ declare ("license: apache-2.0"). Neither repository ships a license file of its 
 LICENSE beside this file is that license's standard text.
 
 Scholia neither ships nor modifies the model. It downloads the file from the repository the
-researcher chooses, or copies a file the researcher imports, and keeps it only if its size
-and SHA-256 match the values above.
+researcher chooses, or copies a file the researcher imports, and installs it only if its
+size and SHA-256 match the values above.

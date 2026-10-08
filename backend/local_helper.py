@@ -20,8 +20,9 @@ action (ticket 71): one at a time, from Hugging Face or ModelScope as the resear
 `[helper] model_source`), sent through the General project's gated client as a model download,
 written to `<file>.part` while it is hashed, and installed only once its size and SHA-256 match the
 pin. A `.part` file is never installed: it is removed when its download or import ends, however it
-ends, and at launch. An import copies a local file the same way. A Local only project offers no
-download. Nothing here logs a path, a URL or the helper's own output, which is read and dropped.
+ends, or, when that fails, at the next launch. An import copies a local file the same way. A Local
+only project offers no download. Nothing here logs a path, a URL or the helper's own output, which
+is read and dropped.
 """
 
 import asyncio
@@ -77,7 +78,7 @@ EMBEDDING_MODEL = {
     # (apache.org's LICENSE-2.0.txt) and SOURCE.txt names the model and where it comes from.
     "notice": {"folder": "Qwen3-Embedding-0.6B", "files": {
         "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
-        "SOURCE.txt": "ab2873254bce1bea81e211610524c98a7e6e442a346104f343ef947226b95841"}},
+        "SOURCE.txt": "6b2b4a08638f6dbee4566d3c984b5c8c0856e1472ffbadb1389910b9d882c524"}},
     "url": _EMBEDDING_HF,  # what tools/fetch.py downloads for CI's self-test
     "sources": {
         "huggingface": {"repository": f"{HF}/Qwen/Qwen3-Embedding-0.6B-GGUF", "url": _EMBEDDING_HF},

@@ -60,6 +60,16 @@ test('every state, source and failure the backend reports has its words in both 
   }
 });
 
+test('a refused file is said not to be installed, never not to be kept: a partial copy may remain', () => {
+  // A .part file that cannot be removed is left for the next launch (backend/local_helper.py _remove).
+  for (const key of ['errors.size_mismatch', 'errors.hash_mismatch', 'helper.consentNote', 'helper.importHint']) {
+    assert.match(en[key], /install/, key);
+    assert.doesNotMatch(en[key], /\bkeeps?\b|\bkept\b|\bcopies\b/, key);
+    assert.match(zhCN[key], /安装/, key);
+    assert.doesNotMatch(zhCN[key], /保留|复制/, key);
+  }
+});
+
 test('the status is read often only while something is under way', () => {
   assert.equal(pollDelay({ download: { state: 'running' }, helper: { state: 'stopped' } }), 1000);
   assert.equal(pollDelay({ download: null, helper: { state: 'starting' } }), 1000);
