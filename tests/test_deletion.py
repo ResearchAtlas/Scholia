@@ -543,18 +543,23 @@ def test_a_row_cannot_take_a_deleted_id(db, store, kind):
 
 def test_a_database_at_schema_1_gets_the_guard_for_its_earlier_deletions(tmp_path):
     data = tmp_path / "data"
+    project, deleted = new_id(), new_id()
     with Database(data, migrations=MIGRATIONS[:1]) as db:
-        store = ContentStore(db)
-        x = populate(db, store, add_project(db, "Thesis"), "p")
-        delete(db, store, "conversation", x["c1"])
+        # A conversation deleted at schema 1, as the deletion service of that time left it: its row
+        # gone and its tombstone kept. (Today's service reads columns later migrations add.)
+        db.write(lambda conn: (
+            conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, 'Thesis', 'research')", (project,)),
+            conn.execute("INSERT INTO conversations (id, project_id) VALUES (?, ?)", (deleted, project)),
+            conn.execute("DELETE FROM conversations WHERE id = ?", (deleted,)),
+            conn.execute("INSERT INTO tombstones (object_id, kind) VALUES (?, 'conversation')", (deleted,))))
 
     with Database(data) as db:
         assert one(db, "PRAGMA user_version") == (len(MIGRATIONS),)
         with pytest.raises(sqlite3.IntegrityError, match="cannot be used again"):
             db.write(lambda conn: conn.execute(
-                "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (x["c1"], x["project"])))
+                "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (deleted, project)))
         db.write(lambda conn: conn.execute(
-            "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), x["project"])))
+            "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), project)))
     generation = sorted((data / "backups" / "daily").iterdir())[0]  # taken before the first migration it ran
     backup = sqlite3.connect(f"{(generation / DB_NAME).as_uri()}?mode=ro", uri=True)
     try:
