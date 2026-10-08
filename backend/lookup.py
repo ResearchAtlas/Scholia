@@ -121,7 +121,9 @@ async def _get(client, url, source, pace):
 async def _fetch(client, url):
     """(status, Retry-After, body): a 200 answer's body as it streams in, decoded here (gzip or none,
     nothing else), counted as decoded bytes and given up (Failed unavailable) once it would pass
-    MAX_BODY, so neither a long body nor a small compressed one that expands is ever held whole."""
+    MAX_BODY, so neither a long body nor a small compressed one that expands is ever held whole. A
+    gzip body is one gzip stream: anything after its end (another member, a tail) is given up too,
+    as it arrives, rather than read on uncounted."""
     async with client.stream("GET", url, headers={"Accept-Encoding": "gzip"}, timeout=TIMEOUT,
                              follow_redirects=False) as response:
         if response.status_code != 200:
@@ -133,9 +135,11 @@ async def _fetch(client, url):
         body = bytearray()
         try:
             async for raw in response.aiter_raw():
-                # At most what is left under the limit, and one byte more to show it is passed.
+                # At most what is left under the limit, and one byte more to show it is passed. Input
+                # left over was held back by the limit (unconsumed_tail) or came after the gzip
+                # stream's end (unused_data, where every later chunk goes): either is given up.
                 body += inflate.decompress(raw, MAX_BODY + 1 - len(body)) if inflate else raw
-                if len(body) > MAX_BODY or (inflate and inflate.unconsumed_tail):
+                if len(body) > MAX_BODY or (inflate and (inflate.unconsumed_tail or inflate.unused_data)):
                     raise Failed("unavailable")
             if inflate:
                 body += inflate.flush()

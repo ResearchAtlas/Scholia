@@ -343,14 +343,21 @@ async def test_openalex_unavailable_and_crossref_without_the_record_is_unavailab
         assert mock.hosts == ["api.openalex.org"] * 3 + ["api.crossref.org"]
 
 
-@pytest.mark.parametrize("body", ["long", "compressed"])
+@pytest.mark.parametrize("body", ["long", "compressed", "more members", "a tail"])
 async def test_an_answer_past_the_body_limit_is_given_up_as_it_streams_in(tmp_path, monkeypatch, body):
     monkeypatch.setattr(lookup, "MAX_BODY", 5000)
+    record = gzip.compress(json.dumps(openalex_work(DOI, TITLE)).encode())  # a small, valid answer
+    gzipped = {"content-encoding": "gzip"}
     if body == "long":  # 50,000 bytes in 50 chunks
         chunks, headers = [b" " * 1000] * 50, {}
-    else:  # 10 MB of spaces as about 10 kB of gzip, in 1 kB chunks
+    elif body == "compressed":  # 10 MB of spaces as about 10 kB of gzip, in 1 kB chunks
         packed = gzip.compress(b" " * 10_000_000)
-        chunks, headers = [packed[i:i + 1000] for i in range(0, len(packed), 1000)], {"content-encoding": "gzip"}
+        chunks, headers = [packed[i:i + 1000] for i in range(0, len(packed), 1000)], gzipped
+    elif body == "more members":  # the record, then 50 more gzip members of 1,000 bytes each, the first in its chunk
+        member = gzip.compress(b" " * 1000)
+        chunks, headers = [record + member] + [member] * 49, gzipped
+    else:  # the record, then 50,000 bytes after its end
+        chunks, headers = [record] + [b"\0" * 1000] * 50, gzipped
     streams = []
 
     async def answer(request):
