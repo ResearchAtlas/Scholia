@@ -8,9 +8,8 @@ time across every lookup, held until its answer, and paced (`SPACING`: arXiv ask
 every 3 seconds); a request that meets 429, a server error or a network failure is retried at
 most twice, after 1 and 4 seconds (a Retry-After within RETRY_AFTER_MAX instead, in seconds or as
 a date), each within TIMEOUT seconds; an answer is read as it streams in, at most MAX_BODY bytes
-once decoded. The
-client is the outbound gate's, made for the project with its dispatch check, so a refusal
-(OutboundDenied) is final and is raised.
+once decoded. The client is the outbound gate's, made for the project with its dispatch check, so
+a refusal (OutboundDenied) is final and is raised.
 
 A DOI resolved through OpenAlex or Crossref records whether the work is retracted (OpenAlex's
 `is_retracted`; a retraction, withdrawal or removal in Crossref's `updated-by`); arXiv says
