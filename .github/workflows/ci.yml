@@ -141,3 +141,23 @@ jobs:
       - name: Close the DMG
         if: always()
         run: if [ -e "build/mnt/Scholia.app" ]; then hdiutil detach build/mnt; fi
+      # The checked DMG, kept for testing the packaged app on a Mac (Harold, 2026-10-07): its
+      # SHA-256, the commit and tree it was built from, and the digest of the interface it bundles
+      # (each file's path and SHA-256, as tests/walkthrough_driver.mjs computes it).
+      - name: Record the DMG
+        run: |
+          {
+            echo "dmg_sha256 $(shasum -a 256 build/Scholia.dmg | cut -d' ' -f1)"
+            echo "commit $(git rev-parse HEAD)"
+            echo "pr_head ${{ github.event.pull_request.head.sha || github.sha }}"
+            echo "tree $(git rev-parse 'HEAD^{tree}')"
+            echo "interface_digest $(cd frontend/dist && find . -type f | sed 's|^\./||' | LC_ALL=C sort | while read -r f; do printf '%s\0%s\n' "$f" "$(shasum -a 256 "$f" | cut -d' ' -f1)"; done | shasum -a 256 | cut -d' ' -f1)"
+          } | tee build/Scholia.dmg.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scholia-dmg
+          path: |
+            build/Scholia.dmg
+            build/Scholia.dmg.txt
+          if-no-files-found: error
+          retention-days: 14

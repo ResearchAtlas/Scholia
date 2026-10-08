@@ -194,7 +194,7 @@ export function Shell({ health, settings, onLanguage }) {
         <Drawer.Portal>
           <Drawer.Overlay className="fixed inset-0 z-40 bg-black/40 data-[state=open]:animate-in data-[state=open]:fade-in-0" />
           <Drawer.Content aria-describedby={undefined}
-            className="fixed inset-y-0 left-0 z-40 w-72 max-w-[85vw] shadow-2xl outline-none data-[state=open]:animate-in data-[state=open]:slide-in-from-left">
+            className="fixed inset-y-0 left-0 z-40 w-72 max-w-[85vw] shadow-2xl outline-hidden data-[state=open]:animate-in data-[state=open]:slide-in-from-left">
             <Drawer.Title className="sr-only">{t('sidebar.projects')}</Drawer.Title>
             {sidebar}
           </Drawer.Content>

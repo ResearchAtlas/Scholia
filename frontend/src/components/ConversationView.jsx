@@ -281,11 +281,11 @@ function Composer({ running, problem, onSend, onStop, projectId }) {
     <form onSubmit={submit} className="shrink-0 px-4 pb-4">
       <div className="mx-auto w-full max-w-3xl">
         {problem && <p role="alert" className="mb-2 text-sm text-destructive">{problem}</p>}
-        <div className="rounded-2xl border bg-card p-2 shadow-sm transition-shadow focus-within:border-brand/50 focus-within:shadow-md focus-within:shadow-brand/5">
+        <div className="rounded-2xl border bg-card p-2 shadow-xs transition-shadow focus-within:border-brand/50 focus-within:shadow-md focus-within:shadow-brand/5">
           <label htmlFor="composer" className="sr-only">{t('composer.label')}</label>
           <textarea id="composer" ref={box} rows={1} value={text} placeholder={t('composer.placeholder')}
             onChange={(event) => setText(event.target.value)} onKeyDown={key}
-            className="scroll-thin block max-h-60 min-h-9 w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed outline-none placeholder:text-muted-foreground" />
+            className="scroll-thin block max-h-60 min-h-9 w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed outline-hidden placeholder:text-muted-foreground" />
           <div className="mt-1 flex items-center justify-between gap-2">
           <ModelPicker projectId={projectId} />
           {running ? (

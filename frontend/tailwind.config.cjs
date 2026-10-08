@@ -57,6 +57,27 @@ module.exports = {
                 },
                 success: "hsl(var(--success))",
                 warning: "hsl(var(--warning))",
+                // Tailwind 3's values of the two palette colors in use (the mark's gradient and the
+                // placeholder default), which Tailwind 4's palette changed (S1-35).
+                violet: { 500: "#8b5cf6" },
+                gray: { 400: "#9ca3af" },
+            },
+            // Tailwind 3's type scale, whose line heights are lengths: Tailwind 4's are ratios, which
+            // text of another size inside would inherit and scale (S1-35).
+            fontSize: {
+                xs: ["0.75rem", { lineHeight: "1rem" }],
+                sm: ["0.875rem", { lineHeight: "1.25rem" }],
+                base: ["1rem", { lineHeight: "1.5rem" }],
+                lg: ["1.125rem", { lineHeight: "1.75rem" }],
+                xl: ["1.25rem", { lineHeight: "1.75rem" }],
+                "2xl": ["1.5rem", { lineHeight: "2rem" }],
+                "3xl": ["1.875rem", { lineHeight: "2.25rem" }],
+                "4xl": ["2.25rem", { lineHeight: "2.5rem" }],
+            },
+            // Tailwind 3's color transition, which leaves the focus outline's color out: Tailwind 4's
+            // fades the outline in (S1-35).
+            transitionProperty: {
+                colors: "color, background-color, border-color, text-decoration-color, fill, stroke",
             },
             borderRadius: {
                 lg: "var(--radius)",

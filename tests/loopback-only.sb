@@ -1,0 +1,7 @@
+; A sandbox profile for the walkthrough's WebKit check: everything is allowed except outgoing
+; network connections, which may only reach this Mac's loopback address (and local sockets).
+(version 1)
+(allow default)
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-outbound (remote unix-socket))
