@@ -20,7 +20,7 @@ import json
 import logging
 import weakref
 
-from backend.extraction import EXTRACTORS
+from backend.extraction import EXTRACTORS, extractor_of
 
 log = logging.getLogger(__name__)
 
@@ -322,11 +322,25 @@ def _revoke(conn):
     return revoked
 
 
+def _reads_now(w, e):
+    """SQL: material version w is current and e is its reading now: its file read by this version of
+    its type's extractor (extractor_of, as backend/materials.py's _extraction picks a paper's
+    reading). Built when it is used, so it follows the extractor versions of the app that runs."""
+    kind = f"coalesce({w}.media_type, (SELECT c.media_type FROM content_files c WHERE c.sha256 = {w}.file_sha256))"
+    reading = (f"CASE {kind}" + "".join(f" WHEN '{kind}' THEN '{'/'.join(extractor_of(kind))}'" for kind in EXTRACTORS)
+               + f" ELSE {e}.extractor || '/' || {e}.extractor_version END")
+    return (f"{w}.is_current = 1 AND {e}.file_sha256 = {w}.file_sha256"
+            f" AND {e}.extractor || '/' || {e}.extractor_version = {reading}")
+
+
 def _queue_index_removals(conn):
     """Queue the search index removals for the deleted passages and memory records.
 
-    Index rows are kept per project, so the passages of a deleted version's own reading
-    are removed for its project once no other material version there reads them.
+    Index rows are kept per project, and a project's index holds only what its current versions
+    read now: the passages of every reading of a deleted version's file are removed for its
+    project unless a surviving current version there reads them now. An earlier version kept after
+    a replacement, or a reading by an earlier extractor version, keeps nothing in the index (it
+    keeps its reading's rows, which go with the last version that read them: see RULES).
     """
     conn.execute(f"""INSERT INTO index_queue (target, target_id, project_id, op)
         SELECT DISTINCT 'passage', p.id, m.project_id, 'remove'
@@ -337,7 +351,7 @@ def _queue_index_removals(conn):
         WHERE v.rowid IN {_doomed('material_versions')}
         AND NOT EXISTS (
             SELECT 1 FROM material_versions w JOIN materials n ON n.id = w.material_id
-            WHERE {_reads('w', 'e')} AND n.project_id = m.project_id
+            WHERE {_reads_now('w', 'e')} AND n.project_id = m.project_id
             AND w.rowid NOT IN {_doomed('material_versions')})
         ORDER BY p.id""")
     conn.execute(f"""INSERT INTO index_queue (target, target_id, project_id, op)

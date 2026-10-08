@@ -15,6 +15,7 @@ import backend.db.deletion as deletion_module
 from backend.db import DB_NAME, ContentStore, Database, delete, new_id
 from backend.db.deletion import DELETE, KINDS, NOT_DELETED, ON_DELETE
 from backend.db.migrations import MIGRATIONS
+from backend.extraction import PDF, extractor_of
 from network_guard import allow_subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,8 +98,8 @@ def populate(db, store, project, tag, paper=None):
             (x["v1"], x["m1"], paper))
         if not conn.execute("SELECT 1 FROM extractions WHERE file_sha256 = ?", (paper,)).fetchone():
             conn.execute(
-                "INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status) VALUES (?, ?, 'pdf', '1', 'done')",
-                (x["e1"], paper))
+                "INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status) VALUES (?, ?, ?, ?, 'done')",
+                (x["e1"], paper, *extractor_of(PDF)))  # the reading this app's PDF extractor makes
             conn.execute(
                 "INSERT INTO passages (id, extraction_id, ordinal, kind, text) VALUES (?, ?, 0, 'paragraph', ?)",
                 (x["s1"], x["e1"], f"text {tag}"))
@@ -393,8 +394,8 @@ def test_a_file_shared_with_another_material_keeps_its_extraction(db, store):
     same_project = new_id()
     db.write(lambda conn: conn.execute(
         "INSERT INTO materials (id, project_id, source) VALUES (?, ?, 'upload')", (same_project, x["project"])))
-    db.write(lambda conn: conn.execute(
-        "INSERT INTO material_versions (id, material_id, seq, file_sha256) VALUES (?, ?, 0, ?)",
+    db.write(lambda conn: conn.execute(  # its current file: it still uses it
+        "INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current) VALUES (?, ?, 0, ?, 1)",
         (new_id(), same_project, x["paper"])))
     assert other["s1"] == x["s1"]  # one extraction for the file
 

@@ -472,6 +472,24 @@ async def test_a_removal_already_queued_is_not_queued_again_and_one_for_passages
         assert await ops(client, reading) == {project: [("add", n), ("remove", n), ("add", n)], other: [("remove", n)]}
 
 
+async def test_deleting_the_paper_that_reads_a_file_takes_it_out_of_the_index_though_another_once_had_it(tmp_path):
+    x, y = b"# File X\n\nIts own text.\n", b"# File Y\n\nAnother text.\n"
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [a] = (await added(client, project, ("x.md", x)))["materials"]
+        await settled(client, project)
+        await added(client, project, ("y.md", y), material_id=a["id"])  # A keeps X only as an earlier version
+        [b] = (await added(client, project, ("x-again.md", x)))["materials"]  # B reads X now
+        await settled(client, project)
+        [(read_x,)] = await rows(client, "SELECT e.id FROM extractions e JOIN material_versions v"
+                                         " ON v.file_sha256 = e.file_sha256 WHERE v.material_id = ?", b["id"])
+        (n,) = (await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", read_x))[0]
+        assert (await ops(client, read_x))[project][-1] == ("add", n)  # in the index, as B's
+        assert (await client.delete(f"/api/materials/{b['id']}")).status_code == 200
+        assert (await ops(client, read_x))[project][-1] == ("remove", n)  # A's earlier version does not keep it there
+        assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", read_x) == [(n,)]  # A's version's
+
+
 async def test_a_reading_of_a_file_replaced_while_it_was_read_reaches_no_index(tmp_path, monkeypatch):
     real, reached, release = extraction.extract, threading.Event(), threading.Event()
 
