@@ -143,6 +143,7 @@ async function startServer(dir) {
     throw new Error(`the server's listener on port ${url.port} was not found`);
   }
   return { child, pid, origin: url.origin, session: url.hash.replace('#session=', ''), dataFolder: lines['data folder'],
+           materials: lines.materials,
            log, stderr: () => stderr };
 }
 
@@ -197,8 +198,8 @@ function computedStyles(properties) {
   });
 }
 
-// The M1 flows: setup, projects, conversations, settings, export, backup, a sensitivity change with
-// the audit view, restore and deletion, in 14 screenshots.
+// The M1 flows: setup, projects, conversations, settings, export (a background run since S1-13),
+// backup, a sensitivity change with the audit view, restore and deletion, in 14 screenshots.
 async function m1(ctx) {
   const { page, L, P, C, step, check, get } = ctx;
   const dialog = () => page.getByRole('dialog', { name: L('sidebar.settings') });
@@ -316,6 +317,138 @@ async function m1(ctx) {
     check('the conversation is gone from the list', !(await page.getByRole('button', { name: P('sidebar.conversationActions') }).count()));
     check('the conversation is deleted', (await get(`/api/conversations/${C.conversation}`)).status === 404);
   });
+}
+
+// The S1-13 flows: adding materials, read into passages, with their details looked up through the
+// test-owned OpenAlex, Crossref and arXiv stand-ins; a paper's details and its page viewer; a Local
+// only project's lookup confirmation, answered in the Library; and the background-run list.
+async function materials(ctx) {
+  const { page, L, C, step, check, get } = ctx;
+  const panel = () => page.getByRole('complementary', { name: L('panel.library') });
+  const dialog = () => page.getByRole('dialog', { name: L('sidebar.settings') });
+  const openSidebar = async () => {
+    const show = page.getByRole('button', { name: L('sidebar.show') });
+    if (await show.count() && await show.isVisible()) { await show.click(); await page.waitForTimeout(500); }
+  };
+  const projectNamed = async (name) => (await get('/api/projects')).body.projects.find((p) => p.name === name);
+  const listing = async (id) => (await get(`/api/projects/${id}/materials`)).body;
+  const settled = async (id, count) => { // once its count of papers is in, read and looked up
+    for (let i = 0; i < 300; i += 1) {
+      const listed = await listing(id);
+      if (listed.materials.length >= count
+          && listed.materials.every((m) => m.state !== 'reading' && m.lookup?.status !== 'running')) return listed;
+      await page.waitForTimeout(200);
+    }
+    throw new Error('the papers were not read and looked up in time');
+  };
+  const requests = () => readFileSync(join(C.out, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const scholarly = (host) => requests().filter((r) => r.host === host);
+  const paper = (title) => panel().getByRole('button', { name: title, exact: true });
+  const files = (...names) => names.map((name) => join(C.materials, name));
+
+  await page.keyboard.press('Escape'); await page.waitForTimeout(400);
+  const projectId = (await projectNamed(C.project)).id;
+  await step('15-library', async () => {
+    await page.getByRole('button', { name: L('panel.library'), exact: true }).click();
+    await panel().getByText(L('library.empty')).waitFor();
+    check('the library is empty', (await listing(projectId)).materials.length === 0);
+  });
+
+  const titles = { pdf: 'Minimum Wages and Employment in a Synthetic Panel', docx: 'Wages Across Synthetic Cities',
+                   latex: '最低工资的合成模型：一项方法说明', markdown: 'Labour Market Notes on a Synthetic Economy' };
+  await step('16-materials-added', async () => {
+    await page.getByTestId('library-files').setInputFiles(files('minimum-wages.pdf', 'synthetic-cities.docx', 'wage-floors.tex',
+      'labour-notes.md', 'city-report.html', 'scanned-appendix.pdf', 'damaged.pdf'));
+    const listed = await settled(projectId, 7);
+    await paper(titles.pdf).waitFor(); await page.waitForTimeout(2000);
+    const by = Object.fromEntries(listed.materials.map((m) => [m.title, m]));
+    check('seven papers are saved, each stored once', listed.materials.length === 7);
+    check('five are Ready, read into passages', listed.materials.filter((m) => m.state === 'ready' && m.extraction?.passages > 0).length === 5);
+    check('the Library shows five Ready', await panel().getByText(L('library.state.ready'), { exact: true }).count() === 5);
+    check('the scanned pages wait for text recognition', by['scanned-appendix']?.reason === 'ocr_waiting'
+      && by['scanned-appendix'].extraction.ocr_pages === 2);
+    check('the damaged file needs attention with its reason', by.damaged?.reason === 'unreadable_file');
+    check('two need attention in the Library', await panel().getByText(L('library.state.needs_attention'), { exact: true }).count() === 2);
+    check('details were looked up and saved', Object.values(titles).every((title) => by[title]?.checked_by === 'lookup'));
+    check('a retraction is recorded and flagged', by[titles.docx]?.retraction === 'retracted'
+      && await panel().getByText(L('library.retracted'), { exact: true }).count() === 1);
+    check('each identifier went alone to its source', scholarly('api.openalex.org').length >= 3 && scholarly('api.crossref.org').length === 1
+      && scholarly('export.arxiv.org').length === 1 && scholarly('api.openalex.org').every((r) => r.path.startsWith('/works/doi:10.5555/')));
+  });
+
+  await step('17-paper-details', async () => {
+    const row = panel().getByRole('listitem').filter({ hasText: titles.docx });
+    await row.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    await row.getByText(L('ask.service.crossref'), { exact: false }).first().waitFor();
+    check('its details name where they came from', await row.getByText(L('library.fact.retraction')).count() === 1);
+  });
+
+  await step('18-page-viewer', async () => {
+    await paper(titles.pdf).click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded(); // pages load in view
+    const image = panel().locator('figure img').first();
+    await image.waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('aside figure img')].some((i) => i.naturalWidth > 0));
+    check('the first page is rendered by the backend', await image.evaluate((i) => i.naturalWidth) > 0);
+    check('its passages are drawn over it', await panel().locator('figure span[title]').count() > 3);
+  });
+
+  await step('19-details-saved', async () => {
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    await paper(titles.latex).click();
+    await panel().getByText(L('paper.kind.table'), { exact: true }).first().waitFor();
+    const title = panel().getByRole('textbox', { name: L('paper.field.title') });
+    await title.fill(`${titles.latex}（已核对）`);
+    await panel().getByRole('button', { name: L('common.save'), exact: true }).click();
+    await panel().getByText(L('paper.saved')).waitFor();
+    const saved = (await listing(projectId)).materials.find((m) => m.title.startsWith(titles.latex));
+    check('the edit is saved as the researcher\'s', saved?.title === `${titles.latex}（已核对）` && saved.checked_by === 'researcher');
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+  });
+
+  const local = C.lang === 'en' ? 'Interviews (synthetic, Local only)' : '访谈（合成数据，仅本机）';
+  const created = await get('/api/projects', { method: 'POST', body: JSON.stringify({ name: local, sensitivity: 'local_only' }) });
+  await step('20-local-only-ask', async () => {
+    check('a Local only project is made', created.body?.sensitivity === 'local_only');
+    await page.reload(); await page.getByRole('textbox', { name: L('composer.label') }).waitFor(); // its list, read again
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+    await page.getByRole('menuitem', { name: local, exact: true }).click(); await page.waitForTimeout(1200);
+    if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+    await page.getByTestId('library-files').setInputFiles(files('interview-codebook.md'));
+    const ask = panel().getByRole('group', { name: L('ask.label') });
+    await ask.waitFor({ timeout: 20000 });
+    const [open] = (await listing(created.body.id)).asks;
+    check('one question for the batch, naming its services and identifiers', open?.kind === 'identifier_lookup'
+      && open.params.identifiers === 1 && open.params.services.join() === 'crossref,openalex');
+    check('the question names the services', (await ask.innerText()).includes('OpenAlex') && (await ask.innerText()).includes('Crossref'));
+    check('nothing was sent before the answer', !requests().some((r) => r.path.includes('codebook')));
+  });
+
+  await step('21-local-only-answered', async () => {
+    await panel().getByRole('button', { name: L('ask.identifier_lookup.option.lookup') }).click();
+    await paper('A Codebook for Synthetic Interviews').waitFor({ timeout: 20000 });
+    const listed = await settled(created.body.id, 1);
+    check('the answer is saved and the lookup made', listed.materials[0]?.checked_by === 'lookup' && listed.asks.length === 0);
+    check('the request went out only after the answer', requests().some((r) => r.path.includes('codebook')));
+    const audited = (await get(`/api/audit?project_id=${created.body.id}`)).body.entries;
+    check('the answer and the approved request are audited', audited.some((e) => e.event === 'ask_answered' && e.data.answer === 'lookup')
+      && audited.some((e) => e.event === 'outbound' && e.data.kind === 'scholarly_api' && e.data.approved === true));
+  });
+
+  await step('22-background-runs', async () => {
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.settings') }).click(); await dialog().waitFor();
+    await dialog().getByRole('button', { name: L('settings.page.advanced'), exact: true }).click(); await page.waitForTimeout(1200);
+    await dialog().getByRole('heading', { name: L('settings.backgroundRuns') }).scrollIntoViewIfNeeded(); await page.waitForTimeout(2500);
+    const runs = (await get('/api/activity')).body.runs;
+    check('readings, lookups and the export are listed', ['extract', 'lookup', 'project_export'].every((w) => runs.some((r) => r.workflow === w)));
+    check('the failed reading offers Retry', runs.some((r) => r.workflow === 'extract' && r.status === 'failed' && r.retryable)
+      && await dialog().getByRole('button', { name: L('runs.retry'), exact: true }).count() >= 1);
+    check('the list names them', await dialog().getByText(L('settings.workflowExtract'), { exact: true }).count() >= 5);
+    await dialog().getByRole('button', { name: L('runs.retry'), exact: true }).first().scrollIntoViewIfNeeded();
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
 }
 
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
@@ -638,7 +771,8 @@ async function run(combo, build, outRoot) {
     page.on('console', (message) => { if (['error', 'warning'].includes(message.type())) consoleMessages.push(`${message.type()}: ${message.text()}`); });
     page.on('pageerror', (error) => consoleMessages.push(`pageerror: ${error.message}`));
     const { label, pattern } = labels(combo.lang);
-    const C = { out, tag, exports, project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
+    const C = { out, tag, exports, lang: combo.lang, materials: server?.materials,
+                project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
                 question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
     const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
     const step = async (name, body, before) => {
@@ -659,6 +793,7 @@ async function run(combo, build, outRoot) {
       await page.reload();
     }
     await m1(ctx);
+    if (C.materials) await materials(ctx);  // an attached app has no synthetic materials of its own
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);

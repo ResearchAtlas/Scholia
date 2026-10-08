@@ -137,8 +137,15 @@ def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
 
 @router.get("/api/asks")
 async def list_asks(request: Request, project_id: str | None = None, conversation_id: str | None = None):
-    db = request.app.state.scholia["db"]
-    return {"asks": await asyncio.to_thread(db.read, lambda conn: open_asks(conn, project_id, conversation_id))}
+    """The open asks; for a conversation, also how many runs started from it still run (`working`),
+    so the conversation knows to look again."""
+    def listing(conn):
+        working = conn.execute(
+            "SELECT count(*) FROM runs WHERE status = 'running' AND json_extract(inputs, '$.origin.conversation_id') = ?",
+            (conversation_id,)).fetchone()[0] if conversation_id else 0
+        return {"asks": open_asks(conn, project_id, conversation_id), "working": working}
+
+    return await asyncio.to_thread(request.app.state.scholia["db"].read, listing)
 
 
 @router.post("/api/runs/{run_id}/asks/{ask_id}")

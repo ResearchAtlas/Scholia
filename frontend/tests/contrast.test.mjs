@@ -31,6 +31,7 @@ const TEXT = [
   ...SURFACES.map((surface) => ['foreground', surface]),
   ...SURFACES.map((surface) => ['muted-foreground', surface]),
   ...['background', 'card', 'brand-soft'].map((surface) => ['brand', surface]),
+  ['foreground', 'brand-soft'], ['muted-foreground', 'brand-soft'], // the shared confirmation's question and note
   ...['background', 'card', 'popover'].map((surface) => ['destructive', surface]),
   ['warning', 'background'], ['warning', 'card'], ['success', 'background'],
   ['brand-foreground', 'brand'], ['primary-foreground', 'primary'],

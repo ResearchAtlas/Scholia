@@ -8,10 +8,12 @@ export function needsPassphrase(projects) {
   return projects.some((project) => SENSITIVE.includes(project?.sensitivity));
 }
 
-// The DELETE request for a project or conversation, with the delete dialog's choices:
+// The DELETE request for a project, conversation or material, with the delete dialog's choices:
 // "Delete everywhere including backups" and, under Details, "Remove all trace".
+const COLLECTIONS = { project: 'projects', conversation: 'conversations', material: 'materials' };
+
 export function deletePath(kind, id, { everywhere = false, removeAllTrace = false } = {}) {
-  const base = `/api/${kind === 'project' ? 'projects' : 'conversations'}/${encodeURIComponent(id)}`;
+  const base = `/api/${COLLECTIONS[kind]}/${encodeURIComponent(id)}`;
   const query = new URLSearchParams();
   if (everywhere) query.set('purge_backups', 'true');
   if (removeAllTrace) query.set('remove_all_trace', 'true');

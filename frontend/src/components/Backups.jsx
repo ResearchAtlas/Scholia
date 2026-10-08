@@ -9,6 +9,8 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { get, post } from '../api.js';
 import { fileSize, restoreBody, restoreNotes } from '../backups.js';
 import { useAction } from '../action.js';
+import { errorText } from '../text.js';
+import { cancelRun, followRun, fraction, runOutcome } from '../runs.js';
 import { FolderField } from './FolderField.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -101,19 +103,73 @@ function BackupRow({ backup, onRestore }) {
   );
 }
 
+// A full backup or an export, written by a background run (backend/backups.py): started here,
+// followed until it ends, with its progress and Cancel; "Saved" only once the run has succeeded.
+export function useArchiveRun() {
+  const t = useT();
+  const { busy, problem, run } = useAction();
+  const [running, setRunning] = useState(null); // { id, progress } while its run goes on
+  const [saved, setSaved] = useState(null);
+  const [failed, setFailed] = useState(null);
+  const shown = useRef(true);
+  useEffect(() => () => { shown.current = false; }, []);
+
+  async function start(path, body) {
+    setSaved(null);
+    setFailed(null);
+    const started = await run(() => post(path, body));
+    if (!started) return false;
+    setRunning({ id: started.run_id, progress: null });
+    let row;
+    try { // followed while the form is shown; the background-run list shows it otherwise
+      row = await followRun(started.run_id, (current) => setRunning({ id: started.run_id, progress: current.progress }),
+        (ms) => (shown.current ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.reject(new Error('closed'))));
+    } catch {
+      return false;
+    }
+    setRunning(null);
+    const outcome = runOutcome(row);
+    if (outcome.ok) setSaved(row.result.file);
+    else setFailed(outcome.code ? errorText(t, outcome.code) : t(outcome.key));
+    return outcome.ok;
+  }
+
+  return { busy: busy || Boolean(running), problem: problem ?? failed, saved, running, start,
+    cancel: () => running && cancelRun(running.id).catch(() => {}) };
+}
+
+export function ArchiveStatus({ archive }) {
+  const t = useT();
+  const share = fraction(archive.running?.progress);
+  return (
+    <>
+      {archive.problem && <p role="alert" className="text-sm text-destructive">{archive.problem}</p>}
+      {archive.running && (
+        <div className="flex items-center gap-3" role="status">
+          <span className="text-sm text-muted-foreground">
+            {share === null ? t('backups.working') : t('backups.writing', { percent: Math.round(share * 100) })}
+          </span>
+          <Button type="button" size="sm" variant="ghost" className="h-7" onClick={archive.cancel}>{t('common.cancel')}</Button>
+        </div>
+      )}
+      {archive.saved && <Saved text={t('backups.saved', { file: archive.saved })} />}
+    </>
+  );
+}
+
 function FullBackup() {
   const t = useT();
   const [destination, setDestination] = useState('');
   const [passphrase, setPassphrase] = useState('');
-  const [saved, setSaved] = useState(null);
-  const { busy, problem, run } = useAction();
+  const archive = useArchiveRun();
 
   async function submit(event) {
     event.preventDefault();
-    setSaved(null);
-    const result = await run(() => post('/api/backups/full',
-      { destination: destination.trim(), ...(passphrase ? { passphrase } : {}) }));
-    if (result) { setSaved(result.file); setPassphrase(''); }
+    const sent = passphrase;
+    setPassphrase(''); // held by the run in memory only, and not kept in the form either
+    if (!(await archive.start('/api/backups/full', { destination: destination.trim(), ...(sent ? { passphrase: sent } : {}) }))) {
+      setPassphrase(sent);
+    }
   }
 
   return (
@@ -124,10 +180,8 @@ function FullBackup() {
       </div>
       <FolderField label={t('folder.label')} value={destination} onChange={setDestination} />
       <Passphrase id="full-backup-passphrase" value={passphrase} onChange={setPassphrase} hint={t('backups.passphraseHint')} />
-      {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
-      {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}
-      {saved && <Saved text={t('backups.saved', { file: saved })} />}
-      <Button type="submit" className="justify-self-start" disabled={busy || !destination.trim()}>{t('backups.fullStart')}</Button>
+      <ArchiveStatus archive={archive} />
+      <Button type="submit" className="justify-self-start" disabled={archive.busy || !destination.trim()}>{t('backups.fullStart')}</Button>
     </form>
   );
 }

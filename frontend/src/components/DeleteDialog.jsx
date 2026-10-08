@@ -11,7 +11,7 @@ import { useAction } from '../action.js';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 
-// target: { kind: "project" or "conversation", id, title, body }, or null when closed.
+// target: { kind: "project", "conversation" or "material", id, title, body }, or null when closed.
 export function DeleteDialog({ target, onClose, onDone }) {
   const t = useT();
   const traceId = useId();

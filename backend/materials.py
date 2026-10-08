@@ -313,7 +313,7 @@ async def _look_up(harness, active, project_id, inputs, pace):
     level, locked = await read(lambda conn: conn.execute(
         "SELECT sensitivity, review_lock FROM projects WHERE id = ?", (project_id,)).fetchone())
     if locked:  # never looks up (its run is revoked when the lock comes)
-        raise RunOutcome("failed", "review_locked")
+        raise RunOutcome("failed", "lookup_locked")
     approved = False
     if level == "local_only":
         approved = await _approval(read, write, run_id, project_id, inputs, distinct)
@@ -746,7 +746,7 @@ async def retry_run(run_id: str, request: Request):
             inputs = {"material_ids": kept, "version_id": inputs["version_id"]}
         else:
             if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
-                raise _refused(403, "review_locked", "A review-locked project never looks identifiers up")
+                raise _refused(403, "lookup_locked", "A review-locked project never looks identifiers up")
             inputs = {"material_ids": kept, "origin": None}
         new = new_id()
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
