@@ -4,8 +4,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
-import { downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress, SOURCES }
-  from '../src/helper.js';
+import { downloadOffered, downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress,
+  SOURCES } from '../src/helper.js';
 
 test('the consent screen selects ModelScope once Hugging Face could not be reached, else the last choice', () => {
   assert.equal(preferredSource({ model_source: null, recommended_source: null }), 'huggingface');
@@ -30,6 +30,47 @@ test('search says why it is keyword-only, with an entry for every reason', () =>
   for (const reason of ['model_missing', 'model_changed', 'binary_missing', 'binary_changed', 'start_timeout',
     'start_failed', 'crashed', 'unhealthy', 'helper_failed', 'other']) {
     for (const catalog of [en, zhCN]) assert.ok(Object.hasOwn(catalog, `helper.reason.${reason}`), reason);
+  }
+});
+
+test('Advanced offers the download unless the current project is Local only', () => {
+  assert.equal(downloadOffered({ kind: 'research', sensitivity: 'local_only', review_lock: false }), false);
+  assert.equal(downloadOffered({ kind: 'research', sensitivity: 'local_only', review_lock: true }), false);
+  for (const project of [{ kind: 'research', sensitivity: 'normal' }, { kind: 'research', sensitivity: 'private' },
+    { kind: 'general', sensitivity: 'normal' }, null, undefined]) {
+    assert.equal(downloadOffered(project), true, JSON.stringify(project));
+  }
+});
+
+test('where no download is offered, a missing or changed model is to be imported, not downloaded', () => {
+  const keywordOnly = (reason) => ({ search: { mode: 'keyword_only', reason } });
+  assert.equal(keywordOnlyReason(keywordOnly('model_missing'), false), 'helper.reasonImport.model_missing');
+  assert.equal(keywordOnlyReason(keywordOnly('model_changed'), false), 'helper.reasonImport.model_changed');
+  assert.equal(keywordOnlyReason(keywordOnly('crashed'), false), 'helper.reason.crashed');
+  assert.equal(keywordOnlyReason(keywordOnly('something new'), false), 'helper.reason.other');
+  assert.equal(keywordOnlyReason(keywordOnly('model_missing')), 'helper.reason.model_missing');
+  assert.equal(keywordOnlyReason({ search: { mode: 'hybrid', reason: null } }, false), null);
+  for (const reason of ['model_missing', 'model_changed']) {
+    const key = `helper.reasonImport.${reason}`;
+    assert.match(en[key], /Import/, key);
+    assert.doesNotMatch(en[key], /download/i, key);
+    assert.match(zhCN[key], /导入/, key);
+    assert.doesNotMatch(zhCN[key], /下载/, key);
+  }
+});
+
+test('the Local only note points to the import under Settings, Advanced, never to a download or an install', () => {
+  assert.match(en['helper.localOnlyBody'], /keyword-only until the search model is installed or imported/);
+  assert.match(en['helper.localOnlyBody'], /import the model file under Settings, Advanced\.$/);
+  assert.doesNotMatch(en['helper.localOnlyBody'], /install it|all projects/);
+  assert.match(zhCN['helper.localOnlyBody'], /可在“设置 › 高级”中导入模型文件。$/);
+  assert.doesNotMatch(zhCN['helper.localOnlyBody'], /所有项目|安装它/);
+  for (const catalog of [en, zhCN]) assert.ok(Object.hasOwn(catalog, 'errors.local_only_no_download'));
+});
+
+test('no string calls the interface bilingual', () => {
+  for (const catalog of [en, zhCN]) {
+    for (const [key, value] of Object.entries(catalog)) assert.doesNotMatch(JSON.stringify(value), /bilingual|双语/i, key);
   }
 });
 

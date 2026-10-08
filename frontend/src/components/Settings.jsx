@@ -386,7 +386,7 @@ function Advanced({ health, project }) {
         <LimitFields file={personal} onProblem={setProblem} prefix="limit" />
       </Section>
       <Section title={t('settings.localServers')} hint={t('settings.localServersHint')} />
-      <LocalHelperSection />
+      <LocalHelperSection project={project} />
       <PrivateAllowlist />
       <AuditLog project={project} />
       <BackgroundRuns />

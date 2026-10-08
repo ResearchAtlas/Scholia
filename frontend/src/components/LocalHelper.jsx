@@ -3,15 +3,16 @@
 // backend/local_helper.py): the search model's status, its download from Hugging Face or ModelScope
 // once the researcher has seen its size, source and hash and chosen Download, its import from a
 // file for offline installs, the helper's state, and whether search is keyword-only. A Local only
-// project offers no download: its note (LocalOnlySearchNote) points to the import here instead.
+// project offers no download: its note (LocalOnlySearchNote) points to the import here, and while it
+// is the current project this section offers the import only.
 import { useCallback, useContext, useEffect, useId, useState } from 'react';
 import { CheckCircle2, Cpu, Download, FileInput, FolderOpen, RotateCcw, TriangleAlert } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, del, get, post } from '../api.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress, SOURCES }
-  from '../helper.js';
+import { downloadOffered, downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress,
+  SOURCES } from '../helper.js';
 import { useAction } from '../action.js';
 import { LoadState, Problem, Section, Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -39,7 +40,9 @@ function useHelperStatus() {
   return { status, problem, load, setStatus };
 }
 
-export function LocalHelperSection() {
+// `project` is the current project, if any: the download request names it, and a Local only one is
+// offered the import only.
+export function LocalHelperSection({ project }) {
   const t = useT();
   const { status, problem, load, setStatus } = useHelperStatus();
   const [consent, setConsent] = useState(false);
@@ -47,6 +50,7 @@ export function LocalHelperSection() {
   const cancelling = useAction();
   const restarting = useAction();
   const model = status?.models?.[0];
+  const offered = downloadOffered(project);
 
   return (
     <Section title={t('helper.title')} hint={t('helper.hint')}>
@@ -66,16 +70,19 @@ export function LocalHelperSection() {
               const data = await restarting.run(() => post('/api/helper/restart'));
               if (data) setStatus(data);
             }} />
-            <SearchRow status={status} />
+            <SearchRow status={status} offered={offered} />
           </div>
           {(cancelling.problem || restarting.problem) && (
             <p role="alert" className="text-sm text-destructive">{cancelling.problem || restarting.problem}</p>
           )}
+          {needsModel(status) && !offered && <LocalOnlyNote />}
           {needsModel(status) && (
             <div className="flex flex-wrap gap-2">
-              <Button disabled={downloading(status)} onClick={() => setConsent(true)}>
-                <Download aria-hidden="true" />{t('helper.download')}
-              </Button>
+              {offered && (
+                <Button disabled={downloading(status)} onClick={() => setConsent(true)}>
+                  <Download aria-hidden="true" />{t('helper.download')}
+                </Button>
+              )}
               <Button variant="outline" aria-expanded={importing} disabled={downloading(status)}
                 onClick={() => setImporting((open) => !open)}>
                 <FileInput aria-hidden="true" />{t('helper.import')}
@@ -85,8 +92,10 @@ export function LocalHelperSection() {
           {importing && needsModel(status) && (
             <ImportForm model={model} onDone={(data) => { setStatus(data); setImporting(false); }} />
           )}
-          <ModelConsent open={consent} status={status} onClose={() => setConsent(false)}
-            onStarted={(data) => { setStatus(data); setConsent(false); }} />
+          {offered && (
+            <ModelConsent open={consent} status={status} project={project} onClose={() => setConsent(false)}
+              onStarted={(data) => { setStatus(data); setConsent(false); }} />
+          )}
         </>
       )}
     </Section>
@@ -168,9 +177,9 @@ function HelperRow({ status, busy, onStartAgain }) {
   );
 }
 
-function SearchRow({ status }) {
+function SearchRow({ status, offered }) {
   const t = useT();
-  const reason = keywordOnlyReason(status);
+  const reason = keywordOnlyReason(status, offered);
   return (
     <p role="status" className={cn('flex gap-2 px-3 py-2.5 text-sm leading-relaxed', reason && 'text-warning')}>
       {reason ? <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
@@ -181,8 +190,9 @@ function SearchRow({ status }) {
 }
 
 // The model consent screen (S13): what is downloaded, from where, its size and SHA-256, and where
-// it is kept. Cancel sends nothing; Download starts the one download the researcher asked for.
-function ModelConsent({ open, status, onClose, onStarted }) {
+// it is kept. Cancel sends nothing; Download starts the one download the researcher asked for, naming
+// the current project so that the backend refuses it for a Local only one.
+function ModelConsent({ open, status, project, onClose, onStarted }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const [source, setSource] = useState('huggingface');
@@ -192,7 +202,8 @@ function ModelConsent({ open, status, onClose, onStarted }) {
   const close = () => { if (!busy) { reset(); onClose(); } };
 
   async function start() {
-    const data = await run(() => post('/api/helper/models/download', { model: model.id, source }));
+    const data = await run(() => post('/api/helper/models/download',
+      { model: model.id, source, ...(project ? { project_id: project.id } : {}) }));
     if (data) onStarted(data);
   }
 
@@ -301,16 +312,23 @@ function ImportForm({ model, onDone }) {
 // In a Local only project, while the search model is not in place: search is keyword-only, and the
 // project offers no download (ticket 71); the model can be imported under Settings, Advanced.
 export function LocalOnlySearchNote({ onOpenAdvanced }) {
-  const t = useT();
   const { status } = useHelperStatus();
   if (!status?.models?.length || !needsModel(status)) return null;
+  return <LocalOnlyNote onOpenAdvanced={onOpenAdvanced} />;
+}
+
+// The note itself, under This project with the way to Advanced, and in Advanced above the import.
+function LocalOnlyNote({ onOpenAdvanced }) {
+  const t = useT();
   return (
     <div role="note" className="grid gap-2 rounded-md border border-warning/40 px-3 py-2.5 text-sm">
       <p className="font-medium">{t('helper.localOnlyTitle')}</p>
       <p className="leading-relaxed text-muted-foreground">{t('helper.localOnlyBody')}</p>
-      <Button variant="outline" size="sm" className="h-7 justify-self-start" onClick={onOpenAdvanced}>
-        {t('helper.localOnlyOpen')}
-      </Button>
+      {onOpenAdvanced && (
+        <Button variant="outline" size="sm" className="h-7 justify-self-start" onClick={onOpenAdvanced}>
+          {t('helper.localOnlyOpen')}
+        </Button>
+      )}
     </div>
   );
 }

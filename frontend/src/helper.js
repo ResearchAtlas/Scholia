@@ -18,14 +18,22 @@ export function progress(download) {
 
 export const downloading = (status) => status?.download?.state === 'running';
 
-// Why search is keyword-only, as a catalog key, or null when it can use the search model.
+// Whether Settings, Advanced offers the search model's download while `project` is the current
+// project. A Local only project offers none, only the import (ticket 71); any other project, the
+// General project among them, or none offers it. Downloads are app-wide either way.
+export const downloadOffered = (project) => project?.sensitivity !== 'local_only';
+
+// Why search is keyword-only, as a catalog key, or null when it can use the search model. Where no
+// download is offered, a missing or changed model's advice names the import only.
 const REASONS = new Set(['model_missing', 'model_changed', 'binary_missing', 'binary_changed', 'start_timeout',
   'start_failed', 'crashed', 'unhealthy', 'helper_failed']);
+const IMPORT_ONLY = new Set(['model_missing', 'model_changed']);
 
-export function keywordOnlyReason(status) {
+export function keywordOnlyReason(status, offered = true) {
   const search = status?.search;
   if (!search || search.mode !== 'keyword_only') return null;
-  return `helper.reason.${REASONS.has(search.reason) ? search.reason : 'other'}`;
+  const reason = REASONS.has(search.reason) ? search.reason : 'other';
+  return `helper.${offered || !IMPORT_ONLY.has(reason) ? 'reason' : 'reasonImport'}.${reason}`;
 }
 
 // The helper's state as the section names it: stopped while search is keyword-only is "unavailable",
