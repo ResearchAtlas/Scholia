@@ -53,11 +53,12 @@ export function requestsOf(files) {
 // Adds files to a project: from a drop, Add files, or the conversation (conversationId), or as a
 // new version of a material (materialId), however many. A file larger than Scholia reads refuses
 // the selection, as the backend would; the rest go in as few requests as fit (requestsOf), read
-// one request at a time, and stay one batch: a selection of more than one request adds its files
-// with look_up false, and a last request names every version they added (batch), so a Local only
-// project asks once, counting every identifier the drop gave. Resolves to the backend's answers
-// together; a request that fails once others were added ends the sending, its error code in
-// `problem`, and those added are still looked up together.
+// one request at a time, and stay one batch, which the backend holds in the drop's lookup run: each
+// request but the last says more follow (more), the ones after the first name the batch the first
+// answered (batch), and the last closes it, so a Local only project asks once, counting every
+// identifier the drop gave. A batch the window never closes (it went away, or a request failed)
+// closes itself on the backend. Resolves to the backend's answers together; a request that fails
+// once others were added ends the sending, its error code in `problem`.
 export async function addFiles(projectId, files, { conversationId, materialId } = {}) {
   if (files.some((file) => file.size > MAX_FILE_BYTES)) throw new ApiError(413, 'file_too_large');
   const send = (body) => post(`/api/projects/${encodeURIComponent(projectId)}/materials`, {
@@ -65,29 +66,20 @@ export async function addFiles(projectId, files, { conversationId, materialId } 
   });
   const groups = requestsOf(files);
   const added = { materials: [], lookup_run_id: null };
-  const batch = []; // the versions this drop added, looked up together at its end
-  let problem = null;
-  const deferred = groups.length > 1 ? { look_up: false } : {};
-  for (const group of groups) {
+  for (const [i, group] of groups.entries()) {
+    const batch = added.lookup_run_id ? { batch: added.lookup_run_id } : {};
     try {
-      const answer = await send({ files: await Promise.all(group.map(readFile)), ...deferred });
+      const answer = await send({ files: await Promise.all(group.map(readFile)), ...batch,
+        ...(i < groups.length - 1 ? { more: true } : {}) });
       added.materials.push(...answer.materials);
-      batch.push(...answer.materials.filter((m) => m.version_id && !m.existing).map((m) => m.version_id));
       added.lookup_run_id = answer.lookup_run_id ?? added.lookup_run_id;
     } catch (error) {
       if (!added.materials.length) throw error;
-      problem = error instanceof ApiError ? error.code : 'internal';
-      break;
+      if (added.lookup_run_id) await send({ files: [], batch: added.lookup_run_id }).catch(() => null); // close it now
+      return { ...added, problem: error instanceof ApiError ? error.code : 'internal' };
     }
   }
-  if (groups.length > 1 && batch.length) {
-    try {
-      added.lookup_run_id = (await send({ files: [], batch })).lookup_run_id;
-    } catch (error) {
-      problem ??= error instanceof ApiError ? error.code : 'internal';
-    }
-  }
-  return problem ? { ...added, problem } : added;
+  return added;
 }
 
 // Tells the open Library that a project's papers changed (files added by a drop on the window).

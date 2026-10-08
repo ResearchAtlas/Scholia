@@ -748,51 +748,72 @@ async def test_a_local_only_project_asks_once_per_batch_and_the_answer_covers_th
         assert asked_again["run_id"] == retried.json()["run_id"]
 
 
-async def test_a_drop_sent_in_several_requests_asks_once_counting_every_identifier(tmp_path):
-    other = "10.5555/second.request"
-    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "Sent Second")}
+def drop_files(count, prefix="drop"):
+    """count Markdown files, each with an identifier of its own, and the records for them."""
+    dois = [f"10.5555/{prefix}.paper.{i}" for i in range(count)]
+    return ([(f"{prefix}-{i}.md", f"# Paper {i}\n\ndoi:{d}\n".encode()) for i, d in enumerate(dois)],
+            {d: openalex_work(d, f"Paper {i}") for i, d in enumerate(dois)})
+
+
+async def lookups(client):
+    return [r for (r,) in await rows(client, "SELECT id FROM runs WHERE workflow = 'lookup' ORDER BY rowid")]
+
+
+async def test_a_drop_sent_in_several_requests_asks_once_counting_every_identifier(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 60)  # closed by its last request, not by waiting
+    files, records = drop_files(45)
     async with started(tmp_path / "data", scholarly(openalex=records)) as client:
         project = await project_of(client, level="local_only")
-        first = await added(client, project, ("a.pdf", synthetic.paper_pdf()), look_up=False)
-        assert first["lookup_run_id"] is None  # left to the drop's last request
-        last = await added(client, project, ("b.md", f"# B\n\ndoi:{other}\n".encode()),
-                           batch=[first["materials"][0]["version_id"]])
+        batch = None
+        for start in range(0, 45, 20):  # as the interface sends it: requests of at most 20 files
+            more = start + 20 < 45
+            sent = await added(client, project, *files[start:start + 20], **({"more": True} if more else {}),
+                               **({"batch": batch} if batch else {}))
+            assert sent["lookup_run_id"] == (batch or sent["lookup_run_id"])  # the first's run is the drop's batch
+            batch = sent["lookup_run_id"]
         [ask] = await ask_of(client, project)
-        assert ask["run_id"] == last["lookup_run_id"] and ask["params"]["identifiers"] == 2  # one question for both
+        assert ask["run_id"] == batch and ask["params"]["identifiers"] == 45  # one question for all of it
+        assert await lookups(client) == [batch]
         assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
                                   json={"option": "lookup"})).status_code == 200
         papers = await settled(client, project)
-        assert sorted(p["title"] for p in papers) == sorted([TITLE, "Sent Second"])
-        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]
+        assert sum(p["checked_by"] == "lookup" for p in papers) == 45
 
 
-async def test_a_drop_of_45_files_asks_once_counting_every_identifier(tmp_path):
-    dois = [f"10.5555/drop.paper.{i}" for i in range(45)]
-    async with started(tmp_path / "data", scholarly(openalex={d: openalex_work(d, f"Paper {i}") for i, d in
-                                                              enumerate(dois)})) as client:
+@pytest.mark.parametrize("ending", ["window closed", "app restarted"])
+async def test_a_drop_whose_last_request_never_comes_is_still_looked_up_once(tmp_path, monkeypatch, ending):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 0.3)
+    files, records = drop_files(3)
+    data = tmp_path / "data"
+    async with started(data, scholarly(openalex=records)) as client:
         project = await project_of(client, level="local_only")
-        files = [(f"{i}.md", f"# Paper {i}\n\ndoi:{d}\n".encode()) for i, d in enumerate(dois)]
-        versions = []
-        for start in range(0, 45, 20):  # as the interface sends it: requests of at most 20 files, then the lookup
-            sent = await added(client, project, *files[start:start + 20], look_up=False)
-            assert sent["lookup_run_id"] is None
-            versions += [m["version_id"] for m in sent["materials"]]
-        last = await added(client, project, batch=versions)
+        first = await added(client, project, files[0], more=True)
+        batch = first["lookup_run_id"]
+        assert (await added(client, project, files[1], batch=batch, more=True))["lookup_run_id"] == batch
+        if ending == "window closed":  # nothing more comes: the batch closes itself once it waits too long
+            [ask] = await ask_of(client, project)
+            assert ask["run_id"] == batch and ask["params"]["identifiers"] == 2
+            assert await lookups(client) == [batch]
+            return
+    async with started(data, scholarly(openalex=records), setup=False) as client:  # the batch was open at the stop
         [ask] = await ask_of(client, project)
-        assert ask["run_id"] == last["lookup_run_id"] and ask["params"]["identifiers"] == 45
-        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]
+        assert ask["run_id"] == batch and ask["params"]["identifiers"] == 2
+        assert await lookups(client) == [batch]
 
 
-async def test_a_drop_whose_later_request_failed_still_looks_up_what_was_added(tmp_path):
-    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+async def test_a_request_for_a_batch_closed_meanwhile_gets_a_lookup_of_its_own(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 0.2)
+    files, records = drop_files(2)
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
         project = await project_of(client)
-        first = await added(client, project, ("a.pdf", synthetic.paper_pdf()), look_up=False)
+        batch = (await added(client, project, files[0], more=True))["lookup_run_id"]
+        assert (await run_finished(client, batch))["status"] == "succeeded"  # closed by waiting, then looked up
+        late = await added(client, project, files[1], batch=batch)
+        assert late["lookup_run_id"] not in (None, batch)  # never lost: it is looked up on its own
+        papers = await settled(client, project)
+        assert sorted(p["title"] for p in papers) == ["Paper 0", "Paper 1"]
         refused = await client.post(f"/api/projects/{project}/materials", json={"files": []})
-        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")  # nothing to add or look up
-        only = await added(client, project, batch=[first["materials"][0]["version_id"], new_id()])  # an unknown one: left out
-        assert only["materials"] == [] and only["lookup_run_id"]
-        [paper] = await settled(client, project)
-        assert paper["title"] == TITLE and paper["lookup"]["run_id"] == only["lookup_run_id"]
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")  # nothing to add or close
 
 
 async def test_a_local_only_lookup_cancelled_while_it_asks_closes_its_ask(tmp_path):

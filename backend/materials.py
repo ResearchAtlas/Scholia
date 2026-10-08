@@ -6,9 +6,11 @@ content store, then one transaction writes, per file, the project's material and
 version (or a new version of a material being replaced), and the background runs that follow:
 - an `extract` run per new version whose file has no extraction yet. An extraction finished by
   another project is shared instead, and its passages are queued for this project's index at once.
-- one `lookup` run for the batch, unless the project is review-locked, which never looks up. A
-  drop sent in several requests, each under the request body limit, is one batch: its requests
-  defer the lookup (look_up false) and a last one names the versions they added (batch).
+- one `lookup` run for the batch, unless the project is review-locked, which never looks up. A drop
+  sent in several requests, each under the request body limit, is one batch, held by its lookup run:
+  the first request records it open, the next ones add to it, the last closes it, and one left open
+  with no addition for BATCH_IDLE_SECONDS (its window closed, or the app restarted) closes itself,
+  so the drop is looked up once however it ends.
 A request that fails validation writes nothing; the same file added again to the same project
 reports the paper it already is.
 
@@ -51,7 +53,6 @@ import binascii
 import json
 import logging
 import time
-from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
@@ -68,7 +69,7 @@ log = logging.getLogger(__name__)
 
 EXTRACTION_SECONDS = 30 * 60  # per material version (section 13)
 MAX_FILES = 20  # per request
-MAX_BATCH = 10_000  # the papers one drop's lookup covers (Upload.batch); a drop's requests carry MAX_FILES each
+BATCH_IDLE_SECONDS = 120  # an open batch (a drop still being sent) with no addition for this long closes itself
 WAIT_SECONDS = 0.5  # a lookup's look at whether its materials have been read, and at its ask
 LOOKUP_WAIT_SECONDS = EXTRACTION_SECONDS + 60  # how long a lookup waits for its readings, at most
 PASSAGE_PAGE = 500
@@ -93,11 +94,11 @@ class Upload(BaseModel):
     files: list[NewFile] = Field(default_factory=list, max_length=MAX_FILES)
     conversation_id: str | None = Field(default=None, max_length=100)  # attached in a conversation
     material_id: str | None = Field(default=None, max_length=100)  # a new version of this material
-    # A drop sent in several requests (each under the body limit) is one batch: its requests add
-    # their files with look_up false, and a last one with no files names the versions they added
-    # (batch), so one lookup covers them all. (A request may also carry files and a batch together.)
-    look_up: bool = True
-    batch: list[Annotated[str, Field(max_length=100)]] = Field(default_factory=list, max_length=MAX_BATCH)
+    # A drop sent in several requests (each under the body limit) is one batch, held by its lookup run:
+    # its first request (more) records the run open, the next ones name it (batch) and add to it, and
+    # the last (no more, files or none) closes it. See _add_to_batch and _look_up.
+    batch: str | None = Field(default=None, max_length=100)
+    more: bool = False
 
 
 class MaterialChange(BaseModel):
@@ -125,7 +126,7 @@ async def add_files(project_id: str, body: Upload, request: Request):
     db, content, harness = state["db"], state["content"], state["harness"]
     if body.material_id is not None and len(body.files) != 1:
         raise _refused(400, "invalid_request", "A file replaces one material")
-    if not body.files and not body.batch:
+    if not body.files and body.batch is None:
         raise _refused(400, "invalid_request", "No files to add")
     files = []
     for item in body.files:
@@ -164,11 +165,6 @@ async def add_files(project_id: str, body: Upload, request: Request):
         ids, used = iter(ids), []
         locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
         added, looked_up = [], {}  # looked_up: {material id: the version its lookup is for}
-        for version in body.batch:  # added by the drop's earlier requests; one replaced since has its own
-            row = conn.execute("SELECT v.material_id FROM material_versions v JOIN materials m ON m.id = v.material_id"
-                               " WHERE v.id = ? AND m.project_id = ? AND v.is_current = 1", (version, project_id)).fetchone()
-            if row is not None:
-                looked_up[row[0]] = version
         for name, sha256, kind in stored:
             replaced = None
             if body.material_id is not None:
@@ -211,19 +207,41 @@ async def add_files(project_id: str, body: Upload, request: Request):
                 _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0])
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
             looked_up[material] = version
-        lookup_run = None
-        if body.look_up and looked_up and not locked:  # a review-locked project never looks identifiers up
+        lookup_run = None  # a review-locked project never looks identifiers up
+        if not locked and body.batch is not None:  # the drop's batch, if it is still open
+            lookup_run = _add_to_batch(conn, project_id, body.batch, looked_up, body.more)
+        if not locked and lookup_run is None and looked_up:
             lookup_run = next(ids)
             used.append(lookup_run)
             origin = {"conversation_id": body.conversation_id} if body.conversation_id else None
+            inputs = {"material_ids": list(looked_up), "versions": looked_up, "origin": origin,
+                      **({"open": True, "touched": time.time()} if body.more else {})}
             conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
-                         " 'lookup', ?)", (lookup_run, project_id, json.dumps({"material_ids": list(looked_up),
-                                                                                "versions": looked_up, "origin": origin})))
+                         " 'lookup', ?)", (lookup_run, project_id, json.dumps(inputs)))
         conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
         return {"materials": added, "lookup_run_id": lookup_run}, used
 
     # The runs start with the commit (record_background): none is ever running in the record and not held.
     return await harness.record_background(len(stored) + 1, record)
+
+
+def _add_to_batch(conn, project_id, run_id, looked_up, more):
+    """Add a drop's next versions to its open batch, the lookup run its earlier requests recorded,
+    and close it unless more of the drop follows; the run's id, or None when it is no open batch of
+    this project (closed meanwhile: these versions then get a lookup of their own)."""
+    row = conn.execute("SELECT inputs FROM runs WHERE id = ? AND project_id = ? AND workflow = 'lookup'"
+                       " AND status = 'running' AND cancel_reason IS NULL", (run_id, project_id)).fetchone()
+    inputs = json.loads(row[0]) if row and row[0] else {}
+    if not inputs.get("open"):
+        return None
+    inputs["material_ids"] += [m for m in looked_up if m not in inputs["material_ids"]]
+    inputs["versions"].update(looked_up)
+    if more:
+        inputs["touched"] = time.time()
+    else:
+        del inputs["open"], inputs["touched"]
+    conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(inputs), run_id))
+    return run_id
 
 
 async def _to_end(awaitable):
@@ -411,6 +429,22 @@ async def _look_up(harness, active, project_id, inputs, pace):
     async def write(fn):
         return await asyncio.to_thread(db.write, fn)
 
+    def close_if_idle(conn):  # in its transaction, so an addition that comes meanwhile keeps it open
+        row = conn.execute("SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
+        now = json.loads(row[0]) if row and row[0] else {}
+        if now.get("open") and time.time() - now.get("touched", 0) > BATCH_IDLE_SECONDS:
+            del now["open"], now["touched"]
+            conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(now), run_id))
+        return now
+
+    # A drop still being sent: its batch closes with its last request, or once it has had no addition
+    # for BATCH_IDLE_SECONDS (its window closed, or the app restarted), and is then looked up as one.
+    while inputs.get("open"):
+        await asyncio.sleep(WAIT_SECONDS)
+        inputs = await read(lambda conn: json.loads((conn.execute(
+            "SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone() or ["{}"])[0] or "{}"))
+        if inputs.get("open") and time.time() - inputs.get("touched", 0) > BATCH_IDLE_SECONDS:
+            inputs = await write(close_if_idle)
     materials, versions = inputs.get("material_ids") or [], inputs.get("versions") or {}
     started = time.monotonic()
     while await read(lambda conn: [run for (run,) in conn.execute(  # the versions it is for are read first, only those

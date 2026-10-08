@@ -216,7 +216,7 @@ test('every lookup outcome a paper\'s details name has its text in both catalogs
   }
 });
 
-test('a drop sent in several requests is one batch: the last names the papers the others added, looked up once', async () => {
+test('a drop sent in several requests is one batch: the first opens it, the next add to it, the last closes it', async () => {
   const MiB = 1024 * 1024;
   const realFetch = globalThis.fetch;
   const realReader = globalThis.FileReader;
@@ -226,30 +226,29 @@ test('a drop sent in several requests is one batch: the last names the papers th
     }
   };
   const sent = [];
-  globalThis.fetch = async (path, init) => {
+  globalThis.fetch = async (path, init) => { // the backend: the first request's lookup run is the batch
     const body = JSON.parse(init.body);
-    sent.push({ path, size: init.body.length, body: { ...body, files: body.files.map((f) => f.name) } });
+    sent.push({ size: init.body.length, body: { ...body, files: body.files.map((f) => f.name) } });
     const n = sent.length;
     const materials = body.files.map((f, i) => ({ id: `m${n}${i}`, existing: false, version_id: `v${n}${i}`, run_id: `r${n}${i}` }));
-    return new Response(JSON.stringify({ materials, lookup_run_id: body.look_up === false ? null : `lookup${n}` }), { status: 201 });
+    return new Response(JSON.stringify({ materials, lookup_run_id: body.batch ?? 'lookup1' }), { status: 201 });
   };
   try {
     const part = new Uint8Array(MiB);
     const file = (name) => new File(Array.from({ length: 60 }, () => part), name); // 60 MiB each
     const added = await addFiles('p1', [file('a.pdf'), file('b.pdf')]);
     assert.deepEqual(sent.map((r) => r.body), [
-      { files: ['a.pdf'], look_up: false }, // recorded, their lookup left to the drop's end
-      { files: ['b.pdf'], look_up: false },
-      { files: [], batch: ['v10', 'v20'] }]); // which looks up both: one question in a Local only project
+      { files: ['a.pdf'], more: true }, // opens the drop's batch: its lookup waits for the rest
+      { files: ['b.pdf'], batch: 'lookup1' }]); // adds to it and closes it: one question in a Local only project
     assert.ok(sent.every((r) => r.size <= REQUEST_FILE_BYTES + 64 * 1024)); // each under the backend's limit
     assert.deepEqual(added.materials.map((m) => m.id), ['m10', 'm20']);
-    assert.equal(added.lookup_run_id, 'lookup3');
+    assert.equal(added.lookup_run_id, 'lookup1');
 
-    // A drop of 45 files: three requests of files, then one naming all 45 for their one lookup.
+    // A drop of 45 files: three requests, one batch.
     sent.length = 0;
     const many = await addFiles('p1', Array.from({ length: 45 }, (_, i) => new File([`# Paper ${i}`], `${i}.md`)));
-    assert.deepEqual(sent.map((r) => [r.body.files.length, r.body.look_up, r.body.batch?.length]),
-      [[20, false, undefined], [20, false, undefined], [5, false, undefined], [0, undefined, 45]]);
+    assert.deepEqual(sent.map((r) => [r.body.files.length, r.body.batch, r.body.more]),
+      [[20, undefined, true], [20, 'lookup1', true], [5, 'lookup1', undefined]]);
     assert.equal(many.materials.length, 45);
   } finally {
     globalThis.fetch = realFetch;
