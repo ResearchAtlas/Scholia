@@ -15,7 +15,7 @@ import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
-import { ACCEPT, libraryChanged } from '../library.js';
+import { ACCEPT, libraryChanged, newest, readAsks } from '../library.js';
 import { addTo } from './Library.jsx';
 import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
@@ -25,23 +25,20 @@ const POLL_MS = 1000; // between reads while a turn is settling, and after a fai
 const ASKS_MS = 1500; // between reads of this conversation's questions, while files attached here are looked up
 
 // The questions raised by work started in this conversation, read again while that work goes on.
+// Only the newest read's answer is shown, and a change of conversation clears what was shown.
 function useConversationAsks(conversationId, watching) {
   const [asks, setAsks] = useState([]);
   const [working, setWorking] = useState(false); // work started here still runs
   const [reads, setReads] = useState(0);
-  const load = useCallback(async () => {
-    if (!conversationId) return;
-    try {
-      const found = await get(`/api/asks?conversation_id=${encodeURIComponent(conversationId)}`);
+  const [asked] = useState(newest);
+  const load = useCallback(() => readAsks(asked, conversationId, (found) => {
+    if (found) {
       setAsks(found.asks);
       setWorking(found.working > 0);
-    } catch {
-      // read again at the next turn
-    } finally {
-      setReads((n) => n + 1);
     }
-  }, [conversationId]);
-  useEffect(() => { load(); }, [load]);
+    setReads((n) => n + 1);
+  }), [conversationId, asked]);
+  useEffect(() => { setAsks([]); setWorking(false); load(); }, [load]);
   useEffect(() => {
     if (!watching && !working && !asks.length) return undefined;
     const timer = setTimeout(load, ASKS_MS);

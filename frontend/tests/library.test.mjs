@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -254,5 +254,26 @@ test('a drop sent in several requests is one batch: the last names the papers th
   } finally {
     globalThis.fetch = realFetch;
     globalThis.FileReader = realReader;
+  }
+});
+
+test('a conversation\'s questions read before a switch to another conversation never show in the new one', async () => {
+  const realFetch = globalThis.fetch;
+  const answers = {};
+  globalThis.fetch = (path) => new Promise((resolve) => { answers[new URL(path, 'http://x').searchParams.get('conversation_id')] =
+    (asks) => resolve(new Response(JSON.stringify({ asks, working: asks.length }), { status: 200 })); });
+  try {
+    const asked = newest(); // the conversation's reads, as useConversationAsks makes them
+    const shown = [];
+    const first = readAsks(asked, 'c1', (found) => shown.push(found)); // the first conversation's read, slow
+    const second = readAsks(asked, 'c2', (found) => shown.push(found)); // after the switch
+    await new Promise((r) => setTimeout(r, 0));
+    answers.c2([{ ask_id: 'a2' }]);
+    await second;
+    answers.c1([{ ask_id: 'a1' }]); // the first conversation's question answers late
+    await first;
+    assert.deepEqual(shown.map((found) => found?.asks.map((a) => a.ask_id)), [['a2']]); // only the second's
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });

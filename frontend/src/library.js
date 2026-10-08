@@ -234,6 +234,21 @@ export function newest() {
   };
 }
 
+// One read of a conversation's open questions (ConversationView's useConversationAsks): show(found)
+// gets its answer, or null when the read failed, only while it is the newest read asked (newest()),
+// so an answer for a conversation left since, or overtaken by a later read, never shows there.
+export async function readAsks(asked, conversationId, show) {
+  const current = asked();
+  if (!conversationId) return;
+  let found = null;
+  try {
+    found = await get(`/api/asks?conversation_id=${encodeURIComponent(conversationId)}`);
+  } catch {
+    // read again at the next turn
+  }
+  if (current()) show(found);
+}
+
 // Every passage of a version, read a page of the API at a time.
 export async function loadPassages(versionId) {
   const all = [];
