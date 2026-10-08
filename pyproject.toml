@@ -20,6 +20,8 @@ dependencies = [
     "apsw>=3.53.4.0,<3.54",
     "pyobjc-framework-vision>=12.1,<12.2 ; sys_platform == 'darwin'",
     "pyzipper>=0.4.0,<0.5",
+    "pypdfium2>=5.14,<6",
+    "pylatexenc>=2.11,<3",
 ]
 
 [project.optional-dependencies]
