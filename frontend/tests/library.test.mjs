@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, unionRect } from '../src/library.js';
+  typeKey, viewOf, pointing, unionRect, refreshed } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -126,4 +126,15 @@ test('a passage is reached by Tab and highlighted on focus as on hover, once on 
   props.onMouseLeave();
   assert.deepEqual(pointed, ['p1', null, 'p1', null]);
   assert.deepEqual(unionRect([[0.1, 0.2, 0.8, 0.22], [0.12, 0.23, 0.5, 0.25]]), [0.1, 0.2, 0.8, 0.25]);
+});
+
+test('details a lookup saves while one field is edited fill the form, and a save sends only that field', () => {
+  const shown = detailsOf({ title: 'paper', csl: {} }); // the form opened before the lookup
+  const form = { ...shown, venue: 'My Own Venue' }; // the researcher types a venue
+  const saved = detailsOf({ title: 'A Resolved Title', csl: { author: [{ literal: 'Ana Example' }],
+    issued: { 'date-parts': [[2024]] }, 'container-title': 'Journal of Synthetic Studies', DOI: '10.5555/x' } });
+  const merged = refreshed(shown, form, saved);
+  assert.deepEqual(merged, { ...saved, venue: 'My Own Venue' });
+  assert.deepEqual(changes(saved, merged), { venue: 'My Own Venue' }); // not the stale blanks of the other fields
+  assert.deepEqual(refreshed(shown, shown, saved), saved); // nothing edited: all of what was saved
 });

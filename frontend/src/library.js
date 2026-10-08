@@ -107,6 +107,13 @@ export function changes(before, after) {
   return body;
 }
 
+// The edit form once the saved details changed (a lookup, or this form's own save): the newly saved
+// values, but each field the researcher changed since the form last took the saved ones kept as
+// typed. Only those then differ from what is saved, so a save sends only them.
+export function refreshed(shown, form, saved) {
+  return Object.fromEntries(Object.keys(saved).map((name) => [name, form[name] !== shown[name] ? form[name] : saved[name]]));
+}
+
 // A year the form may send: empty, or a whole number from 1000 to 2200 (the backend's range).
 export function validYear(text) {
   const year = text.trim();
