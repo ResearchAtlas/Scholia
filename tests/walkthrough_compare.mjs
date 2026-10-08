@@ -145,6 +145,7 @@ function normalize(key, value) {
   return v;
 }
 function sameColor(x, y) {
+  if (typeof x !== 'string' || typeof y !== 'string') return false;  // a value only one run recorded differs
   const parse = (v) => (v.match(/[\d.]+/g) ?? []).map(Number);
   const [a, b] = [parse(x), parse(y)];
   return a.length === b.length && a.every((n, i) => Math.abs(n - b[i]) <= (i === 3 ? 0.01 : 1.01));
