@@ -14,6 +14,7 @@ import { AuditLog, PrivateAllowlist, ProjectProtection } from './Governance.jsx'
 import { Providers } from './Providers.jsx';
 import { BackupsSection } from './Backups.jsx';
 import { ProjectExportSection } from './ProjectExport.jsx';
+import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
@@ -50,7 +51,8 @@ export function Settings({ open, onOpenChange, health, project, onLanguage, onPr
           {open && page === 'general' && <General onLanguage={onLanguage} projectId={project?.id} />}
           {open && page === 'providers' && <Providers />}
           {open && page === 'subagents' && <Subagents />}
-          {open && page === 'project' && project && <ThisProject project={project} onProjectChanged={onProjectChanged} />}
+          {open && page === 'project' && project && <ThisProject project={project} onProjectChanged={onProjectChanged}
+            onOpenAdvanced={() => setPage('advanced')} />}
           {open && page === 'advanced' && <Advanced health={health} project={project} />}
         </div>
       </DialogContent>
@@ -261,7 +263,7 @@ function Subagents() {
   );
 }
 
-function ThisProject({ project, onProjectChanged }) {
+function ThisProject({ project, onProjectChanged, onOpenAdvanced }) {
   const t = useT();
   const own = useSettingsFile(project.id);
   const personal = useSettingsFile();
@@ -294,6 +296,7 @@ function ThisProject({ project, onProjectChanged }) {
       )}
       {general ? <p className="text-sm text-muted-foreground">{t('protection.generalNote')}</p>
         : <ProjectProtection project={project} onProjectChanged={onProjectChanged} />}
+      {project.sensitivity === 'local_only' && <LocalOnlySearchNote onOpenAdvanced={onOpenAdvanced} />}
       <div className="grid gap-5 sm:grid-cols-2">
         <Field label={t('project.venue')} htmlFor="project-venue" hint={t('project.venueHint')}>
           <CommitField id="project-venue" value={project.target_venue} allowEmpty placeholder={t('project.venuePlaceholder')}
@@ -383,6 +386,7 @@ function Advanced({ health, project }) {
         <LimitFields file={personal} onProblem={setProblem} prefix="limit" />
       </Section>
       <Section title={t('settings.localServers')} hint={t('settings.localServersHint')} />
+      <LocalHelperSection />
       <PrivateAllowlist />
       <AuditLog project={project} />
       <BackgroundRuns />

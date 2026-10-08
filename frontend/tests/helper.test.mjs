@@ -1,0 +1,63 @@
+// The local model helper's status as the interface reads it (src/helper.js), and the catalog
+// entries the section and the consent screen name.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import en from '../src/i18n/en.json' with { type: 'json' };
+import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
+import { downloading, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress, SOURCES }
+  from '../src/helper.js';
+
+test('the consent screen selects ModelScope once Hugging Face could not be reached, else the last choice', () => {
+  assert.equal(preferredSource({ model_source: null, recommended_source: null }), 'huggingface');
+  assert.equal(preferredSource({ model_source: 'modelscope', recommended_source: null }), 'modelscope');
+  assert.equal(preferredSource({ model_source: 'huggingface', recommended_source: 'modelscope' }), 'modelscope');
+  assert.equal(preferredSource(null), 'huggingface');
+});
+
+test('a download shows how far it has come', () => {
+  assert.equal(progress({ received: 0, total: 0 }), 0);
+  assert.equal(progress({ received: 50, total: 200 }), 0.25);
+  assert.equal(progress({ received: 300, total: 200 }), 1);
+  assert.equal(progress(null), 0);
+  assert.equal(downloading({ download: { state: 'running' } }), true);
+  assert.equal(downloading({ download: { state: 'cancelled' } }), false);
+});
+
+test('search says why it is keyword-only, with an entry for every reason', () => {
+  assert.equal(keywordOnlyReason({ search: { mode: 'hybrid', reason: null } }), null);
+  assert.equal(keywordOnlyReason({ search: { mode: 'keyword_only', reason: 'model_missing' } }), 'helper.reason.model_missing');
+  assert.equal(keywordOnlyReason({ search: { mode: 'keyword_only', reason: 'something new' } }), 'helper.reason.other');
+  for (const reason of ['model_missing', 'model_changed', 'binary_missing', 'binary_changed', 'start_timeout',
+    'start_failed', 'crashed', 'unhealthy', 'helper_failed', 'other']) {
+    for (const catalog of [en, zhCN]) assert.ok(Object.hasOwn(catalog, `helper.reason.${reason}`), reason);
+  }
+});
+
+test('every state, source and failure the backend reports has its words in both catalogs', () => {
+  const keys = [
+    ...['stopped', 'starting', 'running', 'restarting', 'failed'].map((state) => `helper.state.${state}`),
+    ...SOURCES.map((source) => `helper.source.${source}`),
+    ...['source_unreachable', 'source_refused', 'size_mismatch', 'hash_mismatch', 'redirect_refused', 'download_refused',
+      'download_interrupted', 'disk_full', 'write_failed', 'closing', 'invalid_path', 'file_not_found', 'not_a_file',
+      'file_unreadable', 'import_failed', 'local_only_no_download', 'already_installed', 'download_running',
+      'unknown_model', 'unknown_source', 'no_download'].map((code) => `errors.${code}`),
+  ];
+  for (const key of keys) {
+    assert.ok(Object.hasOwn(en, key), key);
+    assert.ok(Object.hasOwn(zhCN, key), key);
+  }
+});
+
+test('the status is read often only while something is under way', () => {
+  assert.equal(pollDelay({ download: { state: 'running' }, helper: { state: 'stopped' } }), 1000);
+  assert.equal(pollDelay({ download: null, helper: { state: 'starting' } }), 1000);
+  assert.equal(pollDelay({ download: { state: 'done' }, helper: { state: 'running' } }), 4000);
+  assert.equal(pollDelay(null), 4000);
+});
+
+test('the model file picker is the window bridge, where there is one', () => {
+  assert.equal(modelFilePicker({}), null);
+  assert.equal(modelFilePicker({ pywebview: { api: { choose_folder: () => 'x' } } }), null);
+  const pick = modelFilePicker({ pywebview: { api: { choose_model_file: () => '/m.gguf' } } });
+  assert.equal(pick(), '/m.gguf');
+});
