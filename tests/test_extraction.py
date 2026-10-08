@@ -99,6 +99,16 @@ def test_a_page_renders_as_a_valid_png():
         extraction.render_page(synthetic.paper_pdf(), 3)
 
 
+@pytest.mark.parametrize("size", [(14_400, 14_400), (14_400, 3)])
+def test_a_huge_declared_page_renders_within_the_pixel_bound(size):
+    small = synthetic.pdf([[(72, 72, 10, "A small file that declares a huge page")]], size=size)
+    assert len(small) < 4096  # unbounded, its page would need about 1.4 GB at the viewer's scale
+    image = extraction.render_page(small, 1, scale=3.0)
+    width, height = struct.unpack(">II", image[16:24])
+    assert width * height <= extraction.MAX_PAGE_PIXELS
+    assert abs(width / height - size[0] / size[1]) / (size[0] / size[1]) < 0.4  # its shape kept (a sliver rounds up)
+
+
 # DOCX, HTML, Markdown and LaTeX
 
 

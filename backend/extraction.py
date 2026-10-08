@@ -23,6 +23,7 @@ libraries it drives are kept from logging it.
 
 import io
 import logging
+import math
 import re
 import struct
 import threading
@@ -50,6 +51,7 @@ EXTENSIONS = {".pdf": PDF, ".docx": DOCX, ".html": HTML, ".htm": HTML, ".xhtml":
 EXTRACTORS = {PDF: ("pdf", "pdf-1"), DOCX: ("docx", "docx-1"), HTML: ("html", "html-1"),
               MARKDOWN: ("markdown", "markdown-1"), LATEX: ("latex", "latex-1")}
 PDFIUM = threading.Lock()
+MAX_PAGE_PIXELS = 8 * 1024 * 1024  # a rendered page image's pixels: a letter page at scale 3 has 4.4 million
 
 # pylatexenc logs what it parses: a tolerated parse error with the source around it (INFO), an
 # unknown node whole (WARNING), each node (DEBUG). Its loggers never write, at any level. The other
@@ -477,8 +479,9 @@ def _han(char):
 
 
 def render_page(data, number, scale=2.0):
-    """Page number (from 1) of a PDF as a PNG image, rendered by pdfium in memory. Raises
-    IndexError for a page it does not have, Unreadable for a file it cannot open."""
+    """Page number (from 1) of a PDF as a PNG image, rendered by pdfium in memory, at scale or less:
+    never more than MAX_PAGE_PIXELS, however large the page says it is. Raises IndexError for a page
+    it does not have, Unreadable for a file it cannot open or a page with no area."""
     import pypdfium2 as pdfium
 
     with PDFIUM:
@@ -491,6 +494,12 @@ def render_page(data, number, scale=2.0):
                 raise IndexError(number)
             page = document[number - 1]
             try:
+                width, height = page.get_size()
+                if not (width > 0 and height > 0):
+                    raise Unreadable()
+                scale = min(scale, math.sqrt(MAX_PAGE_PIXELS / (width * height)))
+                while math.ceil(width * scale) * math.ceil(height * scale) > MAX_PAGE_PIXELS:  # pypdfium2 rounds up
+                    scale *= 0.99
                 bitmap = page.render(scale=scale, rev_byteorder=True)
                 width, height, stride, channels = bitmap.width, bitmap.height, bitmap.stride, bitmap.n_channels
                 pixels = bytes(bitmap.buffer)
