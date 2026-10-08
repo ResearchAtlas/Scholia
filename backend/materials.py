@@ -326,7 +326,7 @@ async def _look_up(harness, active, project_id, inputs, pace):
     approved = False
     if level == "local_only":
         approved = await _approval(read, write, run_id, project_id, inputs, distinct)
-    resolved = 0
+    resolved, missed = 0, []
     async with harness.gate.async_client(project_id, approved=approved,
                                          admit=lambda conn: may_dispatch(conn, run_id)) as client:
         for done, (scheme, value) in enumerate(distinct, start=1):
@@ -343,7 +343,10 @@ async def _look_up(harness, active, project_id, inputs, pace):
                                                                               value, found, outcome)):
                 break
             resolved += found is not None
+            missed += [outcome] if outcome in ("unavailable", "refused") else []
             active.progress = {"done": done, "total": len(distinct)}
+    if missed:  # a source gave no answer (or could not be asked): the run failed, and Retry asks again
+        raise RunOutcome("failed", "unavailable" if "unavailable" in missed else "refused")
     return {"identifiers": len(distinct), "resolved": resolved}, None
 
 

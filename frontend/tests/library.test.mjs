@@ -89,7 +89,8 @@ test('a run is followed until it ends, and its outcome named', async () => {
 test('the reasons a run ends with have their texts in both catalogs', () => {
   for (const code of ['unsupported_file', 'file_too_large', 'not_retryable', 'not_a_pdf', 'file_missing', 'unreadable_file',
     'encrypted_file', 'time_limit', 'title_needed', 'invalid_doi', 'ask_closed', 'ask_invalid', 'invalid_answer',
-    'lookup_locked', 'declined', 'project_changed', 'closing', 'disk_full', 'write_failed', 'passphrase_required']) {
+    'lookup_locked', 'declined', 'project_changed', 'closing', 'disk_full', 'write_failed', 'passphrase_required', 'unavailable',
+    'refused']) {
     assert.ok(`errors.${code}` in en && `errors.${code}` in zh, code);
   }
 });

@@ -213,11 +213,30 @@ async def test_a_failed_lookup_leaves_the_material_imported_with_incomplete_meta
     mock.answers = {"api.openalex.org": [503, 503, 503], "api.crossref.org": [500, 500, 500]}
     async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
         project = await project_of(client)
-        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
         [paper] = await settled(client, project)
         assert paper["state"] == "ready" and paper["title"] == "paper" and paper["checked_by"] is None
         assert paper["lookup"]["outcome"] == "unavailable" and paper["retraction"] == "unknown"
         assert mock.hosts == ["api.openalex.org"] * 3 + ["api.crossref.org"] * 3  # each retried twice, no more
+        # The run failed with its reason, so Retry is offered, and taken once the services answer again.
+        run = await run_finished(client, result["lookup_run_id"])
+        assert (run["status"], run["result"], run["retryable"]) == ("failed", {"reason": "unavailable"}, True)
+        mock.openalex[DOI] = openalex_work(DOI, TITLE)
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert again.status_code == 201
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert paper["title"] == TITLE and paper["checked_by"] == "lookup"
+
+
+async def test_an_identifier_no_service_knows_is_a_finished_lookup_not_a_failed_one(tmp_path):
+    async with started(tmp_path / "data") as client:  # neither stand-in holds a record for it
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "not_found" and paper["checked_by"] is None
+        run = await run_finished(client, result["lookup_run_id"])
+        assert (run["status"], run["retryable"]) == ("succeeded", False)
 
 
 async def test_a_rate_limited_request_is_retried_and_resolves(tmp_path):
