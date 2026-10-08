@@ -757,7 +757,7 @@ async def get_passage(passage_id: str, request: Request):
                              (row[9], row[1] + 1)).fetchone()
         materials = [(m, p, v) for m, p, v, kind, extractor in conn.execute(
             f"SELECT m.id, m.project_id, v.id, {_VERSION_TYPE}, e.extractor FROM extractions e JOIN material_versions v"
-            " ON v.file_sha256 = e.file_sha256 JOIN content_files c ON c.sha256 = v.file_sha256"
+            " ON v.file_sha256 = e.file_sha256 AND v.is_current = 1 JOIN content_files c ON c.sha256 = v.file_sha256"
             " JOIN materials m ON m.id = v.material_id WHERE e.id = ? ORDER BY m.created_at", (row[9],))
             if extraction.EXTRACTORS.get(kind, (None,))[0] == extractor]  # versions read by this extractor
         return {**_passage(row[:9]), "selector": {"type": "TextQuoteSelector", "exact": row[5],

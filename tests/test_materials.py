@@ -327,6 +327,21 @@ async def test_a_replaced_file_is_a_new_version_read_again(tmp_path):
         assert too_many.json()["code"] == "invalid_request"
 
 
+async def test_a_passage_names_only_the_papers_whose_current_file_it_comes_from(tmp_path):
+    async with started(tmp_path / "data") as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        [paper] = (await added(client, first, PDF))["materials"]
+        [ready] = await settled(client, first)
+        [elsewhere] = (await added(client, second, PDF))["materials"]  # the same file, its reading shared
+        [passage, *_] = (await client.get(f"/api/material-versions/{ready['version']['id']}/passages")).json()["passages"]
+        owners = (await client.get(f"/api/passages/{passage['id']}")).json()["materials"]
+        assert {o["id"] for o in owners} == {paper["id"], elsewhere["id"]}
+        await added(client, first, ("paper-v2.md", synthetic.paper_markdown()), material_id=paper["id"])
+        await settled(client, first)
+        owners = (await client.get(f"/api/passages/{passage['id']}")).json()["materials"]
+        assert [(o["id"], o["project_id"]) for o in owners] == [(elsewhere["id"], second)]  # not the replaced one
+
+
 @pytest.mark.parametrize("files, code", [
     ([("notes.txt", b"plain text")], "unsupported_file"),
     ([("fake.pdf", b"not a pdf at all")], "unsupported_file"),
