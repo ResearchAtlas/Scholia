@@ -1,6 +1,6 @@
 """Serves the app for interface work and rendered walkthroughs, never with real data.
 
-    uv run python tests/walkthrough.py [--port N] [--dev]
+    uv run python tests/walkthrough.py [--port N] [--dev] [--request-log FILE]
 
 The backend runs on a new temporary data folder, with an in-memory credential store
 (never the Keychain) and a test-owned provider that answers with synthetic text, behind
@@ -8,11 +8,15 @@ the test network block (network_guard.py), so this process reaches nothing but i
 listener. It serves the built interface (frontend/dist) and prints the window's address
 with this launch's session. --dev serves no interface and admits the Vite server on
 127.0.0.1:5173 instead (`npm run dev` in frontend/), with no session, on port 8765, where
-that server sends API requests. Without --port, a free port is used.
+that server sends API requests. Without --port, a free port is used. --request-log appends
+each request the test-owned provider receives to FILE, one JSON line each.
+
+tests/walkthrough_driver.mjs drives the rendered walkthrough against this server.
 """
 
 import argparse
 import asyncio
+import json
 import secrets
 import socket
 import sys
@@ -21,6 +25,12 @@ from pathlib import Path
 
 sys.path[:0] = [str(Path(__file__).parent), str(Path(__file__).parents[1])]
 import network_guard  # noqa: E402
+
+# pycryptodomex learns the CPU architecture once, through platform.architecture(), which runs
+# the local `file` command; the network block refuses every subprocess, so encrypted backups
+# and exports (pyzipper) would fail under it. Loading it first runs that one local command
+# before the block starts.
+from Cryptodome.Hash import SHA1  # noqa: E402, F401
 
 network_guard.start()
 
@@ -56,7 +66,14 @@ CATALOG += [{"id": "example/long-context-mini", "name": "Long Context Mini", "co
 
 
 class SyntheticProvider(MockProvider):
+    log = None  # the --request-log file
+
     async def __call__(self, request):
+        if self.log is not None:
+            body = json.loads(request.content) if request.content else {}
+            with open(self.log, "a", encoding="utf-8") as out:
+                out.write(json.dumps({"method": request.method, "host": request.url.host, "path": request.url.path,
+                                      "model": body.get("model") if isinstance(body, dict) else None}) + "\n")
         if request.url.path.endswith("/models"):
             return httpx.Response(200, json={"data": CATALOG})
         return await super().__call__(request)
@@ -73,11 +90,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--port", type=int)
     parser.add_argument("--dev", action="store_true")
+    parser.add_argument("--request-log", type=Path)
     args = parser.parse_args(argv)
 
     provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]])  # half have zero retention
     provider.replies = [synthetic] * 1000
     provider.title_replies = [synthetic] * 1000
+    provider.log = args.request_log
     data_dir = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-"))
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

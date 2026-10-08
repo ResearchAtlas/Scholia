@@ -136,7 +136,7 @@ function ProviderCard({ provider, table, save, onChanged }) {
   }
 
   return (
-    <article className="rounded-xl border bg-card p-4 shadow-sm">
+    <article className="rounded-xl border bg-card p-4 shadow-xs">
       <header className="flex flex-wrap items-center gap-3">
         <div className="min-w-0 flex-1">
           <h4 className="text-sm font-semibold">{openrouter ? t('providers.openrouter') : provider.name}</h4>
@@ -247,7 +247,7 @@ function Picker({ provider, picked, save }) {
           <label htmlFor={`pick-${provider.name}`} className="sr-only">{t('providers.search')}</label>
           <input id={`pick-${provider.name}`} value={query} onChange={(event) => setQuery(event.target.value)}
             placeholder={t('providers.search')}
-            className="h-9 w-full rounded-t-lg bg-transparent pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring" />
+            className="h-9 w-full rounded-t-lg bg-transparent pl-9 pr-3 text-sm outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring" />
         </div>
         <ul className="scroll-thin max-h-56 overflow-y-auto py-1">
           {shown.map((m) => (

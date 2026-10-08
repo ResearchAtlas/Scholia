@@ -30,3 +30,4 @@ The rendered interface is reviewed and iterated against these criteria:
 - **Content:** synthetic or open-access only, in English and Chinese, with long titles.
 - **Sizes and modes:** the three-column layout, the drawer layout below 1,000 px, light and dark.
 - **How:** `uv run python tests/walkthrough.py` serves the built interface on a temporary data folder, with an in-memory credential store and a test-owned provider, behind the test network block. Screenshots come from that process only.
+- **Driver:** `node tests/walkthrough_driver.mjs` builds the interface, starts that server, checks it serves the build, and drives the flows by the interface's own labels in each language, theme and layout, reading saved records back through the API; `tests/walkthrough_compare.mjs` compares two runs pixel by pixel and their sampled animations.
