@@ -11,8 +11,9 @@ A request that fails validation writes nothing; the same file added again to the
 reports the paper it already is.
 
 An `extract` run reads its version's file (backend/extraction.py) within EXTRACTION_SECONDS and
-writes the extraction, its passages and the index queue's `add` rows for its project in its
-terminal transaction, so a partial extraction is never written and a revoked one writes nothing.
+writes the extraction, its passages and the index queue's `add` rows in its terminal transaction,
+for its project and every other project whose current version it now reads (each once), so a
+partial extraction is never written and a revoked one writes nothing.
 Extractions are shared by file and extractor version; a run that finds one written meanwhile uses it.
 Each version is read as the type its file was detected as when it was added (its media_type), so
 the same bytes added as Markdown and as LaTeX are two extractions of one stored file.
@@ -211,7 +212,16 @@ async def _to_end(awaitable):
 
 def _queue_adds(conn, extraction_id, project_id):
     """Queue the extraction's passages for the project's search index (S1-17 applies the queue;
-    adding a passage the project's index holds already changes nothing there)."""
+    adding a passage the project's index holds already changes nothing there), unless the project's
+    last queued operation for them is already an add, so no reading queues them twice. They are
+    queued and removed (backend/db/deletion.py) a whole extraction at a time, so its first passage
+    stands for all of them."""
+    first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1",
+                         (extraction_id,)).fetchone()
+    last = first and conn.execute("SELECT op FROM index_queue WHERE target = 'passage' AND target_id = ?"
+                                  " AND project_id = ? ORDER BY seq DESC LIMIT 1", (first[0], project_id)).fetchone()
+    if first is None or (last is not None and last[0] == "add"):
+        return
     conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
                  " SELECT 'passage', id, ?, 'add' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
                  (project_id, extraction_id))
@@ -299,11 +309,12 @@ def _store(conn, version_id, sha256, extracted, look_up):
             [(new_id(), extraction_id, ordinal, p.page, json.dumps(p.section_path), p.kind, p.text, p.char_start,
               p.char_end, json.dumps(p.boxes) if p.boxes else None) for ordinal, p in enumerate(extracted.passages)])
     _queue_adds(conn, extraction_id, found[0])
-    _looked_up_unread(conn, sha256, extracted.extractor, look_up)
+    _serve(conn, sha256, extracted.extractor, extraction_id, look_up)
 
 
-def _looked_up_unread(conn, sha256, extractor, look_up):
-    """A reading of the file just committed: each current version it reads whose latest lookup
+def _serve(conn, sha256, extractor, extraction_id, look_up):
+    """A reading of the file just committed: every current version it reads, in any project, has its
+    passages queued for that project's index (once, see _queue_adds), and each whose latest lookup
     recorded not_read (it concluded before any reading of its file had) gets a lookup now, as at
     import: a Local only project's asks first, a review-locked project's gets none. A lookup made
     for that version since, or one that has still to read its identifiers, covers it."""
@@ -311,7 +322,10 @@ def _looked_up_unread(conn, sha256, extractor, look_up):
             f"SELECT m.id, v.id, {_VERSION_TYPE}, m.project_id, p.review_lock FROM material_versions v"
             " JOIN content_files c ON c.sha256 = v.file_sha256 JOIN materials m ON m.id = v.material_id"
             " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
-        if locked or extraction.EXTRACTORS.get(kind, (None,))[0] != extractor:
+        if extraction.EXTRACTORS.get(kind, (None,))[0] != extractor:
+            continue
+        _queue_adds(conn, extraction_id, project)
+        if locked:
             continue
         latest = conn.execute("SELECT r.id FROM runs r, json_each(r.inputs, '$.versions') j WHERE r.workflow = 'lookup'"
                               " AND j.key = ? AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material, version)).fetchone()
@@ -346,7 +360,7 @@ async def _look_up(harness, active, project_id, inputs, pace):
     def take(conn):
         """Each version's identifier, and the outcome of those that give none, in one transaction: a
         version with no reading committed is not_read, never no_identifier, so a reading that commits
-        later sees it (_looked_up_unread) and this run can be tried again."""
+        later sees it (_serve) and this run can be tried again."""
         if not _running(conn, run_id) or _revoked(conn, run_id):
             return None
         found = _identifiers(conn, project_id, materials, versions)
@@ -907,7 +921,7 @@ async def retry_run(run_id: str, request: Request):
     """Read a version again, or look a batch up again, after a run that failed, was stopped or was
     interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again.
     A version read again whose lookup concluded unread gets a lookup once the reading commits
-    (_looked_up_unread)."""
+    (_serve)."""
     state = _state(request)
 
     def again(conn, ids):

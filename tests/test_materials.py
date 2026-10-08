@@ -285,6 +285,24 @@ async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_wi
             [(first, count), (second, count)])
 
 
+async def test_two_projects_reading_the_same_file_at_once_queue_each_passage_once_for_each(tmp_path, monkeypatch):
+    reached, go = hold_extraction(monkeypatch)
+    async with started(tmp_path / "data") as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        [one] = (await added(client, first, PDF))["materials"]
+        [two] = (await added(client, second, PDF))["materials"]  # neither read yet: each its own reading
+        assert one["run_id"] and two["run_id"]
+        await asyncio.to_thread(reached.wait, 10)
+        go.set()
+        for run in (one["run_id"], two["run_id"]):
+            assert (await run_finished(client, run))["status"] == "succeeded"
+        assert await rows(client, "SELECT count(*) FROM extractions") == [(1,)]  # the second shares the first's
+        (passages,) = (await rows(client, "SELECT count(*) FROM passages"))[0]
+        assert await rows(client, "SELECT project_id, count(*), count(DISTINCT target_id) FROM index_queue"
+                                  " WHERE op = 'add' GROUP BY project_id ORDER BY project_id") == sorted(
+            [(first, passages, passages), (second, passages, passages)])
+
+
 async def test_the_same_bytes_added_as_another_type_are_read_as_that_type(tmp_path):
     source = b"\\section{Method}\n\nText with \\emph{emphasis} here.\n"  # Markdown and LaTeX alike
     async with started(tmp_path / "data") as client:

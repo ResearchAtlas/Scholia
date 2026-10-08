@@ -347,6 +347,11 @@ async def test_another_projects_reading_of_the_file_brings_the_lookup_a_stopped_
         assert (shared["state"], shared["title"], shared["lookup"]["outcome"]) == ("ready", TITLE, "resolved")
         assert shared["lookup"]["run_id"] not in (result["lookup_run_id"], theirs["lookup_run_id"])
         assert [p["title"] for p in await settled(client, second)] == [TITLE]
+        # Its passages reach both projects' search index, each once.
+        (passages,) = (await rows(client, "SELECT count(*) FROM passages"))[0]
+        queued = await rows(client, "SELECT project_id, count(*), count(DISTINCT target_id) FROM index_queue"
+                                    " WHERE op = 'add' GROUP BY project_id ORDER BY project_id")
+        assert passages and queued == sorted([(first, passages, passages), (second, passages, passages)])
 
 
 async def test_a_reading_tried_again_while_its_batchs_lookup_still_waits_is_looked_up_once(tmp_path, monkeypatch):
