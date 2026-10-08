@@ -1,7 +1,7 @@
 """Backups, restore and project export: the API under Settings, then Advanced.
 
 Automatic backups (backend.db.database) are taken at launch, while the app is idle
-(once a day, checked every IDLE_CHECK_SECONDS when no run is active), and before a
+(once a day, checked every IDLE_CHECK_SECONDS when no run is at work), and before a
 bulk deletion (backup_before_deletion). purge() takes them out of deleted data's way.
 Full backups and project exports are zip files in a folder the researcher chose,
 written by background runs (`register`): the request checks what it can and answers with the
@@ -234,12 +234,23 @@ router = APIRouter(lifespan=lifespan, route_class=_Route)
 
 
 async def _idle_backups(state):
-    """While the app stays open, take the day's backup at a check that finds no run active."""
+    """While the app stays open, take the day's backup at a check that finds no run at work. A run
+    waiting on its question (a Local only lookup's confirmation) is not at work: it writes nothing
+    while it waits, and an unanswered question would otherwise hold the backup off for as long as
+    the app stays open."""
     while True:
         await asyncio.sleep(IDLE_CHECK_SECONDS)
         async with state["backups_lock"]:
             db, harness = state.get("db"), state.get("harness")
-            if db is None or harness is None or harness.registry.runs:
+            if db is None or harness is None:
+                continue
+            held = set(harness.registry.runs)
+            try:
+                asking = await asyncio.to_thread(db.read, lambda conn: {run for (run,) in conn.execute(
+                    "SELECT id FROM runs WHERE status = 'running' AND waiting = 'ask'")}) if held else set()
+            except Exception:  # the next check reads again
+                continue
+            if held - asking:
                 continue
             try:
                 await asyncio.to_thread(db.backup_if_due)
