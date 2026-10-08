@@ -11,8 +11,8 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, del, get, post } from '../api.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { downloadOffered, downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress,
-  SOURCES } from '../helper.js';
+import { downloadOffered, downloadOutcome, downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay,
+  preferredSource, progress, SOURCES } from '../helper.js';
 import { useAction } from '../action.js';
 import { LoadState, Problem, Section, Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -59,7 +59,7 @@ export function LocalHelperSection({ project }) {
         <>
           <Problem code={problem} />
           <div className="divide-y rounded-lg border">
-            <ModelRow model={model} status={status} />
+            <ModelRow model={model} status={status} offered={offered} />
             {downloading(status) && (
               <DownloadProgress status={status} busy={cancelling.busy} onCancel={async () => {
                 const data = await cancelling.run(() => del('/api/helper/models/download'));
@@ -107,11 +107,11 @@ function needsModel(status) {
   return !status.models[0].installed || status.search?.reason === 'model_changed';
 }
 
-function ModelRow({ model, status }) {
+function ModelRow({ model, status, offered }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const download = status.download;
-  const failed = download && ['failed', 'cancelled'].includes(download.state) && needsModel(status);
+  const outcome = needsModel(status) ? downloadOutcome(download, offered) : null;
   return (
     <div className="grid gap-2 px-3 py-3 text-sm">
       <div className="flex items-start gap-3">
@@ -127,9 +127,9 @@ function ModelRow({ model, status }) {
           {t(needsModel(status) ? (model.installed ? 'helper.modelChanged' : 'helper.notInstalled') : 'helper.installed')}
         </span>
       </div>
-      {failed && (
+      {outcome && (
         <p role="alert" className={cn('text-sm', download.state === 'failed' ? 'text-destructive' : 'text-muted-foreground')}>
-          {download.state === 'cancelled' ? t('helper.downloadCancelled') : errorText(t, download.problem)}
+          {outcome.startsWith('errors.') ? errorText(t, download.problem) : t(outcome)}
         </p>
       )}
     </div>

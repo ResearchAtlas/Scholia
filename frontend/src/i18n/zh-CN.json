@@ -280,6 +280,7 @@
   "helper.installed": "已安装",
   "helper.modelChanged": "需要重新安装",
   "helper.downloadCancelled": "下载已取消，没有安装任何文件。",
+  "helper.downloadEndedImport": "上一次下载没有安装搜索模型。请改为导入模型文件。",
   "helper.downloading": "正在从 {source} 下载",
   "helper.downloaded": "{done} / {total}",
   "helper.cancelDownload": "取消下载",

@@ -282,6 +282,7 @@
   "helper.installed": "Installed",
   "helper.modelChanged": "Needs replacing",
   "helper.downloadCancelled": "The download was cancelled. Nothing was installed.",
+  "helper.downloadEndedImport": "The last download did not install the search model. Import the model file instead.",
   "helper.downloading": "Downloading from {source}",
   "helper.downloaded": "{done} of {total}",
   "helper.cancelDownload": "Cancel download",

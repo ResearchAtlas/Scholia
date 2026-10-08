@@ -4,8 +4,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
-import { downloadOffered, downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress,
-  SOURCES } from '../src/helper.js';
+import { downloadOffered, downloadOutcome, downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay,
+  preferredSource, progress, SOURCES } from '../src/helper.js';
 
 test('the consent screen selects ModelScope once Hugging Face could not be reached, else the last choice', () => {
   assert.equal(preferredSource({ model_source: null, recommended_source: null }), 'huggingface');
@@ -57,6 +57,31 @@ test('where no download is offered, a missing or changed model is to be imported
     assert.match(zhCN[key], /导入/, key);
     assert.doesNotMatch(zhCN[key], /下载/, key);
   }
+});
+
+// Every code a download can end with (backend/local_helper.py Local._download).
+const DOWNLOAD_FAILURES = ['source_unreachable', 'source_refused', 'size_mismatch', 'hash_mismatch', 'redirect_refused',
+  'download_refused', 'download_interrupted', 'disk_full', 'write_failed', 'closing', 'database_unavailable',
+  'notice_missing', 'download_failed'];
+
+test('a download that ended without installing the model gives its own advice only where downloads are offered', () => {
+  for (const code of DOWNLOAD_FAILURES) {
+    const failed = { state: 'failed', problem: code };
+    assert.equal(downloadOutcome(failed), `errors.${code}`, code);
+    assert.equal(downloadOutcome(failed, true), `errors.${code}`, code);
+    assert.equal(downloadOutcome(failed, false), 'helper.downloadEndedImport', code);
+  }
+  assert.equal(downloadOutcome({ state: 'cancelled', problem: null }, true), 'helper.downloadCancelled');
+  assert.equal(downloadOutcome({ state: 'cancelled', problem: null }, false), 'helper.downloadEndedImport');
+  for (const download of [null, undefined, { state: 'running' }, { state: 'done' }]) {
+    assert.equal(downloadOutcome(download, true), null);
+    assert.equal(downloadOutcome(download, false), null);
+  }
+  // The one line for every outcome there: that the model is not installed, and the import; never a download.
+  assert.match(en['helper.downloadEndedImport'], /did not install.*Import the model file/);
+  assert.doesNotMatch(en['helper.downloadEndedImport'], /try|again|other source|download it/i);
+  assert.match(zhCN['helper.downloadEndedImport'], /没有安装.*导入模型文件/);
+  assert.doesNotMatch(zhCN['helper.downloadEndedImport'], /再试|重试|另一个来源|重新下载/);
 });
 
 test('the Local only note points to the import under Settings, Advanced, never to a download or an install', () => {

@@ -23,6 +23,16 @@ export const downloading = (status) => status?.download?.state === 'running';
 // General project among them, or none offers it. Downloads are app-wide either way.
 export const downloadOffered = (project) => project?.sensitivity !== 'local_only';
 
+// What the section says of the last download once it ended without installing the model (failed or
+// cancelled), as a catalog key, or null. Downloads are app-wide, so one that ended in another project
+// is still shown; where no download is offered, any outcome says only that it did not install the
+// model and points to the import: no "try again", no other source.
+export function downloadOutcome(download, offered = true) {
+  if (!['failed', 'cancelled'].includes(download?.state)) return null;
+  if (!offered) return 'helper.downloadEndedImport';
+  return download.state === 'cancelled' ? 'helper.downloadCancelled' : `errors.${download.problem}`;
+}
+
 // Why search is keyword-only, as a catalog key, or null when it can use the search model. Where no
 // download is offered, a missing or changed model's advice names the import only.
 const REASONS = new Set(['model_missing', 'model_changed', 'binary_missing', 'binary_changed', 'start_timeout',
