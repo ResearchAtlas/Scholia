@@ -11,7 +11,7 @@ import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, byPage, changes, detailsOf, isPdf, libraryChanged, loadPassages, pageImage, pointing, rectStyle,
-  reasonKey, refreshed, unionRect, validYear, viewOf } from '../library.js';
+  reasonKey, takeSaved, unionRect, validYear, viewOf } from '../library.js';
 import { addTo, Byline, Facts, Progress, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -85,8 +85,7 @@ function Details({ material, onSaved }) {
   const shown = useRef(before); // the saved details the form last took
   const key = `${material.id}:${material.updated_at}`;
   useEffect(() => { // newly saved details (a lookup, or this form's save) fill the form, but for the fields being edited
-    setForm((current) => refreshed(shown.current, current, before));
-    shown.current = before;
+    takeSaved(shown, before, setForm);
   }, [key]); // only when the saved details change
   const body = changes(before, form);
   const invalid = !visible(form.title) || !validYear(form.year);

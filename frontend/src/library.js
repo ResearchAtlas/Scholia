@@ -114,6 +114,15 @@ export function refreshed(shown, form, saved) {
   return Object.fromEntries(Object.keys(saved).map((name) => [name, form[name] !== shown[name] ? form[name] : saved[name]]));
 }
 
+// The form's effect once the saved details changed. The saved details it last took are read here,
+// before the update is queued: React may run the update later, when shown.current already holds
+// the new ones, and then every field left as it was would look edited and stay stale.
+export function takeSaved(shown, saved, setForm) {
+  const before = shown.current;
+  shown.current = saved;
+  setForm((form) => refreshed(before, form, saved));
+}
+
 // A year the form may send: empty, or a whole number from 1000 to 2200 (the backend's range).
 export function validYear(text) {
   const year = text.trim();

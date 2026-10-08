@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, unionRect, refreshed } from '../src/library.js';
+  typeKey, viewOf, pointing, unionRect, refreshed, takeSaved } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -137,4 +137,20 @@ test('details a lookup saves while one field is edited fill the form, and a save
   assert.deepEqual(merged, { ...saved, venue: 'My Own Venue' });
   assert.deepEqual(changes(saved, merged), { venue: 'My Own Venue' }); // not the stale blanks of the other fields
   assert.deepEqual(refreshed(shown, shown, saved), saved); // nothing edited: all of what was saved
+});
+
+test('the form takes newly saved details against the ones it last took, however late React runs the update', () => {
+  const blank = detailsOf({ title: 'paper', csl: {} });
+  const looked = detailsOf({ title: 'A Resolved Title', csl: { 'container-title': 'Journal of Synthetic Studies',
+    DOI: '10.5555/x' } });
+  const corrected = { ...looked, venue: 'Journal of Synthetic Studies, Second Series' }; // a later save elsewhere
+  const shown = { current: blank }; // the ref of the saved details the form last took
+  const queued = []; // React queues the updates, to run them at its next render
+  const later = (update) => queued.push(update);
+  takeSaved(shown, looked, later); // a lookup saved its details
+  takeSaved(shown, corrected, later); // and a save came before React ran the first update
+  assert.deepEqual(shown.current, corrected); // the ref moved on before either update ran
+  const form = queued.reduce((current, update) => update(current), { ...blank, title: 'My Own Title' });
+  assert.deepEqual(form, { ...corrected, title: 'My Own Title' }); // the blanks were not edits: they take what was saved
+  assert.deepEqual(changes(corrected, form), { title: 'My Own Title' }); // a save sends only the field typed
 });

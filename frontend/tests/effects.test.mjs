@@ -1,7 +1,8 @@
 // Effects survive React's StrictMode, which runs each effect's setup, cleanup and setup again: a
 // cleanup that sets a ref's flag (shown.current = false) must have its setup set it as well, or
-// the flag stays as the cleanup left it while the component is still shown. Parsed with ESLint's
-// parser, over every component and module.
+// the flag stays as the cleanup left it while the component is still shown. And a state update
+// passed as a function never reads a ref: React may run it after the call, when the ref holds
+// something newer. Parsed with ESLint's parser, over every component and module.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -58,18 +59,40 @@ const cleanupRestored = {
   }),
 };
 
+// The setters of useState in a file, and every function passed to one: none reads a ref's current.
+const updaterReadsNoRef = {
+  create: (context) => {
+    const setters = new Set();
+    return {
+      VariableDeclarator(node) {
+        if (node.id.type === 'ArrayPattern' && node.init?.type === 'CallExpression' && node.init.callee.name === 'useState'
+          && node.id.elements[1]?.type === 'Identifier') setters.add(node.id.elements[1].name);
+      },
+      CallExpression(call) {
+        const update = call.arguments[0];
+        if (!setters.has(call.callee.name) || !isFunction(update)) return;
+        walk(update.body, (node) => {
+          if (node.type === 'MemberExpression' && !node.computed && node.property.name === 'current') {
+            context.report({ node, message: `the update passed to ${call.callee.name} reads a ref's current` });
+          }
+        }, true);
+      },
+    };
+  },
+};
+
 const CONFIG = [{
   files: ['**/*.js', '**/*.jsx'],
   languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } },
-  plugins: { effects: { rules: { 'cleanup-restored': cleanupRestored } } },
-  rules: { 'effects/cleanup-restored': 'error' },
+  plugins: { effects: { rules: { 'cleanup-restored': cleanupRestored, 'updater-reads-no-ref': updaterReadsNoRef } } },
+  rules: { 'effects/cleanup-restored': 'error', 'effects/updater-reads-no-ref': 'error' },
 }];
 
 function problems(source, file = 'sample.jsx') {
   return new Linter().verify(source, CONFIG, file).map((m) => `${basename(file)}:${m.line} ${m.message}`);
 }
 
-test('no effect leaves a flag as its cleanup set it, under StrictMode', () => {
+test('no effect leaves a flag as its cleanup set it, under StrictMode, and no update reads a ref', () => {
   const files = readdirSync(SRC, { recursive: true }).filter((name) => /\.jsx?$/.test(name)).map((name) => join(SRC, name));
   assert.deepEqual(files.flatMap((file) => problems(readFileSync(file, 'utf8'), file)), []);
 });
@@ -82,4 +105,16 @@ test('the check finds a cleanup-only flag and accepts one its setup sets', () =>
   assert.deepEqual(problems(good), []);
   const counter = 'function A() { useEffect(() => { load(); return () => { latest.current += 1; }; }, []); }';
   assert.deepEqual(problems(counter), []); // a counter moved on by the cleanup is no flag
+});
+
+test('the check finds an update that reads a ref and accepts one given the value read before it', () => {
+  const bad = 'function A() { const [form, setForm] = useState({}); const shown = useRef({});\n'
+    + ' useEffect(() => { setForm((current) => merge(shown.current, current)); shown.current = next; }, [key]); }';
+  assert.deepEqual(problems(bad), ["sample.jsx:2 the update passed to setForm reads a ref's current"]);
+  const good = 'function A() { const [form, setForm] = useState({}); const shown = useRef({});\n'
+    + ' useEffect(() => { const before = shown.current; shown.current = next;\n'
+    + ' setForm((current) => merge(before, current)); }, [key]); }';
+  assert.deepEqual(problems(good), []);
+  const timer = 'function A() { const latest = useRef(0); setTimeout(() => latest.current, 10); }';
+  assert.deepEqual(problems(timer), []); // only the state setters of useState
 });
