@@ -326,7 +326,8 @@ async function m1(ctx) {
 
 // The S1-16 flows: the local model helper under Advanced, the model consent screen and its Cancel, a
 // Local only project's note and Advanced reached from it (the import, no download), a download from a
-// Normal project with its progress and its Cancel, and an import, in 9 screenshots. The search model
+// Normal project with its progress and its Cancel, that cancelled download as the Local only project's
+// Advanced reports it (no download advice), and an import there, in 10 screenshots. The search model
 // is the server's synthetic file, from its test-owned download source.
 async function s116(ctx) {
   const { page, L, P, C, step, check, get } = ctx;
@@ -437,11 +438,26 @@ async function s116(ctx) {
       && downloads().map((r) => r.host).join() === 'modelscope.cn,cdn-lfs-cn-1.modelscope.cn');
   });
 
-  await step('22-import', async () => {
+  // Downloads are app-wide, so Advanced from the Local only project still reports the cancelled one:
+  // as the import-only line, with no download advice. The import then runs there, as its note points.
+  await step('22-local-only-outcome', async () => {
+    await page.keyboard.press('Escape'); await dialog().waitFor({ state: 'hidden' });
+    await switchTo(C.localProject);
+    await openSettings('settings.page.advanced'); await showHelper();
+    await dialog().getByText(L('helper.downloadEndedImport'), { exact: true }).waitFor();
+    const read = await status();
+    check('the cancelled download is still the last one', read.download?.state === 'cancelled' && !read.models[0].installed);
+    check('Advanced from the Local only project reports it with the import only, and offers no download',
+      await dialog().getByText(L('helper.downloadCancelled'), { exact: true }).count() === 0
+      && await offer().count() === 0 && await consent().count() === 0
+      && await dialog().getByRole('button', { name: L('helper.import'), exact: true }).isEnabled());
+  });
+
+  await step('23-import', async () => {
     await dialog().getByRole('button', { name: L('helper.import'), exact: true }).click();
     await dialog().getByRole('textbox', { name: L('helper.importLabel') }).fill(C.modelFile);
   });
-  await step('23-imported', async () => {
+  await step('24-imported', async () => {
     await dialog().getByRole('button', { name: L('helper.importConfirm'), exact: true }).click();
     await dialog().getByText(L('helper.installed'), { exact: true }).waitFor();
     await dialog().getByText(L('helper.searchHybrid')).waitFor();
