@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -189,4 +189,22 @@ test('a slow read of the first project that answers after the switch to another 
   answerFirst('the first project\'s papers');
   await first;
   assert.equal(shown, 'the second project\'s papers');
+});
+
+test('a selection is sent in as few requests as fit the backend\'s body limit, each under it', () => {
+  const MiB = 1024 * 1024;
+  const file = (name, size) => ({ name, size });
+  const small = [file('a.pdf', 2 * MiB), file('b.md', 1000), file('c.docx', 5 * MiB)];
+  assert.deepEqual(requestsOf(small).map((g) => g.map((f) => f.name)), [['a.pdf', 'b.md', 'c.docx']]); // one batch
+  const large = [file('a.pdf', 60 * MiB), file('b.pdf', 60 * MiB), file('c.md', 1000), file('d.pdf', MAX_FILE_BYTES)];
+  const groups = requestsOf(large);
+  assert.deepEqual(groups.map((g) => g.map((f) => f.name)), [['a.pdf'], ['b.pdf', 'c.md'], ['d.pdf']]);
+  for (const group of groups) assert.ok(group.reduce((sum, f) => sum + Math.ceil(f.size / 3) * 4, 0) <= REQUEST_FILE_BYTES);
+  // backend/local_guard.py MAX_BODY: one largest file in base64 and 64 KiB for the JSON around it
+  assert.equal(REQUEST_FILE_BYTES + 64 * 1024, (100 * MiB + 2 - ((100 * MiB + 2) % 3)) / 3 * 4 + 64 * 1024);
+  assert.equal(requestsOf(Array.from({ length: 25 }, (_, i) => file(`${i}.md`, 10))).map((g) => g.length).join(), '20,5');
+});
+
+test('a request over the body limit has its text in both catalogs', () => {
+  assert.ok('errors.request_too_large' in en && 'errors.request_too_large' in zh);
 });

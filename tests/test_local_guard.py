@@ -124,6 +124,35 @@ async def test_a_refused_request_never_reaches_a_route(tmp_path):
         client.app.app = original
 
 
+async def test_a_body_over_the_limit_or_of_unknown_length_is_refused_before_anything_reads_it(tmp_path):
+    from backend import local_guard
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+        path, reached, original = f"/api/projects/{project}/materials", [], client.app.app
+
+        async def recording(scope, receive, send):
+            reached.append(scope["path"])
+            return await original(scope, receive, send)
+
+        client.app.app = recording
+        over = str(local_guard.MAX_BODY + 1).encode()  # said by its Content-Length, before any of it is read
+        status, body = await raw(client.app, "POST", path, headers(SAME, JSON, (b"content-length", over)), b"")
+        assert (status, body["code"]) == (413, "request_too_large")
+        status, body = await raw(client.app, "POST", path, headers(SAME, JSON, (b"transfer-encoding", b"chunked")), b"{}")
+        assert (status, body["code"]) == (411, "length_required")  # a length not known before it is read
+        assert reached == []  # no route parsed either
+        client.app.app = original
+        assert (await client.get(f"/api/projects/{project}/materials")).json()["materials"] == []
+
+
+def test_the_body_limit_admits_one_file_of_the_largest_size_and_no_more():
+    from backend import extraction, local_guard
+    encoded = (extraction.MAX_FILE_BYTES + 2) // 3 * 4  # its bytes in base64
+    around = json.dumps({"files": [{"name": "\u0001" * 255, "data": ""}], "conversation_id": "x" * 100,
+                         "material_id": "x" * 100})  # its name escaped character by character, the longest ids
+    assert encoded + len(around) <= local_guard.MAX_BODY < 2 * encoded
+
+
 async def test_a_closed_connection_mid_turn_cancels_it_over_real_loopback_tcp(tmp_path):
     """A real server and a real socket: the client disconnects while the model call waits."""
     provider = MockProvider()

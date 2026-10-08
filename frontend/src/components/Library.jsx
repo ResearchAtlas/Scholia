@@ -64,7 +64,9 @@ export async function addTo(projectId, fileList, t, notify, options) {
     return null;
   }
   try {
-    return await addFiles(projectId, kept, options);
+    const result = await addFiles(projectId, kept, options);
+    if (result.problem) notify(errorText(t, result.problem)); // some were added before it failed
+    return result;
   } catch (error) {
     notify(errorText(t, error instanceof ApiError ? error.code : 'internal'));
     return null;

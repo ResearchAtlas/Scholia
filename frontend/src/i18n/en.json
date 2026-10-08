@@ -233,6 +233,7 @@
   "errors.not_continuable": "Only the latest stopped or interrupted answer can be continued.",
   "errors.unsupported_file": "Scholia reads PDF, Word (DOCX), HTML, Markdown and LaTeX files.",
   "errors.file_too_large": "That file is larger than Scholia reads (100 MB).",
+  "errors.request_too_large": "That is more than Scholia takes in one request: one file of up to 100 MB at a time.",
   "errors.not_retryable": "This can no longer be tried again.",
   "errors.not_a_pdf": "Only a PDF has page images.",
   "errors.file_missing": "The stored file is missing or damaged. Add the file again.",

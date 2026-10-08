@@ -1,11 +1,15 @@
 // The Library (slice-1 spec S7, F3a) as the interface reads and sends it: which files Scholia reads,
 // how a paper's state and reason are named, its details as the edit form holds them, and where a
 // passage's boxes sit on its page image (backend/materials.py, backend/extraction.py).
-import { get, getBlob, post } from './api.js';
+import { ApiError, get, getBlob, post } from './api.js';
 
 export const ACCEPT = '.pdf,.docx,.html,.htm,.xhtml,.md,.markdown,.tex,.latex';
 const SUPPORTED = new Set(ACCEPT.split(','));
 export const MAX_FILES = 20; // per request (backend/materials.py MAX_FILES)
+export const MAX_FILE_BYTES = 100 * 1024 * 1024; // per file (backend/extraction.py MAX_FILE_BYTES)
+// The files' base64 a request may carry: one largest file (backend/local_guard.py MAX_BODY adds 64 KiB
+// for the JSON around it).
+export const REQUEST_FILE_BYTES = Math.ceil(MAX_FILE_BYTES / 3) * 4;
 
 // Whether Scholia reads a file of this name: PDF, DOCX, HTML, Markdown or LaTeX source.
 export function supported(name) {
@@ -29,13 +33,45 @@ export function readFile(file) {
   });
 }
 
+// The files in their order, in requests the backend takes: as many to a request as fit in
+// REQUEST_FILE_BYTES of base64 (and MAX_FILES), so a selection that fits is one request, one batch.
+export function requestsOf(files) {
+  const groups = [];
+  let size = Infinity;
+  for (const file of files) {
+    const encoded = Math.ceil(file.size / 3) * 4;
+    if (size + encoded > REQUEST_FILE_BYTES || groups.at(-1).length >= MAX_FILES) {
+      groups.push([]);
+      size = 0;
+    }
+    groups.at(-1).push(file);
+    size += encoded;
+  }
+  return groups;
+}
+
 // Adds files to a project: from a drop, Add files, or the conversation (conversationId), or as a
-// new version of a material (materialId). Resolves to the backend's answer.
+// new version of a material (materialId). A file larger than Scholia reads refuses the selection,
+// as the backend would; the rest go in as few requests as fit (requestsOf), read one request at a
+// time. Resolves to the backend's answers together; a request that fails once others were added
+// ends the sending, its error code in `problem`.
 export async function addFiles(projectId, files, { conversationId, materialId } = {}) {
-  const read = await Promise.all(files.map(readFile));
-  return post(`/api/projects/${encodeURIComponent(projectId)}/materials`, {
-    files: read, ...(conversationId ? { conversation_id: conversationId } : {}), ...(materialId ? { material_id: materialId } : {}),
-  });
+  if (files.some((file) => file.size > MAX_FILE_BYTES)) throw new ApiError(413, 'file_too_large');
+  const added = { materials: [], lookup_run_id: null };
+  for (const group of requestsOf(files)) {
+    try {
+      const answer = await post(`/api/projects/${encodeURIComponent(projectId)}/materials`, {
+        files: await Promise.all(group.map(readFile)), ...(conversationId ? { conversation_id: conversationId } : {}),
+        ...(materialId ? { material_id: materialId } : {}),
+      });
+      added.materials.push(...answer.materials);
+      added.lookup_run_id = answer.lookup_run_id ?? added.lookup_run_id;
+    } catch (error) {
+      if (!added.materials.length) throw error;
+      return { ...added, problem: error instanceof ApiError ? error.code : 'internal' };
+    }
+  }
+  return added;
 }
 
 // Tells the open Library that a project's papers changed (files added by a drop on the window).

@@ -231,6 +231,7 @@
   "errors.not_continuable": "只能继续最近一次被停止或中断的回答。",
   "errors.unsupported_file": "Scholia 可以读取 PDF、Word（DOCX）、HTML、Markdown 和 LaTeX 文件。",
   "errors.file_too_large": "该文件超过了 Scholia 可读取的大小（100 MB）。",
+  "errors.request_too_large": "这超出了 Scholia 单次请求可接收的大小：每次最多一个 100 MB 以内的文件。",
   "errors.not_retryable": "这一项已无法重试。",
   "errors.not_a_pdf": "只有 PDF 文件有页面图像。",
   "errors.file_missing": "已保存的文件丢失或已损坏。请重新添加该文件。",
