@@ -30,6 +30,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
+from backend import asks, materials
 from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
@@ -289,6 +290,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         kick false: nothing runs on its own (background runs) until the restore has committed."""
         gate = OutboundGate(db, lambda: providers.gate_inputs(data_dir), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
+        content = ContentStore(db)
+        # Local background work: reading materials and looking their identifiers up; full backups and exports.
+        materials.register(harness, content)
+        backups.register(harness, state)
         loop = asyncio.get_running_loop()
 
         def damaged():  # a backup's full check found it damaged: the app is limited, so its work stops too
@@ -300,7 +305,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         except BaseException:
             await harness.shutdown()
             raise
-        state.update(db=db, content=ContentStore(db), gate=gate, harness=harness)
+        state.update(db=db, content=content, gate=gate, harness=harness)
         state.pop("damaged", None)
         state.pop("damaged_code", None)
 
@@ -342,6 +347,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown
     app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
+    app.include_router(materials.router)  # materials, passages, page images and retries (S1-13)
+    app.include_router(asks.router)  # the shared confirmation (S1-13)
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)
@@ -1174,20 +1181,30 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         return result
 
     @app.get("/api/activity")
-    async def activity(limit: int = 50):
-        rows = await read(lambda conn: conn.execute(
-            "SELECT r.id, r.project_id, r.workflow, r.status, r.cancel_reason, r.settled_cost_usd, r.attempts,"
-            " r.started_at, r.finished_at, p.name, p.kind FROM runs r JOIN projects p ON p.id = r.project_id"
-            # Every running run, where it is cancelled, then the newest others up to the limit.
-            " WHERE r.kind = 'background' AND (r.status = 'running' OR r.id IN (SELECT id FROM runs"
-            " WHERE kind = 'background' AND status != 'running' ORDER BY started_at DESC LIMIT ?))"
-            " ORDER BY r.status = 'running' DESC, r.started_at DESC", (max(1, min(limit, 200)),)).fetchall())
+    async def activity(limit: int = 50, run_id: str | None = None):
+        """Background runs: every running one, then the newest others up to the limit (or one run).
+        Each with its live progress, its open ask, its result or reason, and whether Retry applies."""
+        def listing(conn):
+            rows = conn.execute(
+                "SELECT r.id, r.project_id, r.workflow, r.status, r.cancel_reason, r.settled_cost_usd, r.attempts,"
+                " r.started_at, r.finished_at, p.name, p.kind, r.summary, r.inputs FROM runs r"
+                " JOIN projects p ON p.id = r.project_id WHERE r.kind = 'background' AND (?2 IS NULL OR r.id = ?2)"
+                # Every running run, where it is cancelled, then the newest others up to the limit.
+                " AND (r.status = 'running' OR ?2 IS NOT NULL OR r.id IN (SELECT id FROM runs"
+                " WHERE kind = 'background' AND status != 'running' ORDER BY started_at DESC LIMIT ?1))"
+                " ORDER BY r.status = 'running' DESC, r.started_at DESC", (max(1, min(limit, 200)), run_id)).fetchall()
+            return [(row, materials.run_details(conn, row[0], row[2], row[3], row[12])) for row in rows]
+
+        listed = await read(listing)
         registry = harness().registry
         return {"runs": [{
-            "run_id": run_id, "project_id": project_id, "project_name": name, "project_kind": kind,
-            "workflow": workflow, "status": derived_status(status, run_id, registry), "cancel_reason": cancel,
+            "run_id": run, "project_id": project_id, "project_name": name, "project_kind": kind,
+            "workflow": workflow, "status": derived_status(status, run, registry), "cancel_reason": cancel,
             "cost_usd": cost, "attempts": attempts, "started_at": started, "finished_at": finished,
-        } for run_id, project_id, workflow, status, cancel, cost, attempts, started, finished, name, kind in rows]}
+            "result": json.loads(summary) if summary else None,
+            "progress": registry.runs[run].progress if run in registry.runs else None, **details,
+        } for (run, project_id, workflow, status, cancel, cost, attempts, started, finished, name, kind, summary, _),
+            details in listed]}
 
     # The interface: built files only, from inside their folder
 

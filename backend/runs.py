@@ -35,6 +35,15 @@ own transaction, before the call. On every start, including after a crash, a
 background run is finished from a recorded finished step with no model call, or
 restarted while it has made fewer than 2 attempts, or else marked interrupted.
 Its effects, terminal status and settled cost are written in one transaction.
+
+Local background work (reading a material, identifier lookups, full backups and project
+exports; the workflows registered in `Harness.workflows`) runs the same way without a model
+call: it starts again from its inputs after a restart, unless its handler finds what it needs
+held only in memory gone (a passphrase), and then ends interrupted. Blocking work runs in a
+thread to its end (`Harness.work`), stopping at its next check once cancellation is requested.
+Its progress is live only (`ActiveRun.progress`). Its effect, terminal status and summary are
+written in one transaction; a revocation, or a cancellation requested before that transaction,
+leaves no effect.
 """
 
 import asyncio
@@ -112,10 +121,11 @@ class ActiveRun:
     cancel_reason: str | None = None  # "researcher", "revoked" or "shutdown"
     events: asyncio.Queue = field(default_factory=asyncio.Queue)
     wanted: asyncio.Event = field(default_factory=asyncio.Event)  # the reader asked for the next event
-    context: dict | None = None  # what an admitted turn needs to run
+    context: dict | None = None  # what an admitted turn, or local work, needs to run; in memory only
     call: "_Call | None" = None  # the model call admitted last, until it is settled or released
     provider: str | None = None  # the provider its model calls go to
     closing: asyncio.Future | None = None  # the write that records a claim stopped before it started
+    progress: dict | None = None  # local work's progress, live only: {"done", "total"}
 
 
 class Registry:
@@ -183,6 +193,15 @@ class _Cancelled(Exception):
     """Raised inside a transaction to roll it back because cancellation was requested."""
 
 
+class RunOutcome(Exception):
+    """Ends local work otherwise than succeeded: status failed (reason, a stable code), cancelled
+    (cancel_reason limit, or researcher for an answer that declined it) or interrupted."""
+
+    def __init__(self, status, reason=None, cancel_reason=None):
+        super().__init__(reason or status)
+        self.status, self.reason, self.cancel_reason = status, reason, cancel_reason
+
+
 def _running(conn, run_id) -> bool:
     row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
     return row is not None and row[0] == "running"
@@ -238,6 +257,9 @@ class Harness:
         self.gate = gate
         self.keyring_backend = keyring_backend
         self.registry = Registry()
+        # Local background work by workflow: async handler(harness, active, project_id, inputs) ->
+        # (summary, effect), where effect(conn), if any, is applied in the run's terminal transaction.
+        self.workflows = {}
         self._tasks = set()  # detached tasks, kept referenced until they finish
         # Orders settings saves with the budget reads of call admission: a lowered budget either
         # lands before a call reads it or after that call was admitted.
@@ -842,6 +864,9 @@ class Harness:
             if cancel_reason == "revoked":  # revoked while it waited, or before a crash: no call, no effect
                 await self._write(lambda conn: self._finish_background(conn, active, "cancelled", None, inputs))
                 return
+            if workflow in self.workflows:
+                await self._local(active, project_id, workflow, inputs)
+                return
             inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
             recorded = await self._read(lambda conn: conn.execute(
                 "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished' ORDER BY seq DESC LIMIT 1",
@@ -940,6 +965,77 @@ class Harness:
                                   output=lambda result: _clean_title(result.content))
         return _clean_title(result.content) if result.ok else None
 
+    # Local background work
+
+    async def start_local(self, project_id, workflow, inputs, context=None) -> str:
+        """Admit local work as a background run of the project and start it; returns its id. context
+        is held in memory only (a passphrase): it is in the registry before the run's row exists, so
+        no other start of background runs can run it without it."""
+        run_id = new_id()
+        active = self.registry.add_background(run_id)
+        if active is None:
+            raise AdmissionError(503, "shutting_down", "The app is closing")
+        active.context = context
+        try:
+            await self._write(lambda conn: conn.execute(
+                "INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
+                (run_id, project_id, workflow, json.dumps(inputs))))
+        except BaseException:
+            self.registry.release(active)
+            raise
+        active.task = asyncio.create_task(self._background(active))
+        return run_id
+
+    async def work(self, active, fn):
+        """Run blocking fn in a worker thread to its end, whatever cancellations arrive meanwhile, so
+        nothing it does outlasts the run's record. fn should check active.cancel_requested and stop;
+        if it then raises, the run is cancelled. Its result is returned even when a cancellation
+        came after it was done."""
+        try:
+            result, _ = await _through(asyncio.to_thread(fn))
+        except Exception:
+            if active.cancel_requested.is_set():
+                raise asyncio.CancelledError() from None
+            raise
+        return result
+
+    async def _local(self, active, project_id, workflow, inputs):
+        try:
+            summary, effect = await self.workflows[workflow](self, active, project_id, inputs)
+            outcome = ("succeeded", None)
+        except RunOutcome as ended:
+            summary, effect, outcome = {"reason": ended.reason} if ended.reason else None, None, \
+                (ended.status, ended.cancel_reason)
+        except Exception as error:  # a defect: the run ends failed rather than starting again at each launch
+            log.error("local background work failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
+            summary, effect, outcome = {"reason": "internal"}, None, ("failed", None)
+        try:
+            await self._write(lambda conn: self._finish_local(conn, active, *outcome, summary, effect))
+        except RunOutcome as ended:  # its effect found it could not be applied: nothing of it was written
+            await self._write(lambda conn: self._finish_local(
+                conn, active, ended.status, ended.cancel_reason, {"reason": ended.reason} if ended.reason else None))
+
+    def _finish_local(self, conn, active, status, cancel_reason, summary, effect=None):
+        """Local work's effect, terminal status and summary, in one transaction. A revocation in the
+        record ends it cancelled; so does a cancellation requested before this transaction when it
+        has an effect to apply here, which is then left out. Work whose effect is already done (a
+        file written) keeps its outcome."""
+        run_id = active.run_id
+        if not _running(conn, run_id):
+            return
+        if _revoked(conn, run_id):
+            status, cancel_reason, effect = "cancelled", "revoked", None
+        elif effect is not None and active.cancel_requested.is_set() and active.cancel_reason != "shutdown":
+            status, cancel_reason, effect = "cancelled", "researcher", None
+        if status == "succeeded" and effect is not None:
+            effect(conn)  # may raise RunOutcome, which rolls this transaction back
+        reason = (summary or {}).get("reason") if status != "succeeded" else None
+        _event(conn, run_id, "run_finished", {"status": status, **({"reason": reason} if reason else {})})
+        conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, waiting = NULL, finished_at = ?, summary = ?,"
+                     " settled_cost_usd = ? WHERE id = ?",
+                     (status, cancel_reason, utc_now(), json.dumps(summary) if summary else None,
+                      spending.run_cost(conn, run_id), run_id))
+
     def _finish_background(self, conn, active, status, output, inputs, cancel_reason=None):
         """The run's effect, terminal status and settled cost, in one transaction. A cancel
         requested before this transaction checks for it wins, on every path: the run ends
@@ -959,7 +1055,8 @@ class Harness:
                 " updated_at = ? WHERE id = ? AND title_rev = ? AND coalesce(title_source, '') <> 'researcher'",
                 (output, utc_now(), inputs["conversation_id"], inputs["title_rev"]))
         _event(conn, run_id, "run_finished", {"status": status})
-        conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, finished_at = ?, settled_cost_usd = ? WHERE id = ?",
+        conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, waiting = NULL, finished_at = ?,"
+                     " settled_cost_usd = ? WHERE id = ?",
                      (status, cancel_reason, utc_now(), spending.run_cost(conn, run_id), run_id))
 
 

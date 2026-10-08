@@ -140,7 +140,12 @@ RULES = (
 # doomed rows as RULES do (for example a run whose context holds a deleted
 # material or memory record). Those runs, and the runs they started, are revoked
 # with the rest. The change that records such a link adds its query here.
-SCOPE_LINKS: tuple[str, ...] = ()
+SCOPE_LINKS: tuple[str, ...] = (
+    # A material's background work (reading it, looking up its identifier), which names the
+    # materials it works on in its inputs (backend/materials.py).
+    f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.material_ids') j
+    WHERE r.status = 'running' AND j.value IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
+)
 
 
 def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed=None):
