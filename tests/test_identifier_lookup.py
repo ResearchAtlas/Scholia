@@ -6,12 +6,14 @@ dispatch."""
 import asyncio
 import json
 
+import httpx
 import pytest
 
 import backend.lookup as lookup
 import backend.materials as materials_module
 import synthetic_materials as synthetic
-from scholia_app import MockProvider, MockScholarly, background_idle, crossref_work, openalex_work, run_finished, started
+from scholia_app import (MockProvider, MockScholarly, arxiv_feed, background_idle, crossref_work, openalex_work, run_finished,
+                         started)
 from test_materials import added, hold_extraction, listing, project_of, rows, settled
 
 pytestmark = pytest.mark.asyncio
@@ -260,9 +262,29 @@ async def test_pacing_spaces_one_sources_requests():
     loop = asyncio.get_running_loop()
     times = []
     for _ in range(3):
-        await pace.turn("arxiv")
-        times.append(loop.time())
+        async with pace.turn("arxiv"):
+            times.append(loop.time())
     assert all(b - a >= 0.14 for a, b in zip(times, times[1:]))
+
+
+async def test_a_sources_next_request_waits_for_a_slow_one_to_be_answered():
+    class SlowClient:  # each answer takes longer than the source's spacing
+        def __init__(self):
+            self.in_flight, self.most, self.paths = 0, 0, []
+
+        async def get(self, url, timeout, follow_redirects):
+            self.in_flight += 1
+            self.most = max(self.most, self.in_flight)
+            self.paths.append(url)
+            await asyncio.sleep(0.2)
+            self.in_flight -= 1
+            return httpx.Response(200, content=arxiv_feed("2401.00001", "A Synthetic Preprint"))
+
+    client, pace = SlowClient(), lookup.Pace()
+    lookup.SPACING["arxiv"] = 0.05  # shorter than an answer takes
+    found = await asyncio.gather(*(lookup.resolve(client, "arxiv", "2401.00001", pace) for _ in range(3)))
+    assert [f.source for f in found] == ["arxiv"] * 3 and len(client.paths) == 3
+    assert client.most == 1  # never two requests to arXiv at once, across lookups
 
 
 async def test_a_researchers_edit_is_kept_and_its_retraction_still_checked(tmp_path):

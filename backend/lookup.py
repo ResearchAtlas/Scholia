@@ -3,10 +3,11 @@
 `resolve(client, scheme, identifier, pace)` sends one identifier alone to an identifier endpoint
 and returns what it found: a DOI to OpenAlex, then to Crossref when OpenAlex has no record; an
 arXiv ID to export.arxiv.org. Each request is an anonymous single-record GET: no key, no contact
-address, no credentials (the outbound gate refuses any). Each source is paced (`SPACING`: arXiv
-asks for one request every 3 seconds) and a request that meets 429, a server error or a network
-failure is retried at most twice, after 1 and 4 seconds (a Retry-After within RETRY_AFTER_MAX
-instead), each within TIMEOUT seconds. The client is the outbound gate's, made for the project
+address, no credentials (the outbound gate refuses any). Each source is asked one request at a
+time across every lookup, held until its answer, and paced (`SPACING`: arXiv asks for one request
+every 3 seconds); a request that meets 429, a server error or a network failure is retried at
+most twice, after 1 and 4 seconds (a Retry-After within RETRY_AFTER_MAX instead), each within
+TIMEOUT seconds. The client is the outbound gate's, made for the project
 with its dispatch check, so a refusal (OutboundDenied) is final and is raised.
 
 A DOI resolved through OpenAlex or Crossref records whether the work is retracted (OpenAlex's
@@ -15,6 +16,7 @@ nothing on retraction. Nothing here logs an identifier or a response.
 """
 
 import asyncio
+import contextlib
 import json
 import time
 from dataclasses import dataclass
@@ -55,19 +57,21 @@ class Failed(Exception):
 
 
 class Pace:
-    """When each source may next be asked, shared by a harness's lookups."""
+    """Each source's turns, shared by a harness's lookups: one request at a time per source, held
+    from its start to its answer, each starting at least SPACING after the one before."""
 
     def __init__(self):
         self.next = {}
         self.locks = {}
 
+    @contextlib.asynccontextmanager
     async def turn(self, source):
-        lock = self.locks.setdefault(source, asyncio.Lock())
-        async with lock:
+        async with self.locks.setdefault(source, asyncio.Lock()):
             wait = self.next.get(source, 0.0) - time.monotonic()
             if wait > 0:
                 await asyncio.sleep(wait)
             self.next[source] = time.monotonic() + SPACING[source]
+            yield
 
 
 async def resolve(client, scheme, identifier, pace) -> Found:
@@ -83,14 +87,14 @@ async def resolve(client, scheme, identifier, pace) -> Found:
 async def _get(client, url, source, pace):
     """The body of a 200 answer, retried as the module says. Raises Failed or OutboundDenied."""
     for attempt in range(len(RETRIES) + 1):
-        await pace.turn(source)
         delay = RETRIES[attempt] if attempt < len(RETRIES) else None
-        try:
-            response = await client.get(url, timeout=TIMEOUT, follow_redirects=False)
-        except OutboundDenied:
-            raise
-        except httpx.HTTPError:
-            response = None
+        async with pace.turn(source):  # the source's one request in flight, to its whole answer
+            try:
+                response = await client.get(url, timeout=TIMEOUT, follow_redirects=False)
+            except OutboundDenied:
+                raise
+            except httpx.HTTPError:
+                response = None
         if response is not None:
             if response.status_code == 200:
                 if len(response.content) > MAX_BODY:
