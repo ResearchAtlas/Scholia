@@ -7,7 +7,6 @@ import { FilePlus2, FileText, TriangleAlert, Upload } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get } from '../api.js';
 import { errorText } from '../text.js';
-import { projectName } from '../projects.js';
 import { fileSize } from '../backups.js';
 import { ACCEPT, MAX_FILES, addFiles, authorNames, libraryEvents, reasonKey, sortFiles, stateKey, typeKey, unsettled,
   yearOf } from '../library.js';
@@ -111,7 +110,7 @@ export function Library({ project }) {
         {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         {adding && <p role="status" className="text-sm text-muted-foreground">{t('library.adding')}</p>}
         {(listing?.asks ?? []).map((ask) => (
-          <Ask key={ask.ask_id} ask={ask} projectName={projectName(t, project)} onAnswered={load} />
+          <Ask key={ask.ask_id} ask={ask} onAnswered={load} />
         ))}
         {listing === null && !problem && <p role="status" className="text-sm text-muted-foreground">{t('common.loading')}</p>}
         {listing && materials.length > 0 && (

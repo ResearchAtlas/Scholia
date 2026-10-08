@@ -488,7 +488,7 @@ function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
       {outcome && !outcome.ok && (
         <p className="text-xs text-muted-foreground">{outcome.code ? errorText(t, outcome.code) : t(outcome.key)}</p>
       )}
-      {run.ask && <Ask ask={run.ask} projectName={project} onAnswered={onChanged} />}
+      {run.ask && <Ask ask={run.ask} onAnswered={onChanged} />}
     </li>
   );
 }

@@ -8,7 +8,8 @@ and review lock). It takes one answer, only through `POST /api/runs/{id}/asks/{a
 as an `ask_answered` event and audited without content. It is invalid once its run has ended
 (cancelled, finished, revoked or deleted with its project) or the project's level or lock has
 changed since it was asked. The conversation, the Library panel and the background-run list all
-show the open asks this module lists, and answer them through the one endpoint.
+show the open asks this module lists, each naming its project, and answer them through the one
+endpoint.
 """
 
 import asyncio
@@ -119,20 +120,22 @@ def withdraw(conn, run_id, ask_id, reason):
 
 def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
     """The asks that can be answered now: of running runs waiting on them, under the policy they were
-    asked under; for a project, a conversation they were raised from, or a run."""
+    asked under; for a project, a conversation they were raised from, or a run. Each names its
+    project (project_name, project_kind), wherever it is shown."""
     rows = conn.execute(
-        "SELECT r.id, r.workflow FROM runs r WHERE r.status = 'running' AND r.waiting = 'ask'"
+        "SELECT r.id, r.workflow, p.name, p.kind FROM runs r JOIN projects p ON p.id = r.project_id"
+        " WHERE r.status = 'running' AND r.waiting = 'ask'"
         " AND r.cancel_reason IS NULL AND (?1 IS NULL OR r.project_id = ?1) AND (?2 IS NULL OR r.id = ?2)"
         " ORDER BY r.started_at", (project_id, run_id)).fetchall()
     found = []
-    for run, workflow in rows:
+    for run, workflow, project_name, project_kind in rows:
         ask, answered = asked(conn, run)
         if ask is None or answered is not None or _current_policy(conn, ask["project_id"]) != ask["policy"]:
             continue
         if conversation_id is not None and (ask.get("origin") or {}).get("conversation_id") != conversation_id:
             continue
-        found.append({"run_id": run, "workflow": workflow, **{key: ask[key] for key in (
-            "ask_id", "kind", "project_id", "options", "text_box", "params")}})
+        found.append({"run_id": run, "workflow": workflow, "project_name": project_name, "project_kind": project_kind,
+                      **{key: ask[key] for key in ("ask_id", "kind", "project_id", "options", "text_box", "params")}})
     return found
 
 

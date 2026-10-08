@@ -1,14 +1,16 @@
 // i18n: migrated
 // The shared confirmation (slice-1 spec section 6.2): a question, one to three options and a text
-// box unless its kind rules one out, naming its project and action. The conversation, the Library
-// panel and the background-run list all show it with this component, and answer it through the one
-// ask endpoint (backend/asks.py); an answer that is no longer possible says why.
+// box unless its kind rules one out, naming its project (from the ask itself, so wherever it is shown)
+// and action. The conversation, the Library panel and the background-run list all show it with this
+// component, and answer it through the one ask endpoint (backend/asks.py); an answer that is no
+// longer possible says why.
 import { useContext, useId, useState } from 'react';
 import { MessageCircleQuestion } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { post } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
+import { projectName } from '../projects.js';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 
@@ -18,7 +20,7 @@ function named(t, key, fallback) {
   return text === key ? fallback : text;
 }
 
-export function Ask({ ask, projectName, onAnswered }) {
+export function Ask({ ask, onAnswered }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const textId = useId();
@@ -43,7 +45,9 @@ export function Ask({ ask, projectName, onAnswered }) {
       <div className="flex gap-2.5">
         <MessageCircleQuestion className="mt-0.5 size-4 shrink-0 text-brand" aria-hidden="true" />
         <div className="grid min-w-0 gap-1">
-          {projectName && <p className="truncate text-xs text-muted-foreground">{t('ask.project', { name: projectName })}</p>}
+          <p className="truncate text-xs text-muted-foreground">
+            {t('ask.project', { name: projectName(t, { kind: ask.project_kind, name: ask.project_name }) })}
+          </p>
           <p className="font-medium leading-snug">{question}</p>
           {body && <p className="leading-relaxed text-muted-foreground">{body}</p>}
         </div>

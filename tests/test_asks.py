@@ -16,13 +16,13 @@ from test_materials import project_of, rows
 pytestmark = pytest.mark.asyncio
 
 
-async def asking(client, project, kind="choice", options=("yes", "no"), origin=None):
+async def asking(client, project, kind="choice", options=("yes", "no"), origin=None, workflow="test"):
     """A running background run of the project, waiting on an ask: (run id, ask id)."""
     run = new_id()
 
     def ask(conn):
-        conn.execute("INSERT INTO runs (id, project_id, kind, workflow) VALUES (?, ?, 'background', 'test')",
-                     (run, project))
+        conn.execute("INSERT INTO runs (id, project_id, kind, workflow) VALUES (?, ?, 'background', ?)",
+                     (run, project, workflow))
         return asks.raise_ask(conn, run, kind, list(options), {"n": 1}, origin)
 
     return run, await asyncio.to_thread(client.state["db"].write, ask)
@@ -112,11 +112,16 @@ async def test_asks_are_listed_where_their_work_started(tmp_path):
         project = await project_of(client)
         conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
         _, here = await asking(client, project, origin={"conversation_id": conversation})
-        _, library = await asking(client, project)
+        _, library = await asking(client, project, workflow="lookup")  # the background-run list shows its ask
         listed = (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"]
         assert [a["ask_id"] for a in listed] == [here]
         assert {a["ask_id"] for a in (await client.get("/api/asks", params={"project_id": project})).json()["asks"]} == {
             here, library}
+        # Wherever an ask is shown, it names its project: the conversation's, the Library's and the list's.
+        materials = (await client.get(f"/api/projects/{project}/materials")).json()["asks"]
+        runs = [r["ask"] for r in (await client.get("/api/activity")).json()["runs"] if r.get("ask")]
+        for shown in (listed, materials, runs):
+            assert shown and all((a["project_name"], a["project_kind"]) == ("Thesis", "research") for a in shown)
 
 
 async def test_an_ask_offers_one_to_three_options():
