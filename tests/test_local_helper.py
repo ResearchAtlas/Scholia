@@ -1308,6 +1308,13 @@ def test_the_model_source_setting_takes_only_the_two_mirrors(tmp_path):
     assert load_settings(tmp_path).values["helper"]["model_source"] == "modelscope"
 
 
+def test_the_timing_workload_says_how_its_questions_are_sent():
+    from tools import helper_timings
+    # Each question waits for the previous answer, then 0.25 s: not a fixed rate.
+    assert "a question 0.25 s after each answer" in helper_timings.WORKLOAD["sustained"]
+    assert "every 0.25" not in json.dumps(helper_timings.WORKLOAD)
+
+
 def test_the_offered_models_and_the_reranker_pins():
     assert set(local_helper.MODELS) == {EMBEDDING}  # no reranker is offered in M2 (ticket 72)
     assert EMBEDDING_MODEL["size"] == 639_150_592 and RERANKER_MODEL["size"] == 639_153_184

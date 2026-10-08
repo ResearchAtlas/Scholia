@@ -65,7 +65,7 @@ WORKLOAD = {
                 "and 10% from 1,800-2,000 characters, cut at a sentence end",
     "batches": "32 passages each (section 13); 20 English and 20 Chinese batches warm, after 2 warm-up batches",
     "questions": "50 English and 50 Chinese questions of 8 to 25 words (or 12 to 40 characters), one embedding each",
-    "sustained": "indexing batches back to back, English and Chinese in turn, with a question every 0.25 s",
+    "sustained": "indexing batches back to back, English and Chinese in turn, with a question 0.25 s after each answer",
     "reranking": "24 candidates per query from the same passages, 500 ms deadline; cancellation trials with a "
                  "deadline shorter than the work, so work is under way when it passes",
     "deadline_ms": 500,  # section 13's hybrid retrieval deadline, the bound a question's embedding counts toward
@@ -436,7 +436,7 @@ async def measure(args, state, client, data, processes):
     results["footprint_after_warm_bytes"] = {"backend": footprint(os.getpid()),
                                              "helper": footprint(helper._process.pid)}
 
-    # Sustained: indexing back to back, a question every 0.25 s.
+    # Sustained: indexing back to back, a question 0.25 s after each answer.
     stop_at = time.monotonic() + args.sustained
     sustained_q, sustained_b = [], []
 
