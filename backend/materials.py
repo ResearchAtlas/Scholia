@@ -235,14 +235,16 @@ async def _to_end(awaitable):
 
 
 def _queue_removes(conn, extraction_id, project_id):
-    """Queue the extraction's passages to leave the project's search index, if the project's last
-    queued operation for them is an add (a whole extraction at a time, as _queue_adds). The
+    """Queue the extraction's passages to leave the project's search index (a whole extraction at a
+    time, as _queue_adds), unless the project's latest queued operation for them is already a
+    removal. The index takes an applied row off the queue (backend/db/migrations.py), so an add
+    may no longer be there to see; a removal of passages the index never had changes nothing. The
     extraction and its passages stay."""
     first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1",
                          (extraction_id,)).fetchone()
     last = first and conn.execute("SELECT op FROM index_queue WHERE target = 'passage' AND target_id = ?"
                                   " AND project_id = ? ORDER BY seq DESC LIMIT 1", (first[0], project_id)).fetchone()
-    if last is not None and last[0] == "add":
+    if first is not None and (last is None or last[0] != "remove"):
         conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
                      " SELECT 'passage', id, ?, 'remove' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
                      (project_id, extraction_id))
@@ -251,7 +253,7 @@ def _queue_removes(conn, extraction_id, project_id):
 def _queue_adds(conn, extraction_id, project_id):
     """Queue the extraction's passages for the project's search index (S1-17 applies the queue;
     adding a passage the project's index holds already changes nothing there), unless the project's
-    last queued operation for them is already an add, so no reading queues them twice. They are
+    latest queued operation for them is already an add, so no reading queues them twice. They are
     queued and removed (backend/db/deletion.py) a whole extraction at a time, so its first passage
     stands for all of them."""
     first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1",
@@ -370,20 +372,19 @@ def _serve(conn, sha256, extractor, extraction_id, look_up):
     import: a Local only project's asks first, a review-locked project's gets none, and it starts
     where the lookup it continues started (a conversation shows its ask). A lookup made for that
     version since, or one that has still to read its identifiers, covers it."""
-    # A reading of the file by an earlier version of the extractor is no version's reading now: its
-    # passages leave every project's index that has them (the reading itself stays).
-    for (older,) in conn.execute("SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ?"
-                                 " AND extractor_version != ?", (sha256, *extractor)).fetchall():
-        first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1", (older,)).fetchone()
-        for (project,) in conn.execute("SELECT DISTINCT project_id FROM index_queue WHERE target = 'passage'"
-                                       " AND target_id = ?", (first[0],)).fetchall() if first else []:
-            _queue_removes(conn, older, project)
+    # Readings of the file by an earlier version of the extractor are no version's reading now: their
+    # passages leave the index of every project whose current version reads the file (the readings
+    # themselves stay; a replaced version's left at its replacement).
+    older = [e for (e,) in conn.execute("SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ?"
+                                        " AND extractor_version != ?", (sha256, *extractor))]
     for material, version, kind, project, locked in conn.execute(
             f"SELECT m.id, v.id, {_VERSION_TYPE}, m.project_id, p.review_lock FROM material_versions v"
             " JOIN content_files c ON c.sha256 = v.file_sha256 JOIN materials m ON m.id = v.material_id"
             " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
+        for earlier in older:
+            _queue_removes(conn, earlier, project)
         _queue_adds(conn, extraction_id, project)
         if locked:
             continue

@@ -378,13 +378,17 @@ async def test_a_paper_sharing_a_reading_by_an_earlier_version_is_read_again_wit
 
 
 async def ops(client, extraction_id):
-    """{project id: [its queued operations on the extraction's passages, each with how many passages]}."""
+    """{project id: [its queued operations on the extraction's passages in queue order, each run of the
+    same operation with how many rows it has]}."""
     found = {}
-    for project, op, count in await rows(
-            client, "SELECT q.project_id, q.op, count(*) FROM index_queue q JOIN passages p ON p.id = q.target_id"
-                    " WHERE q.target = 'passage' AND p.extraction_id = ? GROUP BY q.project_id, q.op ORDER BY min(q.seq)",
-            extraction_id):
-        found.setdefault(project, []).append((op, count))
+    for project, op in await rows(
+            client, "SELECT q.project_id, q.op FROM index_queue q JOIN passages p ON p.id = q.target_id"
+                    " WHERE q.target = 'passage' AND p.extraction_id = ? ORDER BY q.seq", extraction_id):
+        runs = found.setdefault(project, [])
+        if runs and runs[-1][0] == op:
+            runs[-1] = (op, runs[-1][1] + 1)
+        else:
+            runs.append((op, 1))
     return found
 
 
@@ -428,6 +432,44 @@ async def test_a_replaced_file_leaves_its_projects_index_unless_another_paper_th
         await added(client, project, ("a-new.md", three), material_id=a["id"])
         await settled(client, project)
         assert await ops(client, read_one) == {project: [("add", n[read_one])]}  # still b's reading: it stays
+
+
+@pytest.mark.parametrize("change", ["replaced", "read by a newer version"])
+async def test_passages_the_index_has_applied_still_leave_it(tmp_path, monkeypatch, change):
+    notes = b"# Notes\n\nA paragraph of synthetic text.\n"
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        [paper] = (await added(client, project, ("notes.md", notes)))["materials"]
+        await settled(client, project)
+        [(reading,)] = await rows(client, "SELECT id FROM extractions")
+        (n,) = (await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", reading))[0]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute("DELETE FROM index_queue"))  # applied
+        if change == "replaced":
+            await added(client, project, ("other.md", b"# Other\n\nAnother text.\n"), material_id=paper["id"])
+        else:
+            monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))
+            read = await client.post(f"/api/runs/{paper['run_id']}/retry")
+            assert (await run_finished(client, read.json()["run_id"]))["status"] == "succeeded"
+        await settled(client, project)
+        assert await ops(client, reading) == {project: [("remove", n)]}  # once, though no add is left in the queue
+
+
+async def test_a_removal_already_queued_is_not_queued_again_and_one_for_passages_never_added_is_harmless(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project, other = await project_of(client), await project_of(client, "Other")
+        await added(client, project, PDF)
+        await settled(client, project)
+        [(reading,)] = await rows(client, "SELECT id FROM extractions")
+        (n,) = (await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", reading))[0]
+        db = client.state["db"]
+        for _ in range(2):
+            for target in (project, other):  # its own project's, and one that never had them
+                await asyncio.to_thread(db.write, lambda conn: materials_module._queue_removes(conn, reading, target))
+        assert await ops(client, reading) == {project: [("add", n), ("remove", n)], other: [("remove", n)]}
+        await asyncio.to_thread(db.write, lambda conn: materials_module._queue_adds(conn, reading, project))
+        await asyncio.to_thread(db.write, lambda conn: materials_module._queue_adds(conn, reading, project))
+        assert await ops(client, reading) == {project: [("add", n), ("remove", n), ("add", n)], other: [("remove", n)]}
 
 
 async def test_a_reading_of_a_file_replaced_while_it_was_read_reaches_no_index(tmp_path, monkeypatch):
