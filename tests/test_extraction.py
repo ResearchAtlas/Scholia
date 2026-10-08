@@ -65,9 +65,30 @@ def test_a_pdf_papers_title_sections_abstract_caption_and_references():
                       " specifications."),
         ("paragraph", "A second paragraph begins after a gap and discusses methods."),
         ("caption", "Figure 1. Earnings by region in the synthetic panel."),
+        ("caption", "Table 1. Employment by region."),
+        ("table", "Region | Workers | Share\nNorth | 120 | 0.40\nSouth | 95 | 0.32\nEast | 81 | 0.28"),
         ("reference", "Smith, J. (2020). An earlier synthetic paper. doi:10.5555/cited.paper.002"),
         ("reference", "Doe, A. (2019). Another synthetic paper.")]
-    assert read.passages[3].section_path == ["1 Introduction"] and read.passages[6].section_path == ["References"]
+    assert read.passages[3].section_path == ["1 Introduction"] and read.passages[8].section_path == ["References"]
+    assert len(read.passages[7].boxes["rects"]) == 4  # the table's boxes: one per row
+
+
+def test_a_pdf_table_is_its_own_passage_and_what_only_looks_like_one_is_not():
+    def row(y, *cells, at=(72, 200, 300)):
+        return [(x, y, 10, cell) for x, cell in zip(at, cells)]
+
+    page = [(72, 750, 18, "Tables in a Synthetic Paper"), (72, 720, 10, "Text before the table ends here."),
+            *row(700, "Year", "Wage"), *row(688, "2020", "10.0"), *row(676, "2021", "10.5"),
+            (72, 650, 10, "Text after the table."),
+            *row(630, "Alone", "on its line"),  # one row is no table
+            *row(600, "Left", "column"), *row(588, "Shifted", "far", at=(72, 420)),  # columns that do not line up
+            (72, 560, 14, "References"),
+            *row(540, "[1]", "Smith (2020)."), *row(528, "[2]", "Doe (2019).")]  # a reference list holds none
+    read = extract(synthetic.pdf([page]), extraction.PDF)
+    tables = [p.text for p in read.passages if p.kind == "table"]
+    assert tables == ["Year | Wage\n2020 | 10.0\n2021 | 10.5"]
+    assert "Text before the table ends here." in [p.text for p in read.passages]
+    assert all(p.kind == "reference" for p in read.passages if p.section_path == ["References"])
 
 
 def pixels(image):
@@ -110,7 +131,7 @@ def test_a_rotated_page_keeps_its_passages_and_its_boxes_sit_on_its_rendered_tex
     # As much of the rendered text lies in the boxes as on the upright page (all but its two
     # headings, which are no passage), and every box is on text.
     assert covered > 0.9 and abs(covered - ink_on(upright_data, upright)[0]) < 0.005
-    assert min(density) > 0.1
+    assert min(density) > 0.03  # a table row's box spans the gaps between its cells
 
 
 def test_image_only_pages_wait_for_ocr_and_give_no_passage():

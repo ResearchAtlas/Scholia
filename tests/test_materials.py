@@ -226,7 +226,7 @@ async def test_a_failed_start_of_the_runs_after_the_commit_still_reports_what_wa
 
 
 @pytest.mark.parametrize("name, data, kinds", [
-    ("paper.pdf", synthetic.paper_pdf(), {"title", "abstract", "paragraph", "caption", "reference"}),
+    ("paper.pdf", synthetic.paper_pdf(), {"title", "abstract", "paragraph", "caption", "table", "reference"}),
     ("paper.docx", synthetic.paper_docx(), {"title", "paragraph", "caption", "table", "reference"}),
     ("paper.html", synthetic.paper_html(), {"title", "paragraph", "caption", "table", "reference"}),
     ("notes.md", synthetic.paper_markdown(), {"title", "paragraph", "table", "reference"}),

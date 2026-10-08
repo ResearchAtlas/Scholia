@@ -417,9 +417,10 @@ def _pdf_blocks(number, lines, size, body, sections):
     """A page's lines grouped into headings and paragraphs, as passages. A larger font than the
     body's marks a heading (the largest on the first page, the title); a vertical gap, a change of
     size, a short line ending a sentence, or a caption's start ends a paragraph."""
-    passages, block, heading, previous = [], [], [], None
+    passages, block, heading, previous, after_table = [], [], [], None, 0
     right_edge = max((line["right"] for line in lines), default=0.0)
     largest = max((line["size"] for line in lines), default=0.0)
+    rows = [_row(line) for line in lines]
 
     def flush():
         if heading:  # consecutive heading lines of one size are one heading
@@ -438,7 +439,17 @@ def _pdf_blocks(number, lines, size, body, sections):
             passages.extend(_pieces(text, kind, number, sections.path, None, None, boxes, size))
             block.clear()
 
-    for line in lines:
+    for at, line in enumerate(lines):
+        if at < after_table:
+            continue
+        end = _table_end(lines, rows, at)
+        if end > at:  # a table starts here: what came before ends, and a reference list holds none
+            flush()
+            if sections.mode != "reference":
+                text, boxes = _table(lines[at:end], rows[at:end])
+                passages.extend(_pieces(text, "table", number, sections.path, None, None, boxes, size))
+                previous, after_table = None, end
+                continue
         text = line["text"].strip()
         larger = body and line["size"] >= body * 1.15 and len(text) < 200 and not text.endswith(".")
         if larger or (len(text) < 40 and (_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))):
@@ -461,6 +472,71 @@ def _pdf_blocks(number, lines, size, body, sections):
         previous = line
     flush()
     return passages
+
+
+# A table in a PDF's text layer (section 7.1: tables are their own passages): two or more
+# consecutive lines, each of the same number (two or more) of short cells, a cell being a run of
+# characters set apart by more than TABLE_GAP of the line's font size, every cell lined up with the
+# first row's by its left or its right edge, and no row further below the one above than two lines.
+# Ruled tables without such gaps, cells over several lines or merged across columns, and tables
+# whose text PDFium gives column by column are read as paragraphs.
+TABLE_GAP = 1.5
+TABLE_CELL_CHARS = 40
+
+
+def _row(line):
+    """A line's cells as [(first, end, left, right)] (character positions in its text and edges) when
+    it can be a table's row: two or more cells of at most TABLE_CELL_CHARS characters."""
+    boxes, gap = line["boxes"], TABLE_GAP * max(line["size"], 1.0)
+    spans, first, last = [], None, None
+    for at, box in enumerate(boxes):
+        if box is None:  # a space, or a character without its box
+            continue
+        if last is not None and box[0] - boxes[last][2] > gap:
+            spans.append((first, last + 1))
+            first = None
+        first = at if first is None else first
+        last = at
+    if first is not None:
+        spans.append((first, last + 1))
+    if len(spans) < 2 or any(end - first > TABLE_CELL_CHARS for first, end in spans):
+        return None
+    return [(first, end, boxes[first][0], boxes[end - 1][2]) for first, end in spans]
+
+
+def _table_end(lines, rows, start):
+    """Where the table that starts at lines[start] ends (after its last row), or start if none does."""
+    head = rows[start]
+    if head is None:
+        return start
+    tolerance = max(lines[start]["size"], 3.0)
+    end = start + 1
+    while end < len(lines):
+        row, above, line = rows[end], lines[end - 1], lines[end]
+        if row is None or len(row) != len(head) or \
+                above["bottom"] - line["top"] > 2 * max(above["top"] - above["bottom"], 1.0):
+            break
+        if not all(abs(cell[2] - first[2]) <= tolerance or abs(cell[3] - first[3]) <= tolerance
+                   for cell, first in zip(row, head)):
+            break
+        end += 1
+    return end if end - start >= 2 else start
+
+
+def _table(lines, rows):
+    """A table's rows as text, a row a line and its cells apart by " | ", with each character's box."""
+    text, boxes = "", []
+    for line, row in zip(lines, rows):
+        if text:
+            text += "\n"
+            boxes.append(None)
+        for number, (first, end, _, _) in enumerate(row):
+            if number:
+                text += " | "
+                boxes += [None] * 3
+            text += line["text"][first:end]
+            boxes += line["boxes"][first:end]
+    return text, boxes
 
 
 def _reference_start(text):

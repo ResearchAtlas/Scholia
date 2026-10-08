@@ -46,10 +46,14 @@ def pdf(pages, *, scanned=(), size=(612, 792), rotation=0):
     return out.getvalue()
 
 
+TABLE = [("Region", "Workers", "Share"), ("North", "120", "0.40"), ("South", "95", "0.32"), ("East", "81", "0.28")]
+
+
 def paper_pdf(title="A Synthetic Study of Minimum Wages", doi=DOI, scanned=0, rotation=0):
-    """A two-page paper: a title, its DOI, an abstract, a section with two paragraphs and a caption,
-    and references on the second page (with a DOI of their own that must not be taken); then
-    `scanned` pages holding only an image."""
+    """A two-page paper: a title, its DOI, an abstract, a section with two paragraphs, a figure's
+    caption, and a table (its caption, then rows of cells set apart in columns), and references on the
+    second page (with a DOI of their own that must not be taken); then `scanned` pages holding only
+    an image."""
     first = [(72, 720, 20, title), (72, 696, 9, f"doi:{doi}" if doi else "Synthetic Working Paper"),
              (72, 670, 12, "Abstract"),
              (72, 652, 10, "We study minimum wages in a synthetic panel of regions."),
@@ -58,7 +62,9 @@ def paper_pdf(title="A Synthetic Study of Minimum Wages", doi=DOI, scanned=0, ro
              (72, 590, 10, "Minimum wages raise the earnings of low-paid workers, and"),
              (72, 578, 10, "employment effects are small in most specifications."),
              (72, 552, 10, "A second paragraph begins after a gap and discusses methods."),
-             (72, 520, 10, "Figure 1. Earnings by region in the synthetic panel.")]
+             (72, 520, 10, "Figure 1. Earnings by region in the synthetic panel."),
+             (72, 496, 10, "Table 1. Employment by region.")]
+    first += [(x, 480 - 12 * row, 10, cell) for row, cells in enumerate(TABLE) for x, cell in zip((72, 200, 300), cells)]
     second = [(72, 720, 14, "References"),
               (72, 700, 10, "Smith, J. (2020). An earlier synthetic paper. doi:10.5555/cited.paper.002"),
               (72, 684, 10, "Doe, A. (2019). Another synthetic paper.")]
