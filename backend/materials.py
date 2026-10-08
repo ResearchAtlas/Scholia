@@ -330,11 +330,22 @@ async def _look_up(harness, active, project_id, inputs, pace):
     approved = False
     if level == "local_only":
         approved = await _approval(read, write, run_id, project_id, inputs, distinct, wanted)
-    resolved, missed = 0, []
-    async with harness.gate.async_client(project_id, approved=approved,
-                                         admit=lambda conn: may_dispatch(conn, run_id)) as client:
+    resolved, missed, asking, stale = 0, [], [[]], []  # asking[0]: the papers the identifier in hand is for
+
+    def admit(conn):
+        """The gate's check of each request, in the transaction that decides it (after the source's turn,
+        before every attempt): the run may still send, and at least one of its papers still has the file
+        the identifier came from. A replaced one is refused, so its identifier is never sent."""
+        if not may_dispatch(conn, run_id):
+            return False
+        if not _current(conn, asking[0]):
+            stale.append(True)
+            return False
+        return True
+
+    async with harness.gate.async_client(project_id, approved=approved, admit=admit) as client:
         for done, (scheme, value) in enumerate(distinct, start=1):
-            mine = [(m, version) for m, (version, found) in wanted.items() if found == (scheme, value)]
+            mine = asking[0] = [(m, version) for m, (version, found) in wanted.items() if found == (scheme, value)]
             if not await read(lambda conn: _current(conn, mine)):  # every paper it was for has another file now
                 found, outcome = None, "replaced"
             else:
@@ -343,9 +354,13 @@ async def _look_up(harness, active, project_id, inputs, pace):
                 except lookup.Failed as failed:
                     found, outcome = None, failed.code
                 except OutboundDenied as denied:
-                    if denied.reason == "revoked":  # deleted, tightened or locked meanwhile: nothing more is sent
+                    if denied.reason == "revoked" and stale:  # its papers' files were replaced as it waited
+                        stale.clear()
+                        found, outcome = None, "replaced"
+                    elif denied.reason == "revoked":  # deleted, tightened or locked meanwhile: nothing more is sent
                         raise RunOutcome("cancelled", "project_changed", "revoked") from None
-                    found, outcome = None, "refused"
+                    else:
+                        found, outcome = None, "refused"
             if not await _write_if_running(write, run_id, lambda conn: _apply(conn, run_id, project_id, mine, scheme,
                                                                               value, found, outcome)):
                 break

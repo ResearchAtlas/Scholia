@@ -4,6 +4,7 @@ Lifecycle cases first: a change of level, a lock or a deletion between a lookup'
 dispatch."""
 
 import asyncio
+import contextlib
 import json
 
 import httpx
@@ -194,6 +195,37 @@ async def test_a_lookup_is_for_the_version_it_was_made_for_and_a_replaced_ones_a
         [paper] = await settled(client, project)
         assert (paper["title"], paper["source_key"]) == ("The Replacement", f"doi:{other}")
         assert [path for _, path, _ in client.provider.scholarly.requests] == [f"/works/doi:{other}"]  # A's: never sent
+
+
+async def test_a_file_replaced_while_its_identifier_waits_for_its_turn_keeps_it_from_being_sent(tmp_path, monkeypatch):
+    class Watched(lookup.Pace):  # says when a request waits for a source another request holds
+        waiting = asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def turn(self, source):
+            if source in self.locks and self.locks[source].locked():
+                Watched.waiting.set()
+            async with super().turn(source):
+                yield
+
+    monkeypatch.setattr(lookup, "Pace", Watched)
+    first = "10.5555/first.in.line"
+    mock = MockScholarly(openalex={first: openalex_work(first, "First In Line"), DOI: openalex_work(DOI, TITLE)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        mock.hold = asyncio.Event()
+        await added(client, project, ("first.md", f"# First\n\ndoi:{first}\n".encode()))
+        await asyncio.wait_for(mock.started.wait(), 10)  # its request holds OpenAlex's turn
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await asyncio.wait_for(Watched.waiting.wait(), 10)  # the paper's DOI, checked current, waits for the turn
+        await added(client, project, ("v2.md", b"# Version two\n\nNo identifier in this one.\n"),
+                    material_id=result["materials"][0]["id"])
+        mock.hold.set()
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        assert [path for _, path, _ in mock.requests] == [f"/works/doi:{first}"]  # the replaced file's DOI: never sent
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'",
+                               result["lookup_run_id"])
+        assert json.loads(data)["outcome"] == "replaced"
 
 
 async def test_an_older_lookup_answered_after_its_file_was_replaced_writes_nothing(tmp_path):
