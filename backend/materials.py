@@ -305,16 +305,14 @@ async def _look_up(harness, active, project_id, inputs, pace):
     async def write(fn):
         return await asyncio.to_thread(db.write, fn)
 
-    materials = inputs.get("material_ids") or []
+    materials, versions = inputs.get("material_ids") or [], inputs.get("versions") or {}
     started = time.monotonic()
     while await read(lambda conn: conn.execute(  # the versions it is for are read first, and only those
             "SELECT count(*) FROM runs WHERE workflow = 'extract' AND status = 'running'"
             " AND json_extract(inputs, '$.version_id') IN (SELECT value FROM json_each(?))",
-            (json.dumps(list((inputs.get("versions") or {}).values())),)).fetchone()[0]) \
-            and time.monotonic() - started < EXTRACTION_SECONDS + 60:
+            (json.dumps(list(versions.values())),)).fetchone()[0]) and time.monotonic() - started < EXTRACTION_SECONDS + 60:
         await asyncio.sleep(WAIT_SECONDS)
 
-    versions = inputs.get("versions") or {}
     wanted = await read(lambda conn: _identifiers(conn, project_id, _left_to(conn, run_id, materials, versions), versions))
     distinct = list(dict.fromkeys(found for _, found in wanted.values() if found))
     if not await _write_if_running(write, run_id, lambda conn: [
