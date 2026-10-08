@@ -97,9 +97,15 @@ RERANKER_MODEL = {
 MODELS = {EMBEDDING: EMBEDDING_MODEL}  # what Settings offers
 SOURCES = ("huggingface", "modelscope")
 
-# Per process: context, physical batch and slots (section 13), about 0.46 GB of cache each.
-LIMITS = ["-c", "4096", "-ub", "2048", "-np", "2"]
+# Per process: context, physical batch and slots (section 13), about 0.46 GB of cache each; and no
+# prompt cache, which llama-server keeps by default (up to 8 GiB of host memory per process) and an
+# embedding or reranking server never reuses: measured in S1-16, a helper grew to 12 GB with it.
+LIMITS = ["-c", "4096", "-ub", "2048", "-np", "2", "--cache-ram", "0"]
 SLOTS = 2
+# Texts per indexing request. The server queues each text of a request as a task of its own, so a
+# question sent during a batch of 32 waited behind it (p95 4.3 s in S1-16's timings); one text per
+# request leaves the other slot to questions (p95 0.22 s) at about a fifth less indexing throughput.
+INDEXING_INPUTS = 1
 FLAGS = {"embedding": ["--embedding", "--pooling", "last"], "reranker": ["--reranking"]}
 LISTENING = re.compile(rb"listening on http://127\.0\.0\.1:(\d+)")
 MANIFEST = "Resources/llama-server.sha256.json"  # under the app's Contents folder; see write_manifest
@@ -112,6 +118,18 @@ PART = ".part"
 _FULL = (errno.ENOSPC, errno.EDQUOT)
 # Problems a check before a launch finds: no restart helps, so the helper waits for the next request.
 _CHECKS = ("model_missing", "model_changed", "binary_missing", "binary_changed")
+
+
+def _vectors(data, count):
+    """The embeddings in a /v1/embeddings reply, in input order, or HelperUnavailable."""
+    rows = data.get("data") if isinstance(data, dict) else None
+    vectors = [row.get("embedding") for row in sorted(rows, key=lambda row: row.get("index", 0))] \
+        if isinstance(rows, list) and all(isinstance(row, dict) for row in rows) else None
+    if vectors is None or len(vectors) != count or not all(
+            isinstance(v, list) and v and all(isinstance(x, (int, float)) and math.isfinite(x) for x in v)
+            for v in vectors):
+        raise HelperUnavailable("request_failed")
+    return vectors
 
 
 class HelperUnavailable(Exception):
@@ -289,27 +307,25 @@ class Helper:
                 "ready_seconds": self.ready_seconds}
 
     async def embed(self, texts, *, project_id=None, query=False) -> list[list[float]]:
-        """One embedding per text, in order. A question's (query) go ahead of indexing batches,
-        which hold at most one slot. Raises HelperUnavailable when the helper cannot serve."""
+        """One embedding per text, in order. A question's (query) go ahead of indexing batches: a
+        batch holds at most one of the server's slots, INDEXING_INPUTS texts at a time, and the
+        other stays free for questions. Raises HelperUnavailable when the helper cannot serve."""
         texts = list(texts)
+        size = len(texts) if query else INDEXING_INPUTS
+        vectors = []
         self._in_use += 1
         try:
             async with contextlib.AsyncExitStack() as held:
                 if not query:
                     await held.enter_async_context(self._indexing)
-                await held.enter_async_context(self._slots)
-                await self._ready()
-                data = await self._post("/v1/embeddings", {"input": texts}, project_id)
+                for start in range(0, len(texts), max(size, 1)):
+                    async with self._slots:
+                        await self._ready()
+                        part = texts[start:start + size]
+                        vectors += _vectors(await self._post("/v1/embeddings", {"input": part}, project_id), len(part))
         finally:
             self._in_use -= 1
             self.last_used = time.monotonic()
-        rows = data.get("data") if isinstance(data, dict) else None
-        vectors = [row.get("embedding") for row in sorted(rows, key=lambda row: row.get("index", 0))] \
-            if isinstance(rows, list) and all(isinstance(row, dict) for row in rows) else None
-        if vectors is None or len(vectors) != len(texts) or not all(
-                isinstance(v, list) and v and all(isinstance(x, (int, float)) and math.isfinite(x) for x in v)
-                for v in vectors):
-            raise HelperUnavailable("request_failed")
         return vectors
 
     async def rerank(self, query, documents, *, deadline, project_id=None) -> list[float] | None:

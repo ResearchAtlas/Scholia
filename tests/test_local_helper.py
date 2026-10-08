@@ -324,7 +324,8 @@ async def test_the_helper_starts_on_demand_with_its_flags_and_a_new_key_each_lau
         [launch] = fake.launches
         model = tmp_path / "data" / "models" / EMBEDDING / PIN["file"]
         assert launch["argv"] == ["-m", str(model), "--offline", "--host", "127.0.0.1", "--port", "0", "--no-webui",
-                                  "--embedding", "--pooling", "last", "-c", "4096", "-ub", "2048", "-np", "2"]
+                                  "--embedding", "--pooling", "last", "-c", "4096", "-ub", "2048", "-np", "2",
+                                  "--cache-ram", "0"]
         # Only the key and the folders it may need; no proxy, no other key.
         # (the stand-in's own runtime may add its locale and text encoding)
         assert set(launch["env"]) - {"__CF_USER_TEXT_ENCODING", "LC_CTYPE"} <= {"LLAMA_API_KEY", "HOME", "TMPDIR"}
@@ -372,16 +373,17 @@ async def test_a_question_goes_ahead_of_indexing_batches(tmp_path, fake, timings
         await local_helper.embed(client.state, ["warm"])
         client.remote.helper_requests.clear()
         held = client.remote.hold["/v1/embeddings"] = asyncio.Event()
-        first = asyncio.create_task(local_helper.embed(client.state, ["batch 1"]))
-        second = asyncio.create_task(local_helper.embed(client.state, ["batch 2"]))
+        first = asyncio.create_task(local_helper.embed(client.state, ["1a", "1b", "1c"]))
+        second = asyncio.create_task(local_helper.embed(client.state, ["2a", "2b"]))
         await until(lambda: len(client.remote.helper_requests) == 1)
-        question = asyncio.create_task(local_helper.embed(client.state, ["a question"], query=True))
+        question = asyncio.create_task(local_helper.embed(client.state, ["q1", "q2"], query=True))
         await until(lambda: len(client.remote.helper_requests) == 2)
         await asyncio.sleep(0.05)
-        assert [body["input"] for _, _, body in client.remote.helper_requests] == [["batch 1"], ["a question"]]
+        # The batch holds one slot, one text at a time; the question takes the other, all its texts at once.
+        assert [body["input"] for _, _, body in client.remote.helper_requests] == [["1a"], ["q1", "q2"]]
         held.set()
-        await asyncio.gather(first, second, question)
-        assert [body["input"] for _, _, body in client.remote.helper_requests][2] == ["batch 2"]
+        assert await first == [[0.5] * 4] * 3 and await second == [[0.5] * 4] * 2 and len(await question) == 2
+        assert [body["input"] for _, _, body in client.remote.helper_requests][2:] == [["1b"], ["1c"], ["2a"], ["2b"]]
 
 
 @pytest.mark.asyncio
@@ -706,4 +708,5 @@ def test_the_offered_models_and_the_reranker_pins():
     assert set(local_helper.MODELS) == {EMBEDDING}  # no reranker is offered in M2 (ticket 72)
     assert EMBEDDING_MODEL["size"] == 639_150_592 and RERANKER_MODEL["size"] == 639_153_184
     assert set(EMBEDDING_MODEL["sources"]) == set(local_helper.SOURCES)
-    assert local_helper.command("/b", "/m", "reranker")[-7:] == ["--reranking", "-c", "4096", "-ub", "2048", "-np", "2"]
+    assert local_helper.command("/b", "/m", "reranker")[-9:] == [
+        "--reranking", "-c", "4096", "-ub", "2048", "-np", "2", "--cache-ram", "0"]
