@@ -325,8 +325,9 @@ async function m1(ctx) {
 }
 
 // The S1-16 flows: the local model helper under Advanced, the model consent screen and its Cancel, a
-// Local only project's note, a download's progress and its Cancel, and an import, in 8 screenshots.
-// The search model is the server's synthetic file, from its test-owned download source.
+// Local only project's note and Advanced reached from it (the import, no download), a download from a
+// Normal project with its progress and its Cancel, and an import, in 9 screenshots. The search model
+// is the server's synthetic file, from its test-owned download source.
 async function s116(ctx) {
   const { page, L, P, C, step, check, get } = ctx;
   const { dialog, openSidebar, openSettings, scrollTo } = navigation(ctx);
@@ -334,6 +335,12 @@ async function s116(ctx) {
   const downloads = () => readFileSync(C.requestLog, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line))
     .filter((request) => /huggingface|hf\.co|modelscope/.test(request.host));
   const consent = () => page.getByRole('dialog', { name: L('helper.consentTitle') });
+  const offer = () => dialog().getByRole('button', { name: L('helper.download'), exact: true });
+  const switchTo = async (name) => {
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(600);
+    await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(1000);
+  };
   const folder = () => join(C.dataFolder, 'models', 'qwen3-embedding-0.6b');
   const leftovers = () => (existsSync(folder()) ? readdirSync(folder()) : []);
   const showHelper = async () => {  // the section's top at the top of the page, so all of it shows
@@ -375,20 +382,42 @@ async function s116(ctx) {
       && downloads().length === 0);
     await page.keyboard.press('Escape'); await dialog().waitFor({ state: 'hidden' });
     await page.reload(); await page.waitForTimeout(1500);
-    await openSidebar();
-    await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(600);
-    await page.getByRole('menuitem', { name: C.localProject, exact: true }).click(); await page.waitForTimeout(1000);
+    await switchTo(C.localProject);
     await openSettings('settings.page.project');
     await dialog().getByText(L('helper.localOnlyTitle')).waitFor();
     await dialog().getByText(L('helper.localOnlyTitle')).scrollIntoViewIfNeeded();
   });
 
-  await step('19-download', async () => {
+  // Advanced reached from the Local only project offers the import only: no Download, no consent screen.
+  await step('19-local-only-advanced', async () => {
     await dialog().getByRole('button', { name: L('helper.localOnlyOpen') }).click(); await page.waitForTimeout(1200);
     await showHelper();
-    await dialog().getByRole('button', { name: L('helper.download'), exact: true }).click(); await consent().waitFor();
+    await dialog().getByRole('note').getByText(L('helper.localOnlyBody'), { exact: true }).waitFor();
+    const advice = L('helper.keywordOnly').replace('{reason}', L('helper.reasonImport.model_missing'));
+    check('Advanced shows the Local only note, and search says the model is to be imported',
+      await dialog().getByRole('note').getByText(L('helper.localOnlyTitle'), { exact: true }).count() === 1
+      && await dialog().getByText(advice, { exact: true }).count() === 1);
+    check('there is no Download action, and no consent screen', await offer().count() === 0
+      && await dialog().getByRole('button', { name: L('helper.consentDownload'), exact: true }).count() === 0
+      && await consent().count() === 0);
+    const imports = dialog().getByRole('button', { name: L('helper.import'), exact: true });
+    check('the import is offered', await imports.count() === 1 && await imports.isEnabled());
+    const read = await status();
+    check('no download started', read.download === null && read.model_source === null && downloads().length === 0);
+  });
+
+  await step('20-download', async () => {
+    await page.keyboard.press('Escape'); await dialog().waitFor({ state: 'hidden' });
+    await switchTo(C.project);
+    await openSettings('settings.page.advanced'); await showHelper();
+    const normal = (await get('/api/projects')).body.projects.find((p) => p.name === C.project);
+    check('Advanced from a Normal project offers the Download action',
+      normal?.sensitivity === 'normal' && await offer().count() === 1 && await offer().isEnabled());
+    await offer().click(); await consent().waitFor();
     await consent().getByRole('radio', { name: L('helper.source.modelscope') }).click();
+    const request = page.waitForRequest((r) => r.method() === 'POST' && new URL(r.url()).pathname === '/api/helper/models/download');
     await consent().getByRole('button', { name: L('helper.consentDownload') }).click();
+    check('the download request names the current project', (await request).postDataJSON().project_id === normal.id);
     await consent().waitFor({ state: 'hidden' });
     await dialog().getByRole('progressbar').waitFor();
     for (let tries = 0; tries < 50 && !((await status()).download?.received > 0); tries += 1) await page.waitForTimeout(100);
@@ -398,7 +427,7 @@ async function s116(ctx) {
     const saved = (await get('/api/settings')).body.values.helper;
     check('the source chosen is saved', saved.model_source === 'modelscope');
   });
-  await step('20-download-cancelled', async () => {
+  await step('21-download-cancelled', async () => {
     await dialog().getByRole('button', { name: L('helper.cancelDownload') }).click();
     await dialog().getByText(L('helper.downloadCancelled')).waitFor();
     const read = await status();
@@ -408,11 +437,11 @@ async function s116(ctx) {
       && downloads().map((r) => r.host).join() === 'modelscope.cn,cdn-lfs-cn-1.modelscope.cn');
   });
 
-  await step('21-import', async () => {
+  await step('22-import', async () => {
     await dialog().getByRole('button', { name: L('helper.import'), exact: true }).click();
     await dialog().getByRole('textbox', { name: L('helper.importLabel') }).fill(C.modelFile);
   });
-  await step('22-imported', async () => {
+  await step('23-imported', async () => {
     await dialog().getByRole('button', { name: L('helper.importConfirm'), exact: true }).click();
     await dialog().getByText(L('helper.installed'), { exact: true }).waitFor();
     await dialog().getByText(L('helper.searchHybrid')).waitFor();
