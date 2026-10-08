@@ -10,7 +10,8 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, del, get, post } from '../api.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { downloading, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress, SOURCES } from '../helper.js';
+import { downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress, SOURCES }
+  from '../helper.js';
 import { useAction } from '../action.js';
 import { LoadState, Problem, Section, Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -154,12 +155,11 @@ function DownloadProgress({ status, busy, onCancel }) {
 
 function HelperRow({ status, busy, onStartAgain }) {
   const t = useT();
-  const helper = status.helper ?? { state: 'stopped' };
   return (
     <div className="flex items-center gap-3 px-3 py-2.5 text-sm">
       <span className="text-muted-foreground">{t('helper.helperLabel')}</span>
-      <span className="min-w-0 flex-1">{t(`helper.state.${helper.state}`)}</span>
-      {helper.state === 'failed' && (
+      <span className="min-w-0 flex-1">{t(`helper.state.${helperState(status)}`)}</span>
+      {status.helper?.state === 'failed' && (
         <Button size="sm" variant="outline" className="h-7 shrink-0" disabled={busy} onClick={onStartAgain}>
           <RotateCcw aria-hidden="true" />{t('helper.startAgain')}
         </Button>

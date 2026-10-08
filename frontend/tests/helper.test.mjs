@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
-import { downloading, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress, SOURCES }
+import { downloading, helperState, keywordOnlyReason, modelFilePicker, pollDelay, preferredSource, progress, SOURCES }
   from '../src/helper.js';
 
 test('the consent screen selects ModelScope once Hugging Face could not be reached, else the last choice', () => {
@@ -33,14 +33,25 @@ test('search says why it is keyword-only, with an entry for every reason', () =>
   }
 });
 
+test('a stopped helper that no request can start is shown as unavailable, not as waiting for search', () => {
+  const keywordOnly = { mode: 'keyword_only', reason: 'model_changed' };
+  assert.equal(helperState({ helper: { state: 'stopped' }, search: { mode: 'hybrid', reason: null } }), 'stopped');
+  assert.equal(helperState({ helper: { state: 'stopped' }, search: keywordOnly }), 'unavailable');
+  assert.equal(helperState({ helper: { state: 'restarting' }, search: { mode: 'keyword_only', reason: 'crashed' } }),
+    'restarting');
+  assert.equal(helperState({ helper: { state: 'failed' }, search: { mode: 'keyword_only', reason: 'helper_failed' } }),
+    'failed');
+  assert.equal(helperState({ helper: null, search: keywordOnly }), 'unavailable');
+});
+
 test('every state, source and failure the backend reports has its words in both catalogs', () => {
   const keys = [
-    ...['stopped', 'starting', 'running', 'restarting', 'failed'].map((state) => `helper.state.${state}`),
+    ...['stopped', 'starting', 'running', 'restarting', 'failed', 'unavailable'].map((state) => `helper.state.${state}`),
     ...SOURCES.map((source) => `helper.source.${source}`),
     ...['source_unreachable', 'source_refused', 'size_mismatch', 'hash_mismatch', 'redirect_refused', 'download_refused',
       'download_interrupted', 'disk_full', 'write_failed', 'closing', 'invalid_path', 'file_not_found', 'not_a_file',
       'file_unreadable', 'import_failed', 'local_only_no_download', 'already_installed', 'download_running',
-      'unknown_model', 'unknown_source', 'no_download'].map((code) => `errors.${code}`),
+      'unknown_model', 'unknown_source', 'no_download', 'download_failed'].map((code) => `errors.${code}`),
   ];
   for (const key of keys) {
     assert.ok(Object.hasOwn(en, key), key);

@@ -28,6 +28,13 @@ export function keywordOnlyReason(status) {
   return `helper.reason.${REASONS.has(search.reason) ? search.reason : 'other'}`;
 }
 
+// The helper's state as the section names it: stopped while search is keyword-only is "unavailable",
+// since no start is coming until what the search row names is fixed.
+export function helperState(status) {
+  const state = status?.helper?.state ?? 'stopped';
+  return state === 'stopped' && keywordOnlyReason(status) ? 'unavailable' : state;
+}
+
 // How often the section reads the status: often while a download or a start is under way.
 export function pollDelay(status) {
   return downloading(status) || ['starting', 'restarting'].includes(status?.helper?.state) ? 1000 : 4000;
