@@ -1395,7 +1395,8 @@ def _project_records(conn, project_id):
     for material in materials:
         material["csl"] = json.loads(material["csl"]) if material["csl"] else None
         material["versions"] = rows(
-            "SELECT v.seq, v.file_sha256, v.is_current, c.media_type, v.created_at FROM material_versions v"
+            "SELECT v.seq, v.file_sha256, v.is_current, coalesce(v.media_type, c.media_type) AS media_type, v.created_at"
+            " FROM material_versions v"
             " LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE v.material_id = ? ORDER BY v.seq",
             material["id"])
     artifacts = rows("SELECT id, kind, title, language, citation_style, template_id, authors, venue, doc, doc_rev,"

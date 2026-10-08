@@ -573,4 +573,11 @@ BEGIN
 END;
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003)
+# A material version's media type, as the file was detected when it was added (S1-13): the same
+# bytes added as Markdown and as LaTeX are two readings of one stored file, each by its own
+# extractor. A version from before it has none and reads as its stored file's type.
+_0004 = r"""
+ALTER TABLE material_versions ADD COLUMN media_type TEXT;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004)

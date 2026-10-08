@@ -271,6 +271,32 @@ async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_wi
             [(first, count), (second, count)])
 
 
+async def test_the_same_bytes_added_as_another_type_are_read_as_that_type(tmp_path):
+    source = b"\\section{Method}\n\nText with \\emph{emphasis} here.\n"  # Markdown and LaTeX alike
+    async with started(tmp_path / "data") as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        await added(client, first, ("notes.md", source))
+        [markdown] = await settled(client, first)
+        [latex_paper] = (await added(client, second, ("notes.tex", source)))["materials"]
+        assert latex_paper["run_id"]  # not the Markdown reading, shared: a reading of its own
+        [latex] = await settled(client, second)
+        assert await rows(client, "SELECT count(*) FROM content_files") == [(1,)]  # one stored file
+        assert {e for (e,) in await rows(client, "SELECT extractor FROM extractions")} == {"markdown", "latex"}
+
+        async def texts(paper):
+            return [p["text"] for p in (await client.get(
+                f"/api/material-versions/{paper['version']['id']}/passages")).json()["passages"]]
+
+        assert (markdown["version"]["media_type"], latex["version"]["media_type"]) == (extraction.MARKDOWN, extraction.LATEX)
+        assert await texts(latex) == ["Text with emphasis here."] and "\\section{Method}" in await texts(markdown)
+        # A new version with the same bytes as another type is read as that type too.
+        [again] = (await added(client, first, ("notes.html", source), material_id=markdown["id"]))["materials"]
+        [html] = await settled(client, first)
+        assert again["run_id"] and html["version"]["media_type"] == extraction.HTML and html["state"] == "ready"
+        versions = (await client.get(f"/api/materials/{markdown['id']}/versions")).json()["versions"]
+        assert [v["media_type"] for v in versions] == [extraction.MARKDOWN, extraction.HTML]
+
+
 async def test_a_replaced_file_is_a_new_version_read_again(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)

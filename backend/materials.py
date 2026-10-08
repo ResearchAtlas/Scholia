@@ -14,6 +14,8 @@ An `extract` run reads its version's file (backend/extraction.py) within EXTRACT
 writes the extraction, its passages and the index queue's `add` rows for its project in its
 terminal transaction, so a partial extraction is never written and a revoked one writes nothing.
 Extractions are shared by file and extractor version; a run that finds one written meanwhile uses it.
+Each version is read as the type its file was detected as when it was added (its media_type), so
+the same bytes added as Markdown and as LaTeX are two extractions of one stored file.
 
 A `lookup` run waits for its materials' extractions, takes each material's first identifier from
 its own text (extraction.identifiers), and resolves the distinct ones (backend/lookup.py) through
@@ -156,8 +158,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
                 conn.execute("INSERT INTO materials (id, project_id, title, source, evidence_type, proposed_by)"
                              " VALUES (?, ?, ?, 'upload', 'full_text', 'researcher')", (material, project_id, title[:500]))
             version = new_id()
-            conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current)"
-                         " VALUES (?, ?, ?, ?, 1)", (version, material, seq, sha256))
+            conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
+                         " VALUES (?, ?, ?, ?, 1, ?)", (version, material, seq, sha256, kind))
             extractor, extractor_version = extraction.extractor_of(kind)
             shared = conn.execute(
                 f"SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ? AND extractor_version = ?"
@@ -224,7 +226,7 @@ def register(harness, content):
     async def extract_run(harness, active, project_id, inputs):
         version_id = inputs["version_id"]
         row = await asyncio.to_thread(harness.db.read, lambda conn: conn.execute(
-            "SELECT v.file_sha256, c.media_type FROM material_versions v JOIN content_files c"
+            f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v JOIN content_files c"
             " ON c.sha256 = v.file_sha256 WHERE v.id = ?", (version_id,)).fetchone())
         if row is None or row[1] not in extraction.EXTRACTORS:
             raise RunOutcome("failed", "not_found")
@@ -365,11 +367,12 @@ def _identifiers(conn, project_id, materials):
     arXiv ID, from its current version's extraction; materials gone since are left out."""
     found = {}
     for material in materials:
-        row = conn.execute("SELECT v.file_sha256 FROM materials m JOIN material_versions v ON v.material_id = m.id"
-                           " AND v.is_current = 1 WHERE m.id = ? AND m.project_id = ?", (material, project_id)).fetchone()
+        row = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM materials m JOIN material_versions v"
+                           " ON v.material_id = m.id AND v.is_current = 1 LEFT JOIN content_files c ON c.sha256 = v.file_sha256"
+                           " WHERE m.id = ? AND m.project_id = ?", (material, project_id)).fetchone()
         if row is None:
             continue
-        extracted = _extraction(conn, row[0])
+        extracted = _extraction(conn, *row)
         passages = [extraction.Passage(kind, text, page) for kind, text, page in conn.execute(
             "SELECT kind, text, page FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 200",
             (extracted[0],))] if extracted else []
@@ -439,26 +442,32 @@ def _apply(conn, run_id, project_id, materials, scheme, value, found, outcome):
 # The Library
 
 
-def _extraction(conn, sha256):
-    """The file's latest extraction: (id, extractor, version, status, pages, ocr_pages, passages), or None."""
-    if sha256 is None:
+# A version's media type: its own, or its stored file's for a version added before it had one.
+_VERSION_TYPE = "coalesce(v.media_type, c.media_type)"
+
+
+def _extraction(conn, sha256, kind):
+    """The latest extraction of the file as a file of that media type (by its extractor): (id,
+    extractor, version, status, pages, ocr_pages, passages), or None."""
+    if sha256 is None or kind not in extraction.EXTRACTORS:
         return None
     return conn.execute(
         "SELECT e.id, e.extractor, e.extractor_version, e.status, e.pages, e.ocr_pages,"
         " (SELECT count(*) FROM passages WHERE extraction_id = e.id) FROM extractions e"
-        f" WHERE e.file_sha256 = ? AND e.status IN {_SHARED} ORDER BY e.rowid DESC LIMIT 1", (sha256,)).fetchone()
+        f" WHERE e.file_sha256 = ? AND e.extractor = ? AND e.status IN {_SHARED} ORDER BY e.rowid DESC LIMIT 1",
+        (sha256, extraction.EXTRACTORS[kind][0])).fetchone()
 
 
 _MATERIAL_COLUMNS = ("m.id, m.project_id, m.title, m.csl, m.source, m.source_key, m.evidence_type, m.resolved_at,"
                      " m.checked_at, m.checked_by, m.retraction, m.retraction_checked_at, m.created_at, m.updated_at,"
-                     " v.id, v.seq, v.file_sha256, c.media_type, c.size, v.created_at")
+                     f" v.id, v.seq, v.file_sha256, {_VERSION_TYPE}, c.size, v.created_at")
 
 
 def _describe(conn, row, registry):
     """A material as the Library shows it, with its state: reading, ready or needs_attention (and why)."""
     (material, project, title, csl, source, source_key, evidence, resolved_at, checked_at, checked_by, retraction,
      retraction_checked_at, created_at, updated_at, version, seq, sha256, media_type, size, version_at) = row
-    extracted = _extraction(conn, sha256)
+    extracted = _extraction(conn, sha256, media_type)
     run = conn.execute("SELECT id, status, cancel_reason, summary FROM runs WHERE workflow = 'extract'"
                        " AND json_extract(inputs, '$.version_id') = ? ORDER BY rowid DESC LIMIT 1",
                        (version,)).fetchone() if version else None
@@ -633,12 +642,12 @@ async def material_versions(material_id: str, request: Request):
     def fetch(conn):
         if conn.execute("SELECT 1 FROM materials WHERE id = ?", (material_id,)).fetchone() is None:
             raise _refused(404, "not_found", "No such material")
-        rows = conn.execute("SELECT v.id, v.seq, v.is_current, v.file_sha256, c.media_type, c.size, v.created_at"
+        rows = conn.execute(f"SELECT v.id, v.seq, v.is_current, v.file_sha256, {_VERSION_TYPE}, c.size, v.created_at"
                             " FROM material_versions v LEFT JOIN content_files c ON c.sha256 = v.file_sha256"
                             " WHERE v.material_id = ? ORDER BY v.seq", (material_id,)).fetchall()
         return {"versions": [{"id": v, "seq": seq, "is_current": bool(current), "media_type": kind, "size": size,
                               "created_at": at, "extraction": (lambda e: e and {"status": e[3], "pages": e[4],
-                                                                                "passages": e[6]})(_extraction(conn, sha))}
+                                                                                "passages": e[6]})(_extraction(conn, sha, kind))}
                              for v, seq, current, sha, kind, size, at in rows]}
 
     return await asyncio.to_thread(_state(request)["db"].read, fetch)
@@ -660,10 +669,11 @@ async def version_passages(version_id: str, request: Request, offset: int = 0, l
     limit, offset = max(1, min(limit, PASSAGE_PAGE)), max(0, offset)
 
     def fetch(conn):
-        row = conn.execute("SELECT file_sha256 FROM material_versions WHERE id = ?", (version_id,)).fetchone()
+        row = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v"
+                           " LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE v.id = ?", (version_id,)).fetchone()
         if row is None:
             raise _refused(404, "not_found", "No such version")
-        extracted = _extraction(conn, row[0])
+        extracted = _extraction(conn, *row)
         if extracted is None:
             return {"passages": [], "total": 0}
         rows = conn.execute(f"SELECT {_PASSAGE_COLUMNS} FROM passages WHERE extraction_id = ? ORDER BY ordinal"
@@ -686,9 +696,11 @@ async def get_passage(passage_id: str, request: Request):
                               (row[9], row[1] - 1)).fetchone()
         after = conn.execute("SELECT text FROM passages WHERE extraction_id = ? AND ordinal = ?",
                              (row[9], row[1] + 1)).fetchone()
-        materials = conn.execute(
-            "SELECT m.id, m.project_id, v.id FROM extractions e JOIN material_versions v ON v.file_sha256 = e.file_sha256"
-            " JOIN materials m ON m.id = v.material_id WHERE e.id = ? ORDER BY m.created_at", (row[9],)).fetchall()
+        materials = [(m, p, v) for m, p, v, kind, extractor in conn.execute(
+            f"SELECT m.id, m.project_id, v.id, {_VERSION_TYPE}, e.extractor FROM extractions e JOIN material_versions v"
+            " ON v.file_sha256 = e.file_sha256 JOIN content_files c ON c.sha256 = v.file_sha256"
+            " JOIN materials m ON m.id = v.material_id WHERE e.id = ? ORDER BY m.created_at", (row[9],))
+            if extraction.EXTRACTORS.get(kind, (None,))[0] == extractor]  # versions read by this extractor
         return {**_passage(row[:9]), "selector": {"type": "TextQuoteSelector", "exact": row[5],
                                                    "prefix": before[0][-32:] if before else "",
                                                    "suffix": after[0][:32] if after else ""},
@@ -702,7 +714,7 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
     """A PDF page rendered as a PNG by pypdfium2, in memory; never written to disk."""
     state = _state(request)
     row = await asyncio.to_thread(state["db"].read, lambda conn: conn.execute(
-        "SELECT v.file_sha256, c.media_type FROM material_versions v JOIN content_files c ON c.sha256 = v.file_sha256"
+        f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v JOIN content_files c ON c.sha256 = v.file_sha256"
         " WHERE v.id = ?", (version_id,)).fetchone())
     if row is None:
         raise _refused(404, "not_found", "No such version")
@@ -756,9 +768,10 @@ async def retry_run(run_id: str, request: Request):
         if not kept:
             raise _refused(404, "not_found", "Its papers no longer exist")
         if workflow == "extract":
-            version = conn.execute("SELECT file_sha256 FROM material_versions WHERE id = ? AND is_current = 1",
+            version = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
+                                   " content_files c ON c.sha256 = v.file_sha256 WHERE v.id = ? AND v.is_current = 1",
                                    (inputs.get("version_id"),)).fetchone()
-            if version is None or _extraction(conn, version[0]) is not None or conn.execute(
+            if version is None or _extraction(conn, *version) is not None or conn.execute(
                     "SELECT 1 FROM runs WHERE workflow = 'extract' AND status = 'running'"
                     " AND json_extract(inputs, '$.version_id') = ?", (inputs.get("version_id"),)).fetchone():
                 raise _refused(409, "not_retryable", "This paper is read already, or being read")
