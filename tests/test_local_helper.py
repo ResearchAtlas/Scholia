@@ -796,7 +796,8 @@ def test_lifecycle_values_come_from_the_helper_settings(tmp_path):
     assert local.timings() == {"idle": 120, "start": 12.5, "health": 20, "backoff": [2, 4]}
     (tmp_path / "config.toml").write_text('[helper]\nstart_seconds = 0\nrestart_backoff_seconds = []\nmodel_source = "x"\n')
     local = local_helper.Local({"data_dir": tmp_path}, Config(binary=None))
-    assert local.timings() == {"idle": 600, "start": 30, "health": 30, "backoff": [1, 5, 30]}  # defaults
+    # defaults; the start deadline calibrated from 30 s to 60 s (cold starts of 31 to 41 s on CI)
+    assert local.timings() == {"idle": 600, "start": 60, "health": 30, "backoff": [1, 5, 30]}
 
 
 # Downloads and imports
