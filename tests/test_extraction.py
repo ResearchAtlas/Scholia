@@ -91,6 +91,33 @@ def test_a_pdf_table_is_its_own_passage_and_what_only_looks_like_one_is_not():
     assert all(p.kind == "reference" for p in read.passages if p.section_path == ["References"])
 
 
+def test_a_pdf_table_with_long_labels_and_a_wrapped_cell_is_one_passage_and_two_text_columns_are_not():
+    def row(y, *cells, at=(72, 330, 430)):
+        return [(x, y, 10, cell) for x, cell in zip(at, cells)]
+
+    labels = ["Employment rate of workers aged 25 to 54 years", "Share of jobs paid at the minimum wage floor"]
+    assert all(len(label) > 40 for label in labels)
+    page = [(72, 750, 18, "Longer Tables in a Synthetic Paper"),
+            *row(720, "Measure", "Value"), *row(708, labels[0], "0.81"), *row(696, labels[1], "0.12"),
+            (72, 670, 10, "Between the tables."),
+            *row(650, "Region", "Workers", "Share"),
+            *row(638, "North-eastern coastal districts of the", "120", "0.40"),
+            (72, 626, 10, "synthetic panel"),  # the cell above, wrapped
+            *row(614, "South", "95", "0.32"),
+            (72, 590, 10, "Text set in two columns lines up as well, but neither holds short cells."),
+            *row(570, "Minimum wages raise the earnings of low", "employment effects are small in most", at=(72, 320)),
+            *row(558, "paid workers in the synthetic panel and", "specifications that the synthetic data", at=(72, 320)),
+            *row(546, "the estimates are made up for testing", "allow, as the authors note in the text", at=(72, 320))]
+    read = extract(synthetic.pdf([page]), extraction.PDF)
+    tables = [p for p in read.passages if p.kind == "table"]
+    assert [t.text for t in tables] == [
+        f"Measure | Value\n{labels[0]} | 0.81\n{labels[1]} | 0.12",
+        "Region | Workers | Share\nNorth-eastern coastal districts of the synthetic panel | 120 | 0.40\nSouth | 95 | 0.32"]
+    assert [len(t.boxes["rects"]) for t in tables] == [3, 4]  # a box per line, the wrapped cell's own included
+    assert "Between the tables." in [p.text for p in read.passages]
+    assert not any("Minimum wages" in t.text for t in tables)  # two columns of body text stay paragraphs
+
+
 def pixels(image):
     """A PNG from render_page as rows of darkness (0 white to 255 black), from its unfiltered rows."""
     width, height = struct.unpack(">II", image[16:24])

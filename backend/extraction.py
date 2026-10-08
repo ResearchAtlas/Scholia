@@ -420,7 +420,7 @@ def _pdf_blocks(number, lines, size, body, sections):
     passages, block, heading, previous, after_table = [], [], [], None, 0
     right_edge = max((line["right"] for line in lines), default=0.0)
     largest = max((line["size"] for line in lines), default=0.0)
-    rows = [_row(line) for line in lines]
+    cells = [_cells(line) for line in lines]
 
     def flush():
         if heading:  # consecutive heading lines of one size are one heading
@@ -442,11 +442,11 @@ def _pdf_blocks(number, lines, size, body, sections):
     for at, line in enumerate(lines):
         if at < after_table:
             continue
-        end = _table_end(lines, rows, at)
-        if end > at:  # a table starts here: what came before ends, and a reference list holds none
+        end, rows = _table_at(lines, cells, at)
+        if rows:  # a table starts here: what came before ends, and a reference list holds none
             flush()
             if sections.mode != "reference":
-                text, boxes = _table(lines[at:end], rows[at:end])
+                text, boxes = _table(lines, rows)
                 passages.extend(_pieces(text, "table", number, sections.path, None, None, boxes, size))
                 previous, after_table = None, end
                 continue
@@ -474,19 +474,24 @@ def _pdf_blocks(number, lines, size, body, sections):
     return passages
 
 
-# A table in a PDF's text layer (section 7.1: tables are their own passages): two or more
-# consecutive lines, each of the same number (two or more) of short cells, a cell being a run of
-# characters set apart by more than TABLE_GAP of the line's font size, every cell lined up with the
-# first row's by its left or its right edge, and no row further below the one above than two lines.
-# Ruled tables without such gaps, cells over several lines or merged across columns, and tables
-# whose text PDFium gives column by column are read as paragraphs.
+# A table in a PDF's text layer (section 7.1: tables are their own passages). A cell is a run of a
+# line's characters set apart from the next by more than TABLE_GAP of its font size. A table is two
+# or more rows in a run of lines of one font size, none further below the one above than two
+# lines: its first line's cells set its columns, and a row has a cell lined up with each column (by
+# its left or its right edge). A line between two rows with fewer cells, each within one column's
+# span, continues those cells (a wrapped cell). What tells a table from text set in columns (two
+# columns of body text line up too) is a column of short cells: in at least one column, every row
+# after the first (which may be a header) holds at most TABLE_SHORT characters, as a column of
+# values or codes does, so a label of any length goes with it. Not found: a table with no such
+# column (every column long text), one whose cells sit closer than TABLE_GAP (ruled tables set
+# tight), a wrapped cell in the last row (its continuation reads as text after the table), a cell
+# spanning columns, rows of differing font size, and a table PDFium gives column by column.
 TABLE_GAP = 1.5
-TABLE_CELL_CHARS = 40
+TABLE_SHORT = 30
 
 
-def _row(line):
-    """A line's cells as [(first, end, left, right)] (character positions in its text and edges) when
-    it can be a table's row: two or more cells of at most TABLE_CELL_CHARS characters."""
+def _cells(line):
+    """A line's cells: [(first, end, left, right)], character positions in its text and edges."""
     boxes, gap = line["boxes"], TABLE_GAP * max(line["size"], 1.0)
     spans, first, last = [], None, None
     for at, box in enumerate(boxes):
@@ -499,43 +504,72 @@ def _row(line):
         last = at
     if first is not None:
         spans.append((first, last + 1))
-    if len(spans) < 2 or any(end - first > TABLE_CELL_CHARS for first, end in spans):
-        return None
     return [(first, end, boxes[first][0], boxes[end - 1][2]) for first, end in spans]
 
 
-def _table_end(lines, rows, start):
-    """Where the table that starts at lines[start] ends (after its last row), or start if none does."""
-    head = rows[start]
-    if head is None:
-        return start
-    tolerance = max(lines[start]["size"], 3.0)
-    end = start + 1
+def _table_at(lines, cells, start):
+    """The table that starts at lines[start]: (the line after it, its rows), each row a list of its
+    cells, each cell [(line index, first, end)] (more than one for a wrapped cell); else (start, None)."""
+    head = cells[start]
+    if len(head) < 2:
+        return start, None
+    tolerance, size = max(lines[start]["size"], 3.0), lines[start]["size"]
+    rows, pending, end = [[[(start, c[0], c[1])] for c in head]], [], start + 1
+
+    def column(cell):  # the column whose span holds the cell, if it stays inside it
+        for k, (_, _, left, _) in enumerate(head):
+            after = head[k + 1][2] if k + 1 < len(head) else float("inf")
+            if left - tolerance <= cell[2] < after - tolerance and cell[3] < after:
+                return k
+        return None
+
     while end < len(lines):
-        row, above, line = rows[end], lines[end - 1], lines[end]
-        if row is None or len(row) != len(head) or \
-                above["bottom"] - line["top"] > 2 * max(above["top"] - above["bottom"], 1.0):
+        line, above = lines[end], lines[end - 1]
+        if abs(line["size"] - size) > 0.6 or above["bottom"] - line["top"] > 2 * max(above["top"] - above["bottom"], 1.0):
             break
-        if not all(abs(cell[2] - first[2]) <= tolerance or abs(cell[3] - first[3]) <= tolerance
-                   for cell, first in zip(row, head)):
-            break
+        row = cells[end]
+        if len(row) == len(head) and all(abs(c[2] - h[2]) <= tolerance or abs(c[3] - h[3]) <= tolerance
+                                         for c, h in zip(row, head)):
+            for _, spans in pending:  # the wrapped cells' lines, joined to the row above them
+                for k, piece in spans:
+                    rows[-1][k].append(piece)
+            pending = []
+            rows.append([[(end, c[0], c[1])] for c in row])
+        else:
+            spans = [(column(c), (end, c[0], c[1])) for c in row]
+            if not 1 <= len(row) < len(head) or any(k is None for k, _ in spans) or \
+                    len({k for k, _ in spans}) != len(spans):
+                break
+            pending.append((end, spans))
         end += 1
-    return end if end - start >= 2 else start
+    end -= len(pending)  # lines after the last row are not the table's
+
+    def length(cell):
+        return sum(e - f for _, f, e in cell) + len(cell) - 1
+
+    if len(rows) < 2 or not any(all(length(row[k]) <= TABLE_SHORT for row in rows[1:]) for k in range(len(head))):
+        return start, None
+    return end, rows
 
 
 def _table(lines, rows):
-    """A table's rows as text, a row a line and its cells apart by " | ", with each character's box."""
+    """A table's rows as text, a row a line, its cells apart by " | " and a wrapped cell's lines by a
+    space, with each character's box."""
     text, boxes = "", []
-    for line, row in zip(lines, rows):
+    for row in rows:
         if text:
             text += "\n"
             boxes.append(None)
-        for number, (first, end, _, _) in enumerate(row):
+        for number, cell in enumerate(row):
             if number:
                 text += " | "
                 boxes += [None] * 3
-            text += line["text"][first:end]
-            boxes += line["boxes"][first:end]
+            for piece, (at, first, end) in enumerate(cell):
+                if piece:
+                    text += " "
+                    boxes.append(None)
+                text += lines[at]["text"][first:end]
+                boxes += lines[at]["boxes"][first:end]
     return text, boxes
 
 
