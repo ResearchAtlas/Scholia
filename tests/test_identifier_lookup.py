@@ -766,6 +766,23 @@ async def test_a_drop_sent_in_several_requests_asks_once_counting_every_identifi
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]
 
 
+async def test_a_drop_of_45_files_asks_once_counting_every_identifier(tmp_path):
+    dois = [f"10.5555/drop.paper.{i}" for i in range(45)]
+    async with started(tmp_path / "data", scholarly(openalex={d: openalex_work(d, f"Paper {i}") for i, d in
+                                                              enumerate(dois)})) as client:
+        project = await project_of(client, level="local_only")
+        files = [(f"{i}.md", f"# Paper {i}\n\ndoi:{d}\n".encode()) for i, d in enumerate(dois)]
+        versions = []
+        for start in range(0, 45, 20):  # as the interface sends it: requests of at most 20 files, then the lookup
+            sent = await added(client, project, *files[start:start + 20], look_up=False)
+            assert sent["lookup_run_id"] is None
+            versions += [m["version_id"] for m in sent["materials"]]
+        last = await added(client, project, batch=versions)
+        [ask] = await ask_of(client, project)
+        assert ask["run_id"] == last["lookup_run_id"] and ask["params"]["identifiers"] == 45
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]
+
+
 async def test_a_drop_whose_later_request_failed_still_looks_up_what_was_added(tmp_path):
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
         project = await project_of(client)

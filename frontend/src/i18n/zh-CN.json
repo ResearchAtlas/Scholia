@@ -261,7 +261,6 @@
   "library.skipped": {
     "other": "有 {count} 个文件未添加，因为 Scholia 无法读取：{names}"
   },
-  "library.tooMany": "每次最多添加 {count} 个文件。",
   "library.alreadyHere": "你添加的某个文件已在本项目的文献库中。",
   "library.state.reading": "读取中",
   "library.state.ready": "已就绪",

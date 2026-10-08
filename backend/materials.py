@@ -7,8 +7,8 @@ version (or a new version of a material being replaced), and the background runs
 - an `extract` run per new version whose file has no extraction yet. An extraction finished by
   another project is shared instead, and its passages are queued for this project's index at once.
 - one `lookup` run for the batch, unless the project is review-locked, which never looks up. A
-  drop sent in several requests, each under the request body limit, is one batch: its earlier
-  requests defer the lookup (look_up false) and its last names the versions they added (batch).
+  drop sent in several requests, each under the request body limit, is one batch: its requests
+  defer the lookup (look_up false) and a last one names the versions they added (batch).
 A request that fails validation writes nothing; the same file added again to the same project
 reports the paper it already is.
 
@@ -68,6 +68,7 @@ log = logging.getLogger(__name__)
 
 EXTRACTION_SECONDS = 30 * 60  # per material version (section 13)
 MAX_FILES = 20  # per request
+MAX_BATCH = 10_000  # the papers one drop's lookup covers (Upload.batch); a drop's requests carry MAX_FILES each
 WAIT_SECONDS = 0.5  # a lookup's look at whether its materials have been read, and at its ask
 LOOKUP_WAIT_SECONDS = EXTRACTION_SECONDS + 60  # how long a lookup waits for its readings, at most
 PASSAGE_PAGE = 500
@@ -92,11 +93,11 @@ class Upload(BaseModel):
     files: list[NewFile] = Field(default_factory=list, max_length=MAX_FILES)
     conversation_id: str | None = Field(default=None, max_length=100)  # attached in a conversation
     material_id: str | None = Field(default=None, max_length=100)  # a new version of this material
-    # A drop sent in several requests (each under the body limit) is one batch: its earlier requests
-    # add their files with look_up false, and its last names the versions they added (batch), so one
-    # lookup covers them all. A last request with no files of its own looks up the batch alone.
+    # A drop sent in several requests (each under the body limit) is one batch: its requests add
+    # their files with look_up false, and a last one with no files names the versions they added
+    # (batch), so one lookup covers them all. (A request may also carry files and a batch together.)
     look_up: bool = True
-    batch: list[Annotated[str, Field(max_length=100)]] = Field(default_factory=list, max_length=MAX_FILES)
+    batch: list[Annotated[str, Field(max_length=100)]] = Field(default_factory=list, max_length=MAX_BATCH)
 
 
 class MaterialChange(BaseModel):

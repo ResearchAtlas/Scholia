@@ -5,7 +5,7 @@ import { ApiError, get, getBlob, post } from './api.js';
 
 export const ACCEPT = '.pdf,.docx,.html,.htm,.xhtml,.md,.markdown,.tex,.latex';
 const SUPPORTED = new Set(ACCEPT.split(','));
-export const MAX_FILES = 20; // per request (backend/materials.py MAX_FILES)
+export const MAX_FILES = 20; // per request (backend/materials.py MAX_FILES); a drop may hold any number
 export const MAX_FILE_BYTES = 100 * 1024 * 1024; // per file (backend/extraction.py MAX_FILE_BYTES)
 // The files' base64 a request may carry: one largest file (backend/local_guard.py MAX_BODY adds 64 KiB
 // for the JSON around it).
@@ -51,13 +51,13 @@ export function requestsOf(files) {
 }
 
 // Adds files to a project: from a drop, Add files, or the conversation (conversationId), or as a
-// new version of a material (materialId). A file larger than Scholia reads refuses the selection,
-// as the backend would; the rest go in as few requests as fit (requestsOf), read one request at a
-// time, and stay one batch: every request but the last leaves the lookup to it (look_up false),
-// and the last names the versions they added (batch), so a Local only project asks once, counting
-// every identifier the drop gave. Resolves to the backend's answers together; a request that fails
-// once others were added ends the sending, its error code in `problem`, and those added are still
-// looked up together.
+// new version of a material (materialId), however many. A file larger than Scholia reads refuses
+// the selection, as the backend would; the rest go in as few requests as fit (requestsOf), read
+// one request at a time, and stay one batch: a selection of more than one request adds its files
+// with look_up false, and a last request names every version they added (batch), so a Local only
+// project asks once, counting every identifier the drop gave. Resolves to the backend's answers
+// together; a request that fails once others were added ends the sending, its error code in
+// `problem`, and those added are still looked up together.
 export async function addFiles(projectId, files, { conversationId, materialId } = {}) {
   if (files.some((file) => file.size > MAX_FILE_BYTES)) throw new ApiError(413, 'file_too_large');
   const send = (body) => post(`/api/projects/${encodeURIComponent(projectId)}/materials`, {
@@ -65,22 +65,29 @@ export async function addFiles(projectId, files, { conversationId, materialId } 
   });
   const groups = requestsOf(files);
   const added = { materials: [], lookup_run_id: null };
-  const batch = []; // the versions this drop's earlier requests added, looked up with its last
-  for (const [i, group] of groups.entries()) {
-    const last = i === groups.length - 1;
+  const batch = []; // the versions this drop added, looked up together at its end
+  let problem = null;
+  const deferred = groups.length > 1 ? { look_up: false } : {};
+  for (const group of groups) {
     try {
-      const ending = last ? (batch.length ? { batch } : {}) : { look_up: false };
-      const answer = await send({ files: await Promise.all(group.map(readFile)), ...ending });
+      const answer = await send({ files: await Promise.all(group.map(readFile)), ...deferred });
       added.materials.push(...answer.materials);
       batch.push(...answer.materials.filter((m) => m.version_id && !m.existing).map((m) => m.version_id));
       added.lookup_run_id = answer.lookup_run_id ?? added.lookup_run_id;
     } catch (error) {
       if (!added.materials.length) throw error;
-      if (batch.length) added.lookup_run_id = (await send({ batch }).catch(() => null))?.lookup_run_id ?? null;
-      return { ...added, problem: error instanceof ApiError ? error.code : 'internal' };
+      problem = error instanceof ApiError ? error.code : 'internal';
+      break;
     }
   }
-  return added;
+  if (groups.length > 1 && batch.length) {
+    try {
+      added.lookup_run_id = (await send({ files: [], batch })).lookup_run_id;
+    } catch (error) {
+      problem ??= error instanceof ApiError ? error.code : 'internal';
+    }
+  }
+  return problem ? { ...added, problem } : added;
 }
 
 // Tells the open Library that a project's papers changed (files added by a drop on the window).

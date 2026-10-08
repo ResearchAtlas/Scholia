@@ -265,7 +265,6 @@
     "one": "Not added, as Scholia does not read it: {names}",
     "other": "{count} files not added, as Scholia does not read them: {names}"
   },
-  "library.tooMany": "Add at most {count} files at a time.",
   "library.alreadyHere": "A file you added is already in this project's library.",
   "library.state.reading": "Reading",
   "library.state.ready": "Ready",

@@ -238,11 +238,19 @@ test('a drop sent in several requests is one batch: the last names the papers th
     const file = (name) => new File(Array.from({ length: 60 }, () => part), name); // 60 MiB each
     const added = await addFiles('p1', [file('a.pdf'), file('b.pdf')]);
     assert.deepEqual(sent.map((r) => r.body), [
-      { files: ['a.pdf'], look_up: false }, // recorded, its lookup left to the drop's last request
-      { files: ['b.pdf'], batch: ['v10'] }]); // which looks up both: one question in a Local only project
+      { files: ['a.pdf'], look_up: false }, // recorded, their lookup left to the drop's end
+      { files: ['b.pdf'], look_up: false },
+      { files: [], batch: ['v10', 'v20'] }]); // which looks up both: one question in a Local only project
     assert.ok(sent.every((r) => r.size <= REQUEST_FILE_BYTES + 64 * 1024)); // each under the backend's limit
     assert.deepEqual(added.materials.map((m) => m.id), ['m10', 'm20']);
-    assert.equal(added.lookup_run_id, 'lookup2');
+    assert.equal(added.lookup_run_id, 'lookup3');
+
+    // A drop of 45 files: three requests of files, then one naming all 45 for their one lookup.
+    sent.length = 0;
+    const many = await addFiles('p1', Array.from({ length: 45 }, (_, i) => new File([`# Paper ${i}`], `${i}.md`)));
+    assert.deepEqual(sent.map((r) => [r.body.files.length, r.body.look_up, r.body.batch?.length]),
+      [[20, false, undefined], [20, false, undefined], [5, false, undefined], [0, undefined, 45]]);
+    assert.equal(many.materials.length, 45);
   } finally {
     globalThis.fetch = realFetch;
     globalThis.FileReader = realReader;

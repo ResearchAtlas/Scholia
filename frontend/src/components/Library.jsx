@@ -8,7 +8,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get } from '../api.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, LOOKUP_OUTCOMES, MAX_FILES, addFiles, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey,
+import { ACCEPT, LOOKUP_OUTCOMES, addFiles, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey,
   typeKey, unsettled, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
@@ -59,10 +59,6 @@ export async function addTo(projectId, fileList, t, notify, options) {
   const { kept, skipped } = sortFiles(fileList);
   if (skipped.length) notify(t('library.skipped', { count: skipped.length, names: skipped.join(', ') }));
   if (!kept.length) return null;
-  if (kept.length > MAX_FILES) {
-    notify(t('library.tooMany', { count: MAX_FILES }));
-    return null;
-  }
   try {
     const result = await addFiles(projectId, kept, options);
     if (result.problem) notify(errorText(t, result.problem)); // some were added before it failed
