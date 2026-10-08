@@ -6,8 +6,9 @@ arXiv ID to export.arxiv.org. Each request is an anonymous single-record GET: no
 address, no credentials (the outbound gate refuses any). Each source is asked one request at a
 time across every lookup, held until its answer, and paced (`SPACING`: arXiv asks for one request
 every 3 seconds); a request that meets 429, a server error or a network failure is retried at
-most twice, after 1 and 4 seconds (a Retry-After within RETRY_AFTER_MAX instead), each within
-TIMEOUT seconds; an answer is read as it streams in, at most MAX_BODY bytes once decoded. The
+most twice, after 1 and 4 seconds (a Retry-After within RETRY_AFTER_MAX instead, in seconds or as
+a date), each within TIMEOUT seconds; an answer is read as it streams in, at most MAX_BODY bytes
+once decoded. The
 client is the outbound gate's, made for the project with its dispatch check, so a refusal
 (OutboundDenied) is final and is raised.
 
@@ -18,10 +19,12 @@ nothing on retraction. Nothing here logs an identifier or a response.
 
 import asyncio
 import contextlib
+import email.utils
 import json
 import time
 import zlib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import quote
 import httpx
 
@@ -154,10 +157,20 @@ async def _fetch(client, url):
 
 
 def _retry_after(response):
+    """Retry-After as seconds from now (RFC 9110 section 10.2.3): its delay-seconds, or the time until
+    its HTTP-date. None, so the fixed delays apply, when it is absent, malformed or already past;
+    _get then bounds it by RETRY_AFTER_MAX."""
+    value = response.headers.get("retry-after", "").strip()
+    if value.isdigit():
+        return float(value)
     try:
-        return float(response.headers.get("retry-after", ""))
-    except ValueError:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
         return None
+    if when.tzinfo is None:  # an HTTP-date is in GMT
+        when = when.replace(tzinfo=UTC)
+    wait = (when - datetime.now(UTC)).total_seconds()
+    return wait if wait > 0 else None
 
 
 def _json(body):

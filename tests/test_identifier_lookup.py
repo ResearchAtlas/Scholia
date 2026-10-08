@@ -601,6 +601,22 @@ async def test_a_rate_limited_request_is_retried_and_resolves(tmp_path):
         assert paper["title"] == TITLE and mock.hosts == ["api.openalex.org"] * 2
 
 
+@pytest.mark.parametrize("value, expected", [
+    ("7", (7.0, 7.0)), ("0", (0.0, 0.0)),  # delay-seconds
+    ("in 5", None), ("-3", None), ("", None), ("Fri, 32 Foo 9999 99:99:99 GMT", None),  # malformed: no delay
+    ("past", None),  # a date already past: no delay
+    ("future", (3.0, 5.5)),  # an HTTP-date: the seconds until then
+])
+async def test_retry_after_is_read_as_seconds_or_as_a_date(value, expected):
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+    now = datetime.now(UTC)
+    value = {"past": format_datetime(now - timedelta(minutes=5), usegmt=True),
+             "future": format_datetime(now + timedelta(seconds=5), usegmt=True)}.get(value, value)
+    after = lookup._retry_after(httpx.Response(429, headers={"retry-after": value} if value else {}))
+    assert after is None if expected is None else expected[0] <= after <= expected[1]
+
+
 async def test_the_starting_values_for_pacing_retries_and_time():
     spacing, retries, timeout = DEFAULTS  # sections 7.6 and 13
     assert (spacing["arxiv"], retries, timeout) == (3.0, (1.0, 4.0), 20.0)
