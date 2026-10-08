@@ -329,6 +329,19 @@ async def test_a_failed_lookup_leaves_the_material_imported_with_incomplete_meta
         assert paper["title"] == TITLE and paper["checked_by"] == "lookup"
 
 
+async def test_openalex_unavailable_and_crossref_without_the_record_is_unavailable_not_not_found(tmp_path):
+    mock = MockScholarly()  # Crossref holds no record for it
+    mock.answers = {"api.openalex.org": [503, 503, 503]}  # OpenAlex never answers
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "unavailable"  # OpenAlex may hold it: not known to be missing
+        run = await run_finished(client, result["lookup_run_id"])
+        assert (run["status"], run["result"], run["retryable"]) == ("failed", {"reason": "unavailable"}, True)
+        assert mock.hosts == ["api.openalex.org"] * 3 + ["api.crossref.org"]
+
+
 async def test_an_identifier_no_service_knows_is_a_finished_lookup_not_a_failed_one(tmp_path):
     async with started(tmp_path / "data") as client:  # neither stand-in holds a record for it
         project = await project_of(client)

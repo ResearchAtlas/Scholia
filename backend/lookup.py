@@ -75,13 +75,19 @@ class Pace:
 
 
 async def resolve(client, scheme, identifier, pace) -> Found:
+    """What the sources hold for the identifier, or Failed: not_found only when every source asked
+    answered that it has no record (OpenAlex's outage with Crossref's not found stays unavailable,
+    so the lookup can be tried again)."""
     if scheme == "arxiv":
         return _arxiv(identifier, await _get(client, ARXIV.format(quote(identifier, safe="/.")), "arxiv", pace))
     try:
         return _openalex(identifier, await _get(client, OPENALEX.format(quote(identifier, safe="/")), "openalex", pace))
-    except Failed:
-        pass
-    return _crossref(identifier, await _get(client, CROSSREF.format(quote(identifier, safe="/")), "crossref", pace))
+    except Failed as failed:
+        openalex = failed.code
+    try:
+        return _crossref(identifier, await _get(client, CROSSREF.format(quote(identifier, safe="/")), "crossref", pace))
+    except Failed as failed:
+        raise Failed("unavailable" if "unavailable" in (openalex, failed.code) else "not_found") from None
 
 
 async def _get(client, url, source, pace):
