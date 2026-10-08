@@ -38,7 +38,8 @@ name. A host on this machine (127.0.0.0/8, ::1, IPv4-compatible forms, 0.0.0.0,
 exact origins count there, and nothing else does. Names are never resolved, so
 `localhost` and `127.0.0.1` are different origins.
 
-- Normal: every kind.
+- Normal: every kind; a model download source only for the General project's client (which
+  is always Normal), never a research project's.
 - Private: model requests only to OpenRouter, on the Private allowlist, carrying
   provider.zdr = true and the entry's other flags, `X-OpenRouter-Cache: false`, limited
   to the model's zero-retention endpoints above the window where OpenRouter compresses
@@ -46,7 +47,8 @@ exact origins count there, and nothing else does. Names are never resolved, so
   sent with a key whose data-settings confirmation is current (see
   `_private_problem`); and a local provider only after the researcher declared its
   exact origin, as for Local only, without OpenRouter's flags or key confirmation
-  (ticket 64). Scholarly APIs, open-access hosts, the helper and model downloads.
+  (ticket 64). Scholarly APIs, open-access hosts and the helper; no model download (that is
+  the General project's).
 - Local only: the helper; a local provider only after the researcher declared
   its exact origin (`local_declarations`); scholarly APIs and open-access hosts
   only for a client marked as approved by the researcher. Nothing else.
