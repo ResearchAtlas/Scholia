@@ -11,27 +11,34 @@ BODY = ("Minimum wages raise the earnings of low-paid workers in the synthetic p
         "Employment effects are small and not significant in most specifications.")
 
 
-def pdf(pages, *, scanned=(), size=(612, 792)):
+def pdf(pages, *, scanned=(), size=(612, 792), rotation=0):
     """A PDF whose pages hold [(x, y, font size, text), ...] lines in Helvetica; a page number in
-    scanned holds only a full-page image (no text), as a scanned page does."""
+    scanned holds only a full-page image (no text), as a scanned page does. With rotation (90, 180
+    or 270), each page is stored turned and carries /Rotate, its text drawn turned back: it shows
+    upright, size wide and high, with each line where (x, y) says, as a landscape scan or a
+    rotated page does."""
     import pypdfium2 as pdfium
     import pypdfium2.raw as raw
 
+    width, height = size if rotation in (0, 180) else size[::-1]  # the page as stored
+    place = {0: lambda x, y: (1, 0, 0, 1, x, y), 90: lambda x, y: (0, 1, -1, 0, width - y, x),
+             180: lambda x, y: (-1, 0, 0, -1, width - x, height - y), 270: lambda x, y: (0, -1, 1, 0, y, height - x)}
     document = pdfium.PdfDocument.new()
     for number, lines in enumerate(pages, start=1):
-        page = document.new_page(*size)
+        page = document.new_page(width, height)
+        page.set_rotation(rotation)
         if number in scanned:
             image = pdfium.PdfImage.new(document)
             bitmap = pdfium.PdfBitmap.new_native(40, 40, raw.FPDFBitmap_BGR)
             bitmap.fill_rect((180, 180, 180, 255), 0, 0, 40, 40)
             image.set_bitmap(bitmap)
-            image.set_matrix(pdfium.PdfMatrix().scale(*size))
+            image.set_matrix(pdfium.PdfMatrix().scale(width, height))
             page.insert_obj(image)
         for x, y, font_size, text in lines:
             obj = raw.FPDFPageObj_NewTextObj(document, b"Helvetica", font_size)
             encoded = (text + "\0").encode("utf-16-le")
             raw.FPDFText_SetText(obj, ctypes.cast(ctypes.c_char_p(encoded), ctypes.POINTER(raw.FPDF_WCHAR)))
-            raw.FPDFPageObj_Transform(obj, 1, 0, 0, 1, x, y)
+            raw.FPDFPageObj_Transform(obj, *place[rotation](x, y))
             raw.FPDFPage_InsertObject(page, obj)
         page.gen_content()
     out = io.BytesIO()
@@ -39,7 +46,7 @@ def pdf(pages, *, scanned=(), size=(612, 792)):
     return out.getvalue()
 
 
-def paper_pdf(title="A Synthetic Study of Minimum Wages", doi=DOI, scanned=0):
+def paper_pdf(title="A Synthetic Study of Minimum Wages", doi=DOI, scanned=0, rotation=0):
     """A two-page paper: a title, its DOI, an abstract, a section with two paragraphs and a caption,
     and references on the second page (with a DOI of their own that must not be taken); then
     `scanned` pages holding only an image."""
@@ -55,7 +62,7 @@ def paper_pdf(title="A Synthetic Study of Minimum Wages", doi=DOI, scanned=0):
     second = [(72, 720, 14, "References"),
               (72, 700, 10, "Smith, J. (2020). An earlier synthetic paper. doi:10.5555/cited.paper.002"),
               (72, 684, 10, "Doe, A. (2019). Another synthetic paper.")]
-    return pdf([first, second] + [[]] * scanned, scanned=range(3, 3 + scanned))
+    return pdf([first, second] + [[]] * scanned, scanned=range(3, 3 + scanned), rotation=rotation)
 
 
 def docx(paragraphs, *, tables=()):

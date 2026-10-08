@@ -2,9 +2,10 @@
 
 `extract(data, media_type, stop)` parses one file from its own structure, never by a model:
 - PDF with pypdfium2: per page, text with PDFium's character range and the characters' boxes
-  merged per line (fractions of the page, top-left origin). A page with fewer than 100
-  characters whose images cover more than 60% of it, or whose characters mostly have no
-  Unicode mapping, is scanned: it yields no passage and is counted for OCR (S1-20).
+  merged per line (fractions of the page as displayed and rendered, its rotation applied, from its
+  top left). A page with fewer than 100 characters whose images cover more than 60% of it, or
+  whose characters mostly have no Unicode mapping, is scanned: it yields no passage and is
+  counted for OCR (S1-20).
 - DOCX from its XML (zip and the standard library): paragraphs by style, tables.
 - HTML with the standard library's parser: text only; nothing it names is fetched.
 - Markdown with a small parser of its own.
@@ -21,6 +22,7 @@ pdfium is not thread-safe, so every use of it holds PDFIUM. Nothing here logs co
 libraries it drives are kept from logging it.
 """
 
+import ctypes
 import io
 import logging
 import math
@@ -48,7 +50,7 @@ EXTENSIONS = {".pdf": PDF, ".docx": DOCX, ".html": HTML, ".htm": HTML, ".xhtml":
               ".markdown": MARKDOWN, ".tex": LATEX, ".latex": LATEX}
 # Each media type's extractor and its version. Bump a version when its parser's output changes:
 # extractions are shared by file and extractor version.
-EXTRACTORS = {PDF: ("pdf", "pdf-1"), DOCX: ("docx", "docx-1"), HTML: ("html", "html-1"),
+EXTRACTORS = {PDF: ("pdf", "pdf-2"), DOCX: ("docx", "docx-1"), HTML: ("html", "html-1"),
               MARKDOWN: ("markdown", "markdown-1"), LATEX: ("latex", "latex-1")}
 PDFIUM = threading.Lock()
 MAX_PAGE_PIXELS = 8 * 1024 * 1024  # a rendered page image's pixels: a letter page at scale 3 has 4.4 million
@@ -325,13 +327,16 @@ def _pdf(data, stop, progress):
 
 def _pdf_page(page, raw):
     """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, index, line) or None), "size",
-    "left", "right", "top", "bottom"}], its size, and whether it is scanned."""
-    width, height = page.get_size()
+    "left", "right", "top", "bottom"}], its size, and whether it is scanned. Sizes, boxes and edges
+    are of the page as displayed and rendered, its rotation and crop applied (_displayed), in points
+    from its bottom left."""
+    width, height = page.get_size()  # as displayed: a page turned a quarter is as wide as it was high
+    shown = _displayed(page, raw, width, height)
     textpage = page.get_textpage()
     try:
         count = textpage.count_chars()
         text = textpage.get_text_range() if count else ""
-        aligned = len(text) == count and page.get_rotation() == 0
+        aligned = len(text) == count
         mapped = unmapped = 0
         lines, chars, boxes = [], [], []
         for index, char in enumerate(text):
@@ -347,7 +352,7 @@ def _pdf_page(page, raw):
                 elif not char.isspace():
                     mapped += 1
                 if not char.isspace():
-                    left, bottom, right, top = textpage.get_charbox(index)
+                    left, bottom, right, top = shown(*textpage.get_charbox(index))
                     box = (left, bottom, right, top, index, len(lines), raw.FPDFText_GetFontSize(textpage, index))
             elif not char.isspace():
                 mapped += 1
@@ -360,13 +365,35 @@ def _pdf_page(page, raw):
     cover = 0.0
     if mapped < SCANNED_CHARS:
         for image in page.get_objects(filter=[raw.FPDF_PAGEOBJ_IMAGE], max_depth=4):
-            left, bottom, right, top = image.get_bounds()
+            left, bottom, right, top = shown(*image.get_bounds())
             cover += max(0.0, min(right, width) - max(left, 0)) * max(0.0, min(top, height) - max(bottom, 0))
     scanned = (mapped < SCANNED_CHARS and cover > SCANNED_IMAGE_COVER * width * height) or \
         unmapped > mapped
     if scanned:
         return [], (width, height), True
     return [_line(chars, boxes) for chars, boxes in lines if "".join(chars).strip()], (width, height), False
+
+
+def _displayed(page, raw, width, height):
+    """The map of a box (left, bottom, right, top) in the page's own PDF space to the page as PDFium
+    displays and renders it (its /Rotate and crop box applied), in points from its bottom left: the
+    transform PDFium renders with, read at three points (its output is whole device units, 1/64 pt)."""
+    k = 64
+
+    def device(x, y):
+        dx, dy = ctypes.c_int(), ctypes.c_int()
+        raw.FPDF_PageToDevice(page.raw, 0, 0, round(width * k), round(height * k), 0, float(x), float(y),
+                              ctypes.byref(dx), ctypes.byref(dy))
+        return dx.value / k, height - dy.value / k
+
+    (ox, oy), (ax, ay), (bx, by) = device(0, 0), device(1000, 0), device(0, 1000)
+    a, b, c, d = (ax - ox) / 1000, (ay - oy) / 1000, (bx - ox) / 1000, (by - oy) / 1000
+
+    def shown(left, bottom, right, top):
+        xs = [a * x + c * y + ox for x in (left, right) for y in (bottom, top)]
+        ys = [b * x + d * y + oy for x in (left, right) for y in (bottom, top)]
+        return min(xs), min(ys), max(xs), max(ys)
+    return shown
 
 
 def _line(chars, boxes):

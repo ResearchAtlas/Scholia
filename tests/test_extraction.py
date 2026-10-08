@@ -70,6 +70,49 @@ def test_a_pdf_papers_title_sections_abstract_caption_and_references():
     assert read.passages[3].section_path == ["1 Introduction"] and read.passages[6].section_path == ["References"]
 
 
+def pixels(image):
+    """A PNG from render_page as rows of darkness (0 white to 255 black), from its unfiltered rows."""
+    width, height = struct.unpack(">II", image[16:24])
+    channels = 4 if image[25] == 6 else 3
+    data, at = b"", 8
+    while at < len(image):
+        (length,) = struct.unpack(">I", image[at:at + 4])
+        data += image[at + 8:at + 8 + length] if image[at + 4:at + 8] == b"IDAT" else b""
+        at += 12 + length
+    raw, stride = zlib.decompress(data), 1 + width * channels
+    return [[255 - min(raw[y * stride + 1 + x * channels:y * stride + 1 + x * channels + 3]) for x in range(width)]
+            for y in range(height)]
+
+
+def ink_on(data, passages):
+    """Of page 1 as rendered: the share of its dark pixels inside its passages' boxes, and each box's
+    share of dark pixels."""
+    dark = pixels(extraction.render_page(data, 1, scale=1.0))
+    height, width = len(dark), len(dark[0])
+    rects = [[int(left * width), int(top * height), int(right * width), int(bottom * height)]
+             for p in passages if p.page == 1 for left, top, right, bottom in p.boxes["rects"]]
+    inside = {(x, y) for left, top, right, bottom in rects
+              for y in range(top - 1, bottom + 2) for x in range(left - 1, right + 2)}
+    ink = {(x, y) for y in range(height) for x in range(width) if dark[y][x] > 128}
+    return len(ink & inside) / len(ink), [
+        sum((x, y) in ink for y in range(top, bottom + 1) for x in range(left, right + 1))
+        / ((bottom - top + 1) * (right - left + 1)) for left, top, right, bottom in rects]
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+def test_a_rotated_page_keeps_its_passages_and_its_boxes_sit_on_its_rendered_text(rotation):
+    upright_data, data = synthetic.paper_pdf(), synthetic.paper_pdf(rotation=rotation)  # stored turned, shown upright
+    upright, turned = extract(upright_data, extraction.PDF).passages, extract(data, extraction.PDF).passages
+    assert kinds(turned) == kinds(upright) and all(p.boxes for p in turned)
+    for a, b in zip(upright, turned):  # the same rectangles on the page as it is shown
+        assert all(abs(u - v) < 0.01 for ra, rb in zip(a.boxes["rects"], b.boxes["rects"]) for u, v in zip(ra, rb))
+    covered, density = ink_on(data, turned)
+    # As much of the rendered text lies in the boxes as on the upright page (all but its two
+    # headings, which are no passage), and every box is on text.
+    assert covered > 0.9 and abs(covered - ink_on(upright_data, upright)[0]) < 0.005
+    assert min(density) > 0.1
+
+
 def test_image_only_pages_wait_for_ocr_and_give_no_passage():
     read = extract(synthetic.paper_pdf(scanned=1), extraction.PDF)
     assert (read.pages, read.ocr_pages) == (3, 1) and {p.page for p in read.passages} == {1, 2}

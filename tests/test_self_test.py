@@ -35,7 +35,7 @@ def test_the_interface_check_serves_the_page_and_what_it_names(tmp_path):
 
 
 def test_the_materials_check_reads_a_pdf_and_latex_and_renders_a_page():
-    assert st.check_materials() == {"pdf": "pdf-1+pypdfium2-5.14.0", "latex": "latex-1+pylatexenc-2.11"}
+    assert st.check_materials() == {"pdf": "pdf-2+pypdfium2-5.14.0", "latex": "latex-1+pylatexenc-2.11"}
 
 
 def test_the_encrypted_zip_check_writes_and_reads_back_an_aes_zip():
