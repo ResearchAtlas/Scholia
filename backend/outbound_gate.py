@@ -96,8 +96,11 @@ hosts file that maps "localhost" elsewhere, or a public name that resolves to
 this machine or a private network address, is not detected; only an
 open-access fetch can reach such a name.
 Cross-origin redirects are refused even between allowed hosts, whether or not
-the client follows them, so a source that redirects to another host (a download
-CDN, say) needs a change here when it is wired in.
+the client follows them, with one exception: a model download's redirect from a
+source (huggingface.co, modelscope.cn) to one of the file hosts that source was seen
+redirecting to (MODEL_FILE_HOSTS). Such a host is a destination only as that one-time
+hop, a public fetch checked and audited like the first request, and the file's
+SHA-256 is checked by its downloader (backend/local_helper.py).
 """
 
 import asyncio
@@ -137,13 +140,23 @@ SCHOLARLY_APIS = frozenset({
     ("https", "api.crossref.org", 443),
     ("https", "export.arxiv.org", 443),
 })
-# ponytail: the sources' main hosts only; the PR that wires model downloads adds
-# the file hosts they redirect to, once checked.
 MODEL_SOURCES = frozenset({
     ("https", "huggingface.co", 443),
     ("https", "modelscope.cn", 443),
     ("https", "www.modelscope.cn", 443),
 })
+# The file hosts each source redirected its pinned files to in the preparation downloads of
+# 2026-10-08 (S1-16): reached only as a redirect hop from that source (see _download_hop).
+# ponytail: exactly the hosts observed; a source that sends another region's host is refused
+# until it is checked and added here.
+_HF_FILES = frozenset({("https", "us.aws.cdn.hf.co", 443)})
+_MODELSCOPE_FILES = frozenset({("https", "cdn-lfs-cn-1.modelscope.cn", 443)})
+MODEL_FILE_HOSTS = {
+    ("https", "huggingface.co", 443): _HF_FILES,
+    ("https", "modelscope.cn", 443): _MODELSCOPE_FILES,
+    ("https", "www.modelscope.cn", 443): _MODELSCOPE_FILES,
+}
+_FILE_HOSTS = _HF_FILES | _MODELSCOPE_FILES
 # Top-level fields a Private request may carry. Anything else (plugins, web
 # search options, presets, newer server-side features) is refused.
 PRIVATE_FIELDS = frozenset({
@@ -168,7 +181,7 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 _THIS_HOST = (ipaddress.IPv4Network("127.0.0.0/8"), ipaddress.IPv4Network("0.0.0.0/8"))
 _NAT64 = ipaddress.IPv6Network("64:ff9b::/96")  # a gateway connects to the IPv4 address in its last 32 bits
 _GLOBAL_UNICAST = ipaddress.IPv6Network("2000::/3")  # the only IPv6 block assigned for public addresses
-_KNOWN = SCHOLARLY_APIS | MODEL_SOURCES | {OPENROUTER}
+_KNOWN = SCHOLARLY_APIS | MODEL_SOURCES | _FILE_HOSTS | {OPENROUTER}
 # Marks a request httpx builds to follow a redirect from an allowed open-access
 # fetch; httpx copies a request's extensions into the redirect it builds. The
 # value is a one-time token from _Scope.expect, bound to the next URL.
@@ -198,7 +211,7 @@ class GateInputs:
     """What the gate needs from settings and the Private flows. A missing input refuses.
 
     provider_urls: base URLs of the model providers configured in settings.
-    helper_url: base URL of the running local helper, on loopback.
+    helper_urls: base URLs of the running local helper processes, on loopback.
     private_route(conn, provider, key, model): the enabled Private allowlist entry covering an
         OpenRouter model id (a mapping with its required_flags, route_key, terms_url and
         checked_on, and the model's zdr_endpoints as the catalog read with key lists
@@ -211,7 +224,7 @@ class GateInputs:
     """
 
     provider_urls: Collection[str] = ()
-    helper_url: str | None = None
+    helper_urls: Collection[str] = ()
     private_route: Callable[[object, str | None, str, str], Mapping | None] | None = None  # see above
     key_attested: Callable[[object, str | None, str], str | None] | None = None
 
@@ -429,10 +442,10 @@ class OutboundGate:
         # checks only when the project is Private now. The level is read again in the
         # transaction, where the route and the key's confirmation are checked.
         seen = self._db.read(lambda conn: _level(conn, scope.project_id))
-        error, providers, helper, inputs = None, frozenset(), None, None
+        error, providers, helpers, inputs = None, frozenset(), frozenset(), None
         try:
             inputs = self._inputs()
-            providers, helper = _origins(inputs)
+            providers, helpers = _origins(inputs)
             if target != OPENROUTER:
                 private_problem = "not_openrouter"
             elif seen == "private":
@@ -445,7 +458,7 @@ class OutboundGate:
         # (not for the helper, the app's own child).
         owned = None
         if self._local_listener is not None and target is not None and target[0] == "http" \
-                and _is_this_host(target[1]) and target in providers and target != helper:
+                and _is_this_host(target[1]) and target in providers and target not in helpers:
             try:
                 owned = bool(self._local_listener(target[1], target[2]))
             except Exception:  # unknown counts as not ours
@@ -464,7 +477,7 @@ class OutboundGate:
             elif error is not None:
                 reason = "gate_inputs_unavailable"
             else:
-                kind = _classify(target, providers, helper, link)
+                kind = _classify(target, providers, helpers, link, hop)
                 # An open-access fetch is bound to the candidate's exact link, as sent;
                 # other URLs on its origin only as redirects followed from it.
                 bound = hop or (link is not None and target == _origin(link) and request.url.raw_path == link.raw_path)
@@ -487,7 +500,7 @@ class OutboundGate:
                         error, admitted = caught, False
                     if admitted is not True:
                         reason = "revoked"
-            shown = _shown(conn, target, kind, link, providers, helper)
+            shown = _shown(conn, target, kind, link, providers, helpers)
             _record(conn, request, scope, level, kind, shown, reason)
             # What was applied, as decided here: for the run's record (ticket 18's provenance).
             terms = None if reason else _terms(conn, level, kind, target, entries)
@@ -500,12 +513,12 @@ class OutboundGate:
 
     def _refuse_redirect(self, request: httpx.Request, scope: _Scope, target) -> None:
         try:
-            providers, helper = _origins(self._inputs())
+            providers, helpers = _origins(self._inputs())
         except Exception:  # they only name the destination; the refusal stands either way
-            providers, helper = frozenset(), None
+            providers, helpers = frozenset(), frozenset()
 
         def record(conn):
-            shown = _shown(conn, target, None, _candidate_link(conn, scope), providers, helper)
+            shown = _shown(conn, target, None, _candidate_link(conn, scope), providers, helpers)
             _record(conn, request, scope, _level(conn, scope.project_id), None, shown, "cross_origin_redirect")
             return shown
 
@@ -521,10 +534,10 @@ class _Transport(httpx.BaseTransport):
         _dispatched(request, terms)
         response = self._inner.handle_request(request)
         leaves, target = _redirect(request, response)
-        if leaves:
+        if leaves and not _download_hop(kind, request, target):
             response.close()
             self._gate._refuse_redirect(request, self._scope, target)
-        if kind is Kind.OPEN_ACCESS and response.has_redirect_location:
+        if kind in (Kind.OPEN_ACCESS, Kind.MODEL_DOWNLOAD) and response.has_redirect_location:
             request.extensions[_HOP] = self._scope.expect(_next_url(request, response))  # httpx copies it
         return response
 
@@ -554,10 +567,10 @@ class _AsyncTransport(httpx.AsyncBaseTransport):
         _dispatched(request, terms)
         response = await self._inner.handle_async_request(request)
         leaves, target = _redirect(request, response)
-        if leaves:
+        if leaves and not _download_hop(kind, request, target):
             await response.aclose()
             await asyncio.to_thread(self._gate._refuse_redirect, request, self._scope, target)
-        if kind is Kind.OPEN_ACCESS and response.has_redirect_location:
+        if kind in (Kind.OPEN_ACCESS, Kind.MODEL_DOWNLOAD) and response.has_redirect_location:
             request.extensions[_HOP] = self._scope.expect(_next_url(request, response))
         return response
 
@@ -745,8 +758,9 @@ def _level(conn, project_id):
 
 
 def _origins(inputs):
-    """The configured providers' origins and the helper's origin."""
-    return frozenset(_origin_of(url) for url in inputs.provider_urls), _origin_of(inputs.helper_url)
+    """The configured providers' origins and the running helpers' origins."""
+    return (frozenset(_origin_of(url) for url in inputs.provider_urls),
+            frozenset(_origin_of(url) for url in inputs.helper_urls) - {None})
 
 
 def _candidate_link(conn, scope):
@@ -762,11 +776,11 @@ def _candidate_link(conn, scope):
         return None
 
 
-def _shown(conn, target, kind, link, providers, helper):
+def _shown(conn, target, kind, link, providers, helpers):
     """How the audit log names a destination: its canonical origin when the gate
     recognizes it, else "unknown", so a refused host's own name is never kept."""
     if target is not None and (
-        kind is not None or target in _KNOWN or target in providers or target == helper
+        kind is not None or target in _KNOWN or target in providers or target in helpers
         or (link is not None and target == _origin(link))
         or any(_origin_of(url) == target for (url,) in conn.execute("SELECT base_url FROM local_declarations"))
     ):
@@ -774,13 +788,13 @@ def _shown(conn, target, kind, link, providers, helper):
     return "unknown"
 
 
-def _classify(target, providers, helper, link):
+def _classify(target, providers, helpers, link, hop):
     if target is None:
         return None
     if _is_this_host(target[1]):
-        # Loopback is only transport: just the helper and configured providers
+        # Loopback is only transport: just the helpers and configured providers
         # count, at their exact origins, never a candidate's link.
-        if target == helper:
+        if target in helpers:
             return Kind.LOCAL_HELPER
         return Kind.LOCAL_PROVIDER if target in providers else None
     if target in providers:
@@ -791,6 +805,8 @@ def _classify(target, providers, helper, link):
         return Kind.SCHOLARLY_API
     if target in MODEL_SOURCES:
         return Kind.MODEL_DOWNLOAD
+    if target in _FILE_HOSTS:  # only as a model download's redirect hop (see _download_hop)
+        return Kind.MODEL_DOWNLOAD if hop else None
     if link is not None and target == _origin(link):
         return Kind.OPEN_ACCESS
     return None
@@ -937,6 +953,12 @@ def _carries(body, flags) -> bool:
         elif type(have) is not type(want) or have != want:  # 1 is not true
             return False
     return True
+
+
+def _download_hop(kind, request: httpx.Request, target) -> bool:
+    """Whether a redirect away from the request's origin is a model download's hop from its
+    source to one of the file hosts that source uses (MODEL_FILE_HOSTS)."""
+    return kind is Kind.MODEL_DOWNLOAD and target in MODEL_FILE_HOSTS.get(_origin(request.url), ())
 
 
 def _redirect(request: httpx.Request, response: httpx.Response):

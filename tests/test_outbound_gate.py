@@ -80,7 +80,7 @@ def setup(db, remote):
     """A gate over db and remote, with full inputs that a test can change."""
     state = {"inputs": GateInputs(
         provider_urls=(OPENROUTER_API, OTHER_PROVIDER, LOCAL_SERVER),
-        helper_url=HELPER,
+        helper_urls=(HELPER,),
         private_route=lambda conn, provider, key, model: entry(ZDR_ONLY) if model in ROUTES else None,
         key_attested=lambda conn, provider, key: CONFIRMED_UNTIL if key == KEY else None,
     )}
@@ -207,7 +207,7 @@ def test_host_case_is_normalized_not_a_bypass(db, remote, setup):
 
 @pytest.mark.parametrize("kind", ["model_provider", "local_helper", "local_provider"])
 def test_missing_inputs_refuse(db, remote, setup, kind):
-    setup.change(provider_urls=(), helper_url=None)
+    setup.change(provider_urls=(), helper_urls=())
     method, url, kwargs = KINDS[kind]
     with setup.gate.client(project(db)) as client:
         refused(client, method, url, "unknown_destination", **kwargs)
@@ -1392,7 +1392,7 @@ def test_every_audit_field_is_from_a_fixed_set_or_a_canonical_origin(db, remote,
 
 
 def test_ipv6_destinations_are_shown_with_brackets(db, remote, setup):
-    setup.change(helper_url="http://[::1]:8765")
+    setup.change(helper_urls=("http://[::1]:8765",))
     with setup.gate.client(project(db)) as client:
         client.get("http://[::1]:8765/health")
     assert audit(db)[0][1]["destination"] == "http://[::1]:8765"
@@ -1533,7 +1533,7 @@ def test_a_request_must_name_the_host_it_connects_to(db, remote, setup, kwargs):
 
 
 def test_a_helper_url_off_loopback_is_not_the_helper(db, remote, setup):
-    setup.change(helper_url="https://helper.example")
+    setup.change(helper_urls=("https://helper.example",))
     with setup.gate.client(project(db, "local_only")) as client:
         refused(client, "GET", "https://helper.example/health", "unknown_destination")
     assert remote.received == []
@@ -1570,7 +1570,7 @@ async def test_async_client_checks_and_audits_the_same_way(db, remote, setup):
 @pytest.mark.parametrize("ours, allowed", [(True, True), (False, False)])
 def test_a_plain_http_local_provider_gets_a_request_only_from_this_accounts_listener(db, remote, ours, allowed):
     asked = []
-    inputs = GateInputs(provider_urls=(LOCAL_SERVER, "https://127.0.0.1:8443/v1"), helper_url=HELPER)
+    inputs = GateInputs(provider_urls=(LOCAL_SERVER, "https://127.0.0.1:8443/v1"), helper_urls=(HELPER,))
     gate = OutboundGate(db, lambda: inputs, transport=httpx.MockTransport(remote),
                         local_listener=lambda host, port: asked.append((host, port)) or ours)
     project_id = project(db)
@@ -1793,3 +1793,90 @@ def test_a_deletion_is_refused_when_a_running_loop_never_marks_it(db, monkeypatc
     assert errors == ["the event loop did not mark a revocation"]
     assert db.read(lambda conn: conn.execute("SELECT count(*) FROM projects WHERE id = ?", (project_id,)).fetchone()) == (1,)
     assert gate._under_way == {}
+
+
+# Model downloads' redirect hops (S1-16): a source to the file hosts it was seen redirecting to
+
+
+HF_FILE = "https://huggingface.co/Qwen/Example-GGUF/resolve/0123abc/model.gguf"
+HF_CDN = "https://us.aws.cdn.hf.co/xet-bridge-us/0123/abcd?X-Amz-Signature=signed&filename=model.gguf"
+MS_FILE = "https://modelscope.cn/models/Qwen/Example-GGUF/resolve/0123abc/model.gguf"
+MS_CDN = "https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/01/23/abcd?auth_key=signed"
+
+
+@pytest.mark.parametrize("source, file_host", [(HF_FILE, HF_CDN), (MS_FILE, MS_CDN)])
+def test_a_model_download_follows_its_sources_redirect_to_a_listed_file_host(db, remote, setup, source, file_host):
+    remote.redirects[source] = (302, file_host)
+    project_id = project(db)
+    with setup.gate.client(project_id, follow_redirects=True) as client:
+        assert client.get(source).status_code == 200
+    assert [str(r.url) for r in remote.received] == [source, file_host]
+    rows = [row for _, row in audit(db)]
+    assert [(row["decision"], row["kind"], row["method"]) for row in rows] == [
+        ("allow", "model_download", "GET"), ("allow", "model_download", "GET")]
+    assert [row["destination"] for row in rows] == [
+        f"https://{httpx.URL(source).host}:443", f"https://{httpx.URL(file_host).host}:443"]
+    assert "signed" not in json.dumps(rows)  # the signed query never reaches the audit log
+
+
+def test_a_file_host_is_no_destination_of_its_own(db, remote, setup):
+    with setup.gate.client(project(db)) as client:
+        refused(client, "GET", HF_CDN, "unknown_destination")
+        refused(client, "GET", MS_CDN, "unknown_destination")
+    assert remote.received == []
+
+
+@pytest.mark.parametrize("location", [
+    MS_CDN,  # another source's file host
+    "https://evil.example/model.gguf",
+    "https://cdn-lfs.hf.co/repos/model.gguf",  # a host the source was not seen using
+    "http://us.aws.cdn.hf.co/xet-bridge-us/0123",  # not https
+])
+def test_a_model_download_redirect_elsewhere_is_refused(db, remote, setup, location):
+    remote.redirects[HF_FILE] = (302, location)
+    with setup.gate.client(project(db), follow_redirects=True) as client:
+        refused(client, "GET", HF_FILE, "cross_origin_redirect")
+    assert [str(r.url) for r in remote.received] == [HF_FILE]
+
+
+def test_a_file_host_redirecting_onward_is_refused(db, remote, setup):
+    remote.redirects[HF_FILE] = (302, HF_CDN)
+    remote.redirects[HF_CDN] = (302, "https://evil.example/model.gguf")
+    with setup.gate.client(project(db), follow_redirects=True) as client:
+        refused(client, "GET", HF_FILE, "cross_origin_redirect")
+    assert [str(r.url) for r in remote.received] == [HF_FILE, HF_CDN]
+
+
+def test_only_a_model_download_hops_to_a_file_host(db, remote, setup):
+    scholarly = "https://api.openalex.org/works/W1"
+    remote.redirects[scholarly] = (302, HF_CDN)
+    with setup.gate.client(project(db), follow_redirects=True) as client:
+        refused(client, "GET", scholarly, "cross_origin_redirect")
+    assert [str(r.url) for r in remote.received] == [scholarly]
+
+
+def test_a_model_download_carries_no_credentials_to_its_source_or_its_hop(db, remote, setup):
+    remote.redirects[HF_FILE] = (302, HF_CDN)
+    with setup.gate.client(project(db), follow_redirects=True, headers={"X-Token": "secret"}) as client:
+        refused(client, "GET", HF_FILE, "credential_to_non_provider")
+    assert remote.received == []
+
+
+def test_a_model_download_and_its_hop_are_refused_in_a_local_only_project(db, remote, setup):
+    remote.redirects[HF_FILE] = (302, HF_CDN)
+    with setup.gate.client(project(db, "local_only"), follow_redirects=True, approved=True) as client:
+        refused(client, "GET", HF_FILE, "not_allowed_at_level")
+    assert remote.received == []
+
+
+@pytest.mark.asyncio
+async def test_the_async_client_follows_a_model_download_hop_the_same_way(db, remote, setup):
+    remote.redirects[HF_FILE] = (302, HF_CDN)
+    project_id = await asyncio.to_thread(project, db)
+    async with setup.gate.async_client(project_id, follow_redirects=True) as client:
+        assert (await client.get(HF_FILE)).status_code == 200
+    remote.redirects[HF_FILE] = (302, "https://evil.example/model.gguf")
+    async with setup.gate.async_client(project_id, follow_redirects=True) as client:
+        with pytest.raises(OutboundDenied, match="cross_origin_redirect"):
+            await client.get(HF_FILE)
+    assert [str(r.url) for r in remote.received] == [HF_FILE, HF_CDN, HF_FILE]
