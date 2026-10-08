@@ -220,17 +220,20 @@ def webkit_of(pid, before: set[int]) -> list[int]:
 
 
 class Memory:
-    """Samples the whole app's memory (this process and its helper processes) every 0.5 s, and the
-    system's memory pressure level and free percentage every 2 s."""
+    """Samples the memory of the processes pids() lists every 0.5 s, and the system's memory
+    pressure level and free percentage every 2 s."""
 
     def __init__(self, pids):
         self.pids, self.samples, self.pressure, self.stop = pids, [], [], threading.Event()
+        self.names = {}  # each process's executable name, read while it runs
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def run(self):
         tick = 0
         while not self.stop.wait(0.5):
             found = {pid: usage(pid) for pid in self.pids() if pid}
+            for pid in found:
+                self.names.setdefault(pid, Path(path_of(pid)).name)
             self.samples.append({pid: value for pid, value in found.items() if value})
             if tick % 4 == 0:
                 level = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
@@ -247,7 +250,7 @@ class Memory:
         return {"footprint_peak_bytes": max(footprints, default=None),
                 "resident_peak_bytes": max(resident, default=None), "samples": len(footprints),
                 # the peak sample, process by process (by executable name)
-                "footprint_peak_by_process": {f"{Path(path_of(pid)).name} {pid}": value[1]
+                "footprint_peak_by_process": {f"{self.names.get(pid, '')} {pid}": value[1]
                                               for pid, value in top.items()},
                 "pressure_level_max": max((level for level, _ in self.pressure), default=None),
                 "pressure_samples": len(self.pressure),
