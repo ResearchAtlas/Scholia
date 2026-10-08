@@ -136,8 +136,10 @@ class Registry:
         self.turns: dict[str, ActiveRun] = {}  # by conversation
         self.closed = False
         self.dropped: list[str] = []  # stale claims released, whose runs are still to be recorded
-        # Background runs whose terminal record this process wrote, added before each is released: a
-        # read taken just before that record committed still says running, and is not interrupted.
+        # Background runs whose terminal record this process wrote, each added once that record has
+        # committed and before the run is released: a read taken just before the commit still says
+        # running, and is not interrupted. A run whose terminal write raised is never added, so once
+        # released it reads interrupted, as its record still says running (Harness._ended).
         # ponytail: one id per background run finished in this launch; a bounded log if that grows large
         self.finished: set[str] = set()
 
@@ -354,7 +356,9 @@ class Harness:
         is never interrupted. A background run stopping for a shutdown it would restart after
         (a refused restore) is the exception: a later Cancel or revocation becomes its reason,
         without interrupting its cleanup, so it ends instead. A claim whose response never
-        started has run nothing: it is released and recorded at once."""
+        started has run nothing: it is released and recorded at once. A background run whose
+        task is still to come (its record being written, see record_background) stays held:
+        its task sees the request as it starts, and ends it."""
         if active.cancel_requested.is_set():
             if active.kind == "background" and active.cancel_reason == "shutdown" and reason != "shutdown":
                 active.cancel_reason = reason
@@ -365,13 +369,12 @@ class Harness:
             if active.started:
                 active.task.cancel()
             # else it sees the request as it starts, and ends through its own cleanup
-        elif self.registry.runs.get(active.run_id) is active:
+        elif active.kind == "turn" and self.registry.runs.get(active.run_id) is active:
             self.registry.release(active)
-            if active.kind == "turn":
-                status = "interrupted" if reason == "shutdown" else "cancelled"
-                cancel_reason = None if status == "interrupted" else ("revoked" if reason == "revoked" else "researcher")
-                active.closing = self._detach(self._write(
-                    lambda conn: self._finish_turn(conn, active.run_id, status, cancel_reason, status)))
+            status = "interrupted" if reason == "shutdown" else "cancelled"
+            cancel_reason = None if status == "interrupted" else ("revoked" if reason == "revoked" else "researcher")
+            active.closing = self._detach(self._write(
+                lambda conn: self._finish_turn(conn, active.run_id, status, cancel_reason, status)))
 
     def stream_closed(self, claim: ActiveRun) -> None:
         """A turn's response ended, however it ended: a turn still running, or one that
@@ -857,9 +860,15 @@ class Harness:
             if active is not None:
                 active.task = asyncio.create_task(self._background(active))
 
+    async def _ended(self, active, write):
+        """Await a background run's terminal write; once it has committed, the run is known finished
+        here (Registry.finished), before it is released. A write that raises marks nothing."""
+        result = await write
+        self.registry.finished.add(active.run_id)
+        return result
+
     async def _background(self, active: ActiveRun) -> None:
         active.started = True
-        left = False  # its record still says running: kept for the next start, or left by a defect
         try:
             if active.cancel_requested.is_set():  # stopped before it began
                 raise asyncio.CancelledError()
@@ -872,10 +881,11 @@ class Harness:
             project_id, workflow, attempts, inputs, _, source, cancel_reason = row
             inputs = json.loads(inputs or "{}")
             if cancel_reason == "revoked":  # revoked while it waited, or before a crash: no call, no effect
-                await self._write(lambda conn: self._finish_background(conn, active, "cancelled", None, inputs))
+                await self._ended(active, self._write(
+                    lambda conn: self._finish_background(conn, active, "cancelled", None, inputs)))
                 return
-            if workflow in self.workflows:
-                await self._local(active, project_id, workflow, inputs)
+            if workflow in self.workflows:  # it returns once its terminal record has committed
+                await self._ended(active, self._local(active, project_id, workflow, inputs))
                 return
             inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
             recorded = await self._read(lambda conn: conn.execute(
@@ -887,10 +897,11 @@ class Harness:
             elif attempts < BACKGROUND_ATTEMPTS:  # rule 3: another model call
                 output = await self._background_call(active, project_id, workflow, inputs)
             else:  # rule 4
-                await self._write(lambda conn: self._finish_background(conn, active, "interrupted", None, inputs))
+                await self._ended(active, self._write(
+                    lambda conn: self._finish_background(conn, active, "interrupted", None, inputs)))
                 return
-            await self._write(lambda conn: self._finish_background(
-                conn, active, "succeeded" if output is not None else "failed", output, inputs))
+            await self._ended(active, self._write(lambda conn: self._finish_background(
+                conn, active, "succeeded" if output is not None else "failed", output, inputs)))
         except asyncio.CancelledError:
             call = active.call
 
@@ -905,17 +916,19 @@ class Harness:
                 cancelled(conn)
                 return False
             (running, _) = await _through(self._write(stop))
-            if running and active.cancel_reason != "shutdown":  # a Cancel came once that had committed
-                await _through(self._write(cancelled))
-            left = running and active.cancel_reason == "shutdown"
+            if not running:  # its terminal record committed
+                self.registry.finished.add(active.run_id)
+            elif active.cancel_reason != "shutdown":  # a Cancel came once that had committed
+                await self._ended(active, _through(self._write(cancelled)))
         except spending.BudgetExceeded:
-            await _through(self._write(lambda conn: self._finish_background(conn, active, "failed", None, None)))
-        except Exception as error:
-            left = True
+            await self._ended(active, _through(self._write(
+                lambda conn: self._finish_background(conn, active, "failed", None, None))))
+        except Exception as error:  # its record still says running: kept for the next start
             log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
         finally:
-            if not left:  # before it is released: at no moment is it neither held nor finished
-                self.registry.finished.add(active.run_id)
+            # Released only after its terminal record committed (and it is in `finished`), or still
+            # running in the record: left for the next start, or by a terminal write that raised, which
+            # reads interrupted from here on. At no moment does a finished run read interrupted.
             self.registry.release(active)
             if active.cancel_reason == "shutdown" and not self.registry.closed:  # admitting again (resume)
                 again = self.registry.add_background(active.run_id)  # at once: a Cancel always finds it active

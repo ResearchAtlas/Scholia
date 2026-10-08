@@ -396,6 +396,58 @@ async def test_a_stop_before_a_background_runs_task_first_runs_ends_it_cancelled
         assert client.provider.titles == []
 
 
+async def test_a_background_run_stopped_before_its_task_exists_stays_held_until_it_ends(tmp_path):
+    async with started(tmp_path / "data") as client:
+        conversation_id = await new_conversation(client, title="Named first, so no title run is queued")
+        await send(client, conversation_id)
+        await background_idle(client)
+        run_id = await seed_title_run(client, conversation_id, attempts=0)
+        harness = client.state["harness"]
+        active = harness.registry.add_background(run_id)  # held, as record_background holds it, its task to come
+        harness._request_cancel(active, "revoked")  # a deletion's revocation arrives first
+        assert harness.registry.is_active(run_id)  # still held: it reads running, never interrupted
+        [listed] = [r for r in (await client.get("/api/activity")).json()["runs"] if r["run_id"] == run_id]
+        assert listed["status"] == "running"
+        active.task = asyncio.create_task(harness._background(active))  # it sees the request as it starts
+        await active.task
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", run_id) == [
+            ("cancelled", "revoked")]
+        assert not harness.registry.is_active(run_id) and run_id in harness.registry.finished
+        assert client.provider.titles == []
+
+
+@pytest.mark.parametrize("handler", ["cancelled", "budget"])
+async def test_a_background_run_whose_terminal_write_fails_reads_interrupted_once_released(tmp_path, monkeypatch,
+                                                                                            handler):
+    from backend import runs as runs_module, spending
+    async with started(tmp_path / "data") as client:
+        conversation_id = await new_conversation(client, title="Named first, so no title run is queued")
+        await send(client, conversation_id)
+        await background_idle(client)
+        run_id = await seed_title_run(client, conversation_id, attempts=0)
+        harness = client.state["harness"]
+
+        def failing(*args, **kwargs):  # the terminal write raises, so nothing of it commits
+            raise RuntimeError("the terminal write failed")
+
+        monkeypatch.setattr(runs_module.Harness, "_finish_background", failing)
+        if handler == "budget":
+            async def over_budget(*args):
+                raise spending.BudgetExceeded("project", 0.01, 0.01, 0.001)
+
+            monkeypatch.setattr(harness, "_background_call", over_budget)
+        active = harness.registry.add_background(run_id)
+        active.task = asyncio.create_task(harness._background(active))
+        if handler == "cancelled":
+            harness._request_cancel(active, "researcher")  # its cancellation handler writes the terminal record
+        with pytest.raises(RuntimeError):
+            await active.task
+        assert not harness.registry.is_active(run_id) and run_id not in harness.registry.finished
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", run_id) == [("running",)]
+        [listed] = [r for r in (await client.get("/api/activity")).json()["runs"] if r["run_id"] == run_id]
+        assert listed["status"] == "interrupted"  # its record says running and nothing here holds it
+
+
 async def test_a_title_runs_record_holds_no_message_text_and_its_call_reads_the_source_turn(tmp_path):
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:

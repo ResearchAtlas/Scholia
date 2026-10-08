@@ -744,6 +744,35 @@ async def test_a_stop_before_the_turns_task_first_runs_ends_it_cancelled(tmp_pat
         await background_idle(client)
 
 
+@pytest.mark.parametrize("handler", ["cancelled", "budget"])
+async def test_a_turn_whose_terminal_write_fails_reads_interrupted_once_released(tmp_path, monkeypatch, handler):
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+        if handler == "budget":  # its first step does not fit: the budget handler writes the terminal record
+            settings = (await client.get("/api/settings", params={"project_id": project})).json()
+            await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                    "updates": {"project.budget_usd": 0.0001}})
+        conversation = await new_conversation(client, project_id=project)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "a question")
+
+        def failing(*args, **kwargs):  # the terminal write raises, so nothing of it commits
+            raise RuntimeError("the terminal write failed")
+
+        monkeypatch.setattr(runs_module.Harness, "_finish_turn", failing)
+        if handler == "cancelled":
+            claim.task = asyncio.create_task(harness._turn(claim))
+            harness._request_cancel(claim, "researcher")  # its cancellation handler writes the terminal record
+        else:  # a reader pulls it to its first step, which does not fit
+            assert [event["type"] async for event in harness.events(claim)] == ["run_started"]
+        with pytest.raises(RuntimeError):
+            await claim.task
+        assert not harness.registry.is_active(claim.run_id) and claim.run_id not in harness.registry.finished
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["status"] == "interrupted"  # its record says running and nothing here holds it
+        await background_idle(client)
+
+
 async def test_an_admission_stopped_by_shutdown_writes_no_run(tmp_path, monkeypatch):
     async with started(tmp_path / "data") as client:
         conversation = await new_conversation(client)
