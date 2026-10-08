@@ -272,9 +272,9 @@ def test_save_into_a_table_defined_out_of_order(tmp_path):
 
 def test_warning_lines_skip_multiline_values(tmp_path):
     (tmp_path / "config.toml").write_text(
-        "[helper]\n"
-        'model_source = """\n'
-        "idle_stop_minutes = 0\n"  # inside the string, not a key
+        "[models]\n"
+        'router = """\n'
+        "chairman = 0\n"  # inside the string, not a key
         '"""\n'
         "[subagents]\n"
         "models = [\n"
@@ -297,15 +297,15 @@ def test_warning_lines_skip_multiline_values(tmp_path):
     )
     loaded = load_settings(tmp_path)
     assert [w.split(":")[0] + ":" + w.split(":")[1].split()[0] for w in loaded.warnings] == [
+        "config.toml line 12:models.efforts.openai/gpt-5.1",  # with the [models] table it extends
         "config.toml line 6:subagents.models",
-        "config.toml line 12:models.efforts.openai/gpt-5.1",
         "config.toml line 14:providers.local.windows.m",
         "config.toml line 16:context.system_rules",
         "config.toml line 19:context.user_memory",
         "config.toml line 21:retrieval.keep",
         "config.toml line 22:retrieval.rrf_k",
     ]
-    assert loaded.values["helper"]["model_source"] == "idle_stop_minutes = 0\n"
+    assert loaded.values["models"]["router"] == "chairman = 0\n"
 
 
 def write_instructions(root, personal=None, project=None):
@@ -549,12 +549,12 @@ def test_identifiers_are_not_mistaken_for_secrets(tmp_path):
 
 def test_warning_lines_count_only_toml_line_endings(tmp_path):
     (tmp_path / "config.toml").write_text(
-        "[helper]\r\n"
-        'model_source = "a b\u0085c"  # comment   here\r\n'
-        "idle_stop_minutes = 0\n"
+        "[subagents]\r\n"
+        'effort_cap = "a b\u0085c"  # comment   here\r\n'
+        "at_once = 0\n"
     )
     loaded = load_settings(tmp_path)
-    assert loaded.values["helper"]["model_source"] == "a b\u0085c"
+    assert loaded.values["subagents"]["effort_cap"] == "a b\u0085c"
     assert [w.split(":")[0] for w in loaded.warnings] == ["config.toml line 3"]
 
 

@@ -427,6 +427,7 @@ def test_llama_cpp_notices_cover_what_the_release_embeds():
 def test_app_metadata_and_pyinstallers_icon_are_known(bundle):
     _put(bundle, "Contents/Info.plist")
     _put(bundle, "Contents/_CodeSignature/CodeResources")
+    _put(bundle, "Contents/Resources/llama-server.sha256.json")  # the helper's hashes, as the build wrote them
     _put(bundle, "Contents/Resources/icon-windowed.icns", la._pyinstaller_icon().read_bytes())
     _ship(bundle, "PyInstaller")
     _ship(bundle, "Scholia")

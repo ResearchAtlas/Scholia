@@ -8,7 +8,11 @@ stand-ins for OpenAlex, Crossref and arXiv that answer made-up records, behind t
 block (network_guard.py), so this process reaches nothing but its own listener. It serves the
 built interface (frontend/dist) and prints the window's address with this launch's session, and
 the folder of synthetic materials (a PDF, DOCX, HTML, Markdown and LaTeX file, and more) it wrote
-for the walkthrough to add. --dev serves no interface and admits the Vite server on
+for the walkthrough to add. The local model helper's search model is a synthetic file with a pin
+of its own, served by a test-owned download source (each source redirecting to the file host
+it uses, the file sent slowly so a download can be watched and cancelled), and written to an
+"offline" folder for the import flow, whose path is printed; the helper binary is a stand-in in
+a bundle with its manifest, never started (the network block refuses child processes). --dev serves no interface and admits the Vite server on
 127.0.0.1:5173 instead (`npm run dev` in frontend/), with no session, on port 8765, where
 that server sends API requests. Without --port, a free port is used. --request-log appends
 each request the test-owned provider receives to FILE, one JSON line each.
@@ -18,6 +22,7 @@ tests/walkthrough_driver.mjs drives the rendered walkthrough against this server
 
 import argparse
 import asyncio
+import hashlib
 import json
 import secrets
 import socket
@@ -41,6 +46,7 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 from scholia_app import FakeKeyring, MockProvider, MockScholarly, crossref_work, openalex_work  # noqa: E402
 
+from backend import local_helper  # noqa: E402
 from backend.app import create_app  # noqa: E402
 from backend.budget_router import MODEL_TIERS  # noqa: E402
 
@@ -100,15 +106,42 @@ def write_materials():
     return folder
 
 
+# The search model the walkthrough offers: a synthetic file, never a model, with its own pin and the
+# real sources' addresses, so the gate classifies and audits its download as it does the real one.
+MODEL_BYTES = b"Scholia walkthrough: a synthetic stand-in for the search model file, not a model. " * 2048
+MODEL = {**local_helper.EMBEDDING_MODEL, "name": "Qwen3-Embedding-0.6B Q8_0 (synthetic file)", "size": len(MODEL_BYTES),
+         "sha256": hashlib.sha256(MODEL_BYTES).hexdigest()}
+FILE_HOSTS = {"huggingface.co": "us.aws.cdn.hf.co", "modelscope.cn": "cdn-lfs-cn-1.modelscope.cn"}
+
+
+class SlowFile(httpx.AsyncByteStream):
+    """The model file in 200 pieces, 50 ms apart: a download takes about 10 s."""
+
+    async def __aiter__(self):
+        piece = len(MODEL_BYTES) // 200 + 1
+        for start in range(0, len(MODEL_BYTES), piece):
+            await asyncio.sleep(0.05)
+            yield MODEL_BYTES[start:start + piece]
+
+
+def download_source(request):
+    """The test-owned download source: each source redirects to its file host, which sends the file."""
+    if request.url.host in FILE_HOSTS:
+        return httpx.Response(302, headers={"Location": f"https://{FILE_HOSTS[request.url.host]}/files/model?signed=0"})
+    return httpx.Response(200, stream=SlowFile())
+
+
 class SyntheticProvider(MockProvider):
     log = None  # the --request-log file
 
     async def __call__(self, request):
         if self.log is not None:
-            body = json.loads(request.content) if request.content else {}
+            body = json.loads(request.content) if request.content and request.method == "POST" else {}
             with open(self.log, "a", encoding="utf-8") as out:
                 out.write(json.dumps({"method": request.method, "host": request.url.host, "path": request.url.path,
                                       "model": body.get("model") if isinstance(body, dict) else None}) + "\n")
+        if request.url.host in FILE_HOSTS or request.url.host in FILE_HOSTS.values():
+            return download_source(request)
         if request.url.path.endswith("/models"):
             return httpx.Response(200, json={"data": CATALOG})
         return await super().__call__(request)
@@ -134,6 +167,16 @@ def main(argv=None):
     provider.title_replies = [synthetic] * 1000
     provider.log = args.request_log
     data_dir = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-"))
+    harness = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-files-"))
+    offline = harness / "offline" / MODEL["file"]  # the file the import flow names
+    offline.parent.mkdir()
+    offline.write_bytes(MODEL_BYTES)
+    binary = harness / "Scholia.app" / "Contents" / "MacOS" / "llama-server"  # a stand-in, never started
+    for folder in (binary.parent, binary.parents[1] / "Frameworks" / "llama-cpp", binary.parents[1] / "Resources"):
+        folder.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\nexit 1\n")
+    binary.chmod(0o755)
+    local_helper.write_manifest(binary.parents[1])
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", args.port if args.port is not None else 8765 if args.dev else 0))
@@ -142,9 +185,11 @@ def main(argv=None):
     app = create_app(data_dir, origin=origin, session=session,
                      dev_origins=("http://127.0.0.1:5173",) if args.dev else (),
                      frontend_dir=None if args.dev else ROOT / "frontend" / "dist",
-                     keyring_backend=FakeKeyring(), transport=httpx.MockTransport(provider))
+                     keyring_backend=FakeKeyring(), transport=httpx.MockTransport(provider),
+                     helper=local_helper.Config(binary=binary, models={MODEL["id"]: MODEL}))
     print(f"data folder: {data_dir}", flush=True)
     print(f"materials: {write_materials()}", flush=True)
+    print(f"model file: {offline}", flush=True)
     print(f"open: {origin}/" + ("" if args.dev else f"#session={session}"), flush=True)
     server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", log_level="warning"))
     asyncio.run(server.serve(sockets=[sock]))

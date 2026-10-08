@@ -30,6 +30,7 @@ ALLOWED_IMPORTS = {
     "openrouter.py": {"httpx"},  # exception and timeout types; requests go through the gate's client
     "openrouter_client.py": {"httpx"},  # the same
     "lookup.py": {"httpx"},  # the error type of a request that failed; requests go through the gate's client
+    "local_helper.py": {"httpx"},  # the same: the helper and model downloads go through the gate's client
     "self_test.py": {"httpx", "urllib.request"},  # in-process app, and the helper it starts on loopback
     "desktop.py": {"socket"},  # the loopback socket the app is served on
 }

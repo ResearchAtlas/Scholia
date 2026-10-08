@@ -40,6 +40,7 @@ LICENSES = "Contents/Resources/licenses"  # license texts ship in <LICENSES>/<co
 # libraries it links in their own Frameworks folder.
 HELPER = "llama.cpp"
 HELPER_SERVER = "Contents/MacOS/llama-server"
+HELPER_MANIFEST = "Contents/Resources/llama-server.sha256.json"  # the build's record of their SHA-256
 HELPER_LIBRARY = re.compile(r"Contents/Frameworks/llama-cpp/lib(llama|ggml|mtmd)[\w.-]*\.dylib")
 PYDANTIC_CORE_CRATES = "pydantic-core-crates"
 PDFIUM = "PDFium"  # the library pypdfium2 ships, with the third-party code built into it
@@ -117,6 +118,10 @@ LIBRARIES = {
     # MIT); zlib (Zlib).
     PDFIUM: ("BSD-3-Clause AND MIT AND Apache-2.0 AND LicenseRef-AGG-2.3 AND FTL AND Unicode-3.0 AND IJG AND Zlib"
              " AND BSD-2-Clause AND Libpng AND (Apache-2.0 WITH LLVM-exception) AND (Apache-2.0 OR MIT)", []),
+    # The search model's license files. The model never ships; the app installs these beside it
+    # when it is downloaded or imported (backend/local_helper.py; slice 1 section 18).
+    "Qwen3-Embedding-0.6B": ("Apache-2.0", [ROOT / "tools/notices/Qwen3-Embedding-0.6B/LICENSE",
+                                            ROOT / "tools/notices/Qwen3-Embedding-0.6B/SOURCE.txt"]),
     # The Rust crates and standard library compiled into pydantic-core's extension, with the
     # licenses tools/rust_notices.py found in its Cargo.lock (it prints this expression).
     PYDANTIC_CORE_CRATES: (
@@ -427,8 +432,8 @@ def assign_file(bundle: Path, rel: str, problems: list[str]):
     if rel.startswith("Contents/MacOS/") and rel.count("/") == 2:
         # the app's executable: PyInstaller's bootloader and an archive
         return ["PyInstaller"] if _is_macho(path) else None
-    if rel in ("Contents/Info.plist", "Contents/_CodeSignature/CodeResources"):
-        return ["Scholia"]  # the app's metadata and its signature seal
+    if rel in ("Contents/Info.plist", "Contents/_CodeSignature/CodeResources", HELPER_MANIFEST):
+        return ["Scholia"]  # the app's metadata, its signature seal and the helper's hash manifest
     if rel == "Contents/Resources/icon-windowed.icns":  # PyInstaller's default app icon
         return ["PyInstaller"] if path.read_bytes() == _pyinstaller_icon().read_bytes() else None
     inner = _inner(rel)

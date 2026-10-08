@@ -57,6 +57,11 @@ def test_a_cached_file_that_differs_is_downloaded_again(tmp_path, server):
 
 def test_pins_are_complete():
     for pin in fetch.PINS.values():
-        assert set(pin) == {"file", "size", "sha256", "url"}
+        assert {"file", "size", "sha256", "url"} <= set(pin)
         assert pin["url"].startswith("https://") and pin["url"].endswith("/" + pin["file"])
         assert len(pin["sha256"]) == 64
+        for source in pin.get("sources", {}).values():  # a model's mirrors serve the same pinned file
+            assert source["url"].startswith(source["repository"] + "/resolve/")
+            assert source["url"].endswith("/" + pin["file"])
+    assert fetch.PINS["embedding-model"]["url"] == fetch.PINS["embedding-model"]["sources"]["huggingface"]["url"]
+    assert set(fetch.PINS["reranker-model"]["sources"]) == {"huggingface"}  # ggml-org's repository only

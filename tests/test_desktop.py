@@ -536,22 +536,24 @@ def test_a_data_folder_others_could_write_is_refused_before_its_lock_is_opened(t
         os.chmod(data, 0o700)
 
 
-def test_the_window_offers_the_interface_only_a_folder_picker(monkeypatch):
+def test_the_window_offers_the_interface_only_a_folder_picker_and_a_model_file_picker(monkeypatch):
     import types
     chosen = []
 
     class Window:
-        def create_file_dialog(self, kind):
-            chosen.append(kind)
-            return ("/Users/researcher/Backups",) if len(chosen) == 1 else None
+        def create_file_dialog(self, kind, file_types=()):
+            chosen.append((kind, file_types))
+            return ("/Users/researcher/Backups",) if len(chosen) % 2 == 1 else None
 
-    fake = types.SimpleNamespace(windows=[Window()], FileDialog=types.SimpleNamespace(FOLDER="folder"))
+    fake = types.SimpleNamespace(windows=[Window()], FileDialog=types.SimpleNamespace(FOLDER="folder", OPEN="open"))
     monkeypatch.setitem(sys.modules, "webview", fake)
     api = desktop.WindowApi()
-    assert [name for name in dir(api) if not name.startswith("_")] == ["choose_folder"]
+    assert [name for name in dir(api) if not name.startswith("_")] == ["choose_folder", "choose_model_file"]
     assert api.choose_folder() == "/Users/researcher/Backups"
     assert api.choose_folder() is None  # cancelled
-    assert chosen == ["folder", "folder"]
+    assert api.choose_model_file() == "/Users/researcher/Backups"
+    assert api.choose_model_file() is None
+    assert chosen == [("folder", ()), ("folder", ()), ("open", ("GGUF (*.gguf)",)), ("open", ("GGUF (*.gguf)",))]
 
 
 def test_finishing_an_interrupted_restore_does_not_count_against_the_start_deadline(tmp_path, monkeypatch):

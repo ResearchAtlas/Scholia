@@ -1,0 +1,16 @@
+Qwen3-Embedding-0.6B GGUF, published by Qwen: the file Qwen3-Embedding-0.6B-Q8_0.gguf
+(639,150,592 bytes, SHA-256 06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439),
+from either of the publisher's repositories:
+
+  https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF
+    at revision 370f27d7550e0def9b39c1f16d3fbaa13aa67728
+  https://modelscope.cn/models/Qwen/Qwen3-Embedding-0.6B-GGUF
+    at revision a6804f0dece24ece939f52ffa3316fd650ca1839
+
+It is licensed under the Apache License, Version 2.0, as both repositories' model cards
+declare ("license: apache-2.0"). Neither repository ships a license file of its own, so
+LICENSE beside this file is that license's standard text.
+
+Scholia neither ships nor modifies the model. It downloads the file from the repository the
+researcher chooses, or copies a file the researcher imports, and installs it only if its
+size and SHA-256 match the values above.
