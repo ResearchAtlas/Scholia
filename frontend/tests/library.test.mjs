@@ -211,7 +211,7 @@ test('a request over the body limit has its text in both catalogs', () => {
 
 test('every lookup outcome a paper\'s details name has its text in both catalogs, a file not read yet included', () => {
   assert.ok(LOOKUP_OUTCOMES.includes('not_read'));
-  for (const key of [...LOOKUP_OUTCOMES.map((outcome) => `library.source.${outcome}`), 'errors.not_read']) {
+  for (const key of [...LOOKUP_OUTCOMES.map((outcome) => `library.source.${outcome}`), 'errors.not_read', 'library.readAgain']) {
     assert.ok(key in en && key in zh, key);
   }
 });

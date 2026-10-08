@@ -664,12 +664,12 @@ def _describe(conn, row, registry):
             state, reason = "needs_attention", "ocr_waiting"
         elif not extracted[6]:
             state, reason = "needs_attention", "no_text"
-    elif run is None:
-        state, reason = "needs_attention", "not_read"
-    else:
+    elif run is not None and status != "succeeded":  # this version's latest reading did not finish
         state = "needs_attention"
         reason = (json.loads(run[3] or "{}").get("reason") or {"limit": "time_limit"}.get(run[2])
-                  or {"cancelled": "stopped", "succeeded": "outdated"}.get(status, status))  # read by an earlier version
+                  or {"cancelled": "stopped"}.get(status, status))
+    else:  # no reading by this extractor version: one by an earlier version (its own or shared), or none
+        state, reason = "needs_attention", "outdated" if _earlier(conn, sha256, media_type) else "not_read"
     found = conn.execute(
         "SELECT r.id, r.status, r.cancel_reason, r.waiting FROM runs r, json_each(r.inputs, '$.material_ids') j"
         " WHERE r.workflow = 'lookup' AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material,)).fetchone()
@@ -693,6 +693,7 @@ def _describe(conn, row, registry):
         "extraction": {"extractor": extracted[1], "version": extracted[2], "status": extracted[3],
                        "pages": extracted[4], "ocr_pages": extracted[5], "passages": extracted[6]} if extracted else None,
         "reading": {"run_id": run[0], "status": status} if run else None,
+        "readable": bool(version) and _unreadable(conn, version, registry) is None,  # Read again applies
         "lookup": looked,
     }
 
@@ -947,6 +948,29 @@ def _live(run_id, registry):
     return derived_status("running", run_id, registry) == "running"
 
 
+def _earlier(conn, sha256, kind):
+    """Whether the file has a reading as that media type by an earlier version of its extractor."""
+    return kind in extraction.EXTRACTORS and conn.execute(
+        f"SELECT 1 FROM extractions WHERE file_sha256 = ? AND extractor = ? AND status IN {_SHARED}",
+        (sha256, extraction.EXTRACTORS[kind][0])).fetchone() is not None
+
+
+def _unreadable(conn, version_id, registry):
+    """Why the version cannot be read (again) now, as (status, code, message), or None when it can:
+    it is its material's current file, which has no reading by this version of its extractor (never
+    read, read by an earlier version, or its reading failed or was stopped), and none is being made.
+    It need not have a reading run of its own: one that shared another's reading has none."""
+    version = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
+                           " content_files c ON c.sha256 = v.file_sha256 WHERE v.id = ? AND v.is_current = 1",
+                           (version_id,)).fetchone()
+    if version is None or version[0] is None or version[1] not in extraction.EXTRACTORS \
+            or _extraction(conn, *version) is not None or any(_live(run, registry) for (run,) in conn.execute(
+                "SELECT id FROM runs WHERE workflow = 'extract' AND status = 'running'"
+                " AND json_extract(inputs, '$.version_id') = ?", (version_id,))):
+        return 409, "not_retryable", "This paper is read already, or being read"
+    return None
+
+
 def _retry(conn, run_id, registry):
     """A retry of a material's run: ((project id, workflow, the new run's inputs), None), or (None,
     (status, code, message)) saying why it cannot be tried again. The background-run list's Retry
@@ -971,19 +995,35 @@ def _retry(conn, run_id, registry):
     if not kept:
         return None, (404, "not_found", "Its papers no longer exist")
     if workflow == "extract":
-        version = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
-                               " content_files c ON c.sha256 = v.file_sha256 WHERE v.id = ? AND v.is_current = 1",
-                               (inputs.get("version_id"),)).fetchone()
-        if version is None or _extraction(conn, *version) is not None or any(_live(other, registry) for (other,) in conn.execute(
-                "SELECT id FROM runs WHERE workflow = 'extract' AND status = 'running'"
-                " AND json_extract(inputs, '$.version_id') = ?", (inputs.get("version_id"),))):
-            return None, (409, "not_retryable", "This paper is read already, or being read")
+        if (refusal := _unreadable(conn, inputs.get("version_id"), registry)) is not None:
+            return None, refusal
         return (project_id, workflow, {"material_ids": kept, "version_id": inputs["version_id"]}), None
     if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
         return None, (403, "lookup_locked", "A review-locked project never looks identifiers up")
     return (project_id, workflow, {"material_ids": kept, "origin": None, "versions": dict(conn.execute(
         "SELECT material_id, id FROM material_versions WHERE is_current = 1 AND material_id IN"
         " (SELECT value FROM json_each(?))", (json.dumps(kept),)).fetchall())}), None
+
+
+@router.post("/api/material-versions/{version_id}/read", status_code=201)
+async def read_again(version_id: str, request: Request):
+    """Read a version (again) now: a new reading run for it, where _unreadable allows one. This is
+    how a paper without a reading run of its own (it shared another's reading, since read by an
+    earlier version of its extractor) is read again, as Retry reads one that has a run."""
+    state = _state(request)
+
+    def again(conn, ids):
+        row = conn.execute("SELECT v.material_id, m.project_id FROM material_versions v JOIN materials m"
+                           " ON m.id = v.material_id WHERE v.id = ?", (version_id,)).fetchone()
+        if row is None:
+            raise _refused(404, "not_found", "No such version")
+        if (refusal := _unreadable(conn, version_id, state["harness"].registry)) is not None:
+            raise _refused(*refusal)
+        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', 'extract', ?)",
+                     (ids[0], row[1], json.dumps({"material_ids": [row[0]], "version_id": version_id})))
+        return ids[0], ids
+
+    return {"run_id": await state["harness"].record_background(1, again)}
 
 
 @router.post("/api/runs/{run_id}/retry", status_code=201)

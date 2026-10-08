@@ -543,6 +543,8 @@ async function materials(ctx) {
     await damaged.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
     check('a file not read says it was not looked up yet', await damaged.getByText(L('library.source.not_read'), { exact: true }).count() === 1
       && (await listing(projectId)).materials.find((m) => m.title === 'damaged')?.lookup.outcome === 'not_read');
+    check('and it can be read again from its row', await damaged.getByRole('button', { name: L('library.readAgain'), exact: true }).count() === 1
+      && (await listing(projectId)).materials.find((m) => m.title === 'damaged')?.readable === true);
     await damaged.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(300);
   });
 

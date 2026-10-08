@@ -12,7 +12,7 @@ import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, byPage, changes, detailsOf, hovering, isPdf, isPointed, libraryChanged, loadPassages, NOT_POINTED,
   pageImage, pointing, rectStyle, reasonKey, takeSaved, unionRect, validYear, viewOf } from '../library.js';
-import { addTo, Byline, Facts, Progress, Retracted, StateChip } from './Library.jsx';
+import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -56,6 +56,7 @@ export function Paper({ material, project, onBack, onChanged }) {
           <Byline material={material} />
           <Progress material={material} />
           {reason && <p className="text-sm text-warning">{t(reason, { count: material.extraction?.ocr_pages ?? 0 })}</p>}
+          {material.readable && <ReadAgain material={material} onDone={onChanged} />}
           {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         </header>
         <Details material={material} onSaved={onChanged} />

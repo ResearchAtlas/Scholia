@@ -5,7 +5,8 @@
 import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { FilePlus2, FileText, TriangleAlert, Upload } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
-import { ApiError, get } from '../api.js';
+import { ApiError, get, post } from '../api.js';
+import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
 import { ACCEPT, LOOKUP_OUTCOMES, addFiles, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey,
@@ -118,7 +119,7 @@ export function Library({ project }) {
         {listing && materials.length > 0 && (
           <ul className="divide-y rounded-lg border" aria-label={t('library.papers')}>
             {materials.map((material) => <PaperRow key={material.id} material={material} project={project}
-              onOpen={() => setOpen(material.id)} />)}
+              onOpen={() => setOpen(material.id)} onChanged={load} />)}
           </ul>
         )}
         {listing && (
@@ -131,6 +132,22 @@ export function Library({ project }) {
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+// Reading a paper's file again, where its file has no reading by this version of Scholia and none is
+// under way (material.readable): never read, read by an earlier version, or its reading failed.
+export function ReadAgain({ material, onDone }) {
+  const t = useT();
+  const { busy, problem, run } = useAction();
+  async function again() {
+    if (await run(() => post(`/api/material-versions/${encodeURIComponent(material.version.id)}/read`))) onDone?.();
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={again}>{t('library.readAgain')}</Button>
+      {problem && <span role="alert" className="text-xs text-destructive">{problem}</span>}
     </div>
   );
 }
@@ -177,7 +194,7 @@ export function Progress({ material }) {
   );
 }
 
-function PaperRow({ material, project, onOpen }) {
+function PaperRow({ material, project, onOpen, onChanged }) {
   const t = useT();
   const reason = reasonKey(material.reason);
   return (
@@ -194,6 +211,7 @@ function PaperRow({ material, project, onOpen }) {
         <Byline material={material} />
         <Progress material={material} />
         {reason && <p className="text-xs text-warning">{t(reason, { count: material.extraction?.ocr_pages ?? 0 })}</p>}
+        {material.readable && <ReadAgain material={material} onDone={onChanged} />}
         <div className="flex flex-wrap items-center gap-2"><Retracted material={material} /></div>
         <details className="group text-xs">
           <summary className="w-fit cursor-pointer select-none rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">

@@ -350,6 +350,33 @@ async def test_a_reading_by_an_earlier_extractor_version_is_never_this_versions(
         assert ready["state"] == "ready" and ready["extraction"]["version"] == "markdown-1"
 
 
+async def test_a_paper_sharing_a_reading_by_an_earlier_version_is_read_again_without_a_run_of_its_own(tmp_path,
+                                                                                                    monkeypatch):
+    notes = b"# Notes\n\nA paragraph of synthetic text.\n"
+    async with started(tmp_path / "data") as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))  # an earlier Scholia
+        [importer] = (await added(client, first, ("notes.md", notes)))["materials"]
+        await settled(client, first)
+        [sharer] = (await added(client, second, ("notes.md", notes)))["materials"]
+        assert sharer["run_id"] is None  # the reading shared: no run of its own
+        [ready] = await settled(client, second)
+        assert ready["state"] == "ready" and ready["readable"] is False
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))  # this one
+        assert (await client.delete(f"/api/materials/{importer['id']}")).status_code == 200  # the importer is gone
+        [outdated] = await settled(client, second)
+        assert (outdated["state"], outdated["reason"], outdated["readable"]) == ("needs_attention", "outdated", True)
+        read = await client.post(f"/api/material-versions/{outdated['version']['id']}/read")
+        assert read.status_code == 201, read.text
+        assert (await run_finished(client, read.json()["run_id"]))["status"] == "succeeded"
+        [again] = await settled(client, second)
+        assert (again["state"], again["readable"], again["extraction"]["version"]) == ("ready", False, "markdown-1")
+        refused = await client.post(f"/api/material-versions/{outdated['version']['id']}/read")
+        assert (refused.status_code, refused.json()["code"]) == (409, "not_retryable")  # read already
+        missing = await client.post("/api/material-versions/no-such-version/read")
+        assert missing.status_code == 404
+
+
 async def ops(client, extraction_id):
     """{project id: [its queued operations on the extraction's passages, each with how many passages]}."""
     found = {}
