@@ -62,4 +62,4 @@ async def test_identifiers_reach_a_lookup_only_from_a_materials_own_text():
                for path in backend.rglob("*.py")}
     assert {name: n for name, n in callers.items() if n} == {"materials.py": 1}
     source = (backend / "materials.py").read_text(encoding="utf-8")
-    assert "identifiers = await read(lambda conn: _identifiers(conn, project_id, materials))" in source
+    assert 'wanted = await read(lambda conn: _identifiers(conn, project_id, materials, inputs.get("versions") or {}))' in source

@@ -18,12 +18,15 @@ Each version is read as the type its file was detected as when it was added (its
 the same bytes added as Markdown and as LaTeX are two extractions of one stored file.
 
 A `lookup` run waits for its materials' extractions, takes each material's first identifier from
-its own text (extraction.identifiers), and resolves the distinct ones (backend/lookup.py) through
-the outbound gate with the dispatch check. A Local only project first asks once for the batch,
-through the shared confirmation (backend/asks.py), naming the services and the number of distinct
-identifiers; the answer covers this run and its retries only. Each material's metadata is written
-in its own transaction while the run is running and not revoked; metadata the researcher edited
-is never replaced, though the retraction check is recorded. A failed lookup leaves the material
+the text of the version it was made for (`inputs.versions`; extraction.identifiers), and resolves
+the distinct ones (backend/lookup.py) through the outbound gate with the dispatch check. A Local
+only project first asks once for the batch, through the shared confirmation (backend/asks.py),
+naming the services and the number of distinct identifiers; the answer covers this run and its
+retries only. Each material's metadata is written in its own transaction while the run is running
+and not revoked, and only while that version is still the material's current file: a file replaced
+meanwhile makes the older lookup stale, so its identifier is not sent (its ask is closed) and its
+answer is not applied. Metadata the researcher edited is never replaced, though the retraction
+check is recorded. A failed lookup leaves the material
 as it was. Both runs name their materials in `inputs.material_ids`, the deletion service's scope
 link (backend/db/deletion.py), so deleting a material revokes them.
 
@@ -138,7 +141,7 @@ async def add_files(project_id: str, body: Upload, request: Request):
     def record(conn):
         check(conn)
         locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
-        added, looked_up = [], []
+        added, looked_up = [], {}  # looked_up: {material id: the version its lookup is for}
         for name, sha256, kind in stored:
             if body.material_id is not None:
                 material = body.material_id
@@ -173,14 +176,14 @@ async def add_files(project_id: str, body: Upload, request: Request):
                              " 'extract', ?)", (run, project_id, json.dumps({"material_ids": [material],
                                                                              "version_id": version})))
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
-            looked_up.append(material)
+            looked_up[material] = version
         lookup_run = None
         if looked_up and not locked:  # a review-locked project never looks identifiers up
             lookup_run = new_id()
             origin = {"conversation_id": body.conversation_id} if body.conversation_id else None
             conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
-                         " 'lookup', ?)", (lookup_run, project_id, json.dumps({"material_ids": looked_up,
-                                                                                "origin": origin})))
+                         " 'lookup', ?)", (lookup_run, project_id, json.dumps({"material_ids": list(looked_up),
+                                                                                "versions": looked_up, "origin": origin})))
         conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
         return {"materials": added, "lookup_run_id": lookup_run}
 
@@ -309,11 +312,11 @@ async def _look_up(harness, active, project_id, inputs, pace):
             (project_id, json.dumps(materials))).fetchone()[0]) and time.monotonic() - started < EXTRACTION_SECONDS + 60:
         await asyncio.sleep(WAIT_SECONDS)
 
-    identifiers = await read(lambda conn: _identifiers(conn, project_id, materials))
-    distinct = list(dict.fromkeys(found for found in identifiers.values() if found))
+    wanted = await read(lambda conn: _identifiers(conn, project_id, materials, inputs.get("versions") or {}))
+    distinct = list(dict.fromkeys(found for _, found in wanted.values() if found))
     if not await _write_if_running(write, run_id, lambda conn: [
             _event(conn, run_id, "step_finished", {"material_id": material, "identifier": None, "outcome": "no_identifier"})
-            for material, found in identifiers.items() if found is None]):
+            for material, (_, found) in wanted.items() if found is None]):
         return {"identifiers": len(distinct)}, None
     active.progress = {"done": 0, "total": len(distinct)}
     if not distinct:
@@ -327,20 +330,23 @@ async def _look_up(harness, active, project_id, inputs, pace):
         raise RunOutcome("failed", "lookup_locked")
     approved = False
     if level == "local_only":
-        approved = await _approval(read, write, run_id, project_id, inputs, distinct)
+        approved = await _approval(read, write, run_id, project_id, inputs, distinct, wanted)
     resolved, missed = 0, []
     async with harness.gate.async_client(project_id, approved=approved,
                                          admit=lambda conn: may_dispatch(conn, run_id)) as client:
         for done, (scheme, value) in enumerate(distinct, start=1):
-            try:
-                found, outcome = await lookup.resolve(client, scheme, value, pace), "resolved"
-            except lookup.Failed as failed:
-                found, outcome = None, failed.code
-            except OutboundDenied as denied:
-                if denied.reason == "revoked":  # deleted, tightened or locked meanwhile: nothing more is sent
-                    raise RunOutcome("cancelled", "project_changed", "revoked") from None
-                found, outcome = None, "refused"
-            mine = [m for m, i in identifiers.items() if i == (scheme, value)]
+            mine = [(m, version) for m, (version, found) in wanted.items() if found == (scheme, value)]
+            if not await read(lambda conn: _current(conn, mine)):  # every paper it was for has another file now
+                found, outcome = None, "replaced"
+            else:
+                try:
+                    found, outcome = await lookup.resolve(client, scheme, value, pace), "resolved"
+                except lookup.Failed as failed:
+                    found, outcome = None, failed.code
+                except OutboundDenied as denied:
+                    if denied.reason == "revoked":  # deleted, tightened or locked meanwhile: nothing more is sent
+                        raise RunOutcome("cancelled", "project_changed", "revoked") from None
+                    found, outcome = None, "refused"
             if not await _write_if_running(write, run_id, lambda conn: _apply(conn, run_id, project_id, mine, scheme,
                                                                               value, found, outcome)):
                 break
@@ -362,33 +368,48 @@ async def _write_if_running(write, run_id, fn):
     return await write(guarded)
 
 
-def _identifiers(conn, project_id, materials):
-    """{material id: (scheme, identifier) or None}: the first DOI its own text gives, else the first
-    arXiv ID, from its current version's extraction; materials gone since are left out."""
+def _identifiers(conn, project_id, materials, versions):
+    """{material id: (version id, (scheme, identifier) or None)}: the first DOI the version's own text
+    gives, else the first arXiv ID. The version is the one the lookup was made for (versions), or the
+    current one for a lookup that names none; materials gone since are left out. A result is about
+    that version, and is sent and applied only while it is still the material's current file."""
     found = {}
     for material in materials:
-        row = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM materials m JOIN material_versions v"
-                           " ON v.material_id = m.id AND v.is_current = 1 LEFT JOIN content_files c ON c.sha256 = v.file_sha256"
-                           " WHERE m.id = ? AND m.project_id = ?", (material, project_id)).fetchone()
+        row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE} FROM materials m JOIN material_versions v"
+                           " ON v.material_id = m.id AND (v.id = ?3 OR (?3 IS NULL AND v.is_current = 1))"
+                           " LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE m.id = ?1 AND m.project_id = ?2",
+                           (material, project_id, versions.get(material))).fetchone()
         if row is None:
             continue
-        extracted = _extraction(conn, *row)
+        extracted = _extraction(conn, *row[1:])
         passages = [extraction.Passage(kind, text, page) for kind, text, page in conn.execute(
             "SELECT kind, text, page FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 200",
             (extracted[0],))] if extracted else []
         ids = extraction.identifiers(passages)
-        found[material] = next((i for i in ids if i[0] == "doi"), None) or next(iter(ids), None)
+        found[material] = (row[0], next((i for i in ids if i[0] == "doi"), None) or next(iter(ids), None))
     return found
 
 
-async def _approval(read, write, run_id, project_id, inputs, distinct):
+def _current(conn, pairs):
+    """Of [(material id, version id)], those whose version is still its material's current one."""
+    return [(m, v) for m, v in pairs if conn.execute(
+        "SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1", (v, m)).fetchone()]
+
+
+async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
     """For a Local only project: the researcher's answer to this batch's ask, asked once. True to look
     up; the run ends cancelled when the researcher declines, and looks up without asking once the
     project no longer needs it (made less strict), closing the ask. The ask records the identifiers
     it asked about, and its answer covers exactly those: a run that finds others to send (after a
-    restart, its paper's file replaced meanwhile) closes it and asks again."""
+    restart, its paper's file replaced meanwhile) closes it and asks again. An ask whose papers all
+    have another file since is closed (replaced): there is nothing left for it to send."""
     covers = sorted(f"{scheme}:{value}" for scheme, value in distinct)
+    asked_for = [(m, v) for m, (v, found) in wanted.items() if found]  # the papers whose identifiers it covers
     ask, answer = await read(lambda conn: asks.asked(conn, run_id))
+    if not await read(lambda conn: _current(conn, asked_for)):  # every paper it was for has another file now
+        if ask is not None:
+            await write(lambda conn: asks.withdraw(conn, run_id, ask["ask_id"], "replaced"))
+        return False
     if ask is None or ask.get("covers") != covers:
         services = sorted({service for scheme, _ in distinct for service in lookup.SERVICES[scheme]})
 
@@ -417,26 +438,34 @@ async def _approval(read, write, run_id, project_id, inputs, distinct):
             raise RunOutcome("cancelled", "project_changed", "revoked")
         if level[0] != "local_only" and await write(lambda conn: asks.withdraw(conn, run_id, ask_id, "policy_changed")):
             return False
+        if not await read(lambda conn: _current(conn, asked_for)) \
+                and await write(lambda conn: asks.withdraw(conn, run_id, ask_id, "replaced")):
+            return False
         await asyncio.sleep(WAIT_SECONDS)
 
 
-def _apply(conn, run_id, project_id, materials, scheme, value, found, outcome):
+def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
+    """An identifier's outcome for the papers it was found in, [(material id, version id)]: their
+    metadata is written only while that version is still the material's current file; a paper whose
+    file was replaced meanwhile keeps what its newer file gives (outcome replaced)."""
     now = utc_now()
-    for material in materials:
-        row = conn.execute("SELECT checked_by FROM materials WHERE id = ? AND project_id = ?",
-                           (material, project_id)).fetchone()
+    for material, version in pairs:
+        row = conn.execute("SELECT m.checked_by, v.id = ? FROM materials m JOIN material_versions v"
+                           " ON v.material_id = m.id AND v.is_current = 1 WHERE m.id = ? AND m.project_id = ?",
+                           (version, material, project_id)).fetchone()
         if row is None:
             continue
-        if found is not None:
+        mine, result = (found, outcome) if row[1] else (None, "replaced")
+        if mine is not None:
             if row[0] != "researcher":  # what the researcher edited stays
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
-                             (found.csl["title"], json.dumps(found.csl), found.source_key, now, now, now, material))
-            if found.retracted is not None:
+                             (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
+            if mine.retracted is not None:
                 conn.execute("UPDATE materials SET retraction = ?, retraction_checked_at = ? WHERE id = ?",
-                             ("retracted" if found.retracted else "none", now, material))
+                             ("retracted" if mine.retracted else "none", now, material))
         _event(conn, run_id, "step_finished", {"material_id": material, "identifier": f"{scheme}:{value}",
-                                               "source": found.source if found else None, "outcome": outcome})
+                                               "source": mine.source if mine else None, "outcome": result})
 
 
 # The Library
@@ -779,7 +808,9 @@ async def retry_run(run_id: str, request: Request):
         else:
             if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
                 raise _refused(403, "lookup_locked", "A review-locked project never looks identifiers up")
-            inputs = {"material_ids": kept, "origin": None}
+            inputs = {"material_ids": kept, "origin": None, "versions": dict(conn.execute(
+                "SELECT material_id, id FROM material_versions WHERE is_current = 1 AND material_id IN"
+                " (SELECT value FROM json_each(?))", (json.dumps(kept),)).fetchall())}
         new = new_id()
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
                      (new, project_id, workflow, json.dumps(inputs)))

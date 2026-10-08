@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 import backend.lookup as lookup
+from backend.db import new_id
 import backend.materials as materials_module
 import synthetic_materials as synthetic
 from scholia_app import (MockProvider, MockScholarly, arxiv_feed, background_idle, crossref_work, openalex_work, run_finished,
@@ -131,9 +132,9 @@ async def test_a_lookup_resumed_after_a_restart_keeps_its_answer(tmp_path, monke
         assert paper["title"] == TITLE
 
 
-async def test_a_restarted_lookup_whose_paper_now_gives_another_identifier_asks_again(tmp_path):
-    data, other = tmp_path / "data", "10.5555/replaced.version"
-    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Replaced Version")}
+async def test_a_restarted_lookup_whose_identifiers_changed_asks_again(tmp_path):
+    data, other = tmp_path / "data", "10.5555/read.again"
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "As Read Again")}
     async with started(data, scholarly(openalex=records)) as client:
         project = await project_of(client, level="local_only")
         mock = client.provider.scholarly
@@ -143,22 +144,76 @@ async def test_a_restarted_lookup_whose_paper_now_gives_another_identifier_asks_
         assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
                                   json={"option": "lookup"})).status_code == 200  # for the PDF's DOI alone
         await asyncio.wait_for(mock.started.wait(), 10)
-        await added(client, project, ("v2.md", f"# Version two\n\ndoi:{other}\n".encode()),
-                    material_id=result["materials"][0]["id"])
+        version = result["materials"][0]["version_id"]
+
+        def read_again(conn):  # the same version read again (a newer extractor, say), giving another DOI
+            (sha,) = conn.execute("SELECT file_sha256 FROM material_versions WHERE id = ?", (version,)).fetchone()
+            extraction_id = new_id()
+            conn.execute("INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status, pages,"
+                         " ocr_pages) VALUES (?, ?, 'pdf', 'pdf-later', 'complete', 1, 0)", (extraction_id, sha))
+            conn.execute("INSERT INTO passages (id, extraction_id, ordinal, page, kind, text) VALUES (?, ?, 0, 1,"
+                         " 'paragraph', ?)", (new_id(), extraction_id, f"doi:{other}"))
+
+        await asyncio.to_thread(client.state["db"].write, read_again)
     first = result["lookup_run_id"]
     async with started(data, scholarly(openalex=records), setup=False) as client:
         mock = client.provider.scholarly
         deadline = asyncio.get_running_loop().time() + 10
-        while not [a for a in (await listing(client, project))["asks"] if a["run_id"] == first]:
+        while not (asks := (await listing(client, project))["asks"]):
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.02)
-        [again] = [a for a in (await listing(client, project))["asks"] if a["run_id"] == first]
-        assert again["ask_id"] != ask["ask_id"] and again["params"]["identifiers"] == 1
-        assert mock.requests == []  # the earlier answer covered the PDF's DOI only: nothing went out
+        [again] = asks
+        assert again["run_id"] == first and again["ask_id"] != ask["ask_id"] and again["params"]["identifiers"] == 1
+        assert mock.requests == []  # the earlier answer covered the earlier DOI only: nothing went out
         assert (await client.post(f"/api/runs/{first}/asks/{ask['ask_id']}", json={"option": "lookup"})).status_code == 404
         assert (await client.post(f"/api/runs/{first}/asks/{again['ask_id']}", json={"option": "lookup"})).status_code == 200
         assert (await run_finished(client, first))["status"] == "succeeded"
-        assert [path for _, path, _ in mock.requests][:1] == [f"/works/doi:{other}"]
+        assert [path for _, path, _ in mock.requests] == [f"/works/doi:{other}"]
+
+
+async def test_a_lookup_is_for_the_version_it_was_made_for_and_a_replaced_ones_ask_closes(tmp_path):
+    other = "10.5555/replacement.version"
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Replacement")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [first] = await ask_of(client, project)  # version A's, left unanswered
+        material = result["materials"][0]["id"]
+        replaced = await added(client, project, ("v2.md", f"# Version two\n\ndoi:{other}\n".encode()), material_id=material)
+        deadline = asyncio.get_running_loop().time() + 10
+        while [a["run_id"] for a in (await listing(client, project))["asks"]] != [replaced["lookup_run_id"]]:
+            assert asyncio.get_running_loop().time() < deadline  # A's ask is closed, B's is open
+            await asyncio.sleep(0.02)
+        [second] = (await listing(client, project))["asks"]
+        assert (await client.post(f"/api/runs/{second['run_id']}/asks/{second['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200
+        assert (await run_finished(client, replaced["lookup_run_id"]))["status"] == "succeeded"
+        late = await client.post(f"/api/runs/{first['run_id']}/asks/{first['ask_id']}", json={"option": "lookup"})
+        assert (late.status_code, late.json()["code"]) == (409, "ask_closed")  # A approved too late: refused
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert (paper["title"], paper["source_key"]) == ("The Replacement", f"doi:{other}")
+        assert [path for _, path, _ in client.provider.scholarly.requests] == [f"/works/doi:{other}"]  # A's: never sent
+
+
+async def test_an_older_lookup_answered_after_its_file_was_replaced_writes_nothing(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)}, arxiv={synthetic.ARXIV: "The Replacement Preprint"})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        mock.hold, mock.held = asyncio.Event(), {"api.openalex.org"}  # the DOI's answer is slow
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await asyncio.wait_for(mock.started.wait(), 10)  # version A's DOI is in flight
+        replaced = await added(client, project, ("v2.md", synthetic.paper_markdown()),
+                               material_id=result["materials"][0]["id"])
+        assert (await run_finished(client, replaced["lookup_run_id"]))["status"] == "succeeded"  # B's arXiv ID first
+        mock.hold.set()
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert (paper["title"], paper["source_key"]) == ("The Replacement Preprint", f"arxiv:{synthetic.ARXIV}")
+        assert paper["lookup"]["run_id"] == replaced["lookup_run_id"] and paper["lookup"]["outcome"] == "resolved"
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'",
+                               result["lookup_run_id"])
+        assert json.loads(data)["outcome"] == "replaced"  # A's answer came, and was not applied
 
 
 # What is sent, and where

@@ -111,18 +111,19 @@ class MockScholarly:
     mock transport: records by DOI or arXiv ID (made-up ones, never real works), each request kept in
     `requests` as (host, path and query, headers). `answers[host]` is a list of statuses (or (status,
     headers) pairs) answered first, before any record; `hold`, when set to an asyncio.Event, keeps
-    requests waiting until it is set, after `started` is set."""
+    requests waiting until it is set, after `started` is set: those to the hosts in `held` only,
+    when it is set."""
 
     HOSTS = {"api.openalex.org", "api.crossref.org", "export.arxiv.org"}
 
     def __init__(self, openalex=None, crossref=None, arxiv=None):
         self.openalex, self.crossref, self.arxiv = dict(openalex or {}), dict(crossref or {}), dict(arxiv or {})
-        self.requests, self.answers, self.hold, self.started = [], {}, None, asyncio.Event()
+        self.requests, self.answers, self.hold, self.started, self.held = [], {}, None, asyncio.Event(), None
 
     async def __call__(self, request):
         self.requests.append((request.url.host, request.url.raw_path.decode(), dict(request.headers)))
         self.started.set()
-        if self.hold is not None:
+        if self.hold is not None and (self.held is None or request.url.host in self.held):
             await self.hold.wait()
         queued = self.answers.get(request.url.host) or []
         if queued:
