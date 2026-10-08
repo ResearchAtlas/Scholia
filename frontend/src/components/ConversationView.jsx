@@ -15,7 +15,7 @@ import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
-import { ACCEPT, libraryChanged, newest, readAsks } from '../library.js';
+import { ACCEPT, asksChanged, followAsks, libraryChanged, newest, readAsks } from '../library.js';
 import { addTo } from './Library.jsx';
 import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
@@ -39,6 +39,7 @@ function useConversationAsks(conversationId, watching) {
     setReads((n) => n + 1);
   }), [conversationId, asked]);
   useEffect(() => { setAsks([]); setWorking(false); load(); }, [load]);
+  useEffect(() => followAsks(conversationId, load), [conversationId, load]); // files attached here were added
   useEffect(() => {
     if (!watching && !working && !asks.length) return undefined;
     const timer = setTimeout(load, ASKS_MS);
@@ -132,7 +133,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       if (!id) onLibrary?.();
     }
     if (notes.length) setAttached({ text: notes.join(' '), lookup: id && result ? result.lookup_run_id : null });
-    if (result && id) setTimeout(loadAsks, 300);
+    if (result && id) asksChanged(id); // the view showing it now reads its questions, this one or its successor
   }
 
   // The watch on an attached batch's lookup ends with it.

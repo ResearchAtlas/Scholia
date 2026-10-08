@@ -226,6 +226,19 @@ export function newest() {
   };
 }
 
+// Tells whichever view shows a conversation that files attached in it were added, so the question
+// their lookup may ask can be there: that view reads its questions again, whichever instance it is
+// (Shell rebuilds a conversation's view when a draft becomes the window's, while an upload may run).
+export const asksEvents = new EventTarget();
+export const asksChanged = (conversationId) => asksEvents.dispatchEvent(new CustomEvent('changed', { detail: conversationId }));
+
+// A view's following of its conversation's changes: load() on each; returns the way to stop.
+export function followAsks(conversationId, load) {
+  const changed = (event) => { if (conversationId && event.detail === conversationId) load(); };
+  asksEvents.addEventListener('changed', changed);
+  return () => asksEvents.removeEventListener('changed', changed);
+}
+
 // One read of a conversation's open questions (ConversationView's useConversationAsks): show(found)
 // gets its answer, or null when the read failed, only while it is the newest read asked (newest()),
 // so an answer for a conversation left since, or overtaken by a later read, never shows there.

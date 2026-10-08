@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -293,6 +293,38 @@ test('a draft conversation\'s questions are read from its first id on, and stay 
     await readAsks(asked, 'draft-1', (found) => shown.push(found)); // the window learns of it: the same id
     assert.deepEqual(asked_for, ['draft-1', 'draft-1']);
     assert.deepEqual(shown.map((found) => found.asks[0].ask_id), ['ask-of-draft-1', 'ask-of-draft-1']);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('an upload that ends after its conversation\'s view was rebuilt wakes the view now showing it', async () => {
+  const realFetch = globalThis.fetch;
+  let lookupRuns = false; // the upload's lookup, once it has committed
+  globalThis.fetch = async () => new Response(JSON.stringify(lookupRuns
+    ? { asks: [{ ask_id: 'the-lookups' }], working: 1 } : { asks: [], working: 0 }), { status: 200 });
+  try {
+    const view = () => { // one instance of the conversation's questions, as useConversationAsks keeps them
+      const asked = newest();
+      const state = { asks: [], reads: 0 };
+      const load = () => readAsks(asked, 'c1', (found) => { if (found) state.asks = found.asks; state.reads += 1; });
+      return { state, load };
+    };
+    const first = view(); // the draft's view, where the slow upload starts
+    const leave = followAsks('c1', first.load);
+    leave(); // the resend made it the parent's: Shell rebuilds the view for the same conversation
+    const second = view();
+    const stop = followAsks('c1', second.load);
+    await second.load(); // its first read: nothing yet, and nothing at work, so it would not look again
+    assert.deepEqual(second.state.asks, []);
+    lookupRuns = true; // the upload commits, with its lookup
+    asksChanged('c1'); // and says so
+    asksChanged('another'); // a change in another conversation wakes nothing here
+    await new Promise((r) => setTimeout(r, 0));
+    assert.deepEqual(second.state.asks.map((a) => a.ask_id), ['the-lookups']); // the view shown reads it
+    assert.equal(first.state.reads, 0); // the one rebuilt away, never
+    assert.equal(second.state.reads, 2);
+    stop();
   } finally {
     globalThis.fetch = realFetch;
   }

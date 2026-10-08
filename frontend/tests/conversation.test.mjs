@@ -19,6 +19,8 @@ function ids(source) {
       CallExpression(call) {
         const text = (node) => context.sourceCode.getText(node);
         if (call.callee.name === 'useConversationAsks') found.asks = text(call.arguments[0]);
+        if (call.callee.name === 'asksChanged') found.woken = text(call.arguments[0]);
+        if (call.callee.name === 'followAsks') found.followed = text(call.arguments[0]);
         if (call.callee.name === 'addTo') {
           const visit = (node) => {
             if (node?.type === 'ObjectExpression') {
@@ -49,4 +51,10 @@ test('the check tells the conversation the window knows from the one attach() us
     async function attach(files) { await addTo(p, files, t, n, id ? { conversationId: id } : {}); } }`;
   assert.deepEqual(ids(wired('id')), { asks: 'id', attach: 'id' });
   assert.notEqual(ids(wired('conversation?.id')).asks, 'id');
+});
+
+test('an upload that ends wakes the view showing its conversation, whichever instance that is', () => {
+  const { attach, woken, followed } = ids(readFileSync(SOURCE, 'utf8'));
+  assert.equal(woken, attach); // attach() says which conversation its files joined, by the id it tagged them with
+  assert.equal(followed, 'conversationId'); // and useConversationAsks follows its own conversation's changes
 });
