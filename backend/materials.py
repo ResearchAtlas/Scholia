@@ -316,8 +316,9 @@ def _serve(conn, sha256, extractor, extraction_id, look_up):
     """A reading of the file just committed: every current version it reads, in any project, has its
     passages queued for that project's index (once, see _queue_adds), and each whose latest lookup
     recorded not_read (it concluded before any reading of its file had) gets a lookup now, as at
-    import: a Local only project's asks first, a review-locked project's gets none. A lookup made
-    for that version since, or one that has still to read its identifiers, covers it."""
+    import: a Local only project's asks first, a review-locked project's gets none, and it starts
+    where the lookup it continues started (a conversation shows its ask). A lookup made for that
+    version since, or one that has still to read its identifiers, covers it."""
     for material, version, kind, project, locked in conn.execute(
             f"SELECT m.id, v.id, {_VERSION_TYPE}, m.project_id, p.review_lock FROM material_versions v"
             " JOIN content_files c ON c.sha256 = v.file_sha256 JOIN materials m ON m.id = v.material_id"
@@ -327,13 +328,15 @@ def _serve(conn, sha256, extractor, extraction_id, look_up):
         _queue_adds(conn, extraction_id, project)
         if locked:
             continue
-        latest = conn.execute("SELECT r.id FROM runs r, json_each(r.inputs, '$.versions') j WHERE r.workflow = 'lookup'"
-                              " AND j.key = ? AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material, version)).fetchone()
+        latest = conn.execute("SELECT r.id, json_extract(r.inputs, '$.origin') FROM runs r, json_each(r.inputs, '$.versions') j"
+                              " WHERE r.workflow = 'lookup' AND j.key = ? AND j.value = ? ORDER BY r.rowid DESC LIMIT 1",
+                              (material, version)).fetchone()
         if latest is not None and conn.execute(
                 "SELECT 1 FROM run_events WHERE run_id = ? AND type = 'step_finished'"
                 " AND json_extract(data, '$.material_id') = ? AND json_extract(data, '$.outcome') = 'not_read'",
-                (latest[0], material)).fetchone():
-            look_up(conn, project, {"material_ids": [material], "versions": {material: version}, "origin": None})
+                (latest[0], material)).fetchone():  # it continues that lookup: where it started, its ask is shown
+            look_up(conn, project, {"material_ids": [material], "versions": {material: version},
+                                    "origin": json.loads(latest[1]) if latest[1] else None})
 
 
 # Looking up identifiers

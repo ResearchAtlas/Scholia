@@ -322,6 +322,29 @@ async def test_a_reading_past_the_lookups_wait_brings_the_lookup_once_it_commits
         assert paper["lookup"]["run_id"] != result["lookup_run_id"]  # recorded with the reading's commit
 
 
+async def test_the_lookup_a_late_reading_brings_asks_in_the_conversation_its_file_was_attached_in(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "LOOKUP_WAIT_SECONDS", 0.3)
+    release, real = threading.Event(), extraction.extract
+
+    def overrunning(data, kind, stop=lambda: None, progress=lambda d, t: None):
+        release.wait(20)
+        return real(data, kind, lambda: None, progress)
+
+    monkeypatch.setattr(extraction, "extract", overrunning)
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client, level="local_only")
+        conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()), conversation_id=conversation)
+        try:
+            assert (await run_finished(client, result["lookup_run_id"]))["result"] == {"reason": "not_read"}
+        finally:
+            release.set()
+        [ask] = await ask_of(client, project)  # the lookup the reading brought, asking first
+        assert ask["run_id"] != result["lookup_run_id"]
+        here = (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"]
+        assert [a["ask_id"] for a in here] == [ask["ask_id"]]  # shown where the file was attached
+
+
 @pytest.mark.parametrize("level", ["normal", "local_only"])
 async def test_another_projects_reading_of_the_file_brings_the_lookup_a_stopped_reading_never_gave(
         tmp_path, monkeypatch, level):
