@@ -122,8 +122,9 @@ async def _fetch(client, url):
     """(status, Retry-After, body): a 200 answer's body as it streams in, decoded here (gzip or none,
     nothing else), counted as decoded bytes and given up (Failed unavailable) once it would pass
     MAX_BODY, so neither a long body nor a small compressed one that expands is ever held whole. A
-    gzip body is one gzip stream: anything after its end (another member, a tail) is given up too,
-    as it arrives, rather than read on uncounted."""
+    gzip body is one gzip stream, read to its end: anything after its end (another member, a tail) is
+    given up too, as it arrives, rather than read on uncounted, and a stream cut before its end (its
+    trailer's length and checksum unchecked) is given up as well."""
     async with client.stream("GET", url, headers={"Accept-Encoding": "gzip"}, timeout=TIMEOUT,
                              follow_redirects=False) as response:
         if response.status_code != 200:
@@ -143,6 +144,8 @@ async def _fetch(client, url):
                     raise Failed("unavailable")
             if inflate:
                 body += inflate.flush()
+                if not inflate.eof:  # cut before its trailer: its length and checksum were never checked
+                    raise Failed("unavailable")
         except zlib.error:
             raise Failed("unavailable") from None
         if len(body) > MAX_BODY:

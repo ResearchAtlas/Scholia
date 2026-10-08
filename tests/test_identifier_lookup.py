@@ -485,6 +485,19 @@ async def test_a_compressed_answer_within_the_limit_is_read(tmp_path):
         assert paper["title"] == TITLE
 
 
+async def test_a_compressed_answer_cut_before_its_end_is_refused(tmp_path):
+    record = gzip.compress(json.dumps(openalex_work(DOI, TITLE)).encode())
+
+    async def answer(request):  # the whole record, but not the gzip trailer that checks it
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Chunks([record[:-8]]))
+
+    async with started(tmp_path / "data", MockProvider(scholarly=answer)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "unavailable" and paper["title"] == "paper"
+
+
 async def test_an_identifier_no_service_knows_is_a_finished_lookup_not_a_failed_one(tmp_path):
     async with started(tmp_path / "data") as client:  # neither stand-in holds a record for it
         project = await project_of(client)
