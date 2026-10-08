@@ -12,7 +12,7 @@
 import { readFileSync, readdirSync, existsSync, mkdirSync, writeFileSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -36,6 +36,16 @@ const browser = await chromium.launch({ executablePath: process.env.SCHOLIA_BROW
 const page = await browser.newPage();
 const summary = { baseline, candidate, screenshots: [], motion: [],
                   candidateOnly: walk(candidate).filter((name) => compared(name) && !baselineFiles.has(name)).sort() };
+// A run is evidence only if it passed its own checks: every manifest.json (the driver's record of a
+// run) that does not say ok is listed first; a run with none (the WebKit check's) is said to be
+// unchecked here, its result being its own command's.
+summary.runs = Object.fromEntries([['baseline', baseline], ['candidate', candidate]].map(([side, dir]) => {
+  const manifests = walk(dir).filter((name) => basename(name) === 'manifest.json');
+  const failed = manifests.filter((name) => {
+    try { return JSON.parse(readFileSync(join(dir, name), 'utf8')).ok !== true; } catch { return true; }
+  });
+  return [side, { manifests: manifests.length, failed }];
+}));
 for (const name of pngs) {
   if (!existsSync(join(candidate, name))) { summary.screenshots.push({ name, missing: true }); continue; }
   const [a, b] = [baseline, candidate].map((dir) => readFileSync(join(dir, name)).toString('base64'));
@@ -200,6 +210,10 @@ summary.styleChanges = styleChanges;
 
 writeFileSync(join(out, 'summary.json'), JSON.stringify(summary, null, 2));
 const changed = summary.screenshots.filter((s) => s.count || s.missing || s.size);
+for (const [side, { manifests, failed }] of Object.entries(summary.runs)) {
+  if (!manifests) console.log(`${side}: no manifest.json, so whether its runs passed their own checks is not checked here`);
+  for (const name of failed) console.log(`${side} run FAILED its own checks: ${name}`);
+}
 console.log(`${summary.screenshots.length} screenshots compared, ${changed.length} differ`);
 for (const s of changed) console.log(`  ${s.name}: ${s.missing ? 'missing' : s.size ? `size ${JSON.stringify(s.size)}` : `${s.count} px in ${JSON.stringify(s.box)}`}`);
 for (const [change, { count, files, example }] of Object.entries(styleChanges)) console.log(`style ${change} (${count} elements in ${files} steps; ${example})`);
