@@ -112,7 +112,10 @@ export function useArchiveRun() {
   const [saved, setSaved] = useState(null);
   const [failed, setFailed] = useState(null);
   const shown = useRef(true);
-  useEffect(() => () => { shown.current = false; }, []);
+  useEffect(() => { // set again on every setup: StrictMode runs setup, cleanup and setup
+    shown.current = true;
+    return () => { shown.current = false; };
+  }, []);
 
   async function start(path, body) {
     setSaved(null);
