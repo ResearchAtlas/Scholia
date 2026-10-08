@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import stat
 import sys
 import threading
@@ -23,8 +24,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from backend import local_helper, logs
-from backend.db import new_id
+from backend import local_helper, logs, outbound_gate
+from backend.db import DatabaseDamagedError, new_id
 from backend.outbound_gate import OutboundDenied
 from backend.local_helper import EMBEDDING, EMBEDDING_MODEL, RERANKER_MODEL, Config, HelperUnavailable
 from network_guard import allow_subprocess
@@ -476,6 +477,32 @@ async def test_closing_the_app_while_a_helper_is_ended_waits_for_it(tmp_path, fa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("then", ["request", "close"])
+async def test_a_stop_cancelled_midway_still_ends_its_process_first(tmp_path, fake, timings, then):
+    """A stop from outside the watch (as a rerank past its deadline makes one) is one operation from
+    its first step: cancelling its caller abandons nothing, a request waits for that process's end
+    before starting another, and closing the app waits for it too."""
+    fake.stop_slowly(0.8)
+    async with app(tmp_path, fake) as client:
+        await local_helper.embed(client.state, ["text"])
+        pid = fake.launches[0]["pid"]
+        stopping = asyncio.create_task(helper(client).stop())
+        await asyncio.sleep(0)  # it has begun: the watch is being cancelled
+        stopping.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stopping
+        assert alive(pid)
+        if then == "request":
+            question = asyncio.create_task(local_helper.embed(client.state, ["a question"], query=True))
+            while alive(pid):
+                assert len(fake.launches) == 1  # one process per model
+                await asyncio.sleep(0.01)
+            assert await question == [[0.5] * 4] and len(fake.launches) == 2
+            pid = fake.launches[1]["pid"]
+    assert not alive(pid)  # closing waited: nothing is left running
+
+
+@pytest.mark.asyncio
 async def test_a_failure_is_counted_even_when_ending_its_process_fails(tmp_path, fake, timings, monkeypatch):
     real_end, failed = local_helper._end, []
 
@@ -501,6 +528,39 @@ async def test_a_health_check_the_gate_refuses_for_another_reason_fails(tmp_path
         monkeypatch.setattr(local_helper, "urls", lambda state: ())  # the gate no longer knows its address
         await until(lambda: helper(client).state == "restarting" and not alive(fake.launches[0]["pid"]))
         assert helper(client).problem == "unhealthy" and len(fake.launches) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [sqlite3.OperationalError("CANARY disk I/O error"),
+                                   DatabaseDamagedError("CANARY integrity check failed")],
+                         ids=["operational error", "damaged"])
+async def test_a_health_check_whose_audit_record_cannot_be_written_keeps_the_helper_supervised(
+        tmp_path, fake, timings, monkeypatch, error):
+    """The gate's audit write failing during a check is a check that could not be recorded: neither a
+    pass nor a failure. The watch goes on, so checks resume and idle stop still comes."""
+    timings.update(health=0.05, idle=1.0)
+    record = outbound_gate._record
+
+    def failing(conn, request, *args):
+        if request.url.path == "/health":
+            raise error
+        return record(conn, request, *args)
+
+    with app_log(tmp_path) as log_text:
+        async with app(tmp_path, fake) as client:
+            await local_helper.embed(client.state, ["text"])
+            client.remote.helper_requests.clear()
+            monkeypatch.setattr(outbound_gate, "_record", failing)
+            await asyncio.sleep(0.3)  # several checks' worth, none recorded
+            assert client.remote.helper_requests == [] and helper(client).state == "running"
+            assert helper(client)._watching is not None and not helper(client)._watching.done()
+            monkeypatch.setattr(outbound_gate, "_record", record)
+            await until(lambda: any(path == "/health" for _, path, _ in client.remote.helper_requests))
+            pid = fake.launches[0]["pid"]
+            await until(lambda: helper(client).state == "stopped" and not alive(pid), timeout=5)  # idle stop
+            assert helper(client).failures == 0 and len(fake.launches) == 1
+    text = log_text()
+    assert f"health check could not be recorded ({type(error).__name__})" in text and "CANARY" not in text
 
 
 class _HeldCheck:

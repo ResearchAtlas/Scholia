@@ -535,25 +535,31 @@ class Helper:
             return False
         except (DatabaseClosedError, HelperUnavailable):  # held writes, or the app closing
             return None
+        except Exception as error:  # the gate could not record it (its audit write failed): not checked
+            log.warning("the local model helper's health check could not be recorded (%s)", type(error).__name__)
+            return None
 
     async def stop(self, kill=False):
         """End the running server, if any, as a stop rather than a failure (idle, or a cancelled
-        rerank with kill): the next request starts it again, once this one is reaped."""
+        rerank with kill): the next request starts it again, once this one is reaped. The stop is
+        one operation (_ending), registered before anything is awaited: the watch's cancellation,
+        then the process's end. A start and close() wait for it, a cancelled caller leaves it going,
+        and a stop while one is under way waits for that one."""
         process, self._process, self._port, self._key = self._process, None, None, None
         watching, self._watching = self._watching, None
         if self.state == "running":
             self.state = "stopped"
-        if watching is not None and watching is not asyncio.current_task():
-            watching.cancel()
-            await asyncio.wait({watching})
-        if process is not None:
-            ending = self._ending = asyncio.ensure_future(_end(process, kill=kill))
+        if watching is asyncio.current_task():  # the watch, stopping the process it watched
+            watching = None
+        if process is not None or watching is not None:
+            ending = self._ending = asyncio.ensure_future(_stopped(watching, process, kill))
 
             def ended(_):
                 if self._ending is ending:
                     self._ending = None
             ending.add_done_callback(ended)
-            await asyncio.shield(ending)  # a cancelled caller leaves it going; start and close wait for it
+        if self._ending is not None:
+            await asyncio.shield(self._ending)
 
     def start_again(self):
         """After the notice (or a stop): start now, with a fresh count of failures."""
@@ -569,16 +575,27 @@ class Helper:
             self.problem = None
 
     async def close(self):
-        """Stop everything: a start under way, a pending restart, the watch and the server."""
-        tasks = [task for task in (self._starting, self._restarting, self._watching) if task is not None]
+        """Stop everything: a start under way, a pending restart, then the watch and the server, or
+        a stop already under way (stop waits for it)."""
+        tasks = [task for task in (self._starting, self._restarting) if task is not None]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.wait(tasks)
         await self.stop()
-        if self._ending is not None:  # a process another stop is still ending (idle, a failure)
-            await asyncio.wait({self._ending})
         self.state = "stopped"
+
+
+async def _stopped(watching, process, kill):
+    """A helper's stop: its watch cancelled, then its process ended and reaped, which happens even
+    when the stop is cancelled meanwhile (the app's loop shutting down)."""
+    try:
+        if watching is not None:
+            watching.cancel()
+            await asyncio.wait({watching})
+    finally:
+        if process is not None:
+            await _end(process, kill=kill)
 
 
 @dataclass
