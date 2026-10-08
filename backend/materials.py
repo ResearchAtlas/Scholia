@@ -307,10 +307,11 @@ async def _look_up(harness, active, project_id, inputs, pace):
 
     materials, versions = inputs.get("material_ids") or [], inputs.get("versions") or {}
     started = time.monotonic()
-    while await read(lambda conn: conn.execute(  # the versions it is for are read first, and only those
-            "SELECT count(*) FROM runs WHERE workflow = 'extract' AND status = 'running'"
+    while await read(lambda conn: [run for (run,) in conn.execute(  # the versions it is for are read first, only those
+            "SELECT id FROM runs WHERE workflow = 'extract' AND status = 'running'"
             " AND json_extract(inputs, '$.version_id') IN (SELECT value FROM json_each(?))",
-            (json.dumps(list(versions.values())),)).fetchone()[0]) and time.monotonic() - started < EXTRACTION_SECONDS + 60:
+            (json.dumps(list(versions.values())),)) if _live(run, harness.registry)]) \
+            and time.monotonic() - started < EXTRACTION_SECONDS + 60:
         await asyncio.sleep(WAIT_SECONDS)
 
     wanted = await read(lambda conn: _identifiers(conn, project_id, _left_to(conn, run_id, materials, versions), versions))
@@ -528,10 +529,11 @@ def _describe(conn, row, registry):
     run = conn.execute("SELECT id, status, cancel_reason, summary FROM runs WHERE workflow = 'extract'"
                        " AND json_extract(inputs, '$.version_id') = ? ORDER BY rowid DESC LIMIT 1",
                        (version,)).fetchone() if version else None
+    status = run and derived_status(run[1], run[0], registry)  # as the background-run list reads it
     state, reason, progress = "ready", None, None
     if sha256 is None:
         pass  # metadata only
-    elif run is not None and run[1] == "running":
+    elif run is not None and status == "running":
         state = "reading"
         active = registry.runs.get(run[0])
         progress = active.progress if active is not None else None
@@ -545,7 +547,7 @@ def _describe(conn, row, registry):
     else:
         state = "needs_attention"
         reason = (json.loads(run[3] or "{}").get("reason") or
-                  {"limit": "time_limit"}.get(run[2]) or ("stopped" if run[1] == "cancelled" else run[1]))
+                  {"limit": "time_limit"}.get(run[2]) or ("stopped" if status == "cancelled" else status))
     found = conn.execute(
         "SELECT r.id, r.status, r.cancel_reason, r.waiting FROM runs r, json_each(r.inputs, '$.material_ids') j"
         " WHERE r.workflow = 'lookup' AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material,)).fetchone()
@@ -568,7 +570,7 @@ def _describe(conn, row, registry):
         if version else None,
         "extraction": {"extractor": extracted[1], "version": extracted[2], "status": extracted[3],
                        "pages": extracted[4], "ocr_pages": extracted[5], "passages": extracted[6]} if extracted else None,
-        "reading": {"run_id": run[0], "status": derived_status(run[1], run[0], registry)} if run else None,
+        "reading": {"run_id": run[0], "status": status} if run else None,
         "lookup": looked,
     }
 
@@ -790,7 +792,7 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
     return Response(image, media_type="image/png", headers={"Cache-Control": "no-store"})  # see _no_store
 
 
-def run_details(conn, run_id, workflow, status, inputs):
+def run_details(conn, run_id, workflow, status, inputs, registry):
     """What the background-run list shows of a material's run beside its status: the titles of the
     papers it works on (up to three, with their count), its open ask, and whether Retry applies."""
     if workflow not in _WORKFLOWS:
@@ -803,21 +805,29 @@ def run_details(conn, run_id, workflow, status, inputs):
                            (json.dumps(ids),)).fetchone()
     ask = asks.open_asks(conn, run_id=run_id) if status == "running" else []
     return {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
-            "retryable": _retry(conn, run_id)[1] is None}
+            "retryable": _retry(conn, run_id, registry)[1] is None}
 
 
-def _retry(conn, run_id):
+def _live(run_id, registry):
+    """Whether a run the record says is running is running, as the background-run list reads it: one
+    this app does not hold (its terminal write failed, or a crash) reads interrupted (derived_status)."""
+    return derived_status("running", run_id, registry) == "running"
+
+
+def _retry(conn, run_id, registry):
     """A retry of a material's run: ((project id, workflow, the new run's inputs), None), or (None,
     (status, code, message)) saying why it cannot be tried again. The background-run list's Retry
     and the retry endpoint both ask this, so the list offers Retry exactly where the endpoint takes
     it: a run that failed, was stopped or was interrupted, whose papers are still here; a reading
-    whose version is still current, unread and not being read; a lookup in a project not locked."""
+    whose version is still current, unread and not being read; a lookup in a project not locked.
+    Statuses are read as the list reads them (derived_status): a run left running in the record
+    that this app does not hold is interrupted, so it may be tried again and is not being read."""
     row = conn.execute("SELECT project_id, workflow, status, inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
         return None, (404, "not_found", "No such run")
     project_id, workflow, status, inputs = row
     inputs = json.loads(inputs or "{}")
-    if workflow not in _WORKFLOWS or status not in ("failed", "cancelled", "interrupted"):
+    if workflow not in _WORKFLOWS or derived_status(status, run_id, registry) not in ("failed", "cancelled", "interrupted"):
         return None, (409, "not_retryable", "This run cannot be tried again")
     kept = [m for m in inputs.get("material_ids", []) if conn.execute(
         "SELECT 1 FROM materials WHERE id = ? AND project_id = ?", (m, project_id)).fetchone()]
@@ -827,9 +837,9 @@ def _retry(conn, run_id):
         version = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
                                " content_files c ON c.sha256 = v.file_sha256 WHERE v.id = ? AND v.is_current = 1",
                                (inputs.get("version_id"),)).fetchone()
-        if version is None or _extraction(conn, *version) is not None or conn.execute(
-                "SELECT 1 FROM runs WHERE workflow = 'extract' AND status = 'running'"
-                " AND json_extract(inputs, '$.version_id') = ?", (inputs.get("version_id"),)).fetchone():
+        if version is None or _extraction(conn, *version) is not None or any(_live(other, registry) for (other,) in conn.execute(
+                "SELECT id FROM runs WHERE workflow = 'extract' AND status = 'running'"
+                " AND json_extract(inputs, '$.version_id') = ?", (inputs.get("version_id"),))):
             return None, (409, "not_retryable", "This paper is read already, or being read")
         return (project_id, workflow, {"material_ids": kept, "version_id": inputs["version_id"]}), None
     if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
@@ -849,7 +859,7 @@ async def retry_run(run_id: str, request: Request):
     state = _state(request)
 
     def again(conn, ids):
-        retry, refusal = _retry(conn, run_id)
+        retry, refusal = _retry(conn, run_id, state["harness"].registry)
         if refusal is not None:
             raise _refused(*refusal)
         project_id, workflow, inputs = retry

@@ -1193,10 +1193,10 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 " AND (r.status = 'running' OR ?2 IS NOT NULL OR r.id IN (SELECT id FROM runs"
                 " WHERE kind = 'background' AND status != 'running' ORDER BY started_at DESC LIMIT ?1))"
                 " ORDER BY r.status = 'running' DESC, r.started_at DESC", (max(1, min(limit, 200)), run_id)).fetchall()
-            return [(row, materials.run_details(conn, row[0], row[2], row[3], row[12])) for row in rows]
+            return [(row, materials.run_details(conn, row[0], row[2], row[3], row[12], registry)) for row in rows]
 
-        listed = await read(listing)
         registry = harness().registry
+        listed = await read(listing)
         return JSONResponse({"runs": [{
             "run_id": run, "project_id": project_id, "project_name": name, "project_kind": kind,
             "workflow": workflow, "status": derived_status(status, run, registry), "cancel_reason": cancel,

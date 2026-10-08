@@ -9,7 +9,7 @@ import pytest
 
 import backend.backups as backups_module
 from scholia_app import background_idle, run_finished, started
-from test_materials import PDF, added, hold_extraction, project_of, rows
+from test_materials import PDF, added, hold_extraction, project_of, rows, settled
 
 pytestmark = pytest.mark.asyncio
 
@@ -73,6 +73,36 @@ async def test_a_run_that_ends_while_the_list_is_read_never_reads_interrupted(tm
         [row] = (await listed).json()["runs"]
         assert row["status"] == "running"  # what the read saw, never interrupted
         assert (await run_finished(client, paper["run_id"]))["status"] == "succeeded"
+
+
+async def test_a_reading_whose_terminal_write_fails_reads_interrupted_needs_attention_and_is_tried_again(
+        tmp_path, monkeypatch):
+    from backend import runs as runs_module
+    real, failed = runs_module.Harness._finish_local, []
+
+    def failing_once(self, conn, active, status, cancel_reason, summary, effect=None):
+        if effect is not None and not failed:  # the reading's terminal write, the first time: nothing of it commits
+            failed.append(active.run_id)
+            raise RuntimeError("the terminal write failed")
+        return real(self, conn, active, status, cancel_reason, summary, effect)
+
+    monkeypatch.setattr(runs_module.Harness, "_finish_local", failing_once)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        result = await added(client, project, PDF)
+        [paper] = result["materials"]
+        run = await run_finished(client, paper["run_id"])
+        assert failed == [paper["run_id"]]
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", paper["run_id"]) == [("running",)]
+        assert (run["status"], run["retryable"]) == ("interrupted", True)  # as the list reads it, Retry offered
+        [stopped] = await settled(client, project)  # its lookup did not wait for the abandoned reading
+        assert (stopped["state"], stopped["reason"]) == ("needs_attention", "interrupted")
+        assert stopped["reading"]["status"] == "interrupted" and stopped["lookup"]["outcome"] == "no_identifier"
+        again = await client.post(f"/api/runs/{paper['run_id']}/retry")
+        assert again.status_code == 201, again.text
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [ready] = await settled(client, project)
+        assert ready["state"] == "ready" and ready["extraction"]["passages"] > 0
 
 
 async def test_retry_is_only_for_a_stopped_or_failed_reading_or_lookup(tmp_path):
