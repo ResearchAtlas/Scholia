@@ -18,28 +18,23 @@ import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
 
-// The helper's status, read again while it is shown: often during a download or a start.
+// The helper's status, read again while it is shown: often during a download or a start. The next
+// read is set from the status last shown, which an action's answer also updates.
 function useHelperStatus() {
   const [status, setStatus] = useState(null);
   const [problem, setProblem] = useState(null);
+  const [reads, setReads] = useState(0);
   const load = useCallback(() => get('/api/helper').then((data) => {
     setStatus(data);
     setProblem(null);
-    return data;
   }).catch((error) => {
     setProblem(error instanceof ApiError ? error.code : 'internal');
-    return null;
-  }), []);
+  }).finally(() => setReads((n) => n + 1)), []);
+  useEffect(() => { load(); }, [load]);
   useEffect(() => {
-    let live = true;
-    let timer;
-    const tick = async () => {
-      const data = await load();
-      if (live) timer = setTimeout(tick, pollDelay(data));
-    };
-    tick();
-    return () => { live = false; clearTimeout(timer); };
-  }, [load]);
+    const timer = setTimeout(load, pollDelay(status));
+    return () => clearTimeout(timer);
+  }, [status, reads, load]);
   return { status, problem, load, setStatus };
 }
 
@@ -229,7 +224,7 @@ function ModelConsent({ open, status, onClose, onStarted }) {
               <p className="break-all font-mono text-xs text-muted-foreground">{model.sources[source]}</p>
             </dd>
           </div>
-          <Detail label={t('helper.consentHash')}><span className="break-all font-mono text-xs">{model.sha256}</span></Detail>
+          <Detail label={t('helper.consentHash')}><span className="break-all font-mono text-[11px]">{model.sha256}</span></Detail>
           <Detail label={t('helper.consentLicense')}>{model.license}</Detail>
           <Detail label={t('helper.consentStored')}><span className="break-all font-mono text-xs">{model.folder}</span></Detail>
         </dl>
