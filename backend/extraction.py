@@ -33,7 +33,9 @@ from xml.etree import ElementTree
 
 MAX_PASSAGE = 2000
 MAX_FILE_BYTES = 100 * 1024 * 1024  # ponytail: uploads travel as base64 JSON; a streamed upload if books matter
-MAX_XML_BYTES = 64 * 1024 * 1024  # a DOCX part's size once unpacked
+MAX_XML_BYTES = 64 * 1024 * 1024  # a DOCX part's size once unpacked, and the parts read together
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024  # a DOCX's members together, as the archive declares them unpacked
+MAX_ARCHIVE_MEMBERS = 10_000
 PDF = "application/pdf"
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 HTML = "text/html"
@@ -507,16 +509,18 @@ def _png(pixels, width, height, stride, channels):
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
-def _part(archive, name):
-    try:
-        info = archive.getinfo(name)
-    except KeyError:
-        return None
-    if info.file_size > MAX_XML_BYTES:
-        raise Unreadable()
-    with archive.open(info) as source:
-        content = source.read(MAX_XML_BYTES + 1)
-    if len(content) > MAX_XML_BYTES:
+# The parts of a DOCX that are read, by exact name; nothing is reached through its relationships.
+_DOCX_PARTS = ("word/document.xml", "word/styles.xml")
+_DECLARATION = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
+
+
+def untrusted_xml(content):
+    """Parse XML from a file or a response that is not ours: refused (Unreadable) when it declares a
+    document type or an entity, so the parser never sees one (no expansion, no external entity)."""
+    probe = content
+    if content[:2] in (b"\xff\xfe", b"\xfe\xff"):  # UTF-16: looked at as text
+        probe = content.decode("utf-16", errors="replace").encode("utf-8", errors="replace")
+    if _DECLARATION.search(probe) or b"\x00<\x00!" in probe or b"<\x00!\x00" in probe:
         raise Unreadable()
     try:
         return ElementTree.fromstring(content)
@@ -524,12 +528,35 @@ def _part(archive, name):
         raise Unreadable() from None
 
 
+def _part(archive, name, budget):
+    """A part read and parsed within what is left of the budget of bytes the parts may take unpacked."""
+    try:
+        info = archive.getinfo(name)
+    except KeyError:
+        return None
+    if info.file_size > budget[0]:
+        raise Unreadable()
+    with archive.open(info) as source:
+        content = source.read(budget[0] + 1)
+    if len(content) > budget[0]:  # the archive understated its size
+        raise Unreadable()
+    budget[0] -= len(content)
+    return untrusted_xml(content)
+
+
 def _docx(data, stop):
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            document = _part(archive, "word/document.xml")
-            styles = _part(archive, "word/styles.xml")
-    except (zipfile.BadZipFile, ValueError, OSError):
+            members = archive.infolist()
+            # An archive that could unpack to more than any document needs, or that names a path
+            # outside itself, is refused before any part is read.
+            if len(members) > MAX_ARCHIVE_MEMBERS or sum(m.file_size for m in members) > MAX_ARCHIVE_BYTES or any(
+                    m.filename.startswith(("/", "\\")) or ".." in m.filename.replace("\\", "/").split("/")
+                    or "\x00" in m.filename for m in members):
+                raise Unreadable()
+            budget = [MAX_XML_BYTES]
+            document, styles = (_part(archive, name, budget) for name in _DOCX_PARTS)
+    except (zipfile.BadZipFile, ValueError, OSError, RuntimeError, NotImplementedError):
         raise Unreadable() from None
     if document is None:
         raise Unreadable()

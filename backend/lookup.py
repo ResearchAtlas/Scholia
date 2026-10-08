@@ -19,10 +19,9 @@ import json
 import time
 from dataclasses import dataclass
 from urllib.parse import quote
-from xml.etree import ElementTree
-
 import httpx
 
+from backend.extraction import Unreadable, untrusted_xml
 from backend.outbound_gate import OutboundDenied
 
 OPENALEX = "https://api.openalex.org/works/doi:{}"
@@ -192,8 +191,8 @@ def _crossref(doi, body):
 
 def _arxiv(identifier, body):
     try:
-        feed = ElementTree.fromstring(body)  # expat: no external entities, bounded entity expansion
-    except ElementTree.ParseError:
+        feed = untrusted_xml(body)  # refused when it declares a document type or an entity
+    except Unreadable:
         raise Failed("unavailable") from None
     entry = feed.find(f"{_ATOM}entry")
     if entry is None or "/api/errors" in (entry.findtext(f"{_ATOM}id") or ""):

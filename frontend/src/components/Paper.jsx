@@ -81,8 +81,12 @@ function Details({ material, onSaved }) {
   const [form, setForm] = useState(before);
   const [saved, setSaved] = useState(false);
   const { busy, problem, run } = useAction();
+  const shown = useRef(before); // the saved details the form last took
   const key = `${material.id}:${material.updated_at}`;
-  useEffect(() => { setForm(detailsOf(material)); }, [key]); // the saved details, once they change
+  useEffect(() => { // newly saved details (a lookup, or this form's save) replace the form's, unless it holds edits
+    setForm((current) => (Object.keys(changes(shown.current, current)).length ? current : before));
+    shown.current = before;
+  }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
   const body = changes(before, form);
   const invalid = !visible(form.title) || !validYear(form.year);
 

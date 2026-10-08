@@ -164,3 +164,80 @@ def test_identifiers_come_from_the_first_pages_outside_references_validated_and_
     ("a.txt", b"text", None), ("noextension", b"%PDF-1.7", None)])
 def test_a_file_is_known_by_its_extension_checked_against_its_bytes(name, data, expected):
     assert media_type(name, data) == expected
+
+
+# DOCX and other XML from outside: no document type, no entity, bounded
+
+
+W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+LAUGHS = ('<?xml version="1.0"?><!DOCTYPE w:document [<!ENTITY a "ha"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
+          '<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">]>'
+          f'<w:document {W}><w:body><w:p><w:r><w:t>&c;</w:t></w:r></w:p></w:body></w:document>')
+EXTERNAL = ('<?xml version="1.0"?><!DOCTYPE w:document [<!ENTITY secret SYSTEM "file:///etc/hosts">]>'
+            f'<w:document {W}><w:body><w:p><w:r><w:t>&secret;</w:t></w:r></w:p></w:body></w:document>')
+
+
+def zipped(parts):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("document", [
+    LAUGHS, EXTERNAL, LAUGHS.encode("utf-16"),  # with its byte-order mark
+    f'<!doctype x><w:document {W}><w:body/></w:document>',  # in any case
+])
+def test_a_docx_part_that_declares_a_document_type_or_an_entity_is_refused_unparsed(document, monkeypatch):
+    parsed = []
+    monkeypatch.setattr(extraction.ElementTree, "fromstring", lambda content: parsed.append(content))
+    with pytest.raises(extraction.Unreadable):
+        extract(zipped({"word/document.xml": document}), extraction.DOCX)
+    assert parsed == []  # the parser never saw it
+
+
+def test_a_docx_styles_part_is_held_to_the_same_rule():
+    plain = f'<w:document {W}><w:body><w:p><w:r><w:t>Text</w:t></w:r></w:p></w:body></w:document>'
+    with pytest.raises(extraction.Unreadable):
+        extract(zipped({"word/document.xml": plain, "word/styles.xml": EXTERNAL.replace("w:document", "w:styles")}),
+                extraction.DOCX)
+    assert kinds(extract(zipped({"word/document.xml": plain}), extraction.DOCX).passages) == [("paragraph", "Text")]
+
+
+@pytest.mark.parametrize("name", ["../outside.xml", "/etc/absolute.xml", "word/../../up.xml", "a\\..\\b.xml"])
+def test_a_docx_that_names_a_path_outside_itself_is_refused(name):
+    plain = f'<w:document {W}><w:body/></w:document>'
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        archive.writestr("word/document.xml", plain)
+        archive.writestr(zipfile.ZipInfo(name), b"x")
+    with pytest.raises(extraction.Unreadable):
+        extract(out.getvalue(), extraction.DOCX)
+
+
+def test_a_docx_is_bounded_by_its_members_and_its_parts_together(monkeypatch):
+    plain = f'<w:document {W}><w:body><w:p><w:r><w:t>{"x" * 300}</w:t></w:r></w:p></w:body></w:document>'
+    styles = f'<w:styles {W}>{" " * 300}</w:styles>'
+    data = zipped({"word/document.xml": plain, "word/styles.xml": styles, "word/media/image.bin": b"\0" * 2000})
+    assert extract(data, extraction.DOCX).passages
+    monkeypatch.setattr(extraction, "MAX_ARCHIVE_BYTES", 1000)  # what the archive says it unpacks to
+    with pytest.raises(extraction.Unreadable):
+        extract(data, extraction.DOCX)
+    monkeypatch.setattr(extraction, "MAX_ARCHIVE_BYTES", 10**6)
+    monkeypatch.setattr(extraction, "MAX_XML_BYTES", 500)  # each part fits, the two together do not
+    with pytest.raises(extraction.Unreadable):
+        extract(data, extraction.DOCX)
+    monkeypatch.setattr(extraction, "MAX_ARCHIVE_MEMBERS", 2)
+    monkeypatch.setattr(extraction, "MAX_XML_BYTES", 10**6)
+    with pytest.raises(extraction.Unreadable):
+        extract(data, extraction.DOCX)
+
+
+def test_an_arxiv_answer_that_declares_an_entity_is_refused():
+    from backend import lookup
+    with pytest.raises(lookup.Failed) as failed:
+        lookup._arxiv("2401.00001", ('<?xml version="1.0"?><!DOCTYPE feed [<!ENTITY x SYSTEM "file:///etc/hosts">]>'
+                                     '<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>&x;</title></entry></feed>')
+                      .encode())
+    assert failed.value.code == "unavailable"

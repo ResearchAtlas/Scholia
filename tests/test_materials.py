@@ -338,6 +338,21 @@ async def test_a_damaged_file_needs_attention_with_its_reason(tmp_path):
         assert (broken["state"], broken["reason"]) == ("needs_attention", "unreadable_file")
 
 
+@pytest.mark.parametrize("entity", ["billion laughs", "external"])
+async def test_a_docx_declaring_an_entity_is_refused_and_nothing_of_it_is_written(tmp_path, entity):
+    from test_extraction import EXTERNAL, LAUGHS, zipped
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        data = zipped({"word/document.xml": LAUGHS if entity == "billion laughs" else EXTERNAL})
+        [paper] = (await added(client, project, ("entity.docx", data)))["materials"]
+        run = await run_finished(client, paper["run_id"])
+        assert (run["status"], run["result"]) == ("failed", {"reason": "unreadable_file"})
+        for table in ("extractions", "passages", "index_queue"):
+            assert await rows(client, f"SELECT count(*) FROM {table}") == [(0,)], table
+        [refused] = await settled(client, project)
+        assert (refused["state"], refused["reason"]) == ("needs_attention", "unreadable_file")
+
+
 async def test_a_pdf_page_is_rendered_as_a_png_and_only_a_pdf_has_pages(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
