@@ -382,9 +382,11 @@ def _identifiers(conn, project_id, materials, versions):
         if row is None:
             continue
         extracted = _extraction(conn, *row[1:])
-        passages = [extraction.Passage(kind, text, page) for kind, text, page in conn.execute(
-            "SELECT kind, text, page FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 200",
-            (extracted[0],))] if extracted else []
+        # Read in order only as far as identifiers() looks (its first pages or characters), however
+        # many passages that takes: the cursor is read lazily, and identifiers() stops at its window.
+        passages = (extraction.Passage(kind, text, page) for kind, text, page in conn.execute(
+            "SELECT kind, text, page FROM passages WHERE extraction_id = ? ORDER BY ordinal",
+            (extracted[0],))) if extracted else ()
         ids = extraction.identifiers(passages)
         found[material] = (row[0], next((i for i in ids if i[0] == "doi"), None) or next(iter(ids), None))
     return found

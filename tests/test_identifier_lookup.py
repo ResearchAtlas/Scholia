@@ -255,6 +255,17 @@ async def test_crossref_answers_when_openalex_has_no_record_and_arxiv_ids_go_to_
         assert {p["lookup"]["source"] for p in papers.values()} == {"crossref", "arxiv"}
 
 
+async def test_a_doi_after_many_short_passages_but_within_the_first_characters_is_found(tmp_path):
+    late = "10.5555/after.many.notes"
+    notes = "".join(f"Note {n}.\n\n" for n in range(250))  # 250 short passages, about 2,400 characters
+    async with started(tmp_path / "data", scholarly(openalex={late: openalex_work(late, "Found Late")})) as client:
+        project = await project_of(client)
+        await added(client, project, ("notes.md", f"# Many Notes\n\n{notes}doi:{late}\n".encode()))
+        [paper] = await settled(client, project)
+        assert paper["extraction"]["passages"] == 252  # the title, the notes and the DOI's
+        assert (paper["title"], paper["lookup"]["identifier"]) == ("Found Late", f"doi:{late}")
+
+
 async def test_a_doi_only_in_the_reference_list_or_with_none_sends_nothing(tmp_path):
     references_only = b"# A Paper\n\nNo identifier here.\n\n## References\n\n- Smith (2020). doi:10.5555/cited.paper.002\n"
     async with started(tmp_path / "data") as client:
