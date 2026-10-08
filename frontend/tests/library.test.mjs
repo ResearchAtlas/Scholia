@@ -276,3 +276,24 @@ test('a conversation\'s questions read before a switch to another conversation n
     globalThis.fetch = realFetch;
   }
 });
+
+test('a draft conversation\'s questions are read from its first id on, and stay when the window learns the same id', async () => {
+  const realFetch = globalThis.fetch;
+  const asked_for = [];
+  globalThis.fetch = async (path) => {
+    const id = new URL(path, 'http://x').searchParams.get('conversation_id');
+    asked_for.push(id);
+    return new Response(JSON.stringify({ asks: [{ ask_id: `ask-of-${id}` }], working: 1 }), { status: 200 });
+  };
+  try {
+    const asked = newest();
+    const shown = [];
+    await readAsks(asked, null, (found) => shown.push(found)); // no conversation yet: nothing is read or shown
+    await readAsks(asked, 'draft-1', (found) => shown.push(found)); // its first message made it: its files' question
+    await readAsks(asked, 'draft-1', (found) => shown.push(found)); // the window learns of it: the same id
+    assert.deepEqual(asked_for, ['draft-1', 'draft-1']);
+    assert.deepEqual(shown.map((found) => found.asks[0].ask_id), ['ask-of-draft-1', 'ask-of-draft-1']);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

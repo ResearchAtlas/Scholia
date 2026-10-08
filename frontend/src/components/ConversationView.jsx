@@ -59,7 +59,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const [reads, setReads] = useState(0); // each read, failed or not, so polling goes on
   const end = useRef(null);
   const [attached, setAttached] = useState(null); // what the last attach said, and the lookup it started
-  const { asks, load: loadAsks } = useConversationAsks(conversation?.id, attached?.lookup);
+  // Read for the conversation attach() tags its files with: a draft's too, before the window knows it.
+  const { asks, load: loadAsks } = useConversationAsks(id, attached?.lookup);
   const here = useRef(false); // still shown: a draft admitted after the researcher left selects nothing
   useEffect(() => {
     here.current = true;
