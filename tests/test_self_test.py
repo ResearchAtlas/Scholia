@@ -34,6 +34,10 @@ def test_the_interface_check_serves_the_page_and_what_it_names(tmp_path):
         st.check_interface(tmp_path / "missing")
 
 
+def test_the_materials_check_reads_a_pdf_and_latex_and_renders_a_page():
+    assert st.check_materials() == {"pdf": "pdf-1+pypdfium2-5.14.0", "latex": "latex-1+pylatexenc-2.11"}
+
+
 def test_the_encrypted_zip_check_writes_and_reads_back_an_aes_zip():
     assert st.check_encrypted_zip() == {"aes": True}
 
@@ -142,7 +146,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
         raise RuntimeError("no helper")
 
     for name in ("check_sqlite", "check_index", "check_backend", "check_interface", "check_encrypted_zip",
-                 "check_ocr"):
+                 "check_materials", "check_ocr"):
         monkeypatch.setattr(st, name, passing(name))
     monkeypatch.setattr(st, "check_embedding", failing)
     argv = ["--self-test", "--model", str(tmp_path / "m.gguf")]
@@ -151,7 +155,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
     assert result["ok"] is False
     assert result["checks"]["embedding"] == {"ok": False, "error": "RuntimeError: no helper"}
     assert result["checks"]["ocr"] == {"ok": True}
-    assert len(calls) == 7
+    assert len(calls) == 8
     monkeypatch.setattr(st, "check_embedding", passing("embedding"))
     assert st.main(argv) == 0
 

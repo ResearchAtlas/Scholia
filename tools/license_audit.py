@@ -42,6 +42,7 @@ HELPER = "llama.cpp"
 HELPER_SERVER = "Contents/MacOS/llama-server"
 HELPER_LIBRARY = re.compile(r"Contents/Frameworks/llama-cpp/lib(llama|ggml|mtmd)[\w.-]*\.dylib")
 PYDANTIC_CORE_CRATES = "pydantic-core-crates"
+PDFIUM = "PDFium"  # the library pypdfium2 ships, with the third-party code built into it
 # The build interpreter's installation, which every bundled CPython file must come from
 CPYTHON_HOME = Path(sys.base_prefix)
 # "stdlib", not "platstdlib": inside a venv, "platstdlib" names the venv
@@ -58,6 +59,9 @@ ALLOWED = {
     "MIT", "MIT-0", "BSD", "BSD-2-Clause", "BSD-3-Clause", "0BSD", "Apache-2.0", "ISC", "Zlib",
     "Libpng", "IJG", "FTL", "PSF-2.0", "BSL-1.0", "Unicode-3.0", "Unicode-DFS-2016",
     "blessing", "CC0-1.0", "Unlicense", "LicenseRef-Public-Domain",
+    # Anti-Grain Geometry 2.3, inside PDFium: copy, use, modify, sell and distribute "provided this
+    # copyright notice appears in all copies", as is. A notice only; no SPDX identifier names it.
+    "LicenseRef-AGG-2.3",
 }
 # GPL is allowed only with these exceptions.
 ALLOWED_WITH = {
@@ -104,6 +108,15 @@ LIBRARIES = {
     # under the Unlicense, which needs no notice.
     HELPER: ("MIT AND Apache-2.0 AND (MIT OR Unlicense) AND (Unlicense OR MIT-0)",
              [ROOT / "tools/notices/llama.cpp/LICENSES.txt"]),
+    # PDFium in pypdfium2 5.14.0's libpdfium.dylib (bblanchon/pdfium-binaries' build), reviewed from
+    # the build's own license list, which ships with pypdfium2's license files (BUILD_LICENSES):
+    # PDFium (BSD-3-Clause) and the build's scripts (MIT); abseil (Apache-2.0); Anti-Grain Geometry
+    # 2.3; fast_float (MIT); FreeType (FTL, taken over its GPL choice); ICU (Unicode-3.0); Little CMS
+    # (MIT); libjpeg-turbo (IJG, BSD-3-Clause and Zlib); OpenJPEG (BSD-2-Clause); libpng (its
+    # license, Libpng); LLVM's libc (Apache-2.0 with the LLVM exception); simdutf (Apache-2.0 or
+    # MIT); zlib (Zlib).
+    PDFIUM: ("BSD-3-Clause AND MIT AND Apache-2.0 AND LicenseRef-AGG-2.3 AND FTL AND Unicode-3.0 AND IJG AND Zlib"
+             " AND BSD-2-Clause AND Libpng AND (Apache-2.0 WITH LLVM-exception) AND (Apache-2.0 OR MIT)", []),
     # The Rust crates and standard library compiled into pydantic-core's extension, with the
     # licenses tools/rust_notices.py found in its Cargo.lock (it prints this expression).
     PYDANTIC_CORE_CRATES: (
@@ -143,6 +156,8 @@ REVIEWED_NATIVE: dict[str, dict[str, list[str]]] = {
     # Reviewed for 3.23.0: each of its 40 extensions links only libSystem, and none carries
     # another project's copyright or license notice.
     "pycryptodomex": {"Cryptodome/*": []},
+    # Its one native file, PDFium as one library (see LIBRARIES); reviewed for 5.14.0, on macOS arm64.
+    "pypdfium2": {"pypdfium2_raw/libpdfium.dylib": [PDFIUM]},
 }
 
 # Licenses read from a distribution's own license text where its metadata is not a usable
@@ -158,6 +173,10 @@ REVIEWED_LICENSES = {
     "pycryptodomex": "BSD-2-Clause AND Unlicense",
     # Metadata MIT; it is a fork of CPython's zipfile, and ships the PSF license for that part.
     "pyzipper": "MIT AND PSF-2.0",
+    # Metadata "BSD-3-Clause, Apache-2.0, dependency licenses": its own code under either; what it
+    # builds in is the PDFium library's entry. Its CC-BY-4.0 text covers its documentation, which
+    # does not ship.
+    "pypdfium2": "Apache-2.0 OR BSD-3-Clause",
 }
 # License texts for distributions whose wheels ship none, from their upstream repositories
 # at the bundled versions.

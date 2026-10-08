@@ -492,3 +492,26 @@ def test_the_zip_encryption_packages_are_reviewed_and_ship_their_licenses(bundle
     _ship(bundle, "pycryptodomex")
     found, problems = la.audit(bundle)
     assert problems == [] and len(found["pycryptodomex"]) == 40
+
+
+def test_pdfium_is_reviewed_with_the_libraries_built_into_it_and_their_notices_ship(bundle):
+    assert la.component("pypdfium2")[0] == "Apache-2.0 OR BSD-3-Clause" and la.allowed("Apache-2.0 OR BSD-3-Clause")
+    assert la.allowed(la.component(la.PDFIUM)[0])
+    # The build's license list ships with pypdfium2's own license files, one per library built in.
+    shipped = {dest for _, dest in la.component("pypdfium2")[1]}
+    for library in ("pdfium", "freetype", "libjpeg_turbo.ijg", "libpng", "zlib", "icu", "lcms", "libopenjpeg",
+                    "abseil", "agg23", "fast_float", "llvm-libc", "simdutf", "pdfium-binaries"):
+        assert any(dest.rsplit("/", 1)[-1].startswith(library) for dest in shipped), library
+    # Its one native file is covered by the review, as PDFium, at the reviewed version.
+    assert metadata.version("pypdfium2") == "5.14.0"
+    natives = [f.as_posix() for f in metadata.distribution("pypdfium2").files if f.suffix in (".dylib", ".so")]
+    assert natives == ["pypdfium2_raw/libpdfium.dylib"]
+    _put(bundle, f"Contents/Frameworks/{natives[0]}", MACHO)
+    _ship(bundle, "pypdfium2")
+    found, problems = la.audit(bundle)
+    assert problems == [] and la.PDFIUM in found and "pypdfium2" in found
+
+
+def test_pylatexenc_is_mit_and_ships_its_license():
+    assert la.component("pylatexenc")[0] == "MIT"
+    assert {dest for _, dest in la.component("pylatexenc")[1]} == {"LICENSE.txt"}
