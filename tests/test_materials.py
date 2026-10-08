@@ -374,6 +374,21 @@ async def test_a_pdf_page_is_rendered_as_a_png_and_only_a_pdf_has_pages(tmp_path
         assert one["materials"][0]["project_id"] == project
 
 
+async def test_no_answer_about_a_material_is_kept_in_the_browser_cache(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, PDF))["materials"]
+        [ready] = await settled(client, project)
+        version = ready["version"]["id"]
+        passages = (await client.get(f"/api/material-versions/{version}/passages")).json()["passages"]
+        for url in (f"/api/material-versions/{version}/pages/1", f"/api/material-versions/{version}/passages",
+                    f"/api/passages/{passages[0]['id']}", f"/api/materials/{paper['id']}",
+                    f"/api/materials/{paper['id']}/versions", f"/api/projects/{project}/materials",
+                    f"/api/activity?run_id={paper['run_id']}"):
+            response = await client.get(url)
+            assert (response.status_code, response.headers.get("cache-control")) == (200, "no-store"), url
+
+
 async def test_the_researchers_edit_of_a_papers_details_is_checked_and_kept(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)

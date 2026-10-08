@@ -5,6 +5,7 @@ import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettl
   typeKey } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
+import { getBlob } from '../src/api.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zh from '../src/i18n/zh-CN.json' with { type: 'json' };
 
@@ -90,5 +91,17 @@ test('the reasons a run ends with have their texts in both catalogs', () => {
     'encrypted_file', 'time_limit', 'title_needed', 'invalid_doi', 'ask_closed', 'ask_invalid', 'invalid_answer',
     'lookup_locked', 'declined', 'project_changed', 'closing', 'disk_full', 'write_failed', 'passphrase_required']) {
     assert.ok(`errors.${code}` in en && `errors.${code}` in zh, code);
+  }
+});
+
+test('a page image is fetched past the browser cache, so a deleted paper\'s page never comes back from it', async () => {
+  const original = globalThis.fetch;
+  const asked = [];
+  globalThis.fetch = async (path, options) => { asked.push(options); return { ok: true, blob: async () => 'png' }; };
+  try {
+    assert.equal(await getBlob('/api/material-versions/v/pages/1'), 'png');
+    assert.equal(asked[0].cache, 'no-store');
+  } finally {
+    globalThis.fetch = original;
   }
 });

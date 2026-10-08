@@ -36,7 +36,7 @@ import json
 import logging
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
@@ -56,7 +56,13 @@ PASSAGE_PAGE = 500
 _WORKFLOWS = ("extract", "lookup")
 _SHARED = ("complete", "ocr_needed")  # an extraction's statuses: written whole, never partly
 
-router = APIRouter()
+
+def _no_store(response: Response):
+    """No answer about a material is kept in the browser's cache, so none outlives its deletion there."""
+    response.headers["Cache-Control"] = "no-store"
+
+
+router = APIRouter(dependencies=[Depends(_no_store)])
 
 
 class NewFile(BaseModel):
@@ -709,7 +715,7 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
         raise _refused(404, "not_found", "No such page") from None
     except (extraction.Unreadable, FileNotFoundError, ContentCorruptError):
         raise _refused(409, "file_missing", "The file cannot be read") from None
-    return Response(image, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
+    return Response(image, media_type="image/png", headers={"Cache-Control": "no-store"})  # see _no_store
 
 
 def run_details(conn, run_id, workflow, status, inputs):

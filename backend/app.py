@@ -1197,14 +1197,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
 
         listed = await read(listing)
         registry = harness().registry
-        return {"runs": [{
+        return JSONResponse({"runs": [{
             "run_id": run, "project_id": project_id, "project_name": name, "project_kind": kind,
             "workflow": workflow, "status": derived_status(status, run, registry), "cancel_reason": cancel,
             "cost_usd": cost, "attempts": attempts, "started_at": started, "finished_at": finished,
             "result": json.loads(summary) if summary else None,
             "progress": registry.runs[run].progress if run in registry.runs else None, **details,
         } for (run, project_id, workflow, status, cancel, cost, attempts, started, finished, name, kind, summary, _),
-            details in listed]}
+            details in listed]}, headers={"Cache-Control": "no-store"})  # it names papers: never kept by the browser
 
     # The interface: built files only, from inside their folder
 

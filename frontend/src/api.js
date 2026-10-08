@@ -54,11 +54,12 @@ export async function api(method, path, body, { signal } = {}) {
   return data;
 }
 
-// A file the API answers with, such as a page image, as a Blob.
+// A file the API answers with, such as a page image, as a Blob: never from or into the browser's
+// cache, so a deleted material's page cannot come back from it.
 export async function getBlob(path) {
   let response;
   try {
-    response = await fetch(path, { headers: headers(false) });
+    response = await fetch(path, { headers: headers(false), cache: 'no-store' });
   } catch {
     throw new ApiError(0, 'unreachable');
   }
