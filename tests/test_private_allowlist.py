@@ -19,6 +19,7 @@ pytestmark = pytest.mark.asyncio
 
 ZDR_MODEL = "example/zdr-model"
 PLAIN_MODEL = "example/kept-model"  # OpenRouter lists it, with no zero-retention endpoint
+SMALL_MODEL = "example/small-model"  # its only zero-retention endpoint has an 8,192-token window
 LOCAL = "http://127.0.0.1:11434/v1"
 
 
@@ -61,13 +62,33 @@ async def test_every_private_request_to_openrouter_carries_zdr_and_no_plugins_or
         assert stream[-1]["status"] == "succeeded"
         await background_idle(client)  # the title run goes the same way
         assert len(provider.chats) == 2
-        for body in provider.chats:
-            assert body["provider"]["zdr"] is True
+        for body, headers in zip(provider.chats, provider.chat_headers):
+            assert body["provider"] == {"zdr": True, "only": ["example"]}
+            assert headers.get_list("x-openrouter-cache") == ["false"]  # response caching off
             assert not {"plugins", "tools", "reasoning", "web_search_options"} & body.keys()
         decisions = await rows(client, "SELECT data ->> 'decision', data ->> 'sensitivity' FROM audit_log"
                                        " WHERE event = 'outbound' AND data ->> 'kind' = 'model_provider'"
                                        " AND project_id IS NOT (SELECT id FROM projects WHERE kind = 'general')")
         assert decisions == [("allow", "private")] * 2
+
+
+async def test_a_private_request_reaches_no_endpoint_where_openrouter_compresses_by_default(tmp_path):
+    # OpenRouter compresses by default on endpoints whose window is 8,192 tokens or less.
+    small = {"model_id": SMALL_MODEL, "tag": "small", "context_length": 8192}
+    provider = MockProvider(catalog=[ZDR_MODEL, SMALL_MODEL], zero_retention=[
+        small, {"model_id": ZDR_MODEL, "tag": "large", "context_length": 32768},
+        {**small, "model_id": ZDR_MODEL}])
+    async with started(tmp_path / "data", provider) as client:
+        project, conversation = await private_conversation(client)
+        listing = (await client.get("/api/providers/openrouter/models", params={"project_id": project})).json()
+        assert {m["id"]: (m["allowed"], m["refusal"]) for m in listing["models"]} == {
+            ZDR_MODEL: (True, None), SMALL_MODEL: (False, "private_route_not_allowed")}
+        assert (await send(client, conversation, model=ZDR_MODEL))[-1]["status"] == "succeeded"
+        assert provider.answers[0]["provider"] == {"zdr": True, "only": ["large"], "ignore": ["small"]}
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "SECRET-INTERVIEW", "model": SMALL_MODEL})
+        assert (refused.status_code, refused.json()["code"]) == (403, "private_route_not_allowed")
+        assert all("SECRET-INTERVIEW" not in json.dumps(body) for body in provider.chats)
 
 
 async def test_a_model_without_a_zero_retention_endpoint_is_neither_offered_nor_sent(tmp_path):
@@ -371,7 +392,8 @@ async def test_an_expired_catalog_is_read_again_and_a_model_no_longer_zero_reten
 async def test_a_stale_catalog_never_vouches_for_zero_retention(monkeypatch):
     from backend.providers import OPENROUTER, OPENROUTER_BASE_URL, Provider
     provider = Provider(OPENROUTER, "openrouter", OPENROUTER_BASE_URL)
-    monkeypatch.setattr(governance, "get_model_metadata", lambda route, key=None: {"supports_zdr": True})
+    monkeypatch.setattr(governance, "get_model_metadata", lambda route, key=None: {
+        "supports_zdr": True, "zdr_endpoints": {"usable": ["example"], "small": []}})
     monkeypatch.setattr(governance, "catalog_status", lambda p, key: {"stale": False})
     assert governance.zero_retention(provider, ZDR_MODEL, KEY)
     monkeypatch.setattr(governance, "catalog_status", lambda p, key: {"stale": True})  # expired, or its refresh failed

@@ -30,6 +30,9 @@ REFRESH_COOLDOWN_SECONDS = 30
 MAX_CATALOG_BYTES = 8 * 1024 * 1024
 MAX_CATALOG_MODELS = 10000
 CATALOG_SECONDS = 20
+# OpenRouter compresses requests by default on endpoints whose window is this or smaller (its
+# context-compression plugin), so a Private request never reaches one (slice 1 section 6.4).
+COMPRESSION_WINDOW = 8192
 
 _caches: dict[tuple, dict] = {}
 _generation = 0  # bumped by clear_cache(); a snapshot taken before it lists nothing (Scholia)
@@ -134,6 +137,35 @@ def _rate(value):
         return None
 
 
+def zdr_endpoints(rows):
+    """{model id: {"usable": [...], "small": [...]}} from OpenRouter's zero-retention endpoint
+    listing: the routing tags of each model's endpoints whose window is larger than
+    COMPRESSION_WINDOW, and of its others (window at most that, or unknown). A larger endpoint
+    is usable only if no smaller endpoint's tag is the same or is its base slug or variant (a
+    base slug such as "deepinfra" matches every "deepinfra/..." variant when routing), so a request
+    limited to the usable tags and ignoring the small ones can reach no small endpoint. A model
+    with an endpoint whose tag is missing or malformed (one a request could neither name nor
+    ignore) has none usable, whatever that endpoint's window."""
+    found = {}
+    for row in rows:
+        tag, window = row.get("tag"), row.get("context_length")
+        sizes = found.setdefault(row["model_id"], {"usable": set(), "small": set(), "untagged": False})
+        if not isinstance(tag, str) or not tag or tag != tag.strip() or len(tag) > 512 or any(ord(c) < 32 for c in tag):
+            sizes["untagged"] = True
+        elif type(window) is int and window > COMPRESSION_WINDOW:
+            sizes["usable"].add(tag)
+        else:
+            sizes["small"].add(tag)
+
+    def related(a, b):
+        return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+    return {model: {"usable": [] if sizes["untagged"] else sorted(
+                        tag for tag in sizes["usable"] if not any(related(tag, small) for small in sizes["small"])),
+                    "small": sorted(sizes["small"])}
+            for model, sizes in found.items()}
+
+
 def parse_model(raw, provider, supports_zdr=None):
     """A catalog row in Scholia's shape. Prices are USD per million tokens, known only
     for OpenRouter: an OpenAI-compatible /models has no standard currency or unit."""
@@ -173,8 +205,15 @@ async def _refresh(client, provider, key, state):
     zdr = None
     if provider.is_openrouter:
         rows = await _fetch_catalog_rows(client, f"{base}/endpoints/zdr", "model_id", key)
-        zdr = {row["model_id"] for row in rows} if rows is not None else None
-    parsed = {row["id"]: parse_model(row, provider, None if zdr is None else row["id"] in zdr) for row in raw}
+        zdr = zdr_endpoints(rows) if rows is not None else None
+    parsed = {}
+    for row in raw:
+        endpoints = None if zdr is None else zdr.get(row["id"], {"usable": [], "small": []})
+        # Zero retention for Private: an endpoint a request can be limited to, above the window
+        # where OpenRouter compresses by default.
+        parsed[row["id"]] = parse_model(row, provider, None if endpoints is None else bool(endpoints["usable"]))
+        if endpoints is not None and provider.is_openrouter:
+            parsed[row["id"]]["zdr_endpoints"] = endpoints
     if _caches.get(_scope(provider, key)) is not state:
         return  # a key or URL change during the await invalidates this generation
     # Zero-retention availability that could not be verified leaves those models unavailable to Private.

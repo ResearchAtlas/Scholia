@@ -255,7 +255,7 @@ async def test_continue_after_a_tightening_builds_its_turn_under_the_current_pol
         assert (await confirm_key(client)).status_code == 200
         continued = events(await client.post(f"/api/runs/{revoked}/continue", json={"model": ZDR_MODEL}))
         assert continued[-1]["status"] == "succeeded"
-        assert provider.answers[-1]["provider"] == {"zdr": True}
+        assert provider.answers[-1]["provider"] == {"zdr": True, "only": ["example"]}
         assert [m["content"] for m in provider.answers[-1]["messages"][1:]] == ["Where were we?"]  # no recorded step reused
         turns = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert [(t["status"], t["cancel_reason"], t["continues"]) for t in turns] == [

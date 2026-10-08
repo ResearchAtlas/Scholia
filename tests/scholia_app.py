@@ -41,7 +41,8 @@ class MockProvider:
     `replies` (a function of the request body, or a (status, body) pair), or a
     default answer. Set `hold` to an asyncio.Event to keep calls waiting until it is set.
     Its model listing holds the ids in `catalog` (each with a 128K window), and its
-    zero-retention endpoints those in `zero_retention`; both are empty by default."""
+    zero-retention endpoints those in `zero_retention`: an id (one endpoint tagged "example"
+    with a 128K window) or a listing row of its own; both are empty by default."""
 
     def __init__(self, *replies, cost=0.002, catalog=(), zero_retention=()):
         self.catalog = list(catalog)
@@ -49,6 +50,7 @@ class MockProvider:
         self.replies = list(replies)
         self.title_replies = []  # replies for title calls, which never take from `replies`
         self.requests = []
+        self.headers = []  # each request's headers, in the order of `requests`
         self.cost = cost
         self.hold = None
         self.started = asyncio.Event()
@@ -61,13 +63,16 @@ class MockProvider:
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
         self.requests.append((request.method, request.url.path, body))
+        self.headers.append(request.headers)
         self.started.set()
         if self.hold is not None:
             await self.hold.wait()
         if request.url.path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000} for m in self.catalog]})
         if "/endpoints/" in request.url.path:
-            return httpx.Response(200, json={"data": [{"model_id": m} for m in self.zero_retention]})
+            return httpx.Response(200, json={"data": [
+                m if isinstance(m, dict) else {"model_id": m, "tag": "example", "context_length": 128000}
+                for m in self.zero_retention]})
         title = _is_title(body)
         queue = self.title_replies if title else self.replies
         reply = queue.pop(0) if queue else None
@@ -79,6 +84,11 @@ class MockProvider:
         if isinstance(payload, bytes):  # a body JSON encoders refuse to write, such as Infinity
             return httpx.Response(status, content=payload, headers={"content-type": "application/json"})
         return httpx.Response(status, json=payload)
+
+    @property
+    def chat_headers(self):
+        return [headers for (method, path, body), headers in zip(self.requests, self.headers)
+                if path.endswith("/chat/completions")]
 
     @property
     def chats(self):

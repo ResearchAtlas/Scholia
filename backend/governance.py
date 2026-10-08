@@ -43,7 +43,7 @@ ALLOWLIST = Path(__file__).resolve().parent / "private_routes.json"
 # needs a new version (tests/test_private_attestation.py holds each version's digest); a key
 # confirmation of an earlier version is out of date, so the key is asked about again (section
 # 6.4), while a declaration keeps the version it was made under, for the record.
-KEY_STATEMENT = "2026-10-03"
+KEY_STATEMENT = "2026-10-08"  # 2026-10-03, plus no default plugins (ticket 72 D)
 LOCAL_STATEMENT = "2026-10-03"
 CONFIRMATION_MONTHS = 6  # a key confirmation's life, and the age at which a list entry is flagged
 SALT_FILE = "key-fingerprint.salt"
@@ -112,11 +112,19 @@ def private_flags(entries, model):
 def zero_retention(provider, model, key=None) -> bool:
     """Whether the provider's catalog, as read (with key, when given: as read with that key, and
     only while that catalog is fresh, so an expired or failed read fails closed), lists a
-    zero-retention endpoint for the model."""
+    zero-retention endpoint for the model above the window where OpenRouter compresses by
+    default (section 6.4)."""
+    return zero_retention_endpoints(provider, model, key) is not None
+
+
+def zero_retention_endpoints(provider, model, key=None):
+    """The model's zero-retention endpoints as zero_retention reads them ({"usable": [...],
+    "small": [...]}, see openrouter_client.zdr_endpoints), or None when it has none usable."""
     from backend.providers import Route  # providers reads this module's checks for the gate
     if key is not None and catalog_status(provider, key)["stale"]:
-        return False
-    return (get_model_metadata(Route(provider, model), key) or {}).get("supports_zdr") is True
+        return None
+    row = get_model_metadata(Route(provider, model), key) or {}
+    return row.get("zdr_endpoints") if row.get("supports_zdr") is True else None
 
 
 # Declared local servers

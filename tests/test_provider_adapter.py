@@ -97,6 +97,17 @@ async def test_zero_retention_on_openrouter_carries_the_flag():
     await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, zdr_enabled=True)
     import json
     assert json.loads(sent[0].read())["provider"] == {"zdr": True}
+    assert sent[0].headers.get_list("x-openrouter-cache") == ["false"]
+
+
+async def test_zero_retention_is_limited_to_the_endpoints_the_catalog_lists():
+    import json
+    entry = {"zdr_endpoints": {"usable": ["large", "large/b"], "small": ["small"]}}
+    client, sent = client_for(ok(), ok())
+    await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, zdr_enabled=True, model_entry=entry)
+    assert json.loads(sent[0].read())["provider"] == {"zdr": True, "only": ["large", "large/b"], "ignore": ["small"]}
+    await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, model_entry=entry)  # Normal: no limit
+    assert "provider" not in json.loads(sent[1].read()) and "x-openrouter-cache" not in sent[1].headers
 
 
 @pytest.mark.parametrize("status, kind", [
