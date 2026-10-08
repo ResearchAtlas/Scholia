@@ -1315,6 +1315,28 @@ def test_the_timing_workload_says_how_its_questions_are_sent():
     assert "every 0.25" not in json.dumps(helper_timings.WORKLOAD)
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_the_timing_tool_removes_its_data_folder(monkeypatch, fails):
+    from tools import helper_timings
+    used = []
+
+    async def measure(args, state, client, data, processes):
+        used.append(data)
+        assert data.is_dir() and data.name.startswith("scholia-timings-")
+        if fails:
+            raise RuntimeError("the workload failed")
+        return {"memory": {}}
+
+    monkeypatch.setattr(helper_timings, "measure", measure)
+    args = helper_timings.argparse.Namespace(helper="/nonexistent/llama-server")
+    if fails:
+        with pytest.raises(RuntimeError):
+            asyncio.run(helper_timings.run(args))
+    else:
+        assert asyncio.run(helper_timings.run(args))["memory"]["covers"]
+    assert len(used) == 1 and not used[0].exists()
+
+
 def test_the_offered_models_and_the_reranker_pins():
     assert set(local_helper.MODELS) == {EMBEDDING}  # no reranker is offered in M2 (ticket 72)
     assert EMBEDDING_MODEL["size"] == 639_150_592 and RERANKER_MODEL["size"] == 639_153_184

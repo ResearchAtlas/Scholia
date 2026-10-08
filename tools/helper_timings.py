@@ -293,14 +293,15 @@ async def timed(fn):
 
 
 async def run(args):
-    """The workload with the backend in this process."""
-    data = Path(tempfile.mkdtemp(prefix="scholia-timings-"))
-    app = create_app(data, origin=ORIGIN, keyring_backend=_Keys(), helper=local_helper.Config(binary=Path(args.helper)))
-    async with app.app.router.lifespan_context(app.app):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN,
-                                     headers={"X-Scholia-Client": "local"}, timeout=600) as client:
-            results = await measure(args, app.app.state.scholia, client, data,
-                                    lambda: [os.getpid(), *helpers_of(os.getpid())])
+    """The workload with the backend in this process, on a temporary data folder removed at the end."""
+    with tempfile.TemporaryDirectory(prefix="scholia-timings-") as folder:
+        data = Path(folder)
+        app = create_app(data, origin=ORIGIN, keyring_backend=_Keys(), helper=local_helper.Config(binary=Path(args.helper)))
+        async with app.app.router.lifespan_context(app.app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN,
+                                         headers={"X-Scholia-Client": "local"}, timeout=600) as client:
+                results = await measure(args, app.app.state.scholia, client, data,
+                                        lambda: [os.getpid(), *helpers_of(os.getpid())])
     results["memory"]["covers"] = "this backend process and its helper processes, from their launch"
     return results
 
@@ -308,13 +309,17 @@ async def run(args):
 def run_desktop(args):
     """The workload inside the desktop application: its backend, its window and the interface,
     started as backend/desktop.py starts them, on a new temporary data folder with an in-memory
-    credential store. The window closes when the workload ends."""
+    credential store. The window closes when the workload ends, and the data folder is removed."""
+    with tempfile.TemporaryDirectory(prefix="scholia-timings-desktop-") as folder:
+        return _run_desktop(args, Path(folder))
+
+
+def _run_desktop(args, data):
     import webview
 
     import backend.app
     from backend import desktop
 
-    data = Path(tempfile.mkdtemp(prefix="scholia-timings-desktop-"))
     found, before = {}, webkit_processes()
     create_app_, run_server = backend.app.create_app, desktop._run_server
 
