@@ -41,7 +41,7 @@ export function Paper({ material, project, onBack, onChanged }) {
         </Button>
         <span className="flex-1" />
         <input ref={replace} type="file" accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
-          onChange={(event) => { replaceFile(event.target.files); event.target.value = ''; }} />
+          data-testid="paper-replace" onChange={(event) => { replaceFile(event.target.files); event.target.value = ''; }} />
         <Button variant="ghost" size="sm" className="h-8" onClick={() => replace.current?.click()}>
           <FileUp aria-hidden="true" />{t('paper.replace')}
         </Button>

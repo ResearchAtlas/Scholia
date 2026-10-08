@@ -391,6 +391,34 @@ async function materials(ctx) {
     await page.waitForFunction(() => [...document.querySelectorAll('aside figure img')].some((i) => i.naturalWidth > 0));
     check('the first page is rendered by the backend', await image.evaluate((i) => i.naturalWidth) > 0);
     check('its passages are drawn over it', await panel().locator('figure span[title]').count() > 3);
+    check('its table is a passage of its own', (await get(`/api/material-versions/${(await listing(projectId)).materials
+      .find((m) => m.title === titles.pdf).version.id}/passages`)).body.passages.some((p) => p.kind === 'table'));
+    // By keyboard: Tab reaches a passage on the page, which shows its focus ring and its highlight.
+    let focused = null;
+    for (let i = 0; i < 150 && !focused; i += 1) {
+      await page.keyboard.press('Tab');
+      focused = await page.evaluate(() => document.activeElement?.closest('figure') && document.activeElement.dataset.passage);
+    }
+    check('Tab reaches a passage on the page', Boolean(focused));
+    await page.waitForTimeout(300);
+    check('the focused passage shows a focus ring', await page.evaluate(() => getComputedStyle(document.activeElement).boxShadow !== 'none'));
+    check('and its lines are highlighted as when pointed at', await panel().locator(`figure span[title][class*="bg-brand/25"]`).count() > 0);
+  });
+
+  await step('18b-replaced-by-text', async () => {
+    // The PDF replaced by a Markdown file read already (shared, so no new reading): its text shows at once.
+    await page.getByTestId('paper-replace').setInputFiles(files('labour-notes.md'));
+    const list = panel().getByRole('list', { name: L('paper.passages'), exact: true });
+    await list.waitFor({ timeout: 20000 });
+    const paperNow = (await listing(projectId)).materials.find((m) => m.version?.seq === 1);
+    check('the replacement is a new version, read by Markdown', paperNow?.version.media_type === 'text/markdown'
+      && paperNow.reading === null);
+    check('its passages show as text, with no page view left over', await list.getByRole('listitem').count() > 2
+      && await panel().locator('figure img').count() === 0);
+    await list.getByRole('listitem').first().focus();
+    await page.waitForTimeout(300);
+    check('a passage in the text is reached by focus and highlighted', await page.evaluate(() => Boolean(document.activeElement?.dataset.passage))
+      && await list.locator('li:focus > div[class*="bg-brand-soft"]').count() === 1);
   });
 
   await step('19-details-saved', async () => {
@@ -422,6 +450,7 @@ async function materials(ctx) {
     check('one question for the batch, naming its services and identifiers', open?.kind === 'identifier_lookup'
       && open.params.identifiers === 1 && open.params.services.join() === 'crossref,openalex');
     check('the question names the services', (await ask.innerText()).includes('OpenAlex') && (await ask.innerText()).includes('Crossref'));
+    check('the question names its project', (await ask.innerText()).includes(L('ask.project').replace('{name}', local)));
     check('nothing was sent before the answer', !requests().some((r) => r.path.includes('codebook')));
   });
 
