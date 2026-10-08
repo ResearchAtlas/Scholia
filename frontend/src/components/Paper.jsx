@@ -6,7 +6,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
 import { useT } from '../i18n/index.js';
-import { headers, patch } from '../api.js';
+import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, byPage, changes, detailsOf, isPdf, libraryChanged, loadPassages, pageImage, rectStyle, reasonKey,
@@ -86,7 +86,7 @@ function Details({ material, onSaved }) {
   useEffect(() => { // newly saved details (a lookup, or this form's save) replace the form's, unless it holds edits
     setForm((current) => (Object.keys(changes(shown.current, current)).length ? current : before));
     shown.current = before;
-  }, [key]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [key]); // only when the saved details change
   const body = changes(before, form);
   const invalid = !visible(form.title) || !validYear(form.year);
 
@@ -179,7 +179,7 @@ function PageView({ version, number, passages, pointed, onPoint }) {
     const element = frame.current;
     if (!element || src) return undefined;
     let live = true;
-    const show = () => pageImage(version, number, () => headers(false)).then((url) => live && setSrc(url))
+    const show = () => pageImage(version, number).then((url) => live && setSrc(url))
       .catch(() => live && setFailed(true));
     if (typeof IntersectionObserver === 'undefined') { show(); return () => { live = false; }; }
     const observer = new IntersectionObserver((entries) => {

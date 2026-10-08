@@ -1,7 +1,7 @@
 // The Library (slice-1 spec S7, F3a) as the interface reads and sends it: which files Scholia reads,
 // how a paper's state and reason are named, its details as the edit form holds them, and where a
 // passage's boxes sit on its page image (backend/materials.py, backend/extraction.py).
-import { get, post } from './api.js';
+import { get, getBlob, post } from './api.js';
 
 export const ACCEPT = '.pdf,.docx,.html,.htm,.xhtml,.md,.markdown,.tex,.latex';
 const SUPPORTED = new Set(ACCEPT.split(','));
@@ -139,11 +139,8 @@ export function byPage(passages) {
 
 // A PDF page as a data URL: the request carries the session, which an <img> could not, and the
 // page's Content-Security-Policy admits data: images.
-export async function pageImage(versionId, number, headers, scale = 1.5) {
-  const response = await fetch(`/api/material-versions/${encodeURIComponent(versionId)}/pages/${number}?scale=${scale}`,
-    { headers: headers() });
-  if (!response.ok) throw new Error(String(response.status));
-  const blob = await response.blob();
+export async function pageImage(versionId, number, scale = 1.5) {
+  const blob = await getBlob(`/api/material-versions/${encodeURIComponent(versionId)}/pages/${number}?scale=${scale}`);
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result));
