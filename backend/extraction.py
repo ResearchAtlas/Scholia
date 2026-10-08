@@ -17,10 +17,12 @@ a sentence boundary. Tables and captions are their own passages, a reference lis
 Each passage keeps its section path (the headings above it) and its offsets: PDFium character
 indices on its page for a PDF, offsets into the source text otherwise (a hint, ADR 0001).
 
-pdfium is not thread-safe, so every use of it holds PDFIUM. Nothing here logs content.
+pdfium is not thread-safe, so every use of it holds PDFIUM. Nothing here logs content, and the
+libraries it drives are kept from logging it.
 """
 
 import io
+import logging
 import re
 import struct
 import threading
@@ -48,6 +50,13 @@ EXTENSIONS = {".pdf": PDF, ".docx": DOCX, ".html": HTML, ".htm": HTML, ".xhtml":
 EXTRACTORS = {PDF: ("pdf", "pdf-1"), DOCX: ("docx", "docx-1"), HTML: ("html", "html-1"),
               MARKDOWN: ("markdown", "markdown-1"), LATEX: ("latex", "latex-1")}
 PDFIUM = threading.Lock()
+
+# pylatexenc logs what it parses: a tolerated parse error with the source around it (INFO), an
+# unknown node whole (WARNING), each node (DEBUG). Its loggers never write, at any level. The other
+# libraries read here log no content: pypdfium2 names unsupported PDF features and its own objects;
+# html.parser, zipfile and ElementTree have no logger (zipfile's one warning on reading names a
+# member, and only the two parts in _DOCX_PARTS are opened).
+logging.getLogger("pylatexenc").setLevel(logging.CRITICAL + 1)
 
 # The scanned-page check (section 13).
 SCANNED_CHARS = 100

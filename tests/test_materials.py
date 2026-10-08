@@ -402,9 +402,13 @@ async def test_reading_and_its_failures_log_no_file_name_or_text(tmp_path, caplo
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, (f"{secret}.md", f"# {secret}\n\n{secret} said this.".encode()),
-                    (f"{secret}.pdf", b"%PDF-1.7 " + secret.encode()))
-        await settled(client, project)
-    assert secret not in caplog.text
+                    (f"{secret}.pdf", b"%PDF-1.7 " + secret.encode()),
+                    # Malformed LaTeX: pylatexenc's tolerant parser would log the mismatched names.
+                    (f"{secret}.tex", f"\\begin{{document}}\n{secret} \\end{{ParticipantSevenCanary}} and"
+                                      f" \\textbf{{{secret}\n\\end{{document}}\n".encode()))
+        latex = {m["version"]["media_type"]: m for m in await settled(client, project)}[extraction.LATEX]
+        assert latex["state"] == "ready"  # read, the error tolerated
+    assert secret not in caplog.text and "ParticipantSevenCanary" not in caplog.text
 
 
 async def test_attached_in_a_conversation_names_it_and_only_its_own_project(tmp_path):
