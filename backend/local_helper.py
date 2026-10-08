@@ -50,9 +50,9 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 from backend.db import DatabaseClosedError
-from backend.outbound_gate import OutboundDenied
+from backend.outbound_gate import MODEL_FILE_HOSTS, OutboundDenied
 from backend.runs import _through
-from backend.settings import SettingsChanged, _make_private_dirs, load_settings
+from backend.settings import SettingsChanged, _make_private_dirs, load_settings, write_private
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +71,13 @@ EMBEDDING_MODEL = {
     "size": 639_150_592,
     "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
     "license": "Apache-2.0",
+    # Its license files (slice 1 section 18), installed beside it from the copies the app ships
+    # (tools/notices, Contents/Resources/licenses): the publisher's repositories ship no license
+    # file, only "license: apache-2.0" in the model card, so LICENSE is Apache-2.0's standard text
+    # (apache.org's LICENSE-2.0.txt) and SOURCE.txt names the model and where it comes from.
+    "notice": {"folder": "Qwen3-Embedding-0.6B", "files": {
+        "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "SOURCE.txt": "ab2873254bce1bea81e211610524c98a7e6e442a346104f343ef947226b95841"}},
     "url": _EMBEDDING_HF,  # what tools/fetch.py downloads for CI's self-test
     "sources": {
         "huggingface": {"repository": f"{HF}/Qwen/Qwen3-Embedding-0.6B-GGUF", "url": _EMBEDDING_HF},
@@ -123,14 +130,30 @@ _FULL = (errno.ENOSPC, errno.EDQUOT)
 _CHECKS = ("model_missing", "model_changed", "binary_missing", "binary_changed")
 
 
+def _finite(value) -> bool:
+    """A real number a float holds: not a boolean, NaN, an infinity or an integer too large."""
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _index(row, count) -> int | None:
+    """A reply row's index, when it is an integer below count (never a boolean)."""
+    index = row.get("index") if isinstance(row, dict) else None
+    return index if type(index) is int and 0 <= index < count else None
+
+
 def _vectors(data, count):
     """The embeddings in a /v1/embeddings reply, in input order, or HelperUnavailable."""
     rows = data.get("data") if isinstance(data, dict) else None
-    vectors = [row.get("embedding") for row in sorted(rows, key=lambda row: row.get("index", 0))] \
-        if isinstance(rows, list) and all(isinstance(row, dict) for row in rows) else None
-    if vectors is None or len(vectors) != count or not all(
-            isinstance(v, list) and v and all(isinstance(x, (int, float)) and math.isfinite(x) for x in v)
-            for v in vectors):
+    indexes = [_index(row, count) for row in rows] if isinstance(rows, list) else [None]
+    if None in indexes or sorted(indexes) != list(range(count)):  # each text's embedding, once
+        raise HelperUnavailable("request_failed")
+    vectors = [row.get("embedding") for row in sorted(rows, key=lambda row: row["index"])]
+    if not all(isinstance(v, list) and v and all(_finite(x) for x in v) for v in vectors):
         raise HelperUnavailable("request_failed")
     return vectors
 
@@ -157,15 +180,25 @@ class _Exited(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    """create_app's helper option: the server binary (None: this build has none) and the models
-    offered by id (tests and walkthroughs pass pins of their own)."""
+    """create_app's helper option: the server binary (None: this build has none), the models
+    offered by id (tests and walkthroughs pass pins of their own) and the license texts the app
+    ships, which an installed model's license files are copied from."""
     binary: Path | None = field(default_factory=lambda: bundled_binary())
     models: dict = field(default_factory=lambda: MODELS)
+    notices: Path = field(default_factory=lambda: bundled_notices())
 
 
 def bundled_binary() -> Path | None:
     """llama-server beside the packaged app's executable (Contents/MacOS); none from source."""
     return Path(sys.executable).with_name("llama-server") if getattr(sys, "frozen", False) else None
+
+
+def bundled_notices() -> Path:
+    """The license texts the app ships (tools/license_audit.py): Contents/Resources/licenses in the
+    packaged app, tools/notices from source."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parents[1] / "Resources" / "licenses"
+    return Path(__file__).resolve().parents[1] / "tools" / "notices"
 
 
 def command(binary, model, kind="embedding") -> list[str]:
@@ -298,6 +331,7 @@ class Helper:
         self.state, self.problem, self.failures, self.ready_seconds = "stopped", None, 0, None
         self._process = self._port = self._key = None
         self._starting = self._watching = self._restarting = None
+        self._ending = None  # a stopped process until it is reaped: a start and close() wait for it
         self._slots, self._indexing = asyncio.Semaphore(SLOTS), asyncio.Semaphore(SLOTS - 1)
         self._in_use, self.last_used = 0, time.monotonic()
         self.installs = 0  # model files installed in this process (see Local.verify_installed)
@@ -352,10 +386,11 @@ class Helper:
             self._in_use -= 1
             self.last_used = time.monotonic()
         scores = [None] * len(documents)
-        for row in data.get("results", []) if isinstance(data, dict) else []:
-            if isinstance(row, dict) and row.get("index") in range(len(documents)):
-                scores[row["index"]] = row.get("relevance_score")
-        if not all(isinstance(score, (int, float)) and math.isfinite(score) for score in scores):
+        rows = data.get("results") if isinstance(data, dict) else None
+        for row in rows if isinstance(rows, list) else []:
+            if (index := _index(row, len(documents))) is not None:
+                scores[index] = row.get("relevance_score")
+        if not all(_finite(score) for score in scores):
             raise HelperUnavailable("request_failed")
         return scores
 
@@ -372,7 +407,7 @@ class Helper:
         except (httpx.HTTPError, OutboundDenied, ValueError):
             raise HelperUnavailable("request_failed") from None
         except DatabaseClosedError:  # the gate cannot record a decision: a restore, or the app closing
-            raise HelperUnavailable("closing") from None
+            raise HelperUnavailable(self.local.unavailable()) from None
 
     async def _ready(self):
         """Start the helper if it is stopped and wait for it; HelperUnavailable unless it runs."""
@@ -401,8 +436,11 @@ class Helper:
 
     async def _start(self):
         times = self.local.timings()
-        self.state, began = "starting", time.monotonic()
+        self.state = "starting"
         try:
+            if self._ending is not None:  # the last process is still being ended: one process per model
+                await asyncio.wait({self._ending})
+            began = time.monotonic()
             if problem := await asyncio.to_thread(self._check):
                 self.state, self.problem = "stopped", problem  # checked again at the next request
                 return
@@ -474,27 +512,33 @@ class Helper:
         self._watching = None
         if problem:  # marked first: no request starts another process while this one is ended
             self.state, self.problem = "restarting", problem
-        await self.stop()
-        if problem:  # then the backoff, from when it has ended
-            self._failed(problem, times)
+        try:
+            await self.stop()
+        finally:
+            if problem:  # then the backoff, from when it has ended (or failed to end)
+                self._failed(problem, times)
 
     async def _healthy(self) -> bool | None:
-        """Whether the server answers its health check; None when the check could not be made (the
-        gate could not decide it: a restore swapping the database, or the app closing), which is
-        neither a pass nor a failure."""
-        url = self.url
+        """Whether the server answers its health check; None when the check could not be made
+        because the gate's database is closed (a restore swapping it, or the app closing), which is
+        neither a pass nor a failure. Any other refusal fails the check."""
+        url, db = self.url, self.local.state.get("db")
         try:
             async with await self.local.client(timeout=HEALTH_TIMEOUT) as http:
                 return url is not None and (await http.get(f"{url}/health")).status_code == 200
         except httpx.HTTPError:
             return False
-        except Exception as error:  # OutboundDenied, HelperUnavailable, DatabaseClosedError: not checked
-            log.warning("the local model helper's health check could not be made (%s)", type(error).__name__)
+        except OutboundDenied as denied:
+            if denied.reason == "revoked" and (db is None or db.closed):  # the database it was decided on
+                return None
+            log.warning("the local model helper's health check was refused (%s)", denied.reason)
+            return False
+        except (DatabaseClosedError, HelperUnavailable):  # held writes, or the app closing
             return None
 
     async def stop(self, kill=False):
         """End the running server, if any, as a stop rather than a failure (idle, or a cancelled
-        rerank with kill): the next request starts it again."""
+        rerank with kill): the next request starts it again, once this one is reaped."""
         process, self._process, self._port, self._key = self._process, None, None, None
         watching, self._watching = self._watching, None
         if self.state == "running":
@@ -503,7 +547,13 @@ class Helper:
             watching.cancel()
             await asyncio.wait({watching})
         if process is not None:
-            await _end(process, kill=kill)
+            ending = self._ending = asyncio.ensure_future(_end(process, kill=kill))
+
+            def ended(_):
+                if self._ending is ending:
+                    self._ending = None
+            ending.add_done_callback(ended)
+            await asyncio.shield(ending)  # a cancelled caller leaves it going; start and close wait for it
 
     def start_again(self):
         """After the notice (or a stop): start now, with a fresh count of failures."""
@@ -526,6 +576,8 @@ class Helper:
         if tasks:
             await asyncio.wait(tasks)
         await self.stop()
+        if self._ending is not None:  # a process another stop is still ending (idle, a failure)
+            await asyncio.wait({self._ending})
         self.state = "stopped"
 
 
@@ -561,8 +613,13 @@ class Local:
         """At launch, in a worker thread: remove what a crash left of a download or an import, and
         check the binary for the status."""
         for part in (self.data_dir / "models").glob(f"*/*{PART}"):
-            part.unlink(missing_ok=True)
+            _remove(part)
         self.binary_problem = binary_problem(self.config.binary)
+
+    def unavailable(self) -> str:
+        """Why the gate could not record a request: the app closing, or its database not open now
+        (a restore holds its writes, or swapped it)."""
+        return "closing" if self.closed else "database_unavailable"
 
     async def verify_installed(self):
         """Once after launch, in the background: check each model file in place against its pin, so
@@ -708,26 +765,32 @@ class Local:
                                 raise Refused(502, "size_mismatch", "The file is larger than its pin")
                             digest.update(chunk)
                             out.write(chunk)
+                        _sync(out)
             if download.received != pin["size"]:
                 raise Refused(502, "size_mismatch", "The file's size differs from its pin")
             if digest.hexdigest() != pin["sha256"]:
                 raise Refused(502, "hash_mismatch", "The file's SHA-256 differs from its pin")
-            _install(part, helper.path)  # on the loop: no cancellation between the check and the install
+            # On the loop: no cancellation between the check and the install.
+            _write_notices(pin, helper.path.parent, self.config.notices)
+            _install(part, helper.path)
         except asyncio.CancelledError:  # Cancel, or the app closing: ended here, so the task itself finishes
             download.state = "cancelled"
         except Refused as refusal:
             download.state, download.problem = "failed", refusal.code
         except OutboundDenied as denied:
             download.state = "failed"
-            download.problem = "redirect_refused" if denied.reason == "cross_origin_redirect" else "download_refused"
+            download.problem = {"cross_origin_redirect": "redirect_refused",
+                                # a download goes through the General project, which is never revoked:
+                                # the gate's database was swapped (a restore)
+                                "revoked": self.unavailable()}.get(denied.reason, "download_refused")
         except (httpx.ConnectError, httpx.ConnectTimeout) as error:
             download.state, download.problem = "failed", "source_unreachable"
-            if _host(error) == httpx.URL(url).host:  # the source itself, not the file host it sent us to
+            if _host(error) in _served_by(url):  # the source, or the file host it sends its files from
                 self.unreachable.add(download.source)
         except httpx.HTTPError:
             download.state, download.problem = "failed", "download_interrupted"
         except (HelperUnavailable, DatabaseClosedError):  # the app closing, or a restore under way
-            download.state, download.problem = "failed", "closing"
+            download.state, download.problem = "failed", self.unavailable()
         except OSError as error:
             download.state, download.problem = "failed", "disk_full" if error.errno in _FULL else "write_failed"
         except Exception as error:  # never left running: a download that failed in any other way says so
@@ -738,7 +801,7 @@ class Local:
             self.unreachable.discard(download.source)
             helper.model_installed()
         finally:
-            part.unlink(missing_ok=True)
+            _remove(part)
             if download.state == "failed":
                 log.warning("a model download failed (%s)", download.problem)
 
@@ -746,8 +809,7 @@ class Local:
         download = self.download
         if download is None or download.task is None or download.task.done():
             raise Refused(409, "no_download", "No download is under way")
-        download.task.cancel()
-        await asyncio.wait({download.task})
+        await _cancel(download)
 
     async def import_file(self, model_id, text) -> None:
         pin = self._pin(model_id)
@@ -759,7 +821,8 @@ class Local:
         helper = self.helpers[model_id]
         self.importing = True
         try:
-            problem, cancelled = await _through(asyncio.to_thread(_import, source, pin, helper.path))
+            problem, cancelled = await _through(asyncio.to_thread(_import, source, pin, helper.path,
+                                                                  self.config.notices))
         finally:
             self.importing = False
         if problem is None:
@@ -773,9 +836,17 @@ class Local:
     async def close(self):
         self.closed = True
         if self.download is not None and self.download.task is not None and not self.download.task.done():
-            self.download.task.cancel()
-            await asyncio.wait({self.download.task})
+            await _cancel(self.download)
         await asyncio.gather(*(helper.close() for helper in self.helpers.values()))
+
+
+async def _cancel(download):
+    """Cancel a download and wait for its end; one cancelled before its first step, which never
+    ran its own handling, is marked cancelled here (it wrote nothing)."""
+    download.task.cancel()
+    await asyncio.wait({download.task})
+    if download.state == "running":
+        download.state = "cancelled"
 
 
 def _host(error: httpx.HTTPError) -> str | None:
@@ -784,6 +855,13 @@ def _host(error: httpx.HTTPError) -> str | None:
         return error.request.url.host
     except RuntimeError:  # no request was attached to it
         return None
+
+
+def _served_by(url) -> set[str]:
+    """The hosts that serve a download from url: its source, and the file hosts that source was
+    seen redirecting its files to (outbound_gate.MODEL_FILE_HOSTS)."""
+    host = httpx.URL(url).host
+    return {host} | {file_host for _, file_host, _ in MODEL_FILE_HOSTS.get(("https", host, 443), ())}
 
 
 def _free_bytes(folder: Path) -> int:
@@ -799,49 +877,98 @@ def _private_file(path: Path):
     return os.fdopen(fd, "wb")
 
 
-def _install(part: Path, path: Path):
-    """Put a verified file in place under its own name, durably."""
-    os.replace(part, path)
-    folder = os.open(path.parent, os.O_RDONLY)
+def _sync(out):
+    """Write a file's contents through to the disk before it is installed."""
+    out.flush()
+    os.fsync(out.fileno())
+
+
+def _code(error: OSError) -> str:
+    """An OSError named by its kind, for the log: never its message, which names the file."""
+    return errno.errorcode.get(error.errno, type(error).__name__)
+
+
+def _remove(path: Path):
+    """Remove a partial file if it is there. A failure is logged by kind, never raised: the next
+    launch removes it (Local.prepare), and nothing ever installs a .part file."""
     try:
-        os.fsync(folder)
-    finally:
-        os.close(folder)
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        log.warning("a partial model file could not be removed (%s)", _code(error))
 
 
-def _import(source: Path, pin, path: Path) -> str | None:
+def _install(part: Path, path: Path):
+    """Put a verified file, its contents already synced, in place under its own name. The rename
+    installs it: a failure to sync the folder afterwards is logged, not reported as a failed install."""
+    os.replace(part, path)
+    try:
+        folder = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(folder)  # makes the rename itself durable
+        finally:
+            os.close(folder)
+    except OSError as error:
+        log.warning("the model folder could not be synced after an install (%s)", _code(error))
+
+
+def _write_notices(pin, folder: Path, notices: Path):
+    """Put the model's license files beside it (pin["notice"]), from the copies the app ships, each
+    checked against its pin first. Refused (notice_missing) when this copy of Scholia lacks one."""
+    notice = pin.get("notice")
+    for name, digest in (notice["files"].items() if notice else ()):
+        try:
+            data = (Path(notices) / notice["folder"] / name).read_bytes()
+        except OSError:
+            data = None
+        if data is None or hashlib.sha256(data).hexdigest() != digest:
+            raise Refused(500, "notice_missing", "The model's license file is missing from this copy of Scholia")
+        write_private(folder / name, data)
+
+
+def _import(source: Path, pin, path: Path, notices: Path) -> str | None:
     """Copy source into place if it is the pinned file, hashing what is copied: None, or why not."""
-    part = path.with_name(path.name + PART)
     try:
         fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK)  # a FIFO would otherwise wait for a writer
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                return "not_a_file"
-            if info.st_size != pin["size"]:
-                return "size_mismatch"
-            _make_private_dirs(path.parent)
-            digest = hashlib.sha256()
-            with _private_file(part) as out:
-                while block := os.read(fd, 1 << 20):
-                    digest.update(block)
-                    out.write(block)
-        finally:
-            os.close(fd)
-        if digest.hexdigest() != pin["sha256"]:
-            return "hash_mismatch"
-        _install(part, path)
-        return None
     except FileNotFoundError:
         return "file_not_found"
     except IsADirectoryError:
         return "not_a_file"
     except PermissionError:
         return "file_unreadable"
-    except OSError as error:
-        return "disk_full" if error.errno in _FULL else "import_failed"
+    except OSError:
+        return "import_failed"
+    part = path.with_name(path.name + PART)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return "not_a_file"
+        if info.st_size != pin["size"]:
+            return "size_mismatch"
+        _make_private_dirs(path.parent)
+        digest = hashlib.sha256()
+        with _private_file(part) as out:
+            while True:
+                try:
+                    block = os.read(fd, 1 << 20)
+                except OSError:  # the file being read, not the copy
+                    return "import_failed"
+                if not block:
+                    break
+                digest.update(block)
+                out.write(block)
+            _sync(out)
+        if digest.hexdigest() != pin["sha256"]:
+            return "hash_mismatch"
+        _write_notices(pin, path.parent, notices)
+        _install(part, path)
+        return None
+    except Refused as refusal:
+        return refusal.code
+    except OSError as error:  # writing the copy or its license files
+        return "disk_full" if error.errno in _FULL else "write_failed"
     finally:
-        part.unlink(missing_ok=True)
+        os.close(fd)
+        _remove(part)
 
 
 def urls(state) -> tuple[str, ...]:

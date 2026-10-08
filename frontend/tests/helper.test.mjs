@@ -51,7 +51,8 @@ test('every state, source and failure the backend reports has its words in both 
     ...['source_unreachable', 'source_refused', 'size_mismatch', 'hash_mismatch', 'redirect_refused', 'download_refused',
       'download_interrupted', 'disk_full', 'write_failed', 'closing', 'invalid_path', 'file_not_found', 'not_a_file',
       'file_unreadable', 'import_failed', 'local_only_no_download', 'already_installed', 'download_running',
-      'unknown_model', 'unknown_source', 'no_download', 'download_failed'].map((code) => `errors.${code}`),
+      'unknown_model', 'unknown_source', 'no_download', 'download_failed', 'database_unavailable', 'notice_missing',
+    ].map((code) => `errors.${code}`),
   ];
   for (const key of keys) {
     assert.ok(Object.hasOwn(en, key), key);

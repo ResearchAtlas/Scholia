@@ -9,20 +9,23 @@ process through the outbound gate's mock transport. Models are synthetic bytes w
 import asyncio
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import stat
 import sys
+import threading
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-from backend import local_helper
+from backend import local_helper, logs
 from backend.db import new_id
+from backend.outbound_gate import OutboundDenied
 from backend.local_helper import EMBEDDING, EMBEDDING_MODEL, RERANKER_MODEL, Config, HelperUnavailable
 from network_guard import allow_subprocess
 from scholia_app import started
@@ -34,8 +37,18 @@ MS_CDN = "https://cdn-lfs-cn-1.modelscope.cn/prod/lfs-objects/01/23/abcd?auth_ke
 
 FAKE_SERVER = r'''#!{python}
 # A stand-in for llama-server: it records how it was started, then behaves as the control file says.
-import json, os, sys, time
+# With a stop_delay file, it takes that many seconds to end after SIGTERM, as a busy server may.
+import json, os, signal, sys, time
 control = {control!r}
+try:
+    with open(os.path.join(control, "stop_delay")) as f:
+        delay = float(f.read())
+    def ending(signum, frame):
+        time.sleep(delay)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, ending)
+except FileNotFoundError:
+    pass
 with open(os.path.join(control, "launches.jsonl"), "a") as f:
     f.write(json.dumps({{"argv": sys.argv[1:], "env": dict(os.environ), "pid": os.getpid()}}) + "\n")
 try:
@@ -86,6 +99,10 @@ class Fake:
     def behave(self, behavior):
         (self.control / "behavior").write_text(behavior)
 
+    def stop_slowly(self, seconds):
+        """Servers launched from now on take this long to end after SIGTERM."""
+        (self.control / "stop_delay").write_text(str(seconds))
+
     @property
     def launches(self):
         path = self.control / "launches.jsonl"
@@ -104,6 +121,7 @@ class Remote:
         self.hold = {}  # path -> asyncio.Event that requests wait for
         self.files = {}  # URL -> (status, headers, body or async iterator)
         self.scores = None  # reranking scores to answer with, instead of 1 / (rank + 1)
+        self.rows = None  # embedding reply rows to answer with, instead of one per input
 
     def key(self, port):
         """The key of the server that announced port (50000 + its launch's number)."""
@@ -131,8 +149,8 @@ class Remote:
         if request.url.path in self.hold:
             await self.hold[request.url.path].wait()
         if request.url.path == "/v1/embeddings":
-            return httpx.Response(200, json={"data": [{"index": i, "embedding": [0.5, 0.5, 0.5, 0.5]}
-                                                      for i, _ in reversed(list(enumerate(body["input"])))]})
+            return httpx.Response(200, json={"data": self.rows or [{"index": i, "embedding": [0.5, 0.5, 0.5, 0.5]}
+                                                                   for i, _ in reversed(list(enumerate(body["input"])))]})
         if request.url.path == "/v1/rerank":
             scores = self.scores or [1.0 / (i + 1) for i, _ in enumerate(body["documents"])]
             return httpx.Response(200, json={"results": [{"index": i, "relevance_score": score}
@@ -173,7 +191,7 @@ def fake(tmp_path):
 
 
 @contextlib.asynccontextmanager
-async def app(tmp_path, fake, *, install=True, models=None, binary="fake"):
+async def app(tmp_path, fake, *, install=True, models=None, binary="fake", notices=None):
     """The app with the stand-in helper (allowed to start) and, with install, the model in place."""
     data = tmp_path / "data"
     models = models or {EMBEDDING: PIN}
@@ -182,7 +200,8 @@ async def app(tmp_path, fake, *, install=True, models=None, binary="fake"):
         path.parent.mkdir(parents=True)
         path.write_bytes(WEIGHTS)
     remote = Remote(fake)
-    config = Config(binary=fake.binary if binary == "fake" else binary, models=models)
+    config = Config(binary=fake.binary if binary == "fake" else binary, models=models,
+                    **({"notices": notices} if notices is not None else {}))
     with allow_subprocess(str(fake.binary)):
         async with started(data, remote, setup=False, helper=config) as client:
             client.remote = remote
@@ -196,6 +215,30 @@ async def until(predicate, timeout=5.0):
         if time.monotonic() > deadline:
             raise AssertionError("timed out")
         await asyncio.sleep(0.01)
+
+
+@contextlib.contextmanager
+def app_log(tmp_path):
+    """The app's default log, configured as the desktop entry configures it (every logger, formatted,
+    tracebacks included): yields a function returning its text."""
+    root = tmp_path / "log-root"
+    root.mkdir()
+    handler = logs.configure(root)
+    path = root / "logs" / "scholia.log"
+    try:
+        yield lambda: path.read_text() if path.exists() else ""
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+
+def names_nothing(text, tmp_path):
+    """No path, file name or download address in a log."""
+    return not any(secret in text for secret in (str(tmp_path), tmp_path.name, PIN["file"], "huggingface.co", "hf.co"))
+
+
+def path_of(fd) -> str:
+    return fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b"\0").decode()
 
 
 def alive(pid):
@@ -357,7 +400,7 @@ async def test_a_health_check_the_gate_cannot_record_is_neither_a_pass_nor_a_fai
             assert client.remote.helper_requests == []  # none went out unrecorded
             assert helper(client).state == "running" and helper(client).failures == 0
             assert helper(client)._watching is not None and not helper(client)._watching.done()
-            with pytest.raises(HelperUnavailable, match="closing"):
+            with pytest.raises(HelperUnavailable, match="database_unavailable"):  # not "closing": it is not
                 await local_helper.embed(client.state, ["text"], query=True)
         finally:
             await asyncio.to_thread(db.release_writes)
@@ -379,6 +422,132 @@ async def test_a_model_file_that_changed_since_it_was_installed_is_found_at_laun
         serve(client, HF_URL, WEIGHTS, via=HF_CDN)
         status = await downloaded(client, source="huggingface")  # replaced, as a download
         assert status["search"]["mode"] == "hybrid" and path.read_bytes() == WEIGHTS
+
+
+@pytest.mark.asyncio
+async def test_a_request_while_a_failed_helper_is_ended_is_refused_and_starts_nothing(tmp_path, fake, timings):
+    """A helper that fails its check is marked restarting before its process is ended: a question
+    meanwhile is refused with the reason, and the next process starts only once this one is gone."""
+    timings.update(health=0.1, backoff=[0.2, 0.2, 0.2])
+    fake.stop_slowly(1.0)
+    async with app(tmp_path, fake) as client:
+        await local_helper.embed(client.state, ["text"])
+        pid = fake.launches[0]["pid"]
+        client.remote.healthy = False
+        await until(lambda: helper(client).state == "restarting")
+        assert alive(pid)  # still being ended
+        with pytest.raises(HelperUnavailable, match="unhealthy"):
+            await local_helper.embed(client.state, ["a question"], query=True)
+        assert len(fake.launches) == 1 and helper(client).state == "restarting" and alive(pid)
+        client.remote.healthy = True
+        await until(lambda: len(fake.launches) == 2, timeout=10)
+        assert not alive(pid)  # one process per model
+        await until(lambda: helper(client).state == "running")
+
+
+@pytest.mark.asyncio
+async def test_a_request_while_an_idle_helper_is_ended_waits_for_its_end(tmp_path, fake, timings):
+    timings.update(idle=0.2)
+    fake.stop_slowly(0.8)
+    async with app(tmp_path, fake) as client:
+        await local_helper.embed(client.state, ["text"])
+        pid = fake.launches[0]["pid"]
+        await until(lambda: helper(client).state == "stopped")  # idle: being ended
+        assert alive(pid)
+        question = asyncio.create_task(local_helper.embed(client.state, ["a question"], query=True))
+        while alive(pid):
+            assert len(fake.launches) == 1  # no second process while the first is being ended
+            await asyncio.sleep(0.01)
+        assert await question == [[0.5] * 4] and len(fake.launches) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("why", ["idle", "unhealthy"])
+async def test_closing_the_app_while_a_helper_is_ended_waits_for_it(tmp_path, fake, timings, why):
+    timings.update(idle=0.2 if why == "idle" else 600, health=0.1, backoff=[30])
+    fake.stop_slowly(1.0)
+    async with app(tmp_path, fake) as client:
+        await local_helper.embed(client.state, ["text"])
+        pid = fake.launches[0]["pid"]
+        client.remote.healthy = why != "unhealthy"
+        await until(lambda: helper(client).state == ("stopped" if why == "idle" else "restarting"))
+        assert alive(pid)
+    assert not alive(pid) and len(fake.launches) == 1  # closing waited for it: nothing is left running
+
+
+@pytest.mark.asyncio
+async def test_a_failure_is_counted_even_when_ending_its_process_fails(tmp_path, fake, timings, monkeypatch):
+    real_end, failed = local_helper._end, []
+
+    async def failing_end(process, *, kill=False):
+        await real_end(process, kill=kill)
+        if not failed:
+            failed.append(process.pid)
+            raise RuntimeError("the end could not be confirmed")
+
+    monkeypatch.setattr(local_helper, "_end", failing_end)
+    async with app(tmp_path, fake) as client:
+        await local_helper.embed(client.state, ["text"])
+        os.kill(fake.launches[0]["pid"], 9)
+        await until(lambda: len(fake.launches) == 2 and helper(client).state == "running")  # restarted all the same
+        assert failed and helper(client).failures == 1
+
+
+@pytest.mark.asyncio
+async def test_a_health_check_the_gate_refuses_for_another_reason_fails(tmp_path, fake, timings, monkeypatch):
+    timings.update(health=0.05, backoff=[30])
+    async with app(tmp_path, fake) as client:
+        await local_helper.embed(client.state, ["text"])
+        monkeypatch.setattr(local_helper, "urls", lambda state: ())  # the gate no longer knows its address
+        await until(lambda: helper(client).state == "restarting" and not alive(fake.launches[0]["pid"]))
+        assert helper(client).problem == "unhealthy" and len(fake.launches) == 1
+
+
+class _HeldCheck:
+    """The launch-time check of an installed model, held once it has hashed the file."""
+
+    def __init__(self, monkeypatch):
+        self.real, self.calls, self.returned = local_helper.mismatch, 0, False
+        self.hashed, self.release = threading.Event(), threading.Event()
+        monkeypatch.setattr(local_helper, "mismatch", self)
+
+    def __call__(self, path, pin):
+        self.calls += 1
+        result = self.real(path, pin)
+        if self.calls == 1:  # the launch's; any check before a start goes straight through
+            self.hashed.set()
+            self.release.wait(5)
+            self.returned = True
+        return result
+
+    async def finish(self):
+        self.release.set()
+        await until(lambda: self.returned)
+        await asyncio.sleep(0.05)  # the check's own next step, on the loop
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("meanwhile", ["import", "start"])
+async def test_the_launch_check_leaves_alone_what_changed_while_it_hashed(tmp_path, fake, timings, monkeypatch,
+                                                                          meanwhile):
+    check = _HeldCheck(monkeypatch)
+    path = model_file(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(WEIGHTS.replace(b"synthetic", b"Synthetic"))  # the pinned size, other bytes
+    async with app(tmp_path, fake, install=False) as client:
+        await asyncio.to_thread(check.hashed.wait, 5)  # it has found the file changed, and is held
+        if meanwhile == "import":  # an install: the check's finding no longer holds
+            good = tmp_path / "good.gguf"
+            good.write_bytes(WEIGHTS)
+            response = await client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(good)})
+            assert response.status_code == 200
+        else:  # put right by hand, and started: its own check before the launch passed
+            path.write_bytes(WEIGHTS)
+            await local_helper.embed(client.state, ["text"])
+        await check.finish()
+        assert helper(client).problem is None
+        assert (await client.get("/api/helper")).json()["search"] == {"mode": "hybrid", "reason": None}
+        assert helper(client).state == ("running" if meanwhile == "start" else "stopped")
 
 
 @pytest.mark.asyncio
@@ -531,7 +700,7 @@ async def test_the_reranker_is_cancelled_by_ending_its_own_process(tmp_path, fak
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("score", [float("nan"), float("inf"), "0.9", None])
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), "0.9", None, True, 10 ** 400])
 async def test_a_reranking_score_that_is_not_a_finite_number_is_refused(tmp_path, fake, timings, score):
     async with app(tmp_path, fake) as client:
         path = tmp_path / "reranker.gguf"
@@ -540,6 +709,24 @@ async def test_a_reranking_score_that_is_not_a_finite_number_is_refused(tmp_path
         client.remote.scores = [0.5, score]
         with pytest.raises(HelperUnavailable, match="request_failed"):
             await reranker.rerank("a question", ["one", "two"], deadline=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rows", [
+    [{"index": 0, "embedding": [0.5, True]}],
+    [{"index": 0, "embedding": [0.5, 10 ** 400]}],  # an integer no float holds
+    [{"index": 0, "embedding": [0.5, float("nan")]}],
+    [{"index": True, "embedding": [0.5, 0.5]}],
+    [{"index": "0", "embedding": [0.5, 0.5]}],
+    [{"embedding": [0.5, 0.5]}],
+    [{"index": 0, "embedding": [0.5]}, {"index": 0, "embedding": [0.5]}],  # the same text twice, the other none
+], ids=["boolean", "huge integer", "nan", "boolean index", "text index", "no index", "repeated index"])
+async def test_an_embedding_reply_that_is_not_one_vector_of_real_numbers_per_text_is_refused(tmp_path, fake, timings,
+                                                                                         rows):
+    async with app(tmp_path, fake) as client:
+        client.remote.rows = rows
+        with pytest.raises(HelperUnavailable, match="request_failed"):
+            await local_helper.embed(client.state, ["text"] * len(rows), query=True)
 
 
 def test_lifecycle_values_come_from_the_helper_settings(tmp_path):
@@ -578,6 +765,11 @@ def model_file(tmp_path):
     return tmp_path / "data" / "models" / EMBEDDING / PIN["file"]
 
 
+# An installed model's folder: the model and its license files (slice 1 section 18).
+INSTALLED = sorted([PIN["file"], "LICENSE", "SOURCE.txt"])
+NOTICES = Path(__file__).resolve().parents[1] / "tools" / "notices" / "Qwen3-Embedding-0.6B"
+
+
 def leftovers(tmp_path):
     folder = tmp_path / "data" / "models" / EMBEDDING
     return sorted(path.name for path in folder.iterdir()) if folder.exists() else []
@@ -595,7 +787,10 @@ async def test_a_download_is_verified_installed_and_sent_through_general(tmp_pat
         assert status["models"][0]["installed"] is True and status["search"]["mode"] == "hybrid"
         assert status["model_source"] == source  # the mirror chosen is remembered
         path = model_file(tmp_path)
-        assert path.read_bytes() == WEIGHTS and leftovers(tmp_path) == [PIN["file"]]
+        assert path.read_bytes() == WEIGHTS and leftovers(tmp_path) == INSTALLED
+        for name in ("LICENSE", "SOURCE.txt"):  # its license files, as the app ships them, owner-only
+            assert (path.parent / name).read_bytes() == (NOTICES / name).read_bytes()
+            assert stat.S_IMODE((path.parent / name).stat().st_mode) == 0o600
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
         assert stat.S_IMODE(path.parent.parent.stat().st_mode) == 0o700
@@ -653,20 +848,30 @@ async def test_a_redirect_to_a_host_not_allowed_is_refused(tmp_path, fake, timin
 
 
 @pytest.mark.asyncio
-async def test_a_source_that_cannot_be_reached_makes_modelscope_the_recommendation(tmp_path, fake, timings):
+@pytest.mark.parametrize("where", ["source", "file host"])
+async def test_a_source_that_cannot_be_reached_makes_modelscope_the_recommendation(tmp_path, fake, timings, where):
+    """Spec 1265: ModelScope is recommended when Hugging Face cannot be reached, whether its own host
+    or the file host it sends its files from does not answer (the coordinator's reading); a refusal is
+    an answer, so it recommends nothing."""
     async with app(tmp_path, fake, install=False) as client:
         status = (await client.get("/api/helper")).json()
         assert status["recommended_source"] is None and status["model_source"] is None
 
-        client.remote.files[HF_URL] = (302, {"Location": HF_CDN}, b"")  # Hugging Face answers; its file host does not
-        client.remote.files[HF_CDN] = ("unreachable", {}, b"")
+        client.remote.files[HF_URL] = (302, {"Location": HF_CDN}, b"")
+        client.remote.files[HF_CDN] = (403, {}, b"denied")  # answered: refused, not unreachable
         status = await downloaded(client, source="huggingface")
-        assert status["download"]["problem"] == "source_unreachable" and status["recommended_source"] is None
+        assert status["download"]["problem"] == "source_refused" and status["recommended_source"] is None
 
-        client.remote.files[HF_URL] = ("unreachable", {}, b"")
+        client.remote.files[HF_URL if where == "source" else HF_CDN] = ("unreachable", {}, b"")
         status = await downloaded(client, source="huggingface")
         assert status["download"]["problem"] == "source_unreachable"
         assert status["recommended_source"] == "modelscope" and status["model_source"] == "huggingface"
+
+        client.remote.files[MS_URL] = (302, {"Location": MS_CDN}, b"")  # and the reverse: ModelScope's file host
+        client.remote.files[MS_CDN] = ("unreachable", {}, b"")
+        status = await downloaded(client, source="modelscope")
+        assert status["download"]["problem"] == "source_unreachable" and status["recommended_source"] is None
+
         serve(client, MS_URL, WEIGHTS, via=MS_CDN)
         status = await downloaded(client, source="modelscope")
         assert status["download"]["state"] == "done" and status["model_source"] == "modelscope"
@@ -759,7 +964,8 @@ async def test_an_import_is_verified_like_a_download(tmp_path, fake, timings):
         good.write_bytes(WEIGHTS)
         response = await client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(good)})
         assert response.status_code == 200 and response.json()["models"][0]["installed"] is True
-        assert model_file(tmp_path).read_bytes() == WEIGHTS and leftovers(tmp_path) == [PIN["file"]]
+        assert model_file(tmp_path).read_bytes() == WEIGHTS and leftovers(tmp_path) == INSTALLED
+        assert (model_file(tmp_path).parent / "LICENSE").read_bytes() == (NOTICES / "LICENSE").read_bytes()
         assert stat.S_IMODE(model_file(tmp_path).stat().st_mode) == 0o600
         assert (await outbound(client)) == []  # an import sends nothing
         assert await local_helper.embed(client.state, ["text"]) == [[0.5] * 4]
@@ -810,7 +1016,7 @@ async def test_downloads_or_imports_asked_for_together_start_one(tmp_path, fake,
         assert sorted(response.status_code for response in answers) in ([200, 409], [202, 409])  # either one
         assert [r.json()["code"] for r in answers if r.status_code == 409] == ["download_running"]
         await until(lambda: not client.local._busy())
-        assert model_file(tmp_path).read_bytes() == WEIGHTS and leftovers(tmp_path) == [PIN["file"]]
+        assert model_file(tmp_path).read_bytes() == WEIGHTS and leftovers(tmp_path) == INSTALLED
 
 
 _private_file = local_helper._private_file
@@ -840,10 +1046,17 @@ class _Failing:
     (OSError(errno.ENOSPC, "No space left on device"), "disk_full"),
     (OSError(errno.EIO, "Input/output error"), "write_failed"),
     (RuntimeError("unexpected"), "download_failed"),
-    ("held", "closing"),  # a restore holds the database's writes: the gate cannot record the request
+    ("held", "database_unavailable"),  # a restore holds the database's writes: the gate cannot record it
 ])
 async def test_a_download_that_fails_on_the_way_installs_nothing_and_says_why(tmp_path, fake, timings, monkeypatch,
-                                                                              caplog, failure, problem):
+                                                                              failure, problem):
+    with app_log(tmp_path) as log_text:
+        await _fails_on_the_way(tmp_path, fake, monkeypatch, failure, problem)
+    # The app's default log says what failed, never where: no path, no file name, no URL.
+    assert f"a model download failed ({problem})" in log_text() and names_nothing(log_text(), tmp_path)
+
+
+async def _fails_on_the_way(tmp_path, fake, monkeypatch, failure, problem):
     async with app(tmp_path, fake, install=False) as client:
         if failure == "not_served":
             client.remote.files[HF_URL] = (302, {"Location": HF_CDN}, b"")
@@ -856,8 +1069,7 @@ async def test_a_download_that_fails_on_the_way_installs_nothing_and_says_why(tm
         if failure == "held":
             await asyncio.to_thread(db.hold_writes)
         try:
-            with caplog.at_level(logging.DEBUG):
-                status = await downloaded(client, source="huggingface")
+            status = await downloaded(client, source="huggingface")
         finally:
             await asyncio.to_thread(db.release_writes)
         assert status["download"]["state"] == "failed" and status["download"]["problem"] == problem
@@ -866,11 +1078,165 @@ async def test_a_download_that_fails_on_the_way_installs_nothing_and_says_why(tm
         monkeypatch.setattr(local_helper, "_private_file", _private_file)
         serve(client, HF_URL, WEIGHTS, via=HF_CDN)
         assert (await downloaded(client, source="huggingface"))["download"]["state"] == "done"
-    # The app's own log says what failed, never where: no path, no file name, no URL.
-    logged = "\n".join(record.getMessage() for record in caplog.records if record.name.startswith("backend"))
-    assert problem in logged
-    for secret in (str(tmp_path), PIN["file"], "huggingface.co", "hf.co"):
-        assert secret not in logged
+
+
+@pytest.mark.asyncio
+async def test_a_partial_file_that_cannot_be_removed_is_logged_by_kind_and_answered_with_a_code(tmp_path, fake,
+                                                                                               timings, monkeypatch):
+    real_unlink = Path.unlink
+
+    def unlink(self, missing_ok=False):  # as when the folder lost its write permission
+        if self.name.endswith(".part") and self.exists():
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_unlink(self, missing_ok=missing_ok)
+
+    changed = WEIGHTS.replace(b"synthetic", b"Synthetic")
+    with app_log(tmp_path) as log_text:
+        async with app(tmp_path, fake, install=False) as client:
+            monkeypatch.setattr(Path, "unlink", unlink)
+            serve(client, HF_URL, changed, via=HF_CDN)
+            status = await downloaded(client, source="huggingface")
+            assert status["download"]["problem"] == "hash_mismatch" and status["models"][0]["installed"] is False
+            other = tmp_path / "other.gguf"
+            other.write_bytes(changed)
+            response = await client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(other)})
+            assert response.status_code == 400 and response.json()["code"] == "hash_mismatch"
+            assert leftovers(tmp_path) == [PIN["file"] + ".part"]  # never installed; left for the next launch
+        async with app(tmp_path, fake, install=False) as client:  # which cannot remove it either, and starts
+            assert leftovers(tmp_path) == [PIN["file"] + ".part"] and client.local.download is None
+            monkeypatch.setattr(Path, "unlink", real_unlink)
+        async with app(tmp_path, fake, install=False) as client:
+            assert leftovers(tmp_path) == []
+    text = log_text()
+    assert text.count("a partial model file could not be removed (EACCES)") == 3 and names_nothing(text, tmp_path)
+
+
+def _fsyncs(monkeypatch, fail=lambda fd, path, calls: False):
+    """os.fsync and os.replace, recorded as (call, file name), with fsync failing (EIO) where fail says,
+    given the calls so far."""
+    calls, real_fsync, real_replace = [], os.fsync, os.replace
+
+    def fsync(fd):
+        path = path_of(fd)
+        calls.append(("fsync", Path(path).name))
+        if fail(fd, path, calls):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_fsync(fd)
+
+    def replace(source, target):
+        calls.append(("replace", Path(source).name, Path(target).name))
+        return real_replace(source, target)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    return calls
+
+
+async def _install(client, tmp_path, how, body=WEIGHTS):
+    """Download or import the model: (whether it went through, the problem's code)."""
+    if how == "download":
+        serve(client, HF_URL, body, via=HF_CDN)
+        download = (await downloaded(client, source="huggingface"))["download"]
+        return download["state"] == "done", download["problem"]
+    offline = tmp_path / f"offline-{time.monotonic_ns()}.gguf"
+    offline.write_bytes(body)
+    response = await client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(offline)})
+    return response.status_code == 200, response.json().get("code")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["download", "import"])
+async def test_a_model_is_synced_before_it_is_renamed_into_place_and_its_folder_after(tmp_path, fake, timings,
+                                                                                      monkeypatch, how):
+    async with app(tmp_path, fake, install=False) as client:
+        calls = _fsyncs(monkeypatch)
+        assert await _install(client, tmp_path, how) == (True, None)
+        part, file, folder = PIN["file"] + ".part", PIN["file"], EMBEDDING
+        synced, renamed = calls.index(("fsync", part)), calls.index(("replace", part, file))
+        assert synced < renamed and ("fsync", folder) in calls[renamed:]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["download", "import"])
+async def test_a_model_whose_contents_cannot_be_synced_is_not_installed(tmp_path, fake, timings, monkeypatch, how):
+    async with app(tmp_path, fake, install=False) as client:
+        _fsyncs(monkeypatch, fail=lambda fd, path, calls: path.endswith(".part"))
+        assert await _install(client, tmp_path, how) == (False, "write_failed")
+        assert leftovers(tmp_path) == [] and (await client.get("/api/helper")).json()["models"][0]["installed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["download", "import"])
+async def test_a_failure_after_the_model_is_renamed_into_place_still_counts_it_installed(tmp_path, fake, timings,
+                                                                                         monkeypatch, how):
+    path = model_file(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(WEIGHTS.replace(b"synthetic", b"Synthetic"))
+    with app_log(tmp_path) as log_text:
+        async with app(tmp_path, fake, install=False) as client:
+            await until(lambda: helper(client).problem == "model_changed")
+            # The folder's sync, once the model is renamed into place, fails.
+            _fsyncs(monkeypatch, fail=lambda fd, synced, calls: stat.S_ISDIR(os.fstat(fd).st_mode)
+                    and ("replace", path.name + ".part", path.name) in calls)
+            assert await _install(client, tmp_path, how) == (True, None)  # installed, and said so
+            assert helper(client).problem is None and path.read_bytes() == WEIGHTS
+            assert (await client.get("/api/helper")).json()["search"] == {"mode": "hybrid", "reason": None}
+    text = log_text()
+    assert "the model folder could not be synced after an install (EIO)" in text and names_nothing(text, tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["download", "import"])
+async def test_without_the_models_license_file_nothing_is_installed(tmp_path, fake, timings, how):
+    notices = tmp_path / "notices" / "Qwen3-Embedding-0.6B"
+    notices.mkdir(parents=True)
+    (notices / "SOURCE.txt").write_bytes((NOTICES / "SOURCE.txt").read_bytes())  # LICENSE is missing
+    async with app(tmp_path, fake, install=False, notices=notices.parent) as client:
+        assert await _install(client, tmp_path, how) == (False, "notice_missing")
+        assert leftovers(tmp_path) == []
+        (notices / "LICENSE").write_text("not the license")  # nor is another text taken for it
+        assert await _install(client, tmp_path, how) == (False, "notice_missing")
+        (notices / "LICENSE").write_bytes((NOTICES / "LICENSE").read_bytes())
+        assert await _install(client, tmp_path, how) == (True, None) and leftovers(tmp_path) == INSTALLED
+
+
+def test_the_models_license_files_are_pinned_and_ship_with_the_app():
+    from tools import license_audit
+    notice = EMBEDDING_MODEL["notice"]
+    assert {name: hashlib.sha256((NOTICES / name).read_bytes()).hexdigest() for name in notice["files"]} \
+        == notice["files"]
+    # LICENSE is Apache-2.0's standard text, as apache.org publishes it (LICENSE-2.0.txt).
+    assert notice["files"]["LICENSE"] == "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    license, files = license_audit.component(notice["folder"])
+    assert license == "Apache-2.0" and sorted(dest for _, dest in files) == sorted(notice["files"])
+    assert notice["folder"] in license_audit._shipped_by_default()  # in every bundle's licenses folder
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason, problem", [("revoked", "database_unavailable"),
+                                             ("gate_inputs_unavailable", "download_refused")])
+async def test_a_download_the_gate_refuses_says_why_in_the_researchers_terms(tmp_path, fake, timings, monkeypatch,
+                                                                             reason, problem):
+    def refuse(request):
+        raise OutboundDenied(reason, None)
+
+    async def refusing(project_id=None, **options):
+        return httpx.AsyncClient(transport=httpx.MockTransport(refuse))
+
+    async with app(tmp_path, fake, install=False) as client:
+        monkeypatch.setattr(client.local, "client", refusing)
+        status = await downloaded(client, source="huggingface")
+        assert status["download"]["problem"] == problem and leftovers(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_a_download_cancelled_before_it_began_is_cancelled_not_running(tmp_path, fake, timings):
+    async with app(tmp_path, fake, install=False) as client:
+        serve(client, HF_URL, WEIGHTS, via=HF_CDN)
+        await client.local.start_download(EMBEDDING, "huggingface")
+        await client.local.cancel_download()  # before its task took a step
+        assert client.local.download.state == "cancelled" and client.remote.source_requests == []
+        assert (await downloaded(client, source="huggingface"))["download"]["state"] == "done"
 
 
 def test_the_model_source_setting_takes_only_the_two_mirrors(tmp_path):

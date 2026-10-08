@@ -418,9 +418,10 @@ async function s116(ctx) {
     await dialog().getByText(L('helper.searchHybrid')).waitFor();
     const read = await status();
     check('the model is installed, and search can use it', read.models[0].installed && read.search.mode === 'hybrid');
-    const installed = join(folder(), read.models[0].file);
-    check('the model file is in place, owner-only', leftovers().join() === read.models[0].file
-      && (statSync(installed).mode & 0o777) === 0o600);
+    const files = [read.models[0].file, 'LICENSE', 'SOURCE.txt'];
+    check('the model file and its license files are in place, owner-only',
+      leftovers().sort().join() === [...files].sort().join()
+      && files.every((name) => (statSync(join(folder(), name)).mode & 0o777) === 0o600));
     check('an import sends nothing', downloads().length === 2);
   });
 }
