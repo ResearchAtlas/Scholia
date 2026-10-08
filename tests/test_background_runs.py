@@ -46,6 +46,35 @@ async def test_the_list_shows_a_readings_progress_its_papers_and_retry_once_it_f
         assert stopped["retryable"] is True and stopped["progress"] is None
 
 
+async def test_a_run_that_ends_while_the_list_is_read_never_reads_interrupted(tmp_path, monkeypatch):
+    reached, go = hold_extraction(monkeypatch)
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Review", "sensitivity": "local_only",
+                                                           "review_lock": True})).json()["id"]  # no lookup: one run
+        [paper] = (await added(client, project, PDF))["materials"]
+        await asyncio.to_thread(reached.wait, 10)
+        harness, db = client.state["harness"], client.state["db"]
+        seen, resume, real_read = threading.Event(), threading.Event(), db.read
+
+        def read(fn):  # the list's read returns only once the run it saw running has ended and been released
+            result = real_read(fn)
+            if fn.__name__ == "listing" and not seen.is_set():
+                seen.set()
+                resume.wait(10)
+            return result
+
+        monkeypatch.setattr(db, "read", read)
+        listed = asyncio.create_task(client.get("/api/activity", params={"run_id": paper["run_id"]}))
+        await asyncio.to_thread(seen.wait, 10)  # the read saw the reading running
+        go.set()
+        while harness.registry.is_active(paper["run_id"]):  # its terminal record committed, then released
+            await asyncio.sleep(0.01)
+        resume.set()
+        [row] = (await listed).json()["runs"]
+        assert row["status"] == "running"  # what the read saw, never interrupted
+        assert (await run_finished(client, paper["run_id"]))["status"] == "succeeded"
+
+
 async def test_retry_is_only_for_a_stopped_or_failed_reading_or_lookup(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)

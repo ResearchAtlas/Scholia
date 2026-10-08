@@ -204,20 +204,34 @@ async def test_a_reading_stopped_by_a_restart_starts_again_from_its_inputs(tmp_p
         assert ready["state"] == "ready"
 
 
-async def test_a_failed_start_of_the_runs_after_the_commit_still_reports_what_was_added(tmp_path, monkeypatch):
+async def test_the_runs_of_added_files_start_with_their_commit_and_never_read_interrupted(tmp_path, monkeypatch):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
-        harness = client.state["harness"]
-        real = harness.kick_background
+        harness, db = client.state["harness"], client.state["db"]
 
         async def failing():
-            raise RuntimeError("could not start")
+            raise RuntimeError("no later start of background runs")
 
-        monkeypatch.setattr(harness, "kick_background", failing)
-        response = await add(client, project, PDF)
-        assert response.status_code == 201  # committed: reported as added
-        monkeypatch.setattr(harness, "kick_background", real)
-        await harness.kick_background()  # the next start of background runs reads it
+        monkeypatch.setattr(harness, "kick_background", failing)  # not needed: they start with the commit
+        committed, go, real_write = threading.Event(), threading.Event(), db.write
+
+        def write(fn):  # held right after the transaction that records the added files commits
+            result = real_write(fn)
+            if "add_files" in fn.__qualname__ or "record_background" in fn.__qualname__:
+                committed.set()
+                go.wait(10)
+            return result
+
+        monkeypatch.setattr(db, "write", write)
+        adding = asyncio.create_task(add(client, project, PDF))
+        await asyncio.to_thread(committed.wait, 10)
+        recorded = await rows(client, "SELECT id FROM runs WHERE kind = 'background' AND status = 'running'")
+        assert len(recorded) == 2  # its reading and its lookup, committed
+        for (run_id,) in recorded:  # held from before the commit: running, never interrupted
+            [row] = (await client.get("/api/activity", params={"run_id": run_id})).json()["runs"]
+            assert row["status"] == "running", row
+        go.set()
+        assert (await adding).status_code == 201
         [ready] = await settled(client, project)
         assert ready["state"] == "ready"
 

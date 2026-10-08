@@ -136,6 +136,10 @@ class Registry:
         self.turns: dict[str, ActiveRun] = {}  # by conversation
         self.closed = False
         self.dropped: list[str] = []  # stale claims released, whose runs are still to be recorded
+        # Background runs whose terminal record this process wrote, added before each is released: a
+        # read taken just before that record committed still says running, and is not interrupted.
+        # ponytail: one id per background run finished in this launch; a bounded log if that grows large
+        self.finished: set[str] = set()
 
     def claim_turn(self, conversation_id: str) -> ActiveRun:
         if self.closed:
@@ -173,8 +177,13 @@ class Registry:
 
 
 def derived_status(status: str, run_id: str, registry: Registry) -> str:
-    """A run's status as it reads now: a running run this process does not hold is interrupted."""
-    return "interrupted" if status == "running" and not registry.is_active(run_id) else status
+    """A run's status as it reads now: a running run this process does not hold is interrupted. A
+    background run is held from before its record commits (record_background, start_local) until its
+    terminal record has, and is in `finished` from then on, so a read that raced its start or its end
+    never takes it for interrupted."""
+    if status == "running" and not registry.is_active(run_id) and run_id not in registry.finished:
+        return "interrupted"
+    return status
 
 
 def _event(conn, run_id, event_type, data):
@@ -850,6 +859,7 @@ class Harness:
 
     async def _background(self, active: ActiveRun) -> None:
         active.started = True
+        left = False  # its record still says running: kept for the next start, or left by a defect
         try:
             if active.cancel_requested.is_set():  # stopped before it began
                 raise asyncio.CancelledError()
@@ -897,11 +907,15 @@ class Harness:
             (running, _) = await _through(self._write(stop))
             if running and active.cancel_reason != "shutdown":  # a Cancel came once that had committed
                 await _through(self._write(cancelled))
+            left = running and active.cancel_reason == "shutdown"
         except spending.BudgetExceeded:
             await _through(self._write(lambda conn: self._finish_background(conn, active, "failed", None, None)))
         except Exception as error:
+            left = True
             log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
         finally:
+            if not left:  # before it is released: at no moment is it neither held nor finished
+                self.registry.finished.add(active.run_id)
             self.registry.release(active)
             if active.cancel_reason == "shutdown" and not self.registry.closed:  # admitting again (resume)
                 again = self.registry.add_background(active.run_id)  # at once: a Cancel always finds it active
@@ -985,6 +999,34 @@ class Harness:
             raise
         active.task = asyncio.create_task(self._background(active))
         return run_id
+
+    async def record_background(self, count, write):
+        """Record new background runs in one transaction and start them. write(conn, ids) gets count
+        fresh run ids, records the runs it needs under some of them, and returns (result, the ids it
+        used). Each id is held in the registry before the transaction commits, and the runs recorded
+        start as soon as it has, so no read ever finds one running in the record and not held here
+        (which reads as interrupted). Returns the result; a cancellation of the caller waits for the
+        transaction (see _through), starts the runs, and is raised after."""
+        actives = [self.registry.add_background(new_id()) for _ in range(count)]
+        if None in actives:
+            for active in actives:
+                if active is not None:
+                    self.registry.release(active)
+            raise AdmissionError(503, "shutting_down", "The app is closing")
+        try:
+            (result, used), cancelled = await _through(self._write(lambda conn: write(conn, [a.run_id for a in actives])))
+        except BaseException:
+            for active in actives:
+                self.registry.release(active)
+            raise
+        for active in actives:
+            if active.run_id in used:
+                active.task = asyncio.create_task(self._background(active))
+            else:
+                self.registry.release(active)
+        if cancelled:
+            raise asyncio.CancelledError()
+        return result
 
     async def work(self, active, fn):
         """Run blocking fn in a worker thread to its end, whatever cancellations arrive meanwhile, so

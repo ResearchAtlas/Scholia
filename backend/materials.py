@@ -138,8 +138,9 @@ async def add_files(project_id: str, body: Upload, request: Request):
     for name, data, kind in files:  # stored before the records: a file no record names is collected later
         stored.append((name, await asyncio.to_thread(content.put, data, kind), kind))
 
-    def record(conn):
+    def record(conn, ids):  # ids: one for each file's reading and one for the lookup, each used only if needed
         check(conn)
+        ids, used = iter(ids), []
         locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
         added, looked_up = [], {}  # looked_up: {material id: the version its lookup is for}
         for name, sha256, kind in stored:
@@ -171,7 +172,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
             if shared is not None:  # read already, for another project or version: shared, not read again
                 _queue_adds(conn, shared[0], project_id)
             else:
-                run = new_id()
+                run = next(ids)
+                used.append(run)
                 conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
                              " 'extract', ?)", (run, project_id, json.dumps({"material_ids": [material],
                                                                              "version_id": version})))
@@ -179,20 +181,17 @@ async def add_files(project_id: str, body: Upload, request: Request):
             looked_up[material] = version
         lookup_run = None
         if looked_up and not locked:  # a review-locked project never looks identifiers up
-            lookup_run = new_id()
+            lookup_run = next(ids)
+            used.append(lookup_run)
             origin = {"conversation_id": body.conversation_id} if body.conversation_id else None
             conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
                          " 'lookup', ?)", (lookup_run, project_id, json.dumps({"material_ids": list(looked_up),
                                                                                 "versions": looked_up, "origin": origin})))
         conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
-        return {"materials": added, "lookup_run_id": lookup_run}
+        return {"materials": added, "lookup_run_id": lookup_run}, used
 
-    result = await _to_end(asyncio.to_thread(db.write, record))
-    try:
-        await harness.kick_background()
-    except Exception as error:  # committed: its runs start with the next start of background runs
-        log.warning("starting the runs of added files failed (%s)", type(error).__name__)
-    return result
+    # The runs start with the commit (record_background): none is ever running in the record and not held.
+    return await harness.record_background(len(stored) + 1, record)
 
 
 async def _to_end(awaitable):
@@ -819,16 +818,13 @@ async def retry_run(run_id: str, request: Request):
     interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again."""
     state = _state(request)
 
-    def again(conn):
+    def again(conn, ids):
         retry, refusal = _retry(conn, run_id)
         if refusal is not None:
             raise _refused(*refusal)
         project_id, workflow, inputs = retry
-        new = new_id()
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
-                     (new, project_id, workflow, json.dumps(inputs)))
-        return new
+                     (ids[0], project_id, workflow, json.dumps(inputs)))
+        return ids[0], ids
 
-    new = await _to_end(asyncio.to_thread(state["db"].write, again))
-    await state["harness"].kick_background()
-    return {"run_id": new}
+    return {"run_id": await state["harness"].record_background(1, again)}
