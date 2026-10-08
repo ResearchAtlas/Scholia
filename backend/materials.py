@@ -14,8 +14,10 @@ reports the paper it already is.
 
 An `extract` run reads its version's file (backend/extraction.py) within EXTRACTION_SECONDS and
 writes the extraction, its passages and the index queue's `add` rows in its terminal transaction,
-for its project and every other project whose current version it now reads (each once), so a
-partial extraction is never written and a revoked one writes nothing.
+for every project whose current version it reads (each once; a version replaced while it was read
+gets none), so a partial extraction is never written and a revoked one writes nothing. A project's
+index holds only the readings its current versions read: a replaced file's readings, and a reading
+by an earlier extractor version once a newer one commits, are queued to leave it.
 Extractions are shared by file and extractor version; a run that finds one written meanwhile uses it.
 Each version is read as the type its file was detected as when it was added (its media_type), so
 the same bytes added as Markdown and as LaTeX are two extractions of one stored file.
@@ -167,10 +169,14 @@ async def add_files(project_id: str, body: Upload, request: Request):
             if row is not None:
                 looked_up[row[0]] = version
         for name, sha256, kind in stored:
+            replaced = None
             if body.material_id is not None:
                 material = body.material_id
                 (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM material_versions WHERE material_id = ?",
                                       (material,)).fetchone()
+                replaced = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
+                                        " content_files c ON c.sha256 = v.file_sha256 WHERE v.material_id = ?"
+                                        " AND v.is_current = 1", (material,)).fetchone()
                 conn.execute("UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material,))
                 conn.execute("UPDATE materials SET updated_at = ? WHERE id = ?", (utc_now(), material))
             else:
@@ -200,6 +206,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
                 conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
                              " 'extract', ?)", (run, project_id, json.dumps({"material_ids": [material],
                                                                              "version_id": version})))
+            if replaced is not None and replaced[1] in extraction.EXTRACTORS:  # its old file's readings, unless read still
+                _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0])
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
             looked_up[material] = version
         lookup_run = None
@@ -223,6 +231,20 @@ async def _to_end(awaitable):
     if cancelled:
         raise asyncio.CancelledError()
     return result
+
+
+def _queue_removes(conn, extraction_id, project_id):
+    """Queue the extraction's passages to leave the project's search index, if the project's last
+    queued operation for them is an add (a whole extraction at a time, as _queue_adds). The
+    extraction and its passages stay."""
+    first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1",
+                         (extraction_id,)).fetchone()
+    last = first and conn.execute("SELECT op FROM index_queue WHERE target = 'passage' AND target_id = ?"
+                                  " AND project_id = ? ORDER BY seq DESC LIMIT 1", (first[0], project_id)).fetchone()
+    if last is not None and last[0] == "add":
+        conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
+                     " SELECT 'passage', id, ?, 'remove' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
+                     (project_id, extraction_id))
 
 
 def _queue_adds(conn, extraction_id, project_id):
@@ -323,8 +345,21 @@ def _store(conn, version_id, sha256, extracted, look_up):
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(new_id(), extraction_id, ordinal, p.page, json.dumps(p.section_path), p.kind, p.text, p.char_start,
               p.char_end, json.dumps(p.boxes) if p.boxes else None) for ordinal, p in enumerate(extracted.passages)])
-    _queue_adds(conn, extraction_id, found[0])
     _serve(conn, sha256, (extracted.extractor, extracted.version), extraction_id, look_up)
+
+
+def _unread_out(conn, project_id, sha256, name):
+    """A project's index holds the readings its current versions read: each reading of the file by
+    that extractor (any version) that none of them reads now (its file replaced, or read by an
+    earlier version) has its passages queued to leave it. The readings stay."""
+    read = {extraction.extractor_of(kind) for (kind,) in conn.execute(
+        f"SELECT {_VERSION_TYPE} FROM material_versions v JOIN materials m ON m.id = v.material_id LEFT JOIN"
+        " content_files c ON c.sha256 = v.file_sha256 WHERE m.project_id = ? AND v.file_sha256 = ? AND v.is_current = 1",
+        (project_id, sha256)) if kind in extraction.EXTRACTORS}
+    for extraction_id, version in conn.execute("SELECT id, extractor_version FROM extractions WHERE file_sha256 = ?"
+                                               " AND extractor = ?", (sha256, name)).fetchall():
+        if (name, version) not in read:
+            _queue_removes(conn, extraction_id, project_id)
 
 
 def _serve(conn, sha256, extractor, extraction_id, look_up):
@@ -334,6 +369,14 @@ def _serve(conn, sha256, extractor, extraction_id, look_up):
     import: a Local only project's asks first, a review-locked project's gets none, and it starts
     where the lookup it continues started (a conversation shows its ask). A lookup made for that
     version since, or one that has still to read its identifiers, covers it."""
+    # A reading of the file by an earlier version of the extractor is no version's reading now: its
+    # passages leave every project's index that has them (the reading itself stays).
+    for (older,) in conn.execute("SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ?"
+                                 " AND extractor_version != ?", (sha256, *extractor)).fetchall():
+        first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1", (older,)).fetchone()
+        for (project,) in conn.execute("SELECT DISTINCT project_id FROM index_queue WHERE target = 'passage'"
+                                       " AND target_id = ?", (first[0],)).fetchall() if first else []:
+            _queue_removes(conn, older, project)
     for material, version, kind, project, locked in conn.execute(
             f"SELECT m.id, v.id, {_VERSION_TYPE}, m.project_id, p.review_lock FROM material_versions v"
             " JOIN content_files c ON c.sha256 = v.file_sha256 JOIN materials m ON m.id = v.material_id"

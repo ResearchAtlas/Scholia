@@ -350,6 +350,81 @@ async def test_a_reading_by_an_earlier_extractor_version_is_never_this_versions(
         assert ready["state"] == "ready" and ready["extraction"]["version"] == "markdown-1"
 
 
+async def ops(client, extraction_id):
+    """{project id: [its queued operations on the extraction's passages, each with how many passages]}."""
+    found = {}
+    for project, op, count in await rows(
+            client, "SELECT q.project_id, q.op, count(*) FROM index_queue q JOIN passages p ON p.id = q.target_id"
+                    " WHERE q.target = 'passage' AND p.extraction_id = ? GROUP BY q.project_id, q.op ORDER BY min(q.seq)",
+            extraction_id):
+        found.setdefault(project, []).append((op, count))
+    return found
+
+
+async def test_a_newer_reading_takes_the_earlier_readings_passages_out_of_every_index_that_has_them(tmp_path, monkeypatch):
+    notes = b"# Notes\n\nA first paragraph.\n\nA second paragraph.\n"
+    async with started(tmp_path / "data") as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))  # an earlier Scholia
+        [paper] = (await added(client, first, ("notes.md", notes)))["materials"]
+        await settled(client, first)
+        await added(client, second, ("notes.md", notes))  # the earlier reading, shared
+        await settled(client, second)
+        [(older,)] = await rows(client, "SELECT id FROM extractions")
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))  # this one
+        again = await client.post(f"/api/runs/{paper['run_id']}/retry")  # read again by this version
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [(newer,)] = await rows(client, "SELECT id FROM extractions WHERE id != ?", older)
+        (n,) = (await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", newer))[0]
+        assert await ops(client, older) == {first: [("add", n), ("remove", n)], second: [("add", n), ("remove", n)]}
+        assert await ops(client, newer) == {first: [("add", n)], second: [("add", n)]}
+        assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", older) == [(n,)]  # kept
+
+
+async def test_a_replaced_file_leaves_its_projects_index_unless_another_paper_there_still_reads_it(tmp_path):
+    one, two, three = (f"# Paper {n}\n\nIts own text, {n}.\n".encode() for n in ("one", "two", "three"))
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [a] = (await added(client, project, ("a.md", one)))["materials"]
+        [b] = (await added(client, project, ("b.md", two)))["materials"]
+        await settled(client, project)
+        by_file = dict(await rows(client, "SELECT v.file_sha256, e.id FROM material_versions v JOIN extractions e"
+                                         " ON e.file_sha256 = v.file_sha256"))
+        [read_one, read_two] = [by_file[sha] for (sha,) in await rows(
+            client, "SELECT file_sha256 FROM material_versions WHERE material_id IN (?, ?) ORDER BY material_id = ?",
+            a["id"], b["id"], b["id"])]
+        n = dict(await rows(client, "SELECT extraction_id, count(*) FROM passages GROUP BY extraction_id"))
+        await added(client, project, ("b-again.md", one), material_id=b["id"])  # b now reads a's file too
+        await settled(client, project)
+        assert await ops(client, read_two) == {project: [("add", n[read_two]), ("remove", n[read_two])]}  # no paper reads it
+        assert await ops(client, read_one) == {project: [("add", n[read_one])]}  # a's file, now b's too: once
+        await added(client, project, ("a-new.md", three), material_id=a["id"])
+        await settled(client, project)
+        assert await ops(client, read_one) == {project: [("add", n[read_one])]}  # still b's reading: it stays
+
+
+async def test_a_reading_of_a_file_replaced_while_it_was_read_reaches_no_index(tmp_path, monkeypatch):
+    real, reached, release = extraction.extract, threading.Event(), threading.Event()
+
+    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):  # only the PDF's reading waits
+        if data == PDF[1]:
+            reached.set()
+            release.wait(20)
+        return real(data, kind, lambda: None, progress)
+
+    monkeypatch.setattr(extraction, "extract", held)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, PDF))["materials"]
+        await asyncio.to_thread(reached.wait, 10)
+        await added(client, project, ("v2.md", b"# Version two\n\nIts text.\n"), material_id=paper["id"])
+        release.set()
+        assert (await run_finished(client, paper["run_id"]))["status"] == "succeeded"  # read, and kept
+        await settled(client, project)
+        [(pdf_reading,)] = await rows(client, "SELECT id FROM extractions WHERE extractor = 'pdf'")
+        assert await ops(client, pdf_reading) == {}  # but no current version reads it: not in the index
+
+
 async def test_the_same_bytes_added_as_another_type_are_read_as_that_type(tmp_path):
     source = b"\\section{Method}\n\nText with \\emph{emphasis} here.\n"  # Markdown and LaTeX alike
     async with started(tmp_path / "data") as client:
