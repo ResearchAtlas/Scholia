@@ -63,7 +63,7 @@ class MockProvider:
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.url.host in MockScholarly.HOSTS:
-            return await self.scholarly(request)
+            return streamed(await self.scholarly(request))
         body = json.loads(request.content) if request.content else None
         self.requests.append((request.method, request.url.path, body))
         self.headers.append(request.headers)
@@ -104,6 +104,25 @@ class MockProvider:
     @property
     def titles(self):
         return [body for body in self.chats if _is_title(body)]
+
+
+class Chunks(httpx.AsyncByteStream):
+    """A body that arrives in these chunks, each only as the client reads it; `read` counts them."""
+
+    def __init__(self, chunks):
+        self.chunks, self.read = list(chunks), 0
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.read += 1
+            yield chunk
+
+
+def streamed(response):
+    """A test's answer as a server's arrives: streamed, not already read (as httpx reads one made from bytes)."""
+    if not response.is_stream_consumed:
+        return response
+    return httpx.Response(response.status_code, headers=response.headers, stream=Chunks([response.content]))
 
 
 class MockScholarly:

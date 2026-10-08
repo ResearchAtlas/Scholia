@@ -7,8 +7,9 @@ address, no credentials (the outbound gate refuses any). Each source is asked on
 time across every lookup, held until its answer, and paced (`SPACING`: arXiv asks for one request
 every 3 seconds); a request that meets 429, a server error or a network failure is retried at
 most twice, after 1 and 4 seconds (a Retry-After within RETRY_AFTER_MAX instead), each within
-TIMEOUT seconds. The client is the outbound gate's, made for the project
-with its dispatch check, so a refusal (OutboundDenied) is final and is raised.
+TIMEOUT seconds; an answer is read as it streams in, at most MAX_BODY bytes once decoded. The
+client is the outbound gate's, made for the project with its dispatch check, so a refusal
+(OutboundDenied) is final and is raised.
 
 A DOI resolved through OpenAlex or Crossref records whether the work is retracted (OpenAlex's
 `is_retracted`; a retraction, withdrawal or removal in Crossref's `updated-by`); arXiv says
@@ -19,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import time
+import zlib
 from dataclasses import dataclass
 from urllib.parse import quote
 import httpx
@@ -96,27 +98,52 @@ async def _get(client, url, source, pace):
         delay = RETRIES[attempt] if attempt < len(RETRIES) else None
         async with pace.turn(source):  # the source's one request in flight, to its whole answer
             try:
-                response = await client.get(url, timeout=TIMEOUT, follow_redirects=False)
+                status, after, body = await _fetch(client, url)
             except OutboundDenied:
                 raise
             except httpx.HTTPError:
-                response = None
-        if response is not None:
-            if response.status_code == 200:
-                if len(response.content) > MAX_BODY:
-                    raise Failed("unavailable")
-                return response.content
-            if response.status_code in (400, 404, 410):
+                status = None
+        if status == 200:
+            return body
+        if status is not None:
+            if status in (400, 404, 410):
                 raise Failed("not_found")
-            if response.status_code != 429 and response.status_code < 500:
+            if status != 429 and status < 500:
                 raise Failed("unavailable")
-            after = _retry_after(response)
             if after is not None and delay is not None:
                 delay = max(delay, after) if after <= RETRY_AFTER_MAX else None
         if delay is None:
             break
         await asyncio.sleep(delay)
     raise Failed("unavailable")
+
+
+async def _fetch(client, url):
+    """(status, Retry-After, body): a 200 answer's body as it streams in, decoded here (gzip or none,
+    nothing else), counted as decoded bytes and given up (Failed unavailable) once it would pass
+    MAX_BODY, so neither a long body nor a small compressed one that expands is ever held whole."""
+    async with client.stream("GET", url, headers={"Accept-Encoding": "gzip"}, timeout=TIMEOUT,
+                             follow_redirects=False) as response:
+        if response.status_code != 200:
+            return response.status_code, _retry_after(response), None
+        encoding = response.headers.get("content-encoding", "identity").strip().lower()
+        if encoding not in ("identity", "gzip"):
+            raise Failed("unavailable")
+        inflate = zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == "gzip" else None
+        body = bytearray()
+        try:
+            async for raw in response.aiter_raw():
+                # At most what is left under the limit, and one byte more to show it is passed.
+                body += inflate.decompress(raw, MAX_BODY + 1 - len(body)) if inflate else raw
+                if len(body) > MAX_BODY or (inflate and inflate.unconsumed_tail):
+                    raise Failed("unavailable")
+            if inflate:
+                body += inflate.flush()
+        except zlib.error:
+            raise Failed("unavailable") from None
+        if len(body) > MAX_BODY:
+            raise Failed("unavailable")
+        return 200, None, bytes(body)
 
 
 def _retry_after(response):

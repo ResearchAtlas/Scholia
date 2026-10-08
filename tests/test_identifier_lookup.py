@@ -5,6 +5,7 @@ dispatch."""
 
 import asyncio
 import contextlib
+import gzip
 import json
 
 import httpx
@@ -14,8 +15,8 @@ import backend.lookup as lookup
 from backend.db import new_id
 import backend.materials as materials_module
 import synthetic_materials as synthetic
-from scholia_app import (MockProvider, MockScholarly, arxiv_feed, background_idle, crossref_work, openalex_work, run_finished,
-                         started)
+from scholia_app import (Chunks, MockProvider, MockScholarly, arxiv_feed, background_idle, crossref_work, openalex_work,
+                         run_finished, started, streamed)
 from test_materials import added, hold_extraction, listing, project_of, rows, settled
 
 pytestmark = pytest.mark.asyncio
@@ -342,6 +343,42 @@ async def test_openalex_unavailable_and_crossref_without_the_record_is_unavailab
         assert mock.hosts == ["api.openalex.org"] * 3 + ["api.crossref.org"]
 
 
+@pytest.mark.parametrize("body", ["long", "compressed"])
+async def test_an_answer_past_the_body_limit_is_given_up_as_it_streams_in(tmp_path, monkeypatch, body):
+    monkeypatch.setattr(lookup, "MAX_BODY", 5000)
+    if body == "long":  # 50,000 bytes in 50 chunks
+        chunks, headers = [b" " * 1000] * 50, {}
+    else:  # 10 MB of spaces as about 10 kB of gzip, in 1 kB chunks
+        packed = gzip.compress(b" " * 10_000_000)
+        chunks, headers = [packed[i:i + 1000] for i in range(0, len(packed), 1000)], {"content-encoding": "gzip"}
+    streams = []
+
+    async def answer(request):
+        streams.append(Chunks(chunks))
+        return httpx.Response(200, headers=headers, stream=streams[-1])
+
+    async with started(tmp_path / "data", MockProvider(scholarly=answer)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "unavailable" and paper["checked_by"] is None
+    assert len(streams) == 2  # OpenAlex's answer, then Crossref's: neither is tried again
+    assert all(stream.read <= 7 for stream in streams)  # each stopped once past the limit, not read to its end
+
+
+async def test_a_compressed_answer_within_the_limit_is_read(tmp_path):
+    record = json.dumps(openalex_work(DOI, TITLE)).encode()
+
+    async def answer(request):
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Chunks([gzip.compress(record)]))
+
+    async with started(tmp_path / "data", MockProvider(scholarly=answer)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["title"] == TITLE
+
+
 async def test_an_identifier_no_service_knows_is_a_finished_lookup_not_a_failed_one(tmp_path):
     async with started(tmp_path / "data") as client:  # neither stand-in holds a record for it
         project = await project_of(client)
@@ -379,23 +416,22 @@ async def test_pacing_spaces_one_sources_requests():
 
 
 async def test_a_sources_next_request_waits_for_a_slow_one_to_be_answered():
-    class SlowClient:  # each answer takes longer than the source's spacing
-        def __init__(self):
-            self.in_flight, self.most, self.paths = 0, 0, []
+    seen = {"in_flight": 0, "most": 0, "paths": []}
 
-        async def get(self, url, timeout, follow_redirects):
-            self.in_flight += 1
-            self.most = max(self.most, self.in_flight)
-            self.paths.append(url)
-            await asyncio.sleep(0.2)
-            self.in_flight -= 1
-            return httpx.Response(200, content=arxiv_feed("2401.00001", "A Synthetic Preprint"))
+    async def slow(request):  # each answer takes longer than the source's spacing
+        seen["in_flight"] += 1
+        seen["most"] = max(seen["most"], seen["in_flight"])
+        seen["paths"].append(request.url.path)
+        await asyncio.sleep(0.2)
+        seen["in_flight"] -= 1
+        return streamed(httpx.Response(200, content=arxiv_feed("2401.00001", "A Synthetic Preprint")))
 
-    client, pace = SlowClient(), lookup.Pace()
+    pace = lookup.Pace()
     lookup.SPACING["arxiv"] = 0.05  # shorter than an answer takes
-    found = await asyncio.gather(*(lookup.resolve(client, "arxiv", "2401.00001", pace) for _ in range(3)))
-    assert [f.source for f in found] == ["arxiv"] * 3 and len(client.paths) == 3
-    assert client.most == 1  # never two requests to arXiv at once, across lookups
+    async with httpx.AsyncClient(transport=httpx.MockTransport(slow)) as client:
+        found = await asyncio.gather(*(lookup.resolve(client, "arxiv", "2401.00001", pace) for _ in range(3)))
+    assert [f.source for f in found] == ["arxiv"] * 3 and len(seen["paths"]) == 3
+    assert seen["most"] == 1  # never two requests to arXiv at once, across lookups
 
 
 async def test_a_researchers_edit_is_kept_and_its_retraction_still_checked(tmp_path):
