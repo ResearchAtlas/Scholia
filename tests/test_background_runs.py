@@ -58,6 +58,28 @@ async def test_retry_is_only_for_a_stopped_or_failed_reading_or_lookup(tmp_path)
         assert (await client.post("/api/runs/00000000-0000-4000-8000-000000000000/retry")).status_code == 404
 
 
+async def test_the_list_offers_retry_exactly_where_the_endpoint_takes_it(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        broken = await added(client, project, ("broken.pdf", b"%PDF-1.7\n" + b"\x00garbage" * 50))
+        [paper] = broken["materials"]
+        failed = await run_finished(client, paper["run_id"])
+        assert (failed["status"], failed["retryable"]) == ("failed", True)
+        # Its file replaced since: the failed reading is of a version no longer current.
+        await added(client, project, ("fixed.md", b"# Fixed\n\nA readable file this time.\n"), material_id=paper["id"])
+        [row] = (await client.get("/api/activity", params={"run_id": paper["run_id"]})).json()["runs"]
+        refused = await client.post(f"/api/runs/{paper['run_id']}/retry")
+        assert row["retryable"] is False and (refused.status_code, refused.json()["code"]) == (409, "not_retryable")
+        # An interrupted lookup is offered Retry, and the endpoint takes it.
+        lookup_run = broken["lookup_run_id"]
+        await run_finished(client, lookup_run)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'interrupted' WHERE id = ?", (lookup_run,)))
+        [row] = (await client.get("/api/activity", params={"run_id": lookup_run})).json()["runs"]
+        assert row["status"] == "interrupted" and row["retryable"] is True
+        assert (await client.post(f"/api/runs/{lookup_run}/retry")).status_code == 201
+
+
 async def test_a_full_backup_answers_with_its_run_and_never_stores_its_passphrase(tmp_path):
     data, destination = tmp_path / "data", tmp_path / "chosen"
     destination.mkdir()

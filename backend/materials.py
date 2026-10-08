@@ -777,42 +777,53 @@ def run_details(conn, run_id, workflow, status, inputs):
                            (json.dumps(ids),)).fetchone()
     ask = asks.open_asks(conn, run_id=run_id) if status == "running" else []
     return {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
-            "retryable": status in ("failed", "cancelled") and kept > 0}
+            "retryable": _retry(conn, run_id)[1] is None}
+
+
+def _retry(conn, run_id):
+    """A retry of a material's run: ((project id, workflow, the new run's inputs), None), or (None,
+    (status, code, message)) saying why it cannot be tried again. The background-run list's Retry
+    and the retry endpoint both ask this, so the list offers Retry exactly where the endpoint takes
+    it: a run that failed, was stopped or was interrupted, whose papers are still here; a reading
+    whose version is still current, unread and not being read; a lookup in a project not locked."""
+    row = conn.execute("SELECT project_id, workflow, status, inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        return None, (404, "not_found", "No such run")
+    project_id, workflow, status, inputs = row
+    inputs = json.loads(inputs or "{}")
+    if workflow not in _WORKFLOWS or status not in ("failed", "cancelled", "interrupted"):
+        return None, (409, "not_retryable", "This run cannot be tried again")
+    kept = [m for m in inputs.get("material_ids", []) if conn.execute(
+        "SELECT 1 FROM materials WHERE id = ? AND project_id = ?", (m, project_id)).fetchone()]
+    if not kept:
+        return None, (404, "not_found", "Its papers no longer exist")
+    if workflow == "extract":
+        version = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
+                               " content_files c ON c.sha256 = v.file_sha256 WHERE v.id = ? AND v.is_current = 1",
+                               (inputs.get("version_id"),)).fetchone()
+        if version is None or _extraction(conn, *version) is not None or conn.execute(
+                "SELECT 1 FROM runs WHERE workflow = 'extract' AND status = 'running'"
+                " AND json_extract(inputs, '$.version_id') = ?", (inputs.get("version_id"),)).fetchone():
+            return None, (409, "not_retryable", "This paper is read already, or being read")
+        return (project_id, workflow, {"material_ids": kept, "version_id": inputs["version_id"]}), None
+    if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
+        return None, (403, "lookup_locked", "A review-locked project never looks identifiers up")
+    return (project_id, workflow, {"material_ids": kept, "origin": None, "versions": dict(conn.execute(
+        "SELECT material_id, id FROM material_versions WHERE is_current = 1 AND material_id IN"
+        " (SELECT value FROM json_each(?))", (json.dumps(kept),)).fetchall())}), None
 
 
 @router.post("/api/runs/{run_id}/retry", status_code=201)
 async def retry_run(run_id: str, request: Request):
-    """Read a version again, or look a batch up again, after a run that failed or was stopped: a new
-    run from the old one's inputs (its materials still here). A Local only lookup asks again."""
+    """Read a version again, or look a batch up again, after a run that failed, was stopped or was
+    interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again."""
     state = _state(request)
 
     def again(conn):
-        row = conn.execute("SELECT project_id, workflow, status, inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if row is None:
-            raise _refused(404, "not_found", "No such run")
-        project_id, workflow, status, inputs = row
-        inputs = json.loads(inputs or "{}")
-        if workflow not in _WORKFLOWS or status not in ("failed", "cancelled", "interrupted"):
-            raise _refused(409, "not_retryable", "This run cannot be tried again")
-        kept = [m for m in inputs.get("material_ids", []) if conn.execute(
-            "SELECT 1 FROM materials WHERE id = ? AND project_id = ?", (m, project_id)).fetchone()]
-        if not kept:
-            raise _refused(404, "not_found", "Its papers no longer exist")
-        if workflow == "extract":
-            version = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
-                                   " content_files c ON c.sha256 = v.file_sha256 WHERE v.id = ? AND v.is_current = 1",
-                                   (inputs.get("version_id"),)).fetchone()
-            if version is None or _extraction(conn, *version) is not None or conn.execute(
-                    "SELECT 1 FROM runs WHERE workflow = 'extract' AND status = 'running'"
-                    " AND json_extract(inputs, '$.version_id') = ?", (inputs.get("version_id"),)).fetchone():
-                raise _refused(409, "not_retryable", "This paper is read already, or being read")
-            inputs = {"material_ids": kept, "version_id": inputs["version_id"]}
-        else:
-            if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
-                raise _refused(403, "lookup_locked", "A review-locked project never looks identifiers up")
-            inputs = {"material_ids": kept, "origin": None, "versions": dict(conn.execute(
-                "SELECT material_id, id FROM material_versions WHERE is_current = 1 AND material_id IN"
-                " (SELECT value FROM json_each(?))", (json.dumps(kept),)).fetchall())}
+        retry, refusal = _retry(conn, run_id)
+        if refusal is not None:
+            raise _refused(*refusal)
+        project_id, workflow, inputs = retry
         new = new_id()
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
                      (new, project_id, workflow, json.dumps(inputs)))
