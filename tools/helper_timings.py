@@ -442,39 +442,36 @@ async def measure(args, state, client, data, processes):
                                              "helper": footprint(helper._process.pid)}
 
     # Sustained: indexing back to back, a question 0.25 s after each answer.
-    stop_at = time.monotonic() + args.sustained
     sustained_q, sustained_b = [], []
 
-    async def indexing():
-        i = 0
-        while time.monotonic() < stop_at:
-            items = english if i % 2 == 0 else chinese
-            start = (i // 2 % 22) * 32
-            try:
-                seconds, _ = await timed(local_helper.embed(state, [t for t, _ in items[start:start + 32]]))
-                sustained_b.append(seconds)
-            except HelperUnavailable as error:
-                failures.append(("sustained batch", i, error.reason))
-            i += 1
+    async def batch(i):
+        items = english if i % 2 == 0 else chinese
+        start = (i // 2 % 22) * 32
+        try:
+            seconds, _ = await timed(local_helper.embed(state, [t for t, _ in items[start:start + 32]]))
+            sustained_b.append(seconds)
+        except HelperUnavailable as error:
+            failures.append(("sustained batch", i, error.reason))
 
-    async def asking():
-        i = 0
-        while time.monotonic() < stop_at:
-            try:
-                seconds, _ = await timed(local_helper.embed(state, [asks[i % len(asks)][1]], query=True))
-                sustained_q.append(seconds)
-            except HelperUnavailable as error:
-                failures.append(("sustained question", i, error.reason))
-            i += 1
-            await asyncio.sleep(0.25)
+    async def ask(i):
+        try:
+            seconds, _ = await timed(local_helper.embed(state, [asks[i % len(asks)][1]], query=True))
+            sustained_q.append(seconds)
+        except HelperUnavailable as error:
+            failures.append(("sustained question", i, error.reason))
+        await asyncio.sleep(0.25)
 
-    await asyncio.gather(indexing(), asking())
+    began = time.monotonic()
+    ended, _ = await asyncio.gather(back_to_back(batch, began + args.sustained),
+                                    back_to_back(ask, began + args.sustained))
     deadline = WORKLOAD["deadline_ms"] / 1000
     results["sustained"] = {
         "seconds": args.sustained, "batches": summary(sustained_b), "questions": summary(sustained_q),
         "questions_over_deadline": sum(1 for s in sustained_q if s > deadline),
         "questions_over_1s": sum(1 for s in sustained_q if s > 1),
-        "passages_per_second": round(32 * len(sustained_b) / args.sustained, 1),
+        # over the time indexing took: from the start to the end of its last batch, past `seconds`
+        "indexing_elapsed_seconds": round(ended - began, 3),
+        "passages_per_second": throughput(32 * len(sustained_b), ended - began),
     }
     results["footprint_after_sustained_bytes"] = {"backend": footprint(os.getpid()),
                                                   "helper": footprint(helper._process.pid)}
@@ -493,6 +490,21 @@ async def measure(args, state, client, data, processes):
         "SELECT data ->> 'kind', data ->> 'decision', count(*) FROM audit_log WHERE event = 'outbound'"
         " GROUP BY 1, 2").fetchall())
     return results
+
+
+async def back_to_back(work, until, clock=time.monotonic):
+    """Runs work(0), work(1), ... one after another while clock() is before `until`; each one started
+    runs to its end. Returns the clock when the last one ended, which can be past `until`."""
+    i, ended = 0, clock()
+    while clock() < until:
+        await work(i)
+        i, ended = i + 1, clock()
+    return ended
+
+
+def throughput(passages, seconds):
+    """Passages per second over the time the work took."""
+    return round(passages / seconds, 1) if seconds > 0 else None
 
 
 async def reranking(state, local, path, english, chinese, asks):

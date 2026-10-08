@@ -1315,6 +1315,21 @@ def test_the_timing_workload_says_how_its_questions_are_sent():
     assert "every 0.25" not in json.dumps(helper_timings.WORKLOAD)
 
 
+def test_the_sustained_rate_counts_the_time_the_last_batch_runs_past_the_interval():
+    from tools import helper_timings
+    now, started = [0.0], []
+
+    async def batch(i):  # each batch takes 3 s
+        started.append(now[0])
+        now[0] += 3
+
+    ended = asyncio.run(helper_timings.back_to_back(batch, 10, clock=lambda: now[0]))
+    assert started == [0, 3, 6, 9] and ended == 12  # the last batch starts before 10 s and ends at 12 s
+    assert helper_timings.throughput(32 * len(started), ended - 0) == 10.7  # not 32 * 4 / 10 = 12.8
+    assert asyncio.run(helper_timings.back_to_back(batch, now[0], clock=lambda: now[0])) == now[0]  # none started
+    assert helper_timings.throughput(0, 0) is None
+
+
 @pytest.mark.parametrize("fails", [False, True])
 def test_the_timing_tool_removes_its_data_folder(monkeypatch, fails):
     from tools import helper_timings
