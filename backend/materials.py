@@ -310,8 +310,11 @@ async def _look_up(harness, active, project_id, inputs, pace):
     active.progress = {"done": 0, "total": len(distinct)}
     if not distinct:
         return {"identifiers": 0}, None
-    level, locked = await read(lambda conn: conn.execute(
+    policy = await read(lambda conn: conn.execute(
         "SELECT sensitivity, review_lock FROM projects WHERE id = ?", (project_id,)).fetchone())
+    if policy is None:  # deleted meanwhile, its runs with it
+        raise RunOutcome("cancelled", "project_changed", "revoked")
+    level, locked = policy
     if locked:  # never looks up (its run is revoked when the lock comes)
         raise RunOutcome("failed", "lookup_locked")
     approved = False

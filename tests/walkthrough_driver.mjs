@@ -380,7 +380,7 @@ async function materials(ctx) {
     const row = panel().getByRole('listitem').filter({ hasText: titles.docx });
     await row.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
     await row.getByText(L('ask.service.crossref'), { exact: false }).first().waitFor();
-    check('its details name where they came from', await row.getByText(L('library.fact.retraction')).count() === 1);
+    check('its details name where they came from', await row.getByText(L('library.fact.retraction'), { exact: true }).count() === 1);
   });
 
   await step('18-page-viewer', async () => {
