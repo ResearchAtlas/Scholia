@@ -1354,8 +1354,8 @@ async function run(combo, build, outRoot) {
     await m1(ctx);
     if (server) await s116(ctx);  // its synthetic model and download source are the test server's
     if (C.materials) await materials(ctx);  // an attached app has no synthetic materials of its own
-    if (C.materials) await s120(ctx);  // S1-20: OCR of a scanned page
-    await parts(ctx);
+    await parts(ctx);  // on the materials flow's window and project, as it was written for
+    if (C.materials) await s120(ctx);  // S1-20: OCR of a scanned page; it sets up its own project and panel
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);
