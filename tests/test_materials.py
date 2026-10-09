@@ -12,6 +12,7 @@ import pytest
 
 import backend.extraction as extraction
 import backend.materials as materials_module
+from backend.db.content import ContentStore
 import synthetic_materials as synthetic
 from scholia_app import MockProvider, MockScholarly, background_idle, openalex_work, run_finished, started
 
@@ -175,6 +176,42 @@ async def test_deleting_a_read_material_queues_its_removals_after_its_additions(
         assert (await client.get(f"/api/material-versions/{version}/passages")).status_code == 404
         assert (await client.get(f"/api/material-versions/{version}/pages/1")).status_code == 404
         assert (await client.get(f"/api/passages/{passages[0]['id']}")).status_code == 404
+
+
+async def test_at_most_two_readings_hold_their_files_and_a_third_waits_unread(tmp_path, monkeypatch):
+    go, reading, reads = threading.Event(), [], []
+    real_extract, real_read = extraction.extract, ContentStore.read
+
+    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):
+        progress(0, 1)
+        reading.append(kind)
+        while not go.wait(0.01):
+            stop()
+        return real_extract(data, kind, stop, progress)
+
+    def read(store, sha256):
+        reads.append(sha256)
+        return real_read(store, sha256)
+
+    monkeypatch.setattr(extraction, "extract", held)
+    monkeypatch.setattr(ContentStore, "read", read)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, *[(f"notes{i}.md", synthetic.paper_markdown(f"Notes {i}", arxiv="")) for i in range(4)])
+        while len(reading) < 2:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.3)
+        assert (len(reading), len(reads)) == (2, 2)  # the others wait for a turn without their files' bytes
+        listed = (await listing(client, project))["materials"]
+        assert {m["state"] for m in listed} == {"reading"}
+        waiting = [m for m in listed if m["progress"] is None]
+        assert len(waiting) == 2
+        cancelled = await client.post(f"/api/runs/{waiting[0]['reading']['run_id']}/cancel")  # while it waits
+        assert cancelled.json()["status"] == "cancelled"
+        go.set()
+        ready = await settled(client, project)
+        assert sorted(m["state"] for m in ready) == ["needs_attention"] + ["ready"] * 3
+        assert len(reads) == 3  # the cancelled one never read its file
 
 
 async def test_a_reading_past_its_limit_stops_and_says_so(tmp_path, monkeypatch):

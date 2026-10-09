@@ -69,6 +69,7 @@ from backend.settings import visible
 log = logging.getLogger(__name__)
 
 EXTRACTION_SECONDS = 30 * 60  # per material version (section 13)
+READINGS = 2  # readings at once, each holding its file's bytes; the others wait their turn without them
 MAX_FILES = 20  # per request
 AUTHOR_CHARS = 2 * lookup.NAME_CHARS + 2  # an author as the details form sends one: "Family, Given", each part a lookup's
 BATCH_IDLE_SECONDS = 120  # an open batch (a drop still being sent) with no addition for this long closes itself
@@ -302,6 +303,7 @@ class _TimeLimit(Exception):
 def register(harness, content):
     """The extract and lookup workflows, as the harness's local background work, on its content store."""
     pace = lookup.Pace()  # shared by this harness's lookups, so each source's spacing holds across runs
+    readings = asyncio.Semaphore(READINGS)  # a turn is taken before a file is read, and its limit starts then
 
     async def extract_run(harness, active, project_id, inputs):
         version_id = inputs["version_id"]
@@ -311,7 +313,7 @@ def register(harness, content):
         if row is None or row[1] not in extraction.EXTRACTORS:
             raise RunOutcome("failed", "not_found")
         sha256, kind = row
-        deadline = time.monotonic() + EXTRACTION_SECONDS
+        deadline = None
 
         def stop():
             if active.cancel_requested.is_set():
@@ -326,7 +328,9 @@ def register(harness, content):
             return extraction.extract(content.read(sha256), kind, stop, progress)
 
         try:
-            extracted = await harness.work(active, read)
+            async with readings:
+                deadline = time.monotonic() + EXTRACTION_SECONDS
+                extracted = await harness.work(active, read)
         except _TimeLimit:
             raise RunOutcome("cancelled", "time_limit", "limit") from None
         except extraction.Unreadable as unreadable:
