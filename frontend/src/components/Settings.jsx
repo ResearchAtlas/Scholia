@@ -21,6 +21,7 @@ import { libraryChanged } from '../library.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { IndexSection } from './SearchIndex.jsx'; // S1-17
 import { indexReason, offerOutcome } from '../search.js'; // S1-17
+import { downloadOffered } from '../helper.js'; // S1-17: an index run's reason, as this page offers the model
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
@@ -400,7 +401,7 @@ function Advanced({ health, project }) {
       <LocalHelperSection project={project} />
       <PrivateAllowlist />
       <AuditLog project={project} />
-      <BackgroundRuns />
+      <BackgroundRuns offered={downloadOffered(project)} />
       <Section title={t('settings.backups')}>
         <BackupsSection />
       </Section>
@@ -411,7 +412,7 @@ function Advanced({ health, project }) {
   );
 }
 
-function BackgroundRuns() {
+function BackgroundRuns({ offered }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const [runs, setRuns] = useState(null);
@@ -451,7 +452,7 @@ function BackgroundRuns() {
       {runs?.length === 0 && <p className="text-sm text-muted-foreground">{t('settings.noRuns')}</p>}
       {runs?.length > 0 && (
         <ul className="divide-y rounded-lg border">
-          {runs.map((run) => <RunRow key={run.run_id} run={run} dates={dates} onChanged={load}
+          {runs.map((run) => <RunRow key={run.run_id} run={run} dates={dates} offered={offered} onChanged={load}
             onCancel={() => act(() => post(`/api/runs/${run.run_id}/cancel`), run.project_id)}
             onRetry={() => act(() => retryRun(run.run_id), run.project_id)} />)}
         </ul>
@@ -462,7 +463,7 @@ function BackgroundRuns() {
 
 // One background run: what it does and for whom, its status and progress, why it stopped, the
 // question it waits on, Cancel while it runs and Retry where a new run can do it again.
-function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
+function RunRow({ run, dates, offered, onCancel, onRetry, onChanged }) {
   const t = useT();
   const { busy, run: press } = useAction(); // Cancel and Retry, each disabled while either is pending
   const language = useContext(LanguageContext);
@@ -509,7 +510,7 @@ function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
         <p className="text-xs text-muted-foreground">{offerOutcome(t, run.result)}</p>
       )}
       {run.workflow === 'index' && run.status === 'succeeded' && run.result?.mode === 'keyword_only' && (
-        <p className="text-xs text-muted-foreground">{t('helper.keywordOnly', { reason: t(indexReason(run.result.reason)) })}</p>
+        <p className="text-xs text-muted-foreground">{t('helper.keywordOnly', { reason: t(indexReason(run.result.reason, offered)) })}</p>
       )}
       {run.ask && <Ask ask={run.ask} onAnswered={onChanged} />}
     </li>

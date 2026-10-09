@@ -3,6 +3,8 @@
 // the offer's outcome, and the catalog entries each names.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
@@ -89,5 +91,21 @@ test('an index run or a paper says why search is keyword-only, in words for each
   for (const reason of ['request_failed', 'start_failed', 'start_timeout', 'helper_failed', 'index_unavailable', 'model_changed',
     'binary_missing', 'binary_changed', 'crashed', 'unhealthy', 'helper_unavailable']) {
     for (const catalog of [en, zhCN]) assert.ok(`errors.${reason}` in catalog, reason); // a failed index run's reason
+  }
+});
+
+test("every view of the index, a search or an index run words its reason by indexReason, as its page offers the model", () => {
+  const source = (name) => readFileSync(fileURLToPath(new URL(`../src/components/${name}`, import.meta.url)), 'utf8');
+  for (const name of ['SearchIndex.jsx', 'Library.jsx', 'Settings.jsx']) {
+    const text = source(name);
+    assert.doesNotMatch(text, /keywordOnlyReason/, name); // the helper's own reasons only (LocalHelper.jsx)
+    const calls = [...text.matchAll(/indexReason\(([^()]*(?:\([^()]*\))?[^()]*)\)/g)].map((m) => m[1]);
+    assert.ok(calls.length > 0, name);
+    for (const args of calls) assert.match(args, /,/, `${name}: indexReason(${args}) says nothing of the offer`);
+  }
+  // A healthy helper with sqlite-vec missing, or the index unavailable, is not "the helper is not available".
+  for (const reason of ['vectors_unavailable', 'index_unavailable']) {
+    assert.notEqual(t(indexReason(reason)), t('helper.reason.other'), reason);
+    assert.notEqual(t(indexReason(reason)), t('helper.reason.helper_failed'), reason);
   }
 });

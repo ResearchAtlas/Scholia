@@ -7,9 +7,9 @@ import { useCallback, useEffect, useState } from 'react';
 import { RotateCcw } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { useAction } from '../action.js';
-import { downloadOffered, keywordOnlyReason } from '../helper.js';
+import { downloadOffered } from '../helper.js';
 import { fraction, followRun } from '../runs.js';
-import { indexPoll, indexStatus, rebuildIndex } from '../search.js';
+import { indexPoll, indexReason, indexStatus, rebuildIndex } from '../search.js';
 import { LoadState } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 
@@ -40,7 +40,7 @@ export function IndexSection({ project }) {
 
   if (!index) return <LoadState problem={problem} onRetry={load} />;
   const reason = index.mode === 'keyword_only'
-    ? t('helper.keywordOnly', { reason: t(keywordOnlyReason({ search: index }, downloadOffered(project)) ?? 'helper.reason.other') })
+    ? t('helper.keywordOnly', { reason: t(indexReason(index.reason, downloadOffered(project))) })
     : t('search.indexHybrid');
   const rebuilding = busy || (index.run?.rebuild && index.run.status === 'running');
   const share = rebuilding ? fraction(index.run?.progress) : null;
