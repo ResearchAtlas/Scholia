@@ -68,7 +68,7 @@ STOP_EVERY = 1000  # rows between a project rebuild's looks at whether its run w
 _HAN = "㐀-䶿一-鿿豈-﫿\U00020000-\U0003134f"
 # A run of Han characters, or a run of other letters and digits (combining marks kept with them).
 _RUNS = re.compile(rf"([{_HAN}]+)|(?:[^\W_{_HAN}]|[̀-ͯ])+")
-_DAMAGE = (apsw.CorruptError, apsw.NotADBError)
+DAMAGE = (apsw.CorruptError, apsw.NotADBError)  # a file SQLite finds damaged, or not a database
 
 SCHEMA = f"""
 CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -264,17 +264,28 @@ class SearchIndex:
     def _connect(self):
         return connect(self.path)
 
-    def _write(self, fn, *args):
+    def _write(self, fn, *args, withdraw=None):
+        """fn(*args) in the writer, and its result. withdraw(), if given, is asked while fn waits its turn
+        (behind a whole rebuild, say): a true answer takes it off the writer's queue before it starts, and
+        None is returned; once it has started, it is waited for."""
         if self.closed:
             raise DatabaseClosedError("the search index is closed")
-        return self._writer.submit(self._guarded, fn, *args).result()
+        future = self._writer.submit(self._guarded, fn, *args)
+        while withdraw is not None and not future.done():
+            if withdraw() and future.cancel():
+                return None
+            try:
+                return future.result(timeout=0.05)
+            except concurrent.futures.TimeoutError:
+                pass
+        return future.result()
 
     def _guarded(self, fn, *args):
         """fn in the writer: one that finds the file damaged (storing vectors, a project's rebuild, a
         pass, a truncation) has it replaced and rebuilt, as a read that finds it so does."""
         try:
             return fn(*args)
-        except _DAMAGE:
+        except DAMAGE:
             self._damaged()
             raise
 
@@ -291,7 +302,7 @@ class SearchIndex:
         try:
             with conn:
                 return fn(conn)
-        except _DAMAGE:
+        except DAMAGE:
             self._damaged()
             raise
         finally:
@@ -393,7 +404,7 @@ class SearchIndex:
         def rebuild():
             if not self._rebuild_all():
                 return
-            if then is not None:  # once the file is ready, whatever the pass after it meets
+            if then is not None and not self.closed:  # once the file is ready, whatever the pass after it meets
                 then()
             try:
                 self._apply()  # what the queue brought meanwhile
@@ -456,8 +467,8 @@ class SearchIndex:
     def apply(self, stop=None):
         """Apply the queue's rows not applied yet (from any thread; see the module's docstring), a page
         (QUEUE_PAGE rows, one transaction) at a time; stop(), if given, is asked before each page, and a
-        true answer leaves the rest to the next pass."""
-        return self._write(self._apply, stop)
+        true answer leaves the rest to the next pass (and withdraws a pass still waiting its turn)."""
+        return self._write(self._apply, stop, withdraw=stop)
 
     def apply_soon(self):
         """apply, in the writer, without waiting for it; a failure is logged."""
@@ -472,7 +483,7 @@ class SearchIndex:
         did not apply never waits on other work; one that finds the file damaged has it rebuilt."""
         try:
             applied = self._apply_queue(stop)
-        except _DAMAGE:
+        except DAMAGE:
             self._damaged()
             raise
         except Exception:
@@ -595,7 +606,7 @@ class SearchIndex:
         self._truncate = True
         try:
             self._conn.wal_checkpoint(mode=apsw.SQLITE_CHECKPOINT_TRUNCATE)
-        except _DAMAGE:
+        except DAMAGE:
             raise
         except apsw.Error as error:
             log.warning("the search index's WAL could not be truncated yet (%s); it is tried again", type(error).__name__)
@@ -609,8 +620,9 @@ class SearchIndex:
         """Replace the project's rows from the main database (keyword rows; its vectors go, to be
         embedded again), in one transaction, so search keeps its keyword rows throughout. Done once
         per run: a run started again after a restart goes on to its embeddings. stop(), if given, is
-        asked every STOP_EVERY rows: a true answer rolls the rebuild back, leaving the rows as they were."""
-        return self._write(self._rebuild_project, project_id, run_id, stop)
+        asked every STOP_EVERY rows: a true answer rolls the rebuild back, leaving the rows as they were (or
+        withdraws it while it waits its turn)."""
+        return self._write(self._rebuild_project, project_id, run_id, stop, withdraw=stop)
 
     def _rebuild_project(self, project_id, run_id, stop=None):
         def check(count):
@@ -648,11 +660,11 @@ class SearchIndex:
             " AND material_id IN (SELECT value FROM json_each(?)) AND id NOT IN (SELECT value FROM json_each(?))"
             " ORDER BY id LIMIT ?", (project_id, json.dumps(list(material_ids)), json.dumps(list(skip)), limit)).fetchall())
 
-    def store(self, project_id, embedded):
+    def store(self, project_id, embedded, stop=None):
         """Write [(rowid, passage id, digest, vector)] in one transaction: each only while its row is
         there with that digest and no embedding (else it was removed, or its text changed, meanwhile).
-        Returns how many were written."""
-        return self._write(self._store, project_id, embedded)
+        Returns how many were written. stop(), if given, withdraws it while it waits its turn."""
+        return self._write(self._store, project_id, embedded, withdraw=stop)
 
     def _store(self, project_id, embedded):
         if not self.vectors or self.building:

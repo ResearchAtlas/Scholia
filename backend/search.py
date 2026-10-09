@@ -50,7 +50,7 @@ from backend import asks, local_helper
 from backend.db import deletion, new_id
 from backend.local_helper import EMBEDDING, HelperUnavailable, Refused
 from backend.runs import AdmissionError, RunOutcome, _event, _revoked, _running, derived_status
-from backend.search_index import DIMENSIONS, SearchIndex, digest, index_text, readings
+from backend.search_index import DAMAGE, DIMENSIONS, SearchIndex, digest, index_text, readings
 from backend.settings import load_settings, visible
 
 log = logging.getLogger(__name__)
@@ -328,8 +328,11 @@ async def _index_run(state, harness, active, project_id, inputs):
         raise RunOutcome("failed", "index_unavailable")
     materials = inputs.get("material_ids") or []
 
-    async def drained(fn, *args):  # a change to the index, finished before the run's end is recorded
-        done = await harness.work(active, lambda: fn(*args))
+    async def drained(fn, *args):  # a change to the index, finished (or withdrawn) before the run's end is recorded
+        try:
+            done = await harness.work(active, lambda: fn(*args))
+        except DAMAGE:  # the file is being replaced and rebuilt (SearchIndex._guarded); Retry, or its rebuild's runs, embed
+            raise RunOutcome("failed", "index_unavailable") from None
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         return done
@@ -384,7 +387,7 @@ async def _index_run(state, harness, active, project_id, inputs):
                 if len(vector) != DIMENSIONS:  # not this model's: nothing would ever be stored
                     raise RunOutcome("failed", "request_failed")
                 vectors.append((rowid, pid, mark, vector))
-            embedded += await drained(index.store, project_id, vectors)
+            embedded += await drained(index.store, project_id, vectors, stop) or 0
             await progress()
     return {"mode": "hybrid", "embedded": embedded}, None
 

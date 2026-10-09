@@ -82,7 +82,7 @@ async def test_a_stale_index_never_surfaces_a_deleted_or_replaced_paper(tmp_path
         [deleted] = (await added(client, project, paper("Deleted", "The aubergine finding.")))["materials"]
         [replaced] = (await added(client, project, paper("Replaced", "The obsolete quince finding.")))["materials"]
         await idle(client, project)
-        monkeypatch.setattr(SearchIndex, "_apply", lambda self: 0)  # the index applies nothing from here
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)  # the index applies nothing from here
         assert (await client.delete(f"/api/materials/{deleted['id']}")).status_code == 200
         await added(client, project, paper("Replaced", "The current finding."), material_id=replaced["id"])
         await idle(client, project)

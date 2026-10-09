@@ -529,7 +529,8 @@ async def test_a_change_that_finds_the_file_damaged_has_it_rebuilt_and_embedded_
                 await asyncio.to_thread(index.store, project, [])
         else:
             response = await client.post(f"/api/projects/{project}/index/rebuild")
-            await run_finished(client, response.json()["run_id"])
+            ended = await run_finished(client, response.json()["run_id"])
+            assert (ended["status"], ended["result"]) == ("failed", {"reason": "index_unavailable"})  # said, not "internal"
         assert met
         deadline = asyncio.get_running_loop().time() + 10
         while not rebuilt:  # the file is replaced and rebuilt, as when a read finds it damaged

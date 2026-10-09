@@ -782,7 +782,7 @@ async def test_queued_additions_whose_passages_a_newer_reading_removed_are_passe
     async with app(tmp_path) as client:
         project = await project_of(client)
         real = SearchIndex._apply
-        monkeypatch.setattr(SearchIndex, "_apply", lambda self: 0)  # the first reading's additions wait in the queue
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)  # the first reading's additions wait in the queue
         await added(client, project, WAGES)
         await idle(client, project)
         older = {p for (p,) in await rows(client, "SELECT id FROM passages")}
@@ -823,6 +823,18 @@ async def _status_of(client, run_id):
     return (await rows(client, "SELECT status FROM runs WHERE id = ?", run_id))[0][0]
 
 
+async def _cancelling(client, run_id):
+    """Ask to cancel the run, without waiting for the reply (it comes once the run has ended): returns the
+    request once the harness holds the cancellation."""
+    active = client.state["harness"].registry.runs[run_id]
+    cancel = asyncio.ensure_future(client.post(f"/api/runs/{run_id}/cancel"))
+    deadline = asyncio.get_running_loop().time() + 10
+    while not active.cancel_requested.is_set():
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.01)
+    return cancel
+
+
 @pytest.mark.parametrize("change", ["store", "rebuild"])
 async def test_a_cancelled_run_ends_only_after_its_index_change_has(tmp_path, monkeypatch, change):
     """Cancel while the run's change waits in the index's writer (vectors stored, or a project's rows
@@ -840,8 +852,7 @@ async def test_a_cancelled_run_ends_only_after_its_index_change_has(tmp_path, mo
             await client.post(f"/api/projects/{project}/index/rebuild")
         assert await asyncio.to_thread(reached.wait, 10)
         [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
-        cancel = asyncio.ensure_future(client.post(f"/api/runs/{run['run_id']}/cancel"))  # answered once it ends
-        await asyncio.sleep(0.3)
+        cancel = await _cancelling(client, run["run_id"])
         assert await _status_of(client, run["run_id"]) == "running"  # its change is still to come
         go.set()
         ended = await run_finished(client, run["run_id"])
@@ -1036,8 +1047,7 @@ async def test_a_cancelled_run_stops_its_pass_between_pages_and_leaves_the_rest_
         await added(client, project, paper("Pages", *[f"Paragraph number {i}." for i in range(10)]))
         assert await asyncio.to_thread(reached.wait, 10)
         [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
-        cancel = asyncio.ensure_future(client.post(f"/api/runs/{run['run_id']}/cancel"))
-        await asyncio.sleep(0.3)
+        cancel = await _cancelling(client, run["run_id"])
         go.set()
         ended = await run_finished(client, run["run_id"])
         assert ended["status"] == "cancelled"
@@ -1068,8 +1078,7 @@ async def test_a_cancelled_rebuild_rolls_back_without_finishing_and_leaves_the_r
         monkeypatch.setattr(SearchIndex, "_add", held)
         rebuild = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
         assert await asyncio.to_thread(reached.wait, 10)
-        cancel = asyncio.ensure_future(client.post(f"/api/runs/{rebuild}/cancel"))
-        await asyncio.sleep(0.3)
+        cancel = await _cancelling(client, rebuild)
         go.set()
         assert (await run_finished(client, rebuild))["status"] == "cancelled"
         await cancel
@@ -1078,3 +1087,29 @@ async def test_a_cancelled_rebuild_rolls_back_without_finishing_and_leaves_the_r
         meta = await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
             "SELECT key FROM index_meta WHERE key LIKE 'rebuilt:%'").fetchall())
         assert meta == []  # not marked rebuilt: a Rebuild later does it whole
+
+
+async def test_a_cancelled_runs_index_change_still_waiting_its_turn_is_withdrawn(tmp_path):
+    """Cancel while the run's pass waits behind other work in the index's writer (a whole rebuild, say): it is
+    taken off the writer's queue, the run ends at once, and the queue keeps its rows for the next pass."""
+    import threading
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        index, go = client.state["index"], threading.Event()
+        index._writer.submit(go.wait, 20)  # the writer busy, as with a damaged file's rebuild
+        try:
+            await added(client, project, WAGES)
+            deadline = asyncio.get_running_loop().time() + 10
+            while not (running := [r for r in await runs_of(client, "index", project) if r["status"] == "running"]):
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.02)
+            cancel = await _cancelling(client, running[0]["run_id"])
+            ended = await asyncio.wait_for(run_finished(client, running[0]["run_id"]), 5)  # the writer still busy
+            assert ended["status"] == "cancelled"
+            await cancel
+        finally:
+            go.set()
+        assert await index_rows(client, project) == []
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(4,)]  # left to the next pass
+        await asyncio.to_thread(index.apply)
+        assert len(await index_rows(client, project)) == 4
