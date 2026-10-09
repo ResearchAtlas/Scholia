@@ -13,6 +13,7 @@ Recognition is local: nothing is sent anywhere. Recognized text and an engine's 
 (which can quote the page) are never logged or kept.
 """
 
+import re
 import sys
 from dataclasses import dataclass
 
@@ -39,23 +40,35 @@ class Failed(Exception):
 
 class Vision:
     """macOS Vision (section 15): VNRecognizeTextRequest's revision 3 at the accurate level, in Simplified
-    Chinese and English, Chinese first (it is read only when it comes first), with automatic language
-    detection, without which English lines read with Chinese first lose letters (measured on 40
-    synthetic lines: 23 exact without it, 40 with it; Chinese and mixed lines read the same). Text as
-    small as MIN_TEXT_PIXELS is looked for: Vision may ignore text under its minimum height. Each
-    setting is set, not left to the system's default."""
+    Chinese and English, Chinese first (it is read only when it comes first). A page is read first
+    without automatic language detection, which keeps every line's Han characters; a page in which
+    that reading finds none is read again with detection, which reads English lines whole (with
+    Chinese first and no detection they lose letters). Measured on synthetic pages: English lines 23
+    of 40 exact without detection, 40 of 40 with it; with detection, Chinese lines holding two English
+    terms lost all their Han characters in 7 of 60, and none without it. Text as small as
+    MIN_TEXT_PIXELS is looked for: Vision may ignore text under its minimum height. Each setting is
+    set, not left to the system's default. Where Vision cannot load, a page fails (Failed)."""
 
     version = "vision-3"
     LANGUAGES = ("zh-Hans", "en-US")
     MIN_TEXT_PIXELS = 12  # about 3 points at 300 dpi
 
     def recognize(self, bitmap):
-        import Foundation
-        import objc
-        import Quartz
-        import Vision as vision
+        lines = self._read(bitmap, detect=False)
+        if not any(_HAN.search(line.text) for line in lines):  # no Chinese on the page: its English read whole
+            lines = self._read(bitmap, detect=True)
+        return lines
 
-        with objc.autorelease_pool():  # each page's objects are let go as soon as it is read
+    def _read(self, bitmap, detect):
+        try:
+            import Foundation
+            import objc
+            import Quartz
+            import Vision as vision
+        except ImportError:
+            raise Failed() from None
+
+        with objc.autorelease_pool():  # each reading's objects are let go as soon as it is done
             data = Foundation.NSData.dataWithBytes_length_(bitmap.pixels, len(bitmap.pixels))
             image = Quartz.CGImageCreate(bitmap.width, bitmap.height, 8, 8, bitmap.stride,
                                          Quartz.CGColorSpaceCreateDeviceGray(), Quartz.kCGImageAlphaNone,
@@ -67,7 +80,7 @@ class Vision:
             request.setRevision_(vision.VNRecognizeTextRequestRevision3)
             request.setRecognitionLevel_(vision.VNRequestTextRecognitionLevelAccurate)
             request.setRecognitionLanguages_(list(self.LANGUAGES))
-            request.setAutomaticallyDetectsLanguage_(True)
+            request.setAutomaticallyDetectsLanguage_(detect)
             request.setMinimumTextHeight_(min(1.0, self.MIN_TEXT_PIXELS / bitmap.height))
             handler = vision.VNImageRequestHandler.alloc().initWithCGImage_options_(
                 image, Foundation.NSDictionary.dictionary())
@@ -88,16 +101,12 @@ class Vision:
             return lines
 
 
+_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 VISION = Vision()
 
 
 def engine():
-    """The platform's engine, or None: Vision on macOS, where its framework loads."""
-    if sys.platform != "darwin":
-        return None
-    try:
-        import Quartz  # noqa: F401
-        import Vision  # noqa: F401
-    except ImportError:
-        return None
-    return VISION
+    """The platform's engine, or None where there is none: Vision on macOS. It is the engine there even
+    where its framework does not load (a damaged copy of the app): a scanned page then fails and can
+    be tried again, rather than a reading by another extractor version replacing one made with it."""
+    return VISION if sys.platform == "darwin" else None

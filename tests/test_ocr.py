@@ -498,26 +498,38 @@ def test_only_the_ocr_module_imports_vision():
 @pytest.mark.skipif(sys.platform != "darwin", reason="Vision is macOS only")
 def test_vision_reads_small_english_and_chinese_lines_of_a_scan_where_they_are_drawn():
     assert ocr.engine() is ocr.VISION
-    english = ["The synthetic panel includes regional data on wages and employment for each study year.",
-               "Standard errors are clustered by region; the paragraph was drawn and ends here."]
+    mixed = [f"我们使用 {method} 方法估计 {outcome} 的效应。" for method in ("difference-in-differences",
+             "regression discontinuity", "instrumental variable") for outcome in ("employment", "minimum wage")]
     data = scanned_pdf([(72, 700, 8, "Eight point text about synthetic minimum wages."),
                         (72, 650, 10, "Ten point text: employment effects are small."),
                         (72, 600, 10.5, "最低工资的合成研究。"),
-                        (72, 560, 10, "本文使用 OLS 方法估计效应。"),
-                        *[(72, 520 - 30 * n, 10, line) for n, line in enumerate(english)]])
+                        *[(72, 560 - 24 * n, 10.5, line) for n, line in enumerate(mixed)]])
     found = extraction.extract(data, extraction.PDF)
     assert found.version.endswith("+vision-3") and (found.ocr_pages, found.status) == (1, "complete")
     texts = [p.text for p in found.passages]
     assert "Eight point text about synthetic minimum wages." in texts
     assert "Ten point text: employment effects are small." in texts
-    assert all(line in texts for line in english)  # English read whole beside Chinese
     assert any("最低工资" in text and "合成研究" in text for text in texts)
-    assert any(text.replace(" ", "") == "本文使用OLS方法估计效应。" for text in texts)  # a Chinese line's English term kept
+    for line in mixed:  # every Chinese line keeps its Han characters beside its two English terms
+        assert any(line.split(" ")[0] in text and "效应" in text for text in texts), line
     eight = next(p for p in found.passages if p.text.startswith("Eight"))
     [[left, top, right, bottom]] = eight.boxes["rects"]
     assert abs(left - 72 / 612) < 0.01 and top < 1 - 700 / 792 < bottom + 0.01  # over the line as it was drawn
     assert all(0 < p.boxes["ocr"]["confidence"] <= 1 for p in found.passages)
     assert vars(ocr.VISION) == {}  # it keeps nothing between pages or readings
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Vision is macOS only")
+def test_vision_reads_a_page_with_no_chinese_again_so_its_english_lines_are_whole():
+    english = ["The synthetic panel includes regional data on wages and employment for each study year.",
+               "Standard errors are clustered by region; the paragraph was drawn and ends here.",
+               "Table 2 reports the main estimates; columns differ in the controls that are included.",
+               "doi:10.5555/scholia.scanned.001"]
+    found = extraction.extract(scanned_pdf([(72, 700 - 30 * n, 10, line) for n, line in enumerate(english)]),
+                               extraction.PDF)
+    texts = [p.text.replace(" ", "") for p in found.passages]
+    assert all(line.replace(" ", "") in texts for line in english), texts
+    assert extraction.identifiers(found.passages) == [("doi", DOI)]
 
 
 # Through the app
@@ -774,32 +786,14 @@ async def test_a_file_being_read_or_read_by_this_version_is_not_read_again(tmp_p
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'extract'") == [(2,)]
 
 
-@pytest.mark.asyncio
-async def test_a_launch_without_the_engine_keeps_its_readings_and_reads_nothing_again(tmp_path, monkeypatch, quick):
-    data = tmp_path / "data"
-    use(monkeypatch, Engine())
-    async with started(data) as client:
-        project = await project_of(client)
-        [paper] = (await added(client, project, ("scan.pdf", synthetic.paper_pdf(scanned=1))))["materials"]
-        [read] = await settled(client, project)
-        assert read["extraction"]["ocr_pages"] == 1
-        [(made, passages)] = await rows(client, "SELECT e.id, count(p.id) FROM extractions e JOIN passages p"
-                                                " ON p.extraction_id = e.id GROUP BY e.id")
-        [(recognized,)] = await rows(client, "SELECT id FROM passages WHERE page = 3")
-        citation = await cite(client, paper["id"], recognized, LINE.text[:20], page=3)
-    use(monkeypatch, None)  # Vision does not load at this launch
-    async with started(data, setup=False) as client:
-        await asyncio.sleep(0.3)
-        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'extract'") == [(1,)]  # nothing read again
-        [degraded] = await settled(client, project)
-        assert degraded["reason"] == "outdated"  # stated: it reads as read by another version until the engine is back
-        again = await client.post(f"/api/material-versions/{degraded['version']['id']}/read")
-        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
-        assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", made) == [(passages,)]  # kept
-        assert await rows(client, "SELECT passage_id FROM citations WHERE id = ?", citation) == [(recognized,)]
-    use(monkeypatch, Engine())
-    async with started(data, setup=False) as client:
-        await asyncio.sleep(0.3)
-        [back] = await settled(client, project)
-        assert (back["state"], back["extraction"]["ocr_pages"], back["extraction"]["version"]) == (
-            "ready", 1, extraction.extractor_of(extraction.PDF)[1])
+def test_vision_is_the_engine_on_macos_and_a_copy_that_cannot_load_it_fails_the_page(monkeypatch):
+    """No other version of the reading is made where Vision does not load: its scanned pages fail, to be tried again."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert ocr.engine() is ocr.VISION
+    monkeypatch.setitem(sys.modules, "Vision", None)  # import Vision raises ImportError
+    assert extraction.extractor_of(extraction.PDF)[1].endswith("+vision-3")
+    with pytest.raises(extraction.Unreadable) as failed:
+        extraction.extract(scan(), extraction.PDF)
+    assert failed.value.code == "ocr_failed"
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert ocr.engine() is None  # elsewhere, scanned pages wait for OCR (the Windows plan)

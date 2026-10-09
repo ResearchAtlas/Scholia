@@ -411,20 +411,19 @@ def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
     lookup now, as at import: a Local only project's asks first, a review-locked project's gets
     none, and it starts where the lookup it continues started (a conversation shows its ask). A
     lookup made for that version since, or one that has still to read its identifiers, covers it.
-    The earlier readings are then removed (_supersede), but for one made with an OCR engine this
-    launch lacks (its version this one's and the engine's): it stays for a launch that has it."""
+    The earlier readings are then removed (_supersede)."""
     # Readings of the file by another version of the extractor are no version's reading now: their
     # passages leave the index of every project whose current version reads the file (a replaced
     # version's left it at its replacement), and then the readings go.
-    older = conn.execute("SELECT id, extractor_version FROM extractions WHERE file_sha256 = ? AND extractor = ?"
-                         " AND extractor_version != ?", (sha256, *extractor)).fetchall()
+    older = [e for (e,) in conn.execute("SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ?"
+                                        " AND extractor_version != ?", (sha256, *extractor))]
     for material, version, kind, project, locked in conn.execute(
             f"SELECT m.id, v.id, {_VERSION_TYPE}, m.project_id, p.review_lock FROM material_versions v"
             " JOIN content_files c ON c.sha256 = v.file_sha256 JOIN materials m ON m.id = v.material_id"
             " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
-        for earlier, _ in older:
+        for earlier in older:
             _queue_removes(conn, earlier, project)
         _queue_adds(conn, extraction_id, project)
         if locked:
@@ -439,16 +438,8 @@ def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
             # it continues that lookup: where it started, its ask is shown
             look_up(conn, project, {"material_ids": [material], "versions": {material: version},
                                     "origin": json.loads(latest[1]) if latest[1] else None})
-    for earlier, version in older:  # each project's index has its removal queued now (above, or when its paper left)
-        if not _engine_made(version, extractor[1]):
-            _supersede(conn, earlier, extraction_id)
-
-
-def _engine_made(version, current):
-    """Whether a reading's version is the current one with an OCR engine's added: made by a launch
-    whose engine this one lacks (backend/ocr.py), so it holds all this launch's reading would and
-    the scanned pages' text besides."""
-    return version.startswith(current + "+")
+    for earlier in older:  # each project's index has its removal queued now (above, or when its paper left)
+        _supersede(conn, earlier, extraction_id)
 
 
 def _supersede(conn, earlier, newer):
@@ -479,29 +470,26 @@ def _supersede(conn, earlier, newer):
 async def read_outdated(harness):
     """Read again every current version whose only reading is by an earlier version of its extractor
     (S1-20 changed the PDF extractor's version, so every PDF read before it, the scanned pages S1-13
-    left waiting for OCR among them): a reading run each, recorded with the extractor version it is
-    for (inputs.outdated). Called when background work starts (backups.start_background: at launch
+    left waiting for OCR among them): a reading run for each such file, recorded with the extractor
+    version it is for (inputs.outdated). Called when background work starts (backups.start_background: at launch
     once the database is checked, and after a restore commits; never while the app is limited). A
     file is read so once for each extractor version, by one of the versions that read it as that type
     (its reading serves the others when it commits, _serve): a file with a reading by this version,
     one being read, or one read so already gets none (Retry and Read again cover a reading that
-    failed); so does one whose earlier readings were all made with an OCR engine this launch lacks
-    (_engine_made). Local work, so at every sensitivity level and in a review-locked project too."""
+    failed). Local work, so at every sensitivity level and in a review-locked project too. Stated
+    limit: the other papers reading the file read outdated while that run runs, and if it is stopped
+    or its paper deleted, they wait for Read again or the next launch."""
     def outdated(conn):
         found, seen = [], set()
         for version, material, project, sha256, kind in conn.execute(
                 f"SELECT v.id, v.material_id, m.project_id, v.file_sha256, {_VERSION_TYPE} FROM material_versions v"
                 " JOIN materials m ON m.id = v.material_id JOIN content_files c ON c.sha256 = v.file_sha256"
                 " WHERE v.is_current = 1 ORDER BY m.created_at").fetchall():
-            if kind not in extraction.EXTRACTORS or (sha256, kind) in seen or _extraction(conn, sha256, kind) is not None:
+            if kind not in extraction.EXTRACTORS or (sha256, kind) in seen or _extraction(conn, sha256, kind) is not None \
+                    or not _earlier(conn, sha256, kind):
                 continue
             seen.add((sha256, kind))
-            name, current = extraction.extractor_of(kind)
-            if all(_engine_made(earlier, current) for (earlier,) in conn.execute(
-                    f"SELECT extractor_version FROM extractions WHERE file_sha256 = ? AND extractor = ? AND status IN {_SHARED}",
-                    (sha256, name))):  # none at all (never read), or only a reading this one would take less from
-                continue
-            mark = f"{name}/{current}"
+            mark = "/".join(extraction.extractor_of(kind))
             if conn.execute("SELECT 1 FROM runs r JOIN material_versions w ON w.id = json_extract(r.inputs, '$.version_id')"
                             " LEFT JOIN content_files d ON d.sha256 = w.file_sha256 WHERE r.workflow = 'extract'"
                             " AND w.file_sha256 = ? AND coalesce(w.media_type, d.media_type) = ?"
