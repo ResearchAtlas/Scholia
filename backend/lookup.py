@@ -52,7 +52,7 @@ class Found:
     source: str  # openalex, crossref or arxiv
     csl: dict
     retracted: bool | None  # None: the source says nothing on it
-    source_key: str
+    source_key: str  # its record, naming its source: openalex:<OpenAlex ID>, doi:<DOI> (Crossref's) or arxiv:<ID>
 
 
 class Failed(Exception):
@@ -225,7 +225,9 @@ def _openalex(doi, body):
     if (first := _text(biblio.get("first_page"), 20)) is not None:
         csl["page"] = first + (f"-{last}" if (last := _text(biblio.get("last_page"), 20)) else "")
     retracted = work.get("is_retracted") if isinstance(work.get("is_retracted"), bool) else None
-    return Found("openalex", csl, retracted, f"doi:{doi}")
+    key = work.get("id") if isinstance(work.get("id"), str) else ""
+    key = key.removeprefix("https://openalex.org/") if re.fullmatch(r"https://openalex\.org/W\d{1,20}", key) else f"doi:{doi}"
+    return Found("openalex", csl, retracted, f"openalex:{key}")
 
 
 def _crossref(doi, body):

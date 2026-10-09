@@ -198,7 +198,7 @@ async def test_a_lookup_is_for_the_version_it_was_made_for_and_a_replaced_ones_a
         assert (late.status_code, late.json()["code"]) == (409, "ask_closed")  # A approved too late: refused
         assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
         [paper] = await settled(client, project)
-        assert (paper["title"], paper["source_key"]) == ("The Replacement", f"doi:{other}")
+        assert (paper["title"], paper["source_key"]) == ("The Replacement", "openalex:W0000000001")
         assert [path for _, path, _ in client.provider.scholarly.requests] == [f"/works/doi:{other}"]  # A's: never sent
 
 
@@ -446,7 +446,7 @@ async def test_a_doi_from_the_file_is_sent_alone_and_anonymously_to_openalex(tmp
         assert "mailto" not in path and "api_key" not in path
         assert paper["title"] == TITLE and paper["checked_by"] == "lookup" and paper["resolved_at"]
         assert paper["csl"]["DOI"] == DOI and paper["csl"]["author"] == [{"literal": "A. Researcher"}]
-        assert (paper["source_key"], paper["retraction"]) == (f"doi:{DOI}", "none")
+        assert (paper["source_key"], paper["retraction"]) == ("openalex:W0000000001", "none")  # the OpenAlex work
         assert paper["retraction_checked_at"] == paper["checked_at"]
         assert paper["lookup"]["outcome"] == "resolved" and paper["lookup"]["source"] == "openalex"
         [decision] = await gate_log(client)
@@ -467,8 +467,16 @@ async def test_crossref_answers_when_openalex_has_no_record_and_arxiv_ids_go_to_
         assert papers["Only In Crossref"]["csl"]["author"] == [{"family": "Example", "given": "Ana"}]
         assert papers["An arXiv Preprint"]["retraction"] == "unknown"  # arXiv says nothing on retraction
         assert papers["An arXiv Preprint"]["source_key"] == f"arxiv:{synthetic.ARXIV}"
+        assert papers["Only In Crossref"]["source_key"] == f"doi:{other}"  # each record's key names its source
         assert sorted(mock.hosts) == ["api.crossref.org", "api.openalex.org", "export.arxiv.org"]
         assert {p["lookup"]["source"] for p in papers.values()} == {"crossref", "arxiv"}
+
+
+async def test_an_openalex_records_key_is_its_openalex_id_or_else_the_doi_it_was_asked_for():
+    for given, key in (("https://openalex.org/W123", "openalex:W123"), (None, f"openalex:doi:{DOI}"),
+                       ("https://example.org/W123", f"openalex:doi:{DOI}"), ("https://openalex.org/W1/../x", f"openalex:doi:{DOI}")):
+        record = {**openalex_work(DOI, TITLE), "id": given}
+        assert lookup._openalex(DOI, json.dumps(record).encode()).source_key == key
 
 
 async def test_a_doi_after_many_short_passages_but_within_the_first_characters_is_found(tmp_path):
@@ -735,7 +743,7 @@ async def test_a_doi_the_researcher_changes_or_clears_takes_its_lookups_provenan
         project = await project_of(client)
         result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
         [looked] = await settled(client, project)
-        assert (looked["retraction"], looked["source_key"], looked["csl"]["volume"]) == ("retracted", f"doi:{DOI}", "3")
+        assert (looked["retraction"], looked["source_key"], looked["csl"]["volume"]) == ("retracted", "openalex:W0000000001", "3")
         material = result["materials"][0]["id"]
         typed = {"changed": "10.5555/another.paper", "cleared": "", "unchanged": f"https://doi.org/{DOI.upper()}"}[doi]
         saved = await client.patch(f"/api/materials/{material}", json={"title": "My Own Title", "doi": typed})
@@ -743,7 +751,7 @@ async def test_a_doi_the_researcher_changes_or_clears_takes_its_lookups_provenan
         paper = saved.json()
         assert (paper["title"], paper["checked_by"]) == ("My Own Title", "researcher")
         if doi == "unchanged":  # the lookup's record still describes it: all of it is kept
-            assert (paper["retraction"], paper["source_key"], paper["csl"]["DOI"]) == ("retracted", f"doi:{DOI}", DOI)
+            assert (paper["retraction"], paper["source_key"], paper["csl"]["DOI"]) == ("retracted", "openalex:W0000000001", DOI)
             assert paper["resolved_at"] and paper["retraction_checked_at"] and paper["csl"]["volume"] == "3"
         else:  # nothing of the old DOI's record stays: no retraction flag, no provenance, none of its fields
             assert (paper["retraction"], paper["retraction_checked_at"]) == ("unknown", None)
@@ -768,7 +776,7 @@ async def test_a_retracted_papers_file_replaced_by_one_known_only_to_arxiv_reads
         project = await project_of(client)
         result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
         [retracted] = await settled(client, project)
-        assert (retracted["retraction"], retracted["source_key"]) == ("retracted", f"doi:{DOI}")
+        assert (retracted["retraction"], retracted["source_key"]) == ("retracted", "openalex:W0000000001")
         await added(client, project, ("v2.md", synthetic.paper_markdown()), material_id=result["materials"][0]["id"])
         [replaced] = await settled(client, project)
         assert (replaced["title"], replaced["source_key"]) == ("The Replacement Preprint", f"arxiv:{synthetic.ARXIV}")
