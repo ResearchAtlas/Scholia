@@ -324,8 +324,9 @@ def check_backend() -> dict:
 
 def check_interface(folder: Path | None = None) -> dict:
     """The built interface the app bundles (or `folder`), served as the window loads it: its
-    page, with the Content-Security-Policy that refuses remote images, and the script and
-    stylesheet the page names."""
+    page, with the Content-Security-Policy that refuses remote images, the script and
+    stylesheet the page names, and every script those import, at start or with import() when a
+    part of the window is first opened (frontend/src/parts.js)."""
     import asyncio
 
     import httpx
@@ -347,9 +348,14 @@ def check_interface(folder: Path | None = None) -> dict:
                 files = re.findall(r'(?:src|href)="/(assets/[^"]+)"', page.text)
                 if not any(f.endswith(".js") for f in files) or not any(f.endswith(".css") for f in files):
                     raise RuntimeError("the page names no script or no stylesheet")
-                for file in files:
-                    if (await client.get("/" + file)).status_code != 200:
+                for file in files:  # grows with the scripts each one imports
+                    response = await client.get("/" + file)
+                    if response.status_code != 200:
                         raise RuntimeError(f"{file} is not served")
+                    if file.endswith(".js"):
+                        for name in re.findall(r"""(?:\bfrom\s*|\bimport\s*\(?\s*)["']\./([\w.-]+\.js)["']""", response.text):
+                            if f"assets/{name}" not in files:
+                                files.append(f"assets/{name}")
                 return len(files)
 
     with tempfile.TemporaryDirectory() as folder_for_data:
