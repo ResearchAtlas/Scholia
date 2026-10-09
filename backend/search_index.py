@@ -21,8 +21,10 @@ an add takes the passage's index text from the main database if a current versio
 in that project reads it now (the reading the Library shows), else adds nothing, since a removal
 follows; a remove deletes the passage's rows. Removed rows are checked gone before the pass commits
 (else it rolls back and its rows wait for the next pass), then the WAL is checkpointed and
-truncated, and the applied queue rows are deleted from the main database. Reference passages are
-indexed for keywords, marked by kind and never embedded; search leaves them out.
+truncated, and the applied queue rows are deleted from the main database. A pass or a truncation
+that fails is tried again at the next pass and, without waiting for one, after a short delay.
+Reference passages are indexed for keywords, marked by kind and never embedded; search leaves them
+out.
 
 At open: a file that cannot be read, one of another schema or built from another database file (a
 restore, or one undone), one a whole rebuild did not finish, or one whose last applied
@@ -60,6 +62,7 @@ TOKENIZER, TOKENIZER_VERSION = "scholia", "1"
 SCHEMA_VERSION = "1"  # a file of another schema is replaced and rebuilt
 QUEUE_PAGE = 1000  # queue rows applied in one index transaction
 MAX_TERMS = 64  # a query's distinct tokens, at most
+RETRY_SECONDS = (1, 60)  # a failed pass or WAL truncation is tried again after 1 s, doubling to at most 60 s
 # Han characters: CJK unified ideographs, extension A, the compatibility ideographs and extensions B on.
 _HAN = "㐀-䶿一-鿿豈-﫿\U00020000-\U0003134f"
 # A run of Han characters, or a run of other letters and digits (combining marks kept with them).
@@ -243,7 +246,9 @@ class SearchIndex:
         self.closed = False
         self.damaged = False  # a read found the file damaged: it is being replaced
         self._conn = None
-        self._truncate = False  # a WAL truncation a reader held off, tried again at each pass
+        self._truncate = False  # a WAL truncation not done yet: tried again at each pass, and soon (_retry_later)
+        self._retry, self._retries = None, 0  # the timer of the next try after a failure, and how many failed
+        self.rebuilt = None  # called (in the writer) once a damaged file found while the app runs is rebuilt
         self._readers = queue.SimpleQueue()  # idle read connections
         self._generation = 0  # a replaced file's readers are closed, not used again
         self._lock = threading.Lock()
@@ -364,13 +369,18 @@ class SearchIndex:
         self._conn.executemany("INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                                [(key, str(value)) for key, value in values.items()])
 
-    def _rebuild_soon(self):
-        """_rebuild_all in the writer, without waiting for it; a failure is logged (the next launch finds
-        the file unfinished and rebuilds it again)."""
+    def _rebuild_soon(self, then=None):
+        """_rebuild_all in the writer, without waiting for it, then then() there once it has succeeded; a
+        failure is logged (the next launch finds the file unfinished and rebuilds it again)."""
         def done(future):
             if not future.cancelled() and future.exception() is not None:
                 log.error("rebuilding the search index failed (%s)", type(future.exception()).__name__)
-        future = self._writer.submit(self._rebuild_all)
+
+        def rebuild():
+            self._rebuild_all()
+            if then is not None and not self.closed:
+                then()
+        future = self._writer.submit(rebuild)
         future.add_done_callback(done)
         return future
 
@@ -412,13 +422,14 @@ class SearchIndex:
         self._apply()
 
     def _damaged(self):
-        """A read found the file damaged: it is replaced and rebuilt in the writer, once."""
+        """A read or a pass found the file damaged: it is replaced and rebuilt in the writer, once, and its
+        vectors are wanted again (self.rebuilt), as when a launch rebuilds it."""
         with self._lock:
             if self.damaged or self.closed:
                 return
             self.damaged = True
         log.warning("the search index is damaged; it is rebuilt")
-        self._rebuild_soon()
+        self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
 
     # Applying the queue
 
@@ -435,6 +446,41 @@ class SearchIndex:
             self._writer.submit(self._apply).add_done_callback(done)
 
     def _apply(self):
+        """A pass over the queue. One that fails is tried again soon (_retry_later), so a removal it
+        did not apply never waits on other work; one that finds the file damaged has it rebuilt."""
+        try:
+            applied = self._apply_queue()
+        except _DAMAGE:
+            self._damaged()
+            raise
+        except Exception:
+            self._retry_later()
+            raise
+        if not self._truncate:
+            self._retries = 0
+        return applied
+
+    def _retry_later(self):
+        """A pass in the writer after a delay that doubles with each failure in a row (RETRY_SECONDS);
+        one at a time, none once the index is closed."""
+        with self._lock:
+            if self.closed or self._retry is not None:
+                return
+            delay = min(RETRY_SECONDS[0] * 2 ** self._retries, RETRY_SECONDS[1])
+            self._retries += 1
+            self._retry = threading.Timer(delay, self._retried)
+            self._retry.daemon = True
+            self._retry.start()
+
+    def _retried(self):
+        with self._lock:
+            self._retry = None
+        try:
+            self.apply_soon()
+        except RuntimeError:  # the writer stopped meanwhile (closing)
+            pass
+
+    def _apply_queue(self):
         applied = 0
         if self._truncate and self._conn is not None:
             self._checkpoint()
@@ -520,14 +566,20 @@ class SearchIndex:
             raise CleanupFailed()
 
     def _checkpoint(self):
-        """Old WAL frames hold what was deleted: copied into the file, and the WAL truncated. One a reader
-        holds off is tried again at the start of every pass until it succeeds."""
+        """Old WAL frames hold what was deleted: copied into the file, and the WAL truncated. The duty is
+        recorded before it is tried and cleared only once it succeeds: one that fails for any reason (a
+        reader holds it off, an I/O error) is tried again at the start of every pass and soon after
+        (_retry_later), though the rows it follows are applied already. A damaged file is replaced."""
+        self._truncate = True
         try:
             self._conn.wal_checkpoint(mode=apsw.SQLITE_CHECKPOINT_TRUNCATE)
-            self._truncate = False
-        except apsw.BusyError:
-            self._truncate = True
-            log.warning("the search index's WAL could not be truncated yet; a reader still needed it")
+        except _DAMAGE:
+            raise
+        except apsw.Error as error:
+            log.warning("the search index's WAL could not be truncated yet (%s); it is tried again", type(error).__name__)
+            self._retry_later()
+            return
+        self._truncate = False
 
     # A project's rebuild
 
@@ -627,7 +679,10 @@ class SearchIndex:
     def close(self):
         """Stop the writer once the job it runs ends (a whole rebuild stops between projects), and close
         every connection."""
-        self.closed = True
+        with self._lock:
+            self.closed = True
+            if self._retry is not None:
+                self._retry.cancel()
 
         def end():
             if self._conn is not None:

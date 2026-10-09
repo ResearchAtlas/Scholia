@@ -305,44 +305,57 @@ async def test_vectors_sqlite_vec_cannot_reach_are_replaced_with_the_file_and_em
         assert status["passages"]["embedded"] == 2 and status["materials"][material["id"]]["embedded"] == 2
 
 
+class FailingCheckpoints:
+    """The writer's connection, its first `failures` WAL truncations failing with error."""
+
+    def __init__(self, conn, error, failures):
+        self.conn, self.error, self.failures, self.calls = conn, error, failures, []
+
+    def __getattr__(self, name):
+        return getattr(self.conn, name)
+
+    def __enter__(self):
+        return self.conn.__enter__()
+
+    def __exit__(self, *exc):
+        return self.conn.__exit__(*exc)
+
+    def wal_checkpoint(self, **options):
+        self.calls.append(options)
+        if len(self.calls) <= self.failures:
+            raise getattr(search_index.apsw, self.error)("held off" if self.error == "BusyError" else "disk I/O error")
+        return self.conn.wal_checkpoint(**options)
+
+
 @pytest.mark.asyncio
-async def test_a_wal_truncation_a_reader_holds_off_is_tried_again_at_the_next_pass(tmp_path):
+@pytest.mark.parametrize("error", ["BusyError", "IOError"])
+async def test_a_wal_truncation_that_fails_stays_owed_and_is_done_soon_without_other_work(tmp_path, monkeypatch, error):
+    """A reader holding it off, or an I/O error: the deletion's rows leave the index and the queue, the
+    truncation stays owed, and it is tried again soon, with no further pass or deletion, until the file and
+    its WAL hold nothing of the paper."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (0.05, 0.05))
+    english = "Ocelots juggle tangerine harpsichords"
     async with app(tmp_path) as client:
         project = await project_of(client)
-        [material] = (await added(client, project, WAGES))["materials"]
+        [material] = (await added(client, project, paper("Ledger of Ocelots", english)))["materials"]
         await idle(client, project)
         index = client.state["index"]
-        calls = []
-
-        class Busy:  # the writer's connection, its first truncation held off by a reader
-            def __init__(self, conn):
-                self.conn = conn
-
-            def __getattr__(self, name):
-                return getattr(self.conn, name)
-
-            def __enter__(self):
-                return self.conn.__enter__()
-
-            def __exit__(self, *exc):
-                return self.conn.__exit__(*exc)
-
-            def wal_checkpoint(self, **options):
-                calls.append(options)
-                if len(calls) == 1:
-                    raise search_index.apsw.BusyError("a reader")
-                return self.conn.wal_checkpoint(**options)
-
+        files = [index.path, Path(f"{index.path}-wal")]
         real = index._conn
-        index._conn = Busy(real)
+        index._conn = failing = FailingCheckpoints(real, error, failures=2)
         try:
             assert (await client.delete(f"/api/materials/{material['id']}")).status_code == 200
-            assert index._truncate is True and len(calls) == 1
-            await asyncio.to_thread(index.apply)
-            assert index._truncate is False and len(calls) == 2
+            assert await index_rows(client, project) == []  # applied, though the truncation failed
+            assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+            deadline = asyncio.get_running_loop().time() + 5
+            while index._truncate or len(failing.calls) < 3:  # the deletion's, then two tries of its own
+                assert asyncio.get_running_loop().time() < deadline, (index._truncate, len(failing.calls))
+                await asyncio.sleep(0.02)
         finally:
             index._conn = real
-        assert not Path(f"{index.path}-wal").exists() or Path(f"{index.path}-wal").stat().st_size == 0
+        assert not files[1].exists() or files[1].stat().st_size == 0
+        left = b"".join(f.read_bytes() for f in files if f.exists())
+        assert english.encode() not in left and b"ocelots" not in left and b"tangerine" not in left
 
 
 @pytest.mark.asyncio
@@ -422,3 +435,31 @@ async def test_an_index_unreadable_at_open_does_not_stop_the_launch(tmp_path, mo
         assert (await client.get(f"/api/projects/{project}/index")).status_code == 200
         runs = [r for r in (await client.get("/api/activity")).json()["runs"] if r["workflow"] == "index"]
         assert len(runs) == 2  # the first launch's, and one this launch recorded: its papers taken as pending
+
+
+@pytest.mark.asyncio
+async def test_a_file_found_damaged_while_the_app_runs_is_rebuilt_with_its_embeddings(tmp_path):
+    """Found damaged during an idle session (not at a launch): the file is replaced, its keyword rows
+    rebuilt, and its papers get index runs that embed them again, without a restart."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES, CHINESE)
+        before = await until_embedded(client, project)
+        runs = len([r for r in (await client.get("/api/activity")).json()["runs"] if r["workflow"] == "index"])
+        index, sent = client.state["index"], len(client.remote.indexing)
+
+        def damaged(conn):
+            raise search_index.apsw.CorruptError("database disk image is malformed")
+        with pytest.raises(search_index.apsw.CorruptError):
+            await asyncio.to_thread(index._read, damaged)
+        assert index.damaged is True
+        deadline = asyncio.get_running_loop().time() + 10
+        while index.damaged or index.building:  # replaced and rebuilt in the writer
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        status = await until_embedded(client, project)
+        assert status["passages"] == before["passages"] and index.damaged is False and status["state"] == "ready"
+        assert len(client.remote.indexing) - sent == before["passages"]["embeddable"]  # embedded again
+        after = [r for r in (await client.get("/api/activity")).json()["runs"] if r["workflow"] == "index"]
+        assert len(after) == runs + 1 and after[0]["status"] == "succeeded"
+        assert (await find(client, project, "最低工资"))["mode"] == "hybrid"

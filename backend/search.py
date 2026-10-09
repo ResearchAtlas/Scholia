@@ -17,7 +17,8 @@ UNSENT_WORKFLOWS); deleting one of its materials revokes it, and the others get 
 
 The offer (workflow `model_offer`, ask kind `model_download`): the first material whose reading
 gives a Normal or Private project passages, while the model is not installed and no download runs,
-records one offer run, unless the project has one running or answered. It asks through the shared
+records one offer run, unless the project has one running, one that ran to its end, or one the
+researcher answered (whatever became of its run after). It asks through the shared
 confirmation (Download from Hugging Face, Download from ModelScope, Later), shown where the work
 started. The answer is the consent: a download answer records the start, then starts one download
 (S1-16's start_download, the General project's client); a download already running or the model
@@ -120,6 +121,15 @@ async def open_index(state, db):
         return
     state["index"] = index
     state["model_installed"] = lambda: asyncio.ensure_future(_embed_all(state))
+    loop = asyncio.get_running_loop()
+
+    def rebuilt():  # a damaged file replaced while the app runs (in the writer): its papers are embedded again
+        if _installed(state):
+            try:
+                loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_embed_all(state, running_too=True)))
+            except RuntimeError:  # the app stopped meanwhile: the next launch embeds them (index.unembedded)
+                pass
+    index.rebuilt = rebuilt
     deletion.CLEANUP[db] = index.apply  # a deletion's removals, applied after its commit
     if rebuilding is None:
         index.apply_soon()
@@ -176,15 +186,17 @@ def _downloading(state):
     return local is not None and local.download is not None and local.download.state == "running"
 
 
-async def _embed_all(state):
+async def _embed_all(state, running_too=False):
     """The model was just installed: every project whose index has passages without embeddings gets an
-    index run for those papers (but those a running index run names)."""
+    index run for those papers, but those a running index run names (it embeds them or, having found the
+    model missing, records one as it ends). running_too: those too (a damaged file rebuilt while the app
+    runs, under a run that may have finished embedding in the file it replaced)."""
     index, harness = state.get("index"), state.get("harness")
     if index is None or harness is None:
         return
     try:
         pending = await asyncio.to_thread(index.unembedded)
-        named = await asyncio.to_thread(harness.db.read, lambda conn: {m for (m,) in conn.execute(
+        named = set() if running_too else await asyncio.to_thread(harness.db.read, lambda conn: {m for (m,) in conn.execute(
             "SELECT j.value FROM runs r, json_each(r.inputs, '$.material_ids') j"
             " WHERE r.workflow = 'index' AND r.status = 'running'")})
         for project, materials in pending.items():
@@ -249,8 +261,11 @@ def queued(conn, harness, project_id, material_ids, origin, record):
     level = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
     if level is None or level[0] == "local_only":
         return
-    if conn.execute("SELECT 1 FROM runs WHERE project_id = ? AND workflow = 'model_offer'"
-                    " AND status IN ('running', 'succeeded') LIMIT 1", (project_id,)).fetchone() is None:
+    # Once per project (ticket 71): none while one runs or has run to its end, nor once the researcher
+    # has answered one, whatever became of its run after the answer (cancelled, revoked, failed).
+    offered = conn.execute("SELECT id, status FROM runs WHERE project_id = ? AND workflow = 'model_offer'",
+                           (project_id,)).fetchall()
+    if not any(status in ("running", "succeeded") or asks.researcher_answered(conn, run) for run, status in offered):
         record(conn, project_id, "model_offer", {"origin": origin})
 
 
@@ -316,10 +331,16 @@ async def _index_run(state, harness, active, project_id, inputs):
     if index is None:
         raise RunOutcome("failed", "index_unavailable")
     materials = inputs.get("material_ids") or []
+
+    async def drained(fn, *args):  # a change to the index, finished before the run's end is recorded
+        done = await harness.work(active, lambda: fn(*args))
+        if active.cancel_requested.is_set():
+            raise asyncio.CancelledError()
+        return done
     if inputs.get("rebuild"):
-        await asyncio.to_thread(index.rebuild_project, project_id, run_id)
+        await drained(index.rebuild_project, project_id, run_id)
     else:
-        await asyncio.to_thread(index.apply)
+        await drained(index.apply)
     # At launch, background runs start before the helper's own startup has run: a moment's wait.
     for _ in range(int(HELPER_WAIT_SECONDS / 0.05)):
         if state.get("local_helper") is not None or harness.registry.closed:
@@ -327,7 +348,11 @@ async def _index_run(state, harness, active, project_id, inputs):
         await asyncio.sleep(0.05)
     mode, reason = search_mode(state)
     if mode != "hybrid" and reason in WAITING_REASONS:  # keyword search only until that changes, said
-        return {"mode": "keyword_only", "reason": reason}, None
+
+        def installed_meanwhile(conn):  # in the run's terminal transaction: the install's runs left these out
+            if reason == "model_missing" and _installed(state):
+                harness.record_in(conn, active, project_id, "index", {"material_ids": materials})
+        return {"mode": "keyword_only", "reason": reason}, installed_meanwhile
     if mode != "hybrid":  # the helper cannot serve now: failed with its reason, and Retry embeds what is missing
         raise RunOutcome("failed", reason)
     batch = load_settings(state["data_dir"]).values["retrieval"]["embedding_batch"]
@@ -366,7 +391,7 @@ async def _index_run(state, harness, active, project_id, inputs):
                 if len(vector) != DIMENSIONS:  # not this model's: nothing would ever be stored
                     raise RunOutcome("failed", "request_failed")
                 vectors.append((rowid, pid, mark, vector))
-            embedded += await asyncio.to_thread(index.store, project_id, vectors)
+            embedded += await drained(index.store, project_id, vectors)
             await progress()
     return {"mode": "hybrid", "embedded": embedded}, None
 
@@ -474,7 +499,7 @@ async def search(state, project_id, query, limit=None):
             "SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone()) is None:
         raise AdmissionError(404, "not_found", "No such project")
     values = load_settings(state["data_dir"]).values["retrieval"]
-    limit = limit or values["keep"]
+    limit = min(limit or values["keep"], MAX_LIMIT)  # the setting may be larger than the API allows
     mode, reason = search_mode(state)
     if index is None or index.closed:  # it could not be opened, or a restore is putting another in place
         return {"results": [], "mode": mode, "reason": reason, "index": "unavailable", "coverage": None}
@@ -517,17 +542,22 @@ async def search_passages(project_id: str, body: Query, request: Request):
 @router.get("/api/projects/{project_id}/index")
 async def index_status(project_id: str, request: Request):
     """The project's index: whether it is ready or being rebuilt, whether search is keyword-only and
-    why, its passages indexed and embedded (in all, and by paper), and its running index run."""
+    why, its passages indexed and embedded (in all, and by paper), and its index run: a rebuild while
+    one runs (a newer run never hides it), else the latest."""
     state = _state(request)
     registry = state["harness"].registry
 
     def latest(conn):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
             raise AdmissionError(404, "not_found", "No such project")
-        return conn.execute("SELECT id, status, json_extract(inputs, '$.rebuild') FROM runs WHERE project_id = ?"
-                            " AND workflow = 'index' ORDER BY rowid DESC LIMIT 1", (project_id,)).fetchone()
+        rebuilding = conn.execute("SELECT id, status, 1 FROM runs WHERE project_id = ? AND workflow = 'index'"
+                                  " AND status = 'running' AND json_extract(inputs, '$.rebuild') ORDER BY rowid DESC",
+                                  (project_id,)).fetchall()
+        return rebuilding, conn.execute("SELECT id, status, json_extract(inputs, '$.rebuild') FROM runs WHERE project_id = ?"
+                                        " AND workflow = 'index' ORDER BY rowid DESC LIMIT 1", (project_id,)).fetchone()
 
-    run = await asyncio.to_thread(state["db"].read, latest)
+    rebuilding, run = await asyncio.to_thread(state["db"].read, latest)
+    run = next((r for r in rebuilding if derived_status(r[1], r[0], registry) == "running"), run)
     index = state.get("index")
     if index is not None and index.closed:
         index = None

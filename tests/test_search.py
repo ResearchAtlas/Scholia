@@ -11,6 +11,7 @@ text's tokens hashed into 1024 dimensions, so texts sharing words are near), nev
 import asyncio
 import contextlib
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -321,6 +322,10 @@ async def until_offer(client, project, timeout=15.0):
 
 
 async def test_a_deletion_whose_index_cleanup_fails_keeps_its_removals_and_search_excludes_the_paper(tmp_path, monkeypatch):
+    """The pass rolls back and its removals stay queued; it is tried again soon, with no other work, until
+    they are applied."""
+    import backend.search_index as search_index
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (0.05, 0.05))
     async with app(tmp_path) as client:
         project = await project_of(client)
         [material] = (await added(client, project, WAGES))["materials"]
@@ -328,13 +333,15 @@ async def test_a_deletion_whose_index_cleanup_fails_keeps_its_removals_and_searc
         real = SearchIndex._verify
         monkeypatch.setattr(SearchIndex, "_verify", lambda self, rowids: (_ for _ in ()).throw(RuntimeError("disk")))
         assert (await client.delete(f"/api/materials/{material['id']}")).status_code == 200
+        await asyncio.sleep(0.2)  # tried again meanwhile, and failing still
         assert len(await index_rows(client, project)) == 4  # the pass rolled back: still there
         assert await rows(client, "SELECT count(*) FROM index_queue WHERE op = 'remove'") == [(4,)]  # still queued
         assert (await find(client, project, "earnings"))["results"] == []  # the access check keeps it out
         monkeypatch.setattr(SearchIndex, "_verify", real)
-        await asyncio.to_thread(client.state["index"].apply)
-        assert await index_rows(client, project) == []
-        assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+        deadline = asyncio.get_running_loop().time() + 5
+        while await index_rows(client, project) or await rows(client, "SELECT count(*) FROM index_queue") != [(0,)]:
+            assert asyncio.get_running_loop().time() < deadline  # no pass, deletion or launch called for
+            await asyncio.sleep(0.02)
 
 
 async def test_an_index_commit_whose_terminal_write_fails_reads_interrupted_and_a_restart_adds_no_duplicate(tmp_path,
@@ -793,3 +800,170 @@ async def test_queued_additions_whose_passages_a_newer_reading_removed_are_passe
         newer = {p for (p,) in await rows(client, "SELECT id FROM passages")}
         assert {r[0] for r in await index_rows(client, project)} == newer and not newer & older
         assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+
+
+# From review 1 (fix batch 1)
+
+
+async def _held_in_the_writer(client, monkeypatch, name):
+    """Hold SearchIndex.name inside the index's writer until the returned event is set; reached is set as it
+    is entered."""
+    import threading
+    reached, go, real = threading.Event(), threading.Event(), getattr(SearchIndex, name)
+
+    def held(self, *args):
+        reached.set()
+        go.wait(20)
+        return real(self, *args)
+    monkeypatch.setattr(SearchIndex, name, held)
+    return reached, go
+
+
+async def _status_of(client, run_id):
+    return (await rows(client, "SELECT status FROM runs WHERE id = ?", run_id))[0][0]
+
+
+@pytest.mark.parametrize("change", ["store", "rebuild"])
+async def test_a_cancelled_run_ends_only_after_its_index_change_has(tmp_path, monkeypatch, change):
+    """Cancel while the run's change waits in the index's writer (vectors stored, or a project's rows
+    rebuilt and its vectors dropped): the run's end is recorded only once that change is done, as the
+    harness drains blocking work (Harness.work), never before it."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        if change == "rebuild":
+            await added(client, project, WAGES)
+            await idle(client, project)
+        reached, go = await _held_in_the_writer(client, monkeypatch, "_store" if change == "store" else "_rebuild_project")
+        if change == "store":
+            await added(client, project, WAGES)
+        else:
+            await client.post(f"/api/projects/{project}/index/rebuild")
+        assert await asyncio.to_thread(reached.wait, 10)
+        [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
+        await client.post(f"/api/runs/{run['run_id']}/cancel")
+        await asyncio.sleep(0.3)
+        assert await _status_of(client, run["run_id"]) == "running"  # its change is still to come
+        go.set()
+        ended = await run_finished(client, run["run_id"])
+        assert (ended["status"], ended["cancel_reason"]) == ("cancelled", "researcher")
+        embedded = sum(1 for r in await index_rows(client, project) if r[3])
+        assert embedded == (4 if change == "store" else 0)  # what it changed was done before its end
+
+
+@pytest.mark.parametrize("then", ["cancelled", "revoked"])
+async def test_an_offer_answered_later_is_not_asked_again_whatever_ends_its_run(tmp_path, monkeypatch, then):
+    import backend.search as search
+    monkeypatch.setattr(search, "WAIT_SECONDS", 30)  # the run reads its answer only after this: it ends first
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        [ask] = await until_offer(client, project)
+        answered = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "later"})
+        assert answered.status_code == 200
+        if then == "cancelled":
+            await client.post(f"/api/runs/{ask['run_id']}/cancel")
+        else:  # a stricter level revokes it (a Private project is still offered the model)
+            response = await client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"})
+            assert response.status_code == 200, response.text
+        ended = await run_finished(client, ask["run_id"])
+        assert ended["status"] == "cancelled"
+        await added(client, project, paper("Next Paper", "Text."))
+        await idle(client, project)
+        await asyncio.sleep(0.2)
+        assert await offers(client, project) == [] and len(await runs_of(client, "model_offer", project)) == 1
+        assert client.remote.sources == []
+
+
+@pytest.mark.parametrize("how", ["an empty reading", "a blank file", "a file that cannot be read"])
+async def test_text_that_gives_way_to_none_leaves_the_index_file_without_other_work(tmp_path, monkeypatch, how):
+    """An indexed reading superseded by one without passages, or a file replaced by one that gives none (blank,
+    or failing to be read): an index run takes the removals now, so the old text leaves the index file and its
+    WAL, not only search (whose access check already hides it)."""
+    import backend.extraction as extraction
+    english = "Narwhals barter vermilion abacuses"
+    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [material] = (await added(client, project, paper("Narwhal Ledger", english)))["materials"]
+        await idle(client, project)
+        index = client.state["index"]
+        files = [index.path, Path(f"{index.path}-wal")]
+        assert english.encode() in b"".join(f.read_bytes() for f in files if f.exists())
+        if how == "an empty reading":
+            real = extraction.extract
+
+            def empty(*args, **kwargs):
+                found = real(*args, **kwargs)
+                return extraction.Extracted(found.extractor, found.version, [], found.pages)
+            monkeypatch.setattr(extraction, "extract", empty)
+            monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))
+            [read] = (await client.get(f"/api/projects/{project}/materials")).json()["materials"]
+            again = await client.post(f"/api/material-versions/{read['version']['id']}/read")
+            assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        else:
+            replacement = ("blank.md", b"\n\n") if how == "a blank file" else ("broken.pdf", b"%PDF-1.7\nnot a pdf")
+            await added(client, project, replacement, material_id=material["id"])
+        await idle(client, project)
+        assert await index_rows(client, project) == []
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+        assert not files[1].exists() or files[1].stat().st_size == 0
+        left = b"".join(f.read_bytes() for f in files if f.exists())
+        assert english.encode() not in left and b"narwhals" not in left and b"vermilion" not in left
+
+
+async def test_a_default_result_count_above_the_apis_bound_is_held_to_it(tmp_path):
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        await added(client, project, paper("Many", *[f"Common finding number {i}." for i in range(60)]))
+        await idle(client, project)
+        await setting(client, "retrieval.keep", 100)
+        await setting(client, "retrieval.bm25_candidates", 100)
+        assert len((await find(client, project, "common"))["results"]) == 50
+        assert len((await find(client, project, "common", limit=10))["results"]) == 10
+
+
+async def test_a_run_that_found_the_model_missing_as_it_was_installed_leaves_an_index_run_for_its_papers(
+        tmp_path, monkeypatch):
+    """The install's own index runs leave out papers a running run names; one that had already found the
+    model missing records a run for them as it ends, so they are embedded without a restart."""
+    import sys
+    import backend.search as search
+    real = search.search_mode
+
+    def missing_once(state):  # the first index run looks just before the model is in place
+        if sys._getframe(1).f_code.co_name == "_index_run" and not getattr(missing_once, "seen", False):
+            missing_once.seen = True
+            return "keyword_only", "model_missing"
+        return real(state)
+    monkeypatch.setattr(search, "search_mode", missing_once)
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        deadline = asyncio.get_running_loop().time() + 10
+        while (status := await idle(client, project))["passages"]["embedded"] < 4:
+            assert asyncio.get_running_loop().time() < deadline, status
+            await asyncio.sleep(0.05)
+        first, *_ = sorted(await runs_of(client, "index", project), key=lambda r: r["started_at"])
+        assert first["result"] == {"mode": "keyword_only", "reason": "model_missing"}
+        assert len(await runs_of(client, "index", project)) == 2
+
+
+async def test_a_rebuild_under_way_shows_in_the_status_though_a_newer_run_follows(tmp_path):
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        client.remote.hold = asyncio.Event()
+        client.remote.free = len(client.remote.indexing)
+        rebuild = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        await added(client, project, paper("Newer Paper", "Text after the rebuild began."))
+        deadline = asyncio.get_running_loop().time() + 10
+        while len([r for r in await runs_of(client, "index", project) if r["status"] == "running"]) < 2:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        status = (await client.get(f"/api/projects/{project}/index")).json()
+        assert (status["run"]["run_id"], status["run"]["rebuild"], status["run"]["status"]) == (rebuild, True, "running")
+        client.remote.hold.set()
+        assert (await run_finished(client, rebuild))["status"] == "succeeded"
+        await idle(client, project)

@@ -216,9 +216,9 @@ async def add_files(project_id: str, body: Upload, request: Request):
             shared = conn.execute(
                 f"SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ? AND extractor_version = ?"
                 f" AND status IN {_SHARED}", (sha256, extractor, extractor_version)).fetchone()
-            run = None
+            run, indexed = None, False
             if shared is not None:  # read already, for another project or version: shared, not read again
-                if _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
+                if indexed := _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
                     search.queued(conn, harness, project_id, [material], origin, recorded)
             else:
                 run = next(ids)
@@ -227,7 +227,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
                              " 'extract', ?)", (run, project_id, json.dumps({"material_ids": [material],
                                                                              "version_id": version, "origin": origin})))
             if replaced is not None and replaced[1] in extraction.EXTRACTORS:  # its old file's readings, unless read still
-                _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0])
+                if _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0]) and not indexed:
+                    recorded(conn, project_id, "index", {"material_ids": [material]})  # takes those removals now
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
             looked_up[material] = version
         lookup_run = None  # a review-locked project never looks identifiers up
@@ -244,7 +245,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
         return {"materials": added, "lookup_run_id": lookup_run}, used
 
     # The runs start with the commit (record_background): none is ever running in the record and not held.
-    return await harness.record_background(len(stored) + 2, record)
+    # Each file may take two (its reading, and an index run for its old file's removals).
+    return await harness.record_background(2 * len(stored) + 2, record)
 
 
 def _add_to_batch(conn, project_id, run_id, looked_up, more, registry):
@@ -283,15 +285,18 @@ def _queue_removes(conn, extraction_id, project_id):
     time, as _queue_adds), unless the project's latest queued operation for them is already a
     removal. The index takes an applied row off the queue (backend/db/migrations.py), so an add
     may no longer be there to see; a removal of passages the index never had changes nothing. The
-    extraction and its passages stay."""
+    extraction and its passages stay. Returns whether removals were queued: the caller records an index
+    run to take them, unless one it records anyway does."""
     first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1",
                          (extraction_id,)).fetchone()
     last = first and conn.execute("SELECT op FROM index_queue WHERE target = 'passage' AND target_id = ?"
                                   " AND project_id = ? ORDER BY seq DESC LIMIT 1", (first[0], project_id)).fetchone()
-    if first is not None and (last is None or last[0] != "remove"):
-        conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
-                     " SELECT 'passage', id, ?, 'remove' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
-                     (project_id, extraction_id))
+    if first is None or (last is not None and last[0] == "remove"):
+        return False
+    conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
+                 " SELECT 'passage', id, ?, 'remove' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
+                 (project_id, extraction_id))
+    return True
 
 
 def _queue_adds(conn, extraction_id, project_id):
@@ -406,24 +411,28 @@ def _store(conn, version_id, sha256, extracted, record, harness=None, origin=Non
 def _unread_out(conn, project_id, sha256, name):
     """A project's index holds the readings its current versions read: each reading of the file by
     that extractor (any version) that none of them reads now (its file replaced, or read by an
-    earlier version) has its passages queued to leave it. The readings stay."""
+    earlier version) has its passages queued to leave it. The readings stay. Returns whether removals
+    were queued (see _queue_removes)."""
     read = {extraction.extractor_of(kind) for (kind,) in conn.execute(
         f"SELECT {_VERSION_TYPE} FROM material_versions v JOIN materials m ON m.id = v.material_id LEFT JOIN"
         " content_files c ON c.sha256 = v.file_sha256 WHERE m.project_id = ? AND v.file_sha256 = ? AND v.is_current = 1",
         (project_id, sha256)) if kind in extraction.EXTRACTORS}
+    queued = False
     for extraction_id, version in conn.execute("SELECT id, extractor_version FROM extractions WHERE file_sha256 = ?"
                                                " AND extractor = ?", (sha256, name)).fetchall():
         if (name, version) not in read:
-            _queue_removes(conn, extraction_id, project_id)
+            queued = _queue_removes(conn, extraction_id, project_id) or queued
+    return queued
 
 
 def _serve(conn, sha256, extractor, extraction_id, record, gives=False, harness=None, origins=None):
     """A reading of the file just committed: every current version it reads, in any project, has its
     passages queued for that project's index (once, see _queue_adds) with an index run (search.queued,
     which also offers the search model at a project's first material, where origins says the version
-    was added), and each whose latest lookup recorded not_read (it concluded before any reading of its
-    file had), or no_identifier when this reading gives one (gives: an earlier reading had none, as a
-    page read by OCR now does), gets a lookup now, as at import: a Local only project's asks first, a
+    was added; a reading without passages gets the run alone when an earlier reading's removals are
+    queued, so the index takes them now), and each whose latest lookup recorded not_read (it
+    concluded before any reading of its file had), or no_identifier when this reading gives one
+    (gives: an earlier reading had none, as a page read by OCR now does), gets a lookup now, as at import: a Local only project's asks first, a
     review-locked project's gets none, and it starts where the lookup it continues started (a
     conversation shows its ask). A lookup made for that version since, or one that has still to read
     its identifiers, covers it. record(conn, project id, workflow, inputs) records those runs. The
@@ -441,10 +450,13 @@ def _serve(conn, sha256, extractor, extraction_id, record, gives=False, harness=
             " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
+        removing = False
         for earlier in older:
-            _queue_removes(conn, earlier, project)
+            removing = _queue_removes(conn, earlier, project) or removing
         if _queue_adds(conn, extraction_id, project):  # a reading with passages: indexed, offered for
             search.queued(conn, harness, project, [material], (origins or {}).get(version), record)
+        elif removing:  # a reading without passages: an index run still takes the earlier reading's removals
+            record(conn, project, "index", {"material_ids": [material]})
         if locked:
             continue
         latest = conn.execute("SELECT r.id, json_extract(r.inputs, '$.origin') FROM runs r, json_each(r.inputs, '$.versions') j"
