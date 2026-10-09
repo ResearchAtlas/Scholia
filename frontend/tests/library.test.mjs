@@ -21,7 +21,7 @@ test('only the formats Scholia reads are sent; the rest are named', () => {
 
 test('every state, reason and type the backend gives has its text in both catalogs', () => {
   const reasons = ['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file', 'encrypted_file',
-    'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'something new'];
+    'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'memory_limit', 'step_limit', 'something new'];
   const keys = [...['reading', 'ready', 'needs_attention'].map((s) => `library.state.${s}`), ...reasons.map(reasonKey),
     ...['application/pdf', 'text/html', 'text/markdown', 'application/x-tex', 'x/unknown',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].map(typeKey)];
@@ -30,6 +30,8 @@ test('every state, reason and type the backend gives has its text in both catalo
     assert.ok(key in zh, key);
   }
   assert.equal(reasonKey('something new'), 'library.reason.other');
+  assert.equal(reasonKey('memory_limit'), 'library.reason.memory_limit'); // a reading's child past its ceilings
+  assert.equal(reasonKey('step_limit'), 'library.reason.step_limit');
   assert.equal(reasonKey(null), null);
 });
 
@@ -90,7 +92,7 @@ test('the reasons a run ends with have their texts in both catalogs', () => {
   for (const code of ['unsupported_file', 'file_too_large', 'not_retryable', 'not_a_pdf', 'file_missing', 'unreadable_file',
     'encrypted_file', 'time_limit', 'title_needed', 'invalid_doi', 'ask_closed', 'ask_invalid', 'invalid_answer',
     'lookup_locked', 'declined', 'project_changed', 'closing', 'disk_full', 'write_failed', 'passphrase_required', 'unavailable',
-    'refused', 'ocr_failed']) {
+    'refused', 'ocr_failed', 'memory_limit', 'step_limit']) {
     assert.ok(`errors.${code}` in en && `errors.${code}` in zh, code);
   }
 });

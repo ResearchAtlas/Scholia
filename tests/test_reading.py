@@ -162,6 +162,13 @@ async def test_a_child_that_sends_nothing_past_the_step_ceiling_is_killed_and_fa
         assert (failed["state"], failed["reason"]) == ("needs_attention", "step_limit")
 
 
+def test_the_time_ceilings_text_names_its_length():
+    catalogs = {name: json.loads((ROOT / "frontend/src/i18n" / f"{name}.json").read_text()) for name in ("en", "zh-CN")}
+    assert reading.STEP_SECONDS == 60  # "a minute" in each catalog: change both with it
+    assert all("a minute" in catalogs["en"][f"{prefix}.step_limit"] for prefix in ("library.reason", "errors"))
+    assert all("1 分钟" in catalogs["zh-CN"][f"{prefix}.step_limit"] for prefix in ("library.reason", "errors"))
+
+
 @pytest.mark.asyncio
 async def test_pylatexenc_on_a_long_run_of_plain_text_is_stopped_at_the_step_ceiling(tmp_path, monkeypatch):
     monkeypatch.setattr(reading, "STEP_SECONDS", 1.0)

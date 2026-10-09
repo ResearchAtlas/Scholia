@@ -62,10 +62,19 @@ from backend import extraction
 
 log = logging.getLogger(__name__)
 
-# The ceilings: see the PR's measurements (largest accepted shapes, with Vision for scanned pages).
+# The ceilings, each the smallest multiple of 256 MiB at least 1.5 times the largest peak measured on
+# the reference Mac among the inputs S1-13's bounds accept (and at least 512 MiB). Readings: 597 MiB
+# for a 96 MB PDF of one 9,800-pixel-square image (OCR renders it), 362 MiB for 50 such pages of
+# 1,400 pixels, 337 MiB for LaTeX at 480,000 marks, 101 MiB for 2,000 dense pages, 250 MiB for a page
+# read by Vision, under 30 MiB for 1,000 pages of prose in any format. Page images: 385 MiB for that
+# one-image page at scale 3, 131 MiB for a page holding a 4,000-pixel image, 45 MiB for a letter page.
+# A child writing memory as fast as it can is killed some 250 MiB past its ceiling at most.
 READING_CEILING = 1024 * 1024 * 1024  # bytes of physical footprint, a reading's child at its peak
-RENDER_CEILING = 512 * 1024 * 1024  # a page image's child
-STEP_SECONDS = 120.0  # a child that sends nothing for this long is stuck in one step
+RENDER_CEILING = 768 * 1024 * 1024  # a page image's child
+# The time ceiling: the longest silence measured in an accepted reading is 4.9 s (pylatexenc parsing
+# LaTeX of 480,000 marks, in one step); an ordinary document's is under 1.1 s (a page read by Vision).
+# pylatexenc on a run of plain text with no mark takes 21 s at 1 MiB and 82 s at 2 MiB.
+STEP_SECONDS = 60.0  # a child that sends nothing for this long is stuck in one step
 WATCH_SECONDS = 0.01
 BEAT_SECONDS = 1.0  # the child's report while it works, at most this far apart
 MAX_REQUEST = 64 * 1024

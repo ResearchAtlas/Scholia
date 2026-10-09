@@ -177,7 +177,7 @@ export function latestLookup(t, material) {
 }
 
 const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file',
-  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed']);
+  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'memory_limit', 'step_limit']);
 
 // A reading's scanned pages under Details: read by text recognition, or waiting for it where no OCR
 // engine read them (status ocr_needed); null when it has none.
