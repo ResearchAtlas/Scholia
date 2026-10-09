@@ -699,6 +699,45 @@ async function materials(ctx) {
     await page.waitForFunction(() => document.activeElement?.dataset.passage);
     check('which reads them, focus on the first of them', await regions.count() === 20
       && (await focused()).startsWith('Item 600.') && await retry.count() === 0);
+    // A part's read held here until the returned function lets it answer, once focus has gone on.
+    const hold = async (offset) => {
+      let release;
+      const held = new Promise((resolve) => { release = resolve; });
+      const match = read(offset);
+      await page.route(match, async (route) => { await held; await route.continue(); });
+      return async () => { release(); await page.waitForFunction(() => document.activeElement?.dataset.passage); await page.unroute(match); };
+    };
+    const onPage = async () => (await focused()) === L('paper.page').replace('{number}', '1');
+    // Back on the earlier ones, and on to the later ones again with their read held: Tab while they load
+    // stays on the page, out of the passages going, and focus goes on to the first of them once they show.
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    let answer = await hold('200');
+    await page.keyboard.press('Tab');
+    check('Tab goes from the last of the earlier ones to the later ones again', await regions.count() === 200
+      && await later.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Tab');
+    await page.waitForTimeout(300);
+    check('Tab while the later ones load stays on the page', await onPage());
+    check('and the passages going cannot take focus meanwhile',
+      await regions.first().evaluate((region) => { region.focus(); return document.activeElement !== region; }));
+    await answer();
+    check('and focus goes on to the first of them once they show', await regions.count() === 20
+      && (await focused()).startsWith('Item 600.'));
+    // And back with the earlier ones' read held: Shift+Tab toward them stays on the page as well.
+    answer = await hold('0');
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Shift+Tab');
+    await page.waitForTimeout(300);
+    check('Shift+Tab while the earlier ones load stays on the page', await onPage());
+    await answer();
+    check('and focus goes on to the last of them once they show', await regions.count() === 200
+      && (await focused()).startsWith('Item 597.'));
   });
 
   await step('29-details-saved', async () => {

@@ -253,8 +253,10 @@ function PageList({ version, pages, pointed, onPoint }) {
 // (PAGE_PART, most pages have fewer) held only while held (near the view or holding focus,
 // heldPages), fetched when it is and let go when it is not, its shape kept meanwhile. A page of more
 // has a button to the part before and one to the part after, in Tab's order, each passing focus on
-// to that part's passages; a read that fails shows beside the button, with Retry, which (as the
-// button does) reads it again (partMove). The line boxes a part draws are bounded (pageLines).
+// to that part's passages; while that part loads, what the page shows is out of Tab's and the
+// pointer's reach and Tab toward it (Shift+Tab toward the part before) waits on the page, and a
+// read that fails shows beside the button, with Retry, which (as the button does) reads it again
+// (partMove). The line boxes a part draws are bounded (pageLines).
 function PageView({ version, number, pointed, onPoint, held, onNear, onWithin }) {
   const t = useT();
   const frame = useRef(null);
@@ -292,6 +294,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
   );
   return (
     <figure ref={frame} {...props}
+      onKeyDown={(event) => { if (move.loading && event.key === 'Tab' && event.shiftKey === part < shown.part) event.preventDefault(); }}
       className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
       aria-label={t('paper.page', { number })}>
       {shown ? <img src={shown.src} alt={t('paper.page', { number })} className="block w-full" draggable={false}
@@ -300,25 +303,27 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
           style={aspect ? { aspectRatio: aspect } : undefined}>
           {failed ? t('paper.pageFailed') : t('common.loading')}
         </div>}
-      {shown?.part > 0 && control(shown.part - 1, 'last', t('paper.earlierPassages'), 'top-2')}
-      {shown?.passages.map((passage, n) => (lines[n] ?? []).map((rect, i) => (
-        <span key={`${passage.id}:${i}`} aria-hidden="true" title={passage.text}
-          {...hovering(passage.id, onPoint)}
-          className={cn('absolute rounded-[2px] transition-colors duration-150',
-            isPointed(pointed, passage.id) ? 'bg-brand/25 ring-1 ring-brand/60' : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
-          style={rectStyle(rect)} />
-      )))}
-      {/* One focusable region per passage, around its lines: the keyboard's way to it, with the same
-          highlight; the pointer's too, for a passage whose lines are not drawn. */}
-      {shown?.passages.map((passage, n) => passage.boxes?.rects?.length > 0 && (
-        <span key={passage.id} role="note" aria-label={passage.text} data-passage={passage.id}
-          {...pointing(passage.id, onPoint)} title={lines[n] ? undefined : passage.text}
-          className={cn('absolute rounded-[3px] outline-hidden focus-visible:ring-2 focus-visible:ring-ring',
-            lines[n] ? 'pointer-events-none' : isPointed(pointed, passage.id) ? 'bg-brand/25 ring-1 ring-brand/60'
-              : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
-          style={rectStyle(unionRect(passage.boxes.rects))} />
-      ))}
-      {shown?.more && control(shown.part + 1, 'first', t('paper.laterPassages'), 'bottom-2')}
+      <div className="contents" inert={move.loading}>
+        {shown?.part > 0 && control(shown.part - 1, 'last', t('paper.earlierPassages'), 'top-2')}
+        {shown?.passages.map((passage, n) => (lines[n] ?? []).map((rect, i) => (
+          <span key={`${passage.id}:${i}`} aria-hidden="true" title={passage.text}
+            {...hovering(passage.id, onPoint)}
+            className={cn('absolute rounded-[2px] transition-colors duration-150',
+              isPointed(pointed, passage.id) ? 'bg-brand/25 ring-1 ring-brand/60' : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
+            style={rectStyle(rect)} />
+        )))}
+        {/* One focusable region per passage, around its lines: the keyboard's way to it, with the same
+            highlight; the pointer's too, for a passage whose lines are not drawn. */}
+        {shown?.passages.map((passage, n) => passage.boxes?.rects?.length > 0 && (
+          <span key={passage.id} role="note" aria-label={passage.text} data-passage={passage.id}
+            {...pointing(passage.id, onPoint)} title={lines[n] ? undefined : passage.text}
+            className={cn('absolute rounded-[3px] outline-hidden focus-visible:ring-2 focus-visible:ring-ring',
+              lines[n] ? 'pointer-events-none' : isPointed(pointed, passage.id) ? 'bg-brand/25 ring-1 ring-brand/60'
+                : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
+            style={rectStyle(unionRect(passage.boxes.rects))} />
+        ))}
+        {shown?.more && control(shown.part + 1, 'first', t('paper.laterPassages'), 'bottom-2')}
+      </div>
       <figcaption className="absolute bottom-1 right-2 rounded bg-black/50 px-1.5 text-[11px] text-white">{number}</figcaption>
     </figure>
   );

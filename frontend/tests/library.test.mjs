@@ -658,18 +658,19 @@ test('a part the selection takes in is kept, and a part waiting to pass focus on
   assert.equal(passOn(empty, empty, 'first'), null); // nothing to pass it to
 });
 
-test('a page reads the part asked for in place of another, and a failed read shows until asked again', () => {
+test('a page moving to another part keeps what it shows out of reach while that part loads, and a failed read shows until asked again', () => {
   const at = (part) => ({ part });
-  assert.deepEqual(partMove(null, 0, false), { read: true, failed: false }); // its first part, in place of nothing
-  assert.deepEqual(partMove(at(0), 0, false), { read: false, failed: false });
-  assert.deepEqual(partMove(at(0), 1, false), { read: true, failed: false }); // Later: part 1 is read while part 0 shows
-  // Its read failed: part 0 shows as before, with the failure beside Later, and nothing is read until asked.
-  assert.deepEqual(partMove(at(0), 1, true), { read: false, failed: true });
-  // Retry, or Later again, clears the failure: part 1 is read again, until it shows.
-  assert.deepEqual(partMove(at(0), 1, false), { read: true, failed: false });
-  assert.deepEqual(partMove(at(1), 1, false), { read: false, failed: false });
+  assert.deepEqual(partMove(null, 0, false), { read: true, loading: false, failed: false }); // its first part, in place of nothing
+  assert.deepEqual(partMove(at(0), 0, false), { read: false, loading: false, failed: false });
+  // Later: part 1 is read while part 0 shows, out of Tab's and the pointer's reach.
+  assert.deepEqual(partMove(at(0), 1, false), { read: true, loading: true, failed: false });
+  // Its read failed: part 0 is in reach again, with the failure beside Later, and nothing is read until asked.
+  assert.deepEqual(partMove(at(0), 1, true), { read: false, loading: false, failed: true });
+  // Retry, or Later again, clears the failure: part 1 is read again, part 0 out of reach again, until it shows.
+  assert.deepEqual(partMove(at(0), 1, false), { read: true, loading: true, failed: false });
+  assert.deepEqual(partMove(at(1), 1, false), { read: false, loading: false, failed: false });
   // A page that could not be shown at all says so in its place, with no part to show beside it, and is
   // read again once let go and held again (its failure cleared).
-  assert.deepEqual(partMove(null, 1, true), { read: false, failed: false });
-  assert.deepEqual(partMove(null, 1, false), { read: true, failed: false });
+  assert.deepEqual(partMove(null, 1, true), { read: false, loading: false, failed: false });
+  assert.deepEqual(partMove(null, 1, false), { read: true, loading: false, failed: false });
 });

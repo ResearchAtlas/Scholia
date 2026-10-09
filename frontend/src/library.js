@@ -372,11 +372,14 @@ export async function pagePart(versionId, number, part, signal) {
 }
 
 // A PDF page and the part of its passages asked for (part), against the part it shows (shown, or
-// null): read it unless it shows already or its read failed, until it is asked for again; failed
-// once its read in place of another failed, the page showing its part as before, with the failure
-// and Retry beside the button to the other.
+// null): read it unless it shows already or its read failed, until it is asked for again; loading
+// while it is read in place of another, what the page shows then out of Tab's and the pointer's
+// reach and Tab toward it waiting on the page, so focus stays there for passOn; failed once that
+// read failed, the page showing its part as before, with the failure and Retry beside the button
+// to the other.
 export function partMove(shown, part, failed) {
-  return { read: shown?.part !== part && !failed, failed: shown != null && shown.part !== part && failed };
+  const moving = shown != null && shown.part !== part;
+  return { read: shown?.part !== part && !failed, loading: moving && !failed, failed: moving && failed };
 }
 
 // Each passage's line boxes to draw, in order, while they fit in budget; null for each from the

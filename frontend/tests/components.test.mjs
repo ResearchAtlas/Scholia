@@ -4,7 +4,8 @@
 // its passages, a stretch of passages) goes when the part is let go; each passage of the text says
 // where it is in the whole; a button that starts work is disabled while its request is pending (React applies that before it
 // handles the next click, so a double click sends one request); the Library says it is adding while
-// any upload is still to finish; a PDF page asks again for a part of its passages whose read failed.
+// any upload is still to finish; a PDF page keeps what it shows out of reach while another part of
+// its passages loads, and asks again for a part whose read failed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -168,19 +169,30 @@ test('each passage of the text says where it is in the whole text, as only the s
   assert.deepEqual(positions('const C = () => <div role="listitem" />;'), [[null, null]]);
 });
 
-// A PDF page's move to another part of its passages, as source text: the onClick of each button a
-// button to another part comes with, go, and what the effect reading a part depends on.
+// A PDF page's move to another part of its passages, as source text: the inert of the element
+// around each passage and each button to another part, the onClick of each button such a button
+// comes with, the page's keydown handler, go, and what the effect reading a part depends on.
 function partMoves(text) {
   return parsed(text, (context, found) => {
     const code = (node) => context.sourceCode.getText(node);
+    const inertOf = (node) => {
+      for (let around = node.parent; around; around = around.parent) {
+        const inert = around.type === 'JSXElement' && around.openingElement.attributes.find((a) => a.name?.name === 'inert');
+        if (inert) return code(inert.value.expression);
+      }
+      return null;
+    };
     return {
       JSXOpeningElement(element) {
         const attribute = (name) => element.attributes.find((a) => a.name?.name === name);
+        if (attribute('data-passage')) (found.passages ??= []).push(inertOf(element.parent));
+        if (element.name.name === 'figure' && attribute('onKeyDown')) found.keyDown = code(attribute('onKeyDown').value.expression);
         let control = element.parent;
         while (control && !(control.type === 'VariableDeclarator' && control.id.name === 'control')) control = control.parent;
         if (control && element.name.name === 'button') (found.asks ??= []).push(code(attribute('onClick').value.expression));
       },
       CallExpression(call) {
+        if (call.callee.name === 'control') (found.controls ??= []).push(inertOf(call));
         if (call.callee.name !== 'pagePart') return;
         let effect = call.parent;
         while (effect && effect.callee?.name !== 'useEffect') effect = effect.parent;
@@ -193,8 +205,20 @@ function partMoves(text) {
   });
 }
 
-test('a PDF page\'s button, or Retry beside it, asks again for a part whose read failed', () => {
+test('a PDF page keeps what it shows out of reach while another part loads, and its button or Retry asks again for a part whose read failed', () => {
   const found = partMoves(source('Paper.jsx'));
+  assert.deepEqual(found.passages, ['move.loading', null]); // a page's passages; the text view never shows a part in another's place
+  assert.deepEqual(found.controls, ['move.loading', 'move.loading']);
+  // While the part loads, Tab toward it waits on the page for passOn (Tab to the part after, Shift+Tab
+  // to the part before), and Tab the other way leaves the page.
+  const held = (loading, part, shiftKey) => {
+    let prevented = false;
+    new Function('move', 'part', 'shown', `return (${found.keyDown});`)({ loading }, part, { part: 1 })(
+      { key: 'Tab', shiftKey, preventDefault: () => { prevented = true; } });
+    return prevented;
+  };
+  assert.deepEqual([held(true, 2, false), held(true, 2, true), held(true, 0, true), held(true, 0, false)], [true, false, true, false]);
+  assert.deepEqual([held(false, 1, false), held(false, 1, true)], [false, false]);
   // Retry asks as the button does, and each ask clears a failed read, on which the read depends (partMove's read).
   assert.deepEqual(found.asks, ['() => go(to, where)', '() => go(to, where)']);
   const calls = [];
