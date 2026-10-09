@@ -209,8 +209,9 @@ function PageView({ version, number, passages, pointed, onPoint, held, onNear })
     if (!held) { setSrc(null); return undefined; } // let go: fetched again (no-store) once it is near
     if (src) return undefined;
     let live = true;
-    pageImage(version, number).then((url) => live && setSrc(url)).catch(() => live && setFailed(true));
-    return () => { live = false; };
+    const controller = new AbortController(); // let go before it came: its request goes too
+    pageImage(version, number, 1.5, controller.signal).then((url) => live && setSrc(url)).catch(() => live && setFailed(true));
+    return () => { live = false; controller.abort(); };
   }, [held, src, version, number]);
   return (
     <figure ref={frame} className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs"

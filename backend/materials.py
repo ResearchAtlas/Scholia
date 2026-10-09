@@ -977,7 +977,11 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
         return extraction.render_page(state["content"].read(row[0]), number, max(0.5, min(scale, 3.0)))
 
     try:
-        async with state.setdefault("renders", asyncio.Semaphore(RENDERS)):  # held to the render's end
+        # A turn is held to its render's end, even when the request goes away meanwhile (_to_end);
+        # one whose page was let go while it waited for its turn (its request gone) is not rendered.
+        async with state.setdefault("renders", asyncio.Semaphore(RENDERS)):
+            if await request.is_disconnected():
+                return Response(status_code=204, headers={"Cache-Control": "no-store"})  # nobody waits for it
             image = await _to_end(asyncio.to_thread(render))
     except IndexError:
         raise _refused(404, "not_found", "No such page") from None

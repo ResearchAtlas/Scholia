@@ -353,8 +353,9 @@ export function withNear(near, page, isNear) {
 
 // A PDF page as a data URL: the request carries the session, which an <img> could not, and the
 // page's Content-Security-Policy admits data: images.
-export async function pageImage(versionId, number, scale = 1.5) {
-  const blob = await getBlob(`/api/material-versions/${encodeURIComponent(versionId)}/pages/${number}?scale=${scale}`);
+export async function pageImage(versionId, number, scale = 1.5, signal = undefined) {
+  const blob = await getBlob(`/api/material-versions/${encodeURIComponent(versionId)}/pages/${number}?scale=${scale}`,
+    signal); // aborted, the request goes away: the backend renders it no further than it has begun
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result));

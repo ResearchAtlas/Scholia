@@ -145,3 +145,21 @@ test('the check finds a button its pending request does not disable', () => {
   assert.deepEqual(pendingButtons(button(''), ['runs.retry']), { 'runs.retry': [] });
   assert.deepEqual(pendingButtons(button('disabled={busy}'), ['runs.retry']), { 'runs.retry': ['busy'] });
 });
+
+// The page image request each effect makes, and whether that effect's cleanup aborts it.
+function imageRequests(text) {
+  return parsed(text, (context, found) => ({
+    CallExpression(call) {
+      if (call.callee.name !== 'pageImage') return;
+      let effect = call.parent;
+      while (effect && !(effect.type === 'ArrowFunctionExpression' && effect.parent?.callee?.name === 'useEffect')) effect = effect.parent;
+      const body = effect ? context.sourceCode.getText(effect) : '';
+      (found.calls ??= []).push({ signal: call.arguments.length === 4 && context.sourceCode.getText(call.arguments[3]),
+        aborted: /return \(\) => \{[^}]*\.abort\(\)/.test(body) });
+    },
+  })).calls ?? [];
+}
+
+test('a page let go while its image loads aborts that request, so no stale render waits for a slot', () => {
+  assert.deepEqual(imageRequests(source('Paper.jsx')), [{ signal: 'controller.signal', aborted: true }]);
+});

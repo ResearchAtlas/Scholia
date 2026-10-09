@@ -754,6 +754,40 @@ async def test_at_most_two_page_images_hold_their_files_at_once(tmp_path, monkey
         assert most[0] == 2
 
 
+async def test_a_page_request_that_goes_away_holds_its_turn_to_its_render_and_no_queued_one_renders(tmp_path, monkeypatch):
+    from starlette.requests import Request
+    renders, go, real = [], threading.Event(), extraction.render_page
+
+    def held(data, number, scale=2.0):
+        renders.append(number)
+        go.wait(10)
+        return real(data, number, scale)
+
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, PDF)
+        [paper] = await settled(client, project)
+        monkeypatch.setattr(extraction, "render_page", held)
+        url = f"/api/material-versions/{paper['version']['id']}/pages"
+        rendering = [asyncio.ensure_future(client.get(f"{url}/{n}")) for n in (1, 2)]  # both turns taken
+        while len(renders) < 2:
+            await asyncio.sleep(0.01)
+        queued = asyncio.ensure_future(client.get(f"{url}/1"))
+        await asyncio.sleep(0.1)
+        for request in [*rendering, queued]:  # every page let go: their requests go away
+            request.cancel()
+        await asyncio.sleep(0.1)
+        renders_now, slots = len(renders), client.state["renders"]
+        assert slots.locked()  # the two renders still hold their turns: their threads run on
+        go.set()
+        while slots.locked():
+            await asyncio.sleep(0.01)
+        assert sorted(renders) == [1, 2] and renders_now == 2  # the queued one never rendered
+        monkeypatch.setattr(Request, "is_disconnected", lambda self: asyncio.sleep(0, True))  # gone once its turn came
+        gone = await client.get(f"{url}/1")
+        assert gone.status_code == 204 and len(renders) == 2
+
+
 async def test_a_pdf_page_is_rendered_as_a_png_and_only_a_pdf_has_pages(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)

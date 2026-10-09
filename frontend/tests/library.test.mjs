@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
   typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES,
-  detailsSource, latestLookup } from '../src/library.js';
+  detailsSource, latestLookup, pageImage } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
@@ -104,6 +104,24 @@ test('a page image is fetched past the browser cache, so a deleted paper\'s page
   try {
     assert.equal(await getBlob('/api/material-versions/v/pages/1'), 'png');
     assert.equal(asked[0].cache, 'no-store');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('a page image let go while it loads is abandoned: its request is aborted, not left to run', async () => {
+  const original = globalThis.fetch;
+  let seen;
+  globalThis.fetch = (path, options) => new Promise((resolve, reject) => { // as the browser's fetch answers an abort
+    seen = options.signal;
+    options.signal.addEventListener('abort', () => reject(new DOMException('The request was aborted', 'AbortError')));
+  });
+  try {
+    const controller = new AbortController();
+    const loading = pageImage('v', 1, 1.5, controller.signal);
+    controller.abort();
+    await assert.rejects(loading, (error) => error.name === 'AbortError');
+    assert.equal(seen, controller.signal);
   } finally {
     globalThis.fetch = original;
   }
