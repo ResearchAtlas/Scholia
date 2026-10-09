@@ -914,7 +914,9 @@ _PASSAGE_COLUMNS = "id, ordinal, page, section_path, kind, text, char_start, cha
 async def version_passages(version_id: str, request: Request, offset: int = 0, limit: int = PASSAGE_PAGE,
                            page: int | None = None):
     """A version's passages in order, a page of the API at a time; with page, only those on that page of
-    its file (the page viewer's, read as its page comes near the view). total counts them all."""
+    its file (the page viewer's, read as its page comes near the view). total counts them all. Without
+    page, section is the section the passages before offset end in: the last of their paths that is not
+    empty (a title has none), so a part of the text read on its own shows the headings the whole does."""
     limit, offset = max(1, min(limit, PASSAGE_PAGE)), max(0, offset)
     on_page = () if page is None else (page,)
 
@@ -931,7 +933,13 @@ async def version_passages(version_id: str, request: Request, offset: int = 0, l
         rows = conn.execute(f"SELECT {_PASSAGE_COLUMNS} FROM passages WHERE extraction_id = ?"
                             f"{' AND page = ?' if on_page else ''} ORDER BY ordinal LIMIT ? OFFSET ?",
                             (extracted[0], *on_page, limit, offset)).fetchall()
-        return {"passages": [_passage(r) for r in rows], "total": extracted[6], "pages": extracted[4]}
+        answer = {"passages": [_passage(r) for r in rows], "total": extracted[6], "pages": extracted[4]}
+        if not on_page:  # ordinals run from 0 without a gap: those before offset are the passages before
+            before = conn.execute("SELECT section_path FROM passages WHERE extraction_id = ? AND ordinal < ?"
+                                  " AND section_path NOT IN ('[]', '') ORDER BY ordinal DESC LIMIT 1",
+                                  (extracted[0], offset)).fetchone()
+            answer["section"] = json.loads(before[0]) if before else []
+        return answer
 
     return await asyncio.to_thread(_state(request)["db"].read, fetch)
 

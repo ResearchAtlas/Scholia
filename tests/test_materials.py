@@ -841,6 +841,21 @@ async def test_a_pdf_page_is_rendered_as_a_png_and_only_a_pdf_has_pages(tmp_path
         assert one["materials"][0]["project_id"] == project
 
 
+async def test_a_stretch_of_the_text_read_on_its_own_continues_the_section_before_it_across_a_title(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, ("sections.docx", synthetic.docx(
+            [("Heading1", "Section A"), (None, "First."), ("Title", "A Title Between"), (None, "Second.")])))
+        version = (await settled(client, project))[0]["version"]["id"]
+        url = f"/api/material-versions/{version}/passages"
+        whole = (await client.get(url)).json()
+        assert [p["section_path"] for p in whole["passages"]] == [["Section A"], [], ["Section A"]]
+        assert whole["section"] == []  # nothing before the first
+        for offset in (1, 2):  # after "First.", and after the title, whose path is empty: still Section A
+            assert (await client.get(url, params={"offset": offset})).json()["section"] == ["Section A"]
+        assert "section" not in (await client.get(url, params={"page": 1})).json()
+
+
 async def test_no_answer_about_a_material_is_kept_in_the_browser_cache(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
