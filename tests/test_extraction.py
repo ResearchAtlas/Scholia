@@ -62,10 +62,14 @@ def _pdf_leaving_out(line, code=b"~"):
             b" <00> <FF> endcodespacerange 1 beginbfchar <" + code.hex().encode() + b"> <0002> endbfchar endcmap"
             b" CMapName currentdict /CMap defineresource pop end end")
     content = b"BT /F1 10 Tf 72 72 Td (" + line + b") Tj ET"
-    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-               b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >>"
-               b" /Contents 5 0 R >>", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
-               *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)]]
+    return _raw_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                     b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >>"
+                     b" /Contents 5 0 R >>", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
+                     *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)]])
+
+
+def _raw_pdf(objects):
+    """A PDF of these objects, numbered from 1, the first its catalog."""
     out, offsets = bytearray(b"%PDF-1.4\n"), []
     for number, body in enumerate(objects, start=1):
         offsets.append(len(out))
@@ -88,6 +92,25 @@ def test_a_pdf_page_whose_text_leaves_characters_out_keeps_its_character_ranges_
     assert abs(left - (72 + 3 * 5.84) / 612) < 0.002 and 0.89 < top < bottom < 0.92  # after three tildes' width
     plain = extract(_pdf_leaving_out(b"This paragraph begins here and goes on", code=b"#"), extraction.PDF).passages[0]
     assert abs(right - plain.boxes["rects"][0][2] - 4 * 5.84 / 612) < 0.002  # the line ends four tildes further on
+
+
+@pytest.mark.parametrize("where", ["leading", "trailing"])
+def test_a_pdf_page_whose_text_leaves_out_too_many_characters_at_an_end_is_an_unreadable_file(where):
+    line = b"~" * 1500 + b"Text" if where == "leading" else b"Text" + b"~" * 1500  # past Python's recursion limit
+    with pytest.raises(extraction.Unreadable) as unreadable:  # pypdfium2 recurses once for each left-out end character
+        extract(_pdf_leaving_out(line), extraction.PDF)
+    assert unreadable.value.code == "unreadable_file"
+
+
+def test_a_pdf_page_pdfium_cannot_load_makes_the_file_unreadable_and_has_no_image():
+    data = _raw_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 2 >>",  # one page of two
+                     b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"])
+    with pytest.raises(extraction.Unreadable) as unreadable:
+        extract(data, extraction.PDF)
+    assert unreadable.value.code == "unreadable_file"
+    assert extraction.render_page(data, 1, 1.0)[:4] == b"\x89PNG"
+    with pytest.raises(extraction.Unreadable):
+        extraction.render_page(data, 2, 1.0)
 
 
 def test_a_pdf_papers_title_sections_abstract_caption_and_references():

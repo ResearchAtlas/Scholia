@@ -424,11 +424,19 @@ def _pdf(data, stop, progress):
 
 
 def _pdf_read(document, number, raw, measure=False):
-    page = document[number]
+    """The page read (_pdf_page). A page PDFium cannot load or read makes the file unreadable, as one
+    whose text leaves out many characters at either end does: pypdfium2 steps over each of those by
+    recursion, past Python's limit (raised from a ctypes call as ArgumentError)."""
+    import pypdfium2 as pdfium
+
     try:
-        return _pdf_page(page, raw, measure)
-    finally:
-        page.close()
+        page = document[number]
+        try:
+            return _pdf_page(page, raw, measure)
+        finally:
+            page.close()
+    except (pdfium.PdfiumError, RecursionError, ctypes.ArgumentError):
+        raise Unreadable() from None
 
 
 def _pdf_page(page, raw, measure=False):
@@ -769,7 +777,10 @@ def render_page(data, number, scale=2.0):
         try:
             if not 1 <= number <= len(document):
                 raise IndexError(number)
-            page = document[number - 1]
+            try:
+                page = document[number - 1]
+            except pdfium.PdfiumError:
+                raise Unreadable() from None
             try:
                 width, height = page.get_size()
                 if not (width > 0 and height > 0):
