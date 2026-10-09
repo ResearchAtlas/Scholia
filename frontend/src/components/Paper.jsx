@@ -11,7 +11,7 @@ import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageImage,
-  pageLines, pagePart, passOn, PASSAGE_STRETCH, passageStretch, pointing, rectStyle, reasonKey, selectedParts, takeSaved,
+  pageLines, pagePart, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing, rectStyle, reasonKey, selectedParts, takeSaved,
   unionRect, validYear, viewOf, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
@@ -253,27 +253,43 @@ function PageList({ version, pages, pointed, onPoint }) {
 // (PAGE_PART, most pages have fewer) held only while held (near the view or holding focus,
 // heldPages), fetched when it is and let go when it is not, its shape kept meanwhile. A page of more
 // has a button to the part before and one to the part after, in Tab's order, each passing focus on
-// to that part's passages; the line boxes a part draws are bounded (pageLines).
+// to that part's passages; a read that fails shows beside the button, with Retry, which (as the
+// button does) reads it again (partMove). The line boxes a part draws are bounded (pageLines).
 function PageView({ version, number, pointed, onPoint, held, onNear, onWithin }) {
   const t = useT();
   const frame = useRef(null);
+  const retry = useRef(null);
   const [part, setPart] = useState(0); // which part of its passages it shows
   const [shown, setShown] = useState(null); // { src, part, passages, more }
-  const [failed, setFailed] = useState(false);
+  const [failed, setFailed] = useState(false); // read again once asked to, or let go and held again
   const [aspect, setAspect] = useState(null); // its image's width over height, once one was shown
   const [props, focusOn] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
+  const move = partMove(shown, part, failed);
   useEffect(() => {
-    if (!held) { setShown(null); return undefined; } // let go: fetched again (no-store) once it is near
-    if (shown?.part === part) return undefined;
+    if (!held) { setShown(null); setFailed(false); return undefined; } // let go: fetched again (no-store) once it is near
+    if (!move.read) return undefined;
     let live = true;
     const controller = new AbortController(); // let go before they came: its requests go too
     Promise.all([shown?.src ?? pageImage(version, number, 1.5, controller.signal), pagePart(version, number, part, controller.signal)])
       .then(([src, found]) => live && setShown({ src, part, ...found })).catch(() => live && setFailed(true));
     return () => { live = false; controller.abort(); };
-  }, [held, shown, version, number, part]);
+  }, [held, shown, version, number, part, failed]);
+  useEffect(() => { // focus waiting on the page for the part goes to Retry once its read failed
+    if (move.failed && document.activeElement === frame.current) retry.current?.focus();
+  }, [move.failed]);
   const lines = shown && pageLines(shown.passages);
-  const go = (to, where) => { focusOn(where); setPart(to); };
-  const button = 'absolute left-2 z-10 rounded bg-black/60 px-2 py-0.5 text-[11px] text-white outline-hidden focus-visible:ring-2 focus-visible:ring-ring';
+  const go = (to, where) => { focusOn(where); setPart(to); setFailed(false); };
+  const button = 'rounded bg-black/60 px-2 py-0.5 text-[11px] text-white outline-hidden focus-visible:ring-2 focus-visible:ring-ring';
+  // A button to another part of its passages, and once that part's read failed, the failure and Retry beside it.
+  const control = (to, where, label, edge) => (
+    <div className={cn('absolute left-2 z-10 flex flex-col items-start gap-1', edge)}>
+      <button type="button" className={button} onClick={() => go(to, where)}>{label}</button>
+      {move.failed && to === part && <>
+        <p role="alert" className="rounded bg-black/60 px-2 py-0.5 text-[11px] text-white">{t('paper.loadFailed')}</p>
+        <button ref={retry} type="button" className={button} onClick={() => go(to, where)}>{t('common.retry')}</button>
+      </>}
+    </div>
+  );
   return (
     <figure ref={frame} {...props}
       className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
@@ -284,8 +300,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
           style={aspect ? { aspectRatio: aspect } : undefined}>
           {failed ? t('paper.pageFailed') : t('common.loading')}
         </div>}
-      {shown?.part > 0 && <button type="button" className={cn(button, 'top-2')}
-        onClick={() => go(shown.part - 1, 'last')}>{t('paper.earlierPassages')}</button>}
+      {shown?.part > 0 && control(shown.part - 1, 'last', t('paper.earlierPassages'), 'top-2')}
       {shown?.passages.map((passage, n) => (lines[n] ?? []).map((rect, i) => (
         <span key={`${passage.id}:${i}`} aria-hidden="true" title={passage.text}
           {...hovering(passage.id, onPoint)}
@@ -303,8 +318,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
               : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
           style={rectStyle(unionRect(passage.boxes.rects))} />
       ))}
-      {shown?.more && <button type="button" className={cn(button, 'bottom-2')}
-        onClick={() => go(shown.part + 1, 'first')}>{t('paper.laterPassages')}</button>}
+      {shown?.more && control(shown.part + 1, 'first', t('paper.laterPassages'), 'bottom-2')}
       <figcaption className="absolute bottom-1 right-2 rounded bg-black/50 px-1.5 text-[11px] text-white">{number}</figcaption>
     </figure>
   );

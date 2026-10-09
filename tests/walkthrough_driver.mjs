@@ -681,6 +681,24 @@ async function materials(ctx) {
     await page.waitForFunction(() => document.activeElement?.dataset.passage);
     check('and goes back to them, focus on the last of them', await regions.count() === 200
       && (await focused()).startsWith('Item 597.'));
+    // A read of the later ones that fails: the page keeps its passages and says so beside the control,
+    // with Retry, which reads them.
+    const read = (offset) => (url) => url.pathname.endsWith('/passages') && url.searchParams.get('page') === '1'
+      && url.searchParams.get('offset') === offset;
+    await page.route(read('200'), (route) => route.fulfill({ status: 500, contentType: 'application/json', body: '{"code":"http_error"}' }),
+      { times: 1 });
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Enter');
+    const retry = figure.getByRole('button', { name: L('common.retry'), exact: true });
+    await retry.waitFor({ timeout: 5000 });
+    check('a failed read says so beside the control, with Retry, and the page keeps its passages',
+      await figure.getByRole('alert').getByText(L('paper.loadFailed'), { exact: true }).count() === 1
+      && await later.count() === 1 && await regions.count() === 200);
+    check('focus waits on Retry', await retry.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('which reads them, focus on the first of them', await regions.count() === 20
+      && (await focused()).startsWith('Item 600.') && await retry.count() === 0);
   });
 
   await step('29-details-saved', async () => {

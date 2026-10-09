@@ -371,6 +371,14 @@ export async function pagePart(versionId, number, part, signal) {
   return { passages: found.passages.slice(0, PAGE_PART), more: found.passages.length > PAGE_PART };
 }
 
+// A PDF page and the part of its passages asked for (part), against the part it shows (shown, or
+// null): read it unless it shows already or its read failed, until it is asked for again; failed
+// once its read in place of another failed, the page showing its part as before, with the failure
+// and Retry beside the button to the other.
+export function partMove(shown, part, failed) {
+  return { read: shown?.part !== part && !failed, failed: shown != null && shown.part !== part && failed };
+}
+
 // Each passage's line boxes to draw, in order, while they fit in budget; null for each from the
 // first that does not fit on.
 export function pageLines(passages, budget = PAGE_LINES) {

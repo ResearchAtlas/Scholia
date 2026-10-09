@@ -4,7 +4,7 @@
 // its passages, a stretch of passages) goes when the part is let go; each passage of the text says
 // where it is in the whole; a button that starts work is disabled while its request is pending (React applies that before it
 // handles the next click, so a double click sends one request); the Library says it is adding while
-// any upload is still to finish.
+// any upload is still to finish; a PDF page asks again for a part of its passages whose read failed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -166,4 +166,41 @@ function positions(text) {
 test('each passage of the text says where it is in the whole text, as only the stretches held are in the page', () => {
   assert.deepEqual(positions(source('Paper.jsx')), [['passage.ordinal + 1', 'count']]);
   assert.deepEqual(positions('const C = () => <div role="listitem" />;'), [[null, null]]);
+});
+
+// A PDF page's move to another part of its passages, as source text: the onClick of each button a
+// button to another part comes with, go, and what the effect reading a part depends on.
+function partMoves(text) {
+  return parsed(text, (context, found) => {
+    const code = (node) => context.sourceCode.getText(node);
+    return {
+      JSXOpeningElement(element) {
+        const attribute = (name) => element.attributes.find((a) => a.name?.name === name);
+        let control = element.parent;
+        while (control && !(control.type === 'VariableDeclarator' && control.id.name === 'control')) control = control.parent;
+        if (control && element.name.name === 'button') (found.asks ??= []).push(code(attribute('onClick').value.expression));
+      },
+      CallExpression(call) {
+        if (call.callee.name !== 'pagePart') return;
+        let effect = call.parent;
+        while (effect && effect.callee?.name !== 'useEffect') effect = effect.parent;
+        found.reads = effect.arguments[1].elements.map((name) => name.name);
+      },
+      VariableDeclarator(node) {
+        if (node.id.name === 'go') found.go = code(node.init);
+      },
+    };
+  });
+}
+
+test('a PDF page\'s button, or Retry beside it, asks again for a part whose read failed', () => {
+  const found = partMoves(source('Paper.jsx'));
+  // Retry asks as the button does, and each ask clears a failed read, on which the read depends (partMove's read).
+  assert.deepEqual(found.asks, ['() => go(to, where)', '() => go(to, where)']);
+  const calls = [];
+  const go = new Function('focusOn', 'setPart', 'setFailed', `return (${found.go});`)(
+    (where) => calls.push(['focusOn', where]), (part) => calls.push(['setPart', part]), (failed) => calls.push(['setFailed', failed]));
+  go(1, 'first');
+  assert.deepEqual(calls, [['focusOn', 'first'], ['setPart', 1], ['setFailed', false]]);
+  assert.ok(['shown', 'part', 'failed'].every((name) => found.reads.includes(name)), found.reads);
 });

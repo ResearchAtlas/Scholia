@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove,
   detailsSource, latestLookup, pageImage } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -656,4 +656,20 @@ test('a part the selection takes in is kept, and a part waiting to pass focus on
   assert.equal(passOn(stretch, stretch, null), null); // left and come back by a click: nothing pending
   const empty = { querySelectorAll: () => [] };
   assert.equal(passOn(empty, empty, 'first'), null); // nothing to pass it to
+});
+
+test('a page reads the part asked for in place of another, and a failed read shows until asked again', () => {
+  const at = (part) => ({ part });
+  assert.deepEqual(partMove(null, 0, false), { read: true, failed: false }); // its first part, in place of nothing
+  assert.deepEqual(partMove(at(0), 0, false), { read: false, failed: false });
+  assert.deepEqual(partMove(at(0), 1, false), { read: true, failed: false }); // Later: part 1 is read while part 0 shows
+  // Its read failed: part 0 shows as before, with the failure beside Later, and nothing is read until asked.
+  assert.deepEqual(partMove(at(0), 1, true), { read: false, failed: true });
+  // Retry, or Later again, clears the failure: part 1 is read again, until it shows.
+  assert.deepEqual(partMove(at(0), 1, false), { read: true, failed: false });
+  assert.deepEqual(partMove(at(1), 1, false), { read: false, failed: false });
+  // A page that could not be shown at all says so in its place, with no part to show beside it, and is
+  // read again once let go and held again (its failure cleared).
+  assert.deepEqual(partMove(null, 1, true), { read: false, failed: false });
+  assert.deepEqual(partMove(null, 1, false), { read: true, failed: false });
 });
