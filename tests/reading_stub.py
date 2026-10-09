@@ -8,6 +8,7 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     sleep SECONDS     wait SECONDS without a word; then read for real
     allocate MIB      touch MIB MiB and keep them; then read for real
     spike MIB         touch MIB MiB and free them; then read for real
+    spike-fail MIB    touch MIB MiB and free them; then fail as an unreadable file would
     exit CODE         exit with CODE at once (os._exit)
     signal NAME       kill itself with signal NAME (SIGSEGV: a crash in native code)
     stall             sleep without a word, for ever
@@ -54,6 +55,10 @@ FRAMES = {
     "not-finite": json.dumps({"passage": ["paragraph", "Text.", 1, [], 0, 5, {"rects": [[0, 0, float("nan"), 1]]}]}).encode(),
     "negative": json.dumps({"passage": ["paragraph", "Text.", -1, [], 0, 5, None]}).encode(),
     "past-int64": json.dumps({"passage": ["paragraph", "Text.", 2**64, [], 0, 5, None]}).encode(),
+    "deep-path": json.dumps({"passage": ["paragraph", "Text.", None, ["Heading"] * 11, 0, 5, None]}).encode(),
+    "empty-heading": json.dumps({"passage": ["paragraph", "Text.", None, [""] * 10, 0, 5, None]}).encode(),
+    "long-heading": json.dumps({"passage": ["paragraph", "Text.", None, ["h" * 501], 0, 5, None]}).encode(),
+    "nested": b'{"passage":' + b"[" * 100_000 + b"]" * 100_000 + b"}",
 }
 real_extract, real_render, real_extractor_of = extraction.extract, extraction.render_page, extraction.extractor_of
 real_file = reading._file
@@ -106,8 +111,10 @@ def before(what, stop, progress, data=b""):
         time.sleep(float(ARGS[0]))
     elif MODE == "allocate":
         before.kept = touch(int(ARGS[0]))
-    elif MODE == "spike":
+    elif MODE in ("spike", "spike-fail"):
         touch(int(ARGS[0]))
+        if MODE == "spike-fail":
+            raise extraction.Unreadable()
     elif MODE == "exit":
         os._exit(int(ARGS[0]))
     elif MODE == "signal":

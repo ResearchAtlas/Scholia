@@ -1086,8 +1086,8 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
         raise _refused(404, "not_found", "No such page") from None
     except _Stop:
         raise _refused(503, "shutting_down", "The app is closing") from None
-    except (extraction.Unreadable, FileNotFoundError, ContentCorruptError):
-        image = None
+    except (extraction.Unreadable, FileNotFoundError, ContentCorruptError, reading.ChildError):
+        image = None  # a child that did not start or failed as it did is logged there
     if await asyncio.to_thread(state["db"].read, version) != row:  # deleted while it rendered, its file with it
         raise _refused(404, "not_found", "No such version")
     if image is None:

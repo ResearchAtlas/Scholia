@@ -107,6 +107,35 @@ async def test_a_peak_that_came_and_went_between_two_looks_still_fails_the_readi
 
 
 @pytest.mark.asyncio
+async def test_a_child_that_passed_its_ceiling_and_then_reports_an_unreadable_file_fails_memory_limit(
+        tmp_path, monkeypatch, reading_stub):
+    reading_stub("spike-fail", 300)  # 300 MiB touched and freed, then an unreadable file reported
+    monkeypatch.setattr(reading, "WATCH_SECONDS", 5.0)  # no look between its frames but at them
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    with pytest.raises(extraction.Unreadable) as unreadable:
+        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN, ceiling=200 * 2**20)
+    assert unreadable.value.code == "memory_limit" and gone()  # the peak decides, whatever came last
+
+
+@pytest.mark.asyncio
+async def test_a_reading_stopped_before_its_child_starts_starts_none(tmp_path, monkeypatch):
+    def never(*args, **kwargs):
+        raise AssertionError("a child was started")
+
+    class Stopped(Exception):
+        pass
+
+    def stop():
+        raise Stopped()
+
+    monkeypatch.setattr(reading.subprocess, "Popen", never)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    with pytest.raises(Stopped):
+        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN, stop)
+    assert gone()
+
+
+@pytest.mark.asyncio
 async def test_a_footprint_that_cannot_be_read_ends_the_child_and_fails_internal(tmp_path, monkeypatch, reading_stub):
     reached, _ = hold_extraction(reading_stub, tmp_path)
     real = reading._peak
@@ -291,6 +320,10 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path):
     (("frame", "not-finite"), "unreadable_file"),
     (("frame", "negative"), "unreadable_file"),
     (("frame", "past-int64"), "unreadable_file"),
+    (("frame", "deep-path"), "unreadable_file"),  # a section path past what any reading makes
+    (("frame", "empty-heading"), "unreadable_file"),
+    (("frame", "long-heading"), "unreadable_file"),
+    (("frame", "nested"), "unreadable_file"),  # nested past the JSON parser's depth
     (("after-done", "beat"), "unreadable_file"),
     (("after-done", "exit"), "unreadable_file"),
     (("version",), "internal"),
@@ -337,8 +370,9 @@ async def test_a_page_images_child_past_its_ceiling_or_crashing_is_a_file_that_c
         monkeypatch.setattr(reading, "RENDER_CEILING", 1024 * 1024)
         assert (await client.get(f"{url}/1")).json()["code"] == "file_missing"
         monkeypatch.setattr(reading, "RENDER_CEILING", 512 * 2**20)
-        reading_stub("signal", "SIGSEGV")
-        assert (await client.get(f"{url}/1")).json()["code"] == "file_missing"
+        for mode in (("signal", "SIGSEGV"), ("no-start",), ("version",)):  # crashing, or failing before ready
+            reading_stub(*mode)
+            assert (await client.get(f"{url}/1")).json()["code"] == "file_missing", mode
         real_child(monkeypatch)
         assert (await client.get(f"{url}/1")).status_code == 200
         assert (await client.get(f"{url}/9")).status_code == 404
@@ -490,17 +524,26 @@ def test_the_child_imports_no_database_server_or_window():
 
 
 def test_only_the_child_parses_a_material():
-    """No backend module but backend/reading.py's child side calls extraction.extract or render_page."""
+    """No backend module but backend/reading.py's child side calls extraction.extract or render_page,
+    under whatever name it imports backend.extraction."""
     callers = set()
     for path in sorted((ROOT / "backend").rglob("*.py")):
         if path.name == "extraction.py":
             continue
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Attribute) and node.attr in ("extract", "render_page") \
-                    and isinstance(node.value, ast.Name) and node.value.id == "extraction":
-                callers.add(path.name)
-            if isinstance(node, ast.ImportFrom) and node.module == "backend.extraction" \
+        tree = ast.parse(path.read_text())
+        names = {"extraction"}  # the module, as each import names it
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names |= {a.asname for a in node.names if a.name == "backend.extraction" and a.asname}
+            elif isinstance(node, ast.ImportFrom) and node.module == "backend":
+                names |= {a.asname or a.name for a in node.names if a.name == "extraction"}
+            elif isinstance(node, ast.ImportFrom) and node.module == "backend.extraction" \
                     and {a.name for a in node.names} & {"extract", "render_page"}:
+                callers.add(path.name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in ("extract", "render_page") \
+                    and (isinstance(node.value, ast.Name) and node.value.id in names
+                         or ast.unparse(node.value) == "backend.extraction"):
                 callers.add(path.name)
     assert callers == {"reading.py"}
 

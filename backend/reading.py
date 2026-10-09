@@ -66,10 +66,14 @@ log = logging.getLogger(__name__)
 # The ceilings, each the smallest multiple of 256 MiB at least 1.5 times the largest peak measured on
 # the reference Mac among the inputs S1-13's bounds accept (and at least 512 MiB). Readings: 597 MiB
 # for a 96 MB PDF of one 9,800-pixel-square image (OCR renders it), 362 MiB for 50 such pages of
-# 1,400 pixels, 337 MiB for LaTeX at 480,000 marks, 101 MiB for 2,000 dense pages, 250 MiB for a page
-# read by Vision, under 30 MiB for 1,000 pages of prose in any format. Page images: 385 MiB for that
-# one-image page at scale 3, 131 MiB for a page holding a 4,000-pixel image, 45 MiB for a letter page.
-# A child writing memory as fast as it can is killed some 250 MiB past its ceiling at most.
+# 1,400 pixels, 337 MiB for LaTeX at 480,000 marks, 101 MiB for 2,000 dense pages, 272 MiB for an A3
+# page read by Vision, under 30 MiB for 1,000 pages of prose in any format. Page images: 385 MiB for
+# that one-image page at scale 3, 131 MiB for a page holding a 4,000-pixel image, 45 MiB for a letter
+# page. A child writing memory as fast as it can was killed up to 249 MiB past its ceiling (the most
+# of 10 trials at each ceiling, with WATCH_SECONDS). Two readings and two page images at once, each at
+# its ceiling and that far past it, come to some 4.5 GiB: on an 8 GB Mac, beside the app, that holds
+# only with memory compression for the moment before each is stopped; RENDERS stays 2 (a question
+# for Harold in the PR).
 READING_CEILING = 1024 * 1024 * 1024  # bytes of physical footprint, a reading's child at its peak
 RENDER_CEILING = 768 * 1024 * 1024  # a page image's child
 # The time ceiling: the longest silence measured in an accepted reading is 4.9 s (pylatexenc parsing
@@ -86,6 +90,9 @@ MAX_PNG = extraction.MAX_PAGE_PIXELS * 4 + extraction.MAX_PAGE_SIDE + 1024 * 102
 # A reading's passages at most: a block's pieces but its last are each longer than a quarter of
 # MAX_PASSAGE (extraction._split), and every passage's text counts against MAX_TEXT_CHARS.
 MAX_PASSAGES = extraction.MAX_BLOCKS + extraction.MAX_TEXT_CHARS // (extraction.MAX_PASSAGE // 4)
+# A section path's headings at most: a DOCX's levels, 0 to 9 (HTML and Markdown have 6, LaTeX 4, PDF 2),
+# each heading cut to MAX_HEADING_CHARS (extraction._Sections).
+MAX_SECTION_DEPTH = 10
 _PNG = b"\x89PNG\r\n\x1a\n"
 _ROOT = Path(__file__).resolve().parents[1]
 LIVE = set()  # the pids of children not yet reaped
@@ -176,18 +183,22 @@ class _Bad(Exception):
 def _run(request, ceiling, limit, stop, received, stats):
     """Start the child, send it request, and watch it to its end (see the module's docstring), giving
     each frame to received.take. Returns its exit status; the child is always reaped."""
-    started = time.monotonic()
+    started, peak, longest = time.monotonic(), 0, 0.0
+    stop()  # a run stopped while it waited for its turn starts no child
+    selector = selectors.DefaultSelector()
     try:
         child = subprocess.Popen(command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                  env={k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ},
                                  cwd=None if getattr(sys, "frozen", False) else _ROOT)
-    except OSError as error:
+    except BaseException as error:
+        selector.close()
+        if not isinstance(error, OSError):
+            raise
         log.error("a reading's child did not start (%s)", type(error).__name__)
         raise ChildError("start") from None
-    with _live_lock:
-        LIVE.add(child.pid)
-    selector, peak, longest = selectors.DefaultSelector(), 0, 0.0
     try:
+        with _live_lock:
+            LIVE.add(child.pid)
         body = json.dumps(request).encode()
         try:  # its stdin stays open: it ends when this process does
             child.stdin.write(struct.pack(">I", len(body)) + body)
@@ -218,7 +229,12 @@ def _run(request, ceiling, limit, stop, received, stats):
                 while (body := _frame(buffer, limit)) is not None:
                     if stats is not None and "ready_seconds" not in stats:
                         stats["ready_seconds"] = time.monotonic() - started
-                    received.take(body)
+                    try:
+                        received.take(body)
+                    except Exception:  # its last frame, or a wrong one: a peak past the ceiling decides first
+                        if (peak := _peak(child.pid) or 0) > ceiling:
+                            raise _Ceiling(peak) from None
+                        raise
                     longest, last = max(longest, time.monotonic() - last), time.monotonic()
             if time.monotonic() - last > STEP_SECONDS:
                 log.warning("a reading's child sent nothing for %d s; it was stopped", STEP_SECONDS)
@@ -265,7 +281,7 @@ def _message(body):
         raise _Bad("a frame that is not JSON")
     try:
         message = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: nested past the parser's depth
         raise _Bad("a frame that is not JSON") from None
     if type(message) is not dict or len(message) != 1:
         raise _Bad("a frame of other fields")
@@ -289,6 +305,11 @@ def _optional_count(value):
 def _text(value):
     """A string the database can store: no unpaired surrogate (UTF-8 has none)."""
     return type(value) is str and not _SURROGATE.search(value)
+
+
+def _heading(value):
+    """A section path's heading, as extraction._Sections keeps one: not empty, and cut to its length."""
+    return _text(value) and 0 < len(value) <= extraction.MAX_HEADING_CHARS
 
 
 _ERRORS = {"unreadable_file", "encrypted_file", "ocr_failed", "file_missing", "no_page", "internal"}
@@ -385,7 +406,7 @@ class _Reading(_Received):
             raise _Bad("a passage that is not one")
         kind, text, page, path, start, end, boxes = value
         if kind not in _KINDS or not _text(text) or not _optional_count(page) \
-                or type(path) is not list or not all(map(_text, path)) \
+                or type(path) is not list or len(path) > MAX_SECTION_DEPTH or not all(map(_heading, path)) \
                 or not _optional_count(start) or not _optional_count(end):
             raise _Bad("a passage that is not one")
         rects = self._boxes(boxes)
