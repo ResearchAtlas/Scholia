@@ -851,11 +851,13 @@ class Harness:
     # Background runs
 
     async def kick_background(self) -> None:
-        """Start every background run that is running in the record but not in this process."""
+        """Start every background run that is running in the record but not in this process, but for
+        one tried again already (materials.retry_run): its retry does its work."""
         if self.registry.closed:
             return
         rows = await self._read(lambda conn: conn.execute(
-            "SELECT id FROM runs WHERE kind = 'background' AND status = 'running' ORDER BY started_at").fetchall())
+            "SELECT id FROM runs WHERE kind = 'background' AND status = 'running'"
+            " AND json_extract(inputs, '$.retried_by') IS NULL ORDER BY started_at").fetchall())
         for (run_id,) in rows:
             active = self.registry.add_background(run_id)
             if active is not None:

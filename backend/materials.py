@@ -1098,7 +1098,8 @@ async def retry_run(run_id: str, request: Request):
     interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again.
     A version read again whose lookup concluded unread gets a lookup once the reading commits
     (_serve). Once per run: the old run records its retry in the same transaction, and a later
-    retry of it (a second press) gets that same run."""
+    retry of it (a second press) gets that same run. An old run left running in the record, held by
+    no process (it reads interrupted), is recorded interrupted then, so no launch starts it again."""
     state = _state(request)
 
     def again(conn, ids):
@@ -1113,6 +1114,10 @@ async def retry_run(run_id: str, request: Request):
                      (ids[0], project_id, workflow, json.dumps(inputs)))
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
                      (ids[0], run_id))
+        if _running(conn, run_id) and not state["harness"].registry.is_active(run_id):  # read as interrupted:
+            _event(conn, run_id, "run_finished", {"status": "interrupted"})  # so it is in the record, never restarted
+            conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
+                         (utc_now(), run_id))
         return ids[0], ids
 
     return {"run_id": await state["harness"].record_background(1, again)}

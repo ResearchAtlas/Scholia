@@ -558,6 +558,31 @@ async def test_a_failed_lookup_tried_again_twice_at_once_is_tried_again_once(tmp
         assert (await run_finished(client, first))["retryable"] is False  # the list no longer offers it
 
 
+async def test_a_run_tried_again_while_left_running_in_the_record_ends_there_and_never_runs_again(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    provider, data = MockProvider(scholarly=mock), tmp_path / "data"
+    async with started(data, provider) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await settled(client, project)
+        first = result["lookup_run_id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # as a lost worker leaves it
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (first,)))
+        client.state["harness"].registry.finished.discard(first)
+        assert (await run_finished(client, first))["status"] == "interrupted"  # held by no process
+        again = (await client.post(f"/api/runs/{first}/retry")).json()["run_id"]
+        assert (await run_finished(client, again))["status"] == "succeeded"
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", first) == [("interrupted",)]  # in the record too
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # one left running all the same
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (first,)))
+        asked = len(mock.requests)
+    async with started(data, provider, setup=False) as client:
+        await background_idle(client)
+        await asyncio.sleep(0.2)
+        assert len(mock.requests) == asked  # its retry ran it: it is never started again
+        assert (await run_finished(client, first))["status"] == "interrupted"
+
+
 async def test_openalex_unavailable_and_crossref_without_the_record_is_unavailable_not_not_found(tmp_path):
     mock = MockScholarly()  # Crossref holds no record for it
     mock.answers = {"api.openalex.org": [503, 503, 503]}  # OpenAlex never answers
