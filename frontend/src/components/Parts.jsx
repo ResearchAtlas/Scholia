@@ -6,7 +6,7 @@
 // open, so Try again reloads the window, which keeps its session (session.js).
 import { useEffect, useState } from 'react';
 import { useT } from '../i18n/index.js';
-import { Boundary, early, part } from '../parts.js';
+import { Boundary, closesDialog, early, part } from '../parts.js';
 import { LoadState } from './fields.jsx';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
@@ -35,11 +35,11 @@ function Unavailable() {
   return <LoadState problem="part_not_loaded" onRetry={() => window.location.reload()} />;
 }
 
-// While Settings loads, Escape or a click anywhere closes it, as either closes its dialog, so it does
-// not open once loaded; focus stays where it is.
+// While Settings loads, what closes its dialog closes it (closesDialog: Escape, or a click anywhere
+// but a right-click or a Control-click), so it does not open once loaded; focus stays where it is.
 function SettingsLoading({ onOpenChange }) {
   useEffect(() => {
-    const close = (event) => { if (event.type === 'pointerdown' || event.key === 'Escape') onOpenChange(false); };
+    const close = (event) => { if (closesDialog(event)) onOpenChange(false); };
     document.addEventListener('keydown', close);
     document.addEventListener('pointerdown', close);
     return () => {

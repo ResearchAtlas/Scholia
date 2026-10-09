@@ -12,7 +12,7 @@ import { join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Suspense } from 'react';
 import { Linter } from 'eslint';
-import { Boundary, NotLoaded, early, loader } from '../src/parts.js';
+import { Boundary, NotLoaded, closesDialog, early, loader } from '../src/parts.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 
@@ -35,6 +35,19 @@ test('the boundary shows the fallback while loading, the failure once not loaded
   const bug = new RangeError('a bug in the part');
   boundary.state = Boundary.getDerivedStateFromError(bug);
   assert.throws(() => boundary.render(), (error) => error === bug);
+});
+
+test('Settings while it loads closes as its dialog does: Escape or a press, not a right-click or Control-click', () => {
+  const key = (k) => ({ type: 'keydown', key: k });
+  const press = (button, ctrlKey = false) => ({ type: 'pointerdown', button, ctrlKey });
+  assert.equal(closesDialog(key('Escape')), true);
+  assert.equal(closesDialog(key('Enter')), false);
+  assert.equal(closesDialog(press(0)), true);
+  assert.equal(closesDialog(press(1)), true); // the middle button closes it too, as Radix's dialog does
+  assert.equal(closesDialog(press(2)), false); // a right-click
+  assert.equal(closesDialog(press(0, true)), false); // a Control-click, macOS's right-click
+  assert.equal(closesDialog(press(2, true)), false);
+  assert.equal(closesDialog({ type: 'pointerup', button: 0 }), false);
 });
 
 test('a part loaded early loads once, is waited for until it settles, and is drawn at once once loaded', async () => {

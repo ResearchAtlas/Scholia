@@ -1192,13 +1192,32 @@ async function parts(ctx) {
     return release;
   };
 
-  await step('60-settings-first-open', async () => {
-    const release = await hold('Settings');
-    await reload();
+  const loading = () => page.locator('p.sr-only[role=status]', { hasText: L('common.loading') });
+  const enterSettings = async () => {
     await openSidebar();
     await page.getByRole('button', { name: L('sidebar.settings') }).focus(); await page.keyboard.press('Enter');
     await page.waitForTimeout(400);
-    check('while Settings loads, a status says so', await page.locator('p.sr-only[role=status]', { hasText: L('common.loading') }).count() === 1);
+  };
+
+  await step('60-settings-first-open', async () => {
+    // A right-click and a Control-click while Settings loads leave it as they leave its dialog:
+    // still loading, then open.
+    let release = await hold('Settings');
+    await reload();
+    await enterSettings();
+    const corner = { x: 1, y: page.viewportSize().height - 2 };
+    await page.mouse.click(corner.x, corner.y, { button: 'right' });
+    await page.keyboard.down('Control'); await page.mouse.click(corner.x, corner.y); await page.keyboard.up('Control');
+    await page.waitForTimeout(300);
+    check('a right-click and a Control-click while Settings loads leave it loading', await loading().count() === 1);
+    release(); await dialog().waitFor(); await page.waitForTimeout(800);
+    check('and it then opens', await pages().isVisible());
+    await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+
+    release = await hold('Settings');
+    await reload();
+    await enterSettings();
+    check('while Settings loads, a status says so', await loading().count() === 1);
     await page.evaluate(() => document.activeElement?.setAttribute('data-focused-before', ''));
     await page.keyboard.press('Escape'); await page.waitForTimeout(300);
     release(); await page.waitForTimeout(1500);

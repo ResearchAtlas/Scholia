@@ -15,6 +15,14 @@ export function loader(load, name) {
 
 export const part = (load, name) => lazy(loader(load, name));
 
+// Whether an event closes a modal dialog, as the installed Radix dialog decides for a press outside
+// it: Escape, or a pointer press other than a right-click or a Control-click (macOS's context-menu
+// click), which leave the dialog as it is.
+export function closesDialog(event) {
+  if (event.type === 'keydown') return event.key === 'Escape';
+  return event.type === 'pointerdown' && event.button !== 2 && !(event.button === 0 && event.ctrlKey === true);
+}
+
 // A part that can be loaded before it is first drawn: load() loads it once; ready() settles when
 // it has loaded or failed, never rejecting (what waits for it goes on, and the part then shows the
 // failure); loaded() is its export once loaded, else null, and failed() whether it could not load,
