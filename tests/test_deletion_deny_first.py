@@ -88,3 +88,36 @@ async def test_a_deleted_scanned_papers_recognized_passages_are_read_back_nowher
         assert await rows(client, "SELECT op FROM index_queue WHERE target_id = ? ORDER BY seq", passage["id"]) == [
             ("add",), ("remove",)]
         assert await rows(client, "SELECT count(*) FROM passages") == [(0,)]
+
+
+async def test_a_superseded_reading_is_removed_through_the_deletion_service_and_read_back_nowhere(tmp_path, monkeypatch):
+    """S1-20: a reading another reading of its file replaced leaves each index it was in, its passages
+    are read back nowhere, and its removal leaves a tombstone (section 4.2) and no dangling reference."""
+    import backend.extraction as extraction
+    from test_ocr import cite
+    from scholia_app import run_finished
+
+    notes = b"# Notes\n\nA paragraph of synthetic text.\n"
+    async with started(tmp_path / "data") as client:
+        mine, theirs = await project_of(client, "Mine"), await project_of(client, "Theirs")
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        [paper] = (await added(client, mine, ("notes.md", notes)))["materials"]
+        [read] = await settled(client, mine)
+        await added(client, theirs, ("notes.md", notes))
+        await settled(client, theirs)
+        [(older,)] = await rows(client, "SELECT id FROM extractions")
+        earlier = [p for (p,) in await rows(client, "SELECT id FROM passages WHERE extraction_id = ?", older)]
+        await cite(client, paper["id"], earlier[0], "synthetic text")
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))
+        again = await client.post(f"/api/material-versions/{read['version']['id']}/read")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        for passage in earlier:
+            assert (await client.get(f"/api/passages/{passage}")).status_code == 404
+            assert {p for (_, p, op) in await rows(client, "SELECT target_id, project_id, op FROM index_queue"
+                                                          " WHERE target_id = ? AND op = 'remove'", passage)} == {mine, theirs}
+        assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", older) == [(0,)]
+        assert await rows(client, "SELECT object_id, kind, title FROM tombstones") == [(older, "reading", None)]
+        assert await rows(client, "SELECT count(*) FROM audit_log WHERE event = 'deletion'") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM citations c LEFT JOIN passages p ON p.id = c.passage_id"
+                                  " WHERE c.passage_id IS NOT NULL AND p.id IS NULL") == [(0,)]
+

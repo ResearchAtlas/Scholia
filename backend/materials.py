@@ -61,6 +61,7 @@ from pydantic import BaseModel, Field
 
 from backend import asks, backups, extraction, lookup
 from backend.db import ContentCorruptError, delete, new_id, utc_now
+from backend.db.deletion import supersede
 from backend.outbound_gate import OutboundDenied
 from backend.runs import (AdmissionError, RunOutcome, _event, _revoked, _running, _through, derived_status,
                           may_dispatch)
@@ -411,7 +412,9 @@ def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
     lookup now, as at import: a Local only project's asks first, a review-locked project's gets
     none, and it starts where the lookup it continues started (a conversation shows its ask). A
     lookup made for that version since, or one that has still to read its identifiers, covers it.
-    The earlier readings are then removed (_supersede)."""
+    The earlier readings are then removed through the deletion service (deletion.supersede), and the
+    citations without a passage of any version it reads are resolved again through their quotes
+    (_resolve)."""
     # Readings of the file by another version of the extractor are no version's reading now: their
     # passages leave the index of every project whose current version reads the file (a replaced
     # version's left it at its replacement), and then the readings go.
@@ -439,32 +442,29 @@ def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
             look_up(conn, project, {"material_ids": [material], "versions": {material: version},
                                     "origin": json.loads(latest[1]) if latest[1] else None})
     for earlier in older:  # each project's index has its removal queued now (above, or when its paper left)
-        _supersede(conn, earlier, extraction_id)
+        supersede(conn, earlier, extraction_id)
+    _resolve(conn, sha256, extractor, extraction_id)
 
 
-def _supersede(conn, earlier, newer):
-    """An earlier reading of a file by the same extractor, replaced by a newer one in the newer one's
-    commit (section 7.1: a re-parse rebuilds passages, and citations re-resolve through their
-    quotes). Each citation of one of its passages is pointed at the newer reading's passage with that
-    passage's text (on the same page and nearest it first), else at the first that holds its quote
-    (on the citation's page first); or, with neither, left unresolved: passage_id null and existence
-    not_found (section 4.2). Then its passages and the reading itself are deleted, so no index,
-    access check or passage request reaches them again. (S1-21: memory sources naming a passage are
-    to be pointed again in the same way.)"""
-    for citation, quote, page, text, at, ordinal in conn.execute(
-            "SELECT c.id, c.quote, c.page, p.text, p.page, p.ordinal FROM citations c JOIN passages p ON p.id = c.passage_id"
-            " WHERE p.extraction_id = ?", (earlier,)).fetchall():
-        found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND text = ?"
-                             " ORDER BY page IS NOT ?, abs(ordinal - ?) LIMIT 1", (newer, text, at, ordinal)).fetchone()
-        if found is None and quote:
-            found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
-                                 " ORDER BY page IS NOT ?, ordinal LIMIT 1", (newer, quote, page)).fetchone()
+def _resolve(conn, sha256, extractor, extraction_id):
+    """Citations of a version this reading is the reading of that have no passage (left unresolved by
+    an earlier reading, or so from the start) are resolved again through their quotes (section 7.1):
+    each points at the first of its passages holding its quote, on the citation's page first, and
+    one that was not found exists again (ok). A citation of a removed source (source_removed) has no
+    version to go by and is left as it is."""
+    for citation, quote, page, kind in conn.execute(
+            "SELECT c.id, c.quote, c.page, coalesce(v.media_type, f.media_type) FROM citations c"
+            " JOIN material_versions v ON v.id = c.material_version_id LEFT JOIN content_files f ON f.sha256 = v.file_sha256"
+            " WHERE c.passage_id IS NULL AND c.existence != 'source_removed' AND c.quote != '' AND v.file_sha256 = ?",
+            (sha256,)).fetchall():
+        if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
+            continue
+        found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
+                             " ORDER BY page IS NOT ?, ordinal LIMIT 1", (extraction_id, quote, page)).fetchone()
         if found is not None:
-            conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page) WHERE id = ?", (*found, citation))
-        else:
-            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'not_found' WHERE id = ?", (citation,))
-    conn.execute("DELETE FROM passages WHERE extraction_id = ?", (earlier,))
-    conn.execute("DELETE FROM extractions WHERE id = ?", (earlier,))
+            conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page),"
+                         " existence = CASE existence WHEN 'not_found' THEN 'ok' ELSE existence END WHERE id = ?",
+                         (*found, citation))
 
 
 async def read_outdated(harness):

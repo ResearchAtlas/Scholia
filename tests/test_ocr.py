@@ -224,8 +224,8 @@ async def test_a_newer_readings_failed_commit_leaves_the_older_reading_and_its_c
     def failing(conn, earlier, newer):
         raise RuntimeError("a failure in the commit's last step")
 
-    real_supersede = materials_module._supersede
-    monkeypatch.setattr(materials_module, "_supersede", failing)
+    real_supersede = materials_module.supersede  # the deletion service's, as materials calls it
+    monkeypatch.setattr(materials_module, "supersede", failing)
     async with started(data, setup=False) as client:
         await asyncio.sleep(0.5)
         await background_idle(client, timeout=10)
@@ -238,7 +238,7 @@ async def test_a_newer_readings_failed_commit_leaves_the_older_reading_and_its_c
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]  # none recorded with it
         [outdated] = await settled(client, project)
         assert outdated["state"] == "needs_attention"
-        monkeypatch.setattr(materials_module, "_supersede", real_supersede)
+        monkeypatch.setattr(materials_module, "supersede", real_supersede)
         again = await client.post(f"/api/runs/{run}/retry")
         assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
         [ready] = await settled(client, project)
@@ -535,12 +535,14 @@ def test_vision_reads_a_page_with_no_chinese_again_so_its_english_lines_are_whol
 # Through the app
 
 
-async def cite(client, material, passage, quote, page=1):
-    """A synthetic citation of a passage (the answers that write citations come with S1-19)."""
+async def cite(client, material, passage, quote, page=1, existence="ok"):
+    """A synthetic citation of a passage (or of none) in the material's current version (the answers
+    that write citations come with S1-19)."""
     citation = new_id()
     await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
-        "INSERT INTO citations (id, owner_kind, owner_id, material_id, passage_id, quote, page, existence)"
-        " VALUES (?, 'answer', ?, ?, ?, ?, ?, 'ok')", (citation, new_id(), material, passage, quote, page)))
+        "INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id, passage_id, quote, page,"
+        " existence) SELECT ?, 'answer', ?, ?, id, ?, ?, ?, ? FROM material_versions WHERE material_id = ? AND is_current = 1",
+        (citation, new_id(), material, passage, quote, page, existence, material)))
     return citation
 
 
@@ -687,6 +689,58 @@ async def test_a_reread_points_citations_at_the_new_passages_or_leaves_them_unre
         assert (await client.get(f"/api/passages/{passage}")).status_code == 404
 
 
+def rewording(monkeypatch, real, words):
+    """extraction.extract as a reading whose parser words its text otherwise: each of words' keys
+    replaced by its value in every passage (an extractor version that reads a phrase differently)."""
+    def extract(data, kind, stop=lambda: None, progress=lambda d, t: None):
+        found = real(data, kind, stop, progress)
+        for passage in found.passages:
+            for old, new in words.items():
+                passage.text = passage.text.replace(old, new)
+        return found
+
+    monkeypatch.setattr(extraction, "extract", extract)
+
+
+@pytest.mark.asyncio
+async def test_a_citation_one_re_read_cannot_find_is_found_again_by_a_later_one_and_one_unresolved_from_the_start(
+        tmp_path, monkeypatch):
+    notes = b"# Notes\n\nWages rose sharply in the synthetic panel.\n\nA second paragraph of synthetic text.\n"
+    real = extraction.extract
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        [paper] = (await added(client, project, ("notes.md", notes)))["materials"]
+        [read] = await settled(client, project)
+        version = read["version"]["id"]
+        passages = (await client.get(f"/api/material-versions/{version}/passages")).json()["passages"]
+        cited = next(p["id"] for p in passages if "rose sharply" in p["text"])
+        kept = await cite(client, paper["id"], cited, "rose sharply")
+        late = await cite(client, paper["id"], None, "second paragraph", existence="not_found")  # unresolved from the start
+        gone = await cite(client, paper["id"], None, "rose sharply", existence="source_removed")
+
+        async def read_as(name):
+            monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", name))
+            again = await client.post(f"/api/material-versions/{version}/read")
+            assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+
+        async def state(citation):
+            [(passage, existence)] = await rows(client, "SELECT passage_id, existence FROM citations WHERE id = ?", citation)
+            text = passage and (await client.get(f"/api/passages/{passage}")).json()["text"]
+            return text, existence
+
+        rewording(monkeypatch, real, {"rose sharply": "fell", "second paragraph": "next part"})
+        await read_as("markdown-1")  # this reading words both quotes otherwise: neither is found
+        assert await state(kept) == (None, "not_found")
+        assert await state(late) == (None, "not_found")
+        monkeypatch.setattr(extraction, "extract", real)
+        await read_as("markdown-2")  # this one finds them again
+        assert await state(kept) == ("Wages rose sharply in the synthetic panel.", "ok")
+        assert await state(late) == ("A second paragraph of synthetic text.", "ok")
+        assert await state(gone) == (None, "source_removed")  # a removed source is never resolved again
+        assert await rows(client, "SELECT kind FROM tombstones WHERE kind = 'reading'") == [("reading",), ("reading",)]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("level", ["normal", "local_only", "review_locked"])
 async def test_a_doi_found_only_by_ocr_is_looked_up_after_the_reread_as_the_level_allows(tmp_path, monkeypatch, quick,
@@ -800,6 +854,14 @@ def test_a_page_without_chinese_keeps_its_first_reading_when_the_second_fails(mo
     monkeypatch.setattr(ocr.Vision, "_read", lambda self, bitmap, detect: [ocr.Line("最低工资", LINE.box, 0.5)]
                         if not detect else 1 / 0)
     assert ocr.VISION.recognize(None)[0].text == "最低工资"  # a page with Chinese is read once
+
+
+def test_a_page_without_chinese_keeps_its_first_reading_when_the_second_finds_no_line(monkeypatch):
+    monkeypatch.setattr(ocr.Vision, "_read", lambda self, bitmap, detect: [] if detect else [LINE])
+    assert ocr.VISION.recognize(None) == [LINE]
+    monkeypatch.setattr(ocr.Vision, "_read", lambda self, bitmap, detect: [ocr.Line("Read whole.", LINE.box, 1.0)]
+                        if detect else [LINE])
+    assert [line.text for line in ocr.VISION.recognize(None)] == ["Read whole."]  # a second reading with lines is kept
 
 
 def test_vision_is_the_engine_on_macos_and_a_copy_that_cannot_load_it_fails_the_page(monkeypatch):
