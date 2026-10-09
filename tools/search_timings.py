@@ -42,12 +42,16 @@ pressure and swap. Without --desktop, memory covers this process (the backend) a
 processes only. With --desktop the whole application runs as the desktop entry runs it (S1-16's
 helper_timings.run_desktop: the backend, its window and the interface in it, on a new temporary data
 folder), the same workload is driven inside its backend, and memory covers the whole app: its
-process, its helper processes and its window's WebKit processes.
+process, its helper processes and its window's WebKit processes. The sandbox profile confines the
+Python process tree only; the results say what stands for the WebKit processes (network_isolation).
+The synthetic papers are made as they are added, so the tool holds no corpus in the measured
+process; QASPER's files are read whole into it first, which the results say (memory.includes).
 """
 
 import argparse
 import asyncio
 import base64
+import itertools
 import json
 import os
 import random
@@ -115,31 +119,34 @@ SYNTHETIC = {
 
 
 def synthetic_papers(size, rng):
-    """[(file name, Markdown)]: generated papers until about 10,000 or 100,000 passages (SYNTHETIC)."""
-    files, count = [], 0
+    """Generated papers until about 10,000 or 100,000 passages (SYNTHETIC), one at a time, as they are
+    added: (file name, Markdown)."""
+    count, made = 0, 0
     while count < (10_000 if size == "10k" else 100_000):
-        english = len(files) % 2 == 0
+        english = made % 2 == 0
         words, sentences, joiner = (EN_WORDS, EN_SENTENCES, " ") if english else (ZH_WORDS, ZH_SENTENCES, "")
-        parts = [f"# {rng.choice(TITLES_EN if english else TITLES_ZH)} {len(files) + 1}"]
+        made += 1
+        parts = [f"# {rng.choice(TITLES_EN if english else TITLES_ZH)} {made}"]
         for section in SECTIONS_EN if english else SECTIONS_ZH:
             parts.append(f"## {section.replace(' > ', ': ')}")
             parts += [_paragraph(rng, words, sentences, _length(rng), joiner) for _ in range(6)]
             count += 6
-        files.append((f"synthetic-{len(files) + 1:05d}.md", "\n\n".join(parts).encode()))
-    return files
+        yield f"synthetic-{made:05d}.md", "\n\n".join(parts).encode()
 
 
 def corpus(args):
-    """(workload, [(file name, Markdown)], [(language, query)]) for --corpus."""
+    """(workload, the papers as an iterator of (file name, Markdown) made as they are added, so the tool
+    holds no corpus while memory is measured, [(language, query)]) for --corpus. QASPER's files are read
+    whole first, into this process (see measure)."""
     if args.corpus == "synthetic":
-        rng = random.Random(SEED)
-        files = synthetic_papers(args.size, rng)[:args.papers or None]
-        return SYNTHETIC, files, [("en", q) for q in questions("en", 100, rng)] + [("zh", q) for q in questions("zh", 100, rng)]
+        asked = random.Random(SEED + 1)
+        queries = [("en", q) for q in questions("en", 100, asked)] + [("zh", q) for q in questions("zh", 100, asked)]
+        return SYNTHETIC, itertools.islice(synthetic_papers(args.size, random.Random(SEED)), args.papers), queries
     picked = chosen(papers(args.qasper), args.size)
     if args.papers:  # a quick check of the tool itself, not a measurement
         picked = dict(list(picked.items())[:args.papers])
-    files = [(f"{pid}.md", markdown(paper)) for pid, paper in picked.items()]
-    return WORKLOAD, files, [("en", q) for q in english_queries(picked)] + [("zh", q) for q in ZH_QUERIES]
+    queries = [("en", q) for q in english_queries(picked)] + [("zh", q) for q in ZH_QUERIES]
+    return WORKLOAD, ((f"{pid}.md", markdown(paper)) for pid, paper in picked.items()), queries
 
 
 def papers(folder):
@@ -228,8 +235,8 @@ async def measure(args, state, client, data, processes):
     async def read(fn):
         return await asyncio.to_thread(db.read, fn)
 
-    workload, papers_added, queries = corpus(args)
-    results = {"workload": workload, "size": args.size, "vectors": args.vectors, "papers": len(papers_added),
+    workload, to_add, queries = corpus(args)
+    results = {"workload": workload, "size": args.size, "vectors": args.vectors,
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "load_average_start": os.getloadavg()}
     memory = Memory(processes)
     vm_before = vm_counters()
@@ -250,13 +257,16 @@ async def measure(args, state, client, data, processes):
     assert locked.status_code == 200, locked.text  # no lookup: nothing leaves the Mac
     before = {**sizes(data), "audit_rows": await read(lambda c: c.execute("SELECT count(*) FROM audit_log").fetchone()[0])}
 
-    # The build: every paper added, read, keyword-indexed, then embedded.
-    files = [(name, base64.b64encode(text).decode()) for name, text in papers_added]
+    # The build: every paper added (made and encoded 20 at a time), read, keyword-indexed, then embedded.
+    added = 0
     began = time.perf_counter()
-    for start in range(0, len(files), 20):
-        response = await client.post(f"/api/projects/{project}/materials",
-                                     json={"files": [{"name": n, "data": d} for n, d in files[start:start + 20]]})
+    while batch := list(itertools.islice(to_add, 20)):
+        response = await client.post(f"/api/projects/{project}/materials", json={
+            "files": [{"name": name, "data": base64.b64encode(text).decode()} for name, text in batch]})
         assert response.status_code == 201, response.text
+        added += len(batch)
+    del batch
+    results["papers"] = added
     index = state["index"]
 
     async def read_done():
@@ -272,7 +282,7 @@ async def measure(args, state, client, data, processes):
     counts = await asyncio.to_thread(index.counts, project)
     passages = sum(c[0] for c in counts.values())
     lengths = await read(lambda c: [n for (n,) in c.execute("SELECT length(text) FROM passages")])
-    build = {"papers": len(files), "passages": passages, "embeddable": sum(c[2] for c in counts.values()),
+    build = {"papers": added, "passages": passages, "embeddable": sum(c[2] for c in counts.values()),
              "passage_chars": summary(lengths), "passages_over_2000_chars": sum(1 for n in lengths if n > 2000),
              "read_seconds": round(read_seconds, 1), "keyword_indexed_seconds": round(keyword_seconds, 1)}
 
@@ -381,6 +391,8 @@ async def measure(args, state, client, data, processes):
     results["memory"] = memory.peak()
     # The backend's and its helpers' figures only; with --desktop, run_desktop says it covers the whole app.
     results["memory"]["covers"] = "this backend process and its helper processes, from their launch"
+    if args.corpus == "qasper":  # held in the process measured, with the backend: not separated
+        results["memory"]["includes"] = "the QASPER files this tool read whole into the same Python process"
     results["vm_before"], results["vm_after"] = vm_before, vm_counters()
     results["helper_sockets"] = sockets(helper._process.pid) if helper._process else None
     results["not_loopback_sockets"] = not_loopback(processes())

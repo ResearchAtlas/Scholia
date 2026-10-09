@@ -374,6 +374,11 @@ def _run_desktop(args, data, measured):
     results["memory"]["covers"] = ("the desktop application: its process (backend, window and interface), its helper "
                                    "processes from their launch, and its window's WebKit processes")
     results["memory"]["webkit_processes"] = [Path(path_of(pid)).name for pid in found.get("webkit", [])]
+    results["network_isolation"] = (
+        "tests/loopback-only.sb confines this Python process and its children (the backend and its helpers) only. The "
+        "window's WebKit processes are the system's XPC services, outside that profile: they reach what the page asks "
+        "for, which loads only its loopback URL, and not_loopback_sockets is a snapshot of every process of the app, "
+        "WebKit's included, at the end of the run.")
     results["desktop_exit_code"] = code
     return results
 
