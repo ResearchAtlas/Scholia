@@ -4,15 +4,15 @@
 // them; every format also shows its passages as text, in order. The cited passage's highlight comes
 // with S1-19's citations; here a passage is highlighted while it is pointed at or focused, and Tab
 // reaches each passage, in the text and on the page.
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageImage,
-  pageLines, pagePart, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing, rectStyle, reasonKey, selectedParts, takeSaved,
-  unionRect, validYear, viewOf, waitsOn, withNear } from '../library.js';
+  pageLines, pageOffsets, pagePart, pagesWithin, pageWindow, PAGE_WIDTH, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing,
+  rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withFocus, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { revealPassage } from '../search.js'; // S1-17: opened at a search result's passage
@@ -148,6 +148,7 @@ function Contents({ material, target }) {
   const t = useT();
   const pdf = isPdf(material);
   const [chosen, setChosen] = useState(target ? 'text' : 'pages'); // a search result opens the text at its passage
+  const views = useRef(null); // the view's switch, whose Passages focus goes to when a note opens that view
   const section = useRef(null);
   useEffect(() => (target ? revealPassage(section.current, target) : undefined), [target]);
   const view = viewOf(material, chosen);
@@ -159,25 +160,32 @@ function Contents({ material, target }) {
     <section ref={section} className="grid gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h4 className="text-sm font-semibold">{t('paper.text')}</h4>
-        {pdf && <Segmented label={t('paper.view')} value={view} onChange={setChosen}
-          options={[{ value: 'pages', label: t('paper.pages') }, { value: 'text', label: t('paper.passages') }]} />}
+        {pdf && <div ref={views}><Segmented label={t('paper.view')} value={view} onChange={setChosen}
+          options={[{ value: 'pages', label: t('paper.pages') }, { value: 'text', label: t('paper.passages') }]} /></div>}
       </div>
       {/* Read again (its count changes), its parts start anew and read the new reading's passages. */}
       {view === 'pages' ? <PageList key={count} version={version} pages={material.extraction.pages ?? 0}
-        pointed={pointed} onPoint={setPointed} />
+        pointed={pointed} onPoint={setPointed}
+        onText={() => { views.current?.querySelectorAll('[role="radio"]')[1]?.focus(); setChosen('text'); }}
+        toSwitch={() => views.current?.querySelector('[role="radio"][aria-checked="true"]')?.focus()} />
         : <PassageList key={count} version={version} count={count} pointed={pointed} onPoint={setPointed} />}
     </section>
   );
 }
 
 // The parts of a list (list, a ref to its element) that hold what they show: those near the view,
-// the one holding focus and the shown ones the reader's selection takes in (heldPages).
+// the one holding focus and the shown ones the reader's selection takes in (heldPages). Focus going
+// from one part to another keeps the one it leaves until the next takes it (to: where it goes), so
+// the part it goes to, held or mounted beside it, is never let go before focus arrives.
 function useHeld(list) {
   const [near, setNear] = useState(() => new Set()); // the parts within two screens of the view
   const [within, setWithin] = useState(null); // the part holding focus
   const [selected, setSelected] = useState([]); // the shown parts the selection takes in
   const onNear = useCallback((part, isNear) => setNear((current) => withNear(current, part, isNear)), []);
-  const onWithin = useCallback((part, inside) => setWithin((current) => (inside ? part : current === part ? null : current)), []);
+  const onWithin = useCallback((part, inside, to) => {
+    const toList = Boolean(to && list.current?.contains(to)); // read as focus moves, not when React runs the update
+    setWithin((current) => withFocus(current, part, inside, toList));
+  }, [list]);
   useEffect(() => {
     const changed = () => {
       const found = list.current ? selectedParts(document.getSelection(), [...list.current.querySelectorAll('[data-part][data-shown]')]) : [];
@@ -186,7 +194,7 @@ function useHeld(list) {
     document.addEventListener('selectionchange', changed);
     return () => document.removeEventListener('selectionchange', changed);
   }, [list]);
-  return { held: heldPages(near, [within, ...selected]), onNear, onWithin };
+  return { held: heldPages(near, [within, ...selected]), within, onNear, onWithin };
 }
 
 // The element that scrolls the paper's text: the root its parts are near or far from.
@@ -234,24 +242,91 @@ function usePart(frame, part, showing, onNear, onWithin) {
     },
     onBlur: (event) => {
       if (event.target === event.currentTarget) entering.current = null; // left before its passages came
-      if (!event.currentTarget.contains(event.relatedTarget)) onWithin(part, false);
+      if (!event.currentTarget.contains(event.relatedTarget)) onWithin(part, false, event.relatedTarget);
     },
   };
-  const focusOn = (where) => { entering.current = where; frame.current?.focus(); };
+  const focusOn = (where) => { frame.current?.focus(); entering.current = where; }; // after onFocus, which sets it too
   const passTo = (element) => { if (waitsOn(frame.current, document.activeElement, entering.current)) element?.focus(); };
   return [props, focusOn, passTo];
 }
 
-// A PDF's pages, each holding its image and its passages only while it is held.
-function PageList({ version, pages, pointed, onPoint }) {
+// A PDF's pages, each holding its image and its passages only while it is held. Only the pages
+// within two screens of the view are mounted, with the held ones and a page on each side of each
+// (pageWindow); the others are spacers of their height, each page's from its own image once shown,
+// so the list keeps its height and every page its place, however many pages there are.
+// Each page also keeps the part of its passages it last showed (startPart), mounted again or not.
+// Engines cap an element's height (16,777,214 px in some Chromium builds), so the list lays out the
+// pages that fit in MAX_LIST_HEIGHT (pageOffsets: about 15,800 letter pages 720 px wide) and after the
+// last says the later ones are not shown here, with a button to the text view, which holds their text.
+// ponytail: a scaled or paged list if every page of longer PDFs must be shown as a page.
+function PageList({ version, pages, pointed, onPoint, onText, toSwitch }) {
+  const t = useT();
   const list = useRef(null);
-  const { held, onNear, onWithin } = useHeld(list);
+  const { held, within, onNear, onWithin } = useHeld(list);
+  const aspects = useRef(new Map()); // each page's width over its height, once its image was shown
+  const [learned, learn] = useReducer((n) => n + 1, 0);
+  const [width, setWidth] = useState(PAGE_WIDTH);
+  const offsets = useMemo(() => pageOffsets(pages, width, aspects.current), [pages, width, learned]);
+  const [span, setSpan] = useState([1, 1]); // the first and last pages within two screens of the view
+  const measure = useRef(null);
+  measure.current = () => {
+    const element = list.current;
+    const root = scroller(element);
+    const view = root ? root.getBoundingClientRect() : { top: 0, bottom: window.innerHeight, height: window.innerHeight };
+    const top = element.getBoundingClientRect().top;
+    const next = pagesWithin(offsets, view.top - top - 2 * view.height, view.bottom - top + 2 * view.height);
+    setSpan((current) => (current[0] === next[0] && current[1] === next[1] ? current : next));
+  };
+  useLayoutEffect(() => measure.current(), [offsets]);
+  useEffect(() => {
+    const element = list.current;
+    const root = scroller(element) ?? window;
+    const follow = () => measure.current();
+    const resized = new ResizeObserver(() => { setWidth((current) => element.clientWidth || current); follow(); }); // hidden: as it was
+    resized.observe(element);
+    if (root !== window) resized.observe(root);
+    root.addEventListener('scroll', follow, { passive: true });
+    return () => { resized.disconnect(); root.removeEventListener('scroll', follow); };
+  }, []);
+  const onAspect = useCallback((number, aspect) => {
+    if (!(aspect > 0 && Number.isFinite(aspect)) || aspects.current.get(number) === aspect) return;
+    aspects.current.set(number, aspect);
+    learn();
+  }, []);
+  const parts = useRef(new Map()); // the part of its passages each page last showed
+  const onPart = useCallback((number, part) => parts.current.set(number, part), []);
+  const shown = offsets.length - 1; // the pages laid out: all of them, or those under the cap
+  const note = useRef(null);
+  // The cut coming before the page holding focus (the list widened, or a taller page's shape was learned) takes
+  // that page away, and focus with it: focus goes to the note, which says where its text is. Focus that had
+  // already left the list stays where it went.
+  useLayoutEffect(() => {
+    if (within == null || within <= shown) return;
+    const lost = !document.activeElement || document.activeElement === document.body;
+    onWithin(within, false);
+    if (lost) note.current?.focus();
+  }, [within, shown]);
+  // The note goes once every page fits again (the list narrowed), and focus on its button with it: focus goes to
+  // the view's switch, on its current option, as Show passages leads there. Focus elsewhere stays there.
+  const noteFocused = useRef(false);
+  useLayoutEffect(() => {
+    if (shown < pages || !noteFocused.current) return;
+    noteFocused.current = false;
+    if (!document.activeElement || document.activeElement === document.body) toSwitch();
+  }, [shown]);
   return (
     <div ref={list} className="grid gap-4">
-      {Array.from({ length: pages }, (_, i) => (
-        <PageView key={i} version={version} number={i + 1} pointed={pointed} onPoint={onPoint}
-          held={held.has(i + 1)} onNear={onNear} onWithin={onWithin} />
-      ))}
+      {pageWindow(offsets, span, held).map((item) => (item.page
+        ? <PageView key={item.page} version={version} number={item.page} pointed={pointed} onPoint={onPoint}
+          held={held.has(item.page)} onNear={onNear} onWithin={onWithin} aspect={aspects.current.get(item.page)} onAspect={onAspect}
+          startPart={parts.current.get(item.page) ?? 0} onPart={onPart} />
+        : <div key={`before-${item.spacer}`} aria-hidden="true" style={{ height: item.height }} />))}
+      {shown < pages && <div className="grid justify-items-center gap-2 py-4 text-center">
+        <p className="text-sm text-muted-foreground">{t('paper.pagesCut', { number: shown })}</p>
+        <Button ref={note} type="button" variant="outline" size="sm" onClick={onText}
+          onFocus={() => { noteFocused.current = true; }} onBlur={() => { noteFocused.current = false; }}>
+          {t('paper.showPassages')}</Button>
+      </div>}
     </div>
   );
 }
@@ -263,15 +338,15 @@ function PageList({ version, pages, pointed, onPoint }) {
 // to that part's passages; while that part loads, what the page shows is out of Tab's and the
 // pointer's reach and Tab toward it (Shift+Tab toward the part before) waits on the page, and a
 // read that fails shows beside the button, with Retry, which (as the button does) reads it again
-// (partMove). The line boxes a part draws are bounded (pageLines).
-function PageView({ version, number, pointed, onPoint, held, onNear, onWithin }) {
+// (partMove); a page whose first read fails says so in its place, with Retry. The line boxes a part
+// draws are bounded (pageLines). Its shape is its image's (aspect, kept by the list: onAspect).
+function PageView({ version, number, pointed, onPoint, held, onNear, onWithin, aspect, onAspect, startPart, onPart }) {
   const t = useT();
   const frame = useRef(null);
   const retry = useRef(null);
-  const [part, setPart] = useState(0); // which part of its passages it shows
+  const [part, setPart] = useState(startPart); // which part of its passages it shows
   const [shown, setShown] = useState(null); // { src, part, passages, more }
   const [failed, setFailed] = useState(false); // read again once asked to, or let go and held again
-  const [aspect, setAspect] = useState(null); // its image's width over height, once one was shown
   const [props, focusOn, passTo] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
   const move = partMove(shown, part, failed);
   useEffect(() => {
@@ -281,7 +356,8 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
     let live = true;
     const controller = new AbortController(); // let go before they came: its requests go too
     Promise.all([shown?.src ?? pageImage(version, number, 1.5, controller.signal), pagePart(version, number, part, controller.signal)])
-      .then(([src, found]) => live && setShown({ src, part, ...found })).catch(() => live && setFailed(true));
+      .then(([src, found]) => { if (live) { setShown({ src, part, ...found }); onPart(number, part); } })
+      .catch(() => live && setFailed(true));
     return () => { live = false; controller.abort(); };
   }, [held, shown, version, number, part, failed]);
   useEffect(() => { // focus waiting on the page for the part goes to Retry once its read failed
@@ -306,10 +382,13 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
       className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
       aria-label={t('paper.page', { number })}>
       {shown ? <img src={shown.src} alt={t('paper.page', { number })} className="block w-full" draggable={false}
-        onLoad={(event) => setAspect(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />
+        onLoad={(event) => onAspect(number, event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />
         : <div className={cn('grid place-items-center text-xs', !aspect && 'aspect-[612/792]', failed ? 'text-destructive' : 'text-muted-foreground')}
           style={aspect ? { aspectRatio: aspect } : undefined}>
-          {failed ? t('paper.pageFailed') : t('common.loading')}
+          {move.failed ? <div className="grid justify-items-center gap-2">
+            <p role="alert">{t('paper.pageFailed')}</p>
+            <button ref={retry} type="button" className={button} onClick={() => go(part, 'first')}>{t('common.retry')}</button>
+          </div> : t('common.loading')}
         </div>}
       <div className="contents" inert={move.loading}>
         {shown?.part > 0 && control(shown.part - 1, 'last', t('paper.earlierPassages'), 'top-2')}
@@ -364,23 +443,30 @@ function PassageList({ version, count, pointed, onPoint }) {
 
 // One stretch of the passages: read when it is held and let go when it is not, its height kept
 // meanwhile (estimated until it was first shown). Each passage says where it is in the whole text
-// (aria-posinset of aria-setsize), as only the stretches held are in the page.
+// (aria-posinset of aria-setsize), as only the stretches held are in the page. A read that fails
+// says so with Retry, which reads it again, as a page's part does (partMove): focus waiting on the
+// stretch goes to Retry, and from Retry back to the stretch, on to its first passage once it shows.
 function PassageStretch({ version, index, count, pointed, onPoint, held, onNear, onWithin }) {
   const t = useT();
   const frame = useRef(null);
+  const retry = useRef(null);
   const [shown, setShown] = useState(null); // { passages, before }
-  const [failed, setFailed] = useState(false);
+  const [failed, setFailed] = useState(false); // read again once asked to, or let go and held again
   const [height, setHeight] = useState(null); // as it was last shown
-  const [part] = usePart(frame, index, shown && index, onNear, onWithin);
+  const [part, focusOn, passTo] = usePart(frame, index, shown && index, onNear, onWithin);
+  const move = partMove(shown && { part: index }, index, failed);
   const size = Math.min(PASSAGE_STRETCH, count - index * PASSAGE_STRETCH);
   useEffect(() => {
-    if (!held) { setShown(null); return undefined; }
-    if (shown) return undefined;
+    if (!held) { setShown(null); setFailed(false); return undefined; }
+    if (!move.read) return undefined;
     let live = true;
     const controller = new AbortController();
     passageStretch(version, index, controller.signal).then((found) => live && setShown(found)).catch(() => live && setFailed(true));
     return () => { live = false; controller.abort(); };
-  }, [held, shown, version, index]);
+  }, [held, shown, failed, version, index]);
+  useEffect(() => { // focus waiting on the stretch for its passages goes to Retry once its read failed
+    if (move.failed) passTo(retry.current);
+  }, [move.failed]);
   useLayoutEffect(() => { if (shown) setHeight(frame.current.offsetHeight); }, [shown]);
   const over = shown && headings(shown.passages, shown.before);
   return (
@@ -399,8 +485,11 @@ function PassageStretch({ version, index, count, pointed, onPoint, held, onNear,
             <p className={cn('break-words', KIND_STYLES[passage.kind])}>{passage.text}</p>
           </div>
         </div>
-      )) : <p className={cn('text-sm', failed ? 'text-destructive' : 'text-muted-foreground')}>
-        {failed ? t('paper.loadFailed') : t('common.loading')}</p>}
+      )) : move.failed ? <div className="sticky top-0 flex flex-wrap items-center gap-2 self-start"> {/* in view while its box is */}
+        <p role="alert" className="text-sm text-destructive">{t('paper.loadFailed')}</p>
+        <Button ref={retry} type="button" variant="outline" size="sm" onClick={() => { focusOn('first'); setFailed(false); }}>
+          {t('common.retry')}</Button>
+      </div> : <p className="text-sm text-muted-foreground">{t('common.loading')}</p>}
     </div>
   );
 }

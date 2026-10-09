@@ -478,7 +478,7 @@ async function s116(ctx) {
 // test-owned OpenAlex, Crossref and arXiv stand-ins; a paper's details and its page viewer; a Local
 // only project's lookup confirmation, answered in the Library; and the background-run list.
 async function materials(ctx) {
-  const { page, L, C, step, check, get } = ctx;
+  const { page, L, P, C, step, check, get } = ctx;
   const panel = () => page.getByRole('complementary', { name: L('panel.library') });
   const dialog = () => page.getByRole('dialog', { name: L('sidebar.settings') });
   const openSidebar = async () => {
@@ -742,6 +742,216 @@ async function materials(ctx) {
     await answer();
     check('and focus goes on to the last of them once they show', await regions.count() === 200
       && (await focused()).startsWith('Item 597.'));
+  });
+
+  // A request of the paper's text answered with a failure once it may: held until the returned function is called.
+  const failOnce = async (match) => {
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    await page.route(match, async (route) => {
+      await held;
+      await route.fulfill({ status: 500, contentType: 'application/json', body: '{"code":"http_error"}' });
+    }, { times: 1 });
+    return release;
+  };
+
+  await step('55-stretch-retry', async () => {
+    // A stretch of the text view whose first read fails says so in its place, with Retry; focus waiting on the
+    // stretch goes to Retry, which reads it again, focus going on to its first passage once it shows.
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    const firstStretch = (url) => url.pathname.endsWith('/passages') && !url.searchParams.has('page')
+      && url.searchParams.get('offset') === '0';
+    const release = await failOnce(firstStretch);
+    await paper('long-notes').click();
+    const list = panel().getByRole('list', { name: L('paper.passages'), exact: true });
+    const stretch = list.locator('[data-part="0"]');
+    await stretch.waitFor();
+    await stretch.focus();
+    release();
+    const retry = list.getByRole('button', { name: L('common.retry'), exact: true });
+    await retry.waitFor({ timeout: 5000 });
+    check('the stretch says its passages could not be loaded, with Retry',
+      await list.getByRole('alert').getByText(L('paper.loadFailed'), { exact: true }).count() === 1 && await retry.count() === 1);
+    check('focus waiting on the stretch goes to Retry', await retry.evaluate((button) => button === document.activeElement));
+    check('the failure keeps to its own row, held at the top of the view, not the middle of the stretch\'s tall box',
+      await list.getByRole('alert').evaluate((alert) => {
+        let node = alert.parentElement;
+        while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
+        const view = node.getBoundingClientRect();
+        const box = alert.getBoundingClientRect();
+        return alert.parentElement.getBoundingClientRect().height < 200 && box.top >= view.top && box.bottom <= view.bottom;
+      }));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('Retry reads it again: its passages show, focus on the first of them (the title)', await retry.count() === 0
+      && await list.locator('[data-passage]').first().evaluate((passage) => passage === document.activeElement
+        && passage.textContent.includes('Long Synthetic Notes')));
+    await page.unroute(firstStretch);
+  });
+
+  await step('56-page-retry', async () => {
+    // A PDF page whose own first read fails says so in its place, with Retry, which reads it again.
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    const firstPage = (url) => /\/pages\/1$/.test(url.pathname);
+    const release = await failOnce(firstPage);
+    await paper('crowded-page').click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded();
+    const figure = panel().locator('figure').first();
+    await figure.waitFor();
+    await figure.focus();
+    release();
+    const retry = figure.getByRole('button', { name: L('common.retry'), exact: true });
+    await retry.waitFor({ timeout: 5000 });
+    check('the page says it could not be shown, with Retry',
+      await figure.getByRole('alert').getByText(L('paper.pageFailed'), { exact: true }).count() === 1 && await retry.count() === 1);
+    check('focus waiting on the page goes to Retry', await retry.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('Retry reads it again: the page shows, focus on its first passage', await retry.count() === 0
+      && await figure.locator('img').count() === 1
+      && (await page.evaluate(() => document.activeElement.getAttribute('aria-label'))).startsWith('Item 0.'));
+    await page.unroute(firstPage);
+  });
+
+  // The many-page PDF's list: its figures mounted, the one labelled for a page, and its height against
+  // the height of all its pages laid out (each the default page's shape: its pages are letter pages).
+  const figures = () => panel().locator('figure');
+  const pageFigure = (n) => panel().getByRole('figure', { exact: true, // its number as the interface writes it: 20,000
+    name: L('paper.page').replace('{number}', new Intl.NumberFormat(C.lang).format(n)) });
+  const pageList = () => page.evaluate(() => {
+    const list = document.querySelector('aside figure').parentElement;
+    const width = Math.min(list.clientWidth, 720);
+    return { height: list.offsetHeight, laidOut: 20000 * ((width - 2) * 792 / 612 + 2 + 16) - 16 };
+  });
+  const scrollPanel = (to) => page.evaluate((where) => { // the panel's scrolling element, to the list's top, a page's or its end
+    let node = document.querySelector('aside figure');
+    while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
+    const list = document.querySelector('aside figure').parentElement;
+    const top = list.getBoundingClientRect().top - node.getBoundingClientRect().top + node.scrollTop;
+    node.scrollTop = where === 'end' ? node.scrollHeight : top + where;
+  }, to);
+
+  await step('57-many-pages', async () => {
+    // A PDF of 20,000 pages, all but the first blank: only the pages near the view are mounted, the others kept as
+    // spacers of their height, so the list is as tall as all its pages and its last page is reached by scrolling.
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    await page.getByTestId('library-files').setInputFiles(files('many-blank-pages.pdf'));
+    const many = (await settled(projectId, 10)).materials.find((m) => m.title === 'many-blank-pages');
+    check('it is read into 20,000 pages', many?.extraction.pages === 20000);
+    await paper('many-blank-pages').click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded();
+    await pageFigure(1).locator('img').waitFor({ timeout: 20000 });
+    await page.waitForTimeout(500);
+    const first = await figures().count();
+    check('at first only the pages near the view are mounted', first > 1 && first <= 16);
+    let list = await pageList();
+    check('the list is as tall as all its pages', Math.abs(list.height - list.laidOut) < 2);
+    // Its first page's later passages shown, the page is let go and unmounted at the end, and comes back on them.
+    const firstPassages = pageFigure(1).locator('[data-passage]');
+    await pageFigure(1).getByRole('button', { name: L('paper.laterPassages'), exact: true }).click();
+    await page.waitForFunction(() => document.querySelectorAll('aside figure:first-of-type [data-passage]').length === 20);
+    await page.evaluate(() => document.activeElement?.blur()); // focus, which the later ones took, keeps no page held
+    await scrollPanel('end');
+    await pageFigure(20000).locator('img').waitFor({ timeout: 20000 });
+    await page.waitForTimeout(500);
+    const last = await figures().count();
+    check('scrolled to its end, its last page is mounted, labelled and shown', await pageFigure(20000).isVisible());
+    check('and still only the pages near the view: the first page is let go', last <= 16 && await pageFigure(1).count() === 0);
+    list = await pageList();
+    check('the list keeps its height', Math.abs(list.height - list.laidOut) < 2);
+    await scrollPanel(0);
+    await pageFigure(1).locator('img').waitFor({ timeout: 20000 });
+    await firstPassages.first().waitFor();
+    check('scrolled back, its first page comes back on the passages it showed', await firstPassages.count() === 20
+      && await pageFigure(1).getByRole('button', { name: L('paper.earlierPassages'), exact: true }).count() === 1);
+    ctx.current().measured = { pages: many?.extraction.pages, mountedAtFirst: first, mountedAtEnd: last, height: list.height };
+  });
+
+  await step('58-many-pages-keyboard', async () => {
+    // Tab and Shift+Tab go from page to page in order, the next one always mounted, never out of the list.
+    await scrollPanel(10_000 * ((await pageList()).laidOut + 16) / 20000);
+    await page.waitForTimeout(800);
+    const at = () => page.evaluate(() => {
+      const figure = document.activeElement?.closest('figure');
+      return figure ? Number(figure.getAttribute('aria-label').replace(/\D/g, '')) : null;
+    });
+    await pageFigure(10001).focus();
+    const visited = [await at()];
+    let most = await figures().count();
+    for (let i = 0; i < 20; i += 1) {
+      await page.keyboard.press('Tab'); await page.waitForTimeout(150);
+      visited.push(await at());
+      most = Math.max(most, await figures().count());
+    }
+    check('Tab goes from page to later page, never out of the list', visited.every((n, i) => n !== null && (i === 0 || n > visited[i - 1])));
+    const back = [visited.at(-1)];
+    for (let i = 0; i < 8; i += 1) {
+      await page.keyboard.press('Shift+Tab'); await page.waitForTimeout(150);
+      back.push(await at());
+      most = Math.max(most, await figures().count());
+    }
+    check('Shift+Tab goes back page by page', back.every((n, i) => n !== null && (i === 0 || n < back[i - 1])));
+    // Scrolled far from the page holding focus, Tab and Shift+Tab still go on from it to the next page.
+    const away = async (screens) => {
+      await page.evaluate((count) => {
+        let node = document.querySelector('aside figure');
+        while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
+        node.scrollTop += count * node.clientHeight;
+      }, screens);
+      await page.waitForTimeout(800);
+    };
+    const from = await at();
+    await away(10);
+    const kept = await at();
+    await page.keyboard.press('Tab'); await page.waitForTimeout(300);
+    const after = await at();
+    await away(-10);
+    await page.keyboard.press('Shift+Tab'); await page.waitForTimeout(300);
+    const before = await at();
+    ctx.current().measured = { forward: visited, back, away: [from, kept, after, before] };
+    check('scrolled away, focus stays on its page, and Tab and Shift+Tab go on from it',
+      kept === from && after > from && before !== null && before < after);
+    most = Math.max(most, await figures().count());
+    check('with only the pages near the view mounted throughout', most <= 20);
+    ctx.current().measured = { forward: visited, back, away: [from, kept, after, before], mostMounted: most };
+  });
+
+  await step('59-many-pages-cut', async () => {
+    // Widened until its pages are 720 px wide, the list lays out only the pages under its height cap: focus on page
+    // 19,000, past the new cut, goes to the note after the last page shown; narrowed back, the note goes and focus on
+    // it to the view's switch; widened again, the note's button opens the text view.
+    const size = page.viewportSize();
+    await scrollPanel(18_999 * ((await pageList()).laidOut + 16) / 20000);
+    await page.waitForTimeout(800);
+    await pageFigure(19000).focus();
+    const show = panel().getByRole('button', { name: L('paper.showPassages'), exact: true });
+    check('at this width every page is laid out: no note', await show.count() === 0);
+    await page.setViewportSize({ width: 1900, height: size.height });
+    await show.waitFor({ timeout: 10000 });
+    await page.waitForTimeout(500);
+    const cut = await page.evaluate(() => [...document.querySelectorAll('aside figure')].map((f) => Number(f.getAttribute('aria-label')
+      .replace(/\D/g, ''))).reduce((a, b) => Math.max(a, b), 0));
+    check('widened, the list lays out the pages under the cap, page 19,000 not among them', await pageFigure(19000).count() === 0
+      && await panel().getByText(P('paper.pagesCut')).count() === 1);
+    check('and focus, which was on that page, is on the note\'s button', await show.evaluate((button) => button === document.activeElement));
+    // Narrowed back, every page fits again: the note goes, and focus on it to the view's switch, on Pages.
+    await page.setViewportSize(size);
+    await show.waitFor({ state: 'detached', timeout: 10000 });
+    await page.waitForTimeout(500);
+    check('narrowed back, the note goes and focus with it to the view switch, on Pages', await show.count() === 0
+      && await panel().getByRole('radio', { name: L('paper.pages'), exact: true }).evaluate((radio) => radio === document.activeElement
+        && radio.getAttribute('aria-checked') === 'true'));
+    await page.setViewportSize({ width: 1900, height: size.height });
+    await show.waitFor({ timeout: 10000 });
+    await show.focus();
+    await page.keyboard.press('Enter');
+    const passages = panel().getByRole('radio', { name: L('paper.passages'), exact: true });
+    await panel().getByRole('list', { name: L('paper.passages'), exact: true }).waitFor();
+    check('which opens the text view, focus on its switch', await passages.evaluate((radio) => radio === document.activeElement
+      && radio.getAttribute('aria-checked') === 'true'));
+    await page.setViewportSize(size);
+    await page.waitForTimeout(500);
+    ctx.current().measured = { lastShownNearCut: cut };
   });
 
   await step('29-details-saved', async () => {

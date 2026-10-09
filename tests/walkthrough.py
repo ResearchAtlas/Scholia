@@ -123,6 +123,8 @@ def write_materials():
         "long-notes.md": long_notes(),
         "crowded-page.pdf": synthetic_materials.pdf(  # one page of 220 passages, a line of three items each
             [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]]),
+        "many-blank-pages.pdf": synthetic_materials.pdf(  # 20,000 pages, all but the first (crowded-page's) blank: 2.4 MB
+            [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]] + [[]] * 19_999),
         # S1-17's search flows: an English and a Chinese paper with no identifier.
         "Wage floors and employment.md": synthetic_materials.SEARCH_NOTES,
         "最低工资与就业笔记.md": synthetic_materials.CHINESE_NOTES,
