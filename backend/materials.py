@@ -411,19 +411,20 @@ def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
     lookup now, as at import: a Local only project's asks first, a review-locked project's gets
     none, and it starts where the lookup it continues started (a conversation shows its ask). A
     lookup made for that version since, or one that has still to read its identifiers, covers it.
-    The earlier readings are then removed (_supersede)."""
-    # Readings of the file by an earlier version of the extractor are no version's reading now: their
-    # passages leave the index of every project whose current version reads the file (the readings
-    # themselves stay; a replaced version's left at its replacement).
-    older = [e for (e,) in conn.execute("SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ?"
-                                        " AND extractor_version != ?", (sha256, *extractor))]
+    The earlier readings are then removed (_supersede), but for one made with an OCR engine this
+    launch lacks (its version this one's and the engine's): it stays for a launch that has it."""
+    # Readings of the file by another version of the extractor are no version's reading now: their
+    # passages leave the index of every project whose current version reads the file (a replaced
+    # version's left it at its replacement), and then the readings go.
+    older = conn.execute("SELECT id, extractor_version FROM extractions WHERE file_sha256 = ? AND extractor = ?"
+                         " AND extractor_version != ?", (sha256, *extractor)).fetchall()
     for material, version, kind, project, locked in conn.execute(
             f"SELECT m.id, v.id, {_VERSION_TYPE}, m.project_id, p.review_lock FROM material_versions v"
             " JOIN content_files c ON c.sha256 = v.file_sha256 JOIN materials m ON m.id = v.material_id"
             " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
-        for earlier in older:
+        for earlier, _ in older:
             _queue_removes(conn, earlier, project)
         _queue_adds(conn, extraction_id, project)
         if locked:
@@ -438,25 +439,39 @@ def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
             # it continues that lookup: where it started, its ask is shown
             look_up(conn, project, {"material_ids": [material], "versions": {material: version},
                                     "origin": json.loads(latest[1]) if latest[1] else None})
-    for earlier in older:  # each project's index has its removal queued now (above, or when its paper left)
-        _supersede(conn, earlier, extraction_id)
+    for earlier, version in older:  # each project's index has its removal queued now (above, or when its paper left)
+        if not _engine_made(version, extractor[1]):
+            _supersede(conn, earlier, extraction_id)
+
+
+def _engine_made(version, current):
+    """Whether a reading's version is the current one with an OCR engine's added: made by a launch
+    whose engine this one lacks (backend/ocr.py), so it holds all this launch's reading would and
+    the scanned pages' text besides."""
+    return version.startswith(current + "+")
 
 
 def _supersede(conn, earlier, newer):
     """An earlier reading of a file by the same extractor, replaced by a newer one in the newer one's
     commit (section 7.1: a re-parse rebuilds passages, and citations re-resolve through their
-    quotes). Each citation of one of its passages is pointed at the first of the newer reading's
-    passages that holds its quote, one on the citation's page first, or left unresolved (passage_id
-    null, section 4.2); then its passages and the reading itself are deleted, so no index, access
-    check or passage request reaches them again. (S1-21: memory sources naming a passage are to be
-    pointed again in the same way.)"""
-    for citation, quote, page in conn.execute(
-            "SELECT c.id, c.quote, c.page FROM citations c JOIN passages p ON p.id = c.passage_id"
+    quotes). Each citation of one of its passages is pointed at the newer reading's passage with that
+    passage's text (on the same page and nearest it first), else at the first that holds its quote
+    (on the citation's page first); or, with neither, left unresolved: passage_id null and existence
+    not_found (section 4.2). Then its passages and the reading itself are deleted, so no index,
+    access check or passage request reaches them again. (S1-21: memory sources naming a passage are
+    to be pointed again in the same way.)"""
+    for citation, quote, page, text, at, ordinal in conn.execute(
+            "SELECT c.id, c.quote, c.page, p.text, p.page, p.ordinal FROM citations c JOIN passages p ON p.id = c.passage_id"
             " WHERE p.extraction_id = ?", (earlier,)).fetchall():
-        found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
-                             " ORDER BY page IS NOT ?, ordinal LIMIT 1", (newer, quote, page)).fetchone() if quote else None
-        conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page) WHERE id = ?",
-                     (found[0] if found else None, found[1] if found else None, citation))
+        found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND text = ?"
+                             " ORDER BY page IS NOT ?, abs(ordinal - ?) LIMIT 1", (newer, text, at, ordinal)).fetchone()
+        if found is None and quote:
+            found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
+                                 " ORDER BY page IS NOT ?, ordinal LIMIT 1", (newer, quote, page)).fetchone()
+        if found is not None:
+            conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page) WHERE id = ?", (*found, citation))
+        else:
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'not_found' WHERE id = ?", (citation,))
     conn.execute("DELETE FROM passages WHERE extraction_id = ?", (earlier,))
     conn.execute("DELETE FROM extractions WHERE id = ?", (earlier,))
 
@@ -467,22 +482,31 @@ async def read_outdated(harness):
     left waiting for OCR among them): a reading run each, recorded with the extractor version it is
     for (inputs.outdated). Called when background work starts (backups.start_background: at launch
     once the database is checked, and after a restore commits; never while the app is limited). A
-    version is read so once for each extractor version: one with a reading by this version, one
-    being read, or one read so already gets none (Retry and Read again cover a reading that failed).
-    Local work, so at every sensitivity level and in a review-locked project too."""
+    file is read so once for each extractor version, by one of the versions that read it as that type
+    (its reading serves the others when it commits, _serve): a file with a reading by this version,
+    one being read, or one read so already gets none (Retry and Read again cover a reading that
+    failed); so does one whose earlier readings were all made with an OCR engine this launch lacks
+    (_engine_made). Local work, so at every sensitivity level and in a review-locked project too."""
     def outdated(conn):
-        found = []
+        found, seen = [], set()
         for version, material, project, sha256, kind in conn.execute(
                 f"SELECT v.id, v.material_id, m.project_id, v.file_sha256, {_VERSION_TYPE} FROM material_versions v"
                 " JOIN materials m ON m.id = v.material_id JOIN content_files c ON c.sha256 = v.file_sha256"
                 " WHERE v.is_current = 1 ORDER BY m.created_at").fetchall():
-            if kind not in extraction.EXTRACTORS or _extraction(conn, sha256, kind) is not None \
-                    or not _earlier(conn, sha256, kind):
+            if kind not in extraction.EXTRACTORS or (sha256, kind) in seen or _extraction(conn, sha256, kind) is not None:
                 continue
-            mark = "/".join(extraction.extractor_of(kind))
-            if conn.execute("SELECT 1 FROM runs WHERE workflow = 'extract' AND json_extract(inputs, '$.version_id') = ?"
-                            " AND (status = 'running' OR json_extract(inputs, '$.outdated') = ?)",
-                            (version, mark)).fetchone() is None:
+            seen.add((sha256, kind))
+            name, current = extraction.extractor_of(kind)
+            if all(_engine_made(earlier, current) for (earlier,) in conn.execute(
+                    f"SELECT extractor_version FROM extractions WHERE file_sha256 = ? AND extractor = ? AND status IN {_SHARED}",
+                    (sha256, name))):  # none at all (never read), or only a reading this one would take less from
+                continue
+            mark = f"{name}/{current}"
+            if conn.execute("SELECT 1 FROM runs r JOIN material_versions w ON w.id = json_extract(r.inputs, '$.version_id')"
+                            " LEFT JOIN content_files d ON d.sha256 = w.file_sha256 WHERE r.workflow = 'extract'"
+                            " AND w.file_sha256 = ? AND coalesce(w.media_type, d.media_type) = ?"
+                            " AND (r.status = 'running' OR json_extract(r.inputs, '$.outdated') = ?)",
+                            (sha256, kind, mark)).fetchone() is None:
                 found.append((version, material, project, mark))
         return found
 

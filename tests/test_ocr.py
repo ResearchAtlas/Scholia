@@ -498,15 +498,21 @@ def test_only_the_ocr_module_imports_vision():
 @pytest.mark.skipif(sys.platform != "darwin", reason="Vision is macOS only")
 def test_vision_reads_small_english_and_chinese_lines_of_a_scan_where_they_are_drawn():
     assert ocr.engine() is ocr.VISION
+    english = ["The synthetic panel includes regional data on wages and employment for each study year.",
+               "Standard errors are clustered by region; the paragraph was drawn and ends here."]
     data = scanned_pdf([(72, 700, 8, "Eight point text about synthetic minimum wages."),
                         (72, 650, 10, "Ten point text: employment effects are small."),
-                        (72, 600, 10.5, "最低工资的合成研究。")])
+                        (72, 600, 10.5, "最低工资的合成研究。"),
+                        (72, 560, 10, "本文使用 OLS 方法估计效应。"),
+                        *[(72, 520 - 30 * n, 10, line) for n, line in enumerate(english)]])
     found = extraction.extract(data, extraction.PDF)
     assert found.version.endswith("+vision-3") and (found.ocr_pages, found.status) == (1, "complete")
     texts = [p.text for p in found.passages]
     assert "Eight point text about synthetic minimum wages." in texts
     assert "Ten point text: employment effects are small." in texts
+    assert all(line in texts for line in english)  # English read whole beside Chinese
     assert any("最低工资" in text and "合成研究" in text for text in texts)
+    assert any(text.replace(" ", "") == "本文使用OLS方法估计效应。" for text in texts)  # a Chinese line's English term kept
     eight = next(p for p in found.passages if p.text.startswith("Eight"))
     [[left, top, right, bottom]] = eight.boxes["rects"]
     assert abs(left - 72 / 612) < 0.01 and top < 1 - 700 / 792 < bottom + 0.01  # over the line as it was drawn
@@ -584,13 +590,14 @@ async def test_papers_read_before_ocr_are_read_again_once_at_launch_and_their_ol
         await asyncio.sleep(0.3)
         runs = await rows(client, "SELECT json_extract(inputs, '$.version_id'), json_extract(inputs, '$.outdated')"
                                   " FROM runs WHERE workflow = 'extract' AND json_extract(inputs, '$.outdated') IS NOT NULL")
-        assert len(runs) == 3  # one for each current version, the one sharing a reading too
+        assert len(runs) == 2  # one for each file: the scan's reading serves both projects' papers when it commits
         assert {mark for _, mark in runs} == {"/".join(extraction.extractor_of(extraction.PDF))}
         listed = {m["id"]: m for p in {p for p, _ in papers.values()} for m in await settled(client, p)}
         for name, (_, material) in papers.items():
             assert (listed[material]["state"], listed[material]["reason"]) == ("ready", None), name
         assert listed[papers["scanned"][1]]["extraction"]["ocr_pages"] == 1
         assert await rows(client, "SELECT count(*) FROM extractions GROUP BY file_sha256") == [(1,), (1,)]  # one each
+        assert len(engine.calls) == 1  # the shared scan recognized once
         calls = len(engine.calls)
         after = await rows(client, "SELECT id FROM extractions")
         assert not {e for (e,) in after} & set(before)  # the earlier readings are gone
@@ -610,7 +617,7 @@ async def test_papers_read_before_ocr_are_read_again_once_at_launch_and_their_ol
     async with started(data, setup=False) as client:  # the next launch reads nothing again
         await asyncio.sleep(0.3)
         assert len(await rows(client, "SELECT id FROM runs WHERE workflow = 'extract'"
-                                      " AND json_extract(inputs, '$.outdated') IS NOT NULL")) == 3
+                                      " AND json_extract(inputs, '$.outdated') IS NOT NULL")) == 2
         assert len(engine.calls) == calls
 
 
@@ -646,18 +653,25 @@ async def test_a_reread_points_citations_at_the_new_passages_or_leaves_them_unre
     async with started(data, setup=False) as client:
         version = (await client.get(f"/api/materials/{papers['text'][1]}")).json()["version"]["id"]
         passages = (await client.get(f"/api/material-versions/{version}/passages")).json()["passages"]
-        passage, text = next((p["id"], p["text"]) for p in passages if p["kind"] == "paragraph")
-        found = await cite(client, papers["text"][1], passage, text[:30])
-        lost = await cite(client, papers["text"][1], passage, "A quote no reading of it holds.")
+        passage, text = next((p["id"], p["text"]) for p in passages if p["text"].startswith("Minimum wages raise"))
+        assert any("wages" in p["text"] and p["ordinal"] < passages[[q["id"] for q in passages].index(passage)]["ordinal"]
+                   for p in passages)  # an earlier passage holds the short quote too
+        found = await cite(client, papers["text"][1], passage, "wages")
+        gone, extracted = new_id(), passages[0]
+        [(reading,)] = await rows(client, "SELECT extraction_id FROM passages WHERE id = ?", passage)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "INSERT INTO passages (id, extraction_id, ordinal, page, section_path, kind, text) VALUES (?, ?, 9999, 1, '[]',"
+            " 'paragraph', 'A passage the next reading does not give.')", (gone, reading)))
+        lost = await cite(client, papers["text"][1], gone, "A quote no reading of it holds.")
     use(monkeypatch, Engine())
     async with started(data, setup=False) as client:
         await asyncio.sleep(0.3)
         await settled(client, papers["text"][0])
-        [(now, page)] = await rows(client, "SELECT passage_id, page FROM citations WHERE id = ?", found)
-        assert now != passage and page == 1
-        assert (await client.get(f"/api/passages/{now}")).json()["text"] == text
-        assert await rows(client, "SELECT passage_id, quote FROM citations WHERE id = ?", lost) == [
-            (None, "A quote no reading of it holds.")]
+        [(now, page, existence)] = await rows(client, "SELECT passage_id, page, existence FROM citations WHERE id = ?", found)
+        assert now != passage and (page, existence) == (1, "ok")
+        assert (await client.get(f"/api/passages/{now}")).json()["text"] == text  # its own passage again, not the first holding "wages"
+        assert await rows(client, "SELECT passage_id, quote, existence FROM citations WHERE id = ?", lost) == [
+            (None, "A quote no reading of it holds.", "not_found")]
         assert (await client.get(f"/api/passages/{passage}")).status_code == 404
 
 
@@ -742,14 +756,50 @@ async def test_rereading_at_launch_works_at_every_level_and_in_a_locked_project(
 
 
 @pytest.mark.asyncio
-async def test_a_version_with_a_current_reading_or_one_being_read_is_not_read_again(tmp_path, monkeypatch):
-    engine = use(monkeypatch, Engine(hold=True))
+async def test_a_file_being_read_or_read_by_this_version_is_not_read_again(tmp_path, monkeypatch):
+    use(monkeypatch, None)  # read first with no engine
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
-        await added(client, project, ("scan.pdf", scan()), ("text.pdf", synthetic.paper_pdf()))
+        await added(client, project, ("scan.pdf", scan()))
+        [paper] = await settled(client, project)
+        engine = use(monkeypatch, Engine(hold=True))  # now outdated: its reading named no engine
+        read = await client.post(f"/api/material-versions/{paper['version']['id']}/read")  # Read again, held
+        assert read.status_code == 201
         await held(engine)
-        await materials_module.read_outdated(client.state["harness"])  # one being read, one read now
-        engine.go.set()
-        await settled(client, project)
-        await materials_module.read_outdated(client.state["harness"])
+        await materials_module.read_outdated(client.state["harness"])  # being read: none
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'extract'") == [(2,)]
+        engine.go.set()
+        assert (await run_finished(client, read.json()["run_id"]))["status"] == "succeeded"
+        await materials_module.read_outdated(client.state["harness"])  # read by this version: none
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'extract'") == [(2,)]
+
+
+@pytest.mark.asyncio
+async def test_a_launch_without_the_engine_keeps_its_readings_and_reads_nothing_again(tmp_path, monkeypatch, quick):
+    data = tmp_path / "data"
+    use(monkeypatch, Engine())
+    async with started(data) as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, ("scan.pdf", synthetic.paper_pdf(scanned=1))))["materials"]
+        [read] = await settled(client, project)
+        assert read["extraction"]["ocr_pages"] == 1
+        [(made, passages)] = await rows(client, "SELECT e.id, count(p.id) FROM extractions e JOIN passages p"
+                                                " ON p.extraction_id = e.id GROUP BY e.id")
+        [(recognized,)] = await rows(client, "SELECT id FROM passages WHERE page = 3")
+        citation = await cite(client, paper["id"], recognized, LINE.text[:20], page=3)
+    use(monkeypatch, None)  # Vision does not load at this launch
+    async with started(data, setup=False) as client:
+        await asyncio.sleep(0.3)
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'extract'") == [(1,)]  # nothing read again
+        [degraded] = await settled(client, project)
+        assert degraded["reason"] == "outdated"  # stated: it reads as read by another version until the engine is back
+        again = await client.post(f"/api/material-versions/{degraded['version']['id']}/read")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", made) == [(passages,)]  # kept
+        assert await rows(client, "SELECT passage_id FROM citations WHERE id = ?", citation) == [(recognized,)]
+    use(monkeypatch, Engine())
+    async with started(data, setup=False) as client:
+        await asyncio.sleep(0.3)
+        [back] = await settled(client, project)
+        assert (back["state"], back["extraction"]["ocr_pages"], back["extraction"]["version"]) == (
+            "ready", 1, extraction.extractor_of(extraction.PDF)[1])
