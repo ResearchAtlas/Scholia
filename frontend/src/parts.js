@@ -15,6 +15,19 @@ export function loader(load, name) {
 
 export const part = (load, name) => lazy(loader(load, name));
 
+// A part that can be loaded before it is first drawn: load() loads it once; ready() settles when
+// it has loaded or failed, never rejecting (what waits for it goes on, and the part then shows the
+// failure); loaded() is its export once loaded, else null, and failed() whether it could not load,
+// so either can be drawn at once, where React.lazy would show its fallback for one render first.
+export function early(load, name) {
+  let module = null;
+  let failed = false;
+  let loading = null;
+  const once = () => (loading ??= load().then((loadedModule) => { module = loadedModule; return loadedModule; },
+    (error) => { failed = true; throw error; }));
+  return { load: once, ready: () => once().then(() => {}, () => {}), loaded: () => module?.[name] ?? null, failed: () => failed };
+}
+
 // The fallback while the part loads, and failed once it could not load. Any other error thrown
 // while rendering the part goes on to the window, as it did before parts were loaded apart.
 export class Boundary extends Component {

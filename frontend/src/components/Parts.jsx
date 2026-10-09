@@ -4,9 +4,9 @@
 // so a quick load flashes nothing and nothing moves. One that cannot load says so where it would
 // show, with Try again. A browser keeps a script that failed to load as failed while the page is
 // open, so Try again reloads the window, which keeps its session (session.js).
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useT } from '../i18n/index.js';
-import { Boundary, part } from '../parts.js';
+import { Boundary, early, part } from '../parts.js';
 import { LoadState } from './fields.jsx';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
@@ -14,16 +14,12 @@ import { cn } from '@/lib/utils';
 const LazySettings = part(() => import('./Settings.jsx'), 'Settings');
 const LazyPaper = part(() => import('./Paper.jsx'), 'Paper');
 
-let markdown = null; // react-markdown's component, once loaded
-let markdownLoad = null;
-const loadMarkdown = () => (markdownLoad ??= import('react-markdown').then((module) => { markdown = module.default; return module; }));
-const LazyMarkdown = part(loadMarkdown, 'default');
+const markdown = early(() => import('../markdown.js'), 'default');
+const LazyMarkdown = part(markdown.load, 'default');
 
-// Starts loading the Markdown renderer, once; settles when it has loaded or failed (an answer
-// then says it could not be loaded), never rejecting.
-export function markdownReady() {
-  return loadMarkdown().then(() => {}, () => {});
-}
+// Loads the Markdown renderer, once; settles when it has loaded or failed (an answer then says it
+// could not be loaded), never rejecting.
+export const markdownReady = markdown.ready;
 
 // Loading: announced at once, shown only once it takes a moment.
 function Pending({ className }) {
@@ -37,6 +33,21 @@ function Pending({ className }) {
 
 function Unavailable() {
   return <LoadState problem="part_not_loaded" onRetry={() => window.location.reload()} />;
+}
+
+// While Settings loads, Escape or a click anywhere closes it, as either closes its dialog, so it does
+// not open once loaded; focus stays where it is.
+function SettingsLoading({ onOpenChange }) {
+  useEffect(() => {
+    const close = (event) => { if (event.type === 'pointerdown' || event.key === 'Escape') onOpenChange(false); };
+    document.addEventListener('keydown', close);
+    document.addEventListener('pointerdown', close);
+    return () => {
+      document.removeEventListener('keydown', close);
+      document.removeEventListener('pointerdown', close);
+    };
+  }, [onOpenChange]);
+  return <Pending className="sr-only" />;
 }
 
 // Settings, loaded when first opened and kept, so it closes as before. It is a modal: while it
@@ -55,7 +66,8 @@ export function Settings(props) {
       </DialogContent>
     </Dialog>
   );
-  return <Boundary fallback={<Pending className="sr-only" />} failed={failed}><LazySettings {...props} /></Boundary>;
+  const loading = props.open ? <SettingsLoading onOpenChange={props.onOpenChange} /> : null;
+  return <Boundary fallback={loading} failed={failed}><LazySettings {...props} /></Boundary>;
 }
 
 // A paper's page, in the panel where the Library was.
@@ -67,9 +79,10 @@ export function Paper(props) {
   );
 }
 
-// An answer's Markdown. Once the renderer has loaded (markdownReady), it is drawn at once.
+// An answer's Markdown. Once the renderer has loaded or failed (markdownReady), that is drawn at once.
 export function Markdown(props) {
-  const Loaded = markdown;
+  const Loaded = markdown.loaded();
   if (Loaded) return <Loaded {...props} />;
+  if (markdown.failed()) return <Unavailable />;
   return <Boundary fallback={<Pending />} failed={<Unavailable />}><LazyMarkdown {...props} /></Boundary>;
 }
