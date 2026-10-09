@@ -636,8 +636,8 @@ async def test_a_kick_and_a_retry_of_a_run_left_running_never_both_run_it(tmp_pa
         else:  # the kick holds it and starts it while the retry's transaction is open
             real_retry = materials_module._retry
 
-            def retry(conn, run_id, registry):
-                found = real_retry(conn, run_id, registry)
+            def retry(conn, run_id, registry, derived=None):
+                found = real_retry(conn, run_id, registry, derived)
                 active = registry.add_background(run_id)
                 loop.call_soon_threadsafe(lambda: setattr(active, "task", loop.create_task(harness._background(active))))
                 return found
