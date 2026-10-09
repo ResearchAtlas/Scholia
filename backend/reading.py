@@ -234,14 +234,16 @@ def _run(request, ceiling, limit, stop, received, stats):
                             stats["ready_seconds"] = time.monotonic() - started
                         received.take(body)
                         longest, last = max(longest, time.monotonic() - last), time.monotonic()
-                except Exception:  # its last frame, or a wrong one: a peak past the ceiling decides first
+                except Exception as error:  # its last frame, or a wrong one: a peak past the ceiling decides first
                     if (now := _peak(child.pid)) is None:
                         log.error("a reading's child's memory could not be read; it was stopped")
                         raise ChildError("watch") from None
                     peak = now
                     if peak > ceiling:
                         raise _Ceiling(peak) from None
-                    raise
+                    if isinstance(error, (_Bad, extraction.Unreadable, FileNotFoundError, IndexError, ChildError)):
+                        raise  # what a frame may say, or a wrong frame found as one
+                    raise _Bad("a frame its checks could not take") from None  # any other failure on a value
             if time.monotonic() - last > STEP_SECONDS:
                 log.warning("a reading's child sent nothing for %d s; it was stopped", STEP_SECONDS)
                 raise extraction.Unreadable("step_limit")
@@ -296,7 +298,7 @@ def _message(body):
 
 def _number(value):
     """A finite number: a box's edge or a confidence (a non-finite one is not JSON the database keeps)."""
-    return type(value) in (int, float) and math.isfinite(value)
+    return type(value) is float and math.isfinite(value) or type(value) is int and abs(value) < 2**53
 
 
 def _count(value):
@@ -350,8 +352,10 @@ class _Received:
             raise ChildError("version")
         self.ready = True
 
+    errors = _ERRORS - {"no_page"}  # what a reading's child may report
+
     def failed(self, value):
-        if type(value) is not list or not value or type(value[0]) is not str or value[0] not in _ERRORS:
+        if type(value) is not list or not value or type(value[0]) is not str or value[0] not in self.errors:
             raise _Bad("an error that is not one")
         code = value[0]
         if code == "file_missing":
@@ -451,6 +455,8 @@ class _Reading(_Received):
 
 
 class _Render(_Received):
+    errors = _ERRORS  # a page image's child may also report a page it does not have
+
     def __init__(self):
         super().__init__(extraction.PDF)
         self.image = None

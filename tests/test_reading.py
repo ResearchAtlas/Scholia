@@ -129,6 +129,43 @@ async def test_a_child_that_passed_its_ceiling_and_then_sends_a_frame_past_its_b
 
 
 @pytest.mark.asyncio
+async def test_a_footprint_that_cannot_be_read_as_a_wrong_frame_is_weighed_fails_closed(tmp_path, monkeypatch,
+                                                                                         reading_stub):
+    reading_stub("frame", "not-json")
+    failed, real_take, real_peak = [], reading._Reading.take, reading._peak
+
+    def take(self, body):
+        try:
+            return real_take(self, body)
+        except Exception:
+            failed.append(True)
+            raise
+
+    monkeypatch.setattr(reading._Reading, "take", take)
+    monkeypatch.setattr(reading, "_peak", lambda pid: None if failed else real_peak(pid))
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    with pytest.raises(reading.ChildError):
+        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
+    assert failed and gone()
+
+
+@pytest.mark.asyncio
+async def test_a_selector_that_cannot_be_made_starts_no_child_and_fails_internal(tmp_path, monkeypatch):
+    def never(*args, **kwargs):
+        raise AssertionError("a child was started")
+
+    def no_selector():
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(reading.subprocess, "Popen", never)
+    monkeypatch.setattr(reading.selectors, "DefaultSelector", no_selector)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    with pytest.raises(reading.ChildError):
+        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
+    assert gone()
+
+
+@pytest.mark.asyncio
 async def test_a_reading_stopped_before_its_child_starts_starts_none(tmp_path, monkeypatch):
     def never(*args, **kwargs):
         raise AssertionError("a child was started")
@@ -337,6 +374,8 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path):
     (("frame", "nested"), "unreadable_file"),  # nested past the JSON parser's depth
     (("frame", "list-kind"), "unreadable_file"),  # a list where a name is due
     (("frame", "list-error"), "unreadable_file"),
+    (("frame", "bigint-rect"), "unreadable_file"),  # past a float: any value the checks cannot take
+    (("frame", "no-page"), "unreadable_file"),  # a page image's report, not a reading's
     (("after-done", "beat"), "unreadable_file"),
     (("after-done", "exit"), "unreadable_file"),
     (("version",), "internal"),

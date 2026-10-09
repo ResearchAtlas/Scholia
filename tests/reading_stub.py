@@ -62,6 +62,8 @@ FRAMES = {
     "nested": b'{"passage":' + b"[" * 100_000 + b"]" * 100_000 + b"}",
     "list-kind": json.dumps({"passage": [["paragraph"], "Text.", None, [], 0, 5, None]}).encode(),
     "list-error": json.dumps({"error": [["unreadable_file"]]}).encode(),
+    "bigint-rect": b'{"passage":["paragraph","Text.",1,[],0,5,{"rects":[[0,0,1,1' + b"0" * 400 + b']]}]}',
+    "no-page": json.dumps({"error": ["no_page"]}).encode(),
 }
 real_extract, real_render, real_extractor_of = extraction.extract, extraction.render_page, extraction.extractor_of
 real_file = reading._file
