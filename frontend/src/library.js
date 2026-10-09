@@ -82,7 +82,11 @@ async function upload(projectId, files, { conversationId, materialId, replaces }
   for (const [i, group] of groups.entries()) {
     const batch = added.lookup_run_id ? { batch: added.lookup_run_id } : {};
     try {
-      const answer = await send({ files: await Promise.all(group.map(readFile)), ...batch,
+      // Every file read, or failed, before the next upload's turn: a failure does not end it while others still read.
+      const read = await Promise.allSettled(group.map(readFile));
+      const failed = read.find((r) => r.status === 'rejected');
+      if (failed) throw failed.reason;
+      const answer = await send({ files: read.map((r) => r.value), ...batch,
         ...(i < groups.length - 1 ? { more: true } : {}) });
       added.materials.push(...answer.materials);
       added.lookup_run_id = answer.lookup_run_id ?? added.lookup_run_id;

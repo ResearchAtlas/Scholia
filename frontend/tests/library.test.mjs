@@ -380,6 +380,33 @@ test('uploads started together run one after another, so only one holds its file
   }
 });
 
+test('an upload whose file fails to read keeps its turn until its other files have read', async () => {
+  const realFetch = globalThis.fetch;
+  const realReader = globalThis.FileReader;
+  const events = [];
+  globalThis.FileReader = class { // bad.md fails at once, slow.md takes a while
+    readAsDataURL(blob) {
+      events.push(['read', blob.name]);
+      if (blob.name === 'bad.md') { setTimeout(() => { this.error = new Error('unreadable'); this.onerror(); }); return; }
+      setTimeout(() => { events.push(['read out', blob.name]); this.result = 'data:;base64,'; this.onload(); },
+        blob.name === 'slow.md' ? 50 : 0);
+    }
+  };
+  globalThis.fetch = async (path, init) => new Response(JSON.stringify({
+    materials: JSON.parse(init.body).files.map((f) => ({ id: f.name, existing: false })), lookup_run_id: null }), { status: 201 });
+  try {
+    const first = addFiles('p1', [new File(['# x'], 'bad.md'), new File(['# x'], 'slow.md')]);
+    const next = addFiles('p1', [new File(['# x'], 'next.md')]);
+    await assert.rejects(first);
+    assert.equal((await next).materials[0].id, 'next.md');
+    assert.deepEqual(events, [['read', 'bad.md'], ['read', 'slow.md'], ['read out', 'slow.md'],
+      ['read', 'next.md'], ['read out', 'next.md']]); // next.md is read only once slow.md is done
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.FileReader = realReader;
+  }
+});
+
 test('a conversation\'s questions read before a switch to another conversation never show in the new one', async () => {
   const realFetch = globalThis.fetch;
   const answers = {};
