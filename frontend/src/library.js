@@ -292,6 +292,25 @@ export function byPage(passages) {
   return pages;
 }
 
+// The pages of a PDF holding their rendered images: those near the view (within two screens of the
+// panel's scrolled view), at most MAX_HELD_PAGES, the ones around the middle of that stretch first.
+// Any other page lets its image go, and fetches it again (no-store) once it comes near.
+export const MAX_HELD_PAGES = 8;
+export function heldPages(near, limit = MAX_HELD_PAGES) {
+  const pages = [...near].sort((a, b) => a - b);
+  const first = Math.max(0, Math.floor((pages.length - limit) / 2));
+  return new Set(pages.slice(first, first + limit));
+}
+
+// The pages near the view once one page says whether it is: the same set when that changes nothing.
+export function withNear(near, page, isNear) {
+  if (near.has(page) === isNear) return near;
+  const next = new Set(near);
+  if (isNear) next.add(page);
+  else next.delete(page);
+  return next;
+}
+
 // A PDF page as a data URL: the request carries the session, which an <img> could not, and the
 // page's Content-Security-Policy admits data: images.
 export async function pageImage(versionId, number, scale = 1.5) {

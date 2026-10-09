@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -371,4 +371,16 @@ test('a lookup stopped says why by what it recorded: skipped on its question, st
   for (const key of ['library.source.declined', 'runs.stopped', 'library.source.projectChanged']) assert.ok(key in en && key in zh);
   // The background-run list follows the same rule.
   assert.deepEqual(runOutcome({ status: 'cancelled', cancel_reason: 'researcher', result: null }), { ok: false, key: 'runs.stopped' });
+});
+
+test('a long PDF holds the rendered images of the pages near the view only, a bounded number of them', () => {
+  let near = new Set();
+  for (let page = 1; page <= 3; page += 1) near = withNear(near, page, true); // the first screens
+  assert.deepEqual([...heldPages(near)], [1, 2, 3]);
+  const same = withNear(near, 2, true);
+  assert.equal(same, near); // a page reported near again changes nothing
+  for (let page = 1; page <= 30; page += 1) near = withNear(near, page, page >= 18 && page <= 30); // scrolled down
+  assert.deepEqual([...heldPages(near)].sort((a, b) => a - b), [20, 21, 22, 23, 24, 25, 26, 27]); // the middle of it
+  assert.equal(heldPages(near).size, MAX_HELD_PAGES);
+  assert.ok(!heldPages(near).has(1)); // a page far behind lets its image go
 });

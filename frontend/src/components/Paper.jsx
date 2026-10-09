@@ -4,14 +4,14 @@
 // them; every format also shows its passages as text, in order. The cited passage's highlight comes
 // with S1-19's citations; here a passage is highlighted while it is pointed at or focused, and Tab
 // reaches each passage, in the text and on the page.
-import { useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
-import { ACCEPT, byPage, changes, detailsOf, hovering, isPdf, isPointed, libraryChanged, loadPassages, NOT_POINTED,
-  pageImage, pointing, rectStyle, reasonKey, takeSaved, unionRect, validYear, viewOf } from '../library.js';
+import { ACCEPT, byPage, changes, detailsOf, heldPages, hovering, isPdf, isPointed, libraryChanged, loadPassages,
+  NOT_POINTED, pageImage, pointing, rectStyle, reasonKey, takeSaved, unionRect, validYear, viewOf, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -143,6 +143,9 @@ function Contents({ material }) {
   const [passages, setPassages] = useState(null);
   const [failed, setFailed] = useState(false);
   const [pointed, setPointed] = useState(NOT_POINTED); // the passages with focus and under the pointer
+  const [near, setNear] = useState(() => new Set()); // the pages within two screens of the view
+  const onNear = useCallback((page, isNear) => setNear((current) => withNear(current, page, isNear)), []);
+  const held = heldPages(near); // the pages holding their images: a bounded number, near the view
   const version = material.version.id;
   useEffect(() => {
     let live = true;
@@ -164,7 +167,7 @@ function Contents({ material }) {
         <div className="grid gap-4">
           {Array.from({ length: material.extraction.pages ?? 0 }, (_, i) => (
             <PageView key={i} version={version} number={i + 1} passages={byPage(passages).get(i + 1) ?? []}
-              pointed={pointed} onPoint={setPointed} />
+              pointed={pointed} onPoint={setPointed} held={held.has(i + 1)} onNear={onNear} />
           ))}
         </div>
       )}
@@ -173,30 +176,45 @@ function Contents({ material }) {
   );
 }
 
-// One PDF page, rendered when it comes into view, with the boxes of its passages over it.
-function PageView({ version, number, passages, pointed, onPoint }) {
+// The element that scrolls the page viewer: the root its pages are near or far from.
+function scroller(element) {
+  for (let node = element.parentElement; node; node = node.parentElement) {
+    if (/(auto|scroll)/.test(getComputedStyle(node).overflowY)) return node;
+  }
+  return null;
+}
+
+// One PDF page with the boxes of its passages over it: its image held only while held (near the
+// view, heldPages), fetched when it is and let go when it is not, its shape kept meanwhile.
+function PageView({ version, number, passages, pointed, onPoint, held, onNear }) {
   const t = useT();
   const frame = useRef(null);
   const [src, setSrc] = useState(null);
   const [failed, setFailed] = useState(false);
-  useEffect(() => {
+  const [aspect, setAspect] = useState(null); // its image's width over height, once one was shown
+  useEffect(() => { // says whether it is within two screens of the view, for as long as it is shown
     const element = frame.current;
-    if (!element || src) return undefined;
-    let live = true;
-    const show = () => pageImage(version, number).then((url) => live && setSrc(url))
-      .catch(() => live && setFailed(true));
-    if (typeof IntersectionObserver === 'undefined') { show(); return () => { live = false; }; }
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting)) { observer.disconnect(); show(); }
-    }, { rootMargin: '400px' });
+    if (!element) return undefined;
+    if (typeof IntersectionObserver === 'undefined') { onNear(number, true); return () => onNear(number, false); }
+    const observer = new IntersectionObserver((entries) => onNear(number, entries.some((entry) => entry.isIntersecting)),
+      { root: scroller(element), rootMargin: '200% 0px' });
     observer.observe(element);
-    return () => { live = false; observer.disconnect(); };
-  }, [version, number, src]);
+    return () => { observer.disconnect(); onNear(number, false); };
+  }, [number, onNear]);
+  useEffect(() => {
+    if (!held) { setSrc(null); return undefined; } // let go: fetched again (no-store) once it is near
+    if (src) return undefined;
+    let live = true;
+    pageImage(version, number).then((url) => live && setSrc(url)).catch(() => live && setFailed(true));
+    return () => { live = false; };
+  }, [held, src, version, number]);
   return (
     <figure ref={frame} className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs"
       aria-label={t('paper.page', { number })}>
-      {src ? <img src={src} alt={t('paper.page', { number })} className="block w-full" draggable={false} />
-        : <div className={cn('grid aspect-[612/792] place-items-center text-xs', failed ? 'text-destructive' : 'text-muted-foreground')}>
+      {src ? <img src={src} alt={t('paper.page', { number })} className="block w-full" draggable={false}
+        onLoad={(event) => setAspect(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />
+        : <div className={cn('grid place-items-center text-xs', !aspect && 'aspect-[612/792]', failed ? 'text-destructive' : 'text-muted-foreground')}
+          style={aspect ? { aspectRatio: aspect } : undefined}>
           {failed ? t('paper.pageFailed') : t('common.loading')}
         </div>}
       {src && passages.map((passage) => (passage.boxes?.rects ?? []).map((rect, i) => (
