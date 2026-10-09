@@ -1164,6 +1164,154 @@ async function s120(ctx) {
   });
 }
 
+// The parts of the window loaded when first opened (frontend/src/parts.js), on a window just loaded:
+// Escape while Settings loads closes it, and Settings opened from the keyboard lands focus in its
+// dialog; a part whose script is refused once by the browser says so where it would show, with Try
+// again, which reloads the window and loads it; a conversation read while the Markdown renderer
+// loads shows its answers formatted, scrolled to its end.
+async function parts(ctx) {
+  const { page, L, C, step, check, get } = ctx;
+  const { dialog, openSidebar } = navigation(ctx);
+  const composer = () => page.getByRole('textbox', { name: L('composer.label') });
+  const retry = (within) => within.getByRole('button', { name: L('common.retry'), exact: true });
+  const reload = async (refused) => {
+    if (refused) await page.route(`**/assets/${refused}-*.js`, (route) => route.abort(), { times: 1 });
+    await page.reload(); await composer().waitFor(); await page.waitForTimeout(500);
+  };
+  const openSettings = async () => {
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.settings') }).focus(); await page.keyboard.press('Enter');
+    await dialog().waitFor(); await page.waitForTimeout(800);
+  };
+  const pages = () => dialog().getByRole('button', { name: L('settings.page.general'), exact: true });
+  const focusInDialog = () => page.evaluate(() => Boolean(document.activeElement?.closest('[role=dialog]')));
+  const hold = async (name) => {  // its script's request waits until released
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    await page.route(`**/assets/${name}-*.js`, async (route) => { await held; await route.continue(); }, { times: 1 });
+    return release;
+  };
+
+  const loading = () => page.locator('p.sr-only[role=status]', { hasText: L('common.loading') });
+  const enterSettings = async () => {
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.settings') }).focus(); await page.keyboard.press('Enter');
+    await page.waitForTimeout(400);
+  };
+
+  await step('60-settings-first-open', async () => {
+    // A right-click and a Control-click while Settings loads leave it as they leave its dialog:
+    // still loading, then open.
+    let release = await hold('Settings');
+    await reload();
+    await enterSettings();
+    const corner = { x: 1, y: page.viewportSize().height - 2 };
+    await page.mouse.click(corner.x, corner.y, { button: 'right' });
+    await page.keyboard.down('Control'); await page.mouse.click(corner.x, corner.y); await page.keyboard.up('Control');
+    await page.waitForTimeout(300);
+    check('a right-click and a Control-click while Settings loads leave it loading', await loading().count() === 1);
+    release(); await dialog().waitFor(); await page.waitForTimeout(800);
+    check('and it then opens', await pages().isVisible());
+    await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+
+    release = await hold('Settings');
+    await reload();
+    await enterSettings();
+    check('while Settings loads, a status says so', await loading().count() === 1);
+    await page.evaluate(() => document.activeElement?.setAttribute('data-focused-before', ''));
+    await page.keyboard.press('Escape'); await page.waitForTimeout(300);
+    release(); await page.waitForTimeout(1500);
+    check('Escape while Settings loads closes it: it does not open once loaded', !(await dialog().count()));
+    check('and focus stays where it was', await page.evaluate(() => document.activeElement?.hasAttribute('data-focused-before') ?? false));
+    await page.evaluate(() => document.querySelector('[data-focused-before]')?.removeAttribute('data-focused-before'));
+    await openSettings();
+    check('Settings opened from the keyboard on a window just loaded shows its pages', await pages().isVisible());
+    check('and focus is in its dialog', await focusInDialog());
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+
+  await step('61-settings-not-loaded', async () => {
+    await reload('Settings');
+    await openSettings();
+    check('Settings that cannot load says so in its dialog', await dialog().getByText(L('errors.part_not_loaded')).isVisible());
+    check('with Try again, and focus in the dialog', await retry(dialog()).isVisible() && await focusInDialog());
+  });
+  await step('62-settings-retried', async () => {
+    await Promise.all([page.waitForEvent('load'), retry(dialog()).click()]);
+    await composer().waitFor();
+    await openSettings();
+    check('Try again reloads the window, and Settings then loads', await pages().isVisible()
+      && !(await dialog().getByText(L('errors.part_not_loaded')).count()));
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+
+  if (!C.materials) return;  // an attached app has no synthetic papers
+  await step('63-paper-not-loaded', async () => {
+    await reload('Paper');
+    const panel = page.getByRole('complementary', { name: L('panel.library') });
+    if (!(await panel.count())) await page.getByRole('button', { name: L('panel.library'), exact: true }).click();
+    await panel.getByRole('button', { name: 'A Codebook for Synthetic Interviews', exact: true }).click();
+    await panel.getByText(L('errors.part_not_loaded')).waitFor();
+    check('a paper whose page cannot load says so in the panel, with Try again', await retry(panel).isVisible());
+    // The browser remembers the refused script for the page's life: Try again reloads the window, so
+    // the flows after this one start on a window whose parts load.
+    await Promise.all([page.waitForEvent('load'), retry(panel).click()]);
+    await composer().waitFor(); await page.waitForTimeout(500);
+    check('Try again reloads the window', await composer().isVisible());
+  });
+
+  // A conversation of four answers in the walkthrough's project, through the API, so it fills more
+  // than the view; it is deleted after, so the flows after this one find the project as it was.
+  const asked = [1, 2, 3, 4].map((n) => `${C.question} (${n})`);
+  let conversation;
+  const view = page.locator('section', { has: page.locator('#composer') });
+  const failures = () => view.getByText(L('errors.part_not_loaded'));
+  // The view fills more than its height and comes to show its end (its scroll is smooth: waited for,
+  // up to 5 s; a view that scrolled before its answers took their height never gets there).
+  const atEnd = () => page.waitForFunction(() => {
+    const box = document.getElementById('composer').closest('section').querySelector('.overflow-y-auto');
+    const end = box.firstElementChild.lastElementChild;  // the marker after the turns, before the bottom padding
+    return box.scrollHeight > box.clientHeight && end.getBoundingClientRect().bottom <= box.getBoundingClientRect().bottom + 2;
+  }, null, { timeout: 5000 }).then(() => true, () => false);
+  await step('64-answers-not-loaded', async () => {
+    await page.route('**/assets/markdown-*.js', (route) => route.abort(), { times: 1 });
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+    await page.getByRole('menuitem', { name: C.project, exact: true }).click(); await page.waitForTimeout(800);
+    const close = page.getByRole('button', { name: L('panel.close') });  // the answers in view, in either layout
+    if (await close.count()) { await close.click(); await page.waitForTimeout(500); }
+    await view.getByText(asked[3]).waitFor(); await page.waitForTimeout(800);
+    check('a conversation whose Markdown renderer cannot load still shows its turns',
+      (await Promise.all(asked.map((text) => view.getByText(text).count()))).every((count) => count === 1)
+      && !(await view.getByText(L('conversation.loadFailed')).count()));
+    check('each answer says it could not be loaded, with Try again', await failures().count() === 4 && await retry(view).count() === 4);
+    check('and the conversation is scrolled to its end', await atEnd());
+  }, async () => {
+    const projectId = (await get('/api/projects')).body.projects.find((p) => p.name === C.project).id;
+    conversation = (await get('/api/conversations', { method: 'POST', body: JSON.stringify({ project_id: projectId }) })).body.id;
+    for (const content of asked) {
+      await get(`/api/conversations/${conversation}/message/stream`, { method: 'POST', body: JSON.stringify({ content }) });
+    }
+    const turns = (await get(`/api/conversations/${conversation}`)).body.turns;
+    if (turns.filter((turn) => turn.status === 'succeeded' && turn.answer?.text).length !== 4) throw new Error('the four answers were not saved');
+  });
+  await step('64b-answers-retried', async () => {
+    const release = await hold('markdown');
+    await Promise.all([page.waitForEvent('load'), retry(view).first().click()]);
+    await composer().waitFor(); await page.waitForTimeout(1000);
+    check('while the renderer loads, the conversation is still loading: no answer shows unformatted',
+      await view.getByRole('status').filter({ hasText: L('common.loading') }).count() === 1 && !(await view.getByText(asked[0]).count()));
+    release();
+    await view.locator('.prose-answer ol').nth(3).waitFor(); await page.waitForTimeout(1500);
+    check('Try again reloads the window, and the answers then show formatted',
+      await view.locator('.prose-answer ol li strong').count() === 8 && await view.locator('.prose-answer blockquote').count() === 4
+      && !(await view.getByText('**Prospective**').count()) && !(await failures().count()));
+    check('the reopened conversation is scrolled to its end', await atEnd());
+  });
+  if ((await get(`/api/conversations/${conversation}`, { method: 'DELETE' })).status >= 300) throw new Error('the conversation was not deleted');
+  await page.reload(); await composer().waitFor(); await page.waitForTimeout(500);
+}
+
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
 // of its animations, read with them paused (Web Animations API). The box shows the composed
 // motion, whichever properties (transform, translate) carry it.
@@ -1510,7 +1658,8 @@ async function run(combo, build, outRoot) {
     await m1(ctx);
     if (server) await s116(ctx);  // its synthetic model and download source are the test server's
     if (C.materials) await materials(ctx);  // an attached app has no synthetic materials of its own
-    if (C.materials) await s120(ctx);  // S1-20: OCR of a scanned page
+    await parts(ctx);  // on the materials flow's window and project, as it was written for
+    if (C.materials) await s120(ctx);  // S1-20: OCR of a scanned page; it sets up its own project and panel
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);

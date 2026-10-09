@@ -18,7 +18,7 @@ import { Divider } from './Divider.jsx';
 import { Sidebar } from './Sidebar.jsx';
 import { ConversationView } from './ConversationView.jsx';
 import { SidePanel } from './SidePanel.jsx';
-import { Settings } from './Settings.jsx';
+import { Settings } from './Parts.jsx';
 import { cn } from '@/lib/utils';
 
 const CURRENT = 'scholia.project';

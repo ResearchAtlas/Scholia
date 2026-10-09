@@ -73,6 +73,11 @@ jobs:
         run: npm ci
       - name: Tests
         run: node --test
+      - name: Build
+        run: npm run build
+      # docs/interface-criteria.md, Performance: the script loaded at start stays under 600 kB minified.
+      - name: Interface script size
+        run: node ../tools/script_size.mjs dist
 
   package:
     name: Packaged build and license audit

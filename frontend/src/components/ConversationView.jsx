@@ -5,7 +5,7 @@
 // added to the project's Library, and the questions their lookups ask are shown here (F3a,
 // section 6.2: a confirmation appears where its work started).
 import { useCallback, useContext, useEffect, useRef, useState } from 'react';
-import Markdown from 'react-markdown';
+import { Markdown, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
@@ -69,7 +69,9 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const load = useCallback(async () => { // whether the conversation was read
     if (!id) return false;
     try {
-      setTurns((await get(`/api/conversations/${id}`)).turns);
+      // The Markdown renderer loads beside the first read, so answers show formatted with their turns.
+      const [read] = await Promise.all([get(`/api/conversations/${id}`), markdownReady()]);
+      setTurns(read.turns);
       setFailed(false);
       return true;
     } catch {

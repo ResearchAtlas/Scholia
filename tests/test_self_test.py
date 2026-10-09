@@ -34,6 +34,21 @@ def test_the_interface_check_serves_the_page_and_what_it_names(tmp_path):
         st.check_interface(tmp_path / "missing")
 
 
+def test_the_interface_check_serves_every_script_the_page_s_scripts_import(tmp_path):
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets/app.js").write_text('import{a}from"./shared.js";const p=()=>import("./Settings-x1.js");')
+    (tmp_path / "assets/shared.js").write_text("export const a=1;")
+    (tmp_path / "assets/Settings-x1.js").write_text('import{a}from"./app.js";import"./textarea-x2.js";')
+    (tmp_path / "assets/textarea-x2.js").write_text("export const t=1;")
+    (tmp_path / "assets/app.css").write_text("body{}")
+    page = '<script type="module" src="/assets/app.js"></script><link href="/assets/app.css"><div id="root"></div>'
+    (tmp_path / "index.html").write_text(page)
+    assert st.check_interface(tmp_path) == {"assets": 5}
+    (tmp_path / "assets/textarea-x2.js").unlink()  # a part's chunk left out of the bundle
+    with pytest.raises(RuntimeError, match="textarea-x2.js is not served"):
+        st.check_interface(tmp_path)
+
+
 def test_the_materials_check_reads_a_pdf_and_latex_and_renders_a_page():
     from backend import extraction
     assert st.check_materials() == {"pdf": extraction.extractor_of(extraction.PDF)[1], "latex": "latex-2+pylatexenc-2.11"}
