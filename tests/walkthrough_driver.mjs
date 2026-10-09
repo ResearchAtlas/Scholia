@@ -592,18 +592,19 @@ async function materials(ctx) {
     const read = (request) => { if (request.url().includes('/passages?')) reads.push(new URL(request.url()).searchParams); };
     page.on('request', read);
     await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
-    await page.getByTestId('library-files').setInputFiles(files('long-notes.md'));
-    const long = (await settled(projectId, 8)).materials.find((m) => m.title === 'long-notes');
+    await page.getByTestId('library-files').setInputFiles(files('long-notes.md', 'crowded-page.pdf'));
+    const long = (await settled(projectId, 9)).materials.find((m) => m.title === 'long-notes');
     await paper('long-notes').click(); // named by its file: it has no identifier to look up
     const list = panel().getByRole('list', { name: L('paper.passages'), exact: true });
     const passage = (n) => list.getByText(`Paragraph ${n} of the long synthetic notes, written for the walkthrough.`, { exact: true });
     await passage(1).waitFor({ timeout: 20000 });
     const shown = () => list.locator('[data-passage]').count();
-    const toEnd = () => page.evaluate(() => { // the panel's scrolling element, scrolled to its end
+    const scrolled = (end) => page.evaluate((toEnd) => { // the panel's scrolling element, scrolled to its start or end
       let node = document.querySelector('aside [role="list"]');
       while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
-      node.scrollTop = node.scrollHeight;
-    });
+      node.scrollTop = toEnd ? node.scrollHeight : 0;
+    }, end);
+    const toEnd = () => scrolled(true);
     check('it is read into 3,001 passages', long?.extraction.passages === 3001);
     const first = await shown();
     check('at first only the stretches near the view are read and shown', first > 0 && first <= 300
@@ -625,8 +626,61 @@ async function materials(ctx) {
       && await passage(150).count() === 1 && await passage(250).count() === 0);
     const last = await shown();
     check('at most nine stretches are held at once', last <= 900);
+    check('each passage says where it is in the whole text', await passage(3000).evaluate((element) => {
+      const item = element.closest('[role="listitem"]');
+      return item.getAttribute('aria-posinset') === '3001' && item.getAttribute('aria-setsize') === '3001';
+    }));
+    // A selection across stretches keeps them while it lasts, so a copy leaves none of its passages out.
+    await scrolled(false);
+    await passage(5).waitFor();
+    await page.evaluate(([from, to]) => {
+      const item = (text) => [...document.querySelectorAll('aside [role="listitem"]')].find((e) => e.textContent.includes(text));
+      const range = document.createRange();
+      range.setStartBefore(item(from));
+      range.setEndAfter(item(to));
+      document.getSelection().removeAllRanges();
+      document.getSelection().addRange(range);
+    }, ['Paragraph 5 of', 'Paragraph 120 of']);
+    await page.waitForTimeout(500);
+    await toEnd();
+    await passage(3000).waitFor();
+    await page.waitForTimeout(500);
+    const selected = await page.evaluate(() => document.getSelection().toString());
+    check('scrolled away, the selected stretches stay with all their text', await passage(5).count() === 1
+      && selected.includes('Paragraph 5 of') && selected.includes('Paragraph 99 of') && selected.includes('Paragraph 120 of'));
+    await page.evaluate(() => document.getSelection().removeAllRanges());
+    await page.waitForTimeout(500);
+    check('and are let go once nothing is selected', await passage(5).count() === 0);
     page.off('request', read);
     ctx.current().measured = { passages: long?.extraction.passages, shownAtFirst: first, shownAtEnd: last, reads: reads.length };
+  });
+
+  await step('28d-crowded-page', async () => {
+    // A PDF page of 220 passages shows 200 at a time; a button in Tab's order goes on to the others, passing focus on.
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    await paper('crowded-page').click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded();
+    const figure = panel().locator('figure').first();
+    const regions = figure.locator('[data-passage]');
+    await regions.first().waitFor({ timeout: 20000 });
+    const focused = () => page.evaluate(() => document.activeElement?.getAttribute('aria-label') ?? '');
+    const later = figure.getByRole('button', { name: L('paper.laterPassages'), exact: true });
+    const earlier = figure.getByRole('button', { name: L('paper.earlierPassages'), exact: true });
+    check('the page shows its first 200 passages, and offers the later ones', await regions.count() === 200 && await later.count() === 1);
+    await regions.last().focus();
+    await page.keyboard.press('Tab');
+    check('Tab goes from its last passage to the later ones', await later.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('which show in their place, focus on the first of them', await regions.count() === 20
+      && (await focused()).startsWith('Item 600.'));
+    check('highlighted as when pointed at', await figure.locator('span[title][class*="bg-brand/25"]').count() > 0);
+    await page.keyboard.press('Shift+Tab');
+    check('Shift+Tab reaches the earlier ones', await earlier.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('and goes back to them, focus on the last of them', await regions.count() === 200
+      && (await focused()).startsWith('Item 597.'));
   });
 
   await step('29-details-saved', async () => {

@@ -1,7 +1,8 @@
 // Components' handlers and render work, checked in their source parsed with ESLint's parser: files
 // dropped in the docked Library are imported once, by the Library, and the window's drop overlay
 // goes with the drop; each read of a paper's text made for a part near the view (a page's image,
-// its passages, a stretch of passages) goes when the part is let go; a button that starts work is disabled while its request is pending (React applies that before it
+// its passages, a stretch of passages) goes when the part is let go; each passage of the text says
+// where it is in the whole; a button that starts work is disabled while its request is pending (React applies that before it
 // handles the next click, so a double click sends one request); the Library says it is adding while
 // any upload is still to finish.
 import test from 'node:test';
@@ -119,7 +120,7 @@ test('the check finds a button its pending request does not disable', () => {
 });
 
 // The reads of a paper's text each effect makes, and whether that effect's cleanup aborts them.
-const READS = ['pageImage', 'pagePassages', 'passageStretch'];
+const READS = ['pageImage', 'pagePart', 'passageStretch'];
 function textReads(text) {
   return parsed(text, (context, found) => ({
     CallExpression(call) {
@@ -148,4 +149,21 @@ function addingFrom(text) {
 
 test('the Library says it is adding while any upload is still to finish, not only until the first one ends', () => {
   assert.equal(addingFrom(source('Library.jsx')), 'useSyncExternalStore(watchUploads, uploadsWaiting) > 0');
+});
+
+// The aria-posinset and aria-setsize of each element whose role is listitem, as source text.
+function positions(text) {
+  return parsed(text, (context, found) => ({
+    JSXOpeningElement(element) {
+      const attribute = (name) => element.attributes.find((a) => a.name?.name === name);
+      if (attribute('role')?.value?.value !== 'listitem') return;
+      (found.items ??= []).push(['aria-posinset', 'aria-setsize'].map((name) => (attribute(name)
+        ? context.sourceCode.getText(attribute(name).value.expression) : null)));
+    },
+  })).items ?? [];
+}
+
+test('each passage of the text says where it is in the whole text, as only the stretches held are in the page', () => {
+  assert.deepEqual(positions(source('Paper.jsx')), [['passage.ordinal + 1', 'count']]);
+  assert.deepEqual(positions('const C = () => <div role="listitem" />;'), [[null, null]]);
 });

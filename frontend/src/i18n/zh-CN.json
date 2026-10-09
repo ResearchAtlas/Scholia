@@ -349,6 +349,8 @@
   "paper.loadFailed": "无法加载段落。",
   "paper.page": "第 {number} 页",
   "paper.pageFailed": "无法显示这一页。",
+  "paper.earlierPassages": "本页前面的段落",
+  "paper.laterPassages": "本页后面的段落",
   "paper.kind.title": "标题",
   "paper.kind.abstract": "摘要",
   "paper.kind.table": "表格",

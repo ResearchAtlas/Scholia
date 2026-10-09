@@ -338,17 +338,14 @@ export async function readAsks(asked, conversationId, show) {
 }
 
 // The text view shows a version's passages a stretch at a time, each read when it comes near the view
-// and let go when it leaves (heldPages): the stretch's passages and the section the one before it is
-// in, so its first heading shows as it does in the whole text. A section's path is never empty once
-// a heading has begun one, so the passage just before says which section a stretch continues.
+// and let go when it leaves (heldPages): the stretch's passages and the section the passages before
+// it end in (the API's section: the last path before it that is not empty, as a title's is), so its
+// first heading shows as it does in the whole text.
 export const PASSAGE_STRETCH = 100;
 export async function passageStretch(versionId, index, signal) {
-  const first = index * PASSAGE_STRETCH;
-  const from = Math.max(0, first - 1);
-  const found = await get(`/api/material-versions/${encodeURIComponent(versionId)}/passages?offset=${from}`
-    + `&limit=${first - from + PASSAGE_STRETCH}`, { signal });
-  const before = from < first ? found.passages.shift() : null;
-  return { passages: found.passages, before: before ? before.section_path.join(' › ') : null };
+  const found = await get(`/api/material-versions/${encodeURIComponent(versionId)}/passages`
+    + `?offset=${index * PASSAGE_STRETCH}&limit=${PASSAGE_STRETCH}`, { signal });
+  return { passages: found.passages, before: found.section?.join(' › ') || null };
 }
 
 // The section heading over each passage: its section's path where that differs from the section
@@ -363,29 +360,60 @@ export function headings(passages, before = null) {
   });
 }
 
-// The passages on one page of a PDF, for the page viewer: read when its page comes near the view.
-export async function pagePassages(versionId, number, signal) {
-  const all = [];
-  for (let offset = 0; ; offset += 500) {
-    const found = await get(`/api/material-versions/${encodeURIComponent(versionId)}/passages?page=${number}`
-      + `&offset=${offset}&limit=500`, { signal });
-    all.push(...found.passages);
-    if (found.passages.length < 500) return all;
-  }
+// A PDF page shows its passages PAGE_PART at a time (most pages have fewer): the part asked for, and
+// whether more follow it on the page. Each part draws the line boxes of its passages up to
+// PAGE_LINES of them (pageLines); a passage past that is drawn as the one box around its lines.
+export const PAGE_PART = 200;
+export const PAGE_LINES = 2000;
+export async function pagePart(versionId, number, part, signal) {
+  const found = await get(`/api/material-versions/${encodeURIComponent(versionId)}/passages?page=${number}`
+    + `&offset=${part * PAGE_PART}&limit=${PAGE_PART + 1}`, { signal });
+  return { passages: found.passages.slice(0, PAGE_PART), more: found.passages.length > PAGE_PART };
+}
+
+// Each passage's line boxes to draw, in order, while they fit in budget; null for each from the
+// first that does not fit on.
+export function pageLines(passages, budget = PAGE_LINES) {
+  let left = budget;
+  return passages.map((passage) => {
+    const rects = passage.boxes?.rects ?? [];
+    if (rects.length > left) left = -1;
+    if (left < 0) return null;
+    left -= rects.length;
+    return rects;
+  });
 }
 
 // The parts of a paper's text that hold what they show (a PDF's pages their images and passages, the
 // text view's stretches their passages): those near the view (within two screens of the panel's
 // scrolled view), at most MAX_HELD_PAGES, the ones around the middle of that stretch first, and the
-// one holding focus wherever it is, so focus never goes with its passage. Any other part lets what it
-// holds go, and fetches it again (no-store) once it comes near.
+// kept ones wherever they are: the one holding focus, so focus never goes with its passage, and
+// those the reader's selection takes in (selectedParts), so a copy never leaves passages out. Any
+// other part lets what it holds go, and fetches it again (no-store) once it comes near.
 export const MAX_HELD_PAGES = 8;
-export function heldPages(near, within = null, limit = MAX_HELD_PAGES) {
+export function heldPages(near, kept = [], limit = MAX_HELD_PAGES) {
   const pages = [...near].sort((a, b) => a - b);
   const first = Math.max(0, Math.floor((pages.length - limit) / 2));
   const held = new Set(pages.slice(first, first + limit));
-  if (within != null) held.add(within);
+  for (const part of kept) if (part != null) held.add(part);
   return held;
+}
+
+// The parts among those shown (elements with their data-part) that the selection takes in, wholly
+// or in part.
+export function selectedParts(selection, shown) {
+  if (!selection?.rangeCount || selection.isCollapsed) return [];
+  return shown.filter((element) => selection.containsNode(element, true)).map((element) => Number(element.dataset.part));
+}
+
+// Where focus goes once a part shows what it was asked for (its passages read, or another part of a
+// page's), when focus was on the part itself waiting for them: its first passage, or its last when
+// it came back from after it. Nowhere once focus has left the part: entering is cleared then, and
+// focus is checked to be on it still.
+export function passOn(part, active, entering) {
+  if (!entering || !part || active !== part) return null;
+  const passages = part.querySelectorAll('[data-passage]');
+  return (entering === 'last' ? passages[passages.length - 1] : passages[0]) ?? null;
 }
 
 // The parts near the view once one says whether it is: the same set when that changes nothing.

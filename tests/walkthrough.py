@@ -111,6 +111,8 @@ def write_materials():
         "damaged.pdf": b"%PDF-1.7\n" + b"\x00 not a whole PDF " * 40,
         "interview-codebook.md": f"# Interview Codebook\n\ndoi:{DOIS['local']}\n\nSynthetic codes only.\n".encode(),
         "long-notes.md": long_notes(),
+        "crowded-page.pdf": synthetic_materials.pdf(  # one page of 220 passages, a line of three items each
+            [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]]),
     }
     for name, data in files.items():
         (folder / name).write_bytes(data)

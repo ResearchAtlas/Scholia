@@ -11,8 +11,8 @@ import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageImage,
-  pagePassages, PASSAGE_STRETCH, passageStretch, pointing, rectStyle, reasonKey, takeSaved, unionRect, validYear, viewOf,
-  withNear } from '../library.js';
+  pageLines, pagePart, passOn, PASSAGE_STRETCH, passageStretch, pointing, rectStyle, reasonKey, selectedParts, takeSaved,
+  unionRect, validYear, viewOf, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -165,13 +165,23 @@ function Contents({ material }) {
   );
 }
 
-// The parts that hold what they show: those near the view and the one holding focus (heldPages).
-function useHeld() {
+// The parts of a list (list, a ref to its element) that hold what they show: those near the view,
+// the one holding focus and the shown ones the reader's selection takes in (heldPages).
+function useHeld(list) {
   const [near, setNear] = useState(() => new Set()); // the parts within two screens of the view
   const [within, setWithin] = useState(null); // the part holding focus
+  const [selected, setSelected] = useState([]); // the shown parts the selection takes in
   const onNear = useCallback((part, isNear) => setNear((current) => withNear(current, part, isNear)), []);
   const onWithin = useCallback((part, inside) => setWithin((current) => (inside ? part : current === part ? null : current)), []);
-  return { held: heldPages(near, within), onNear, onWithin };
+  useEffect(() => {
+    const changed = () => {
+      const found = list.current ? selectedParts(document.getSelection(), [...list.current.querySelectorAll('[data-part][data-shown]')]) : [];
+      setSelected((current) => (current.join() === found.join() ? current : found));
+    };
+    document.addEventListener('selectionchange', changed);
+    return () => document.removeEventListener('selectionchange', changed);
+  }, [list]);
+  return { held: heldPages(near, [within, ...selected]), onNear, onWithin };
 }
 
 // The element that scrolls the paper's text: the root its parts are near or far from.
@@ -182,13 +192,15 @@ function scroller(element) {
   return null;
 }
 
-// A part of the text (a page, a stretch of passages): says whether it is within two screens of the
-// view for as long as it is shown, and whether focus is in it. While its passages are not shown it
-// takes Tab's focus in their place; once they show, it passes focus on to the first of them, or to
-// the last when focus came back from after it, so Tab reaches every passage in order. Returns the
-// props of its element.
-function usePart(frame, part, shown, onNear, onWithin) {
+// A part of the text (a page, a stretch of passages), showing what showing names (null while it
+// shows nothing): says whether it is within two screens of the view for as long as it is shown, and
+// whether focus is in it. While its passages are not shown it takes Tab's focus in their place; once
+// they show, it passes focus on to the first of them, or to the last when focus came back from after
+// it (passOn), so Tab reaches every passage in order. focusOn(where) asks the same of what it shows
+// next. Focus that leaves it meanwhile stays where it went. Returns its element's props and focusOn.
+function usePart(frame, part, showing, onNear, onWithin) {
   const entering = useRef(null);
+  const shown = showing != null;
   useEffect(() => {
     const element = frame.current;
     if (!element) return undefined;
@@ -199,13 +211,14 @@ function usePart(frame, part, shown, onNear, onWithin) {
     return () => { observer.disconnect(); onNear(part, false); };
   }, [frame, part, onNear]);
   useEffect(() => {
-    if (!shown || !entering.current) return;
-    const passages = frame.current?.querySelectorAll('[data-passage]') ?? [];
-    (entering.current === 'last' ? passages[passages.length - 1] : passages[0])?.focus();
+    if (!shown) return;
+    passOn(frame.current, document.activeElement, entering.current)?.focus();
     entering.current = null;
-  }, [frame, shown]);
-  return {
-    tabIndex: shown ? undefined : 0,
+  }, [frame, shown, showing]);
+  const props = {
+    tabIndex: shown ? -1 : 0, // shown, it keeps focus given to it until its passages take it, out of Tab's way
+    'data-part': part,
+    'data-shown': shown ? '' : undefined,
     onFocus: (event) => {
       onWithin(part, true);
       if (shown || event.target !== event.currentTarget) return;
@@ -213,15 +226,21 @@ function usePart(frame, part, shown, onNear, onWithin) {
       entering.current = from && event.currentTarget.compareDocumentPosition(from) & Node.DOCUMENT_POSITION_FOLLOWING
         ? 'last' : 'first';
     },
-    onBlur: (event) => { if (!event.currentTarget.contains(event.relatedTarget)) onWithin(part, false); },
+    onBlur: (event) => {
+      if (event.target === event.currentTarget) entering.current = null; // left before its passages came
+      if (!event.currentTarget.contains(event.relatedTarget)) onWithin(part, false);
+    },
   };
+  const focusOn = (where) => { entering.current = where; frame.current?.focus(); };
+  return [props, focusOn];
 }
 
 // A PDF's pages, each holding its image and its passages only while it is held.
 function PageList({ version, pages, pointed, onPoint }) {
-  const { held, onNear, onWithin } = useHeld();
+  const list = useRef(null);
+  const { held, onNear, onWithin } = useHeld(list);
   return (
-    <div className="grid gap-4">
+    <div ref={list} className="grid gap-4">
       {Array.from({ length: pages }, (_, i) => (
         <PageView key={i} version={version} number={i + 1} pointed={pointed} onPoint={onPoint}
           held={held.has(i + 1)} onNear={onNear} onWithin={onWithin} />
@@ -230,27 +249,33 @@ function PageList({ version, pages, pointed, onPoint }) {
   );
 }
 
-// One PDF page with the boxes of its passages over it: its image and its passages held only while
-// held (near the view or holding focus, heldPages), fetched when it is and let go when it is not, its
-// shape kept meanwhile.
+// One PDF page with the boxes of its passages over it: its image and a part of its passages
+// (PAGE_PART, most pages have fewer) held only while held (near the view or holding focus,
+// heldPages), fetched when it is and let go when it is not, its shape kept meanwhile. A page of more
+// has a button to the part before and one to the part after, in Tab's order, each passing focus on
+// to that part's passages; the line boxes a part draws are bounded (pageLines).
 function PageView({ version, number, pointed, onPoint, held, onNear, onWithin }) {
   const t = useT();
   const frame = useRef(null);
-  const [shown, setShown] = useState(null); // { src, passages }
+  const [part, setPart] = useState(0); // which part of its passages it shows
+  const [shown, setShown] = useState(null); // { src, part, passages, more }
   const [failed, setFailed] = useState(false);
   const [aspect, setAspect] = useState(null); // its image's width over height, once one was shown
-  const part = usePart(frame, number, Boolean(shown), onNear, onWithin);
+  const [props, focusOn] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
   useEffect(() => {
     if (!held) { setShown(null); return undefined; } // let go: fetched again (no-store) once it is near
-    if (shown) return undefined;
+    if (shown?.part === part) return undefined;
     let live = true;
     const controller = new AbortController(); // let go before they came: its requests go too
-    Promise.all([pageImage(version, number, 1.5, controller.signal), pagePassages(version, number, controller.signal)])
-      .then(([src, passages]) => live && setShown({ src, passages })).catch(() => live && setFailed(true));
+    Promise.all([shown?.src ?? pageImage(version, number, 1.5, controller.signal), pagePart(version, number, part, controller.signal)])
+      .then(([src, found]) => live && setShown({ src, part, ...found })).catch(() => live && setFailed(true));
     return () => { live = false; controller.abort(); };
-  }, [held, shown, version, number]);
+  }, [held, shown, version, number, part]);
+  const lines = shown && pageLines(shown.passages);
+  const go = (to, where) => { focusOn(where); setPart(to); };
+  const button = 'absolute left-2 z-10 rounded bg-black/60 px-2 py-0.5 text-[11px] text-white outline-hidden focus-visible:ring-2 focus-visible:ring-ring';
   return (
-    <figure ref={frame} {...part}
+    <figure ref={frame} {...props}
       className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
       aria-label={t('paper.page', { number })}>
       {shown ? <img src={shown.src} alt={t('paper.page', { number })} className="block w-full" draggable={false}
@@ -259,20 +284,27 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
           style={aspect ? { aspectRatio: aspect } : undefined}>
           {failed ? t('paper.pageFailed') : t('common.loading')}
         </div>}
-      {shown?.passages.map((passage) => (passage.boxes?.rects ?? []).map((rect, i) => (
+      {shown?.part > 0 && <button type="button" className={cn(button, 'top-2')}
+        onClick={() => go(shown.part - 1, 'last')}>{t('paper.earlierPassages')}</button>}
+      {shown?.passages.map((passage, n) => (lines[n] ?? []).map((rect, i) => (
         <span key={`${passage.id}:${i}`} aria-hidden="true" title={passage.text}
           {...hovering(passage.id, onPoint)}
           className={cn('absolute rounded-[2px] transition-colors duration-150',
             isPointed(pointed, passage.id) ? 'bg-brand/25 ring-1 ring-brand/60' : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
           style={rectStyle(rect)} />
       )))}
-      {/* One focusable region per passage, around its lines: the keyboard's way to it, with the same highlight. */}
-      {shown?.passages.filter((passage) => passage.boxes?.rects?.length).map((passage) => (
+      {/* One focusable region per passage, around its lines: the keyboard's way to it, with the same
+          highlight; the pointer's too, for a passage whose lines are not drawn. */}
+      {shown?.passages.map((passage, n) => passage.boxes?.rects?.length > 0 && (
         <span key={passage.id} role="note" aria-label={passage.text} data-passage={passage.id}
-          {...pointing(passage.id, onPoint)}
-          className="pointer-events-none absolute rounded-[3px] outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+          {...pointing(passage.id, onPoint)} title={lines[n] ? undefined : passage.text}
+          className={cn('absolute rounded-[3px] outline-hidden focus-visible:ring-2 focus-visible:ring-ring',
+            lines[n] ? 'pointer-events-none' : isPointed(pointed, passage.id) ? 'bg-brand/25 ring-1 ring-brand/60'
+              : 'bg-brand/10 ring-1 ring-brand/20 hover:bg-brand/20')}
           style={rectStyle(unionRect(passage.boxes.rects))} />
       ))}
+      {shown?.more && <button type="button" className={cn(button, 'bottom-2')}
+        onClick={() => go(shown.part + 1, 'first')}>{t('paper.laterPassages')}</button>}
       <figcaption className="absolute bottom-1 right-2 rounded bg-black/50 px-1.5 text-[11px] text-white">{number}</figcaption>
     </figure>
   );
@@ -291,11 +323,12 @@ const KIND_STYLES = {
 // PASSAGE_STRETCH at a time, each holding its passages only while it is held.
 function PassageList({ version, count, pointed, onPoint }) {
   const t = useT();
-  const { held, onNear, onWithin } = useHeld();
+  const list = useRef(null);
+  const { held, onNear, onWithin } = useHeld(list);
   return (
-    <div role="list" className="grid gap-3" aria-label={t('paper.passages')}>
+    <div ref={list} role="list" className="grid gap-3" aria-label={t('paper.passages')}>
       {Array.from({ length: Math.ceil(count / PASSAGE_STRETCH) }, (_, i) => (
-        <PassageStretch key={i} version={version} index={i} size={Math.min(PASSAGE_STRETCH, count - i * PASSAGE_STRETCH)}
+        <PassageStretch key={i} version={version} index={i} count={count}
           pointed={pointed} onPoint={onPoint} held={held.has(i)} onNear={onNear} onWithin={onWithin} />
       ))}
     </div>
@@ -303,14 +336,16 @@ function PassageList({ version, count, pointed, onPoint }) {
 }
 
 // One stretch of the passages: read when it is held and let go when it is not, its height kept
-// meanwhile (estimated until it was first shown).
-function PassageStretch({ version, index, size, pointed, onPoint, held, onNear, onWithin }) {
+// meanwhile (estimated until it was first shown). Each passage says where it is in the whole text
+// (aria-posinset of aria-setsize), as only the stretches held are in the page.
+function PassageStretch({ version, index, count, pointed, onPoint, held, onNear, onWithin }) {
   const t = useT();
   const frame = useRef(null);
   const [shown, setShown] = useState(null); // { passages, before }
   const [failed, setFailed] = useState(false);
   const [height, setHeight] = useState(null); // as it was last shown
-  const part = usePart(frame, index, Boolean(shown), onNear, onWithin);
+  const [part] = usePart(frame, index, shown && index, onNear, onWithin);
+  const size = Math.min(PASSAGE_STRETCH, count - index * PASSAGE_STRETCH);
   useEffect(() => {
     if (!held) { setShown(null); return undefined; }
     if (shown) return undefined;
@@ -326,6 +361,7 @@ function PassageStretch({ version, index, size, pointed, onPoint, held, onNear, 
       style={shown ? undefined : { height: height ?? size * 64 }}>
       {shown ? shown.passages.map((passage, i) => (
         <div role="listitem" key={passage.id} data-passage={passage.id} {...pointing(passage.id, onPoint)}
+          aria-posinset={passage.ordinal + 1} aria-setsize={count}
           className="grid gap-1.5 rounded-md outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
           {over[i] && <p className="pt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{over[i]}</p>}
           <div className={cn('rounded-md px-2 py-1 transition-colors duration-150', isPointed(pointed, passage.id) && 'bg-brand-soft')}>
