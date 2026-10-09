@@ -192,6 +192,26 @@ _responsible = ctypes.CDLL("/usr/lib/libSystem.B.dylib").responsibility_get_pid_
 _responsible.argtypes, _responsible.restype = [ctypes.c_int], ctypes.c_int
 
 
+_libsystem = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+_libsystem.sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+
+
+def sandboxed() -> bool:
+    """Whether this process runs under a sandbox profile (sandbox-exec), by sandbox_check."""
+    return _libsystem.sandbox_check(os.getpid(), None, 0) == 1
+
+
+def network_isolation() -> str:
+    """What kept a desktop run's network on this Mac, for its results."""
+    snapshot = ("not_loopback_sockets is a snapshot of every process of the app, WebKit's included, at the end of "
+                "the run.")
+    if not sandboxed():
+        return "Not run under a sandbox profile: nothing confined the app's network. " + snapshot
+    return ("A sandbox profile (tests/loopback-only.sb, as the docstring says) confines this Python process and its "
+            "children (the backend and its helpers) only. The window's WebKit processes are the system's XPC "
+            "services, outside it: they reach what the page asks for, which loads only its loopback URL. " + snapshot)
+
+
 def _pids(listing, *args):
     buffer = (ctypes.c_int * 8192)()
     count = listing(*args, buffer, ctypes.sizeof(buffer))
@@ -374,11 +394,7 @@ def _run_desktop(args, data, measured):
     results["memory"]["covers"] = ("the desktop application: its process (backend, window and interface), its helper "
                                    "processes from their launch, and its window's WebKit processes")
     results["memory"]["webkit_processes"] = [Path(path_of(pid)).name for pid in found.get("webkit", [])]
-    results["network_isolation"] = (
-        "tests/loopback-only.sb confines this Python process and its children (the backend and its helpers) only. The "
-        "window's WebKit processes are the system's XPC services, outside that profile: they reach what the page asks "
-        "for, which loads only its loopback URL, and not_loopback_sockets is a snapshot of every process of the app, "
-        "WebKit's included, at the end of the run.")
+    results["network_isolation"] = network_isolation()
     results["desktop_exit_code"] = code
     return results
 

@@ -112,7 +112,8 @@ SYNTHETIC = {
               "up to 2,000 characters with S1-16's length mix; no real or public data",
     "cut": WORKLOAD["cut"],
     "sizes": {"10k": "papers until about 10,000 passages", "100k": "papers until about 100,000 passages"},
-    "queries": "100 English and 100 Chinese synthetic questions in S1-16's question forms",
+    "queries": "100 English and 100 Chinese synthetic questions in S1-16's question forms, seed 20261010 (the papers' "
+               "seed plus one)",
     "search": WORKLOAD["search"],
     "machine": WORKLOAD["machine"],
 }
@@ -141,7 +142,7 @@ def corpus(args):
     if args.corpus == "synthetic":
         asked = random.Random(SEED + 1)
         queries = [("en", q) for q in questions("en", 100, asked)] + [("zh", q) for q in questions("zh", 100, asked)]
-        return SYNTHETIC, itertools.islice(synthetic_papers(args.size, random.Random(SEED)), args.papers), queries
+        return SYNTHETIC, itertools.islice(synthetic_papers(args.size, random.Random(SEED)), args.papers or None), queries
     picked = chosen(papers(args.qasper), args.size)
     if args.papers:  # a quick check of the tool itself, not a measurement
         picked = dict(list(picked.items())[:args.papers])
