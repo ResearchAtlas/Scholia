@@ -1080,3 +1080,43 @@ def test_a_markdown_front_matter_never_closed_is_refused_at_the_structural_bound
     assert kinds(extract(closed, extraction.MARKDOWN).passages) == [("title", "Title"), ("paragraph", "Text.")]
     with pytest.raises(extraction.Unreadable):
         extract(b"---\n" + b"key: value\n" * 1001 + b"---\n# Title\n", extraction.MARKDOWN)
+
+
+# A Markdown line of each shape, n characters long, which its patterns once read in time growing with the
+# square of n (with its cube, a heading's spaces), with no call to stop().
+MARKDOWN_SHAPES = {
+    "image openers": lambda n: "![" * (n // 2),
+    "link openers": lambda n: "[" * n,
+    "tag openers": lambda n: "<" * n,
+    "emphasis never closed": lambda n: "*a " * (n // 3),
+    "underscores never closed": lambda n: " _a" * (n // 3),
+    "code never closed": lambda n: "`a " * (n // 3),
+    "a heading's spaces": lambda n: "# a" + " " * n + "b",
+    "a heading's hashes": lambda n: "# a" + "#" * n + "b",
+    "a table rule's spaces": lambda n: "a|b\n" + " " * n + "x",
+    "a paragraph's spaces": lambda n: "a" + " " * n + "b",
+}
+
+
+@pytest.mark.parametrize("shape", MARKDOWN_SHAPES)
+def test_a_markdown_line_of_marks_never_closed_is_read_in_time_linear_in_it(shape):
+    import time
+    small = 2_000 if shape == "a heading's spaces" else 80_000  # 1.3 to 33 s each at f962e62
+    for size in (small, extraction.MAX_BLOCK_CHARS - 16):  # and 1 MiB, past an hour each there
+        data = MARKDOWN_SHAPES[shape](size).encode()
+        start = time.perf_counter()
+        extract(data, extraction.MARKDOWN)
+        took = time.perf_counter() - start
+        assert took < (0.25 if size == small else 3), f"{took:.2f} s for {size} characters"
+
+
+def test_a_markdown_reading_is_cancelled_through_a_long_line():
+    import time
+    stop, _ = _stops_at(1)
+    with pytest.raises(_Stopped):  # one line, read whole with no call to stop() before (40 KB: 2.3 s)
+        extract(("![" * 20_000).encode(), extraction.MARKDOWN, stop)
+    stop, calls = _stops_at(3)
+    start = time.perf_counter()
+    with pytest.raises(_Stopped):  # lines of 1 MiB each: stop() is called for each, the third call ends it
+        extract((("![" * (extraction.MAX_BLOCK_CHARS // 2) + "\n") * 8).encode(), extraction.MARKDOWN, stop)
+    assert len(calls) == 3 and time.perf_counter() - start < 2

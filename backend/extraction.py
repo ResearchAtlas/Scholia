@@ -1575,25 +1575,111 @@ def _html(source, stop):
 
 # Markdown
 
-_ATX = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+# Each pattern here runs in time linear in its line, and the inline marks are taken out by scans
+# rather than patterns, which would rescan the rest of the line from each mark not closed.
+_ATX = re.compile(r" {0,3}(#{1,6})\s+")  # an ATX heading's mark; its text is the rest of its line (_atx_text)
 _LIST = re.compile(r"^\s*(?:[-*+]|\d{1,9}[.)])\s+")
 _FENCE = re.compile(r"^ {0,3}(```|~~~)")
-_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
-_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
-_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
-_INLINE = re.compile(r"(\*\*|\*|`|~~)(?=\S)(.+?)(?<=\S)\1|(?<!\w)(__|_)(?=\S)(.+?)(?<=\S)\3(?!\w)")
+_TABLE_RULE = re.compile(r"\s*(?:\|\s*)?:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*(?:\|\s*)?$")
+_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")  # matched whole only (a caption); taken out of text by _bracketed
+_EMPHASIS = ("**", "*", "`", "~~", "__", "_")  # in the order tried; the last two only where no word runs on
+_EMPHASIS_START = re.compile(r"[*`~_]")
+
+
+def _atx_text(line, heading):
+    """An ATX heading's text: the rest of its line after its mark (heading, an _ATX match), without the
+    closing #s and the spaces around them."""
+    return line[heading.end():].rstrip().rstrip("#").rstrip()
+
+
+def _bracketed(text, opener):
+    """text with each opener…](…) (opener "![": an image; "[": a link) made its bracketed text alone, as
+    the pattern !?\\[([^\\]]*)\\]\\([^)]*\\) would. An opener whose first "]" is not followed by "(" fails, and
+    so does every opener before that "]", so the search goes on past it; past the last "]" or ")", none can match."""
+    out, done, at = [], 0, 0
+    while (start := text.find(opener, at)) >= 0:
+        close = text.find("]", start + len(opener))
+        if close < 0:
+            break
+        if not text.startswith("(", close + 1):
+            at = close + 1
+            continue
+        end = text.find(")", close + 2)
+        if end < 0:
+            break
+        out += (text[done:start], text[start + len(opener):close])
+        done = at = end + 1
+    out.append(text[done:])
+    return "".join(out)
+
+
+def _untagged(text):
+    """text without its tags, as re.sub(r"<[^>]+>", "", text) would: each "<" to the first ">" after it,
+    with something between."""
+    out, done, at = [], 0, 0
+    while (start := text.find("<", at)) >= 0:
+        end = text.find(">", start + 1)
+        if end < 0:
+            break
+        if end > start + 1:
+            out.append(text[done:start])
+            done = end + 1
+        at = end + 1
+    out.append(text[done:])
+    return "".join(out)
+
+
+def _emphasis(line):
+    """One line's text (no "\\n") with each emphasis, strong, code or strikethrough mark pair taken out,
+    once, as the pattern (\\*\\*|\\*|`|~~)(?=\\S)(.+?)(?<=\\S)\\1|(?<!\\w)(__|_)(?=\\S)(.+?)(?<=\\S)\\3(?!\\w)
+    replaced by its text would: at each place a mark opens (the first of _EMPHASIS that fits there, not
+    before a space, an underscore not after a word), it closes at the first place after its text begins
+    where the same mark follows something other than a space (an underscore not before a word). Each mark's
+    closing place is looked for once for a stretch of the line and kept for the openings after it."""
+    size, found, out, done, at = len(line), {}, [], 0, 0
+
+    def word(i):
+        return i < size and (line[i].isalnum() or line[i] == "_")
+
+    def closing(mark, start):  # the first place at or after start where mark closes, or -1
+        known = found.get(mark)
+        if known and known[0] <= start and (known[1] < 0 or start <= known[1]):
+            return known[1]
+        close = line.find(mark, start)
+        while close >= 0 and (line[close - 1].isspace() or mark[0] == "_" and word(close + len(mark))):
+            close = line.find(mark, close + 1)
+        found[mark] = (start, close)
+        return close
+
+    while opening := _EMPHASIS_START.search(line, at):
+        start = at = opening.start()
+        for mark in _EMPHASIS:
+            text = start + len(mark)
+            if not line.startswith(mark, start) or text >= size or line[text].isspace() \
+                    or mark[0] == "_" and start > 0 and word(start - 1):
+                continue
+            close = closing(mark, text + 1)
+            if close >= 0:
+                out += (line[done:start], line[text:close])
+                done = at = close + len(mark)
+                break
+        if at == start:
+            at += 1
+    out.append(line[done:])
+    return "".join(out)
 
 
 def _markdown_inline(text):
-    """Text without Markdown's inline marks; Unreadable past MAX_BLOCK_CHARS, before each re.sub
-    makes a piece for each of its marks."""
+    """Text without Markdown's inline marks (images and links to their text, tags, then emphasis three
+    times over, for marks within marks); Unreadable past MAX_BLOCK_CHARS, before it is scanned."""
     if len(text) > MAX_BLOCK_CHARS:
         raise Unreadable()
-    text = _IMAGE.sub(r"\1", text)
-    text = _LINK.sub(r"\1", text)
-    text = re.sub(r"<[^>]+>", "", text)
+    text = _untagged(_bracketed(_bracketed(text, "!["), "["))
     for _ in range(3):
-        text = _INLINE.sub(lambda m: m.group(2) if m.group(2) is not None else m.group(4), text)
+        _stop()
+        marked, text = text, "\n".join(map(_emphasis, text.split("\n")))
+        if text == marked:  # nothing taken out: neither would a next time
+            break
     return text
 
 
@@ -1643,7 +1729,8 @@ def _markdown(source, stop):
                 raise Unreadable()
             first, _, rest = source[start:last].partition("\n") if item else ("", "", source[start:last])
             rest = re.sub(r"(?m)^[^\S\n]{0,3}>[^\S\n]?", "", rest)  # each line's quote mark
-            joined = re.sub(r"\s*\n\s*", " ", (_LIST.sub("", first, count=1) + "\n" if item else "") + rest).strip()
+            lines = ((_LIST.sub("", first, count=1) + "\n" if item else "") + rest).split("\n")
+            joined = " ".join(part for part in map(str.strip, lines) if part)  # each space around a line break one
             text = _normal(_markdown_inline(joined))
             if text:
                 emit("caption" if _IMAGE.fullmatch(joined) else "paragraph", text, start, end)
@@ -1680,7 +1767,8 @@ def _markdown(source, stop):
         heading = _ATX.match(line)
         if heading:
             flush(at)
-            emit("heading", _normal(_markdown_inline(heading.group(2))), at, at + len(line), len(heading.group(1)))
+            emit("heading", _normal(_markdown_inline(_atx_text(line, heading))), at, at + len(line),
+                 len(heading.group(1)))
             at, (line, after) = after, line_at(after)
             continue
         if line.strip() and following is not None and re.fullmatch(r" {0,3}(=+|-+)\s*", following) \
