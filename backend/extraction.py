@@ -131,6 +131,7 @@ def media_type(name, data):
 _EOCD = struct.Struct("<4s4H2LH")  # a ZIP's end of central directory record
 _ZIP64_LOCATOR = struct.Struct("<4sLQL")
 _ZIP64_EOCD = struct.Struct("<4sQ2H2L4Q")
+_CENTRAL = struct.Struct("<4s4B4HL2L5H2L")  # a central directory record, its name, extra and comment after it
 
 
 def _end_records(data):
@@ -178,17 +179,37 @@ def _end_records(data):
     return entries, size, location - size
 
 
+def _records(data, size, start):
+    """How many records zipfile will take from the central directory: as it does, record after record
+    until their lengths use the directory's size, whatever count the end records gave; stopped at a
+    cut record or a wrong signature, where zipfile stops too (refusing the archive), or once past
+    MAX_ARCHIVE_MEMBERS."""
+    directory, total, count = data[start:start + size], 0, 0
+    while total < size and count <= MAX_ARCHIVE_MEMBERS:
+        if total + _CENTRAL.size > len(directory):
+            break
+        record = _CENTRAL.unpack_from(directory, total)
+        if record[0] != b"PK\x01\x02":
+            break
+        count += 1
+        total += _CENTRAL.size + record[12] + record[13] + record[14]  # its name, extra field and comment
+    return count
+
+
 def _zip(data):
     """A ZIP archive opened, once its end records, read here as zipfile will read them
     (_end_records), show it within bounds: at most MAX_ARCHIVE_MEMBERS entries and a central
-    directory of at most MAX_CENTRAL_DIRECTORY bytes, inside the file before its end record.
-    Otherwise Unreadable, before zipfile reads that directory and builds an entry for each of its
-    records."""
+    directory of at most MAX_CENTRAL_DIRECTORY bytes, inside the file before its end record, and
+    that directory, walked as zipfile will walk it (_records), holds at most MAX_ARCHIVE_MEMBERS
+    records whatever its count says. Otherwise Unreadable, before zipfile reads that directory and
+    builds an entry for each of its records."""
     try:
         found = _end_records(data)
     except (struct.error, OverflowError, ValueError):
         found = None
     if found is None or found[0] > MAX_ARCHIVE_MEMBERS or found[1] > MAX_CENTRAL_DIRECTORY:
+        raise Unreadable()
+    if _records(data, found[1], found[2]) > MAX_ARCHIVE_MEMBERS:
         raise Unreadable()
     return zipfile.ZipFile(io.BytesIO(data))
 

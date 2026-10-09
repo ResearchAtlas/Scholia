@@ -473,6 +473,18 @@ def test_a_zip64_record_beside_a_small_classic_one_governs_and_is_bounded(monkey
     _refused_unread(monkeypatch, body + directory + record + locator + classic)
 
 
+@pytest.mark.parametrize("zip64", [False, True])
+def test_a_directory_holding_more_records_than_its_count_says_is_refused_before_it_is_read(monkeypatch, zip64):
+    body = b"PK\x03\x04" + b"\0" * 60
+    record = struct.pack("<4s4B4HL2L5H2L", b"PK\x01\x02", 20, 0, 20, 0, *[0] * 14)  # one entry, no name
+    directory = record * (extraction.MAX_ARCHIVE_MEMBERS + 1)  # within the size bound, past the count's
+    data = body + directory + struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 1, 1, len(directory), len(body), 0)
+    data = _zip64_of(data) if zip64 else data
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:  # zipfile reads records until the size is used, whatever the count
+        assert len(archive.filelist) == extraction.MAX_ARCHIVE_MEMBERS + 1
+    _refused_unread(monkeypatch, data)
+
+
 @pytest.mark.parametrize("case", ["a locator offset past any file", "a directory before the file's start",
                                   "a directory past its end record"])
 def test_end_records_pointing_outside_the_file_are_refused_as_unreadable(monkeypatch, case):
