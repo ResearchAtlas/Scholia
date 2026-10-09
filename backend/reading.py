@@ -548,6 +548,7 @@ def _sentinel():
     app died before then (its group was orphaned with no stopped member to bring the SIGHUP)."""
     signal.signal(signal.SIGHUP, signal.SIG_DFL)  # never inherited ignored,
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGHUP})  # nor blocked by the thread that started it
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # its sentinel waited for and reaped, never reaped unasked
     parent = os.getppid()
     pid = os.fork()
     if pid == 0:  # the sentinel: no Python beyond these calls

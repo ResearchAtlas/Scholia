@@ -206,8 +206,10 @@ def extract(data, kind, stop=lambda: None, progress=lambda done, total: None):
 
 def render_page(data, number, scale=2.0):
     before(number, lambda: None, lambda done, total: None)
-    if MODE == "png":  # a PNG whose header says an image past MAX_PAGE_SIDE and MAX_PAGE_PIXELS
-        return reading._PNG + struct.pack(">I", 13) + b"IHDR" + struct.pack(">IIBBBBB", 30_000, 30_000, 8, 6, 0, 0, 0)
+    if MODE == "png":  # a PNG whose header says an image of a size ARGS[0] names
+        width, height = {"huge": (30_000, 30_000), "a pixel past": (extraction.MAX_PAGE_SIDE + 1, 1),
+                         "two pixels past": (extraction.MAX_PAGE_SIDE + 2, 1)}[ARGS[0]]
+        return reading._PNG + struct.pack(">I", 13) + b"IHDR" + struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
     return real_render(data, number, scale)
 
 

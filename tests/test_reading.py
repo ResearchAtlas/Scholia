@@ -446,7 +446,9 @@ async def test_a_child_whose_app_dies_while_it_starts_ends_too(tmp_path, delay):
     app = await app_reading(path, sha256, stub, then_kill_after=delay)
     child = None
     try:
-        child = int(await asyncio.to_thread(app.stdout.readline))  # its child's pid, printed as it started
+        line = await asyncio.wait_for(asyncio.to_thread(app.stdout.readline), 15)  # its child's pid, as it started
+        assert line.strip(), "the stand-in app's child never started"
+        child = int(line)
         app.wait()  # it killed itself
         await ended_with_its_group(child)
     finally:
@@ -465,7 +467,9 @@ async def app_reading(path, sha256, stub, app_code="", then_kill_after=None):
         code += "reading.read(*args)"
     else:
         code += ("threading.Thread(target=reading.read, args=args, daemon=True).start()\n"
-                 "while not reading.LIVE: pass\n"
+                 "deadline = time.monotonic() + 10\n"
+                 "while not reading.LIVE and time.monotonic() < deadline: pass\n"
+                 "if not reading.LIVE: sys.exit(1)\n"
                  "print(next(iter(reading.LIVE)), flush=True); time.sleep(float(sys.argv[5 + count])); "
                  "os.kill(os.getpid(), signal.SIGKILL)")
     command = [sys.executable, "-c", code, str(ROOT), str(len(stub)), *stub, str(path), sha256,
@@ -604,12 +608,30 @@ async def test_a_childs_sentinel_goes_with_it(tmp_path, reading_stub, ended):
 
 
 @pytest.mark.asyncio
-async def test_a_page_image_past_its_bounds_is_a_wrong_frame(tmp_path, reading_stub):
-    reading_stub("png", "huge")
+@pytest.mark.parametrize(("size", "taken"), [("huge", False), ("two pixels past", False), ("a pixel past", True)])
+async def test_a_page_image_past_its_bounds_is_a_wrong_frame(tmp_path, reading_stub, size, taken):
+    """Past MAX_PAGE_PIXELS, or MAX_PAGE_SIDE by more than the one pixel pypdfium2's rounding up may add."""
+    reading_stub("png", size)
     path, sha256 = stored(tmp_path, synthetic.paper_pdf())
-    with pytest.raises(extraction.Unreadable):
-        await asyncio.to_thread(reading.render, path, sha256, 1, 2.0)
+    if taken:
+        assert (await asyncio.to_thread(reading.render, path, sha256, 1, 2.0)).startswith(reading._PNG)
+    else:
+        with pytest.raises(extraction.Unreadable):
+            await asyncio.to_thread(reading.render, path, sha256, 1, 2.0)
     assert gone()
+
+
+@pytest.mark.asyncio
+async def test_a_child_started_with_sigchld_ignored_still_reaps_its_sentinel_and_reads(tmp_path, monkeypatch):
+    """Ignored dispositions survive exec: a child whose starter ignored SIGCHLD resets it, so the wait
+    for its sentinel at its end works and the reading is taken."""
+    command = [sys.executable, "-c", "import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
+               "os.execv(sys.executable, [sys.executable, '-m', 'backend.reading'])"]
+    monkeypatch.setattr(reading, "command", lambda: command)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    with allow_command(*command):
+        read = await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
+    assert read == extraction.extract(MARKDOWN[1], extraction.MARKDOWN) and gone()
 
 
 @pytest.mark.asyncio
