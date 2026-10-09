@@ -769,6 +769,13 @@ async function materials(ctx) {
     check('the stretch says its passages could not be loaded, with Retry',
       await list.getByRole('alert').getByText(L('paper.loadFailed'), { exact: true }).count() === 1 && await retry.count() === 1);
     check('focus waiting on the stretch goes to Retry', await retry.evaluate((button) => button === document.activeElement));
+    check('the failure is in the panel\'s view, at the top of the stretch\'s tall box', await list.getByRole('alert').evaluate((alert) => {
+      let node = alert.parentElement;
+      while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
+      const view = node.getBoundingClientRect();
+      const box = alert.getBoundingClientRect();
+      return box.top >= view.top && box.bottom <= view.bottom;
+    }));
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.activeElement?.dataset.passage);
     check('Retry reads it again: its passages show, focus on the first of them (the title)', await retry.count() === 0
