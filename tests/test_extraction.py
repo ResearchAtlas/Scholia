@@ -391,6 +391,23 @@ def test_a_docx_that_names_a_path_outside_itself_is_refused(name):
         extract(out.getvalue(), extraction.DOCX)
 
 
+def test_a_long_pdfs_reading_holds_one_page_of_characters_at_a_time():
+    import tracemalloc
+    words = "The synthetic panel shows minimum wages raise earnings of low paid workers in every region studied"
+    page = [(54, 760 - 11.5 * i, 9, f"{i:02d} {words}") for i in range(64)]  # a dense page: 6,400 characters
+    data = synthetic.pdf([page] * 24)
+    tracemalloc.start()
+    try:
+        read = extract(data, extraction.PDF)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert read.pages == 24 and sum(len(p.text) for p in read.passages) >= 24 * sum(len(line[3]) for line in page)
+    # Held for every page at once, each character's box would come to about 29 MiB here; one page at a time,
+    # the reading stays near 4 MiB whatever the length (2,000 such pages: 134 MiB of the process at its peak).
+    assert peak < 10 * 2**20, f"{peak / 2**20:.1f} MiB"
+
+
 def _end_records(entries, size, zip64):
     """A ZIP's tail declaring entries and a central directory of size bytes, as a ZIP64 archive's when
     zip64 (its classic record saturated), after a little of a first member."""

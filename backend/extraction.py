@@ -377,32 +377,42 @@ def _pdf(data, stop, progress):
             raise Unreadable("encrypted_file" if "password" in str(error).lower() else "unreadable_file") from None
         try:
             count = len(document)
-            pages, scanned = [], 0
+            # Two passes, so that no page's characters are held past its own reading: the first takes
+            # each line's font size and length, all the body text's size needs (_body_size); the
+            # second reads each page whole and makes its passages at once.
+            sizes = []
             for number in range(count):
                 stop()
-                page = document[number]
-                try:
-                    lines, size, is_scanned = _pdf_page(page, raw)
-                finally:
-                    page.close()
+                lines, _, _ = _pdf_read(document, number, raw, measure=True)
+                sizes += [(line["size"], len(line["text"])) for line in lines]
+                progress(number + 1, 2 * count)
+            body = _body_size(sizes)
+            sections, passages, scanned = _Sections(), [], 0
+            for number in range(count):
+                stop()
+                lines, size, is_scanned = _pdf_read(document, number, raw)
                 scanned += is_scanned
-                pages.append((number + 1, lines, size))
-                progress(number + 1, count)
+                passages += _pdf_blocks(number + 1, lines, size, body, sections)
+                progress(count + number + 1, 2 * count)
         finally:
             document.close()
-    body = _body_size([line for _, lines, _ in pages for line in lines])
-    sections, passages = _Sections(), []
-    for number, lines, size in pages:
-        stop()
-        passages += _pdf_blocks(number, lines, size, body, sections)
     return Extracted(*extractor_of(PDF), passages, count, scanned)
 
 
-def _pdf_page(page, raw):
+def _pdf_read(document, number, raw, measure=False):
+    page = document[number]
+    try:
+        return _pdf_page(page, raw, measure)
+    finally:
+        page.close()
+
+
+def _pdf_page(page, raw, measure=False):
     """The page's lines: [{"text", "boxes" (per character: (l, b, r, t, index, line) or None), "size",
     "left", "right", "top", "bottom", "bold"}], its size, and whether it is scanned. Sizes, boxes and
     edges are of the page as displayed and rendered, its rotation and crop applied (_displayed), in points
-    from its bottom left."""
+    from its bottom left. With measure, only each line's text and size are true: no box is read and no
+    line is checked for bold, the rest (lines, sizes, the scanned check) as without it."""
     width, height = page.get_size()  # as displayed: a page turned a quarter is as wide as it was high
     shown = _displayed(page, raw, width, height)
     textpage = page.get_textpage()
@@ -425,7 +435,7 @@ def _pdf_page(page, raw):
                 elif not char.isspace():
                     mapped += 1
                 if not char.isspace():
-                    left, bottom, right, top = shown(*textpage.get_charbox(index))
+                    left, bottom, right, top = (0.0, 0.0, 0.0, 0.0) if measure else shown(*textpage.get_charbox(index))
                     box = (left, bottom, right, top, index, len(lines), raw.FPDFText_GetFontSize(textpage, index))
             elif not char.isspace():
                 mapped += 1
@@ -434,7 +444,7 @@ def _pdf_page(page, raw):
         if chars:
             lines.append((chars, boxes))
         # Whether each line is bold, by its first character with a box.
-        bold = [_bold(textpage, raw, next((b[4] for b in boxes if b), None)) for _, boxes in lines]
+        bold = [not measure and _bold(textpage, raw, next((b[4] for b in boxes if b), None)) for _, boxes in lines]
     finally:
         textpage.close()
     cover = 0.0
@@ -495,10 +505,10 @@ def _line(chars, boxes):
 
 
 def _body_size(lines):
-    """The most common line font size, by characters: the body text's."""
+    """The most common line font size, by characters: the body text's. lines: each line's (size, length)."""
     weights = {}
-    for line in lines:
-        weights[round(line["size"] * 2) / 2] = weights.get(round(line["size"] * 2) / 2, 0) + len(line["text"])
+    for size, length in lines:
+        weights[round(size * 2) / 2] = weights.get(round(size * 2) / 2, 0) + length
     return max(weights, key=weights.get) if weights else 0.0
 
 
