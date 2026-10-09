@@ -604,6 +604,26 @@ def test_a_latex_files_paragraphs_are_found_one_at_a_time(monkeypatch):
     assert refused and peak < 4 * 2**20, f"{peak / 2**20:.1f} MiB"  # every blank line found first: 14 MiB
 
 
+def test_a_latex_table_is_built_a_cell_at_a_time_never_its_whole_text_at_once():
+    """A tabular holding nearly its whole file as text with few marks (a 30 MiB cell) is refused before
+    that text is copied or split, and one of more cells than MAX_BLOCKS as its cells are counted. Its
+    node is made here: pylatexenc reads a long run of plain text in time that grows with its square."""
+    from pylatexenc.latexwalker import LatexCharsNode, LatexEnvironmentNode, LatexMacroNode, LatexSpecialsNode
+    reading = extraction._READING.set(extraction._Reading())
+    try:
+        whole = LatexEnvironmentNode("tabular", [LatexCharsNode("a" * (30 * 1024 * 1024))])
+        peak, refused = _peak(lambda: extraction._latex_table(whole, None))
+        assert refused and peak < 64 * 1024
+        cells = LatexEnvironmentNode("tabular", [LatexSpecialsNode("&")] * extraction.MAX_BLOCKS)
+        peak, refused = _peak(lambda: extraction._latex_table(cells, None))
+        assert refused and peak < 8 * 1024 * 1024
+    finally:
+        extraction._READING.reset(reading)
+    rows = LatexEnvironmentNode("tabular", [LatexCharsNode("a "), LatexSpecialsNode("&"), LatexCharsNode(" b"),
+                                            LatexMacroNode("\\"), LatexMacroNode("hline"), LatexCharsNode("c\\\\d&e")])
+    assert extraction._latex_table(rows, None) == "a | b\nc\nd | e"  # breaks as marks and as text alike
+
+
 def test_a_latex_title_without_maketitle_is_counted_and_split_as_any_block(monkeypatch):
     title = " ".join(f"Word{i}" for i in range(500))  # about 3,400 characters
     source = f"\\documentclass{{article}}\\title{{{title}}}\\begin{{document}}Text.\\end{{document}}".encode()

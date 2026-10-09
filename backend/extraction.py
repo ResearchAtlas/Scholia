@@ -1831,12 +1831,8 @@ def _latex(source, stop):
                     flush("reference")
                 elif env in ("tabular", "tabularx", "longtable", "array"):
                     flush(kind)
-                    rows = [" | ".join(_normal(cell) for cell in row.split("&"))
-                            for row in re.split(r"\\\\|\\hline|\\toprule|\\midrule|\\bottomrule",
-                                                _latex_table_text(node, text_of))]
-                    table = "\n".join(row for row in rows if row.strip(" |"))
-                    passages.extend(_pieces(table, "table", None, sections.path, node.pos, node.pos + node.len,
-                                            source=source))
+                    passages.extend(_pieces(_latex_table(node, text_of), "table", None, sections.path, node.pos,
+                                            node.pos + node.len, source=source))
                 elif env in ("figure", "table"):
                     flush(kind)
                     walk(node.nodelist, kind)
@@ -1866,19 +1862,57 @@ def _latex(source, stop):
     return Extracted(*extractor_of(LATEX), passages)
 
 
-def _latex_table_text(node, text_of):
-    """A tabular's cells as text, keeping its & and \\\\ separators (converted per cell)."""
+# A table row's end (\\ and the rules), or a cell's (&), as the text of a table's cells holds them.
+_LATEX_TABLE_BREAK = re.compile(r"(\\\\|\\hline|\\toprule|\\midrule|\\bottomrule)|&")
+
+
+def _latex_table(node, text_of):
+    """A tabular's text: a line a row, its cells joined by " | ", rows of no text left out. Written
+    out a cell at a time, as its children come: each cell at most MAX_BLOCK_CHARS (Unreadable before
+    more is copied into it) and counted as a block as it ends, the table at most MAX_TEXT_CHARS, so
+    neither the table's text nor a row's is ever split or joined whole. A child's text is split at the
+    breaks it holds (\\\\ or & as text) as well as at its & and row marks."""
     from pylatexenc.latexwalker import LatexCharsNode, LatexMacroNode, LatexSpecialsNode
 
-    out = []
+    table, cell = _Text(), _Text(MAX_BLOCK_CHARS)
+    held, cells, kept = _Text(), 0, False  # the row's cells before its first with text other than " " and "|"
+
+    def end(row):  # a cell's end, and with row its row's: a row of no such text is left out
+        nonlocal cell, held, cells, kept
+        _keep(blocks=1)
+        text = _normal(cell.value())
+        cell = _Text(MAX_BLOCK_CHARS)
+        if kept:
+            table.add(" | " + text)
+        elif text.strip(" |"):  # written out from here, after the row's cells held before it
+            table.add("\n" if table else "")
+            table.add(held.value())
+            table.add((" | " if cells else "") + text)
+            kept = True
+        else:
+            held.add((" | " if cells else "") + text)
+        cells += 1
+        if row:
+            held, cells, kept = _Text(), 0, False
+
+    def add(text, at, until):
+        if cell.size + until - at > MAX_BLOCK_CHARS:  # before it is copied out
+            raise Unreadable()
+        cell.add(text[at:until])
+
     for child in node.nodelist or []:
         if isinstance(child, LatexSpecialsNode) and child.specials_chars == "&":
-            out.append("&")
+            end(False)
         elif isinstance(child, LatexMacroNode) and child.macroname in ("\\", "hline", "toprule", "midrule",
                                                                         "bottomrule"):
-            out.append("\\\\")
-        elif isinstance(child, LatexCharsNode):
-            out.append(child.chars)
+            end(True)
         else:
-            out.append(text_of([child]))
-    return "".join(out)
+            text = child.chars if isinstance(child, LatexCharsNode) else text_of([child])
+            at = 0
+            for found in _LATEX_TABLE_BREAK.finditer(text):
+                add(text, at, found.start())
+                end(found.group(1) is not None)
+                at = found.end()
+            add(text, at, len(text))
+    end(True)
+    return table.value()
