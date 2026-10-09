@@ -672,6 +672,34 @@ async def test_a_docx_declaring_an_entity_is_refused_and_nothing_of_it_is_writte
         assert (refused["state"], refused["reason"]) == ("needs_attention", "unreadable_file")
 
 
+@pytest.mark.parametrize("held", ["its file's read", "its render"])
+@pytest.mark.parametrize("deleted", ["material", "project"])
+async def test_a_page_image_whose_paper_is_deleted_while_it_renders_is_not_given(tmp_path, monkeypatch, deleted, held):
+    reached, go = threading.Event(), threading.Event()
+
+    def holding(real):
+        def wait_then(*args):
+            reached.set()
+            go.wait(10)
+            return real(*args)
+        return wait_then
+
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, PDF)
+        [paper] = await settled(client, project)
+        if held == "its render":
+            monkeypatch.setattr(extraction, "render_page", holding(extraction.render_page))
+        else:
+            monkeypatch.setattr(ContentStore, "read", holding(ContentStore.read))
+        page = asyncio.ensure_future(client.get(f"/api/material-versions/{paper['version']['id']}/pages/1"))
+        await asyncio.to_thread(reached.wait, 10)
+        url = f"/api/materials/{paper['id']}" if deleted == "material" else f"/api/projects/{project}"
+        assert (await client.delete(url)).status_code == 200
+        go.set()
+        assert (await page).status_code == 404
+
+
 async def test_at_most_two_page_images_hold_their_files_at_once(tmp_path, monkeypatch):
     lock, holding, most = threading.Lock(), [0], [0]
     real_read, real_render = ContentStore.read, extraction.render_page

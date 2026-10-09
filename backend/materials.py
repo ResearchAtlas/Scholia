@@ -948,11 +948,16 @@ async def get_passage(passage_id: str, request: Request):
 
 @router.get("/api/material-versions/{version_id}/pages/{number}")
 async def page_image(version_id: str, number: int, request: Request, scale: float = 2.0):
-    """A PDF page rendered as a PNG by pypdfium2, in memory; never written to disk."""
+    """A PDF page rendered as a PNG by pypdfium2, in memory; never written to disk. The version is
+    looked for again once the page is rendered, so a page whose paper was deleted meanwhile is not
+    given."""
     state = _state(request)
-    row = await asyncio.to_thread(state["db"].read, lambda conn: conn.execute(
-        f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v JOIN content_files c ON c.sha256 = v.file_sha256"
-        " WHERE v.id = ?", (version_id,)).fetchone())
+
+    def version(conn):
+        return conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v JOIN content_files c"
+                            " ON c.sha256 = v.file_sha256 WHERE v.id = ?", (version_id,)).fetchone()
+
+    row = await asyncio.to_thread(state["db"].read, version)
     if row is None:
         raise _refused(404, "not_found", "No such version")
     if row[1] != extraction.PDF:
@@ -967,7 +972,11 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
     except IndexError:
         raise _refused(404, "not_found", "No such page") from None
     except (extraction.Unreadable, FileNotFoundError, ContentCorruptError):
-        raise _refused(409, "file_missing", "The file cannot be read") from None
+        image = None
+    if await asyncio.to_thread(state["db"].read, version) != row:  # deleted while it rendered, its file with it
+        raise _refused(404, "not_found", "No such version")
+    if image is None:
+        raise _refused(409, "file_missing", "The file cannot be read")
     return Response(image, media_type="image/png", headers={"Cache-Control": "no-store"})  # see _no_store
 
 
