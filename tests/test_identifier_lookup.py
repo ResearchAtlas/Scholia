@@ -497,6 +497,30 @@ async def test_a_record_with_malformed_entries_skips_them_and_still_resolves():
     assert failed.value.code == "unavailable"
 
 
+async def test_a_records_fields_reach_the_csl_only_as_short_strings_and_plausible_years():
+    def openalex(**fields):
+        return lookup._openalex(DOI, json.dumps({**openalex_work(DOI, TITLE), **fields}).encode()).csl
+
+    def crossref(**fields):
+        return lookup._crossref(DOI, json.dumps({"message": {**crossref_work(DOI, TITLE), **fields}}).encode()).csl
+
+    for bad in ("x" * 100_000, ["journal-article"], {"a": 1}, 7, "Journal Article", "a--b"):
+        assert openalex(type=bad)["type"] == "article-journal"
+        assert crossref(type=bad)["type"] == "article-journal"
+    assert (openalex(type="book-chapter")["type"], crossref(type="posted-content")["type"]) == ("book-chapter", "posted-content")
+    for year in (10 ** 30, True, -5, 2024.5, "2024"):
+        assert "issued" not in openalex(publication_year=year)
+        assert "issued" not in crossref(issued={"date-parts": [[year]]})
+    assert openalex()["issued"] == crossref(issued={"date-parts": [[2024]]})["issued"] == {"date-parts": [[2024]]}
+    for given in ("not a doi", "10.5555/" + "x" * 300):
+        feed = arxiv_feed(synthetic.ARXIV, "A Preprint").replace(
+            b"</entry>", f"<arxiv:doi>{given}</arxiv:doi></entry>".encode())
+        assert "DOI" not in lookup._arxiv(synthetic.ARXIV, feed).csl
+    assert extraction.clean_doi("10.5555/" + "x" * 300) is None and extraction.clean_doi("10.5555/" + "x" * 292)
+    feed = arxiv_feed(synthetic.ARXIV, "A Preprint").replace(b"</entry>", b"<arxiv:doi>10.5555/Pub.1</arxiv:doi></entry>")
+    assert lookup._arxiv(synthetic.ARXIV, feed).csl["DOI"] == "10.5555/pub.1"
+
+
 async def test_a_doi_after_many_short_passages_but_within_the_first_characters_is_found(tmp_path):
     late = "10.5555/after.many.notes"
     notes = "".join(f"Note {n}.\n\n" for n in range(250))  # 250 short passages, about 2,400 characters

@@ -77,6 +77,7 @@ _ABSTRACT = re.compile(r"^(?:abstract|摘要|摘\s*要)\s*[:：.—-]?\s*", re.I
 
 # Identifiers (F3a step 3): the DOI pattern Crossref recommends, and arXiv's two forms.
 DOI = re.compile(r"10\.\d{4,9}/[-._;()/:a-z0-9]+", re.IGNORECASE)
+DOI_CHARS = 300  # a DOI's length at most, as the details form takes one
 _DOI_FOUND = re.compile(r"\b10\.\d{4,9}/[^\s\"'<>,\x00-\x1f]+", re.IGNORECASE)
 ARXIV = re.compile(r"(?:\d{2}(?:0[1-9]|1[0-2])\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})", re.IGNORECASE)
 _ARXIV_FOUND = re.compile(r"(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})"
@@ -282,13 +283,13 @@ def identifiers(passages):
 
 def clean_doi(text):
     """A DOI as found in text, without trailing punctuation, in lower case; None if it fails the
-    pattern or holds a "." or ".." segment."""
+    pattern, holds a "." or ".." segment, or is longer than DOI_CHARS."""
     doi = text.strip().rstrip(".,;:'\"")
     while doi.endswith((")", "]")) and doi.count(doi[-1]) > doi.count({")": "(", "]": "["}[doi[-1]]):
         doi = doi[:-1].rstrip(".,;:")
     doi = doi.lower()
-    if not DOI.fullmatch(doi) or {".", ".."} & set(doi.split("/")):
-        return None  # a dot segment: a URL holding it would name another path once resolved
+    if len(doi) > DOI_CHARS or not DOI.fullmatch(doi) or {".", ".."} & set(doi.split("/")):
+        return None  # a dot segment among them: a URL holding it would name another path once resolved
     return doi
 
 

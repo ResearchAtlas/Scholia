@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 from urllib.parse import quote
 import httpx
 
-from backend.extraction import Unreadable, untrusted_xml
+from backend.extraction import DOI_CHARS, Unreadable, clean_doi, untrusted_xml
 from backend.outbound_gate import OutboundDenied
 
 OPENALEX = "https://api.openalex.org/works/doi:{}"
@@ -208,6 +208,19 @@ def _list(value):
     return value if isinstance(value, list) else []
 
 
+_TYPE = re.compile(r"[a-z]{1,30}(?:-[a-z]{1,30}){0,3}")  # a CSL type name: lower-case words joined by hyphens
+
+
+def _type(value, default="article-journal"):
+    """A record's type as its CSL keeps it: a short type name, else default."""
+    return value if isinstance(value, str) and _TYPE.fullmatch(value) else default
+
+
+def _year(value):
+    """A year as a record gives it (a whole number, not true or false), when it could be one."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 10_000 else None
+
+
 def _text(value, limit=1000):
     return " ".join(value.split())[:limit] if isinstance(value, str) and value.strip() else None
 
@@ -217,14 +230,14 @@ def _openalex(doi, body):
     title = _text(work.get("title") or work.get("display_name"))
     if not title:
         raise Failed("not_found")
-    csl = {"type": "article-journal" if work.get("type") in ("article", None) else str(work.get("type")),
+    csl = {"type": "article-journal" if work.get("type") == "article" else _type(work.get("type")),
            "title": title, "DOI": doi}
     authors = [_text(_dict(_dict(a).get("author")).get("display_name"), NAME_CHARS)
                for a in _list(work.get("authorships"))]
     if authors := [{"literal": name} for name in authors if name]:
         csl["author"] = authors[:100]
-    if isinstance(work.get("publication_year"), int):
-        csl["issued"] = {"date-parts": [[work["publication_year"]]]}
+    if (year := _year(work.get("publication_year"))) is not None:
+        csl["issued"] = {"date-parts": [[year]]}
     source = _dict(_dict(work.get("primary_location")).get("source"))
     if venue := _text(source.get("display_name"), 300):
         csl["container-title"] = venue
@@ -249,7 +262,7 @@ def _crossref(doi, body):
     title = _text(titles[0] if isinstance(titles, list) and titles else titles)
     if not title:
         raise Failed("not_found")
-    csl = {"type": str(work.get("type") or "article-journal"), "title": title, "DOI": doi}
+    csl = {"type": _type(work.get("type")), "title": title, "DOI": doi}
     authors = []
     for author in _list(work.get("author")):
         if isinstance(author, dict):
@@ -261,8 +274,8 @@ def _crossref(doi, body):
     if authors:
         csl["author"] = authors[:100]
     parts = _list(_dict(work.get("issued")).get("date-parts"))
-    if (first := _list(parts[0]) if parts else []) and isinstance(first[0], int):
-        csl["issued"] = {"date-parts": [[first[0]]]}
+    if (first := _list(parts[0]) if parts else []) and (year := _year(first[0])) is not None:
+        csl["issued"] = {"date-parts": [[year]]}
     containers = work.get("container-title") or []
     if venue := _text(containers[0] if isinstance(containers, list) and containers else None, 300):
         csl["container-title"] = venue
@@ -297,6 +310,7 @@ def _arxiv(identifier, body):
     published = entry.findtext(f"{_ATOM}published") or ""
     if published[:4].isdigit():
         csl["issued"] = {"date-parts": [[int(published[:4])]]}
-    if doi := _text(entry.findtext(f"{_ARXIV_NS}doi"), 200):
-        csl["DOI"] = doi.lower()
+    given = (entry.findtext(f"{_ARXIV_NS}doi") or "").strip()
+    if len(given) <= DOI_CHARS and (doi := clean_doi(given)):  # a DOI, or none kept
+        csl["DOI"] = doi
     return Found("arxiv", csl, None, f"arxiv:{identifier}")
