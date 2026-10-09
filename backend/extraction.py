@@ -989,7 +989,7 @@ class _XmlEvents:
     """An expat parser and its handlers: its events as (event, tag, attributes or text), with no
     tree built, its text in pieces of up to 8 KiB (buffer_text), and its names bounded as it reports
     each tag, before any more are read: at most MAX_XML_NAMES distinct element and attribute names
-    (expat keeps every one it has met), and each namespace's name, which it makes part of every
+    and namespace prefixes (expat keeps every one it has met), and each namespace's name, which it makes part of every
     name in it, at most MAX_XML_NAMESPACE characters (checked as it is declared, before its tag's
     names are expanded with it). Python's own interning of names is off."""
 
@@ -1015,6 +1015,7 @@ class _XmlEvents:
     def namespace(self, prefix, uri):
         if uri is not None and len(uri) > MAX_XML_NAMESPACE:
             raise Unreadable()
+        self.name(f"\x00{prefix or ''}")  # expat keeps every prefix it has met too: counted with the names
 
     def start(self, tag, attrib):
         attributes = {self.name(key): value for key, value in attrib.items()} if attrib else _NO_ATTRIBUTES

@@ -751,10 +751,12 @@ def test_a_docx_part_cut_short_is_unreadable_not_read_as_far_as_it_goes(cut):
         extract(_docx_document(xml), extraction.DOCX)
 
 
-@pytest.mark.parametrize("shape", ["distinct names", "a long namespace"])
+@pytest.mark.parametrize("shape", ["distinct names", "distinct prefixes", "a long namespace"])
 def test_a_docx_parts_names_are_bounded_as_the_parser_reports_them(shape):
     if shape == "distinct names":  # each an element Scholia does not read, each kept by the parser
         body = "".join(f"<n{i}/>" for i in range(20_000))
+    elif shape == "distinct prefixes":  # one name, under prefixes the parser keeps each of
+        body = "".join(f'<n xmlns:p{i}="urn:x"/>' for i in range(20_000))
     else:  # every name in it would carry its 8,192 characters
         body = f'<x:a xmlns:x="urn:{"u" * 8192}">' + "".join(f"<x:n{i}/>" for i in range(2000)) + "</x:a>"
     data = _docx_document(f"<w:document {W_NS}><w:body>{KEPT}{body}</w:body></w:document>")
