@@ -466,6 +466,25 @@ def test_a_long_pdfs_reading_holds_one_page_of_characters_at_a_time():
     assert peak < 10 * 2**20, f"{peak / 2**20:.1f} MiB"
 
 
+def test_a_pdfs_first_pass_holds_its_font_sizes_not_one_entry_per_line(monkeypatch):
+    import tracemalloc
+    line = {"size": 9.0, "text": "x"}  # a short line, as a highly compressed text layer holds millions of
+
+    def read(document, number, raw, measure=False):  # each page's lines as PDFium would give them
+        return ([line] * 2000 if measure else []), (612, 792), False
+
+    monkeypatch.setattr(extraction, "_pdf_read", read)
+    data = synthetic.pdf([[]] * 500)  # a million lines in all
+    tracemalloc.start()
+    try:
+        read_whole = extract(data, extraction.PDF)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert read_whole.pages == 500
+    assert peak < 2 * 2**20, f"{peak / 2**20:.1f} MiB"  # a (size, length) for each line would be over 60 MiB
+
+
 def _end_records(entries, size, zip64):
     """A ZIP's tail declaring entries and a central directory of size bytes, as a ZIP64 archive's when
     zip64 (its classic record saturated), after a little of a first member."""

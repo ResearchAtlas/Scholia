@@ -22,6 +22,7 @@ pdfium is not thread-safe, so every use of it holds PDFIUM. Nothing here logs co
 libraries it drives are kept from logging it.
 """
 
+import collections
 import ctypes
 import io
 import logging
@@ -401,16 +402,18 @@ def _pdf(data, stop, progress):
             raise Unreadable("encrypted_file" if "password" in str(error).lower() else "unreadable_file") from None
         try:
             count = len(document)
-            # Two passes, so that no page's characters are held past its own reading: the first takes
-            # each line's font size and length, all the body text's size needs (_body_size); the
-            # second reads each page whole and makes its passages at once.
-            sizes = []
+            # Two passes, so that no page's characters are held past its own reading: the first counts
+            # the characters set in each font size, all the body text's size needs (_body_size), as a
+            # few sizes, not an entry for each line; the second reads each page whole and makes its
+            # passages at once.
+            weights = collections.Counter()
             for number in range(count):
                 stop()
                 lines, _, _ = _pdf_read(document, number, raw, measure=True)
-                sizes += [(line["size"], len(line["text"])) for line in lines]
+                for line in lines:
+                    weights[round(line["size"] * 2) / 2] += len(line["text"])
                 progress(number + 1, 2 * count)
-            body = _body_size(sizes)
+            body = _body_size(weights)
             sections, passages, scanned = _Sections(), [], 0
             for number in range(count):
                 stop()
@@ -539,11 +542,9 @@ def _line(chars, boxes):
             "top": max((b[3] for b in found), default=0.0), "bottom": min((b[1] for b in found), default=0.0)}
 
 
-def _body_size(lines):
-    """The most common line font size, by characters: the body text's. lines: each line's (size, length)."""
-    weights = {}
-    for size, length in lines:
-        weights[round(size * 2) / 2] = weights.get(round(size * 2) / 2, 0) + length
+def _body_size(weights):
+    """The most common line font size, by characters: the body text's. weights: the characters set
+    in each size, rounded to half points, in the order the sizes were first met."""
     return max(weights, key=weights.get) if weights else 0.0
 
 
