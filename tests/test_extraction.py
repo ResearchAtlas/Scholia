@@ -1030,3 +1030,53 @@ def test_an_arxiv_answer_that_declares_an_entity_is_refused():
                                      '<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>&x;</title></entry></feed>')
                       .encode())
     assert failed.value.code == "unavailable"
+
+
+# The S1-13 hardening: scans that call stop() and keep to the bounds, and Markdown's marks in linear time
+
+
+class _Stopped(Exception):
+    pass
+
+
+def _stops_at(call):
+    """A stop() that raises _Stopped on its call-th call, and the number of calls so far, as a list."""
+    calls = []
+
+    def stop():
+        calls.append(None)
+        if len(calls) == call:
+            raise _Stopped()
+    return stop, calls
+
+
+def test_a_markdown_fence_past_the_block_bound_is_refused_as_it_is_scanned_before_it_is_copied():
+    for data in (b"```\n" + b"x\n" * (2 * 2**20), b"```\n" + b"x\n" * (2 * 2**20) + b"```\n"):  # unclosed and closed
+        peak, refused = _peak(lambda: extract(data, extraction.MARKDOWN))
+        assert refused and peak < len(data) + 2**20, f"{peak / 2**20:.1f} MiB"  # its text decoded: 12.8 MiB before
+
+
+@pytest.mark.parametrize("shape", ["a fence", "a table", "a front matter never closed"])
+def test_each_markdown_scan_calls_stop_as_it_reads_lines(shape):
+    """The main loop once called stop() every 200 lines of its own; a fence's or a table's lines, read by their
+    own scans, and a front matter's, read before it, were read with no call."""
+    data = {"a fence": b"```\n" + b"x\n" * 5000 + b"```\n",
+            "a table": b"| a |\n|---|\n" + b"| b |\n" * 5000,
+            "a front matter never closed": b"---\n" + b"a\n\n" * 100_000}[shape]
+    stop, calls = _stops_at(3)
+    kept = []
+    with pytest.raises(_Stopped):
+        extract(data, extraction.MARKDOWN, lambda: kept.append(extraction._READING.get().blocks) or stop())
+    assert len(calls) == 3
+    if shape == "a front matter never closed":  # stopped in its scan, before the text after it is read as blocks
+        assert kept == [0, 0, 0]
+
+
+def test_a_markdown_front_matter_never_closed_is_refused_at_the_structural_bound(monkeypatch):
+    with pytest.raises(extraction.Unreadable):  # read whole twice before: once looking for its end, once as text
+        extract(b"---\n" + b"\n" * (extraction.MAX_BLOCKS + 1), extraction.MARKDOWN)
+    monkeypatch.setattr(extraction, "MAX_BLOCKS", 1000)
+    closed = b"---\n" + b"key: value\n" * 1000 + b"---\n# Title\n\nText.\n"
+    assert kinds(extract(closed, extraction.MARKDOWN).passages) == [("title", "Title"), ("paragraph", "Text.")]
+    with pytest.raises(extraction.Unreadable):
+        extract(b"---\n" + b"key: value\n" * 1001 + b"---\n# Title\n", extraction.MARKDOWN)

@@ -268,7 +268,7 @@ def extract(data, kind, stop=lambda: None, progress=lambda done, total: None):
     """The passages of a file of a supported media type. stop() is called between pages or
     blocks and may raise to abandon the work; progress(done, total) reports it."""
     parser = {PDF: _pdf, DOCX: _docx, HTML: _html, MARKDOWN: _markdown, LATEX: _latex}[kind]
-    reading = _READING.set(_Reading())  # this reading's bounds, wherever its extractor keeps something
+    reading = _READING.set(_Reading(stop))  # this reading's bounds, wherever its extractor keeps something
     try:
         if kind == PDF:
             return parser(data, stop, progress)
@@ -337,10 +337,11 @@ def clean_doi(text):
 
 
 class _Reading:
-    """What one reading has kept (MAX_TEXT_CHARS, MAX_BLOCKS) and built (MAX_BUILT_CHARS) so far."""
+    """What one reading has kept (MAX_TEXT_CHARS, MAX_BLOCKS) and built (MAX_BUILT_CHARS) so far, and its stop()."""
 
-    def __init__(self):
+    def __init__(self, stop=lambda: None):
         self.chars = self.blocks = self.built = self.rects = 0
+        self.stop = stop
 
     def keep(self, text="", blocks=1):
         self.blocks += blocks
@@ -374,6 +375,13 @@ def _build(chars):
     reading = _READING.get()
     if reading is not None:
         reading.build(chars)
+
+
+def _stop():
+    """The reading's stop(), for work its reader's own loop does not reach: within a block, or a parser's input."""
+    reading = _READING.get()
+    if reading is not None:
+        reading.stop()
 
 
 class _Text:
@@ -1607,15 +1615,22 @@ def _markdown(source, stop):
         passages.extend(_pieces(_ABSTRACT.sub("", text, count=1) if kind == "abstract" else text, kind, None,
                                 sections.path, start, end, source=source))
 
+    read = [0]  # lines read since stop() was last called, a long one counting once for each KiB of it
+
     def line_at(at):
         """The line that starts at at and where the next one starts; (None, at) past the last.
-        Unreadable for a line longer than MAX_BLOCK_CHARS, before it is copied out."""
+        Unreadable for a line longer than MAX_BLOCK_CHARS, before it is copied out. Every scan reads its
+        lines here, so stop() is called every 200 lines read, or fewer long ones."""
         if at > len(source):
             return None, at
         end = source.find("\n", at)
         end = len(source) if end < 0 else end
         if end - at > MAX_BLOCK_CHARS:
             raise Unreadable()
+        read[0] += 1 + (end - at) // 1024
+        if read[0] >= 200:
+            read[0] = 0
+            stop()
         return source[at:end], end + 1
 
     paragraph = None  # (where it starts, where its last line ends, whether a list item starts it)
@@ -1636,19 +1651,18 @@ def _markdown(source, stop):
 
     at = 0
     line, after = line_at(0)
-    if line is not None and line.strip() == "---":  # front matter
-        scan, past = line_at(after)
+    if line is not None and line.strip() == "---":  # front matter, to its closing line
+        lines, (scan, past) = 0, line_at(after)
         while scan is not None:
             if scan.strip() in ("---", "..."):
                 at = past
                 break
+            lines += 1
+            if lines > MAX_BLOCKS:  # at most as many lines as a reading's blocks, not all read to be read again
+                raise Unreadable()
             scan, past = line_at(past)
     line, after = line_at(at)
-    count = 0
     while line is not None:
-        count += 1
-        if count % 200 == 0:
-            stop()
         following, beyond = line_at(after)
         if _FENCE.match(line):
             flush(at)
@@ -1656,6 +1670,8 @@ def _markdown(source, stop):
             closing, (scan, past) = after, (following, beyond)  # the closing line's start, and the line there
             while scan is not None and not scan.strip().startswith(fence):
                 closing, (scan, past) = past, line_at(past)
+                if closing - 1 - after > MAX_BLOCK_CHARS:  # its text so far, before it is copied out
+                    raise Unreadable()
             code = source[after:closing - 1 if scan is not None else len(source)].strip()
             if code:
                 emit("paragraph", code, at, closing if scan is not None else len(source))  # unfinished: to the end
