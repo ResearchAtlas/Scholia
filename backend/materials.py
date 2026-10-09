@@ -72,7 +72,7 @@ log = logging.getLogger(__name__)
 
 EXTRACTION_SECONDS = 30 * 60  # per material version (section 13)
 READINGS = 2  # readings at once, each in its child (backend/reading.py); the others wait their turn without one
-RENDERS = 2  # page images rendered at once, as READINGS
+RENDERS = 1  # page images rendered at once, each in its child: one keeps the children's worst case near 3.5 GiB
 MAX_FILES = 20  # per request
 AUTHOR_CHARS = 2 * lookup.NAME_CHARS + 2  # an author as the details form sends one: "Family, Given", each part a lookup's
 BATCH_IDLE_SECONDS = 120  # an open batch (a drop still being sent) with no addition for this long closes itself

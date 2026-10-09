@@ -70,10 +70,9 @@ log = logging.getLogger(__name__)
 # page read by Vision, under 30 MiB for 1,000 pages of prose in any format. Page images: 385 MiB for
 # that one-image page at scale 3, 131 MiB for a page holding a 4,000-pixel image, 45 MiB for a letter
 # page. A child writing memory as fast as it can was killed up to 249 MiB past its ceiling (the most
-# of 10 trials at each ceiling, with WATCH_SECONDS). Two readings and two page images at once, each at
-# its ceiling and that far past it, come to some 4.5 GiB: on an 8 GB Mac, beside the app, that holds
-# only with memory compression for the moment before each is stopped; RENDERS stays 2 (a question
-# for Harold in the PR).
+# of 10 trials at each ceiling, with WATCH_SECONDS). The readings and the page image that may run at
+# once (materials.READINGS 2, RENDERS 1, Harold's decision of 2026-10-10), each at its ceiling and
+# that far past it, come to some 3.5 GiB (2 x (1,024 + 249) + 768 + 249 MiB).
 READING_CEILING = 1024 * 1024 * 1024  # bytes of physical footprint, a reading's child at its peak
 RENDER_CEILING = 768 * 1024 * 1024  # a page image's child
 # The time ceiling: the longest silence measured in an accepted reading is 4.9 s (pylatexenc parsing
@@ -115,7 +114,7 @@ def read(path, sha256, kind, stop=lambda: None, progress=lambda done, total: Non
     """The stored file at path (its SHA-256 sha256) read as media type kind, in a child: an
     extraction.Extracted equal to extraction.extract's. Raises extraction.Unreadable (its codes,
     and memory_limit or step_limit), FileNotFoundError for a missing or changed file, ChildError,
-    or what stop() raised. stats, a dict, gets the child's start (to ready), its peak footprint and its
+    MemoryError when this process runs out of memory taking its result, or what stop() raised. stats, a dict, gets the child's start (to ready), its peak footprint and its
     longest silence between two frames."""
     received = _Reading(kind, progress)
     request = {"op": "read", "path": str(path), "sha256": sha256, "kind": kind}
@@ -125,7 +124,7 @@ def read(path, sha256, kind, stop=lambda: None, progress=lambda done, total: Non
 
 def render(path, sha256, number, scale, stop=lambda: None, *, ceiling=None, stats=None):
     """Page number of the stored PDF at path as a PNG, rendered in a child as extraction.render_page
-    does. Raises IndexError for a page it does not have, and otherwise as read."""
+    does. Raises IndexError for a page it does not have, and otherwise as read (MemoryError included)."""
     received = _Render()
     request = {"op": "render", "path": str(path), "sha256": sha256, "number": number, "scale": scale}
     received.exit = _run(request, ceiling or RENDER_CEILING, MAX_PNG, stop, received, stats)

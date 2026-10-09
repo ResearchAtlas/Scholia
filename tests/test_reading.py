@@ -24,7 +24,7 @@ import synthetic_materials as synthetic
 from backend import extraction, reading
 from network_guard import NetworkBlocked, allow_command
 from scholia_app import run_finished, started
-from test_extraction import _raw_pdf
+from test_extraction import MARKDOWN_SHAPES, _raw_pdf
 from test_materials import PDF, Held, added, ended, gone, hold_extraction, project_of, rows, settled
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,13 +155,14 @@ async def test_any_other_failure_on_a_childs_value_is_a_wrong_frame_and_this_pro
     path, sha256 = stored(tmp_path, synthetic.paper_pdf())  # its passages have boxes
     for failure, outcome in ((ZeroDivisionError, extraction.Unreadable), (MemoryError, MemoryError)):
         def failing(value, failure=failure):
-            raise failure()
+            raise failure("Participant-Eleven-Canary")  # a message that could hold the value
 
         monkeypatch.setattr(reading, "_number", failing)  # a check that fails on a value, as an unforeseen one would
         with pytest.raises(outcome) as raised:
             await asyncio.to_thread(reading.read, path, sha256, extraction.PDF)
         assert gone()
     assert "a frame its checks could not take (ZeroDivisionError)" in caplog.text  # its type, never its content
+    assert "Participant-Eleven-Canary" not in caplog.text
     assert raised.type is MemoryError  # the app's own memory, not the file's fault: the run fails internal
 
 
@@ -296,6 +297,63 @@ async def test_cancel_ends_a_child_in_the_middle_of_one_long_step_at_once(tmp_pa
         assert (await client.post(f"/api/runs/{paper['run_id']}/cancel")).json()["status"] == "cancelled"
         assert time.monotonic() - asked < 2
         assert await nothing_written(client) and gone(*pids)
+
+
+# The S1-13 hardening through the child: its readers' own calls to stop() are the child's reports,
+# Cancel ends the child wherever its reader is, and markdown-3 reads the same in the child
+
+
+def long_html():
+    """Some 12 MB of HTML whose reading takes about 3 s, its reader calling stop() as it goes."""
+    sentence = "Minimum wages raise the earnings of low-paid workers in the synthetic panel. "
+    return ("<html><body>" + "".join(f"<p>Paragraph {i}. <b>{sentence}</b> <i>{sentence}</i></p>" for i in range(60_000))
+            + "</body></html>").encode()
+
+
+@pytest.mark.asyncio
+async def test_a_long_text_reading_reports_through_its_readers_calls_to_stop_and_is_never_stopped_for_time(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(reading, "STEP_SECONDS", 2.5)
+    data = long_html()
+    path, sha256 = stored(tmp_path, data)
+    stats = {}
+    read = await asyncio.to_thread(reading.read, path, sha256, extraction.HTML, stats=stats)
+    assert stats["seconds"] > reading.STEP_SECONDS and stats["longest_step_seconds"] < 2  # a report each second
+    assert read == extraction.extract(data, extraction.HTML) and gone()
+
+
+@pytest.mark.asyncio
+async def test_cancel_ends_a_child_whose_text_reader_is_at_work(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, ("long.html", long_html())))["materials"]
+        while not reading.LIVE:
+            await asyncio.sleep(0.01)
+        pids = set(reading.LIVE)
+        await asyncio.sleep(1.0)  # its reader at work
+        asked = time.monotonic()
+        assert (await client.post(f"/api/runs/{paper['run_id']}/cancel")).json()["status"] == "cancelled"
+        assert time.monotonic() - asked < 2
+        assert await nothing_written(client) and gone(*pids)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", [*MARKDOWN_SHAPES, "a front matter never closed", "a fence past the block bound"])
+async def test_the_hardened_markdown_reader_reads_the_same_in_its_child(tmp_path, shape):
+    data = {"a front matter never closed": b"---\n" + b"a\n\n" * 100_000,
+            "a fence past the block bound": b"```\n" + b"x\n" * (2 * 2**20)}.get(shape)
+    data = data or ("Before.\n\n" + MARKDOWN_SHAPES[shape](20_000) + "\n\nAfter.\n").encode()
+    path, sha256 = stored(tmp_path, data)
+    try:
+        expected = extraction.extract(data, extraction.MARKDOWN)
+    except extraction.Unreadable as unreadable:
+        expected = unreadable.code
+    try:
+        found = await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
+    except extraction.Unreadable as unreadable:
+        found = unreadable.code
+    assert found == expected and gone()
+    assert extraction.extractor_of(extraction.MARKDOWN) == ("markdown", "markdown-3")
 
 
 # The child ends in every case
