@@ -57,8 +57,8 @@ function main(dist) {
     console.log(`  ${(start ? 'at start' : 'on demand').padEnd(10)} ${kB(bytes).padStart(10)}  ${path}`);
   }
   const total = found.filter((script) => script.start).reduce((sum, script) => sum + script.bytes, 0);
-  if (total > LIMIT) {
-    console.log(`Loaded at start: ${kB(total)}, over the ${kB(LIMIT)} limit (docs/interface-criteria.md, Performance).`);
+  if (total >= LIMIT) {  // the criterion says under 600 kB, so exactly 600 kB fails too
+    console.log(`Loaded at start: ${kB(total)}, not under the ${kB(LIMIT)} limit (docs/interface-criteria.md, Performance).`);
     return 1;
   }
   console.log(`Loaded at start: ${kB(total)}, within the ${kB(LIMIT)} limit (${kB(LIMIT - total)} to spare).`);

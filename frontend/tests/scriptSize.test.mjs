@@ -57,16 +57,16 @@ test('static imports and modulepreloads load at start, import() only on demand',
   }
 });
 
-test('the start script passes at 600 kB and fails one byte over, whatever waits on demand', () => {
+test('the start script passes one byte under 600 kB and fails at 600 kB, whatever waits on demand', () => {
   const startBytes = (dist) => scripts(dist).filter((s) => s.start).reduce((sum, s) => sum + s.bytes, 0);
-  for (const [over, status] of [[0, 0], [1, 1]]) {
+  for (const [over, status] of [[-1, 0], [0, 1]]) {
     const others = ['entry.js', 'shared.js', 'side.js', 'more.js'].reduce((sum, name) => sum + Buffer.byteLength(FILES[name][0]), 0);
     const dist = build({ ...FILES, 'vendor.js': [FILES['vendor.js'][0], LIMIT - others + over], 'deeper.js': ['', 900_000] });
     try {
       assert.equal(startBytes(dist), LIMIT + over);
       const result = run(dist);
       assert.equal(result.status, status, result.stdout + result.stderr);
-      assert.match(result.stdout, over ? /over the 600\.00 kB limit/ : /within the 600\.00 kB limit \(0\.00 kB to spare\)/);
+      assert.match(result.stdout, status ? /not under the 600\.00 kB limit/ : /within the 600\.00 kB limit \(0\.00 kB to spare\)/);
     } finally {
       rmSync(dist, { recursive: true, force: true });
     }
