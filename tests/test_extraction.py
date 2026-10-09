@@ -391,6 +391,44 @@ def test_a_docx_that_names_a_path_outside_itself_is_refused(name):
         extract(out.getvalue(), extraction.DOCX)
 
 
+def _end_records(entries, size, zip64):
+    """A ZIP's tail declaring entries and a central directory of size bytes, as a ZIP64 archive's when
+    zip64 (its classic record saturated), after a little of a first member."""
+    body = b"PK\x03\x04" + b"\0" * 60
+    if not zip64:
+        return body + struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, min(entries, 0xFFFF), min(entries, 0xFFFF),
+                                  size, len(body), 0)
+    record = len(body)
+    body += struct.pack("<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, entries, entries, size, 0)
+    body += struct.pack("<4sLQL", b"PK\x06\x07", 0, record, 1)
+    return body + struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0)
+
+
+@pytest.mark.parametrize("zip64", [False, True])
+@pytest.mark.parametrize("declares", ["entries", "directory size"])
+def test_a_docx_declaring_too_many_entries_or_too_large_a_directory_is_refused_before_it_is_read(monkeypatch, zip64,
+                                                                                               declares):
+    entries, size = ((extraction.MAX_ARCHIVE_MEMBERS + 1, 46) if declares == "entries"
+                     else (1, extraction.MAX_CENTRAL_DIRECTORY + 1))
+    if zip64 and declares == "entries":
+        entries = 500_000  # far past what a 16-bit count can say
+    data = _end_records(entries, size, zip64)
+
+    def never(*args, **kwargs):
+        raise AssertionError("the archive's directory was read")
+
+    monkeypatch.setattr(zipfile, "ZipFile", never)
+    with pytest.raises(extraction.Unreadable):
+        extract(data, extraction.DOCX)
+    assert media_type("paper.docx", data) is None  # nor taken as a DOCX when added
+
+
+def test_a_docx_within_its_bounds_still_reads():
+    read = extract(synthetic.docx([(None, "A paragraph of synthetic text.")]), extraction.DOCX)
+    assert [p.text for p in read.passages] == ["A paragraph of synthetic text."]
+    assert media_type("paper.docx", synthetic.docx([(None, "x")])) == extraction.DOCX
+
+
 def test_a_docx_is_bounded_by_its_members_and_its_parts_together(monkeypatch):
     plain = f'<w:document {W}><w:body><w:p><w:r><w:t>{"x" * 300}</w:t></w:r></w:p></w:body></w:document>'
     styles = f'<w:styles {W}>{" " * 300}</w:styles>'

@@ -41,6 +41,7 @@ MAX_FILE_BYTES = 100 * 1024 * 1024  # ponytail: uploads travel as base64 JSON; a
 MAX_XML_BYTES = 64 * 1024 * 1024  # a DOCX part's size once unpacked, and the parts read together
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024  # a DOCX's members together, as the archive declares them unpacked
 MAX_ARCHIVE_MEMBERS = 10_000
+MAX_CENTRAL_DIRECTORY = MAX_ARCHIVE_MEMBERS * 256  # bytes: 46 for each entry and room for its name
 PDF = "application/pdf"
 DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 HTML = "text/html"
@@ -119,12 +120,40 @@ def media_type(name, data):
         return None
     if found == DOCX:
         try:
-            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            with _zip(data) as archive:
                 if "word/document.xml" not in archive.namelist():
                     return None
-        except (zipfile.BadZipFile, ValueError):
+        except (Unreadable, zipfile.BadZipFile, ValueError):
             return None
     return found
+
+
+_EOCD = struct.Struct("<4s4H2LH")  # a ZIP's end of central directory record
+_ZIP64_LOCATOR = struct.Struct("<4sLQL")
+_ZIP64_EOCD = struct.Struct("<4sQ2H2L4Q")
+
+
+def _zip(data):
+    """A ZIP archive opened, once its end records, read here from its tail, show it within bounds:
+    at most MAX_ARCHIVE_MEMBERS entries and a central directory of at most MAX_CENTRAL_DIRECTORY
+    bytes (a ZIP64 archive's by its own record, through its locator). Otherwise Unreadable, before
+    zipfile reads that directory and builds an entry for each of its records."""
+    at = data.rfind(b"PK\x05\x06", max(0, len(data) - _EOCD.size - 0xFFFF))  # its comment may follow it
+    try:
+        if at < 0:
+            raise Unreadable()
+        _, _, _, _, entries, size, offset, _ = _EOCD.unpack_from(data, at)
+        if entries == 0xFFFF or size == 0xFFFFFFFF or offset == 0xFFFFFFFF:  # ZIP64: its own record says
+            signature, _, record, _ = _ZIP64_LOCATOR.unpack_from(data, at - _ZIP64_LOCATOR.size)
+            fields = _ZIP64_EOCD.unpack_from(data, record) if signature == b"PK\x06\x07" else None
+            if at < _ZIP64_LOCATOR.size or fields is None or fields[0] != b"PK\x06\x06":
+                raise Unreadable()
+            entries, size = fields[7], fields[8]
+    except struct.error:
+        raise Unreadable() from None
+    if entries > MAX_ARCHIVE_MEMBERS or size > MAX_CENTRAL_DIRECTORY:
+        raise Unreadable()
+    return zipfile.ZipFile(io.BytesIO(data))
 
 
 def extractor_of(kind):
@@ -738,7 +767,7 @@ def _part(archive, name, budget):
 
 def _docx(data, stop):
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        with _zip(data) as archive:
             members = archive.infolist()
             # An archive that could unpack to more than any document needs, or that names a path
             # outside itself, is refused before any part is read.
