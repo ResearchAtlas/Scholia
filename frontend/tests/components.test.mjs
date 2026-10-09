@@ -2,7 +2,8 @@
 // dropped in the docked Library are imported once, by the Library, and the window's drop overlay
 // goes with the drop; the page viewer groups a paper's passages by page once per set of passages;
 // a button that starts work is disabled while its request is pending (React applies that before it
-// handles the next click, so a double click sends one request).
+// handles the next click, so a double click sends one request); the Library says it is adding while
+// any upload is still to finish.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -162,4 +163,17 @@ function imageRequests(text) {
 
 test('a page let go while its image loads aborts that request, so no stale render waits for a slot', () => {
   assert.deepEqual(imageRequests(source('Paper.jsx')), [{ signal: 'controller.signal', aborted: true }]);
+});
+
+// What the Library's adding is made from, as source text.
+function addingFrom(text) {
+  return parsed(text, (context, found) => ({
+    VariableDeclarator(node) {
+      if (/\badding\b/.test(context.sourceCode.getText(node.id))) found.from = context.sourceCode.getText(node.init);
+    },
+  })).from;
+}
+
+test('the Library says it is adding while any upload is still to finish, not only until the first one ends', () => {
+  assert.equal(addingFrom(source('Library.jsx')), 'useSyncExternalStore(watchUploads, uploadsWaiting) > 0');
 });

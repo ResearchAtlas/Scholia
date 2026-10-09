@@ -63,11 +63,23 @@ export function requestsOf(files) {
 // once others were added ends the sending, its error code in `problem`. Uploads run one after
 // another, wherever they start (a drop, Add files, the conversation, Replace file): each reads its
 // files' data only once it is its turn, so several started at once never hold theirs together. One
-// that fails does not stop the next.
+// that fails does not stop the next. uploadsWaiting() counts those started and not yet finished;
+// watchUploads(listener) hears each change.
 let uploads = Promise.resolve();
+let waiting = 0;
+export const uploadsWaiting = () => waiting;
+export function watchUploads(listener) {
+  libraryEvents.addEventListener('uploads', listener);
+  return () => libraryEvents.removeEventListener('uploads', listener);
+}
+function waitingChanged(change) {
+  waiting += change;
+  libraryEvents.dispatchEvent(new Event('uploads'));
+}
 export function addFiles(projectId, files, options = {}) {
+  waitingChanged(1);
   const turn = uploads.then(() => upload(projectId, files, options));
-  uploads = turn.catch(() => null);
+  uploads = turn.catch(() => null).then(() => waitingChanged(-1));
   return turn;
 }
 

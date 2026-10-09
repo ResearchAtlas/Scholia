@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES,
   detailsSource, latestLookup, pageImage } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -402,6 +402,38 @@ test('an upload whose file fails to read keeps its turn until its other files ha
     assert.deepEqual(events, [['read', 'bad.md'], ['read', 'slow.md'], ['read out', 'slow.md'],
       ['read', 'next.md'], ['read out', 'next.md']]); // next.md is read only once slow.md is done
   } finally {
+    globalThis.fetch = realFetch;
+    globalThis.FileReader = realReader;
+  }
+});
+
+test('the uploads still to finish are counted until the last one, and each change is heard', async () => {
+  const realFetch = globalThis.fetch;
+  const realReader = globalThis.FileReader;
+  globalThis.FileReader = class {
+    readAsDataURL() { setTimeout(() => { this.result = 'data:;base64,'; this.onload(); }); }
+  };
+  globalThis.fetch = async (path, init) => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return new Response(JSON.stringify({ materials: [{ id: JSON.parse(init.body).files[0].name, existing: false }],
+      lookup_run_id: null }), { status: 201 });
+  };
+  const heard = [];
+  const stop = watchUploads(() => heard.push(uploadsWaiting()));
+  try {
+    assert.equal(uploadsWaiting(), 0);
+    const a = addFiles('p1', [new File(['# x'], 'a.md')]); // two drops, the second queued behind the first
+    const b = addFiles('p1', [new File(['# x'], 'b.md')]);
+    assert.equal(uploadsWaiting(), 2);
+    await a;
+    await new Promise((resolve) => setTimeout(resolve));
+    assert.equal(uploadsWaiting(), 1); // the first is done, the second still under way: still adding
+    await b;
+    await new Promise((resolve) => setTimeout(resolve));
+    assert.equal(uploadsWaiting(), 0);
+    assert.deepEqual(heard, [1, 2, 1, 0]);
+  } finally {
+    stop();
     globalThis.fetch = realFetch;
     globalThis.FileReader = realReader;
   }

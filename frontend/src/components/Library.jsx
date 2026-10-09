@@ -2,7 +2,7 @@
 // The Library (S7; slice-1 spec F3a): Add files and a drop zone, the confirmations its work waits
 // on, and the project's papers, each Reading, Ready, or Needs attention with its reason, with its
 // details under Details. A paper opens its own page (Paper.jsx). Search comes with S1-17.
-import { useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { FilePlus2, FileText, TriangleAlert, Upload } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
@@ -10,7 +10,7 @@ import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
 import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEvents, newest, reasonKey, sortFiles, stateKey,
-  typeKey, unsettled, yearOf } from '../library.js';
+  typeKey, unsettled, uploadsWaiting, watchUploads, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { Paper } from './Paper.jsx';
@@ -75,15 +75,13 @@ export function Library({ project }) {
   const { listing, problem, load } = useLibrary(project?.id);
   const [open, setOpen] = useState(null); // the paper whose page is shown
   const [notice, setNotice] = useState(null);
-  const [adding, setAdding] = useState(false);
+  const adding = useSyncExternalStore(watchUploads, uploadsWaiting) > 0; // while any upload is still to finish
   const [over, setOver] = useState(false);
   const input = useRef(null);
 
   async function add(files) {
     setNotice(null);
-    setAdding(true);
     const result = await addTo(project.id, files, t, setNotice);
-    setAdding(false);
     if (result?.materials.some((m) => m.existing)) setNotice(t('library.alreadyHere'));
     load();
   }
