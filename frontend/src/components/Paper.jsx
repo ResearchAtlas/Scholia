@@ -4,7 +4,7 @@
 // them; every format also shows its passages as text, in order. The cited passage's highlight comes
 // with S1-19's citations; here a passage is highlighted while it is pointed at or focused, and Tab
 // reaches each passage, in the text and on the page.
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { patch } from '../api.js';
@@ -141,6 +141,7 @@ function Contents({ material }) {
   const [chosen, setChosen] = useState('pages');
   const view = viewOf(material, chosen);
   const [passages, setPassages] = useState(null);
+  const pages = useMemo(() => passages && byPage(passages), [passages]); // once per set, not for each page shown
   const [failed, setFailed] = useState(false);
   const [pointed, setPointed] = useState(NOT_POINTED); // the passages with focus and under the pointer
   const [near, setNear] = useState(() => new Set()); // the pages within two screens of the view
@@ -166,7 +167,7 @@ function Contents({ material }) {
       {passages && view === 'pages' && (
         <div className="grid gap-4">
           {Array.from({ length: material.extraction.pages ?? 0 }, (_, i) => (
-            <PageView key={i} version={version} number={i + 1} passages={byPage(passages).get(i + 1) ?? []}
+            <PageView key={i} version={version} number={i + 1} passages={pages.get(i + 1) ?? []}
               pointed={pointed} onPoint={setPointed} held={held.has(i + 1)} onNear={onNear} />
           ))}
         </div>

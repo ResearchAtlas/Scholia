@@ -78,3 +78,32 @@ test('a drop elsewhere in the window imports there, and a drag that leaves the w
   dispatch('onDragLeave', shell, null);
   assert.equal(state.dropping, false);
 });
+
+// Each byPage call in a source, with the dependencies of the useMemo it is made in ('' when none).
+function groupings(text) {
+  return parsed(text, (context, found) => ({
+    CallExpression(call) {
+      if (call.callee.name !== 'byPage') return;
+      let memo = '';
+      for (let node = call.parent, inner = call; node; inner = node, node = node.parent) {
+        if (node.type === 'CallExpression' && node.callee.name === 'useMemo' && node.arguments[0] === inner) {
+          memo = context.sourceCode.getText(node.arguments[1]);
+          break;
+        }
+        if (['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type) && node.parent?.callee?.name !== 'useMemo') break;
+      }
+      (found.calls ??= []).push(memo);
+    },
+  })).calls ?? [];
+}
+
+test('the page viewer groups the passages by page once per set of passages, not for each page it shows', () => {
+  assert.deepEqual(groupings(source('Paper.jsx')), ['[passages]']);
+});
+
+test('the check finds a grouping made inside the pages\' loop', () => {
+  const inLoop = 'function C({ passages, n }) { return Array.from({ length: n }, (_, i) => <P passages={byPage(passages).get(i)} />); }';
+  const once = 'function C({ passages, n }) { const pages = useMemo(() => passages && byPage(passages), [passages]); return n; }';
+  assert.deepEqual(groupings(inLoop), ['']);
+  assert.deepEqual(groupings(once), ['[passages]']);
+});
