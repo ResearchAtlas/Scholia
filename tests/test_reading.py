@@ -622,11 +622,14 @@ async def test_a_page_image_past_its_bounds_is_a_wrong_frame(tmp_path, reading_s
 
 
 @pytest.mark.asyncio
-async def test_a_child_started_with_sigchld_ignored_still_reaps_its_sentinel_and_reads(tmp_path, monkeypatch):
-    """Ignored dispositions survive exec: a child whose starter ignored SIGCHLD resets it, so the wait
-    for its sentinel at its end works and the reading is taken."""
-    command = [sys.executable, "-c", "import os, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
-               "os.execv(sys.executable, [sys.executable, '-m', 'backend.reading'])"]
+async def test_a_child_whose_sigchld_is_ignored_before_its_main_still_reaps_its_sentinel_and_reads(tmp_path,
+                                                                                                   monkeypatch):
+    """A child in which SIGCHLD is ignored before main() runs (as a library imported first might), which
+    on macOS makes the kernel reap its children unasked, resets it: its wait for its sentinel at its end
+    works, and the reading is taken. (An ignored SIGCHLD inherited through exec does not make the kernel
+    reap on macOS, so the child is started here in the process that ignored it.)"""
+    command = [sys.executable, "-c", "import runpy, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
+               "sys.argv = ['backend.reading']; runpy.run_module('backend.reading', run_name='__main__')"]
     monkeypatch.setattr(reading, "command", lambda: command)
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     with allow_command(*command):

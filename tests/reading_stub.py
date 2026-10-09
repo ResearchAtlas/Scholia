@@ -19,7 +19,8 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     frame NAME        send a frame that is not one (FRAMES), then read for real
     after-done NAME   read for real, then after `done`: send a frame (beat) or exit non-zero (exit)
     done NAME         read for real, its `done` changed as NAME says (see Out.send)
-    png NAME          a page image whose PNG header says NAME (huge: past the page bounds)
+    png NAME          a page image whose PNG header says NAME: huge (past the page bounds), a pixel past
+                      or two pixels past (MAX_PAGE_SIDE)
     version           name another extractor version in `ready`
     no-start          exit before `ready`
     canary TEXT       print TEXT to stdout and stderr, then abort
