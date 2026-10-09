@@ -1143,21 +1143,27 @@ def test_a_latex_texts_paragraph_breaks_each_call_stop():
     assert len(calls) == 3
 
 
-def test_a_latex_paragraph_past_the_block_bound_is_refused_before_its_pieces_are_copied_and_joined(monkeypatch):
+@pytest.mark.parametrize("texts", [["a" * (30 * 2**20) + "\n\nb"], ["a" * 2**20] * 30])
+def test_a_latex_paragraph_past_the_block_bound_is_refused_before_its_pieces_are_copied_and_joined(monkeypatch, texts):
+    """Text nodes as pylatexenc makes them: a paragraph of 30 MiB in one (copied out before), and one of 30
+    nodes of 1 MiB (joined before), each refused before more of it is copied."""
     import pylatexenc.latexwalker as walker
-    text = "a" * (30 * 2**20)  # one text node, as pylatexenc made it: refused before any of it is copied
 
     class Walker:
         def __init__(self, *args, **kwargs):
             pass
 
         def get_latex_nodes(self):
-            return [walker.LatexCharsNode(text, pos=0, len=len(text))], 0, len(text)
+            nodes, at = [], 0
+            for text in texts:
+                nodes.append(walker.LatexCharsNode(text, pos=at, len=len(text)))
+                at += len(text)
+            return nodes, 0, at
 
     extract(b"x", extraction.LATEX)  # pylatexenc imported before memory is measured
     monkeypatch.setattr(walker, "LatexWalker", Walker)
     peak, refused = _peak(lambda: extract(b"x", extraction.LATEX))
-    assert refused and peak < 2**20, f"{peak / 2**20:.1f} MiB"  # its copy and their join: 60 MiB before
+    assert refused and peak < 2**20, f"{peak / 2**20:.1f} MiB"  # 30 MiB at f962e62
 
 
 def test_each_search_for_where_a_piece_begins_calls_stop():
