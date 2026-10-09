@@ -32,7 +32,9 @@ sequence the main database cannot have (a restored or replaced database: its que
 is lower) is replaced and rebuilt from the main database's current readings, in the writer, while
 the app runs; another tokenizer version re-tokenizes the keyword rows; another model, revision,
 quantization, runtime or dimension drops every vector, so that search never uses one from another
-model. Nothing here logs text, a title, a query or a path.
+model. A whole rebuild that fails leaves the index unavailable (its partial file is never read, nor
+taken for ready) and is tried again in the writer, sooner and then less often, until one succeeds.
+Nothing here logs text, a title, a query or a path.
 """
 
 import concurrent.futures
@@ -100,6 +102,11 @@ class CleanupFailed(Exception):
 
 class _Stopped(Exception):
     """The run a project's rebuild works for was stopped: its transaction rolls back."""
+
+
+class Unavailable(Exception):
+    """A whole rebuild of the file failed: nothing is read from the partial file, or written to it, until
+    one succeeds (it is tried again, SearchIndex._rebuild_later)."""
 
 
 # Tokens
@@ -253,6 +260,8 @@ class SearchIndex:
         self._conn = None
         self._truncate = False  # a WAL truncation not done yet: tried again at each pass, and soon (_retry_later)
         self._retry, self._retries = None, 0  # the timer of the next try after a failure, and how many failed
+        self.unusable = False  # a whole rebuild failed: its partial file is neither read nor written (Unavailable)
+        self._rebuild_retry, self._rebuild_failures = None, 0  # the same, for a whole rebuild
         self.rebuilt = None  # called (in the writer) once a damaged file found while the app runs is rebuilt
         self._readers = queue.SimpleQueue()  # idle read connections
         self._generation = 0  # a replaced file's readers are closed, not used again
@@ -293,6 +302,8 @@ class SearchIndex:
         """fn(conn) on an idle read connection, in one read transaction."""
         if self.closed:
             raise DatabaseClosedError("the search index is closed")
+        if self.unusable:
+            raise Unavailable()
         with self._lock:
             generation = self._generation
         try:
@@ -395,15 +406,23 @@ class SearchIndex:
                                [(key, str(value)) for key, value in values.items()])
 
     def _rebuild_soon(self, then=None):
-        """_rebuild_all in the writer, without waiting for it, then then() there once it has succeeded; a
-        failure is logged (the next launch finds the file unfinished and rebuilds it again)."""
+        """_rebuild_all in the writer, without waiting for it, then then() there once it has succeeded. One
+        that fails leaves its partial file unusable (never read as ready) and is tried again soon, its
+        papers' embeddings asked for once one succeeds (self.rebuilt)."""
         def done(future):
             if not future.cancelled() and future.exception() is not None:
                 log.error("rebuilding the search index failed (%s)", type(future.exception()).__name__)
 
         def rebuild():
-            if not self._rebuild_all():
+            try:
+                if not self._rebuild_all():
+                    return
+            except Exception as error:
+                self.unusable = True
+                log.error("rebuilding the search index failed (%s); it is tried again", type(error).__name__)
+                self._rebuild_later()
                 return
+            self._rebuild_failures = 0
             if then is not None and not self.closed:  # once the file is ready, whatever the pass after it meets
                 then()
             try:
@@ -414,42 +433,61 @@ class SearchIndex:
         future.add_done_callback(done)
         return future
 
+    def _rebuild_later(self):
+        """Another whole rebuild after a delay that doubles with each failure in a row (RETRY_SECONDS), one at
+        a time, none once the index is closed."""
+        def again():
+            with self._lock:
+                self._rebuild_retry = None
+                if self.closed:
+                    return
+            try:
+                self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
+            except RuntimeError:  # the writer stopped meanwhile (closing)
+                pass
+        with self._lock:
+            if self.closed or self._rebuild_retry is not None:
+                return
+            delay = min(RETRY_SECONDS[0] * 2 ** self._rebuild_failures, RETRY_SECONDS[1])
+            self._rebuild_failures += 1
+            self._rebuild_retry = threading.Timer(delay, again)
+            self._rebuild_retry.daemon = True
+            self._rebuild_retry.start()
+
     def _rebuild_all(self):
         """Replace the file with a new one built from the main database's current readings: marked
         building until every project's rows are in, so a launch that finds it unfinished starts
         again. The last sequence applied is the queue's high-water mark read first; the queue then
         brings in what changed meanwhile (the caller's next pass). Readers never make the file
         (connect), so the new one is this writer's, owner-only. Returns whether it finished (else the
-        index closed meanwhile)."""
+        index closed meanwhile). One that fails leaves building set: no pass applies to its file."""
         self.building = True
-        try:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
-            self._close_readers()
-            for suffix in ("", "-wal", "-shm"):
-                Path(f"{self.path}{suffix}").unlink(missing_ok=True)
-            self._create()
-            self._conn, self.vectors = self._connect()
-            self._conn.execute("PRAGMA journal_mode = WAL")
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+        self._close_readers()
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+        self._create()
+        self._conn, self.vectors = self._connect()
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        with self._conn:
+            self._conn.execute(SCHEMA)
+            self._meta(state="building", last_seq=0, schema=SCHEMA_VERSION, database=self._database(),
+                       tokenizer=TOKENIZER, tokenizer_version=TOKENIZER_VERSION, **self.identity)
+        self._vector_tables()
+        last = self.db.read(high_water)
+        for (project,) in self.db.read(lambda conn: conn.execute("SELECT id FROM projects").fetchall()):
+            if self.closed:
+                return False
+            found = self.db.read(lambda conn: readings(conn, project))
             with self._conn:
-                self._conn.execute(SCHEMA)
-                self._meta(state="building", last_seq=0, schema=SCHEMA_VERSION, database=self._database(),
-                           tokenizer=TOKENIZER, tokenizer_version=TOKENIZER_VERSION, **self.identity)
-            self._vector_tables()
-            last = self.db.read(high_water)
-            for (project,) in self.db.read(lambda conn: conn.execute("SELECT id FROM projects").fetchall()):
-                if self.closed:
-                    return False
-                found = self.db.read(lambda conn: readings(conn, project))
-                with self._conn:
-                    for pid, reading in found.items():
-                        self._add(project, pid, reading)
-            with self._conn:
-                self._meta(state="ready", last_seq=last)
-            self.damaged = False
-        finally:
-            self.building = False
+                for pid, reading in found.items():
+                    self._add(project, pid, reading)
+        with self._conn:
+            self._meta(state="ready", last_seq=last)
+        self.damaged = self.unusable = False
+        self.building = False
         return True
 
     def _damaged(self):
@@ -667,6 +705,8 @@ class SearchIndex:
         return self._write(self._store, project_id, embedded, withdraw=stop)
 
     def _store(self, project_id, embedded):
+        if self.unusable:
+            raise Unavailable()
         if not self.vectors or self.building:
             return 0
         written = 0
@@ -725,8 +765,9 @@ class SearchIndex:
         every connection."""
         with self._lock:
             self.closed = True
-            if self._retry is not None:
-                self._retry.cancel()
+            for timer in (self._retry, self._rebuild_retry):
+                if timer is not None:
+                    timer.cancel()
 
         def end():
             if self._conn is not None:

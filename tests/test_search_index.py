@@ -539,3 +539,96 @@ async def test_a_change_that_finds_the_file_damaged_has_it_rebuilt_and_embedded_
         await until_rebuilt(index)
         status = await until_embedded(client, project)
         assert status["passages"] == before["passages"] and status["state"] == "ready" and rebuilt == [True]
+
+
+def _failing_rebuilds(monkeypatch, fail_project, failures, held=None):
+    """Make whole rebuilds fail as they reach fail_project's rows (the projects before it committed: a
+    partial file), for the first `failures` attempts; with held, the attempt after them waits for it. Returns
+    the list of attempts made."""
+    import threading
+    attempts, real_all, real_add = [], SearchIndex._rebuild_all, SearchIndex._add
+
+    def counted(self):
+        attempts.append(True)
+        if held is not None and len(attempts) == failures + 1:
+            held.wait(20)
+        return real_all(self)
+
+    def failing(self, project, pid, reading):
+        if self.building and project == fail_project and len(attempts) <= failures:
+            raise search_index.apsw.IOError("disk I/O error")
+        return real_add(self, project, pid, reading)
+    monkeypatch.setattr(SearchIndex, "_rebuild_all", counted)
+    monkeypatch.setattr(SearchIndex, "_add", failing)
+    return attempts
+
+
+async def _unfinished(path):
+    conn = search_index.apsw.Connection(str(path))
+    conn.execute("UPDATE index_meta SET value = 'building' WHERE key = 'state'")  # rebuilt at the next launch
+    conn.close()
+
+
+async def _until(check, timeout=10.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not check():
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_a_whole_rebuild_that_fails_once_is_tried_again_and_its_partial_file_is_never_read(tmp_path, monkeypatch):
+    import threading
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (0.05, 0.05))
+    async with app(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        await added(client, first, WAGES)
+        await added(client, second, CHINESE)
+        before = {p: await until_embedded(client, p) for p in (first, second)}
+        path = client.state["index"].path
+    await _unfinished(path)
+    held = threading.Event()
+    attempts = _failing_rebuilds(monkeypatch, second, failures=1, held=held)
+    try:
+        async with app(tmp_path) as client:
+            index = client.state["index"]
+            await _until(lambda: len(attempts) == 2)  # the first failed, after First's rows; the retry waits
+            assert index.unusable
+            status = (await client.get(f"/api/projects/{first}/index")).json()
+            assert (status["state"], status["mode"], status["reason"]) == ("unavailable", "keyword_only", "index_unavailable")
+            found = await find(client, first, "earnings")  # First's rows are in the partial file: never read
+            assert (found["results"], found["index"], found["reason"]) == ([], "unavailable", "index_unavailable")
+            held.set()
+            await _until(lambda: not index.unusable and not index.building)
+            for project in (first, second):
+                status = await until_embedded(client, project)
+                assert status["state"] == "ready" and status["passages"] == before[project]["passages"]
+            assert (await find(client, second, "最低工资"))["results"]
+    finally:
+        held.set()
+
+
+@pytest.mark.asyncio
+async def test_a_whole_rebuild_that_keeps_failing_leaves_search_unavailable_never_the_partial_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (0.05, 0.2))
+    async with app(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        await added(client, first, WAGES)
+        await added(client, second, CHINESE)
+        await until_embedded(client, second)
+        path = client.state["index"].path
+    await _unfinished(path)
+    attempts = _failing_rebuilds(monkeypatch, second, failures=10_000)
+    async with app(tmp_path) as client:
+        index = client.state["index"]
+        await _until(lambda: len(attempts) >= 3)  # tried again, and again
+        for project in (first, second):
+            status = await idle(client, project)  # the launch's index runs end; none loops on the file
+            assert (status["state"], status["reason"], status["passages"]["indexed"]) == ("unavailable", "index_unavailable", 0)
+            found = await find(client, project, "earnings")
+            assert (found["results"], found["index"]) == ([], "unavailable")
+        ended = [r for r in (await client.get("/api/activity")).json()["runs"]  # this launch's: the first's succeeded
+                 if r["workflow"] == "index" and r["status"] != "succeeded"]
+        assert ended and all((r["status"], (r["result"] or {}).get("reason")) == ("failed", "index_unavailable")
+                             for r in ended)
+        assert index.unusable and index.building

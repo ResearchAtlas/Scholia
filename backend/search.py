@@ -50,7 +50,7 @@ from backend import asks, local_helper
 from backend.db import deletion, new_id
 from backend.local_helper import EMBEDDING, HelperUnavailable, Refused
 from backend.runs import AdmissionError, RunOutcome, _event, _revoked, _running, derived_status
-from backend.search_index import DAMAGE, DIMENSIONS, SearchIndex, digest, index_text, readings
+from backend.search_index import DAMAGE, DIMENSIONS, SearchIndex, Unavailable, digest, index_text, readings
 from backend.settings import load_settings, visible
 
 log = logging.getLogger(__name__)
@@ -285,7 +285,10 @@ def register(harness, state):
     _STATES[harness] = state
 
     async def index_run(harness, active, project_id, inputs):
-        return await _index_run(state, harness, active, project_id, inputs)
+        try:
+            return await _index_run(state, harness, active, project_id, inputs)
+        except (Unavailable, *DAMAGE):  # the file is being replaced or rebuilt again; its rebuild's runs embed
+            raise RunOutcome("failed", "index_unavailable") from None
 
     async def offer_run(harness, active, project_id, inputs):
         return await _offer_run(state, harness, active, project_id, inputs)
@@ -298,7 +301,7 @@ def search_mode(state):
     """("hybrid", None), or ("keyword_only", why): no index, sqlite-vec not loaded, or the helper's own
     reason (local_helper.Local.status: the model missing, the helper failed, and so on)."""
     index = state.get("index")
-    if index is None or index.closed:
+    if index is None or index.closed or index.unusable:
         return "keyword_only", "index_unavailable"
     if not index.vectors:
         return "keyword_only", "vectors_unavailable"
@@ -329,10 +332,7 @@ async def _index_run(state, harness, active, project_id, inputs):
     materials = inputs.get("material_ids") or []
 
     async def drained(fn, *args):  # a change to the index, finished (or withdrawn) before the run's end is recorded
-        try:
-            done = await harness.work(active, lambda: fn(*args))
-        except DAMAGE:  # the file is being replaced and rebuilt (SearchIndex._guarded); Retry, or its rebuild's runs, embed
-            raise RunOutcome("failed", "index_unavailable") from None
+        done = await harness.work(active, lambda: fn(*args))
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         return done
@@ -497,7 +497,7 @@ async def search(state, project_id, query, limit=None):
     values = load_settings(state["data_dir"]).values["retrieval"]
     limit = min(limit or values["keep"], MAX_LIMIT)  # the setting may be larger than the API allows
     mode, reason = search_mode(state)
-    if index is None or index.closed:  # it could not be opened, or a restore is putting another in place
+    if index is None or index.closed or index.unusable:  # not opened, being replaced, or its rebuild failed (retried)
         return {"results": [], "mode": mode, "reason": reason, "index": "unavailable", "coverage": None}
     keyword = asyncio.ensure_future(asyncio.to_thread(index.keyword, project_id, text, values["bm25_candidates"]))
     counts = await _counts(index, project_id)
@@ -558,7 +558,7 @@ async def index_status(project_id: str, request: Request):
                        (run, run and derived_status(run[1], run[0], registry)))
     active = run and registry.runs.get(run[0])
     index = state.get("index")
-    if index is not None and index.closed:
+    if index is not None and (index.closed or index.unusable):
         index = None
     counts = await _counts(index, project_id) if index is not None else {}
     mode, reason = search_mode(state)
