@@ -1430,11 +1430,14 @@ def _markdown(source, stop):
                                 sections.path, start, end, source=source))
 
     def line_at(at):
-        """The line that starts at at and where the next one starts; (None, at) past the last."""
+        """The line that starts at at and where the next one starts; (None, at) past the last.
+        Unreadable for a line longer than MAX_BLOCK_CHARS, before it is copied out."""
         if at > len(source):
             return None, at
         end = source.find("\n", at)
         end = len(source) if end < 0 else end
+        if end - at > MAX_BLOCK_CHARS:
+            raise Unreadable()
         return source[at:end], end + 1
 
     paragraph = None  # (where it starts, where its last line ends, whether a list item starts it)
@@ -1480,8 +1483,6 @@ def _markdown(source, stop):
                 emit("paragraph", code, at, closing if scan is not None else len(source))  # unfinished: to the end
             at, (line, after) = past, line_at(past)
             continue
-        if len(line) > MAX_BLOCK_CHARS:  # a heading's or a row's line, before its marks are taken out
-            raise Unreadable()
         heading = _ATX.match(line)
         if heading:
             flush(at)
@@ -1504,8 +1505,6 @@ def _markdown(source, stop):
             table.add(cells(line))
             row_at, (row, past) = beyond, line_at(beyond)
             while row is not None and "|" in row and row.strip():
-                if len(row) > MAX_BLOCK_CHARS:
-                    raise Unreadable()
                 table.add("\n" + cells(row))
                 end = row_at + len(row)
                 row_at, (row, past) = past, line_at(past)
@@ -1561,6 +1560,9 @@ def _latex(source, stop):
     # that can start one (with the text between them, at most twice as many nodes and one more).
     if sum(source.count(mark) for mark in _LATEX_MARKS) > MAX_LATEX_MARKS:
         raise Unreadable()
+    for breaks, _ in enumerate(_BLANK_LINE.finditer(source), start=1):  # its paragraph breaks, one at a time
+        if breaks > MAX_BLOCKS:  # each a block once read (walk): refused before pylatexenc reads them all
+            raise Unreadable()
     context = get_default_latex_context_db()
     context.add_context_category("scholia", macros=[MacroSpec("caption", "[{"), MacroSpec("bibitem", "[{")],
                                  environments=[EnvironmentSpec("thebibliography", "{")], prepend=True)
@@ -1611,6 +1613,7 @@ def _latex(source, stop):
                     end = gap.start() if gap else len(node.chars)
                     add(node.chars[at:end], node.pos + at, node.pos + end)
                     if gap:
+                        _keep()  # each break counted as a block, so blank lines alone make no unbounded work
                         flush(kind)
                         at = gap.end()
                 continue

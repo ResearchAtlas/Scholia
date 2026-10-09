@@ -673,6 +673,34 @@ def test_a_pdfs_font_sizes_are_counted_in_at_most_a_few_thousand_buckets(monkeyp
     assert held == [1991]  # 10 to 1,999 points, and 2,000 for every larger size
 
 
+def test_a_markdown_line_past_the_block_bound_is_refused_before_it_is_copied_or_transformed():
+    data = b"a " * 4 * 2**20  # 8 MiB in one nonblank line
+    peak, refused = _peak(lambda: extract(data, extraction.MARKDOWN))
+    assert refused and peak < 3 * len(data), f"{peak / 2**20:.1f} MiB"  # its text decoded, no more: 91 MiB before
+
+
+def test_a_latex_file_of_more_paragraph_breaks_than_blocks_is_refused_before_it_is_parsed(monkeypatch):
+    import pylatexenc.latexwalker as walker
+
+    def never(*args, **kwargs):
+        raise AssertionError("the file was parsed")
+
+    extract(b"x", extraction.LATEX)  # pylatexenc imported before memory is measured
+    monkeypatch.setattr(walker, "LatexWalker", never)
+    data = b"\n\n" * (extraction.MAX_BLOCKS + 1)  # no mark at all, and a break for every two characters
+    peak, refused = _peak(lambda: extract(data, extraction.LATEX))
+    assert refused and peak < 4 * 2**20, f"{peak / 2**20:.1f} MiB"
+
+
+def test_a_latex_files_breaks_are_counted_as_blocks_as_they_are_found(monkeypatch):
+    monkeypatch.setattr(extraction, "MAX_BLOCKS", 1000)
+    data = b"a\n\n" * 600  # 600 breaks pass the count before parsing; with their 600 paragraphs, 1,200 blocks
+    with pytest.raises(extraction.Unreadable):
+        extract(data, extraction.LATEX)
+    monkeypatch.setattr(extraction, "MAX_BLOCKS", 1200)
+    assert len(extract(data, extraction.LATEX).passages) == 600
+
+
 def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
     import pypdfium2
 
