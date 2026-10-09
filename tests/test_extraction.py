@@ -3,6 +3,9 @@ on one page, at most 2,000 characters split at sentence boundaries, tables and c
 references marked, and each format read from its own structure with nothing fetched or included."""
 
 import io
+import itertools
+import random
+import re
 import struct
 import textwrap
 import zipfile
@@ -355,6 +358,47 @@ def test_markdown_inline_marks_go_and_names_with_underscores_stay():
     read = extract(b"Some **bold** and *em* and `code` with snake_case_name and a [link](https://example.org).",
                    extraction.MARKDOWN)
     assert kinds(read.passages) == [("paragraph", "Some bold and em and code with snake_case_name and a link.")]
+
+
+# The patterns the Markdown reader's scans replaced, as f962e62 had them (they rescan a line from each mark
+# not closed): each scan gives what its pattern gave, here over every short string of the marks.
+OLD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+OLD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+OLD_INLINE = re.compile(r"(\*\*|\*|`|~~)(?=\S)(.+?)(?<=\S)\1|(?<!\w)(__|_)(?=\S)(.+?)(?<=\S)\3(?!\w)")
+OLD_ATX = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+OLD_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def old_inline(text):
+    text = re.sub(r"<[^>]+>", "", OLD_LINK.sub(r"\1", OLD_IMAGE.sub(r"\1", text)))
+    for _ in range(3):
+        text = OLD_INLINE.sub(lambda m: m.group(2) if m.group(2) is not None else m.group(4), text)
+    return text
+
+
+def strings(alphabet, longest):
+    for size in range(longest + 1):
+        yield from map("".join, itertools.product(alphabet, repeat=size))
+
+
+@pytest.mark.parametrize("alphabet", ["*_`~ a", "![]()a", "<> a!["])
+def test_markdown_inline_scans_give_what_the_patterns_they_replace_gave(alphabet):
+    for text in strings(alphabet, 6):
+        assert extraction._markdown_inline(text) == old_inline(text), repr(text)
+    rng = random.Random(alphabet)  # and longer lines, with spaces, word characters and marks of every kind
+    marks = list("![]()<>*_`~#|:- ") + ["**", "__", "~~", "\t", "\u3000", "\u00a0", "a", "\u00e9", "\u4e2d", "1"]
+    for _ in range(3000):
+        text = "".join(rng.choice(marks) for _ in range(rng.randint(0, 40)))
+        assert extraction._markdown_inline(text) == old_inline(text), repr(text)
+
+
+def test_markdown_heading_and_table_rule_scans_give_what_their_patterns_gave():
+    for line in strings("# a\t", 7):
+        old, new = OLD_ATX.match(line), extraction._ATX.match(line)
+        assert bool(old) == bool(new) and (not old or (old.group(1), old.group(2))
+                                           == (new.group(1), extraction._atx_text(line, new))), repr(line)
+    for line in strings(" |:-x", 7):
+        assert bool(OLD_TABLE_RULE.match(line)) == bool(extraction._TABLE_RULE.match(line)), repr(line)
 
 
 def test_latex_reads_no_other_file_and_no_comment(tmp_path):
@@ -1031,3 +1075,161 @@ def test_an_arxiv_answer_that_declares_an_entity_is_refused():
                                      '<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>&x;</title></entry></feed>')
                       .encode())
     assert failed.value.code == "unavailable"
+
+
+# The S1-13 hardening: scans that call stop() and keep to the bounds, and Markdown's marks in linear time
+
+
+class _Stopped(Exception):
+    pass
+
+
+def _stops_at(call):
+    """A stop() that raises _Stopped on its call-th call, and the number of calls so far, as a list."""
+    calls = []
+
+    def stop():
+        calls.append(None)
+        if len(calls) == call:
+            raise _Stopped()
+    return stop, calls
+
+
+def test_a_markdown_fence_past_the_block_bound_is_refused_as_it_is_scanned_before_it_is_copied():
+    for data in (b"```\n" + b"x\n" * (2 * 2**20), b"```\n" + b"x\n" * (2 * 2**20) + b"```\n"):  # unclosed and closed
+        peak, refused = _peak(lambda: extract(data, extraction.MARKDOWN))
+        assert refused and peak < len(data) + 2**20, f"{peak / 2**20:.1f} MiB"  # its text decoded: 12.8 MiB before
+
+
+@pytest.mark.parametrize("shape", ["a fence", "a table", "a front matter never closed"])
+def test_each_markdown_scan_calls_stop_as_it_reads_lines(shape):
+    """The main loop once called stop() every 200 lines of its own; a fence's or a table's lines, read by their
+    own scans, and a front matter's, read before it, were read with no call."""
+    data = {"a fence": b"```\n" + b"x\n" * 5000 + b"```\n",
+            "a table": b"| a |\n|---|\n" + b"| b |\n" * 5000,
+            "a front matter never closed": b"---\n" + b"a\n\n" * 100_000}[shape]
+    stop, calls = _stops_at(3)
+    kept = []
+    with pytest.raises(_Stopped):
+        extract(data, extraction.MARKDOWN, lambda: kept.append(extraction._READING.get().blocks) or stop())
+    assert len(calls) == 3
+    if shape == "a front matter never closed":  # stopped in its scan, before the text after it is read as blocks
+        assert kept == [0, 0, 0]
+
+
+def test_a_markdown_front_matter_is_looked_for_within_the_structural_bound_then_read_as_text(monkeypatch):
+    """Its closing line is looked for in at most MAX_BLOCKS lines: one not closed within them is no front matter,
+    and the file is read as text, as f962e62 read it, but without reading all its lines twice."""
+    newlines = b"---\n" + b"\n" * (extraction.MAX_BLOCKS + 1)
+    assert kinds(extract(newlines, extraction.MARKDOWN).passages) == [("paragraph", "---")]
+    never = b"---\n" + b"a\n\n" * 120_000  # a rule, then more lines than blocks with no other rule: read as before
+    assert len(extract(never, extraction.MARKDOWN).passages) == 120_000
+    monkeypatch.setattr(extraction, "MAX_BLOCKS", 1000)
+    closed = b"---\n" + b"key: value\n" * 1000 + b"---\n# Title\n\nText.\n"
+    assert kinds(extract(closed, extraction.MARKDOWN).passages) == [("title", "Title"), ("paragraph", "Text.")]
+    past = extract(b"---\n" + b"key: value\n" * 1001 + b"---\n# Title\n", extraction.MARKDOWN).passages
+    assert {p.kind for p in past} == {"paragraph"} and past[0].text.startswith("--- key: value key: value")  # as text
+
+
+# A Markdown line of each shape, n characters long, which its patterns once read in time growing with the
+# square of n (with its cube, a heading's spaces), with no call to stop().
+MARKDOWN_SHAPES = {
+    "image openers": lambda n: "![" * (n // 2),
+    "link openers": lambda n: "[" * n,
+    "tag openers": lambda n: "<" * n,
+    "emphasis never closed": lambda n: "*a " * (n // 3),
+    "underscores never closed": lambda n: " _a" * (n // 3),
+    "code never closed": lambda n: "`a " * (n // 3),
+    "a heading's spaces": lambda n: "# a" + " " * n + "b",
+    "a heading's hashes": lambda n: "# a" + "#" * n + "b",
+    "a table rule's spaces": lambda n: "a|b\n" + " " * n + "x",
+    "a paragraph's spaces": lambda n: "a" + " " * n + "b",
+}
+
+
+@pytest.mark.parametrize("shape", MARKDOWN_SHAPES)
+def test_a_markdown_line_of_marks_never_closed_is_read_in_time_linear_in_it(shape):
+    import time
+    small = 2_000 if shape == "a heading's spaces" else 80_000  # 1.3 to 33 s each at f962e62
+    for size in (small, extraction.MAX_BLOCK_CHARS - 16):  # and 1 MiB, past an hour each there
+        data = MARKDOWN_SHAPES[shape](size).encode()
+        start = time.perf_counter()
+        extract(data, extraction.MARKDOWN)
+        took = time.perf_counter() - start
+        assert took < (0.25 if size == small else 3), f"{took:.2f} s for {size} characters"
+
+
+def test_a_markdown_reading_is_cancelled_through_a_long_line():
+    import time
+    stop, _ = _stops_at(1)
+    with pytest.raises(_Stopped):  # one line, read whole with no call to stop() before (40 KB: 2.3 s)
+        extract(("![" * 20_000).encode(), extraction.MARKDOWN, stop)
+    stop, calls = _stops_at(3)
+    start = time.perf_counter()
+    with pytest.raises(_Stopped):  # lines of 1 MiB each: stop() is called for each, the third call ends it
+        extract((("![" * (extraction.MAX_BLOCK_CHARS // 2) + "\n") * 8).encode(), extraction.MARKDOWN, stop)
+    assert len(calls) == 3 and time.perf_counter() - start < 2
+
+
+def test_html_markup_that_makes_no_block_is_read_with_calls_to_stop():
+    stop, calls = _stops_at(2)
+    with pytest.raises(_Stopped):  # the title's pass and the text's each call it for each piece they read
+        extract(b"<i></i>" * 100_000, extraction.HTML, stop)
+    assert len(calls) == 2
+
+
+def test_a_docx_body_block_is_read_with_calls_to_stop_as_its_events_come():
+    stop, calls = _stops_at(3)
+    with pytest.raises(_Stopped):  # one paragraph of 200,000 empty runs: once one call, at its start
+        extract(_docx_of("<w:p>" + "<w:r/>" * 200_000 + "</w:p>"), extraction.DOCX, stop)
+    assert len(calls) == 3
+
+
+def test_a_latex_texts_paragraph_breaks_each_call_stop():
+    stop, calls = _stops_at(3)
+    with pytest.raises(_Stopped):  # one text node of 1,000 paragraphs: once no call, as one node
+        extract(b"a\n\n" * 1000, extraction.LATEX, stop)
+    assert len(calls) == 3
+
+
+def test_a_latex_tables_cells_each_call_stop():
+    stop, calls = _stops_at(3)
+    with pytest.raises(_Stopped):  # one tabular of 1,000 cells: once no call, as one of walk's nodes
+        extract(b"\\begin{tabular}{l}" + b"a&" * 1000 + b"\\end{tabular}", extraction.LATEX, stop)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("texts", [["a" * (30 * 2**20) + "\n\nb"], ["a" * 2**20] * 30])
+def test_a_latex_paragraph_past_the_block_bound_is_refused_before_its_pieces_are_copied_and_joined(monkeypatch, texts):
+    """Text nodes as pylatexenc makes them: a paragraph of 30 MiB in one (copied out before), and one of 30
+    nodes of 1 MiB (joined before), each refused before more of it is copied."""
+    import pylatexenc.latexwalker as walker
+
+    class Walker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_latex_nodes(self):
+            nodes, at = [], 0
+            for text in texts:
+                nodes.append(walker.LatexCharsNode(text, pos=at, len=len(text)))
+                at += len(text)
+            return nodes, 0, at
+
+    extract(b"x", extraction.LATEX)  # pylatexenc imported before memory is measured
+    monkeypatch.setattr(walker, "LatexWalker", Walker)
+    peak, refused = _peak(lambda: extract(b"x", extraction.LATEX))
+    assert refused and peak < 2**20, f"{peak / 2**20:.1f} MiB"  # 30 MiB at f962e62
+
+
+def test_each_search_for_where_a_piece_begins_calls_stop():
+    """A piece whose first words are not in its block's source (an HTML entity, a mark taken out) is
+    searched for to the block's end, which markup can make far longer than its text."""
+    calls = []
+    reading = extraction._READING.set(extraction._Reading(lambda: calls.append(None)))
+    try:
+        source = "A&amp;B one. " + "<i></i>" * 1000 + "A&amp;B two. A&amp;B three."
+        found = extraction._located(["A&B one.", "A&B two.", "A&B three."], source, 0, 0, len(source))
+    finally:
+        extraction._READING.reset(reading)
+    assert len(found) == 3 and len(calls) == 3

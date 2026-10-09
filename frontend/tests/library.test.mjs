@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, MAX_LIST_HEIGHT, withFocus,
   detailsSource, latestLookup, pageImage, ocrPages } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -673,10 +673,87 @@ test('a page moving to another part keeps what it shows out of reach while that 
   // Retry, or Later again, clears the failure: part 1 is read again, part 0 out of reach again, until it shows.
   assert.deepEqual(partMove(at(0), 1, false), { read: true, loading: true, failed: false });
   assert.deepEqual(partMove(at(1), 1, false), { read: false, loading: false, failed: false });
-  // A page that could not be shown at all says so in its place, with no part to show beside it, and is
-  // read again once let go and held again (its failure cleared).
-  assert.deepEqual(partMove(null, 1, true), { read: false, loading: false, failed: false });
+  // A page that could not be shown at all (or a stretch of the text view) says so in its place, with
+  // Retry, and is read again once asked again or let go and held again (its failure cleared).
+  assert.deepEqual(partMove(null, 1, true), { read: false, loading: false, failed: true });
   assert.deepEqual(partMove(null, 1, false), { read: true, loading: false, failed: false });
+  assert.deepEqual(partMove({ part: 3 }, 3, true), { read: false, loading: false, failed: false }); // a stretch shown
+});
+
+test('a PDF of 100,000 pages mounts only the pages near the view, with spacers keeping every page\'s place', () => {
+  const pages = 100_000;
+  const aspects = new Map([[2, 2], [50_000, 0.5], [99_999, 612 / 792]]); // a wide page, a tall one, an ordinary one
+  const offsets = pageOffsets(pages, 900, aspects, Infinity); // a list wider than a page: pages PAGE_WIDTH wide; no cap
+  const height = (n) => offsets[n] - offsets[n - 1] - PAGE_GAP;
+  assert.equal(height(1), (PAGE_WIDTH - 2) / PAGE_ASPECT + 2);
+  assert.equal(height(2), (PAGE_WIDTH - 2) / 2 + 2);
+  assert.equal(height(50_000), (PAGE_WIDTH - 2) * 2 + 2);
+  assert.equal(pageOffsets(3, 400, new Map())[1], (400 - 2) / PAGE_ASPECT + 2 + PAGE_GAP); // a narrow list: pages its width
+  // Laid out, a window's items take the whole list's height: each spacer its pages' and their gaps, less the list's gap after it.
+  const laid = (items) => items.reduce((sum, item) => sum + (item.page ? height(item.page) : item.height), 0)
+    + PAGE_GAP * (items.length - 1);
+  const pagesOf = (items) => items.filter((item) => item.page).map((item) => item.page);
+  const screen = 900;
+  const at = (top, held = []) => pageWindow(offsets, pagesWithin(offsets, top - 2 * screen, top + 3 * screen), held);
+  for (const [top, held] of [[0, []], [offsets[49_999] - 100, []], [offsets[pages] - screen, []], [offsets[70_000], [1, 100_000]],
+    [offsets[pages] + 5000, []], [-5000, [3]]]) {
+    const items = at(top, held);
+    const mounted = pagesOf(items);
+    assert.ok(mounted.length <= 16, `${mounted.length} pages mounted at ${top}`); // of 100,000
+    assert.ok(Math.abs(laid(items) - (offsets[pages] - PAGE_GAP)) < 1e-3, `${laid(items)} at ${top}`);
+    assert.deepEqual(mounted, [...mounted].sort((a, b) => a - b)); // in order: Tab goes from each to the next
+    for (const page of held) assert.ok([page - 1, page, page + 1].filter((n) => n >= 1 && n <= pages).every((n) => mounted.includes(n)));
+    assert.ok(items.every((item, i) => item.page || (item.height > 0 && !items[i + 1]?.spacer))); // no two spacers together
+  }
+  // At the top: the first pages, and one more past those within two screens; at the end, the last ones.
+  const top = pagesOf(at(0));
+  assert.deepEqual([top[0], top.length > 2], [1, true]);
+  assert.ok(top.at(-1) * (height(1) + PAGE_GAP) >= 3 * screen); // the pages reach past two screens below the view
+  assert.equal(pagesOf(at(offsets[pages] - screen)).at(-1), pages);
+  // Around the middle: the tall page near the view, and nothing far from it.
+  const middle = pagesOf(at(offsets[49_999] - 100));
+  assert.ok(middle.includes(50_000) && middle.every((n) => Math.abs(n - 50_000) < 8), middle);
+  // Focus or a selection far from the view keeps its page mounted, with one on each side.
+  assert.deepEqual(pagesOf(at(offsets[70_000], [1, 100_000])).filter((n) => n < 60_000 || n > 80_000), [1, 2, 99_999, 100_000]);
+  assert.deepEqual(pageWindow(pageOffsets(0, 900, new Map()), [1, 0]), []); // no pages, nothing to lay out
+});
+
+test('a PDF too long to lay out lays out the pages under the height cap, and says the later ones are in the text view', () => {
+  const pages = 100_000;
+  const offsets = pageOffsets(pages, 900, new Map([[3, 0.5]]));
+  const shown = offsets.length - 1;
+  const one = (PAGE_WIDTH - 2) / PAGE_ASPECT + 2 + PAGE_GAP;
+  assert.ok(shown < pages && shown > 15_000, shown); // the note shows (shown < pages): some 15,800 letter pages
+  assert.ok(offsets[shown] - PAGE_GAP <= MAX_LIST_HEIGHT && offsets[shown] - PAGE_GAP + one > MAX_LIST_HEIGHT);
+  assert.ok(MAX_LIST_HEIGHT < 16_777_214); // under the lowest cap measured (Chromium), and WebKit's 33,554,432
+  assert.deepEqual(Array.from(offsets), Array.from(pageOffsets(pages, 900, new Map([[3, 0.5]]), Infinity).subarray(0, shown + 1)));
+  // Laid out wherever the view is, the list stays under the cap: at its end, the last page shown and nothing after.
+  const end = pageWindow(offsets, pagesWithin(offsets, offsets[shown] - 1000, offsets[shown] + 5000));
+  assert.equal(end.filter((item) => item.page).at(-1).page, shown);
+  assert.ok(end.reduce((sum, item) => sum + (item.page ? offsets[item.page] - offsets[item.page - 1] - PAGE_GAP : item.height), 0)
+    + PAGE_GAP * (end.length - 1) <= MAX_LIST_HEIGHT);
+  // A PDF that fits is laid out whole, as before: no note.
+  assert.equal(pageOffsets(10_000, 900, new Map()).length - 1, 10_000);
+  // The first page always shows, however tall (a page 1 px wide and 20,000 high, as rendered).
+  assert.equal(pageOffsets(5, 900, new Map([[1, 1 / 20_000]]), 1000).length - 1, 1);
+  // A held page the cut comes to pass, as the list widens: laid out at 400 px wide, not at 720, so the list gives its
+  // focus to the note (Paper.jsx) rather than let it go with the page.
+  const narrow = pageOffsets(20_000, 400, new Map());
+  const wide = pageOffsets(20_000, 900, new Map());
+  assert.deepEqual([narrow.length - 1, wide.length - 1 < 19_000], [20_000, true]);
+  const at = (offsets, y) => pageWindow(offsets, pagesWithin(offsets, y - 1000, y + 1000), [19_000])
+    .filter((item) => item.page).map((item) => item.page);
+  assert.ok(at(narrow, narrow[18_999]).includes(19_000)); // the view at it, and held
+  const bottom = wide[wide.length - 1]; // widened: the view where the list now ends, the page still held
+  assert.ok(!at(wide, bottom).includes(19_000) && at(wide, bottom).at(-1) === wide.length - 1);
+});
+
+test('focus going on from one part of the list to another keeps the one it leaves held until the next says it came', () => {
+  assert.equal(withFocus(null, 4, true, false), 4);
+  assert.equal(withFocus(4, 4, false, true), 4); // Tab to page 5: page 4 (and page 5 beside it) stay mounted meanwhile
+  assert.equal(withFocus(4, 5, true, false), 5); // page 5 says focus came
+  assert.equal(withFocus(5, 5, false, false), null); // focus left the list
+  assert.equal(withFocus(5, 3, false, false), 5); // a part focus had already left says so late: nothing changes
 });
 
 test('Details counts a reading\'s scanned pages: read by text recognition, or waiting where no engine read them', () => {

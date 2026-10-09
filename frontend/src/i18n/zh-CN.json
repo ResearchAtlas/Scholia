@@ -357,6 +357,8 @@
   "paper.pageFailed": "无法显示这一页。",
   "paper.earlierPassages": "本页前面的段落",
   "paper.laterPassages": "本页后面的段落",
+  "paper.pagesCut": "第 {number} 页之后的页面不在此显示，其文字见“段落”。",
+  "paper.showPassages": "显示段落",
   "paper.kind.title": "标题",
   "paper.kind.abstract": "摘要",
   "paper.kind.table": "表格",
