@@ -842,6 +842,60 @@ async function materials(ctx) {
   await page.keyboard.press('Escape'); await page.waitForTimeout(500);
 }
 
+// The parts of the window loaded when first opened (frontend/src/parts.js), on a window just loaded:
+// Settings opened from the keyboard lands focus in its dialog; a part whose script is refused once
+// by the browser says so where it would show, with Try again, which reloads the window and loads it.
+async function parts(ctx) {
+  const { page, L, C, step, check } = ctx;
+  const { dialog, openSidebar } = navigation(ctx);
+  const composer = () => page.getByRole('textbox', { name: L('composer.label') });
+  const retry = (within) => within.getByRole('button', { name: L('common.retry'), exact: true });
+  const reload = async (refused) => {
+    if (refused) await page.route(`**/assets/${refused}-*.js`, (route) => route.abort(), { times: 1 });
+    await page.reload(); await composer().waitFor(); await page.waitForTimeout(500);
+  };
+  const openSettings = async () => {
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.settings') }).focus(); await page.keyboard.press('Enter');
+    await dialog().waitFor(); await page.waitForTimeout(800);
+  };
+  const pages = () => dialog().getByRole('button', { name: L('settings.page.general'), exact: true });
+  const focusInDialog = () => page.evaluate(() => Boolean(document.activeElement?.closest('[role=dialog]')));
+
+  await step('60-settings-first-open', async () => {
+    await reload();
+    await openSettings();
+    check('Settings opened from the keyboard on a window just loaded shows its pages', await pages().isVisible());
+    check('and focus is in its dialog', await focusInDialog());
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+
+  await step('61-settings-not-loaded', async () => {
+    await reload('Settings');
+    await openSettings();
+    check('Settings that cannot load says so in its dialog', await dialog().getByText(L('errors.part_not_loaded')).isVisible());
+    check('with Try again, and focus in the dialog', await retry(dialog()).isVisible() && await focusInDialog());
+  });
+  await step('62-settings-retried', async () => {
+    await Promise.all([page.waitForEvent('load'), retry(dialog()).click()]);
+    await composer().waitFor();
+    await openSettings();
+    check('Try again reloads the window, and Settings then loads', await pages().isVisible()
+      && !(await dialog().getByText(L('errors.part_not_loaded')).count()));
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+
+  if (!C.materials) return;  // an attached app has no synthetic papers
+  await step('63-paper-not-loaded', async () => {
+    await reload('Paper');
+    const panel = page.getByRole('complementary', { name: L('panel.library') });
+    if (!(await panel.count())) await page.getByRole('button', { name: L('panel.library'), exact: true }).click();
+    await panel.getByRole('button', { name: 'A Codebook for Synthetic Interviews', exact: true }).click();
+    await panel.getByText(L('errors.part_not_loaded')).waitFor();
+    check('a paper whose page cannot load says so in the panel, with Try again', await retry(panel).isVisible());
+  });
+}
+
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
 // of its animations, read with them paused (Web Animations API). The box shows the composed
 // motion, whichever properties (transform, translate) carry it.
@@ -1188,6 +1242,7 @@ async function run(combo, build, outRoot) {
     await m1(ctx);
     if (server) await s116(ctx);  // its synthetic model and download source are the test server's
     if (C.materials) await materials(ctx);  // an attached app has no synthetic materials of its own
+    await parts(ctx);
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);
