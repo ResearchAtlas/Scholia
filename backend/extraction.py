@@ -467,6 +467,7 @@ def _located(pieces, source, base, start, end):
     def find(piece, lower):
         if source is None:
             return None
+        _stop()  # a search may run to the block's end: a block's source may be far longer than its text
         words = r"\s+".join(map(re.escape, piece.split(maxsplit=3)[:3]))
         match = re.compile(words).search(source, lower - base, end - base)
         return match.start() + base if match else None
@@ -1059,6 +1060,7 @@ def _xml_events(content):
     depth, quiet = 0, 0
     try:
         for at in range(0, len(content) + (1 << 14), 1 << 14):
+            _stop()  # events within one block of the body, and the styles part's, as well as between blocks
             piece = content[at:at + (1 << 14)]
             reader.parser.Parse(piece, not piece)  # the empty piece after the last: finished once
             events, reader.events = reader.events, []
@@ -1375,6 +1377,7 @@ class _BoundedHtml(HTMLParser):
     def read(self, source):
         self.source, at = source, 0
         while at < len(source):
+            _stop()  # markup that makes no block is read here too
             end, held = min(at + 64 * 1024, len(source)), self.rawdata
             if self.cdata_elem:  # its text, to its closing tag (looked for from where the text began)
                 start = at - len(held)
@@ -1854,7 +1857,7 @@ def _latex(source, stop):
         raise Unreadable() from None
     sections, passages = _Sections(), []
     title = None
-    pending, span = [], [None, None]  # the current paragraph's pieces and its source range
+    pending, span, held = [], [None, None], [0]  # the current paragraph's pieces, its source range and its length
     steps = [0]
 
     def flush(kind=None):
@@ -1866,9 +1869,16 @@ def _latex(source, stop):
             passages.extend(_pieces(text, chosen, None, sections.path, span[0], span[1], source=source))
         pending.clear()
         span[0] = span[1] = None
+        held[0] = 0
+
+    def room(size):  # a paragraph is at most MAX_BLOCK_CHARS (as _normal holds it), checked before more is copied
+        if held[0] + size > MAX_BLOCK_CHARS:
+            raise Unreadable()
 
     def add(text, start, end):
         if text:
+            room(len(text))
+            held[0] += len(text)
             pending.append(text)
             span[0] = start if span[0] is None else span[0]
             span[1] = end
@@ -1893,9 +1903,11 @@ def _latex(source, stop):
                 while gap:  # one blank line at a time: none is looked for before the paragraph before it is kept
                     gap = _BLANK_LINE.search(node.chars, at)
                     end = gap.start() if gap else len(node.chars)
+                    room(end - at)
                     add(node.chars[at:end], node.pos + at, node.pos + end)
                     if gap:
                         _keep()  # each break counted as a block, so blank lines alone make no unbounded work
+                        stop()
                         flush(kind)
                         at = gap.end()
                 continue

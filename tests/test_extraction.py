@@ -1120,3 +1120,54 @@ def test_a_markdown_reading_is_cancelled_through_a_long_line():
     with pytest.raises(_Stopped):  # lines of 1 MiB each: stop() is called for each, the third call ends it
         extract((("![" * (extraction.MAX_BLOCK_CHARS // 2) + "\n") * 8).encode(), extraction.MARKDOWN, stop)
     assert len(calls) == 3 and time.perf_counter() - start < 2
+
+
+def test_html_markup_that_makes_no_block_is_read_with_calls_to_stop():
+    stop, calls = _stops_at(2)
+    with pytest.raises(_Stopped):  # the title's pass and the text's each call it for each piece they read
+        extract(b"<i></i>" * 100_000, extraction.HTML, stop)
+    assert len(calls) == 2
+
+
+def test_a_docx_body_block_is_read_with_calls_to_stop_as_its_events_come():
+    stop, calls = _stops_at(3)
+    with pytest.raises(_Stopped):  # one paragraph of 200,000 empty runs: once one call, at its start
+        extract(_docx_of("<w:p>" + "<w:r/>" * 200_000 + "</w:p>"), extraction.DOCX, stop)
+    assert len(calls) == 3
+
+
+def test_a_latex_texts_paragraph_breaks_each_call_stop():
+    stop, calls = _stops_at(3)
+    with pytest.raises(_Stopped):  # one text node of 1,000 paragraphs: once no call, as one node
+        extract(b"a\n\n" * 1000, extraction.LATEX, stop)
+    assert len(calls) == 3
+
+
+def test_a_latex_paragraph_past_the_block_bound_is_refused_before_its_pieces_are_copied_and_joined(monkeypatch):
+    import pylatexenc.latexwalker as walker
+    text = "a" * (30 * 2**20)  # one text node, as pylatexenc made it: refused before any of it is copied
+
+    class Walker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_latex_nodes(self):
+            return [walker.LatexCharsNode(text, pos=0, len=len(text))], 0, len(text)
+
+    extract(b"x", extraction.LATEX)  # pylatexenc imported before memory is measured
+    monkeypatch.setattr(walker, "LatexWalker", Walker)
+    peak, refused = _peak(lambda: extract(b"x", extraction.LATEX))
+    assert refused and peak < 2**20, f"{peak / 2**20:.1f} MiB"  # its copy and their join: 60 MiB before
+
+
+def test_each_search_for_where_a_piece_begins_calls_stop():
+    """A piece whose first words are not in its block's source (an HTML entity, a mark taken out) is
+    searched for to the block's end, which markup can make far longer than its text."""
+    calls = []
+    reading = extraction._READING.set(extraction._Reading(lambda: calls.append(None)))
+    try:
+        source = "A&amp;B one. " + "<i></i>" * 1000 + "A&amp;B two. A&amp;B three."
+        found = extraction._located(["A&B one.", "A&B two.", "A&B three."], source, 0, 0, len(source))
+    finally:
+        extraction._READING.reset(reading)
+    assert len(found) == 3 and len(calls) == 3
