@@ -489,7 +489,7 @@ async def test_a_record_with_malformed_entries_skips_them_and_still_resolves():
     crossref = {**crossref_work(DOI, TITLE), "author": ["x", 5, {"family": "Example"}], "issued": {"date-parts": [5]},
                 "updated-by": 7}
     found = lookup._crossref(DOI, json.dumps({"message": crossref}).encode())
-    assert (found.csl["author"], found.retracted, "issued" in found.csl) == ([{"family": "Example"}], False, False)
+    assert (found.csl["author"], found.retracted, "issued" in found.csl) == ([{"family": "Example"}], None, False)
     for record in ({**crossref, "author": 5, "issued": "2020"}, {**crossref, "issued": {"date-parts": 5}}):
         assert lookup._crossref(DOI, json.dumps({"message": record}).encode()).csl["title"] == TITLE
     with pytest.raises(lookup.Failed) as failed:  # nested past what the parser follows: no answer it can read

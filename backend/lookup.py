@@ -269,8 +269,12 @@ def _crossref(doi, body):
     for key in ("volume", "issue", "page"):
         if value := _text(work.get(key), 50):
             csl[key] = value
-    updates = _list(work.get("updated-by"))
-    retracted = any(isinstance(u, dict) and str(u.get("type", "")).lower() in _RETRACTED for u in updates)
+    # Retracted when an update says so; else not, when every update can be read; else unknown (None):
+    # an answer whose updates cannot be read never clears a retraction recorded before.
+    updates = work.get("updated-by")
+    kinds = [_dict(u).get("type") for u in updates] if isinstance(updates, list) else [] if updates is None else [None]
+    retracted = (True if any(isinstance(k, str) and k.lower() in _RETRACTED for k in kinds)
+                 else False if all(isinstance(k, str) for k in kinds) else None)
     return Found("crossref", csl, retracted, f"doi:{doi}")
 
 

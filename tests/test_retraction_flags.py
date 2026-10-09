@@ -2,11 +2,13 @@
 identifier resolves through OpenAlex or Crossref, whether the work is retracted is recorded with
 when it was checked, over fixture records with known retractions (made up, never real works)."""
 
+import asyncio
+
 import pytest
 
 import backend.lookup as lookup
 import backend.materials as materials_module
-from scholia_app import MockProvider, MockScholarly, crossref_work, openalex_work, started
+from scholia_app import MockProvider, MockScholarly, crossref_work, openalex_work, run_finished, started
 from test_materials import added, listing, project_of, settled
 
 pytestmark = pytest.mark.asyncio
@@ -51,3 +53,22 @@ async def test_every_resolved_reference_records_its_retraction_and_when_it_was_c
         assert papers["arxiv:2401.00002"]["retraction"] == "unknown"  # arXiv says nothing on retraction
         listed = {p["id"]: p["retraction"] for p in (await listing(client, project))["materials"]}
         assert sorted(listed.values()).count("retracted") == 3  # the Library flags each one
+
+
+@pytest.mark.parametrize("updates", [7, "retraction", [7], [{"DOI": "10.5555/notice"}], [{"type": 7}]])
+async def test_a_later_answer_whose_retraction_cannot_be_read_leaves_the_flag_as_it_was(tmp_path, updates):
+    doi = "10.5555/crossref.retracted"
+    mock = MockScholarly(crossref={doi: crossref_work(doi, "CR retracted", retracted=True)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.md", f"# Paper\n\ndoi:{doi}\n".encode()))
+        [flagged] = await settled(client, project)
+        assert flagged["retraction"] == "retracted"
+        mock.crossref[doi] = {**crossref_work(doi, "CR retracted, again"), "updated-by": updates}  # unreadable here
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'failed' WHERE id = ?", (result["lookup_run_id"],)))
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert paper["title"] == "CR retracted, again"  # its readable fields are kept
+        assert (paper["retraction"], paper["retraction_checked_at"]) == ("retracted", flagged["retraction_checked_at"])
