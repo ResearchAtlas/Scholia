@@ -40,16 +40,26 @@ from xml.etree import ElementTree
 
 MAX_PASSAGE = 2000
 MAX_FILE_BYTES = 100 * 1024 * 1024  # ponytail: uploads travel as base64 JSON; a streamed upload if books matter
-# What any reading keeps, whatever its file's shape (_Reading): a reading never holds an object for
-# each of a file's lines or characters, only what it keeps, and a file past one of these is
-# unreadable_file before its memory grows. Every extractor goes through them: its blocks reach
-# _pieces and its headings _Sections.heading, which count them; text built piece by piece is a
-# _Text; and each format's own structure has its bound below, checked before it is read.
+# What any reading holds, whatever its file's shape (_Reading). A reading never holds an object for
+# each of a file's lines, characters or marks beyond these: each allocation that grows with the
+# file's structure (a list of its lines, cells, matches, attributes or nodes, or text copied once
+# for each level it is nested in) is bounded before it is made, by a count taken first or by a
+# check as it grows, and a file past a bound is unreadable_file before its memory grows. What is
+# only as large as the file (its decoded text, a copy of one block of it) is bounded by its size.
 MAX_TEXT_CHARS = 16 * 1024 * 1024  # the text a reading keeps: its passages and headings together
+MAX_BUILT_CHARS = 4 * MAX_TEXT_CHARS  # the text it builds on the way (_Text, joined rows), each copy counted
+MAX_BLOCK_CHARS = 1024 * 1024  # one block's text, or its source, before regular expressions run over it
 MAX_BLOCKS = 200_000  # its blocks: paragraphs, headings, tables and captions, and tables' rows and cells
 MAX_PAGE_CHARS = 100_000  # a PDF page's characters, as PDFium counts them before any is read
-MAX_LATEX_MARKS = 250_000  # a LaTeX file's markup characters, each of which may start a node, counted before parsing
-MAX_STYLES = 10_000  # a DOCX's paragraph styles taken by name
+# A LaTeX file's marks: what may start one of pylatexenc's nodes (a macro, a group, a comment, math,
+# or a special: & ~ -- `` '' !` ?`), counted before parsing. It holds a node for each and one for
+# the text between two, about 570 bytes a mark as measured: 500,000 marks come to about 280 MiB. A
+# paper has some thousands; a heavily marked-up book of 700 pages, at 700 a page, still fits.
+MAX_LATEX_MARKS = 500_000
+MAX_STYLES = 10_000  # a DOCX's styles by name: a file of more is refused, never read with some left out
+MAX_TAG_ATTRIBUTES = 1024  # an HTML tag's attributes, counted before the parser lists them
+MAX_XML_DEPTH = 1000  # a DOCX part's elements open at once
+MAX_XML_TOKEN = 256 * 1024  # bytes a DOCX part's parser may take in without a tag or text ending
 MAX_XML_BYTES = 64 * 1024 * 1024  # a DOCX part's size once unpacked, and the parts read together
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024  # a DOCX's members together, as the archive declares them unpacked
 MAX_ARCHIVE_MEMBERS = 10_000
@@ -312,39 +322,53 @@ def clean_doi(text):
 
 
 class _Reading:
-    """What one reading has kept so far, against MAX_TEXT_CHARS and MAX_BLOCKS."""
+    """What one reading has kept (MAX_TEXT_CHARS, MAX_BLOCKS) and built (MAX_BUILT_CHARS) so far."""
 
     def __init__(self):
-        self.chars = self.blocks = 0
+        self.chars = self.blocks = self.built = 0
 
-    def keep(self, text=""):
-        self.blocks += 1
+    def keep(self, text="", blocks=1):
+        self.blocks += blocks
         self.chars += len(text)
         if self.blocks > MAX_BLOCKS or self.chars > MAX_TEXT_CHARS:
+            raise Unreadable()
+
+    def build(self, chars):
+        self.built += chars
+        if self.built > MAX_BUILT_CHARS:
             raise Unreadable()
 
 
 _READING = contextvars.ContextVar("reading", default=None)  # set by extract for its reading
 
 
-def _keep(text=""):
-    """Count a block (and its text) against the reading's bounds; Unreadable past one."""
+def _keep(text="", blocks=1):
+    """Count blocks (and their text) against the reading's bounds; Unreadable past one."""
     reading = _READING.get()
     if reading is not None:
-        reading.keep(text)
+        reading.keep(text, blocks)
+
+
+def _build(chars):
+    """Count text about to be built (a copy, a join) against the reading's bound; Unreadable past it."""
+    reading = _READING.get()
+    if reading is not None:
+        reading.build(chars)
 
 
 class _Text:
-    """Text built piece by piece, held as one growing buffer rather than a list of its pieces, and
-    given up (Unreadable) once longer than a reading may keep."""
+    """Text built piece by piece, held as one growing buffer rather than a list of its pieces, each
+    piece counted against the reading's bound on what it builds (_build), and given up (Unreadable)
+    once longer than limit."""
 
-    def __init__(self):
-        self.buffer, self.size = io.StringIO(), 0
+    def __init__(self, limit=MAX_TEXT_CHARS):
+        self.buffer, self.size, self.limit = io.StringIO(), 0, limit
 
     def add(self, piece):
         self.size += len(piece)
-        if self.size > MAX_TEXT_CHARS:
+        if self.size > self.limit:
             raise Unreadable()
+        _build(len(piece))
         self.buffer.write(piece)
 
     def __bool__(self):
@@ -355,7 +379,10 @@ class _Text:
 
 
 def _normal(text):
-    """Text with its whitespace runs as single spaces, trimmed, in NFC."""
+    """Text with its whitespace runs as single spaces, trimmed, in NFC; Unreadable for a text longer
+    than MAX_BLOCK_CHARS, before re.sub makes a piece for each of its runs."""
+    if len(text) > MAX_BLOCK_CHARS:
+        raise Unreadable()
     return unicodedata.normalize("NFC", re.sub(r"\s+", " ", text)).strip()
 
 
@@ -402,19 +429,24 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
 
 
 def _located(pieces, source, base, start, end):
-    """Where each of a block's pieces begins in its source range [start, end): the first at start,
-    and each later one where its first words are next found in source, no sooner than the piece
-    before it is long (a piece's text is never longer than its source); else, as when there is no
-    source, at its share of the range. In order, and within the range."""
+    """Where each of a block's pieces begins in its source range [start, end): each where its first
+    words are next found in source, the first from start (a block of one piece: at start) and each
+    later one no sooner than the piece before it is long (a piece's text is never longer than its
+    source); else, as when there is no source, at its share of the range. In order, and within it."""
+    def find(piece, lower):
+        if source is None:
+            return None
+        words = r"\s+".join(map(re.escape, piece.split(maxsplit=3)[:3]))
+        match = re.compile(words).search(source, lower - base, end - base)
+        return match.start() + base if match else None
+
     found, total, done = [start], sum(map(len, pieces)) or 1, 0
+    if len(pieces) > 1:  # past what comes before its text: a fence's opening line, a list item's mark
+        found[0] = find(pieces[0], start) or start
     for before, piece in zip(pieces, pieces[1:]):
         done += len(before)
         lower = min(found[-1] + len(before), end)
-        at = None
-        if source is not None:
-            words = r"\s+".join(map(re.escape, piece.split()[:3]))
-            match = re.compile(words).search(source, lower - base, end - base)
-            at = match.start() + base if match else None
+        at = find(piece, lower)
         found.append(at if at is not None else min(max(start + (end - start) * done // total, lower), end))
     return found
 
@@ -495,7 +527,8 @@ def _pdf(data, stop, progress):
                 stop()
                 lines, _, _ = _pdf_read(document, number, raw, measure=True)
                 for line in lines:
-                    weights[round(line["size"] * 2) / 2] += len(line["text"])
+                    # A size past 2,000 points is counted as 2,000: at most 4,001 sizes, however many a file sets.
+                    weights[round(min(max(line["size"], 0.0), 2000.0) * 2) / 2] += len(line["text"])
                 progress(number + 1, 2 * count)
             body = _body_size(weights)
             sections, passages, scanned = _Sections(), [], 0
@@ -948,17 +981,29 @@ class _XmlEvents:
 def _xml_events(content):
     """An untrusted XML part's events, ("start", tag, attributes), ("data", None, text) and ("end",
     tag, None), as it is parsed 64 KiB at a time (refused as _undeclared refuses it): no element is
-    built, so nothing is held for the whole part but its bytes."""
+    built, so nothing is held for the whole part but its bytes and one piece's events. Refused too
+    (Unreadable) when more than MAX_XML_DEPTH elements are open at once, or when the parser takes in
+    MAX_XML_TOKEN bytes with nothing ending: a tag that long would have its attributes made whole."""
     _undeclared(content)
     target = _XmlEvents()
     parser = ElementTree.XMLParser(target=target)
+    depth, quiet = 0, 0
     try:
-        for at in range(0, len(content), 1 << 16):
-            parser.feed(content[at:at + (1 << 16)])
+        for at in range(0, len(content) + 1, 1 << 16):
+            piece = content[at:at + (1 << 16)]
+            if piece:
+                parser.feed(piece)
+            else:
+                parser.close()
             events, target.events = target.events, []
-            yield from events
-        parser.close()
-        yield from target.events
+            quiet = 0 if events else quiet + len(piece)
+            if quiet > MAX_XML_TOKEN:
+                raise Unreadable()
+            for event in events:
+                depth += {"start": 1, "end": -1}.get(event[0], 0)
+                if depth > MAX_XML_DEPTH:
+                    raise Unreadable()
+                yield event
     except ElementTree.ParseError:
         raise Unreadable() from None
 
@@ -1035,18 +1080,20 @@ def _docx_styles(content):
             path.pop()
             if tag == f"{_W}style":
                 style, name = open_.pop()
-                if style in names or len(names) < MAX_STYLES:
-                    names[style] = (name or "").lower()
+                if style not in names and len(names) >= MAX_STYLES:  # never read with some left out
+                    raise Unreadable()
+                names[style] = (name or "").lower()
     return names
 
 
 class _Collected(_Text):
-    """A paragraph's or a cell's visible text gathered from events (_docx_body), counting
-    its pieces (a paragraph within it is set apart only after some), and once it ends (done), its
-    text as a cell keeps it."""
+    """A paragraph's or a cell's visible text gathered from events (_docx_body), at most
+    MAX_BLOCK_CHARS, each piece counted against what the reading builds (a nested cell's text comes
+    into every cell around it, each copy counted): how many pieces it has (a paragraph within it is
+    set apart only after some), and once it ends (done), its text as a cell keeps it."""
 
     def __init__(self):
-        super().__init__()
+        super().__init__(MAX_BLOCK_CHARS)
         self.pieces, self.cell = 0, None
 
     def add(self, piece):
@@ -1066,16 +1113,15 @@ def _docx_body(content, stop):
     bytes, and a table's rows and cells count against the reading's bounds (_keep) as they start."""
     T, P, TBL, TR, TC = (f"{_W}{name}" for name in ("t", "p", "tbl", "tr", "tc"))
     path, in_body, block, style = [], False, None, None  # path: the open elements' tags, the document's first
-    collectors, rows, open_rows, text, bodies = [], [], [], None, 0
+    collectors, rows, open_rows, text, text_ended, bodies = [], [], [], None, False, 0
     for event, tag, value in _xml_events(content):
         if event == "data":
-            if text is not None and path[-1] == T:  # a w:t's own text, before any child of it
+            if text is not None and path[-1] == T and not text_ended:  # a w:t's own text, before any child of it
                 text.append(value)
             continue
         if event == "start":
             depth = len(path)  # the document 0, its body 1, the body's blocks 2
-            if text is not None:
-                text.append(None)  # a child: no more of the w:t's own text
+            text_ended = text is not None  # a child of a w:t ends its own text
             path.append(tag)
             if depth == 1 and tag == f"{_W}body":
                 bodies += 1
@@ -1089,7 +1135,7 @@ def _docx_body(content, stop):
             elif block not in (P, TBL):
                 continue
             elif tag == T:
-                text = []
+                text, text_ended = [], False
             elif tag == P:
                 for collector in collectors:
                     if collector.pieces:
@@ -1124,12 +1170,14 @@ def _docx_body(content, stop):
             if block == P:
                 yield "p", collectors[0].value(), style
             elif block == TBL:
-                yield "tbl", "\n".join(row[0] for row in rows if row[0].strip(" |")), None
+                kept = [row[0] for row in rows if row[0].strip(" |")]
+                _build(sum(map(len, kept)) + len(kept))  # before they are joined
+                yield "tbl", "\n".join(kept), None
             block, collectors, rows, open_rows = None, [], [], []
         elif block not in (P, TBL):
             continue
         elif tag == T and text is not None:
-            own = "".join(piece for piece in text[:text.index(None)] if piece) if None in text else "".join(text)
+            own = "".join(text)
             for collector in collectors:
                 collector.add(own)
             text = None
@@ -1137,7 +1185,8 @@ def _docx_body(content, stop):
             collectors.pop().done()
         elif tag == TR and block == TBL:
             row = open_rows.pop()
-            row[:] = [" | ".join(cell.cell for cell in row)]  # its cells, nested ones included, have ended
+            _build(sum(len(cell.cell) + 3 for cell in row))  # before its cells, nested ones included, are joined
+            row[:] = [" | ".join(cell.cell for cell in row)]
 
 
 # HTML
@@ -1154,7 +1203,7 @@ class _HtmlTitle(HTMLParser):
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.title, self.in_title = _Text(), False
+        self.title, self.in_title = _Text(MAX_BLOCK_CHARS), False
 
     def handle_starttag(self, tag, attrs):
         self.in_title = self.in_title or tag == "title"
@@ -1177,7 +1226,7 @@ class _HtmlReader(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.source, self.emit, self.line, self.line_start = source, emit, 1, 0
         self.skip, self.in_title = 0, False
-        self.text, self.start, self.end, self.kind, self.level = _Text(), None, None, "paragraph", 0
+        self.text, self.start, self.end, self.kind, self.level = _Text(MAX_BLOCK_CHARS), None, None, "paragraph", 0
         self.table, self.row, self.cell, self.pre = None, None, None, 0
 
     def _at(self):
@@ -1192,7 +1241,7 @@ class _HtmlReader(HTMLParser):
             text = self.text.value()
             if text.strip():
                 self.emit(self.kind, text if self.pre else _normal(text), self.start, self.end, self.level)
-        self.text, self.start, self.end, self.kind, self.level = _Text(), None, None, "paragraph", 0
+        self.text, self.start, self.end, self.kind, self.level = _Text(MAX_BLOCK_CHARS), None, None, "paragraph", 0
 
     def handle_starttag(self, tag, attrs):
         if tag in _SKIPPED:
@@ -1213,7 +1262,7 @@ class _HtmlReader(HTMLParser):
             if tag == "tr" and self.depth == 1:
                 self.row, self.row_cells, self.row_any = _Text(), 0, False
             elif tag in ("td", "th", "caption") and self.depth == 1:
-                self.cell = _Text()
+                self.cell = _Text(MAX_BLOCK_CHARS)
             elif tag in ("td", "th") and self.cell is not None:
                 self.cell.add(" ")
         elif tag in _HEADINGS:
@@ -1280,9 +1329,29 @@ class _HtmlReader(HTMLParser):
         self._flush()
 
 
+def _html_tags(source):
+    """Refuse (Unreadable) a document with a tag of more than MAX_TAG_ATTRIBUTES attributes, counted
+    one at a time with html.parser's own patterns (Python 3.13's) before the parser sees it: it
+    lists a tag's attributes whole before any handler is called. Every start tag is looked at once,
+    each from where the one before ended."""
+    from html import parser as stdlib
+
+    at = 0
+    while (start := stdlib.starttagopen.search(source, at)) is not None:
+        end = stdlib.locatetagend.match(source, start.start() + 1).end()
+        found, k = 0, stdlib.tagfind_tolerant.match(source, start.start() + 1).end()
+        while k < end and (attribute := stdlib.attrfind_tolerant.match(source, k)) is not None:
+            found += 1
+            if found > MAX_TAG_ATTRIBUTES:
+                raise Unreadable()
+            k = attribute.end()
+        at = max(end, start.start() + 1)
+
+
 def _html(source, stop):
     """An HTML document's passages: its title first (its <title>, read in a first pass, or else its
-    first h1), then its blocks as the reader gives them."""
+    first h1), then its blocks as the reader gives them; its tags checked first (_html_tags)."""
+    _html_tags(source)
     sections, passages = _Sections(), []
     titles = _HtmlTitle()
     try:
@@ -1328,6 +1397,10 @@ _INLINE = re.compile(r"(\*\*|\*|`|~~)(?=\S)(.+?)(?<=\S)\1|(?<!\w)(__|_)(?=\S)(.+
 
 
 def _markdown_inline(text):
+    """Text without Markdown's inline marks; Unreadable past MAX_BLOCK_CHARS, before each re.sub
+    makes a piece for each of its marks."""
+    if len(text) > MAX_BLOCK_CHARS:
+        raise Unreadable()
     text = _IMAGE.sub(r"\1", text)
     text = _LINK.sub(r"\1", text)
     text = re.sub(r"<[^>]+>", "", text)
@@ -1368,6 +1441,8 @@ def _markdown(source, stop):
         nonlocal paragraph
         if paragraph is not None:
             start, last, item = paragraph
+            if last - start > MAX_BLOCK_CHARS:  # before its marks are taken out, match by match
+                raise Unreadable()
             first, _, rest = source[start:last].partition("\n") if item else ("", "", source[start:last])
             rest = re.sub(r"(?m)^[^\S\n]{0,3}>[^\S\n]?", "", rest)  # each line's quote mark
             joined = re.sub(r"\s*\n\s*", " ", (_LIST.sub("", first, count=1) + "\n" if item else "") + rest).strip()
@@ -1400,9 +1475,11 @@ def _markdown(source, stop):
                 closing, (scan, past) = past, line_at(past)
             code = source[after:closing - 1 if scan is not None else len(source)].strip()
             if code:
-                emit("paragraph", code, at, closing if scan is not None else source.rfind("\n") + 1)
+                emit("paragraph", code, at, closing if scan is not None else len(source))  # unfinished: to the end
             at, (line, after) = past, line_at(past)
             continue
+        if len(line) > MAX_BLOCK_CHARS:  # a heading's or a row's line, before its marks are taken out
+            raise Unreadable()
         heading = _ATX.match(line)
         if heading:
             flush(at)
@@ -1417,11 +1494,16 @@ def _markdown(source, stop):
         if "|" in line and following is not None and _TABLE_RULE.match(following):
             flush(at)
             table, end = _Text(), after + len(following)  # a table of no row but its header ends at its rule
-            cells = lambda row: " | ".join(_normal(_markdown_inline(cell)) for cell in row.strip().strip("|").split("|"))
+
+            def cells(row):  # its cells, counted as blocks before the row is split into them
+                _keep(blocks=row.count("|") + 1)
+                return " | ".join(_normal(_markdown_inline(cell)) for cell in row.strip().strip("|").split("|"))
+
             table.add(cells(line))
             row_at, (row, past) = beyond, line_at(beyond)
             while row is not None and "|" in row and row.strip():
-                _keep()  # a row, as a block
+                if len(row) > MAX_BLOCK_CHARS:
+                    raise Unreadable()
                 table.add("\n" + cells(row))
                 end = row_at + len(row)
                 row_at, (row, past) = past, line_at(past)
@@ -1451,6 +1533,10 @@ _LATEX_DROPPED = {"input", "include", "includeonly", "includegraphics", "bibliog
                   "citeauthor", "citeyear", "nocite", "ref", "eqref", "autoref", "cref", "Cref", "pageref"}
 _LATEX_MATH = {"equation", "align", "gather", "multline", "eqnarray", "displaymath", "math", "flalign", "alignat"}
 _LATEX_LISTS = {"itemize", "enumerate", "description"}
+# What starts one of pylatexenc's nodes: a macro, math or an environment (\\), a group, a comment,
+# inline math, and its default context's specials. Counted with str.count, so "---" counts once.
+_LATEX_MARKS = ("\\", "{", "%", "$", "&", "~", "--", "``", "''", "!`", "?`")
+_BLANK_LINE = re.compile(r"\n[ \t]*\n")
 
 
 def _latex(source, stop):
@@ -1469,9 +1555,9 @@ def _latex(source, stop):
 
     # The arguments the default context does not know, so a caption's text, a reference's key and
     # a bibliography's width are read as arguments rather than as text.
-    # pylatexenc holds the whole file's nodes at once: their number is bounded first, by the markup
-    # characters that can start one (with the text between them, at most twice as many nodes).
-    if sum(source.count(mark) for mark in "\\{}%$&~^_#[]") > MAX_LATEX_MARKS:
+    # pylatexenc holds the whole file's nodes at once: their number is bounded first, by the marks
+    # that can start one (with the text between them, at most twice as many nodes and one more).
+    if sum(source.count(mark) for mark in _LATEX_MARKS) > MAX_LATEX_MARKS:
         raise Unreadable()
     context = get_default_latex_context_db()
     context.add_context_category("scholia", macros=[MacroSpec("caption", "[{"), MacroSpec("bibitem", "[{")],
@@ -1517,13 +1603,14 @@ def _latex(source, stop):
             if isinstance(node, LatexCommentNode):
                 continue
             if isinstance(node, LatexCharsNode):  # paragraphs apart at blank lines, each its own range
-                at = 0
-                for gap in [*re.finditer(r"\n[ \t]*\n", node.chars), None]:
-                    if at:
-                        flush(kind)
+                at, gap = 0, True
+                while gap:  # one blank line at a time: none is looked for before the paragraph before it is kept
+                    gap = _BLANK_LINE.search(node.chars, at)
                     end = gap.start() if gap else len(node.chars)
                     add(node.chars[at:end], node.pos + at, node.pos + end)
-                    at = gap.end() if gap else at
+                    if gap:
+                        flush(kind)
+                        at = gap.end()
                 continue
             if isinstance(node, LatexMacroNode):
                 name = node.macroname.rstrip("*")
@@ -1592,7 +1679,7 @@ def _latex(source, stop):
         walk(nodes)
     flush()
     if title and not any(p.kind == "title" for p in passages):
-        passages.insert(0, Passage("title", title, None, [], None, None))
+        passages[:0] = _pieces(title, "title", None, [], None, None)  # counted and split as any block
     return Extracted(*extractor_of(LATEX), passages)
 
 

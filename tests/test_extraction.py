@@ -548,6 +548,131 @@ def test_a_files_shape_holds_no_memory_for_each_of_its_lines(shape):
     assert peak < bound * 2**20, f"{peak / 2**20:.1f} MiB"
 
 
+def _peak(read):
+    """The memory read() takes at its peak (tracemalloc), and whether it was refused as unreadable."""
+    import tracemalloc
+    tracemalloc.start()
+    try:
+        try:
+            read()
+            refused = False
+        except extraction.Unreadable:
+            refused = True
+        return tracemalloc.get_traced_memory()[1], refused
+    finally:
+        tracemalloc.stop()
+
+
+@pytest.mark.parametrize("media", ["html", "markdown", "docx", "latex"])
+def test_a_block_longer_than_its_bound_is_refused_before_its_runs_and_marks_are_matched(monkeypatch, media):
+    words = " ".join(["word"] * 1500)  # 7,500 characters in one paragraph
+    data = {"html": f"<p>{words}</p>".encode(), "markdown": words.encode(),
+            "docx": synthetic.docx([(None, words)]),
+            "latex": f"\\documentclass{{article}}\\begin{{document}}{words}\\end{{document}}".encode()}[media]
+    kind = {"html": extraction.HTML, "markdown": extraction.MARKDOWN, "docx": extraction.DOCX, "latex": extraction.LATEX}
+    assert extract(data, kind[media]).passages
+    monkeypatch.setattr(extraction, "MAX_BLOCK_CHARS", 5000)
+    with pytest.raises(extraction.Unreadable):
+        extract(data, kind[media])
+
+
+def test_a_docx_of_nested_tables_is_refused_before_their_copies_of_its_text_grow(monkeypatch):
+    monkeypatch.setattr(extraction, "MAX_BUILT_CHARS", 2 * 2**20)
+    body = '<w:p><w:r><w:t>' + "x" * 20_000 + '</w:t></w:r></w:p>'
+    for _ in range(40):  # each cell's text holds the cells within it: 40 copies, rows of up to 40 cells
+        body = f"<w:tbl><w:tr><w:tc>{body}</w:tc></w:tr></w:tbl>"
+    peak, refused = _peak(lambda: extract(_docx_of(body), extraction.DOCX))
+    assert refused and peak < 8 * 2**20, f"{peak / 2**20:.1f} MiB"  # its rows would come to 16 million characters
+
+
+@pytest.mark.parametrize("unit", ["--a ", "``a'' ", "!`a ", "~a ", "a&b ", "\\x ", "{a} ", "$a$ ", "% c\n"])
+def test_a_latex_file_of_more_marks_than_its_bound_is_refused_before_it_is_parsed(monkeypatch, unit):
+    import pylatexenc.latexwalker as walker
+
+    def never(*args, **kwargs):
+        raise AssertionError("the file was parsed")
+
+    monkeypatch.setattr(extraction, "MAX_LATEX_MARKS", 1000)
+    monkeypatch.setattr(walker, "LatexWalker", never)
+    with pytest.raises(extraction.Unreadable):  # each unit is a mark pylatexenc makes a node of, with its text
+        extract((unit * 1001).encode(), extraction.LATEX)
+
+
+def test_a_latex_files_paragraphs_are_found_one_at_a_time(monkeypatch):
+    monkeypatch.setattr(extraction, "MAX_BLOCKS", 50)
+    peak, refused = _peak(lambda: extract(("a\n\n" * 100_000).encode(), extraction.LATEX))
+    assert refused and peak < 4 * 2**20, f"{peak / 2**20:.1f} MiB"  # every blank line found first: 14 MiB
+
+
+def test_a_latex_title_without_maketitle_is_counted_and_split_as_any_block(monkeypatch):
+    title = " ".join(f"Word{i}" for i in range(500))  # about 3,400 characters
+    source = f"\\documentclass{{article}}\\title{{{title}}}\\begin{{document}}Text.\\end{{document}}".encode()
+    pieces = [p for p in extract(source, extraction.LATEX).passages if p.kind == "title"]
+    assert len(pieces) == 2 and all(len(p.text) <= extraction.MAX_PASSAGE for p in pieces)
+    assert " ".join(p.text for p in pieces) == title
+    monkeypatch.setattr(extraction, "MAX_TEXT_CHARS", 1000)
+    with pytest.raises(extraction.Unreadable):
+        extract(source, extraction.LATEX)
+
+
+def test_a_markdown_tables_cells_are_counted_before_its_rows_are_split():
+    header = "|" + "a|" * 300_000  # more cells than a reading's blocks, in one line
+    peak, refused = _peak(lambda: extract(f"{header}\n|--|--|\n".encode(), extraction.MARKDOWN))
+    assert refused and peak < 4 * 2**20, f"{peak / 2**20:.1f} MiB"
+
+
+def test_an_unfinished_markdown_fence_runs_to_the_end_of_the_file():
+    source = "```\n" + "x" * 5000
+    pieces = extract(source.encode(), extraction.MARKDOWN).passages
+    assert len(pieces) == 3 and "".join(p.text for p in pieces) == "x" * 5000
+    assert [p.char_start for p in pieces] == sorted({p.char_start for p in pieces}) and pieces[-1].char_end == len(source)
+    assert all(source[p.char_start:p.char_end].strip().strip("`").strip() == p.text for p in pieces)
+
+
+@pytest.mark.parametrize("attributes", [1000, 2000])
+def test_an_html_tag_of_too_many_attributes_is_refused_before_the_parser_lists_them(monkeypatch, attributes):
+    from html.parser import HTMLParser
+    parsed = []
+    real = HTMLParser.parse_starttag
+    monkeypatch.setattr(HTMLParser, "parse_starttag", lambda self, i: parsed.append(i) or real(self, i))
+    source = ("<html><body><p" + "".join(f" a{n}" for n in range(attributes)) + ">Text.</p></body></html>").encode()
+    if attributes <= extraction.MAX_TAG_ATTRIBUTES:
+        assert [p.text for p in extract(source, extraction.HTML).passages] == ["Text."]
+    else:
+        with pytest.raises(extraction.Unreadable):
+            extract(source, extraction.HTML)
+        assert parsed == []  # refused before the parser read a tag
+
+
+def test_a_docx_of_more_styles_than_its_bound_is_refused_not_read_with_some_left_out(monkeypatch):
+    data = synthetic.paper_docx()  # four styles: title, two headings and caption
+    assert extract(data, extraction.DOCX).passages
+    monkeypatch.setattr(extraction, "MAX_STYLES", 3)
+    with pytest.raises(extraction.Unreadable):
+        extract(data, extraction.DOCX)
+
+
+@pytest.mark.parametrize("shape", ["nested past the depth bound", "a tag past the token bound"])
+def test_a_docx_part_too_deep_or_with_too_long_a_tag_is_refused_as_it_is_read(shape):
+    if shape == "nested past the depth bound":
+        body = "<w:p>" * 1001 + "</w:p>" * 1001
+    else:  # its attributes would be made whole once its tag ended
+        body = "<w:p " + " ".join(f'a{n}="1"' for n in range(60_000)) + "/>"
+    peak, refused = _peak(lambda: extract(_docx_of(body), extraction.DOCX))
+    assert refused and peak < 8 * 2**20, f"{peak / 2**20:.1f} MiB"
+
+
+def test_a_pdfs_font_sizes_are_counted_in_at_most_a_few_thousand_buckets(monkeypatch):
+    lines = [{"size": 10.0 + n, "text": "x"} for n in range(10_000)]  # a size of its own for every line
+    monkeypatch.setattr(extraction, "_pdf_read", lambda document, number, raw, measure=False: (
+        (lines if measure else []), (612, 792), False))
+    held = []
+    real = extraction._body_size
+    monkeypatch.setattr(extraction, "_body_size", lambda weights: held.append(len(weights)) or real(weights))
+    extract(synthetic.pdf([[]]), extraction.PDF)
+    assert held == [1991]  # 10 to 1,999 points, and 2,000 for every larger size
+
+
 def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
     import pypdfium2
 
@@ -559,18 +684,6 @@ def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(
     with pytest.raises(extraction.Unreadable) as unreadable:
         extract(synthetic.paper_pdf(), extraction.PDF)
     assert unreadable.value.code == "unreadable_file"
-
-
-def test_a_latex_file_of_more_markup_than_its_bound_is_refused_before_it_is_parsed(monkeypatch):
-    import pylatexenc.latexwalker as walker
-
-    def never(*args, **kwargs):
-        raise AssertionError("the file was parsed")
-
-    monkeypatch.setattr(extraction, "MAX_LATEX_MARKS", 100)
-    monkeypatch.setattr(walker, "LatexWalker", never)
-    with pytest.raises(extraction.Unreadable):
-        extract(("\\x " * 101).encode(), extraction.LATEX)
 
 
 def _end_records(entries, size, zip64):
