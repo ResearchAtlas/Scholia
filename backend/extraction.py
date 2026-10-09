@@ -64,7 +64,10 @@ MAX_PAGE_CHARS = 100_000  # a PDF page's characters, as PDFium counts them befor
 # file still fits.
 MAX_LATEX_MARKS = 500_000
 MAX_STYLES = 10_000  # a DOCX's styles by name: a file of more is refused, never read with some left out
-MAX_TAG_ATTRIBUTES = 1024  # an HTML tag's attributes, counted before the parser lists them
+MAX_TAG_ATTRIBUTES = 1024  # an HTML tag's attributes, counted where the parser starts the tag, before it lists them
+MAX_TAG_REFERENCES = 1024  # character references in a tag's attribute values together, or in a title or textarea
+MAX_TAG_SPACE = 4096  # a run of spaces and slashes within a tag, which html.parser walks a character at a time
+MAX_HTML_PENDING = 256 * 1024  # text html.parser holds back between two pieces fed (a reference cut at the end)
 MAX_XML_DEPTH = 1000  # a DOCX part's elements open at once
 MAX_XML_TOKEN = 256 * 1024  # bytes a DOCX part's parser may take in without a tag or text ending
 MAX_XML_NAMES = 4096  # distinct element and attribute names in a DOCX part: Word's own come to some hundreds
@@ -1238,11 +1241,90 @@ _BLOCKS = {"p", "div", "section", "article", "header", "footer", "main", "aside"
 _HEADINGS = {f"h{n}": n for n in range(1, 7)}
 
 
-class _HtmlTitle(HTMLParser):
-    """An HTML document's <title> text (title): what every <title> element holds, together."""
+_TAG_NAME = re.compile(r"[a-zA-Z][^\t\n\r\f />]*")
+_TAG_SPACE = re.compile(r"[\t\n\r\f /]*")
+_ATTRIBUTE_NAME = re.compile(r"[^\t\n\r\f />][^\t\n\r\f /=>]*")
+_ATTRIBUTE_EQUALS = re.compile(r"[\t\n\r\f ]*=[\t\n\r\f ]*")
+_BARE_VALUE = re.compile(r"[^>\t\n\r\f ]*")
+
+
+def _tag_end(raw, at):
+    """Where the tag whose name starts at raw[at] ends, just past its ">", or -1 when raw ends first:
+    as Python 3.13's html.parser finds it (its locatetagend), but walked one token at a time, each
+    a pattern that holds no state per character. Unreadable once the tag has more than
+    MAX_TAG_ATTRIBUTES attributes, more than MAX_TAG_REFERENCES "&" in their values, or a run of
+    spaces and slashes longer than MAX_TAG_SPACE: before the parser's own patterns walk it whole."""
+    def space(pos):
+        end = _TAG_SPACE.match(raw, pos).end()
+        if end - pos > MAX_TAG_SPACE:
+            raise Unreadable()
+        return end
+
+    pos, attributes, references = space(_TAG_NAME.match(raw, at).end()), 0, 0
+    while raw[pos - 1:pos] in ("'", '"', "\t", "\n", "\r", "\f", " ", "/") and (name := _ATTRIBUTE_NAME.match(raw, pos)):
+        attributes += 1
+        if attributes > MAX_TAG_ATTRIBUTES:
+            raise Unreadable()
+        pos = name.end()
+        if equals := _ATTRIBUTE_EQUALS.match(raw, pos):
+            value, quote = equals.end(), raw[equals.end():equals.end() + 1]
+            if quote in ("'", '"'):
+                close = raw.find(quote, value + 1)
+                if close >= 0:
+                    end = close + 1
+                elif raw[value - 1] != "=":  # unclosed after a space: the pattern backs off to an empty value
+                    end = value - 1
+                else:  # unclosed right after "=": no value at all
+                    end = None
+            else:
+                end = _BARE_VALUE.match(raw, value).end()
+            if end is not None:
+                references += raw.count("&", value, end)
+                if references > MAX_TAG_REFERENCES:
+                    raise Unreadable()
+                pos = end
+        pos = space(pos)
+    return pos + 1 if raw.startswith(">", pos) else -1
+
+
+class _BoundedHtml(HTMLParser):
+    """html.parser with convert_charrefs, fed a piece at a time (read), so it never turns more than a
+    piece of text's references into characters at once, and bounded where it starts each tag
+    (_tag_end) and where it holds text back: a title's or a textarea's whole text, which it turns
+    at once, at most MAX_BLOCK_CHARS with MAX_TAG_REFERENCES references, and other text held
+    between pieces at most MAX_HTML_PENDING."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
+
+    def parse_starttag(self, i):
+        if _tag_end(self.rawdata, i + 1) < 0:
+            return -1  # not all here yet: as the parser would find it
+        return super().parse_starttag(i)
+
+    def parse_endtag(self, i):
+        raw = self.rawdata
+        if raw.find(">", i + 2) >= 0 and _TAG_NAME.match(raw, i + 2):  # an end tag the parser walks as a tag
+            _tag_end(raw, i + 2)
+        return super().parse_endtag(i)
+
+    def read(self, source):
+        for at in range(0, len(source), 64 * 1024):
+            self.feed(source[at:at + 64 * 1024])
+            held = self.rawdata
+            if self.cdata_elem and self._escapable:
+                if len(held) > MAX_BLOCK_CHARS or held.count("&") > MAX_TAG_REFERENCES:
+                    raise Unreadable()
+            elif not self.cdata_elem and len(held) > MAX_HTML_PENDING and not held.startswith("<"):
+                raise Unreadable()
+        self.close()
+
+
+class _HtmlTitle(_BoundedHtml):
+    """An HTML document's <title> text (title): what every <title> element holds, together."""
+
+    def __init__(self):
+        super().__init__()
         self.title, self.in_title = _Text(MAX_BLOCK_CHARS), False
 
     def handle_starttag(self, tag, attrs):
@@ -1256,14 +1338,14 @@ class _HtmlTitle(HTMLParser):
             self.title.add(data)
 
 
-class _HtmlReader(HTMLParser):
+class _HtmlReader(_BoundedHtml):
     """An HTML document's blocks, each given to emit(kind, text, start, end, level) as it ends. Its
     own text only: no resource it names is ever loaded. Nothing is held for the whole document but
     the parser's own input: positions are found from the line the parser is on, a block's text and
     a table's are each a _Text, and a table's cells count against the reading's bounds as they end."""
 
     def __init__(self, source, emit):
-        super().__init__(convert_charrefs=True)
+        super().__init__()
         self.source, self.emit, self.line, self.line_start = source, emit, 1, 0
         self.skip, self.in_title = 0, False
         self.text, self.start, self.end, self.kind, self.level = _Text(MAX_BLOCK_CHARS), None, None, "paragraph", 0
@@ -1369,34 +1451,13 @@ class _HtmlReader(HTMLParser):
         self._flush()
 
 
-def _html_tags(source):
-    """Refuse (Unreadable) a document with a tag of more than MAX_TAG_ATTRIBUTES attributes, counted
-    one at a time with html.parser's own patterns (Python 3.13's) before the parser sees it: it
-    lists a tag's attributes whole before any handler is called. Every start tag is looked at once,
-    each from where the one before ended."""
-    from html import parser as stdlib
-
-    at = 0
-    while (start := stdlib.starttagopen.search(source, at)) is not None:
-        end = stdlib.locatetagend.match(source, start.start() + 1).end()
-        found, k = 0, stdlib.tagfind_tolerant.match(source, start.start() + 1).end()
-        while k < end and (attribute := stdlib.attrfind_tolerant.match(source, k)) is not None:
-            found += 1
-            if found > MAX_TAG_ATTRIBUTES:
-                raise Unreadable()
-            k = attribute.end()
-        at = max(end, start.start() + 1)
-
-
 def _html(source, stop):
     """An HTML document's passages: its title first (its <title>, read in a first pass, or else its
-    first h1), then its blocks as the reader gives them; its tags checked first (_html_tags)."""
-    _html_tags(source)
+    first h1), then its blocks as the reader gives them; each pass bounded (_BoundedHtml)."""
     sections, passages = _Sections(), []
     titles = _HtmlTitle()
     try:
-        titles.feed(source)
-        titles.close()
+        titles.read(source)
     except (AssertionError, ValueError):
         raise Unreadable() from None
     title = [_normal(titles.title.value())]
@@ -1418,8 +1479,7 @@ def _html(source, stop):
 
     reader = _HtmlReader(source, emit)
     try:
-        reader.feed(source)
-        reader.close()
+        reader.read(source)
     except (AssertionError, ValueError):
         raise Unreadable() from None
     return Extracted(*extractor_of(HTML), passages)

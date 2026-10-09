@@ -641,7 +641,7 @@ def test_an_html_tag_of_too_many_attributes_is_refused_before_the_parser_lists_t
     else:
         with pytest.raises(extraction.Unreadable):
             extract(source, extraction.HTML)
-        assert parsed == []  # refused before the parser read a tag
+        assert source.index(b"<p") not in parsed  # refused before the parser listed that tag's attributes
 
 
 def test_a_docx_of_more_styles_than_its_bound_is_refused_not_read_with_some_left_out(monkeypatch):
@@ -767,6 +767,28 @@ def test_a_docx_text_runs_references_are_counted_as_they_come():
                           "</w:body></w:document>")  # one fragment for each, once
     peak, refused = _peak(lambda: extract(data, extraction.DOCX))
     assert refused and peak < 24 * 2**20, f"{peak / 2**20:.1f} MiB"  # its 10 MB part and a block: 90 MiB before
+
+
+@pytest.mark.parametrize("shape", ["bare attributes", "attributes hidden from a scan of the source by a comment",
+                                   "an end tag's attributes", "a run of spaces"])
+def test_an_html_tag_is_bounded_where_the_parser_starts_it(shape):
+    many = " a" * 200_000
+    source = {"bare attributes": f"<p{many}>x</p>",
+              "attributes hidden from a scan of the source by a comment": f'<!-- <x a=" --> <p{many}>Text.</p>" >',
+              "an end tag's attributes": f"<p>x</p{many}>",
+              "a run of spaces": "<p" + " " * 200_000 + ">x</p>"}[shape].encode()
+    peak, refused = _peak(lambda: extract(source, extraction.HTML))
+    assert refused and peak < 4 * 2**20, f"{peak / 2**20:.1f} MiB"  # bare attributes: 69 MiB before
+
+
+@pytest.mark.parametrize("where", ["a paragraph", "the title"])
+def test_html_references_are_turned_a_piece_at_a_time_and_bounded(where):
+    references = "&copy;" * 2_000_000
+    source = (f"<p>{references}</p>" if where == "a paragraph" else f"<title>{references}</title><p>x</p>").encode()
+    peak, refused = _peak(lambda: extract(source, extraction.HTML))
+    assert refused and peak < 1.5 * len(source), f"{peak / 2**20:.1f} MiB"  # its text decoded and a piece: 41 MiB before
+    assert [p.text for p in extract(b"<title>a &amp; b &copy</title><p>&copyright &notin; x</p>", extraction.HTML).passages] \
+        == ["a & b \u00a9", "\u00a9right \u2209 x"]  # turned as before
 
 
 def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
