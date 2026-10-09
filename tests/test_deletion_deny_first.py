@@ -70,10 +70,9 @@ async def test_deleting_one_reading_of_a_file_read_two_ways_removes_its_passages
 
 
 async def test_a_deleted_scanned_papers_recognized_passages_are_read_back_nowhere_and_leave_its_index(tmp_path, monkeypatch):
-    from backend import ocr
-    from test_ocr import Engine, scan
+    from test_ocr import Engine, scan, use
 
-    monkeypatch.setattr(ocr, "engine", lambda: Engine())  # S1-20: its page read by a test-owned engine
+    use(monkeypatch, Engine())  # S1-20: its page read by a test-owned engine (in this process)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, ("scan.pdf", scan())))["materials"]
@@ -95,8 +94,9 @@ async def test_a_superseded_reading_is_removed_through_the_deletion_service_and_
     are read back nowhere, and its removal leaves a tombstone (section 4.2) and no dangling reference."""
     import backend.extraction as extraction
     from test_ocr import cite
-    from scholia_app import run_finished
+    from scholia_app import read_in_process, run_finished
 
+    read_in_process(monkeypatch)  # an earlier extractor version, as this process sees it
     notes = b"# Notes\n\nA paragraph of synthetic text.\n"
     async with started(tmp_path / "data") as client:
         mine, theirs = await project_of(client, "Mine"), await project_of(client, "Theirs")

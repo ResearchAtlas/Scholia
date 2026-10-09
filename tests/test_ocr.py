@@ -23,7 +23,8 @@ from backend import ocr
 from backend.db import new_id
 from backend.self_test import scanned_pdf
 import synthetic_materials as synthetic
-from scholia_app import MockProvider, MockScholarly, background_idle, openalex_work, run_finished, started
+from scholia_app import (MockProvider, MockScholarly, background_idle, openalex_work, read_in_process, run_finished,
+                         started)
 from test_materials import added, listing, project_of, rows, settled
 
 DOI = "10.5555/scholia.scanned.001"
@@ -54,7 +55,11 @@ class Engine:
 
 
 def use(monkeypatch, engine):
+    """The engine in place of the platform's, here: the app's readings run in this process with it
+    (read_in_process), as a child process would not see it. Vision in the child is tested in
+    tests/test_reading.py."""
     monkeypatch.setattr(ocr, "engine", lambda: engine)
+    read_in_process(monkeypatch)
     return engine
 
 
@@ -777,6 +782,7 @@ def rewording(monkeypatch, real, words):
 @pytest.mark.asyncio
 async def test_a_citation_one_re_read_cannot_find_is_found_again_by_a_later_one_and_one_unresolved_from_the_start(
         tmp_path, monkeypatch):
+    read_in_process(monkeypatch)  # earlier extractor versions, as this process sees them
     notes = b"# Notes\n\nWages rose sharply in the synthetic panel.\n\nA second paragraph of synthetic text.\n"
     real = extraction.extract
     async with started(tmp_path / "data") as client:

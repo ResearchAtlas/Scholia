@@ -5,8 +5,10 @@ build, the native pieces the app ships: SQLite, FTS5 secure-delete, extension lo
 sqlite-vec through APSW, the backend with one turn against an in-process provider, an
 AES-encrypted zip file as backups and exports write them (pyzipper and pycryptodomex's native
 code, imported only when first used), one embedding through the llama.cpp helper, whose binary and libraries are first checked against
-the build's SHA-256 manifest as the app checks them before every launch, and one scanned PDF page
-read through the app's own reading code and OCR engine (Vision). It prints the
+the build's SHA-256 manifest as the app checks them before every launch, and materials read as the
+app reads them, each in a child process (backend/reading.py; here, this executable started with
+--read-material): a PDF, LaTeX source, a page image, one scanned PDF page through the OCR engine
+(Vision), and a reading past a ceiling below any child's footprint, stopped. It prints the
 results as JSON and exits non-zero when any check fails.
 
 The checks also run from source (tests/test_self_test.py), except the embedding, which
@@ -14,6 +16,7 @@ needs the model and the helper binary.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -269,22 +272,35 @@ def scanned_pdf(lines, size=(612, 792), dpi=300):
     return out.getvalue()
 
 
+def _stored(folder, data):
+    """data written to folder as the content store keeps a file: (its path, its SHA-256)."""
+    sha256 = hashlib.sha256(data).hexdigest()
+    path = Path(folder) / sha256
+    path.write_bytes(data)
+    return path, sha256
+
+
 def check_ocr() -> dict:
-    """One scanned page read as the app reads one (backend/extraction.py): the page rendered by
-    pypdfium2 at 300 dpi, its text recognized by the OCR engine (backend/ocr.py), made into passages."""
-    from backend import extraction, ocr
+    """One scanned page read as the app reads one, in its child process (backend/reading.py): the page
+    rendered by pypdfium2 at 300 dpi, its text recognized by the OCR engine (backend/ocr.py), made
+    into passages."""
+    from backend import extraction, ocr, reading
 
     engine = ocr.engine()
     if engine is None:
         raise RuntimeError("no OCR engine loads")
-    read = extraction.extract(scanned_pdf([(72, 700, 14, OCR_LINES[0]), (72, 600, 14, OCR_LINES[1])]), extraction.PDF)
+    stats = {}
+    with tempfile.TemporaryDirectory() as folder:
+        scan = _stored(folder, scanned_pdf([(72, 700, 14, OCR_LINES[0]), (72, 600, 14, OCR_LINES[1])]))
+        read = reading.read(*scan, extraction.PDF, stats=stats)
     found = [passage.text for passage in read.passages]
     text = "".join(found).replace(" ", "")
     missing = [line for line in OCR_LINES if line.replace(" ", "") not in text]
     if missing or (read.ocr_pages, read.status) != (1, "complete"):
         raise RuntimeError(f"OCR missed {missing}; read {found}")
     return {"lines": found, "engine": engine.version,
-            "min_confidence": min(passage.boxes["ocr"]["confidence"] for passage in read.passages)}
+            "min_confidence": min(passage.boxes["ocr"]["confidence"] for passage in read.passages),
+            "child_peak_mib": stats["peak_mib"]}
 
 
 class _Keys:
@@ -437,20 +453,43 @@ def _pdf(text):
 
 
 def check_materials() -> dict:
-    """Reading materials as the app does: a PDF read by PDFium (pypdfium2) into a passage and rendered
-    as a page image, and LaTeX source read by pylatexenc."""
-    from backend import extraction
+    """Reading materials as the app does, each in its child process (backend/reading.py): a PDF read by
+    PDFium (pypdfium2) into a passage and rendered as a page image, and LaTeX source read by
+    pylatexenc; with the PDF reading's child's start (to ready) and peak footprint."""
+    from backend import extraction, reading
 
-    pdf = extraction.extract(_pdf("Scholia self-test"), extraction.PDF)
-    if [p.text for p in pdf.passages] != ["Scholia self-test"]:
-        raise RuntimeError("the PDF's text was not read back")
-    if not extraction.render_page(_pdf("Scholia self-test"), 1, 0.5).startswith(b"\x89PNG"):
-        raise RuntimeError("the PDF's page was not rendered")
-    latex = extraction.extract(b"\\begin{document}\\section{Check}Self-test \\emph{text}.\\end{document}",
-                               extraction.LATEX)
+    stats = {}
+    with tempfile.TemporaryDirectory() as folder:
+        stored = _stored(folder, _pdf("Scholia self-test"))
+        pdf = reading.read(*stored, extraction.PDF, stats=stats)
+        if [p.text for p in pdf.passages] != ["Scholia self-test"]:
+            raise RuntimeError("the PDF's text was not read back")
+        if not reading.render(*stored, 1, 0.5).startswith(b"\x89PNG"):
+            raise RuntimeError("the PDF's page was not rendered")
+        source = b"\\begin{document}\\section{Check}Self-test \\emph{text}.\\end{document}"
+        latex = reading.read(*_stored(folder, source), extraction.LATEX)
     if [(p.section_path, p.text) for p in latex.passages] != [(["Check"], "Self-test text.")]:
         raise RuntimeError("the LaTeX source was not read back")
-    return {"pdf": pdf.version, "latex": latex.version}
+    return {"pdf": pdf.version, "latex": latex.version, "child_ready_seconds": round(stats["ready_seconds"], 3),
+            "child_peak_mib": stats["peak_mib"]}
+
+
+def check_reading_ceiling() -> dict:
+    """A reading whose child passes its memory ceiling (1 MiB, below any child's footprint) is stopped:
+    it ends memory_limit and no child is left."""
+    from backend import extraction, reading
+
+    with tempfile.TemporaryDirectory() as folder:
+        try:
+            reading.read(*_stored(folder, _pdf("Scholia self-test")), extraction.PDF, ceiling=1024 * 1024)
+        except extraction.Unreadable as unreadable:
+            if unreadable.code != "memory_limit":
+                raise
+        else:
+            raise RuntimeError("a reading past its memory ceiling was not stopped")
+    if reading.LIVE:
+        raise RuntimeError("a reading's child was left")
+    return {"reason": "memory_limit"}
 
 
 def run(helper: Path, model: Path) -> dict:
@@ -461,6 +500,7 @@ def run(helper: Path, model: Path) -> dict:
         "interface": check_interface,
         "encrypted_zip": check_encrypted_zip,
         "materials": check_materials,
+        "reading_ceiling": check_reading_ceiling,
         "embedding": lambda: check_embedding(helper, model),
         "ocr": check_ocr,
     }

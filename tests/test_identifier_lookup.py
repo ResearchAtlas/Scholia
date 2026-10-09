@@ -19,7 +19,7 @@ from backend.db import new_id
 import backend.materials as materials_module
 import synthetic_materials as synthetic
 from scholia_app import (Chunks, MockProvider, MockScholarly, arxiv_feed, background_idle, crossref_work, openalex_work,
-                         run_finished, started, streamed)
+                         read_in_process, run_finished, started, streamed)
 from test_materials import added, hold_extraction, listing, project_of, rows, settled
 
 pytestmark = pytest.mark.asyncio
@@ -56,8 +56,8 @@ async def ask_of(client, project):
 # Lifecycle
 
 
-async def test_a_project_made_local_only_before_dispatch_sends_nothing(tmp_path, monkeypatch):
-    reached, go = hold_extraction(monkeypatch)  # the lookup waits for its material to be read
+async def test_a_project_made_local_only_before_dispatch_sends_nothing(tmp_path, monkeypatch, reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)  # the lookup waits for its material to be read
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
         project = await project_of(client)
         result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
@@ -244,6 +244,7 @@ async def test_a_lookup_waits_only_for_the_reading_of_the_version_it_is_for(tmp_
                 stop()
         return real(data, kind, stop, progress)
 
+    read_in_process(monkeypatch)  # the readings this test holds, by their files, here
     monkeypatch.setattr(extraction, "extract", held)
     other = "10.5555/quick.replacement"
     async with started(tmp_path / "data", scholarly(openalex={other: openalex_work(other, "The Quick Replacement")})) \
@@ -262,8 +263,9 @@ async def test_a_lookup_waits_only_for_the_reading_of_the_version_it_is_for(tmp_
 
 
 @pytest.mark.parametrize("level", ["normal", "local_only", "review_locked"])
-async def test_a_reading_tried_again_brings_the_lookup_its_version_never_had(tmp_path, monkeypatch, level):
-    reached, go = hold_extraction(monkeypatch)
+async def test_a_reading_tried_again_brings_the_lookup_its_version_never_had(tmp_path, monkeypatch, level,
+                                                                             reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
         if level == "review_locked":
             project = (await client.post("/api/projects", json={"name": "Review", "sensitivity": "local_only",
@@ -306,6 +308,7 @@ async def test_a_reading_past_the_lookups_wait_brings_the_lookup_once_it_commits
         release.wait(20)
         return real(data, kind, lambda: None, progress)
 
+    read_in_process(monkeypatch)  # the readings this test holds, by their files, here
     monkeypatch.setattr(extraction, "extract", overrunning)
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
         project = await project_of(client)
@@ -332,6 +335,7 @@ async def test_the_lookup_a_late_reading_brings_asks_in_the_conversation_its_fil
         release.wait(20)
         return real(data, kind, lambda: None, progress)
 
+    read_in_process(monkeypatch)  # the readings this test holds, by their files, here
     monkeypatch.setattr(extraction, "extract", overrunning)
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
         project = await project_of(client, level="local_only")
@@ -349,8 +353,8 @@ async def test_the_lookup_a_late_reading_brings_asks_in_the_conversation_its_fil
 
 @pytest.mark.parametrize("level", ["normal", "local_only"])
 async def test_another_projects_reading_of_the_file_brings_the_lookup_a_stopped_reading_never_gave(
-        tmp_path, monkeypatch, level):
-    reached, go = hold_extraction(monkeypatch)
+        tmp_path, monkeypatch, level, reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     pdf = synthetic.paper_pdf()
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
         first = await project_of(client, "First", level=level)
@@ -391,6 +395,7 @@ async def test_a_reading_tried_again_while_its_batchs_lookup_still_waits_is_look
                 stop()
         return real(data, kind, stop, progress)
 
+    read_in_process(monkeypatch)  # the readings this test holds, by their files, here
     monkeypatch.setattr(extraction, "extract", held)
     records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Long Read, Resolved")}
     async with started(tmp_path / "data", scholarly(openalex=records)) as client:
