@@ -431,7 +431,7 @@ async def search(state, project_id, query, limit=None):
     values = load_settings(state["data_dir"]).values["retrieval"]
     limit = limit or values["keep"]
     mode, reason = search_mode(state)
-    if index is None:
+    if index is None or index.closed:  # it could not be opened, or a restore is putting another in place
         return {"results": [], "mode": mode, "reason": reason, "index": "unavailable", "coverage": None}
     keyword = asyncio.ensure_future(asyncio.to_thread(index.keyword, project_id, text, values["bm25_candidates"]))
     counts = await asyncio.to_thread(index.counts, project_id)
@@ -480,6 +480,8 @@ async def index_status(project_id: str, request: Request):
 
     run = await asyncio.to_thread(state["db"].read, latest)
     index = state.get("index")
+    if index is not None and index.closed:
+        index = None
     counts = await asyncio.to_thread(index.counts, project_id) if index is not None else {}
     mode, reason = search_mode(state)
     status = run and derived_status(run[1], run[0], registry)
