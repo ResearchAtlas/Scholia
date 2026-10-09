@@ -369,11 +369,28 @@ async def measure(args, state, client, data, processes):
     results["warm_part_seconds"] = {name: summary(values) for name, values in parts.items()}
     results["footprint_after_warm"] = memory.peak()
 
-    # Sustained: searches back to back while a rebuild of the project embeds (helper vectors only).
+    # Sustained: searches back to back while a rebuild of the project embeds (helper vectors only); then
+    # how long Cancel takes, during the rebuild's embeddings and during its rows (ticket 70: cancellation).
     if args.vectors == "helper" and args.sustained:
-        response = await client.post(f"/api/projects/{project}/index/rebuild")
-        rebuild = response.json()["run_id"]
-        await asyncio.sleep(5)  # its keyword part done, its embeddings under way
+        registry = state["harness"].registry
+
+        async def rebuilding():
+            response = await client.post(f"/api/projects/{project}/index/rebuild")
+            return response.json()["run_id"], time.perf_counter()
+
+        async def cancelled(run_id):  # seconds from Cancel to the run's end in the record, and its status
+            began = time.perf_counter()
+            reply = asyncio.ensure_future(client.post(f"/api/runs/{run_id}/cancel"))
+            while (status := await read(lambda c: c.execute("SELECT status FROM runs WHERE id = ?",
+                                                          (run_id,)).fetchone()[0])) == "running":
+                await asyncio.sleep(0.02)
+            await reply
+            return round(time.perf_counter() - began, 3), status
+
+        rebuild, began = await rebuilding()
+        while (held := registry.runs.get(rebuild)) is not None and held.progress is None:
+            await asyncio.sleep(0.1)  # its rows rebuilt (keyword search throughout), its embeddings starting
+        rows_seconds = round(time.perf_counter() - began, 1)
         sustained, outcomes, i = [], {}, 0
         stop = time.monotonic() + args.sustained
         while time.monotonic() < stop:
@@ -382,11 +399,17 @@ async def measure(args, state, client, data, processes):
             outcomes[found["reason"] or found["mode"]] = outcomes.get(found["reason"] or found["mode"], 0) + 1
             i += 1
             await asyncio.sleep(0.25)
-        progress = state["harness"].registry.runs.get(rebuild)
-        await client.post(f"/api/runs/{rebuild}/cancel")
+        progress = registry.runs.get(rebuild)
+        progress = progress.progress if progress else None
+        cancel_embedding = await cancelled(rebuild)
+        second, _ = await rebuilding()
+        await asyncio.sleep(min(1.0, rows_seconds / 4))  # within its rows (one transaction, rolled back on Cancel)
+        cancel_rows = await cancelled(second)
         results["sustained"] = {"seconds": args.sustained, "searches": summary(sustained), "outcomes": outcomes,
-                                "past_deadline": outcomes.get("deadline", 0),
-                                "rebuild_progress_at_end": progress.progress if progress else None}
+                                "past_deadline": outcomes.get("deadline", 0), "rebuild_rows_seconds": rows_seconds,
+                                "rebuild_progress_at_end": progress,
+                                "cancel_during_embeddings": {"seconds": cancel_embedding[0], "status": cancel_embedding[1]},
+                                "cancel_during_rows": {"seconds": cancel_rows[0], "status": cancel_rows[1]}}
     memory.stop.set()
     memory.thread.join()
     results["memory"] = memory.peak()
