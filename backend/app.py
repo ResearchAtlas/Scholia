@@ -1206,18 +1206,21 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 " AND (r.status = 'running' OR ?2 IS NOT NULL OR r.id IN (SELECT id FROM runs"
                 " WHERE kind = 'background' AND status != 'running' ORDER BY started_at DESC LIMIT ?1))"
                 " ORDER BY r.status = 'running' DESC, r.started_at DESC", (max(1, min(limit, 200)), run_id)).fetchall()
-            return [(row, materials.run_details(conn, row[0], row[2], row[3], row[12], registry)) for row in rows]
+            # Each run's status is worked out once, in this read, and its Retry from that same status: a run
+            # released meanwhile (its terminal write failed) never reads interrupted without its Retry.
+            return [(row, status, materials.run_details(conn, row[0], row[2], row[3], row[12], registry, status))
+                    for row in rows for status in [derived_status(row[3], row[0], registry)]]
 
         registry = harness().registry
         listed = await read(listing)
         return JSONResponse({"runs": [{
             "run_id": run, "project_id": project_id, "project_name": name, "project_kind": kind,
-            "workflow": workflow, "status": derived_status(status, run, registry), "cancel_reason": cancel,
+            "workflow": workflow, "status": status, "cancel_reason": cancel,
             "cost_usd": cost, "attempts": attempts, "started_at": started, "finished_at": finished,
             "result": json.loads(summary) if summary else None,
             "progress": registry.runs[run].progress if run in registry.runs else None, **details,
-        } for (run, project_id, workflow, status, cancel, cost, attempts, started, finished, name, kind, summary, _),
-            details in listed]}, headers={"Cache-Control": "no-store"})  # it names papers: never kept by the browser
+        } for (run, project_id, workflow, _, cancel, cost, attempts, started, finished, name, kind, summary, _),
+            status, details in listed]}, headers={"Cache-Control": "no-store"})  # it names papers: never kept by the browser
 
     # The interface: built files only, from inside their folder
 

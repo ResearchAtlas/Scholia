@@ -553,14 +553,15 @@ async def index_status(project_id: str, request: Request):
                                         " AND workflow = 'index' ORDER BY rowid DESC LIMIT 1", (project_id,)).fetchone()
 
     rebuilding, run = await asyncio.to_thread(state["db"].read, latest)
-    run = next((r for r in rebuilding if derived_status(r[1], r[0], registry) == "running"), run)
+    # Its status worked out once (a run may be released between two looks at the registry).
+    run, status = next(((r, "running") for r in rebuilding if derived_status(r[1], r[0], registry) == "running"),
+                       (run, run and derived_status(run[1], run[0], registry)))
+    active = run and registry.runs.get(run[0])
     index = state.get("index")
     if index is not None and index.closed:
         index = None
     counts = await _counts(index, project_id) if index is not None else {}
     mode, reason = search_mode(state)
-    status = run and derived_status(run[1], run[0], registry)
-    active = run and registry.runs.get(run[0])
     return {"state": "unavailable" if index is None else "building" if index.building or index.damaged else "ready",
             "mode": mode, "reason": reason,
             "passages": {"indexed": sum(c[0] for c in counts.values()), "embedded": sum(c[1] for c in counts.values()),

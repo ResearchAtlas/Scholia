@@ -1130,10 +1130,11 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
     return Response(image, media_type="image/png", headers={"Cache-Control": "no-store"})  # see _no_store
 
 
-def run_details(conn, run_id, workflow, status, inputs, registry):
+def run_details(conn, run_id, workflow, status, inputs, registry, derived=None):
     """What the background-run list shows of a material's run beside its status: the titles of the
     papers it works on (up to three, with their count), its open ask, whether Retry applies, and for
-    an index run whether its project offers the search model's download (S1-17)."""
+    an index run whether its project offers the search model's download (S1-17). derived: the status the
+    list shows (derived_status), worked out in the same read, which Retry is decided by."""
     if workflow not in _WORKFLOWS:
         return {}
     ids = json.loads(inputs or "{}").get("material_ids") or []
@@ -1144,7 +1145,7 @@ def run_details(conn, run_id, workflow, status, inputs, registry):
                            (json.dumps(ids),)).fetchone()
     ask = asks.open_asks(conn, run_id=run_id) if status == "running" else []
     details = {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
-               "retryable": _retry(conn, run_id, registry)[1] is None}
+               "retryable": _retry(conn, run_id, registry, derived)[1] is None}
     if workflow == "index":  # S1-17: why it was keyword-only is worded as its own project offers the model
         level = conn.execute("SELECT p.sensitivity FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?",
                              (run_id,)).fetchone()
@@ -1181,7 +1182,7 @@ def _unreadable(conn, version_id, registry):
     return None
 
 
-def _retry(conn, run_id, registry):
+def _retry(conn, run_id, registry, derived=None):
     """A retry of a material's run: ((project id, workflow, the new run's inputs), None), or (None,
     (status, code, message)) saying why it cannot be tried again. The background-run list's Retry
     and the retry endpoint both ask this, so the list offers Retry exactly where the endpoint takes
@@ -1190,7 +1191,9 @@ def _retry(conn, run_id, registry):
     earlier extractor version included (its file has no reading by this one); a lookup in a
     project not locked.
     Statuses are read as the list reads them (derived_status): a run left running in the record
-    that this app does not hold is interrupted, so it may be tried again and is not being read."""
+    that this app does not hold is interrupted, so it may be tried again and is not being read.
+    derived, if given, is that status as the list worked it out in this read (the run's state may
+    change between two looks at the registry)."""
     row = conn.execute("SELECT project_id, workflow, status, inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
         return None, (404, "not_found", "No such run")
@@ -1198,7 +1201,7 @@ def _retry(conn, run_id, registry):
     inputs = json.loads(inputs or "{}")
     if inputs.get("retried_by"):  # tried again already: that run is the one to follow, or to try again
         return None, (409, "not_retryable", "This run was tried again already")
-    status = derived_status(status, run_id, registry)
+    status = derived or derived_status(status, run_id, registry)
     if workflow not in _WORKFLOWS or workflow == "model_offer" or (status not in ("failed", "cancelled", "interrupted")
                                       and (workflow, status) != ("extract", "succeeded")):  # read by an earlier version
         return None, (409, "not_retryable", "This run cannot be tried again")
