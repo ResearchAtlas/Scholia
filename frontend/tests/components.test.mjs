@@ -257,6 +257,121 @@ test('a PDF page keeps what it shows out of reach while another part loads, and 
   assert.deepEqual([focused('page', 'first'), focused('page', null), focused('elsewhere', 'first')], [true, false, false]);
 });
 
+// Each Retry of a paper's text, as source text: the component it is in and its onClick; each effect that
+// reads a stretch of passages, with what it depends on; and each effect giving focus to Retry, by component.
+function retries(text) {
+  return parsed(text, (context, found) => {
+    const code = (node) => context.sourceCode.getText(node);
+    const component = (node) => {
+      for (let around = node.parent; around; around = around.parent) if (around.type === 'FunctionDeclaration') return around.id.name;
+      return null;
+    };
+    return {
+      JSXElement(element) {
+        if (!element.children.some((child) => child.type === 'JSXExpressionContainer' && code(child.expression) === "t('common.retry')")) return;
+        const click = element.openingElement.attributes.find((a) => a.name?.name === 'onClick');
+        (found.buttons ??= []).push([component(element), code(click.value.expression)]);
+      },
+      CallExpression(call) {
+        if (call.callee.name === 'useEffect' && code(call.arguments[0]).includes('passTo(retry.current)')) {
+          (found.toRetry ??= []).push([component(call), code(call.arguments[0])]);
+        }
+        if (call.callee.name !== 'passageStretch') return;
+        let effect = call.parent;
+        while (effect && effect.callee?.name !== 'useEffect') effect = effect.parent;
+        found.read = code(effect.arguments[0]);
+        found.reads = effect.arguments[1].elements.map((name) => name.name);
+      },
+    };
+  });
+}
+
+test('a stretch or a page whose first read failed offers Retry, which reads it again, focus going on as for a part', () => {
+  const found = retries(source('Paper.jsx'));
+  assert.deepEqual(found.buttons.map(([where]) => where), ['PageView', 'PageView', 'PassageStretch']);
+  assert.deepEqual(found.buttons[1][1], "() => go(part, 'first')"); // the page's own: as its part's button, on the part it asked for
+  const calls = [];
+  new Function('focusOn', 'setFailed', `return (${found.buttons[2][1]});`)(
+    (where) => calls.push(['focusOn', where]), (failed) => calls.push(['setFailed', failed]))();
+  assert.deepEqual(calls, [['focusOn', 'first'], ['setFailed', false]]); // focus waits on the stretch, then its first passage
+  assert.deepEqual(found.toRetry.map(([where]) => where), ['PageView', 'PassageStretch']);
+  // The stretch reads again once its failure is cleared (Retry), not before; let go, its failure is cleared.
+  assert.ok(found.reads.includes('failed'), found.reads);
+  const effect = (held, move) => {
+    const set = [];
+    new Function('held', 'move', 'setShown', 'setFailed', 'passageStretch', 'version', 'index', 'AbortController', `return (${found.read});`)(
+      held, move, (value) => set.push(['shown', value]), (value) => set.push(['failed', value]),
+      () => { set.push(['read']); return new Promise(() => {}); }, 'v', 0, AbortController)();
+    return set;
+  };
+  assert.deepEqual(effect(true, { read: false }), []);
+  assert.deepEqual(effect(true, { read: true }), [['read']]);
+  assert.deepEqual(effect(false, { read: false }), [['shown', null], ['failed', false]]);
+});
+
+// What a PDF's page list renders its pages from, as source text.
+function pageItems(text) {
+  return parsed(text, (context, found) => ({
+    JSXOpeningElement(element) {
+      if (element.name.name !== 'PageView') return;
+      let call = element.parent;
+      while (call && !(call.type === 'CallExpression' && call.callee.property?.name === 'map')) call = call.parent;
+      (found.from ??= []).push(call ? context.sourceCode.getText(call.callee.object) : null);
+    },
+  })).from ?? [];
+}
+
+test('a PDF\'s page list mounts its pages only through the window near the view, never one for every page', () => {
+  assert.deepEqual(pageItems(source('Paper.jsx')), ['pageWindow(offsets, span, held)']);
+});
+
+// Where a PDF page's part of its passages starts, and what its read records once a part shows, as source text.
+function pagePartMemory(text) {
+  return parsed(text, (context, found) => ({
+    VariableDeclarator(node) {
+      if (node.id.type === 'ArrayPattern' && node.id.elements[0]?.name === 'part' && node.init?.callee?.name === 'useState') {
+        found.start = context.sourceCode.getText(node.init.arguments[0]);
+      }
+    },
+    CallExpression(call) {
+      if (call.callee.name === 'onPart') (found.recorded ??= []).push(context.sourceCode.getText(call));
+    },
+  }));
+}
+
+test('a PDF page mounted again comes back on the part of its passages it last showed', () => {
+  const found = pagePartMemory(source('Paper.jsx'));
+  assert.equal(found.start, 'startPart'); // the list's record of it, 0 for a page never shown
+  assert.deepEqual(found.recorded, ['onPart(number, part)']); // recorded once that part shows, not one asked for or failed
+});
+
+// The note after the pages a PDF's list lays out, as source text: what it shows on, its button's handler,
+// and the handler Contents gives the list for it.
+function pagesCut(text) {
+  return parsed(text, (context, found) => ({
+    LogicalExpression(node) {
+      if (context.sourceCode.getText(node.right).includes("'paper.pagesCut'")) found.when = context.sourceCode.getText(node.left);
+    },
+    JSXOpeningElement(element) {
+      const attribute = (name) => element.attributes.find((a) => a.name?.name === name);
+      const code = (a) => context.sourceCode.getText(a.value.expression);
+      if (element.name.name === 'PageList') found.onText = code(attribute('onText'));
+      if (element.name.name === 'Button' && context.sourceCode.getText(element.parent).includes("'paper.showPassages'")) found.click = code(attribute('onClick'));
+    },
+  }));
+}
+
+test('a PDF too long to lay out says, after its last page shown, that the others are in the text view, with a button to it', () => {
+  const found = pagesCut(source('Paper.jsx'));
+  assert.equal(found.when, 'shown < pages'); // only when pages did not fit under the cap (pageOffsets)
+  assert.equal(found.click, 'onText');
+  const calls = [];
+  const radios = [{ focus: () => calls.push('Pages') }, { focus: () => calls.push('Passages') }];
+  new Function('views', 'setChosen', `return (${found.onText});`)({ current: { querySelectorAll: () => radios } },
+    (view) => calls.push(`chosen ${view}`))();
+  assert.deepEqual(calls, ['Passages', 'chosen text']); // focus on the switch's Passages, not lost with the button
+});
+
 // What the background-run list's act does once a run is tried again or stopped, as source text.
 function actBody(text) {
   return parsed(text, (context, found) => ({
@@ -271,4 +386,76 @@ test('a run tried again or stopped in the background-run list wakes the Library 
   assert.match(body, /load\(\);\s*libraryChanged\(projectId\);/);
   assert.match(source('Settings.jsx'), /act\(\(\) => retryRun\(run\.run_id\), run\.project_id\)/);
   assert.match(source('Settings.jsx'), /act\(\(\) => post\(`\/api\/runs\/\$\{run\.run_id\}\/cancel`\), run\.project_id\)/);
+});
+
+// The effect that gives focus to the note once the cut comes before the page holding it, as source text.
+function focusPastCut(text) {
+  return parsed(text, (context, found) => ({
+    CallExpression(call) {
+      if (call.callee.name === 'useLayoutEffect' && context.sourceCode.getText(call.arguments[0]).includes('note.current')) {
+        found.effect = context.sourceCode.getText(call.arguments[0]);
+        found.deps = call.arguments[1].elements.map((name) => name.name);
+      }
+    },
+    VariableDeclarator(node) {
+      let inside = node.parent;
+      while (inside && inside.type !== 'FunctionDeclaration') inside = inside.parent;
+      if (node.id.name === 'shown' && inside?.id.name === 'PageList') found.shown = context.sourceCode.getText(node.init);
+    },
+  }));
+}
+
+test('focus in a page the height cut comes before (the list widened) goes to the note, never to the body', () => {
+  const found = focusPastCut(source('Paper.jsx'));
+  assert.equal(found.shown, 'offsets.length - 1');
+  assert.deepEqual(found.deps, ['within', 'shown']);
+  const run = (within, shown, active) => {
+    const calls = [];
+    const body = { tag: 'body' };
+    new Function('within', 'shown', 'document', 'onWithin', 'note', `return (${found.effect});`)(within, shown,
+      { activeElement: active === 'body' ? body : active, body }, (page, inside) => calls.push(['onWithin', page, inside]),
+      { current: { focus: () => calls.push(['note']) } })();
+    return calls;
+  };
+  assert.deepEqual(run(19_000, 15_836, 'body'), [['onWithin', 19_000, false], ['note']]); // its page gone: to the note
+  assert.deepEqual(run(19_000, 15_836, null), [['onWithin', 19_000, false], ['note']]); // focus nowhere, as the spec has it
+  assert.deepEqual(run(19_000, 15_836, { composer: true }), [['onWithin', 19_000, false]]); // focus elsewhere stays there
+  assert.deepEqual(run(15_000, 15_836, 'body'), []); // a page still laid out keeps focus
+  assert.deepEqual(run(null, 15_836, 'body'), []);
+});
+
+// The effect that gives focus to the view's switch once the note goes with focus on its button, as source text.
+function noteGone(text) {
+  return parsed(text, (context, found) => ({
+    CallExpression(call) {
+      if (call.callee.name === 'useLayoutEffect' && context.sourceCode.getText(call.arguments[0]).includes('toSwitch')) {
+        found.effect = context.sourceCode.getText(call.arguments[0]);
+        found.deps = call.arguments[1].elements.map((name) => name.name);
+      }
+    },
+    JSXOpeningElement(element) {
+      if (element.name.name !== 'Button' || !context.sourceCode.getText(element.parent).includes("'paper.showPassages'")) return;
+      const handler = (name) => context.sourceCode.getText(element.attributes.find((a) => a.name?.name === name).value.expression);
+      found.focus = [handler('onFocus'), handler('onBlur')];
+    },
+  }));
+}
+
+test('focus on the note goes to the view switch when the note goes, every page fitting again (the list narrowed)', () => {
+  const found = noteGone(source('Paper.jsx'));
+  assert.deepEqual(found.deps, ['shown']);
+  assert.deepEqual(found.focus, ['() => { noteFocused.current = true; }', '() => { noteFocused.current = false; }']);
+  const run = (shown, pages, focused, active) => {
+    const calls = [];
+    const body = { tag: 'body' };
+    const noteFocused = { current: focused };
+    new Function('shown', 'pages', 'noteFocused', 'document', 'toSwitch', `return (${found.effect});`)(shown, pages, noteFocused,
+      { activeElement: active === 'body' ? body : active, body }, () => calls.push('switch'))();
+    return [calls, noteFocused.current];
+  };
+  assert.deepEqual(run(20_000, 20_000, true, 'body'), [['switch'], false]); // the note gone with focus: to the switch
+  assert.deepEqual(run(20_000, 20_000, true, null), [['switch'], false]);
+  assert.deepEqual(run(20_000, 20_000, true, { composer: true }), [[], false]); // focus already elsewhere stays there
+  assert.deepEqual(run(20_000, 20_000, false, 'body'), [[], false]); // focus was not on the note
+  assert.deepEqual(run(15_836, 20_000, true, 'body'), [[], true]); // the note still there
 });
