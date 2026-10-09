@@ -398,7 +398,9 @@ function focusPastCut(text) {
       }
     },
     VariableDeclarator(node) {
-      if (node.id.name === 'shown' && node.init) found.shown = context.sourceCode.getText(node.init);
+      let inside = node.parent;
+      while (inside && inside.type !== 'FunctionDeclaration') inside = inside.parent;
+      if (node.id.name === 'shown' && inside?.id.name === 'PageList') found.shown = context.sourceCode.getText(node.init);
     },
   }));
 }
@@ -416,7 +418,44 @@ test('focus in a page the height cut comes before (the list widened) goes to the
     return calls;
   };
   assert.deepEqual(run(19_000, 15_836, 'body'), [['onWithin', 19_000, false], ['note']]); // its page gone: to the note
+  assert.deepEqual(run(19_000, 15_836, null), [['onWithin', 19_000, false], ['note']]); // focus nowhere, as the spec has it
   assert.deepEqual(run(19_000, 15_836, { composer: true }), [['onWithin', 19_000, false]]); // focus elsewhere stays there
   assert.deepEqual(run(15_000, 15_836, 'body'), []); // a page still laid out keeps focus
   assert.deepEqual(run(null, 15_836, 'body'), []);
+});
+
+// The effect that gives focus to the view's switch once the note goes with focus on its button, as source text.
+function noteGone(text) {
+  return parsed(text, (context, found) => ({
+    CallExpression(call) {
+      if (call.callee.name === 'useLayoutEffect' && context.sourceCode.getText(call.arguments[0]).includes('toSwitch')) {
+        found.effect = context.sourceCode.getText(call.arguments[0]);
+        found.deps = call.arguments[1].elements.map((name) => name.name);
+      }
+    },
+    JSXOpeningElement(element) {
+      if (element.name.name !== 'Button' || !context.sourceCode.getText(element.parent).includes("'paper.showPassages'")) return;
+      const handler = (name) => context.sourceCode.getText(element.attributes.find((a) => a.name?.name === name).value.expression);
+      found.focus = [handler('onFocus'), handler('onBlur')];
+    },
+  }));
+}
+
+test('focus on the note goes to the view switch when the note goes, every page fitting again (the list narrowed)', () => {
+  const found = noteGone(source('Paper.jsx'));
+  assert.deepEqual(found.deps, ['shown']);
+  assert.deepEqual(found.focus, ['() => { noteFocused.current = true; }', '() => { noteFocused.current = false; }']);
+  const run = (shown, pages, focused, active) => {
+    const calls = [];
+    const body = { tag: 'body' };
+    const noteFocused = { current: focused };
+    new Function('shown', 'pages', 'noteFocused', 'document', 'toSwitch', `return (${found.effect});`)(shown, pages, noteFocused,
+      { activeElement: active === 'body' ? body : active, body }, () => calls.push('switch'))();
+    return [calls, noteFocused.current];
+  };
+  assert.deepEqual(run(20_000, 20_000, true, 'body'), [['switch'], false]); // the note gone with focus: to the switch
+  assert.deepEqual(run(20_000, 20_000, true, null), [['switch'], false]);
+  assert.deepEqual(run(20_000, 20_000, true, { composer: true }), [[], false]); // focus already elsewhere stays there
+  assert.deepEqual(run(20_000, 20_000, false, 'body'), [[], false]); // focus was not on the note
+  assert.deepEqual(run(15_836, 20_000, true, 'body'), [[], true]); // the note still there
 });

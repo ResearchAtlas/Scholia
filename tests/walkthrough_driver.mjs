@@ -915,7 +915,8 @@ async function materials(ctx) {
 
   await step('59-many-pages-cut', async () => {
     // Widened until its pages are 720 px wide, the list lays out only the pages under its height cap: focus on page
-    // 19,000, past the new cut, goes to the note after the last page shown, whose button opens the text view.
+    // 19,000, past the new cut, goes to the note after the last page shown; narrowed back, the note goes and focus on
+    // it to the view's switch; widened again, the note's button opens the text view.
     const size = page.viewportSize();
     await scrollPanel(18_999 * ((await pageList()).laidOut + 16) / 20000);
     await page.waitForTimeout(800);
@@ -930,6 +931,16 @@ async function materials(ctx) {
     check('widened, the list lays out the pages under the cap, page 19,000 not among them', await pageFigure(19000).count() === 0
       && await panel().getByText(P('paper.pagesCut')).count() === 1);
     check('and focus, which was on that page, is on the note\'s button', await show.evaluate((button) => button === document.activeElement));
+    // Narrowed back, every page fits again: the note goes, and focus on it to the view's switch, on Pages.
+    await page.setViewportSize(size);
+    await show.waitFor({ state: 'detached', timeout: 10000 });
+    await page.waitForTimeout(500);
+    check('narrowed back, the note goes and focus with it to the view switch, on Pages', await show.count() === 0
+      && await panel().getByRole('radio', { name: L('paper.pages'), exact: true }).evaluate((radio) => radio === document.activeElement
+        && radio.getAttribute('aria-checked') === 'true'));
+    await page.setViewportSize({ width: 1900, height: size.height });
+    await show.waitFor({ timeout: 10000 });
+    await show.focus();
     await page.keyboard.press('Enter');
     const passages = panel().getByRole('radio', { name: L('paper.passages'), exact: true });
     await panel().getByRole('list', { name: L('paper.passages'), exact: true }).waitFor();

@@ -161,7 +161,8 @@ function Contents({ material }) {
       {/* Read again (its count changes), its parts start anew and read the new reading's passages. */}
       {view === 'pages' ? <PageList key={count} version={version} pages={material.extraction.pages ?? 0}
         pointed={pointed} onPoint={setPointed}
-        onText={() => { views.current?.querySelectorAll('[role="radio"]')[1]?.focus(); setChosen('text'); }} />
+        onText={() => { views.current?.querySelectorAll('[role="radio"]')[1]?.focus(); setChosen('text'); }}
+        toSwitch={() => views.current?.querySelector('[role="radio"][aria-checked="true"]')?.focus()} />
         : <PassageList key={count} version={version} count={count} pointed={pointed} onPoint={setPointed} />}
     </section>
   );
@@ -253,7 +254,7 @@ function usePart(frame, part, showing, onNear, onWithin) {
 // pages that fit in MAX_LIST_HEIGHT (pageOffsets: about 15,800 letter pages 720 px wide) and after the
 // last says the later ones are not shown here, with a button to the text view, which holds their text.
 // ponytail: a scaled or paged list if every page of longer PDFs must be shown as a page.
-function PageList({ version, pages, pointed, onPoint, onText }) {
+function PageList({ version, pages, pointed, onPoint, onText, toSwitch }) {
   const t = useT();
   const list = useRef(null);
   const { held, within, onNear, onWithin } = useHeld(list);
@@ -300,6 +301,14 @@ function PageList({ version, pages, pointed, onPoint, onText }) {
     onWithin(within, false);
     if (lost) note.current?.focus();
   }, [within, shown]);
+  // The note goes once every page fits again (the list narrowed), and focus on its button with it: focus goes to
+  // the view's switch, on its current option, as Show passages leads there. Focus elsewhere stays there.
+  const noteFocused = useRef(false);
+  useLayoutEffect(() => {
+    if (shown < pages || !noteFocused.current) return;
+    noteFocused.current = false;
+    if (!document.activeElement || document.activeElement === document.body) toSwitch();
+  }, [shown]);
   return (
     <div ref={list} className="grid gap-4">
       {pageWindow(offsets, span, held).map((item) => (item.page
@@ -309,7 +318,9 @@ function PageList({ version, pages, pointed, onPoint, onText }) {
         : <div key={`before-${item.spacer}`} aria-hidden="true" style={{ height: item.height }} />))}
       {shown < pages && <div className="grid justify-items-center gap-2 py-4 text-center">
         <p className="text-sm text-muted-foreground">{t('paper.pagesCut', { number: shown })}</p>
-        <Button ref={note} type="button" variant="outline" size="sm" onClick={onText}>{t('paper.showPassages')}</Button>
+        <Button ref={note} type="button" variant="outline" size="sm" onClick={onText}
+          onFocus={() => { noteFocused.current = true; }} onBlur={() => { noteFocused.current = false; }}>
+          {t('paper.showPassages')}</Button>
       </div>}
     </div>
   );
