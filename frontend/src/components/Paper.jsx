@@ -450,7 +450,7 @@ function PassageStretch({ version, index, count, pointed, onPoint, held, onNear,
             <p className={cn('break-words', KIND_STYLES[passage.kind])}>{passage.text}</p>
           </div>
         </div>
-      )) : move.failed ? <div className="sticky top-0 flex flex-wrap items-center gap-2"> {/* in view while its box is */}
+      )) : move.failed ? <div className="sticky top-0 flex flex-wrap items-center gap-2 self-start"> {/* in view while its box is */}
         <p role="alert" className="text-sm text-destructive">{t('paper.loadFailed')}</p>
         <Button ref={retry} type="button" variant="outline" size="sm" onClick={() => { focusOn('first'); setFailed(false); }}>
           {t('common.retry')}</Button>
