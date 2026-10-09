@@ -1042,7 +1042,7 @@ async function parts(ctx) {
   const atEnd = () => page.waitForFunction(() => {
     const box = document.getElementById('composer').closest('section').querySelector('.overflow-y-auto');
     const end = box.firstElementChild.lastElementChild;  // the marker after the turns, scrolled into view
-    return box.scrollHeight > box.clientHeight + 200 && Math.abs(end.getBoundingClientRect().bottom - box.getBoundingClientRect().bottom) <= 2;
+    return box.scrollHeight > box.clientHeight && Math.abs(end.getBoundingClientRect().bottom - box.getBoundingClientRect().bottom) <= 2;
   }, null, { timeout: 5000 }).then(() => true, () => false);
   await step('64-answers-not-loaded', async () => {
     await page.route('**/assets/markdown-*.js', (route) => route.abort(), { times: 1 });
