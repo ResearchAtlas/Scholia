@@ -56,6 +56,7 @@ MAX_BLOCKS = 200_000  # its blocks: paragraphs, headings, tables and captions, a
 # file still reads; each passage's path is also counted against MAX_BUILT_CHARS as it is made.
 MAX_HEADING_CHARS = 500
 MAX_PAGE_CHARS = 100_000  # a PDF page's characters, as PDFium counts them before any is read
+MAX_RECTS = 200_000  # a PDF reading's passage rectangles, one for each line of a passage, all held until it is stored
 # A LaTeX file's marks: what may start one of pylatexenc's nodes (a macro, a group, a comment, math,
 # or a special: & ~ -- `` '' !` ?`), counted before parsing. It holds a node for each and one for
 # the text between two, about 570 bytes a mark as measured: 500,000 marks come to about 280 MiB.
@@ -337,7 +338,7 @@ class _Reading:
     """What one reading has kept (MAX_TEXT_CHARS, MAX_BLOCKS) and built (MAX_BUILT_CHARS) so far."""
 
     def __init__(self):
-        self.chars = self.blocks = self.built = 0
+        self.chars = self.blocks = self.built = self.rects = 0
 
     def keep(self, text="", blocks=1):
         self.blocks += blocks
@@ -348,6 +349,11 @@ class _Reading:
     def build(self, chars):
         self.built += chars
         if self.built > MAX_BUILT_CHARS:
+            raise Unreadable()
+
+    def rectangles(self, count):
+        self.rects += count
+        if self.rects > MAX_RECTS:
             raise Unreadable()
 
 
@@ -429,6 +435,8 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
     passages = []
     for n, (a, b, piece) in enumerate(spans):
         rects = _rects(char_boxes[a:b], page_size) if char_boxes and page_size else None
+        if rects and (reading := _READING.get()) is not None:  # at most a piece's lines, counted as made
+            reading.rectangles(len(rects))
         if char_boxes is not None:  # a PDF piece: PDFium's characters it is made of
             chars = [i for i in char_boxes[a:b] if i is not None]
             first, last = (chars[0][4], chars[-1][4] + 1) if chars else (start, end)

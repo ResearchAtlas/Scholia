@@ -791,6 +791,16 @@ def test_html_references_are_turned_a_piece_at_a_time_and_bounded(where):
         == ["a & b \u00a9", "\u00a9right \u2209 x"]  # turned as before
 
 
+def test_a_pdf_readings_rectangles_are_counted_as_they_are_made(monkeypatch):
+    page = [(72, 780 - i * 12, 10, "ab") for i in range(60)]  # a short line on each of 60 rows: 60 rectangles
+    data = synthetic.pdf([page] * 100)
+    monkeypatch.setattr(extraction, "MAX_RECTS", 6000)
+    assert sum(len(p.boxes["rects"]) for p in extract(data, extraction.PDF).passages) == 6000
+    monkeypatch.setattr(extraction, "MAX_RECTS", 5000)
+    peak, refused = _peak(lambda: extract(data, extraction.PDF))
+    assert refused and peak < 2 * 2**20, f"{peak / 2**20:.1f} MiB"
+
+
 def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
     import pypdfium2
 
