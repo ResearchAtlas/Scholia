@@ -200,6 +200,7 @@
   "dataFolder.where": "Data folder",
   "errors.internal": "Something went wrong. Try again.",
   "errors.unreachable": "Scholia's engine is not responding. Close Scholia and open it again.",
+  "errors.part_not_loaded": "This part of Scholia could not be loaded. Try again reloads the window.",
   "errors.active_run": "This conversation is still working. Wait for it, or stop it.",
   "errors.empty_message": "Write a message first.",
   "errors.message_too_long": "This message is too long.",
