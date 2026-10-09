@@ -9,6 +9,7 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     allocate MIB      touch MIB MiB and keep them; then read for real
     spike MIB         touch MIB MiB and free them; then read for real
     spike-fail MIB    touch MIB MiB and free them; then fail as an unreadable file would
+    spike-frame MIB   touch MIB MiB and free them; then send a frame past MAX_FRAME
     exit CODE         exit with CODE at once (os._exit)
     signal NAME       kill itself with signal NAME (SIGSEGV: a crash in native code)
     stall             sleep without a word, for ever
@@ -59,6 +60,8 @@ FRAMES = {
     "empty-heading": json.dumps({"passage": ["paragraph", "Text.", None, [""] * 10, 0, 5, None]}).encode(),
     "long-heading": json.dumps({"passage": ["paragraph", "Text.", None, ["h" * 501], 0, 5, None]}).encode(),
     "nested": b'{"passage":' + b"[" * 100_000 + b"]" * 100_000 + b"}",
+    "list-kind": json.dumps({"passage": [["paragraph"], "Text.", None, [], 0, 5, None]}).encode(),
+    "list-error": json.dumps({"error": [["unreadable_file"]]}).encode(),
 }
 real_extract, real_render, real_extractor_of = extraction.extract, extraction.render_page, extraction.extractor_of
 real_file = reading._file
@@ -111,10 +114,12 @@ def before(what, stop, progress, data=b""):
         time.sleep(float(ARGS[0]))
     elif MODE == "allocate":
         before.kept = touch(int(ARGS[0]))
-    elif MODE in ("spike", "spike-fail"):
+    elif MODE in ("spike", "spike-fail", "spike-frame"):
         touch(int(ARGS[0]))
         if MODE == "spike-fail":
             raise extraction.Unreadable()
+        if MODE == "spike-frame":
+            out.raw(b"x" * (reading.MAX_FRAME + 1))
     elif MODE == "exit":
         os._exit(int(ARGS[0]))
     elif MODE == "signal":

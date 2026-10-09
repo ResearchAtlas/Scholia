@@ -185,13 +185,15 @@ def _run(request, ceiling, limit, stop, received, stats):
     each frame to received.take. Returns its exit status; the child is always reaped."""
     started, peak, longest = time.monotonic(), 0, 0.0
     stop()  # a run stopped while it waited for its turn starts no child
-    selector = selectors.DefaultSelector()
+    selector = None
     try:
+        selector = selectors.DefaultSelector()
         child = subprocess.Popen(command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                  env={k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ},
                                  cwd=None if getattr(sys, "frozen", False) else _ROOT)
     except BaseException as error:
-        selector.close()
+        if selector is not None:
+            selector.close()
         if not isinstance(error, OSError):
             raise
         log.error("a reading's child did not start (%s)", type(error).__name__)
@@ -226,16 +228,20 @@ def _run(request, ceiling, limit, stop, received, stats):
                     ended = True
                     continue
                 buffer += chunk
-                while (body := _frame(buffer, limit)) is not None:
-                    if stats is not None and "ready_seconds" not in stats:
-                        stats["ready_seconds"] = time.monotonic() - started
-                    try:
+                try:
+                    while (body := _frame(buffer, limit)) is not None:
+                        if stats is not None and "ready_seconds" not in stats:
+                            stats["ready_seconds"] = time.monotonic() - started
                         received.take(body)
-                    except Exception:  # its last frame, or a wrong one: a peak past the ceiling decides first
-                        if (peak := _peak(child.pid) or 0) > ceiling:
-                            raise _Ceiling(peak) from None
-                        raise
-                    longest, last = max(longest, time.monotonic() - last), time.monotonic()
+                        longest, last = max(longest, time.monotonic() - last), time.monotonic()
+                except Exception:  # its last frame, or a wrong one: a peak past the ceiling decides first
+                    if (now := _peak(child.pid)) is None:
+                        log.error("a reading's child's memory could not be read; it was stopped")
+                        raise ChildError("watch") from None
+                    peak = now
+                    if peak > ceiling:
+                        raise _Ceiling(peak) from None
+                    raise
             if time.monotonic() - last > STEP_SECONDS:
                 log.warning("a reading's child sent nothing for %d s; it was stopped", STEP_SECONDS)
                 raise extraction.Unreadable("step_limit")
@@ -345,7 +351,7 @@ class _Received:
         self.ready = True
 
     def failed(self, value):
-        if type(value) is not list or not value or value[0] not in _ERRORS:
+        if type(value) is not list or not value or type(value[0]) is not str or value[0] not in _ERRORS:
             raise _Bad("an error that is not one")
         code = value[0]
         if code == "file_missing":
@@ -405,7 +411,7 @@ class _Reading(_Received):
         if type(value) is not list or len(value) != 7:
             raise _Bad("a passage that is not one")
         kind, text, page, path, start, end, boxes = value
-        if kind not in _KINDS or not _text(text) or not _optional_count(page) \
+        if type(kind) is not str or kind not in _KINDS or not _text(text) or not _optional_count(page) \
                 or type(path) is not list or len(path) > MAX_SECTION_DEPTH or not all(map(_heading, path)) \
                 or not _optional_count(start) or not _optional_count(end):
             raise _Bad("a passage that is not one")

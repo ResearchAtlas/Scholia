@@ -118,6 +118,17 @@ async def test_a_child_that_passed_its_ceiling_and_then_reports_an_unreadable_fi
 
 
 @pytest.mark.asyncio
+async def test_a_child_that_passed_its_ceiling_and_then_sends_a_frame_past_its_bound_fails_memory_limit(
+        tmp_path, monkeypatch, reading_stub):
+    reading_stub("spike-frame", 300)  # 300 MiB touched and freed, then a header past MAX_FRAME
+    monkeypatch.setattr(reading, "WATCH_SECONDS", 5.0)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    with pytest.raises(extraction.Unreadable) as unreadable:
+        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN, ceiling=200 * 2**20)
+    assert unreadable.value.code == "memory_limit" and gone()
+
+
+@pytest.mark.asyncio
 async def test_a_reading_stopped_before_its_child_starts_starts_none(tmp_path, monkeypatch):
     def never(*args, **kwargs):
         raise AssertionError("a child was started")
@@ -324,6 +335,8 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path):
     (("frame", "empty-heading"), "unreadable_file"),
     (("frame", "long-heading"), "unreadable_file"),
     (("frame", "nested"), "unreadable_file"),  # nested past the JSON parser's depth
+    (("frame", "list-kind"), "unreadable_file"),  # a list where a name is due
+    (("frame", "list-error"), "unreadable_file"),
     (("after-done", "beat"), "unreadable_file"),
     (("after-done", "exit"), "unreadable_file"),
     (("version",), "internal"),
@@ -370,7 +383,7 @@ async def test_a_page_images_child_past_its_ceiling_or_crashing_is_a_file_that_c
         monkeypatch.setattr(reading, "RENDER_CEILING", 1024 * 1024)
         assert (await client.get(f"{url}/1")).json()["code"] == "file_missing"
         monkeypatch.setattr(reading, "RENDER_CEILING", 512 * 2**20)
-        for mode in (("signal", "SIGSEGV"), ("no-start",), ("version",)):  # crashing, or failing before ready
+        for mode in (("signal", "SIGSEGV"), ("no-start",), ("version",), ("frame", "list-error")):
             reading_stub(*mode)
             assert (await client.get(f"{url}/1")).json()["code"] == "file_missing", mode
         real_child(monkeypatch)
