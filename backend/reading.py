@@ -390,8 +390,10 @@ class _Received:
 class _Reading(_Received):
     """A reading's frames, each field checked against what the extraction promises (backend/extraction.py,
     section 7.1): a passage of 1 to MAX_PASSAGE characters; a PDF's passages on pages from 1, in page
-    order, within the document's pages, and no other format's on a page; offsets both absent or a
-    start at most its end; a PDF's rectangles at most one for each character, each with its left at
+    order, within the document's pages, and no other format's on a page; offsets both absent or both
+    there, a text's start at most its end (a PDF's are its first and last characters' PDFium indices,
+    which a table's wrapped cell can put out of order); a PDF's rectangles at most one for each
+    character, each with its left at
     most its right and its top at most its bottom; a recognized passage's confidence from 0 to 1; no
     boxes outside a PDF; a PDF's scanned pages at most its pages, ocr_needed only with some; and no
     pages or scanned pages for another format. Anything else is a wrong frame."""
@@ -443,7 +445,7 @@ class _Reading(_Received):
                 or not _optional_count(start) or not _optional_count(end):
             raise _Bad("a passage that is not one")
         if not 0 < len(text) <= extraction.MAX_PASSAGE or (start is None) != (end is None) \
-                or (start is not None and start > end) \
+                or (start is not None and start > end and not self.pdf) \
                 or (page is None if self.pdf else page is not None) or (self.pdf and not self.page <= page) \
                 or (page == 0) or (not self.pdf and boxes is not None):
             raise _Bad("a passage its reading does not agree with")
@@ -495,9 +497,10 @@ class _Render(_Received):
 
     def take(self, body):
         if self.ready and self.image is None and body.startswith(_PNG):
-            # Its header, as render_page writes it: an image within MAX_PAGE_SIDE and MAX_PAGE_PIXELS.
+            # Its header, as render_page writes it: an image within MAX_PAGE_PIXELS and MAX_PAGE_SIDE, a
+            # pixel past it allowed (pypdfium2 rounds a side up from the scale that side bound gives).
             width, height = struct.unpack(">II", body[16:24]) if body[12:16] == b"IHDR" else (0, 0)
-            if not (1 <= width <= extraction.MAX_PAGE_SIDE and 1 <= height <= extraction.MAX_PAGE_SIDE
+            if not (1 <= width <= extraction.MAX_PAGE_SIDE + 1 and 1 <= height <= extraction.MAX_PAGE_SIDE + 1
                     and width * height <= extraction.MAX_PAGE_PIXELS):
                 raise _Bad("an image past its bounds")
             self.image = body
@@ -524,7 +527,7 @@ class _Render(_Received):
 
 # socket.__new__: no socket is made at all, so none can connect, send or look a name up: a connection
 # to a host name would resolve it before its own audit event (tests/network_guard.py's note), and the
-# C class _socket.socket can be used directly. The rest refuse lookups and process starts.
+# C socket class can be used directly. The rest refuse lookups and process starts.
 _REFUSED = {"socket.__new__", "socket.connect", "socket.sendto", "socket.sendmsg", "socket.getaddrinfo",
             "socket.gethostbyname", "socket.gethostbyaddr", "socket.getnameinfo", "subprocess.Popen", "os.system",
             "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "pty.spawn"}
@@ -541,12 +544,20 @@ def _sentinel():
     orphaned with a stopped member, and the kernel sends every member SIGHUP (POSIX's orphaned
     process groups), whose default action ends the child whatever it is doing, a parser holding the
     GIL in native code included: no Python code of the child's need run. When the child ends first,
-    the same rule ends the sentinel. Returns its pid."""
-    signal.signal(signal.SIGHUP, signal.SIG_DFL)  # never inherited ignored
+    the same rule ends the sentinel. Returns its pid once it has stopped; ends the child at once if the
+    app died before then (its group was orphaned with no stopped member to bring the SIGHUP)."""
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)  # never inherited ignored,
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGHUP})  # nor blocked by the thread that started it
+    parent = os.getppid()
     pid = os.fork()
     if pid == 0:  # the sentinel: no Python beyond these calls
         os.closerange(0, 1024)
         os.kill(os.getpid(), signal.SIGSTOP)
+        os._exit(0)
+    os.waitpid(pid, os.WUNTRACED)  # stopped: from now on the app's death brings the SIGHUP
+    if os.getppid() != parent or parent == 1:  # the app died before: no SIGHUP will come
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
         os._exit(0)
     return pid
 

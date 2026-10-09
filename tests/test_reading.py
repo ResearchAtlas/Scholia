@@ -7,9 +7,11 @@ child too (cancellation, deletion, the 30-minute limit, a restart, two readings 
 
 import ast
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -306,8 +308,8 @@ def long_html():
     """Some 16 MB of HTML whose reading takes some 4 to 5 s in the child on the reference Mac, its reader
     calling stop() as it goes."""
     sentence = "Minimum wages raise the earnings of low-paid workers in the synthetic panel. "
-    return ("<html><body>" + "".join(f"<p>Paragraph {i}. <b>{sentence}</b> <i>{sentence}</i></p>" for i in range(80_000))
-            + "</body></html>").encode()
+    paragraphs = "".join(f"<p>Paragraph {i}. <b>{sentence}</b> <i>{sentence}</i></p>" for i in range(80_000))
+    return ("<html><body>" + paragraphs + "</body></html>").encode()
 
 
 def count_reports(monkeypatch):
@@ -408,42 +410,95 @@ async def test_a_shutdown_ends_a_page_images_child_and_its_request_is_refused(tm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["hold", "gil-stall"])
-async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path, mode):
+@pytest.mark.parametrize(("mode", "app_code"), [("hold", ""), ("gil-stall", ""), (
+    "gil-stall", "import signal; signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+                 "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGHUP}); ")])
+async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path, mode, app_code):
     """However the child is occupied: waiting in Python (hold), or stalled in native code holding the GIL
     (gil-stall), where no Python code of its own can run: its sentinel's process group is orphaned and
-    the kernel's SIGHUP ends it."""
+    the kernel's SIGHUP ends it, even when the app ignored and blocked SIGHUP, which a child inherits."""
     held = tmp_path / "held"
     held.mkdir()
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     stub = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), mode, str(held),
             *(["60"] if mode == "gil-stall" else [])]
-    code = ("import sys; sys.path.insert(0, sys.argv[1]); from backend import extraction, reading; "
-            "count = int(sys.argv[2]); reading.command = lambda: sys.argv[3:3 + count]; "
-            "reading.read(sys.argv[3 + count], sys.argv[4 + count], extraction.MARKDOWN)")
-    command = [sys.executable, "-c", code, str(ROOT), str(len(stub)), *stub, str(path), sha256]
-    with allow_command(*command):
-        app = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    app = await app_reading(path, sha256, stub, app_code)
+    child = None
     try:
         assert await asyncio.to_thread(Held(held).wait, 10)
         [child] = Held(held).held()
+        assert os.getpgid(child) == child  # it leads its own process group, beside its sentinel
         await asyncio.sleep(0.2)  # in its stall
         app.kill()  # SIGKILL: no cleanup of its own runs
         app.wait()
-        deadline = time.monotonic() + 2
-        while True:
-            try:
-                os.killpg(child, 0)  # the child and its sentinel, its process group
-            except ProcessLookupError:
-                break  # ended, and reaped by launchd
-            except PermissionError:
-                pass  # ended, not yet reaped: a group of zombies only
-            assert time.monotonic() < deadline, "the child or its sentinel outlived the app by 2 s"
-            await asyncio.sleep(0.01)
+        await ended_with_its_group(child)
     finally:
-        if app.poll() is None:
-            app.kill()
-            app.wait()
+        end_group(app, child)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delay", [0.0, 0.01, 0.02])
+async def test_a_child_whose_app_dies_while_it_starts_ends_too(tmp_path, delay):
+    """The app killed delay seconds after the child started, before it could have made its sentinel:
+    the child, finding its app gone once its sentinel is in place, ends at once and leaves none."""
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    stub = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), "gil-stall", str(tmp_path), "60"]
+    app = await app_reading(path, sha256, stub, then_kill_after=delay)
+    child = None
+    try:
+        child = int(await asyncio.to_thread(app.stdout.readline))  # its child's pid, printed as it started
+        app.wait()  # it killed itself
+        await ended_with_its_group(child)
+    finally:
+        end_group(app, child)
+
+
+async def app_reading(path, sha256, stub, app_code="", then_kill_after=None):
+    """A stand-in app in a process of its own: reading.read with the stub as its child. With
+    then_kill_after, it prints its child's pid as soon as the child has started and kills itself (SIGKILL)
+    that many seconds later."""
+    code = (app_code + "import os, signal, sys, threading, time; sys.path.insert(0, sys.argv[1]); "
+            "from backend import extraction, reading; "
+            "count = int(sys.argv[2]); reading.command = lambda: sys.argv[3:3 + count]; "
+            "args = (sys.argv[3 + count], sys.argv[4 + count], extraction.MARKDOWN); ")
+    if then_kill_after is None:
+        code += "reading.read(*args)"
+    else:
+        code += ("threading.Thread(target=reading.read, args=args, daemon=True).start()\n"
+                 "while not reading.LIVE: pass\n"
+                 "print(next(iter(reading.LIVE)), flush=True); time.sleep(float(sys.argv[5 + count])); "
+                 "os.kill(os.getpid(), signal.SIGKILL)")
+    command = [sys.executable, "-c", code, str(ROOT), str(len(stub)), *stub, str(path), sha256,
+               *([] if then_kill_after is None else [str(then_kill_after)])]
+    with allow_command(*command):
+        return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True)
+
+
+async def ended_with_its_group(child, seconds=2.0):
+    """The child and every member of its process group (its sentinel) ended within seconds."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            os.killpg(child, 0)
+        except ProcessLookupError:
+            break  # ended, and reaped by launchd
+        except PermissionError:
+            pass  # ended, not yet reaped: a group of zombies only
+        assert time.monotonic() < deadline, f"the child or its sentinel outlived the app by {seconds} s"
+        await asyncio.sleep(0.01)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)  # the child itself, by its own pid
+
+
+def end_group(app, child):
+    """Whatever a failed check left: the stand-in app, and the child's group."""
+    if app.poll() is None:
+        app.kill()
+        app.wait()
+    if child is not None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(child, signal.SIGKILL)
 
 
 # Child failures: each fails the reading cleanly, writes nothing, and Retry reads the file
@@ -497,17 +552,18 @@ async def test_a_child_that_fails_fails_its_reading_cleanly_and_retry_reads_it(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("mode", "kind"), [
     *((("frame", name), extraction.PDF) for name in (
-        "long-passage", "empty-passage", "page-zero", "no-page-in-a-pdf", "reversed-offsets", "one-offset",
+        "long-passage", "empty-passage", "page-zero", "page-out-of-order", "no-page-in-a-pdf", "one-offset",
         "confidence-past-one", "rectangle-backwards", "more-rectangles-than-characters", "progress-past-total")),
     *((("done", name), extraction.PDF)
       for name in ("page-past-pages", "scanned-past-pages", "ocr-needed-without-scans")),
-    *((("frame", name), extraction.MARKDOWN) for name in ("page-in-a-text", "boxes-in-a-text")),
+    *((("frame", name), extraction.MARKDOWN) for name in ("page-in-a-text", "boxes-in-a-text", "reversed-offsets")),
     *((("done", name), extraction.MARKDOWN) for name in ("pages-in-a-text", "scanned-in-a-text")),
 ])
 async def test_a_value_outside_what_the_extraction_promises_is_a_wrong_frame(tmp_path, reading_stub, mode, kind):
     """Section 7.1 and backend/extraction.py: a passage of 1 to 2,000 characters; a PDF's passages on its
-    pages from 1, in order; offsets a start at most its end; rectangles in order, at most one a
-    character; a confidence from 0 to 1; scanned pages at most the pages; none of these in a text."""
+    pages from 1, in order; offsets both there or neither, a text's start at most its end; rectangles in
+    order, at most one a character; a confidence from 0 to 1; scanned pages at most the pages; none of
+    these in a text."""
     reading_stub(*mode)
     data = synthetic.paper_pdf() if kind == extraction.PDF else MARKDOWN[1]
     path, sha256 = stored(tmp_path, data)
@@ -657,13 +713,37 @@ async def test_every_synthetic_material_reads_in_its_child_as_in_process(tmp_pat
     assert gone()
 
 
+def wrapped_table_pdf(rows=24, pad=8):
+    """A PDF table past MAX_PASSAGE whose rows' first cells wrap onto a line of their own: a piece of it
+    begins on a wrapped line, whose characters PDFium numbers after its row's later cells, so its
+    char_start (its first character's index) is past its char_end (its last's)."""
+    y, page = 1900, []
+    for r in range(rows):
+        page += [(72, y, 10, f"Employment rate group {r:02d}" + "x" * pad),
+                 (330, y, 10, f"Share of jobs bracket {r:02d}"), (470, y, 10, f"0.{r:02d}")]
+        page.append((72, y - 12, 10, "of adults aged 25"))
+        y -= 24
+    return synthetic.pdf([page], size=(612, 2000))
+
+
+@pytest.mark.asyncio
+async def test_a_pdf_table_whose_pieces_offsets_run_backwards_reads_the_same_in_its_child(tmp_path):
+    data = wrapped_table_pdf()
+    expected = extraction.extract(data, extraction.PDF)
+    assert any(p.char_start > p.char_end for p in expected.passages if p.char_start is not None)  # the case
+    path, sha256 = stored(tmp_path, data)
+    assert await asyncio.to_thread(reading.read, path, sha256, extraction.PDF) == expected and gone()
+
+
 @pytest.mark.asyncio
 async def test_page_images_render_in_their_child_byte_for_byte_as_in_process(tmp_path):
     tall = _raw_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
                      b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1000000] >>"])  # at the side bound
     for data, number, scale in [(synthetic.paper_pdf(), 1, 0.5), (synthetic.paper_pdf(), 2, 1.5),
                                 (synthetic.paper_pdf(), 1, 3.0), (synthetic.paper_pdf(rotation=90), 1, 2.0),
-                                (synthetic.paper_pdf(scanned=1), 1, 3.0), (tall, 1, 3.0)]:
+                                (synthetic.paper_pdf(scanned=1), 1, 3.0), (tall, 1, 3.0),
+                                # a strip whose long side, at the side bound, pypdfium2 rounds up to 20,001 pixels
+                                (synthetic.pdf([[(72, 50, 10, "A strip")]], size=(8283.1, 100)), 1, 3.0)]:
         path, sha256 = stored(tmp_path, data)
         image = await asyncio.to_thread(reading.render, path, sha256, number, scale)
         assert image == extraction.render_page(data, number, scale)

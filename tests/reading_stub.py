@@ -58,7 +58,8 @@ FRAMES = {
     "unknown-error": json.dumps({"error": ["no_such_code"]}).encode(),
     "unknown-kind": json.dumps({"passage": ["poem", "Text.", None, [], 0, 5, None]}).encode(),
     "surrogate": json.dumps({"passage": ["paragraph", "Half \ud800 a pair.", None, [], 0, 5, None]}).encode(),
-    "not-finite": json.dumps({"passage": ["paragraph", "Text.", 1, [], 0, 5, {"rects": [[0, 0, float("nan"), 1]]}]}).encode(),
+    "not-finite": json.dumps(
+        {"passage": ["paragraph", "Text.", 1, [], 0, 5, {"rects": [[0, 0, float("nan"), 1]]}]}).encode(),
     "negative": json.dumps({"passage": ["paragraph", "Text.", -1, [], 0, 5, None]}).encode(),
     "past-int64": json.dumps({"passage": ["paragraph", "Text.", 2**64, [], 0, 5, None]}).encode(),
     "deep-path": json.dumps({"passage": ["paragraph", "Text.", None, ["Heading"] * 11, 0, 5, None]}).encode(),
@@ -73,8 +74,9 @@ FRAMES = {
     "long-passage": json.dumps({"passage": ["paragraph", "a" * 2001, 1, [], 0, 2001, None]}).encode(),
     "empty-passage": json.dumps({"passage": ["paragraph", "", 1, [], 0, 0, None]}).encode(),
     "page-zero": json.dumps({"passage": ["paragraph", "Text.", 0, [], 0, 5, None]}).encode(),
+    "page-out-of-order": json.dumps({"passage": ["paragraph", "Text.", 2, [], 0, 5, None]}).encode(),  # page 1 after
     "no-page-in-a-pdf": json.dumps({"passage": ["paragraph", "Text.", None, [], 0, 5, None]}).encode(),
-    "reversed-offsets": json.dumps({"passage": ["paragraph", "Text.", 1, [], 9, 1, None]}).encode(),
+    "reversed-offsets": json.dumps({"passage": ["paragraph", "Text.", None, [], 9, 1, None]}).encode(),  # a text's
     "one-offset": json.dumps({"passage": ["paragraph", "Text.", 1, [], 3, None, None]}).encode(),
     "confidence-past-one": json.dumps(
         {"passage": ["paragraph", "Text.", 1, [], 0, 5, {"ocr": {"confidence": 2.0}}]}).encode(),
