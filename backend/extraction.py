@@ -443,6 +443,8 @@ def _pdf_page(page, raw, measure=False):
     try:
         count = textpage.count_chars()
         text = textpage.get_text_range() if count else ""
+        # The text leaves out some characters PDFium counts (control characters) when it is shorter:
+        # each of its characters is then found among them by PDFium's own map (-1 for one it put in).
         aligned = len(text) == count
         mapped = unmapped = 0
         lines, chars, boxes = [], [], []
@@ -453,14 +455,15 @@ def _pdf_page(page, raw, measure=False):
                 chars, boxes = [], []
                 continue
             box = None
-            if aligned:
-                if raw.FPDFText_HasUnicodeMapError(textpage, index) == 1:
+            at = index if aligned else raw.FPDFText_GetCharIndexFromTextIndex(textpage, index)
+            if at >= 0:
+                if raw.FPDFText_HasUnicodeMapError(textpage, at) == 1:
                     unmapped += 1
                 elif not char.isspace():
                     mapped += 1
                 if not char.isspace():
-                    left, bottom, right, top = (0.0, 0.0, 0.0, 0.0) if measure else shown(*textpage.get_charbox(index))
-                    box = (left, bottom, right, top, index, len(lines), raw.FPDFText_GetFontSize(textpage, index))
+                    left, bottom, right, top = (0.0, 0.0, 0.0, 0.0) if measure else shown(*textpage.get_charbox(at))
+                    box = (left, bottom, right, top, at, len(lines), raw.FPDFText_GetFontSize(textpage, at))
             elif not char.isspace():
                 mapped += 1
             chars.append(char)

@@ -55,6 +55,41 @@ def test_a_pdf_gives_one_paragraph_per_page_with_its_character_range_and_boxes()
     assert read.pages == 2 and read.ocr_pages == 0 and read.extractor == "pdf"
 
 
+def _pdf_leaving_out(line, code=b"~"):
+    """A one-page PDF whose line is in Helvetica, its code character mapped (ToUnicode) to a control
+    character, which PDFium counts among the page's characters but leaves out of its text."""
+    cmap = (b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /T def 1 begincodespacerange"
+            b" <00> <FF> endcodespacerange 1 beginbfchar <" + code.hex().encode() + b"> <0002> endbfchar endcmap"
+            b" CMapName currentdict /CMap defineresource pop end end")
+    content = b"BT /F1 10 Tf 72 72 Td (" + line + b") Tj ET"
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+               b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >>"
+               b" /Contents 5 0 R >>", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
+               *[b"<< /Length %d >>\nstream\n%s\nendstream" % (len(data), data) for data in (content, cmap)]]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1) + b"".join(b"%010d 00000 n \n" % at for at in offsets)
+    return bytes(out + b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref))
+
+
+def test_a_pdf_page_whose_text_leaves_characters_out_keeps_its_character_ranges_and_boxes():
+    import pypdfium2 as pdfium
+
+    data = _pdf_leaving_out(b"~~~This paragraph begins~ here and goes on")
+    textpage = pdfium.PdfDocument(data)[0].get_textpage()
+    assert (textpage.count_chars(), len(textpage.get_text_range())) == (42, 38)  # four characters left out
+    [passage] = extract(data, extraction.PDF).passages
+    assert passage.text == "This paragraph begins here and goes on"
+    assert (passage.char_start, passage.char_end) == (3, 42)  # PDFium's character indices, the left-out ones counted
+    [[left, top, right, bottom]] = passage.boxes["rects"]
+    assert abs(left - (72 + 3 * 5.84) / 612) < 0.002 and 0.89 < top < bottom < 0.92  # after three tildes' width
+    plain = extract(_pdf_leaving_out(b"This paragraph begins here and goes on", code=b"#"), extraction.PDF).passages[0]
+    assert abs(right - plain.boxes["rects"][0][2] - 4 * 5.84 / 612) < 0.002  # the line ends four tildes further on
+
+
 def test_a_pdf_papers_title_sections_abstract_caption_and_references():
     read = extract(synthetic.paper_pdf(), extraction.PDF)
     assert kinds(read.passages) == [
