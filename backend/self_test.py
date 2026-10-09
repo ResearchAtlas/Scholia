@@ -5,8 +5,8 @@ build, the native pieces the app ships: SQLite, FTS5 secure-delete, extension lo
 sqlite-vec through APSW, the backend with one turn against an in-process provider, an
 AES-encrypted zip file as backups and exports write them (pyzipper and pycryptodomex's native
 code, imported only when first used), one embedding through the llama.cpp helper, whose binary and libraries are first checked against
-the build's SHA-256 manifest as the app checks them before every launch, and one OCR page through
-Vision. It prints the
+the build's SHA-256 manifest as the app checks them before every launch, and one scanned PDF page
+read through the app's own reading code and OCR engine (Vision). It prints the
 results as JSON and exits non-zero when any check fails.
 
 The checks also run from source (tests/test_self_test.py), except the embedding, which
@@ -41,7 +41,7 @@ DIMENSIONS = 1024
 # A bound for a cold start, not the app's start deadline, which is a separate setting: the
 # first start on a CI runner's virtual GPU spent about 35 s preparing Metal before the model loaded.
 HELPER_START_SECONDS = 120
-# The OCR page: one English and one Simplified Chinese line.
+# The scanned page: one English and one Simplified Chinese line.
 OCR_LINES = ["Scholia self-test 2026", "学术研究平台"]
 
 
@@ -220,13 +220,21 @@ def check_embedding(helper: Path, model: Path) -> dict:
             process.wait()
 
 
-def render_page(lines=OCR_LINES, width=1600, height=420):
-    """A page image (CGImage) with `lines` drawn in black on white."""
-    import AppKit
-    import Quartz  # noqa: F401  (registers the CGImage type that rep.CGImage() returns)
+def scanned_pdf(lines, size=(612, 792), dpi=300):
+    """A one-page PDF of size (points) holding only an image of lines drawn in black on white, as a
+    scanned page does: no text layer. lines: [(x, y, points, text)], from the page's bottom left,
+    drawn by AppKit at dpi in the system font."""
+    import ctypes
+    import io
 
+    import AppKit
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as raw
+
+    scale = dpi / 72
+    width, height = round(size[0] * scale), round(size[1] * scale)
     rep = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(  # noqa: E501
-        None, width, height, 8, 4, True, False, AppKit.NSDeviceRGBColorSpace, 0, 0
+        None, width, height, 8, 1, False, False, AppKit.NSDeviceWhiteColorSpace, 0, 0
     )
     context = AppKit.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
     AppKit.NSGraphicsContext.saveGraphicsState()
@@ -234,50 +242,49 @@ def render_page(lines=OCR_LINES, width=1600, height=420):
         AppKit.NSGraphicsContext.setCurrentContext_(context)
         AppKit.NSColor.whiteColor().set()
         AppKit.NSRectFill(AppKit.NSMakeRect(0, 0, width, height))
-        attributes = {
-            AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(64),
-            AppKit.NSForegroundColorAttributeName: AppKit.NSColor.blackColor(),
-        }
-        for i, line in enumerate(lines):
-            AppKit.NSString.stringWithString_(line).drawAtPoint_withAttributes_(
-                AppKit.NSMakePoint(80, height - 140 - i * 140), attributes
+        for x, y, points, text in lines:
+            attributes = {
+                AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(points * scale),
+                AppKit.NSForegroundColorAttributeName: AppKit.NSColor.blackColor(),
+            }
+            AppKit.NSString.stringWithString_(text).drawAtPoint_withAttributes_(
+                AppKit.NSMakePoint(x * scale, y * scale), attributes
             )
         context.flushGraphics()
     finally:
         AppKit.NSGraphicsContext.restoreGraphicsState()
-    return rep.CGImage()
-
-
-def recognize(image) -> list[tuple[str, float]]:
-    """Vision's text lines in `image`, accurate level, Simplified Chinese first."""
-    import Foundation
-    import Vision
-
-    request = Vision.VNRecognizeTextRequest.alloc().init()
-    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-    request.setRecognitionLanguages_(["zh-Hans", "en-US"])
-    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(
-        image, Foundation.NSDictionary.dictionary()
-    )
-    ok, error = handler.performRequests_error_([request], None)
-    if not ok:
-        raise RuntimeError(f"Vision failed: {error}")
-    return [
-        (str(candidate.string()), float(candidate.confidence()))
-        for candidate in (obs.topCandidates_(1)[0] for obs in request.results())
-    ]
+    stride, pixels = rep.bytesPerRow(), bytes(rep.bitmapData()[: rep.bytesPerRow() * height])
+    document = pdfium.PdfDocument.new()
+    page = document.new_page(*size)
+    bitmap = pdfium.PdfBitmap.new_native(width, height, raw.FPDFBitmap_Gray)
+    for row in range(height):
+        ctypes.memmove(ctypes.addressof(bitmap.buffer) + row * bitmap.stride, pixels[row * stride:row * stride + width], width)
+    image = pdfium.PdfImage.new(document)
+    image.set_bitmap(bitmap)
+    image.set_matrix(pdfium.PdfMatrix().scale(*size))
+    page.insert_obj(image)
+    page.gen_content()
+    out = io.BytesIO()
+    document.save(out)
+    return out.getvalue()
 
 
 def check_ocr() -> dict:
-    import objc
+    """One scanned page read as the app reads one (backend/extraction.py): the page rendered by
+    pypdfium2 at 300 dpi, its text recognized by the OCR engine (backend/ocr.py), made into passages."""
+    from backend import extraction, ocr
 
-    with objc.autorelease_pool():
-        found = recognize(render_page())
-    text = "".join(line for line, _ in found).replace(" ", "")
+    engine = ocr.engine()
+    if engine is None:
+        raise RuntimeError("no OCR engine loads")
+    read = extraction.extract(scanned_pdf([(72, 700, 14, OCR_LINES[0]), (72, 600, 14, OCR_LINES[1])]), extraction.PDF)
+    found = [passage.text for passage in read.passages]
+    text = "".join(found).replace(" ", "")
     missing = [line for line in OCR_LINES if line.replace(" ", "") not in text]
-    if missing:
-        raise RuntimeError(f"OCR missed {missing}; read {[line for line, _ in found]}")
-    return {"lines": [line for line, _ in found], "min_confidence": round(min(c for _, c in found), 3)}
+    if missing or (read.ocr_pages, read.status) != (1, "complete"):
+        raise RuntimeError(f"OCR missed {missing}; read {found}")
+    return {"lines": found, "engine": engine.version,
+            "min_confidence": min(passage.boxes["ocr"]["confidence"] for passage in read.passages)}
 
 
 class _Keys:

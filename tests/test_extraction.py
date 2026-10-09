@@ -282,7 +282,8 @@ def test_a_rotated_page_keeps_its_passages_and_its_boxes_sit_on_its_rendered_tex
     assert min(density) > 0.03  # a table row's box spans the gaps between its cells
 
 
-def test_image_only_pages_wait_for_ocr_and_give_no_passage():
+def test_image_only_pages_wait_for_ocr_and_give_no_passage(monkeypatch):
+    monkeypatch.setattr(extraction.ocr, "engine", lambda: None)  # where no OCR engine loads (S1-20)
     read = extract(synthetic.paper_pdf(scanned=1), extraction.PDF)
     assert (read.pages, read.ocr_pages) == (3, 1) and {p.page for p in read.passages} == {1, 2}
 
