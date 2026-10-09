@@ -270,7 +270,8 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
   const [props, focusOn, passTo] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
   const move = partMove(shown, part, failed);
   useEffect(() => {
-    if (!held) { setShown(null); setFailed(false); return undefined; } // let go: fetched again (no-store) once it is near
+    // Let go: fetched again (no-store) once it is near, on the part it showed, not one still to come or failed.
+    if (!held) { setPart(shown?.part ?? part); setShown(null); setFailed(false); return undefined; }
     if (!move.read) return undefined;
     let live = true;
     const controller = new AbortController(); // let go before they came: its requests go too

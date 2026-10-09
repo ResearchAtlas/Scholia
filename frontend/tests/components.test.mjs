@@ -171,8 +171,8 @@ test('each passage of the text says where it is in the whole text, as only the s
 
 // A PDF page's move to another part of its passages, as source text: the inert of the element
 // around each passage and each button to another part, the onClick of each button such a button
-// comes with, the page's keydown handler, go, what the effect reading a part depends on, and the
-// effect giving focus to Retry.
+// comes with, the page's keydown handler, go, the effect reading a part and what it depends on, and
+// the effect giving focus to Retry.
 function partMoves(text) {
   return parsed(text, (context, found) => {
     const code = (node) => context.sourceCode.getText(node);
@@ -198,6 +198,7 @@ function partMoves(text) {
         if (call.callee.name !== 'pagePart') return;
         let effect = call.parent;
         while (effect && effect.callee?.name !== 'useEffect') effect = effect.parent;
+        found.read = code(effect.arguments[0]);
         found.reads = effect.arguments[1].elements.map((name) => name.name);
       },
       VariableDeclarator(node) {
@@ -229,6 +230,15 @@ test('a PDF page keeps what it shows out of reach while another part loads, and 
   go(1, 'first');
   assert.deepEqual(calls, [['focusOn', 'first'], ['setPart', 1], ['setFailed', false]]);
   assert.ok(['shown', 'part', 'failed'].every((name) => found.reads.includes(name)), found.reads);
+  // Let go, a page comes back on the part it showed, its failure cleared, not on one still to come or failed.
+  const letGo = (shown, part) => {
+    const set = [];
+    new Function('held', 'shown', 'part', 'setPart', 'setShown', 'setFailed', `return (${found.read});`)(false, shown, part,
+      (value) => set.push(['part', value]), (value) => set.push(['shown', value]), (value) => set.push(['failed', value]))();
+    return set;
+  };
+  assert.deepEqual(letGo({ part: 0 }, 1), [['part', 0], ['shown', null], ['failed', false]]);
+  assert.deepEqual(letGo(null, 1), [['part', 1], ['shown', null], ['failed', false]]);
   // A failed read gives focus to Retry only through passTo, so only while focus waits on the page (waitsOn).
   const passed = [];
   const toRetry = (failed) => new Function('move', 'passTo', 'retry', 'document', 'frame', `return (${found.toRetry});`)(
