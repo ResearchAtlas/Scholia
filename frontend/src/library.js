@@ -382,11 +382,12 @@ export async function pagePart(versionId, number, part, signal) {
 // null): read it unless it shows already or its read failed, until it is asked for again; loading
 // while it is read in place of another, what the page shows then out of Tab's and the pointer's
 // reach and Tab toward it waiting on the page, so focus stays there for passOn; failed once that
-// read failed, the page showing its part as before, with the failure and Retry beside the button
-// to the other.
+// read failed, with Retry: beside the button to the other part, the page showing its part as
+// before, or in the page's place when it showed nothing yet. A stretch of the text view is a part
+// of its own (shown { part: its index } or null).
 export function partMove(shown, part, failed) {
   const moving = shown != null && shown.part !== part;
-  return { read: shown?.part !== part && !failed, loading: moving && !failed, failed: moving && failed };
+  return { read: shown?.part !== part && !failed, loading: moving && !failed, failed: shown?.part !== part && failed };
 }
 
 // Each passage's line boxes to draw, in order, while they fit in budget; null for each from the
@@ -437,6 +438,77 @@ export function passOn(part, active, entering) {
   if (!waitsOn(part, active, entering)) return null;
   const passages = part.querySelectorAll('[data-passage]');
   return (entering === 'last' ? passages[passages.length - 1] : passages[0]) ?? null;
+}
+
+// A PDF's pages as the page viewer lays them out: each as wide as the list (at most PAGE_WIDTH), its
+// height from its width over its height (its image's once shown, else the default page's), with its
+// border's two pixels, and PAGE_GAP between pages.
+export const PAGE_WIDTH = 720;
+export const PAGE_GAP = 16;
+export const PAGE_ASPECT = 612 / 792;
+
+// The tallest the page list is laid out: under the lowest height an engine lays an element out to
+// (16,777,214 px in some Chromium builds, 33,554,432 px in the app's WebKit), with room to spare.
+export const MAX_LIST_HEIGHT = 15_000_000;
+
+// Where each page begins in the list, from its top: offsets[n - 1] for page n, and offsets[length - 1]
+// the list's height and a gap, for the pages that fit within most (the first at least): the list
+// shows those, and says the others are in the text view. aspects holds the known ones, by page number.
+// ponytail: rebuilt whole for each aspect learned (a millisecond for 100,000 pages); a Fenwick tree if
+// documents of millions of pages are read.
+export function pageOffsets(pages, width, aspects, most = MAX_LIST_HEIGHT) {
+  const offsets = new Float64Array(pages + 1);
+  const inner = Math.min(width, PAGE_WIDTH) - 2;
+  for (let i = 0; i < pages; i += 1) {
+    offsets[i + 1] = offsets[i] + inner / (aspects.get(i + 1) ?? PAGE_ASPECT) + 2 + PAGE_GAP;
+    if (i > 0 && offsets[i + 1] - PAGE_GAP > most) return offsets.subarray(0, i + 1);
+  }
+  return offsets;
+}
+
+// The first and last pages with some of their height between from and to (in the list's own
+// coordinates), each found by halving; last is first - 1 when none has.
+export function pagesWithin(offsets, from, to) {
+  const count = (before) => { // how many pages come before the first for which before(i) is true
+    let low = 0;
+    let high = offsets.length - 1;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (before(middle)) high = middle;
+      else low = middle + 1;
+    }
+    return low;
+  };
+  return [count((i) => offsets[i + 1] - PAGE_GAP > from) + 1, count((i) => offsets[i] >= to)];
+}
+
+// What a PDF's page list mounts, in order: the pages from first to last (those within two screens
+// of the view) and one more on each side, and each held page (heldPages: focus, the selection)
+// with the one on each side, so Tab from a page always reaches the next one; between them, each
+// stretch of pages not mounted as one spacer of their height, less the gap the list puts after it.
+// Its length is bounded by the view's height, however many pages there are.
+export function pageWindow(offsets, [first, last], held = []) {
+  const pages = offsets.length - 1;
+  const mounted = new Set();
+  for (let page = first - 1; page <= last + 1; page += 1) mounted.add(page);
+  for (const page of held) for (let near = page - 1; near <= page + 1; near += 1) mounted.add(near);
+  const items = [];
+  let next = 1; // the first page not yet laid out
+  for (const page of [...mounted].filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b)) {
+    if (page > next) items.push({ spacer: next, height: offsets[page - 1] - offsets[next - 1] - PAGE_GAP });
+    items.push({ page });
+    next = page + 1;
+  }
+  if (next <= pages) items.push({ spacer: next, height: offsets[pages] - offsets[next - 1] - PAGE_GAP });
+  return items;
+}
+
+// The part holding focus once one says focus came into it (inside) or left it: none once focus left
+// the list, but the same while it goes on to another part of the list (toList), until that part says
+// it came: a list that mounts only some parts (pageWindow) keeps the next one mounted meanwhile.
+export function withFocus(current, part, inside, toList) {
+  if (inside) return part;
+  return current === part && !toList ? null : current;
 }
 
 // The parts near the view once one says whether it is: the same set when that changes nothing.

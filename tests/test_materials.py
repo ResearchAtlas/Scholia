@@ -974,3 +974,32 @@ async def test_attached_in_a_conversation_names_it_and_only_its_own_project(tmp_
         [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", result["lookup_run_id"])
         assert json.loads(inputs)["origin"] == {"conversation_id": mine}
         await settled(client, project)
+
+
+async def test_a_markdown_paper_read_by_markdown_2_is_read_once_again_by_markdown_3_at_launch(tmp_path, monkeypatch):
+    """The S1-13 hardening bumped the Markdown reader to markdown-3 (a fence past the block bound is refused, a
+    front matter past the structural bound is read as text); S1-20's launch re-read reads a paper whose only
+    reading is by markdown-2 once again, by markdown-3, which supersedes the earlier reading."""
+    data, current = tmp_path / "data", extraction.EXTRACTORS[extraction.MARKDOWN]
+    assert current == ("markdown", "markdown-3")
+    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-2"))
+    async with started(data) as client:
+        project = await project_of(client)
+        await added(client, project, ("notes.md", synthetic.paper_markdown()))
+        [read] = await settled(client, project)
+        assert read["state"] == "ready"
+        assert await rows(client, "SELECT extractor_version FROM extractions") == [("markdown-2",)]
+    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, current)
+    outdated = "SELECT json_extract(inputs, '$.outdated') FROM runs WHERE workflow = 'extract'" \
+               " AND json_extract(inputs, '$.outdated') IS NOT NULL"
+    async with started(data, setup=False) as client:
+        await asyncio.sleep(0.5)
+        await background_idle(client, timeout=10)
+        assert await rows(client, outdated) == [("markdown/markdown-3",)]
+        [ready] = await settled(client, project)
+        assert (ready["state"], ready["extraction"]["passages"]) == ("ready", read["extraction"]["passages"])
+        assert await rows(client, "SELECT extractor_version FROM extractions") == [("markdown-3",)]  # the earlier one gone
+    async with started(data, setup=False) as client:  # once: the next launch reads it no more
+        await asyncio.sleep(0.5)
+        await background_idle(client, timeout=10)
+        assert await rows(client, outdated) == [("markdown/markdown-3",)]

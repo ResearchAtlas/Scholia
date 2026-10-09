@@ -367,6 +367,8 @@
   "paper.pageFailed": "This page could not be shown.",
   "paper.earlierPassages": "Earlier passages on this page",
   "paper.laterPassages": "Later passages on this page",
+  "paper.pagesCut": "Pages after page {number} are not shown here. Their text is in Passages.",
+  "paper.showPassages": "Show passages",
   "paper.kind.title": "Title",
   "paper.kind.abstract": "Abstract",
   "paper.kind.table": "Table",
