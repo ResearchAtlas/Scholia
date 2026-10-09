@@ -734,3 +734,62 @@ async def test_a_dense_depth_above_what_vec0_takes_is_bounded(tmp_path):
         await setting(client, "retrieval.dense_candidates", 5000)
         found = await find(client, project, "earnings")
         assert found["mode"] == "hybrid" and found["results"]
+
+
+# A newer reading of a file supersedes the earlier one (S1-20): the index follows
+
+
+async def test_a_superseded_readings_passages_leave_the_index_for_the_newer_ones(tmp_path, monkeypatch):
+    import backend.extraction as extraction
+    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+    async with app(tmp_path) as client:
+        mine, theirs = await project_of(client, "Mine"), await project_of(client, "Theirs")
+        [material] = (await added(client, mine, WAGES))["materials"]
+        await added(client, theirs, WAGES)
+        await idle(client, mine)
+        await idle(client, theirs)
+        older = {r[0] for r in await index_rows(client)}
+        assert len(older) == 4 and len(await index_rows(client)) == 8  # the same passages, a row in each project
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))
+        [read] = (await client.get(f"/api/projects/{mine}/materials")).json()["materials"]
+        again = await client.post(f"/api/material-versions/{read['version']['id']}/read")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        for project in (mine, theirs):
+            deadline = asyncio.get_running_loop().time() + 10
+            while (status := await idle(client, project))["passages"]["embedded"] < 4:
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.05)
+        rows_now = await index_rows(client)
+        newer = {r[0] for r in rows_now}
+        assert len(rows_now) == 8 and not newer & older  # each project now holds the newer reading's passages only
+        assert newer == {p for (p,) in await rows(client, "SELECT id FROM passages")}
+        fts = {p for (p,) in await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+            "SELECT passage_id FROM fts_passages").fetchall())}
+        assert fts == newer and await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+        assert (await find(client, mine, "earnings"))["results"][0]["material_id"] == material["id"]
+
+
+async def test_queued_additions_whose_passages_a_newer_reading_removed_are_passed_over(tmp_path, monkeypatch):
+    import backend.extraction as extraction
+    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        real = SearchIndex._apply
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self: 0)  # the first reading's additions wait in the queue
+        await added(client, project, WAGES)
+        await idle(client, project)
+        older = {p for (p,) in await rows(client, "SELECT id FROM passages")}
+        assert await index_rows(client, project) == [] and len(older) == 4
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))
+        [read] = (await client.get(f"/api/projects/{project}/materials")).json()["materials"]
+        again = await client.post(f"/api/material-versions/{read['version']['id']}/read")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        queued = await rows(client, "SELECT target_id, op FROM index_queue ORDER BY seq")
+        assert {p for p, op in queued if op == "add"} >= older  # the earlier additions are still queued
+        assert await rows(client, "SELECT count(*) FROM passages WHERE id IN (SELECT value FROM json_each(?))",
+                          json.dumps(sorted(older))) == [(0,)]  # but the newer reading removed their passages
+        monkeypatch.setattr(SearchIndex, "_apply", real)
+        await asyncio.to_thread(client.state["index"].apply)
+        newer = {p for (p,) in await rows(client, "SELECT id FROM passages")}
+        assert {r[0] for r in await index_rows(client, project)} == newer and not newer & older
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]

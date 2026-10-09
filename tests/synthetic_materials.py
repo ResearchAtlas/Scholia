@@ -74,6 +74,17 @@ def paper_pdf(title="A Synthetic Study of Minimum Wages", doi=DOI, scanned=0, ro
     return pdf([first, second] + [[]] * scanned, scanned=range(3, 3 + scanned), rotation=rotation)
 
 
+def scanned_letter(doi=DOI):
+    """A one-page scanned letter (S1-20): an image of English lines, a Chinese line and its DOI, drawn
+    by AppKit at 300 dpi, with no text layer, so only text recognition reads it. macOS only."""
+    from backend.self_test import scanned_pdf
+
+    return scanned_pdf([(72, 720, 16, "A Scanned Letter on Synthetic Wages"), (72, 692, 10, f"doi:{doi}"),
+                        (72, 650, 11, "Dear colleague, this synthetic letter was scanned for the walkthrough."),
+                        (72, 634, 11, "Minimum wages in the synthetic panel rose by ten percent."),
+                        (72, 596, 11, "这是一封用于演示的合成扫描信件。")])
+
+
 def docx(paragraphs, *, tables=()):
     """A DOCX of [(style or None, text), ...] paragraphs, then tables of rows of cells."""
     w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'

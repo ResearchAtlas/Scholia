@@ -12,6 +12,7 @@ import pytest
 
 import backend.extraction as extraction
 import backend.materials as materials_module
+from backend import ocr
 from backend.db.content import ContentStore
 import synthetic_materials as synthetic
 from scholia_app import MockProvider, MockScholarly, background_idle, openalex_work, run_finished, started
@@ -453,13 +454,15 @@ async def test_a_paper_sharing_a_reading_by_an_earlier_version_is_read_again_wit
         assert missing.status_code == 404
 
 
-async def ops(client, extraction_id):
+async def ops(client, extraction_id, passages=None):
     """{project id: [its queued operations on the extraction's passages in queue order, each run of the
-    same operation with how many rows it has]}."""
+    same operation with how many rows it has]}. passages: their ids, for a reading since removed."""
     found = {}
+    if passages is None:
+        passages = [p for (p,) in await rows(client, "SELECT id FROM passages WHERE extraction_id = ?", extraction_id)]
     for project, op in await rows(
-            client, "SELECT q.project_id, q.op FROM index_queue q JOIN passages p ON p.id = q.target_id"
-                    " WHERE q.target = 'passage' AND p.extraction_id = ? ORDER BY q.seq", extraction_id):
+            client, "SELECT q.project_id, q.op FROM index_queue q WHERE q.target = 'passage'"
+                    " AND q.target_id IN (SELECT value FROM json_each(?)) ORDER BY q.seq", json.dumps(passages)):
         runs = found.setdefault(project, [])
         if runs and runs[-1][0] == op:
             runs[-1] = (op, runs[-1][1] + 1)
@@ -478,14 +481,17 @@ async def test_a_newer_reading_takes_the_earlier_readings_passages_out_of_every_
         await added(client, second, ("notes.md", notes))  # the earlier reading, shared
         await settled(client, second)
         [(older,)] = await rows(client, "SELECT id FROM extractions")
+        earlier = [p for (p,) in await rows(client, "SELECT id FROM passages WHERE extraction_id = ?", older)]
         monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))  # this one
         again = await client.post(f"/api/runs/{paper['run_id']}/retry")  # read again by this version
         assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
         [(newer,)] = await rows(client, "SELECT id FROM extractions WHERE id != ?", older)
         (n,) = (await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", newer))[0]
-        assert await ops(client, older) == {first: [("add", n), ("remove", n)], second: [("add", n), ("remove", n)]}
+        assert await ops(client, older, earlier) == {first: [("add", n), ("remove", n)], second: [("add", n), ("remove", n)]}
         assert await ops(client, newer) == {first: [("add", n)], second: [("add", n)]}
-        assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", older) == [(n,)]  # kept
+        # The earlier reading is gone with that commit (S1-20: section 7.1, a re-parse rebuilds passages).
+        assert await rows(client, "SELECT count(*) FROM extractions WHERE id = ?", older) == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", older) == [(0,)]
 
 
 async def test_a_replaced_file_leaves_its_projects_index_unless_another_paper_there_still_reads_it(tmp_path, kept_queue):
@@ -520,6 +526,7 @@ async def test_passages_the_index_has_applied_still_leave_it(tmp_path, monkeypat
         await settled(client, project)
         [(reading,)] = await rows(client, "SELECT id FROM extractions")
         (n,) = (await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", reading))[0]
+        earlier = [p for (p,) in await rows(client, "SELECT id FROM passages WHERE extraction_id = ?", reading)]
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute("DELETE FROM index_queue"))  # applied
         if change == "replaced":
             await added(client, project, ("other.md", b"# Other\n\nAnother text.\n"), material_id=paper["id"])
@@ -528,7 +535,7 @@ async def test_passages_the_index_has_applied_still_leave_it(tmp_path, monkeypat
             read = await client.post(f"/api/runs/{paper['run_id']}/retry")
             assert (await run_finished(client, read.json()["run_id"]))["status"] == "succeeded"
         await settled(client, project)
-        assert await ops(client, reading) == {project: [("remove", n)]}  # once, though no add is left in the queue
+        assert await ops(client, reading, earlier) == {project: [("remove", n)]}  # once, though no add is left in the queue
 
 
 async def test_a_removal_already_queued_is_not_queued_again_and_one_for_passages_never_added_is_harmless(tmp_path, kept_queue):
@@ -695,7 +702,8 @@ async def test_oversized_unknown_and_garbled_uploads_are_refused(tmp_path, monke
         assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
 
 
-async def test_scanned_pages_wait_for_ocr_and_the_text_pages_are_kept(tmp_path):
+async def test_scanned_pages_wait_for_ocr_and_the_text_pages_are_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(ocr, "engine", lambda: None)  # where no OCR engine loads (S1-20)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, ("scan.pdf", synthetic.paper_pdf(scanned=2)))

@@ -738,3 +738,15 @@ def test_a_process_killed_after_the_commit_keeps_the_deletion(tmp_path):
         store.collect_garbage(now=later())
         with pytest.raises(FileNotFoundError):
             store.read(x["paper"])
+
+
+def test_only_the_deletion_service_deletes_readings_or_their_passages():
+    """Section 4.2: every deletion goes through one deletion service; a superseded reading's too (S1-20)."""
+    import re
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parents[1] / "backend"
+    found = {path.relative_to(backend).as_posix() for path in backend.rglob("*.py")
+             if re.search(r"DELETE\s+FROM\s+(passages|extractions)\b", path.read_text(), re.IGNORECASE)}
+    assert found == {"db/deletion.py"}
+

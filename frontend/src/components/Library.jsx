@@ -10,8 +10,8 @@ import { ApiError, get, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEvents, newest, reasonKey, sortFiles, stateKey,
-  typeKey, unsettled, uploadsWaiting, watchUploads, yearOf } from '../library.js';
+import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEvents, newest, ocrPages, reasonKey, sortFiles,
+  stateKey, typeKey, unsettled, uploadsWaiting, watchUploads, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { Paper } from './Paper.jsx';
@@ -248,7 +248,7 @@ export function Facts({ material, project, index }) {
       + (material.version.seq ? ` · ${t('library.version', { number: material.version.seq + 1 })}` : '')],
     extraction?.pages != null && [t('library.fact.pages'), String(extraction.pages)],
     extraction && [t('library.fact.passages'), String(extraction.passages)],
-    extraction?.ocr_pages > 0 && [t('library.fact.ocr'), t('library.ocrWaiting', { count: extraction.ocr_pages })],
+    ocrPages(t, extraction) && [t('library.fact.ocr'), ocrPages(t, extraction)],
     index && extraction && [t('search.indexTitle'), t(...paperIndexed(index, material.id))
       + (index.mode === 'keyword_only' && index.materials?.[material.id]  // and why meaning search is not there
         ? (language.startsWith('zh') ? '' : ' ') + t('helper.keywordOnly', { reason: t(indexReason(index.reason, downloadOffered(project))) })
