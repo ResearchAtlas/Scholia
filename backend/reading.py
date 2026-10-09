@@ -34,12 +34,15 @@ never holds more than one frame and one read, and what it keeps never exceeds th
 bounds. Anything else ends the child. A result counts only after `done`, a zero exit and a peak at
 or under the ceiling.
 
-The child refuses, in an audit hook installed before it reads its request, every connection, name
-lookup and process start; it writes its frames to a copy of its stdout and points stdout and
-stderr at /dev/null, so nothing a library prints reaches the parent; and it exits as soon as its
-stdin ends, which is when the parent dies, however it dies. Its environment is HOME and TMPDIR
-only. It never imports the database, the server or the window. Logs carry codes, counts and MiB,
-never a path, a name, a hash or text.
+The child refuses, in an audit hook installed before it reads its request, to make any socket (so
+no connection, send or name lookup can happen, by address or by name), every name lookup and every
+process start; it writes its frames to a copy of its stdout and points stdout and stderr at
+/dev/null, so nothing a library prints reaches the parent. It ends when the parent dies, however it
+dies and whatever the child is doing: it runs in a process group of its own beside a stopped
+sentinel (_sentinel), so the parent's death leaves the group orphaned and the kernel sends it
+SIGHUP, whose default action ends the child even in native code holding the GIL; and its stdin's
+end ends it too. Its environment is HOME and TMPDIR only. It never imports the database, the
+server or the window. Logs carry codes, counts and MiB, never a path, a name, a hash or text.
 """
 
 import contextlib
@@ -51,6 +54,7 @@ import math
 import os
 import re
 import selectors
+import signal
 import struct
 import subprocess
 import sys
@@ -188,9 +192,10 @@ def _run(request, ceiling, limit, stop, received, stats):
     selector = None
     try:
         selector = selectors.DefaultSelector()
+        # In a process group of its own, with its sentinel (_sentinel): it ends when this process does.
         child = subprocess.Popen(command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                  env={k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ},
-                                 cwd=None if getattr(sys, "frozen", False) else _ROOT)
+                                 cwd=None if getattr(sys, "frozen", False) else _ROOT, process_group=0)
     except BaseException as error:
         if selector is not None:
             selector.close()
@@ -265,8 +270,10 @@ def _run(request, ceiling, limit, stop, received, stats):
         raise received.bad(str(bad)) from None
     finally:
         if child.returncode is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):  # EPERM: a group of zombies only
+                os.killpg(child.pid, signal.SIGKILL)  # the child and its sentinel
             with contextlib.suppress(ProcessLookupError):
-                child.kill()
+                child.kill()  # a child that had not made its group yet
             child.wait()
         for stream in (child.stdin, child.stdout):
             with contextlib.suppress(OSError):
@@ -381,10 +388,19 @@ class _Received:
 
 
 class _Reading(_Received):
+    """A reading's frames, each field checked against what the extraction promises (backend/extraction.py,
+    section 7.1): a passage of 1 to MAX_PASSAGE characters; a PDF's passages on pages from 1, in page
+    order, within the document's pages, and no other format's on a page; offsets both absent or a
+    start at most its end; a PDF's rectangles at most one for each character, each with its left at
+    most its right and its top at most its bottom; a recognized passage's confidence from 0 to 1; no
+    boxes outside a PDF; a PDF's scanned pages at most its pages, ocr_needed only with some; and no
+    pages or scanned pages for another format. Anything else is a wrong frame."""
+
     def __init__(self, kind, progress):
         super().__init__(kind)
+        self.pdf = kind == extraction.PDF
         self.progress, self.passages, self.done = progress, [], None
-        self.chars = self.rects = self.built = 0
+        self.chars = self.rects = self.built = self.page = 0  # page: the last passage's
         self.path = []  # the last passage's section path, which the next one shares when it is the same
 
     def take(self, body):
@@ -396,7 +412,7 @@ class _Reading(_Received):
         if key == "beat":
             return
         if key == "progress":
-            if type(value) is not list or len(value) != 2 or not all(map(_count, value)):
+            if type(value) is not list or len(value) != 2 or not all(map(_count, value)) or value[0] > value[1]:
                 raise _Bad("a progress that is not one")
             return self.progress(*value)
         if key == "passage":
@@ -405,6 +421,11 @@ class _Reading(_Received):
             if type(value) is not list or len(value) != 3 or not _optional_count(value[0]) \
                     or not _count(value[1]) or value[2] not in ("complete", "ocr_needed"):
                 raise _Bad("a done that is not one")
+            pages, ocr_pages, status = value
+            if (not self.pdf and (pages is not None or ocr_pages or status != "complete")) \
+                    or (self.pdf and (pages is None or ocr_pages > pages or self.page > pages
+                                      or (status == "ocr_needed" and not ocr_pages))):
+                raise _Bad("a done its reading does not agree with")
             self.done = value
             return
         if key == "error":
@@ -421,7 +442,15 @@ class _Reading(_Received):
                 or type(path) is not list or len(path) > MAX_SECTION_DEPTH or not all(map(_heading, path)) \
                 or not _optional_count(start) or not _optional_count(end):
             raise _Bad("a passage that is not one")
+        if not 0 < len(text) <= extraction.MAX_PASSAGE or (start is None) != (end is None) \
+                or (start is not None and start > end) \
+                or (page is None if self.pdf else page is not None) or (self.pdf and not self.page <= page) \
+                or (page == 0) or (not self.pdf and boxes is not None):
+            raise _Bad("a passage its reading does not agree with")
         rects = self._boxes(boxes)
+        if rects > len(text):
+            raise _Bad("a passage its reading does not agree with")
+        self.page = page or 0
         self.chars += len(text)
         self.built += sum(map(len, path))
         self.rects += rects
@@ -442,10 +471,11 @@ class _Reading(_Received):
         if type(boxes) is not dict or not boxes or not set(boxes) <= {"rects", "ocr"}:
             raise _Bad("boxes that are not boxes")
         rects = boxes.get("rects", [])
-        if type(rects) is not list or not all(type(r) is list and len(r) == 4 and all(map(_number, r)) for r in rects):
+        if type(rects) is not list or not all(type(r) is list and len(r) == 4 and all(map(_number, r))
+                                              and r[0] <= r[2] and r[1] <= r[3] for r in rects):
             raise _Bad("boxes that are not boxes")
         if "ocr" in boxes and (type(boxes["ocr"]) is not dict or list(boxes["ocr"]) != ["confidence"]
-                               or not _number(boxes["ocr"]["confidence"])):
+                               or not _number(boxes["ocr"]["confidence"]) or not 0 <= boxes["ocr"]["confidence"] <= 1):
             raise _Bad("boxes that are not boxes")
         return len(rects)
 
@@ -465,6 +495,11 @@ class _Render(_Received):
 
     def take(self, body):
         if self.ready and self.image is None and body.startswith(_PNG):
+            # Its header, as render_page writes it: an image within MAX_PAGE_SIDE and MAX_PAGE_PIXELS.
+            width, height = struct.unpack(">II", body[16:24]) if body[12:16] == b"IHDR" else (0, 0)
+            if not (1 <= width <= extraction.MAX_PAGE_SIDE and 1 <= height <= extraction.MAX_PAGE_SIDE
+                    and width * height <= extraction.MAX_PAGE_PIXELS):
+                raise _Bad("an image past its bounds")
             self.image = body
             return
         key, value = _message(body)
@@ -487,14 +522,33 @@ class _Render(_Received):
 # The child
 
 
-_REFUSED = {"socket.connect", "socket.sendto", "socket.sendmsg", "socket.getaddrinfo", "socket.gethostbyname",
-            "socket.gethostbyaddr", "socket.getnameinfo", "subprocess.Popen", "os.system", "os.exec",
-            "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "pty.spawn"}
+# socket.__new__: no socket is made at all, so none can connect, send or look a name up: a connection
+# to a host name would resolve it before its own audit event (tests/network_guard.py's note), and the
+# C class _socket.socket can be used directly. The rest refuse lookups and process starts.
+_REFUSED = {"socket.__new__", "socket.connect", "socket.sendto", "socket.sendmsg", "socket.getaddrinfo",
+            "socket.gethostbyname", "socket.gethostbyaddr", "socket.getnameinfo", "subprocess.Popen", "os.system",
+            "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty", "pty.spawn"}
 
 
 def _refuse(event, args):
     if event in _REFUSED:
         raise PermissionError(f"a reading opens no connection and starts no process ({event})")
+
+
+def _sentinel():
+    """A stopped process in the child's own process group (the parent starts the child in a group
+    of its own), holding none of its pipes. When the app dies, however it dies, the group is left
+    orphaned with a stopped member, and the kernel sends every member SIGHUP (POSIX's orphaned
+    process groups), whose default action ends the child whatever it is doing, a parser holding the
+    GIL in native code included: no Python code of the child's need run. When the child ends first,
+    the same rule ends the sentinel. Returns its pid."""
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)  # never inherited ignored
+    pid = os.fork()
+    if pid == 0:  # the sentinel: no Python beyond these calls
+        os.closerange(0, 1024)
+        os.kill(os.getpid(), signal.SIGSTOP)
+        os._exit(0)
+    return pid
 
 
 class _Out:
@@ -557,6 +611,15 @@ def _file(path, sha256):
 
 def main():
     """The child: one request, one reading or page image, its frames on stdout."""
+    sentinel = _sentinel()  # before the audit hook, which refuses a fork, and before any thread
+    try:
+        return _child()
+    finally:
+        os.kill(sentinel, signal.SIGKILL)
+        os.waitpid(sentinel, 0)
+
+
+def _child():
     sys.addaudithook(_refuse)
     out = _Out(os.dup(1))
     quiet = os.open(os.devnull, os.O_WRONLY)

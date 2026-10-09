@@ -120,6 +120,31 @@ def gone(*pids):
     return not reading.LIVE
 
 
+async def until(condition, what, timeout=10.0, over=None):
+    """condition()'s value once it holds (each may be a coroutine function), failing after timeout, or
+    at once when over() says the work it waits on ended without reaching it."""
+    deadline = time.monotonic() + timeout
+    while True:
+        found = condition()
+        found = await found if asyncio.iscoroutine(found) else found
+        if found:
+            return found
+        if over is not None:
+            ended_first = over()
+            assert not (await ended_first if asyncio.iscoroutine(ended_first) else ended_first), \
+                f"{what}: the work ended first"
+        assert time.monotonic() < deadline, f"{what}: not within {timeout} s"
+        await asyncio.sleep(0.005)
+
+
+def run_over(client, run_id):
+    """over() for until: the run has ended."""
+    async def over():
+        found = (await client.get("/api/activity", params={"run_id": run_id})).json()["runs"]
+        return bool(found) and found[0]["status"] != "running"
+    return over
+
+
 async def ended(*pids, timeout=5.0):
     deadline = time.monotonic() + timeout
     while not gone(*pids):
@@ -253,8 +278,10 @@ async def test_at_most_two_readings_hold_their_files_and_a_third_waits_unread(tm
         await asyncio.sleep(0.3)
         assert len(reached.held()) == len(reading.LIVE) == 2  # two children; the others wait for a turn without one
         assert set(reached.held()) == reading.LIVE
-        while sum(1 for m in (await listing(client, project))["materials"] if m["progress"]) < 2:
-            await asyncio.sleep(0.01)
+        async def shown():
+            return sum(1 for m in (await listing(client, project))["materials"] if m["progress"]) >= 2
+
+        await until(shown, "two readings' progress shown")
         listed = (await listing(client, project))["materials"]
         assert {m["state"] for m in listed} == {"reading"}
         waiting = [m for m in listed if m["progress"] is None]
@@ -835,8 +862,7 @@ async def test_a_page_request_that_goes_away_holds_its_turn_to_its_render_and_no
 
         url = f"/api/material-versions/{paper['version']['id']}/pages"
         rendering = asyncio.ensure_future(client.get(f"{url}/1"))  # the one turn taken
-        while len(renders()) < 1:
-            await asyncio.sleep(0.01)
+        await until(renders, "the first page image held in its child")
         queued = asyncio.ensure_future(client.get(f"{url}/2"))  # the second waits for the first, without a child
         await asyncio.sleep(0.2)
         assert (renders(), len(reading.LIVE)) == ([1], 1)
@@ -846,8 +872,7 @@ async def test_a_page_request_that_goes_away_holds_its_turn_to_its_render_and_no
         renders_now, slots = len(renders()), client.state["renders"]
         assert slots.locked()  # the render still holds its turn: its thread runs on
         go.set()
-        while slots.locked():
-            await asyncio.sleep(0.01)
+        await until(lambda: not slots.locked(), "the render's turn given back")
         assert renders() == [1] and renders_now == 1  # the queued one never rendered
         assert await ended(*held.held())
         monkeypatch.setattr(Request, "is_disconnected", lambda self: asyncio.sleep(0, True))  # gone once its turn came
@@ -870,6 +895,7 @@ async def test_a_shutdown_ends_the_page_image_rendering_and_the_one_waiting_star
         waiting = asyncio.ensure_future(client.get(f"{url}/2"))
         await asyncio.sleep(0.2)
         await client.state["harness"].shutdown()
+        assert gone(*held.held())  # reaped by the time the shutdown returns, before any page's answer is read
         for response in (await rendering, await waiting):
             assert (response.status_code, response.json()["code"]) == (503, "shutting_down")
         assert list(held.held().values()) == ["1"] and len(children) == 1  # the waiting one started no child

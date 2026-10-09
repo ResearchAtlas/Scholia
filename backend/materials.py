@@ -1054,7 +1054,7 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
     """A PDF page rendered as a PNG by pypdfium2, in memory, in a child process under its own memory
     ceiling (backend/reading.py); never written to disk. The version is looked for again once the
     page is rendered, so a page whose paper was deleted meanwhile is not given. The app closing ends
-    the child (503)."""
+    the child (503), and its shutdown returns only once the child is reaped."""
     state = _state(request)
     harness = state["harness"]
 
@@ -1081,7 +1081,8 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
         async with state.setdefault("renders", asyncio.Semaphore(RENDERS)):
             if await request.is_disconnected():
                 return Response(status_code=204, headers={"Cache-Control": "no-store"})  # nobody waits for it
-            image = await _to_end(asyncio.to_thread(render))
+            # Held by the harness as its detached work, so a shutdown waits for its child to end and be reaped.
+            image = await _to_end(harness._detach(asyncio.to_thread(render)))
     except IndexError:
         raise _refused(404, "not_found", "No such page") from None
     except _Stop:

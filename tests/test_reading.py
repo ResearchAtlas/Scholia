@@ -25,7 +25,7 @@ from backend import extraction, reading
 from network_guard import NetworkBlocked, allow_command
 from scholia_app import run_finished, started
 from test_extraction import MARKDOWN_SHAPES, _raw_pdf
-from test_materials import PDF, Held, added, ended, gone, hold_extraction, project_of, rows, settled
+from test_materials import PDF, Held, added, ended, gone, hold_extraction, project_of, rows, run_over, settled, until
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKDOWN = ("notes.md", synthetic.paper_markdown(arxiv=""))
@@ -289,8 +289,7 @@ async def test_cancel_ends_a_child_in_the_middle_of_one_long_step_at_once(tmp_pa
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, ("run.tex", latex_run(1))))["materials"]  # about 21 s in one step
-        while not reading.LIVE:
-            await asyncio.sleep(0.01)
+        await until(lambda: reading.LIVE, "its child started", over=run_over(client, paper["run_id"]))
         pids = set(reading.LIVE)
         await asyncio.sleep(0.5)
         asked = time.monotonic()
@@ -304,7 +303,8 @@ async def test_cancel_ends_a_child_in_the_middle_of_one_long_step_at_once(tmp_pa
 
 
 def long_html():
-    """Some 16 MB of HTML whose reading takes some 3 to 4 s, its reader calling stop() as it goes."""
+    """Some 16 MB of HTML whose reading takes some 4 to 5 s in the child on the reference Mac, its reader
+    calling stop() as it goes."""
     sentence = "Minimum wages raise the earnings of low-paid workers in the synthetic panel. "
     return ("<html><body>" + "".join(f"<p>Paragraph {i}. <b>{sentence}</b> <i>{sentence}</i></p>" for i in range(80_000))
             + "</body></html>").encode()
@@ -328,7 +328,7 @@ async def test_a_long_text_reading_reports_through_its_readers_calls_to_stop_and
         tmp_path, monkeypatch, reading_stub):
     reading_stub("beat", 0.05)  # the real child, its reports at most 50 ms apart
     beats = count_reports(monkeypatch)
-    monkeypatch.setattr(reading, "STEP_SECONDS", 0.5)  # stops a reading whose reader is silent for half a second
+    monkeypatch.setattr(reading, "STEP_SECONDS", 0.25)  # stops a reading whose reader is silent for a quarter second
     data = long_html()
     path, sha256 = stored(tmp_path, data)
     stats = {}
@@ -344,8 +344,7 @@ async def test_cancel_ends_a_child_whose_text_reader_is_at_work(tmp_path, monkey
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, ("long.html", long_html())))["materials"]
-        while not beats:  # its reader at work, and saying so
-            await asyncio.sleep(0.005)
+        await until(lambda: beats, "its reader at work, and saying so", over=run_over(client, paper["run_id"]))
         pids = set(reading.LIVE)
         asked = time.monotonic()
         assert (await client.post(f"/api/runs/{paper['run_id']}/cancel")).json()["status"] == "cancelled"
@@ -403,34 +402,43 @@ async def test_a_shutdown_ends_a_page_images_child_and_its_request_is_refused(tm
         page = asyncio.ensure_future(client.get(f"/api/material-versions/{paper['version']['id']}/pages/1"))
         await asyncio.to_thread(reached.wait, 10)
         await client.state["harness"].shutdown()
+        assert gone(*reached.held())  # reaped by the time the shutdown returns, before its answer is read
         response = await page
         assert (response.status_code, response.json()["code"]) == (503, "shutting_down")
-        assert gone(*reached.held())
 
 
 @pytest.mark.asyncio
-async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path):
+@pytest.mark.parametrize("mode", ["hold", "gil-stall"])
+async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path, mode):
+    """However the child is occupied: waiting in Python (hold), or stalled in native code holding the GIL
+    (gil-stall), where no Python code of its own can run: its sentinel's process group is orphaned and
+    the kernel's SIGHUP ends it."""
     held = tmp_path / "held"
     held.mkdir()
     path, sha256 = stored(tmp_path, MARKDOWN[1])
-    stub = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), "hold", str(held)]
+    stub = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), mode, str(held),
+            *(["60"] if mode == "gil-stall" else [])]
     code = ("import sys; sys.path.insert(0, sys.argv[1]); from backend import extraction, reading; "
-            "reading.command = lambda: sys.argv[2:6]; reading.read(sys.argv[6], sys.argv[7], extraction.MARKDOWN)")
-    command = [sys.executable, "-c", code, str(ROOT), *stub, str(path), sha256]
+            "count = int(sys.argv[2]); reading.command = lambda: sys.argv[3:3 + count]; "
+            "reading.read(sys.argv[3 + count], sys.argv[4 + count], extraction.MARKDOWN)")
+    command = [sys.executable, "-c", code, str(ROOT), str(len(stub)), *stub, str(path), sha256]
     with allow_command(*command):
         app = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         assert await asyncio.to_thread(Held(held).wait, 10)
         [child] = Held(held).held()
+        await asyncio.sleep(0.2)  # in its stall
         app.kill()  # SIGKILL: no cleanup of its own runs
         app.wait()
         deadline = time.monotonic() + 2
         while True:
             try:
-                os.kill(child, 0)
+                os.killpg(child, 0)  # the child and its sentinel, its process group
             except ProcessLookupError:
-                break
-            assert time.monotonic() < deadline, "the child outlived the app by 2 s"
+                break  # ended, and reaped by launchd
+            except PermissionError:
+                pass  # ended, not yet reaped: a group of zombies only
+            assert time.monotonic() < deadline, "the child or its sentinel outlived the app by 2 s"
             await asyncio.sleep(0.01)
     finally:
         if app.poll() is None:
@@ -484,6 +492,68 @@ async def test_a_child_that_fails_fails_its_reading_cleanly_and_retry_reads_it(
         again = await client.post(f"/api/runs/{paper['run_id']}/retry")
         assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
         assert (await settled(client, project))[0]["state"] == "ready" and gone()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mode", "kind"), [
+    *((("frame", name), extraction.PDF) for name in (
+        "long-passage", "empty-passage", "page-zero", "no-page-in-a-pdf", "reversed-offsets", "one-offset",
+        "confidence-past-one", "rectangle-backwards", "more-rectangles-than-characters", "progress-past-total")),
+    *((("done", name), extraction.PDF)
+      for name in ("page-past-pages", "scanned-past-pages", "ocr-needed-without-scans")),
+    *((("frame", name), extraction.MARKDOWN) for name in ("page-in-a-text", "boxes-in-a-text")),
+    *((("done", name), extraction.MARKDOWN) for name in ("pages-in-a-text", "scanned-in-a-text")),
+])
+async def test_a_value_outside_what_the_extraction_promises_is_a_wrong_frame(tmp_path, reading_stub, mode, kind):
+    """Section 7.1 and backend/extraction.py: a passage of 1 to 2,000 characters; a PDF's passages on its
+    pages from 1, in order; offsets a start at most its end; rectangles in order, at most one a
+    character; a confidence from 0 to 1; scanned pages at most the pages; none of these in a text."""
+    reading_stub(*mode)
+    data = synthetic.paper_pdf() if kind == extraction.PDF else MARKDOWN[1]
+    path, sha256 = stored(tmp_path, data)
+    with pytest.raises(extraction.Unreadable) as unreadable:
+        await asyncio.to_thread(reading.read, path, sha256, kind)
+    assert unreadable.value.code == "unreadable_file" and gone()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", ["read to its end", "stopped"])
+async def test_a_childs_sentinel_goes_with_it(tmp_path, reading_stub, ended):
+    """Its process group (the child and its stopped sentinel) is empty once the child has ended."""
+    reached, go = hold_extraction(reading_stub, tmp_path)
+    if ended == "read to its end":
+        go.set()
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+
+    def stop():
+        if ended == "stopped" and reached.is_set():
+            raise RuntimeError("stopped")
+
+    try:
+        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN, stop)
+    except RuntimeError:
+        assert ended == "stopped"
+    [child] = reached.held()
+    deadline = time.monotonic() + 2
+    while True:
+        try:
+            os.killpg(child, 0)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            pass  # ended, not yet reaped: a group of zombies only
+        assert time.monotonic() < deadline, "the child's process group outlived it"
+        await asyncio.sleep(0.01)
+    assert gone(child)
+
+
+@pytest.mark.asyncio
+async def test_a_page_image_past_its_bounds_is_a_wrong_frame(tmp_path, reading_stub):
+    reading_stub("png", "huge")
+    path, sha256 = stored(tmp_path, synthetic.paper_pdf())
+    with pytest.raises(extraction.Unreadable):
+        await asyncio.to_thread(reading.render, path, sha256, 1, 2.0)
+    assert gone()
 
 
 @pytest.mark.asyncio
@@ -614,8 +684,12 @@ async def test_the_child_refuses_connections_lookups_and_processes_and_still_rea
         path, sha256 = stored(tmp_path, MARKDOWN[1])
         read = await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
         assert read == extraction.extract(MARKDOWN[1], extraction.MARKDOWN)
-        assert json.loads((tmp_path / "probe").read_text()) == {"connect": "refused", "lookup": "refused",
-                                                                 "process": "refused"}
+        # Each connection and send, to an address or a host name, through the socket class or the C class, is
+        # refused where the socket would be made (socket.__new__): before any name could be resolved.
+        found = json.loads((tmp_path / "probe").read_text())
+        assert found == {**{route: "socket.__new__" for route in (
+            "connect", "connect by name", "connect_ex by name", "sendto by name", "sendmsg by name",
+            "the C class by name")}, "lookup": "socket.getaddrinfo", "process": "subprocess.Popen"}
         with pytest.raises(BlockingIOError):
             listener.accept()  # nothing reached it
     finally:

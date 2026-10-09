@@ -14,8 +14,12 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     exit CODE         exit with CODE at once (os._exit)
     signal NAME       kill itself with signal NAME (SIGSEGV: a crash in native code)
     stall             sleep without a word, for ever
+    gil-stall DIR S   say it holds by a file DIR/held-<pid>, then stall S seconds in native code holding
+                      the GIL (libc's sleep through ctypes.PyDLL), as a parser stuck in C would
     frame NAME        send a frame that is not one (FRAMES), then read for real
     after-done NAME   read for real, then after `done`: send a frame (beat) or exit non-zero (exit)
+    done NAME         read for real, its `done` changed as NAME says (see Out.send)
+    png NAME          a page image whose PNG header says NAME (huge: past the page bounds)
     version           name another extractor version in `ready`
     no-start          exit before `ready`
     canary TEXT       print TEXT to stdout and stderr, then abort
@@ -65,6 +69,23 @@ FRAMES = {
     "list-error": json.dumps({"error": [["unreadable_file"]]}).encode(),
     "bigint-rect": b'{"passage":["paragraph","Text.",1,[],0,5,{"rects":[[0,0,1,1' + b"0" * 400 + b']]}]}',
     "no-page": json.dumps({"error": ["no_page"]}).encode(),
+    # Values outside what the extraction promises (section 7.1), each for a PDF's reading unless named
+    "long-passage": json.dumps({"passage": ["paragraph", "a" * 2001, 1, [], 0, 2001, None]}).encode(),
+    "empty-passage": json.dumps({"passage": ["paragraph", "", 1, [], 0, 0, None]}).encode(),
+    "page-zero": json.dumps({"passage": ["paragraph", "Text.", 0, [], 0, 5, None]}).encode(),
+    "no-page-in-a-pdf": json.dumps({"passage": ["paragraph", "Text.", None, [], 0, 5, None]}).encode(),
+    "reversed-offsets": json.dumps({"passage": ["paragraph", "Text.", 1, [], 9, 1, None]}).encode(),
+    "one-offset": json.dumps({"passage": ["paragraph", "Text.", 1, [], 3, None, None]}).encode(),
+    "confidence-past-one": json.dumps(
+        {"passage": ["paragraph", "Text.", 1, [], 0, 5, {"ocr": {"confidence": 2.0}}]}).encode(),
+    "rectangle-backwards": json.dumps(
+        {"passage": ["paragraph", "Text.", 1, [], 0, 5, {"rects": [[0.5, 0, 0.1, 1]]}]}).encode(),
+    "more-rectangles-than-characters": json.dumps(
+        {"passage": ["paragraph", "ab", 1, [], 0, 2, {"rects": [[0, 0, 1, 1]] * 3}]}).encode(),
+    "progress-past-total": json.dumps({"progress": [3, 2]}).encode(),
+    "page-in-a-text": json.dumps({"passage": ["paragraph", "Text.", 3, [], 0, 5, None]}).encode(),  # a text's reading
+    "boxes-in-a-text": json.dumps(
+        {"passage": ["paragraph", "Text.", None, [], 0, 5, {"rects": [[0, 0, 1, 1]]}]}).encode(),
 }
 real_extract, real_render, real_extractor_of = extraction.extract, extraction.render_page, extraction.extractor_of
 real_file = reading._file
@@ -78,6 +99,13 @@ class Out(reading._Out):
         out = self
 
     def send(self, key, value, flush=True):
+        if key == "done" and MODE == "done":  # what its done says, changed as ARGS[0] names
+            pages, ocr_pages, status = value
+            if ARGS[0] == "page-past-pages":  # a last passage past the document's pages, in page order
+                super().send("passage", ["paragraph", "Text.", (pages or 0) + 1, [], 0, 5, None])
+            value = {"page-past-pages": value, "scanned-past-pages": [pages, (pages or 0) + 5, status],
+                     "ocr-needed-without-scans": [pages, 0, "ocr_needed"], "pages-in-a-text": [3, 0, status],
+                     "scanned-in-a-text": [None, 1, status]}[ARGS[0]]
         super().send(key, value, flush)
         if key == "done" and MODE == "after-done":
             if ARGS[0] == "exit":
@@ -130,6 +158,11 @@ def before(what, stop, progress, data=b""):
     elif MODE == "stall":
         while True:
             time.sleep(1)
+    elif MODE == "gil-stall":
+        import ctypes
+
+        Path(ARGS[0], f"held-{os.getpid()}").write_text(str(what))
+        ctypes.PyDLL(None).sleep(int(ARGS[1]))  # PyDLL: the GIL is held through the call
     elif MODE == "frame":
         if ARGS[0] == "oversized":
             out.stream.write(struct.pack(">I", 0xFFFFFFFF))
@@ -141,16 +174,24 @@ def before(what, stop, progress, data=b""):
         os.write(2, ARGS[0].encode())
         os.abort()
     elif MODE == "probe":
-        found = {}
-        attempts = {"connect": lambda: socket.socket().connect(("127.0.0.1", int(ARGS[1]))),
+        import _socket
+
+        found, port, by_name = {}, int(ARGS[1]), ("localhost", int(ARGS[1]))  # a name, resolved without a network
+        udp = (socket.AF_INET, socket.SOCK_DGRAM)
+        attempts = {"connect": lambda: socket.socket().connect(("127.0.0.1", port)),
+                    "connect by name": lambda: socket.socket().connect(by_name),
+                    "connect_ex by name": lambda: socket.socket().connect_ex(by_name),
+                    "sendto by name": lambda: socket.socket(*udp).sendto(b"x", by_name),
+                    "sendmsg by name": lambda: socket.socket(*udp).sendmsg([b"x"], [], 0, by_name),
+                    "the C class by name": lambda: _socket.socket().connect(by_name),
                     "lookup": lambda: socket.getaddrinfo("example.com", 80),
                     "process": lambda: subprocess.run(["/usr/bin/true"], check=True)}
         for name, attempt in attempts.items():
             try:
                 attempt()
                 found[name] = "allowed"
-            except PermissionError:
-                found[name] = "refused"
+            except PermissionError as error:  # the audit event that refused it, from its message
+                found[name] = str(error).rsplit("(", 1)[-1].rstrip(")")
             except OSError as error:
                 found[name] = type(error).__name__
         Path(ARGS[0], "probe").write_text(json.dumps(found))
@@ -163,6 +204,8 @@ def extract(data, kind, stop=lambda: None, progress=lambda done, total: None):
 
 def render_page(data, number, scale=2.0):
     before(number, lambda: None, lambda done, total: None)
+    if MODE == "png":  # a PNG whose header says an image past MAX_PAGE_SIDE and MAX_PAGE_PIXELS
+        return reading._PNG + struct.pack(">I", 13) + b"IHDR" + struct.pack(">IIBBBBB", 30_000, 30_000, 8, 6, 0, 0, 0)
     return real_render(data, number, scale)
 
 
