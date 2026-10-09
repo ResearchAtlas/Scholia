@@ -324,3 +324,23 @@ function pageItems(text) {
 test('a PDF\'s page list mounts its pages only through the window near the view, never one for every page', () => {
   assert.deepEqual(pageItems(source('Paper.jsx')), ['pageWindow(offsets, span, held)']);
 });
+
+// Where a PDF page's part of its passages starts, and what its read records once a part shows, as source text.
+function pagePartMemory(text) {
+  return parsed(text, (context, found) => ({
+    VariableDeclarator(node) {
+      if (node.id.type === 'ArrayPattern' && node.id.elements[0]?.name === 'part' && node.init?.callee?.name === 'useState') {
+        found.start = context.sourceCode.getText(node.init.arguments[0]);
+      }
+    },
+    CallExpression(call) {
+      if (call.callee.name === 'onPart') (found.recorded ??= []).push(context.sourceCode.getText(call));
+    },
+  }));
+}
+
+test('a PDF page mounted again comes back on the part of its passages it last showed', () => {
+  const found = pagePartMemory(source('Paper.jsx'));
+  assert.equal(found.start, 'startPart'); // the list's record of it, 0 for a page never shown
+  assert.deepEqual(found.recorded, ['onPart(number, part)']); // recorded once that part shows, not one asked for or failed
+});

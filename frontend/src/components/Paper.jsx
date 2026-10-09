@@ -246,8 +246,10 @@ function usePart(frame, part, showing, onNear, onWithin) {
 // within two screens of the view are mounted, with the held ones and a page on each side of each
 // (pageWindow); the others are spacers of their height, each page's from its own image once shown,
 // so the list keeps its height and every page its place, however many pages there are.
-// ponytail: laid out at its whole height, which browsers cap at 33,554,432 px (about 35,000 letter
-// pages 720 px wide; past it Chromium squeezes the pages); a scaled or paged list if longer PDFs are read.
+// Each page also keeps the part of its passages it last showed (startPart), mounted again or not.
+// ponytail: laid out at its whole height, which engines cap (33,554,432 px measured in the app's WebKit
+// and one Chromium build, 16,777,214 px in another; about 35,000 and 17,700 letter pages 720 px wide);
+// pages past the cap cannot be scrolled to. A scaled or paged list if longer PDFs are read.
 function PageList({ version, pages, pointed, onPoint }) {
   const list = useRef(null);
   const { held, onNear, onWithin } = useHeld(list);
@@ -270,20 +272,25 @@ function PageList({ version, pages, pointed, onPoint }) {
     const element = list.current;
     const root = scroller(element) ?? window;
     const follow = () => measure.current();
-    const resized = new ResizeObserver(() => { setWidth(element.clientWidth); follow(); });
+    const resized = new ResizeObserver(() => { setWidth((current) => element.clientWidth || current); follow(); }); // hidden: as it was
     resized.observe(element);
     if (root !== window) resized.observe(root);
     root.addEventListener('scroll', follow, { passive: true });
     return () => { resized.disconnect(); root.removeEventListener('scroll', follow); };
   }, []);
   const onAspect = useCallback((number, aspect) => {
-    if (aspects.current.get(number) !== aspect) { aspects.current.set(number, aspect); learn(); }
+    if (!(aspect > 0 && Number.isFinite(aspect)) || aspects.current.get(number) === aspect) return;
+    aspects.current.set(number, aspect);
+    learn();
   }, []);
+  const parts = useRef(new Map()); // the part of its passages each page last showed
+  const onPart = useCallback((number, part) => parts.current.set(number, part), []);
   return (
     <div ref={list} className="grid gap-4">
       {pageWindow(offsets, span, held).map((item) => (item.page
         ? <PageView key={item.page} version={version} number={item.page} pointed={pointed} onPoint={onPoint}
-          held={held.has(item.page)} onNear={onNear} onWithin={onWithin} aspect={aspects.current.get(item.page)} onAspect={onAspect} />
+          held={held.has(item.page)} onNear={onNear} onWithin={onWithin} aspect={aspects.current.get(item.page)} onAspect={onAspect}
+          startPart={parts.current.get(item.page) ?? 0} onPart={onPart} />
         : <div key={`before-${item.spacer}`} aria-hidden="true" style={{ height: item.height }} />))}
     </div>
   );
@@ -298,11 +305,11 @@ function PageList({ version, pages, pointed, onPoint }) {
 // read that fails shows beside the button, with Retry, which (as the button does) reads it again
 // (partMove); a page whose first read fails says so in its place, with Retry. The line boxes a part
 // draws are bounded (pageLines). Its shape is its image's (aspect, kept by the list: onAspect).
-function PageView({ version, number, pointed, onPoint, held, onNear, onWithin, aspect, onAspect }) {
+function PageView({ version, number, pointed, onPoint, held, onNear, onWithin, aspect, onAspect, startPart, onPart }) {
   const t = useT();
   const frame = useRef(null);
   const retry = useRef(null);
-  const [part, setPart] = useState(0); // which part of its passages it shows
+  const [part, setPart] = useState(startPart); // which part of its passages it shows
   const [shown, setShown] = useState(null); // { src, part, passages, more }
   const [failed, setFailed] = useState(false); // read again once asked to, or let go and held again
   const [props, focusOn, passTo] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
@@ -314,7 +321,8 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin, a
     let live = true;
     const controller = new AbortController(); // let go before they came: its requests go too
     Promise.all([shown?.src ?? pageImage(version, number, 1.5, controller.signal), pagePart(version, number, part, controller.signal)])
-      .then(([src, found]) => live && setShown({ src, part, ...found })).catch(() => live && setFailed(true));
+      .then(([src, found]) => { if (live) { setShown({ src, part, ...found }); onPart(number, part); } })
+      .catch(() => live && setFailed(true));
     return () => { live = false; controller.abort(); };
   }, [held, shown, version, number, part, failed]);
   useEffect(() => { // focus waiting on the page for the part goes to Retry once its read failed
@@ -442,7 +450,7 @@ function PassageStretch({ version, index, count, pointed, onPoint, held, onNear,
             <p className={cn('break-words', KIND_STYLES[passage.kind])}>{passage.text}</p>
           </div>
         </div>
-      )) : move.failed ? <div className="flex flex-wrap items-center gap-2">
+      )) : move.failed ? <div className="sticky top-0 flex flex-wrap items-center gap-2"> {/* in view while its box is */}
         <p role="alert" className="text-sm text-destructive">{t('paper.loadFailed')}</p>
         <Button ref={retry} type="button" variant="outline" size="sm" onClick={() => { focusOn('first'); setFailed(false); }}>
           {t('common.retry')}</Button>

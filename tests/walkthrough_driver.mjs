@@ -834,6 +834,11 @@ async function materials(ctx) {
     check('at first only the pages near the view are mounted', first > 1 && first <= 16);
     let list = await pageList();
     check('the list is as tall as all its pages', Math.abs(list.height - list.laidOut) < 2);
+    // Its first page's later passages shown, the page is let go and unmounted at the end, and comes back on them.
+    const firstPassages = pageFigure(1).locator('[data-passage]');
+    await pageFigure(1).getByRole('button', { name: L('paper.laterPassages'), exact: true }).click();
+    await page.waitForFunction(() => document.querySelectorAll('aside figure:first-of-type [data-passage]').length === 20);
+    await page.evaluate(() => document.activeElement?.blur()); // focus, which the later ones took, keeps no page held
     await scrollPanel('end');
     await pageFigure(20000).locator('img').waitFor({ timeout: 20000 });
     await page.waitForTimeout(500);
@@ -842,6 +847,11 @@ async function materials(ctx) {
     check('and still only the pages near the view: the first page is let go', last <= 16 && await pageFigure(1).count() === 0);
     list = await pageList();
     check('the list keeps its height', Math.abs(list.height - list.laidOut) < 2);
+    await scrollPanel(0);
+    await pageFigure(1).locator('img').waitFor({ timeout: 20000 });
+    await firstPassages.first().waitFor();
+    check('scrolled back, its first page comes back on the passages it showed', await firstPassages.count() === 20
+      && await pageFigure(1).getByRole('button', { name: L('paper.earlierPassages'), exact: true }).count() === 1);
     ctx.current().measured = { pages: many?.extraction.pages, mountedAtFirst: first, mountedAtEnd: last, height: list.height };
   });
 
