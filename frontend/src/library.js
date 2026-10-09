@@ -60,8 +60,18 @@ export function requestsOf(files) {
 // answered (batch), and the last closes it, so a Local only project asks once, counting every
 // identifier the drop gave. A batch the window never closes (it went away, or a request failed)
 // closes itself on the backend. Resolves to the backend's answers together; a request that fails
-// once others were added ends the sending, its error code in `problem`.
-export async function addFiles(projectId, files, { conversationId, materialId, replaces } = {}) {
+// once others were added ends the sending, its error code in `problem`. Uploads run one after
+// another, wherever they start (a drop, Add files, the conversation, Replace file): each reads its
+// files' data only once it is its turn, so several started at once never hold theirs together. One
+// that fails does not stop the next.
+let uploads = Promise.resolve();
+export function addFiles(projectId, files, options = {}) {
+  const turn = uploads.then(() => upload(projectId, files, options));
+  uploads = turn.catch(() => null);
+  return turn;
+}
+
+async function upload(projectId, files, { conversationId, materialId, replaces } = {}) {
   if (files.some((file) => file.size > MAX_FILE_BYTES)) throw new ApiError(413, 'file_too_large');
   const send = (body) => post(`/api/projects/${encodeURIComponent(projectId)}/materials`, {
     ...body, ...(conversationId ? { conversation_id: conversationId } : {}),

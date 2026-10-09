@@ -346,6 +346,40 @@ test('a drop sent in several requests is one batch: the first opens it, the next
   }
 });
 
+test('uploads started together run one after another, so only one holds its files\' data at a time', async () => {
+  const realFetch = globalThis.fetch;
+  const realReader = globalThis.FileReader;
+  globalThis.FileReader = class {
+    readAsDataURL(blob) { blob.arrayBuffer().then((bytes) => { this.result = `data:;base64,${Buffer.from(bytes).toString('base64')}`; this.onload(); }); }
+  };
+  const events = [];
+  let open = 0;
+  globalThis.fetch = async (path, init) => {
+    const body = JSON.parse(init.body);
+    open += 1;
+    events.push(['start', body.files[0], open]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    open -= 1;
+    events.push(['end', body.files[0].name]);
+    return new Response(JSON.stringify({ materials: [{ id: body.files[0].name, existing: false }], lookup_run_id: null }),
+      { status: 201 });
+  };
+  try {
+    const picks = ['a.md', 'b.md', 'c.md'].map((name) => addFiles('p1', [new File(['# x'], name)])); // three quick picks
+    const results = await Promise.all(picks);
+    assert.deepEqual(results.map((r) => r.materials[0].id), ['a.md', 'b.md', 'c.md']);
+    assert.ok(events.every((event) => event[0] !== 'start' || event[2] === 1)); // never two in flight
+    assert.deepEqual(events.filter((e) => e[0] === 'end').map((e) => e[1]), ['a.md', 'b.md', 'c.md']);
+    globalThis.fetch = async () => { throw new TypeError('offline'); };
+    await assert.rejects(addFiles('p1', [new File(['# x'], 'd.md')])); // a failed one does not stop the next
+    globalThis.fetch = async (path, init) => new Response(JSON.stringify({ materials: [{ id: 'e', existing: false }], lookup_run_id: null }), { status: 201 });
+    assert.equal((await addFiles('p1', [new File(['# x'], 'e.md')])).materials[0].id, 'e');
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.FileReader = realReader;
+  }
+});
+
 test('a conversation\'s questions read before a switch to another conversation never show in the new one', async () => {
   const realFetch = globalThis.fetch;
   const answers = {};
