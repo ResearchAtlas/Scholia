@@ -69,6 +69,7 @@ MAX_TAG_ATTRIBUTES = 1024  # an HTML tag's attributes, counted where the parser 
 MAX_TAG_REFERENCES = 1024  # character references in a tag's attribute values together, or in a title or textarea
 MAX_TAG_SPACE = 4096  # a run of spaces and slashes within a tag, which html.parser walks a character at a time
 MAX_HTML_PENDING = 256 * 1024  # text html.parser holds back between two pieces fed (a reference cut at the end)
+MAX_HTML_TOKEN = 8 * 1024 * 1024  # one tag or comment: a data-URI image of some 6 MB in an attribute fits
 MAX_XML_DEPTH = 1000  # a DOCX part's elements open at once
 MAX_XML_TOKEN = 256 * 1024  # bytes a DOCX part's parser may take in without a tag or text ending
 MAX_XML_NAMES = 4096  # distinct element and attribute names in a DOCX part: Word's own come to some hundreds
@@ -1264,12 +1265,15 @@ _ATTRIBUTE_EQUALS = re.compile(r"[\t\n\r\f ]*=[\t\n\r\f ]*")
 _BARE_VALUE = re.compile(r"[^>\t\n\r\f ]*")
 
 
-def _tag_end(raw, at):
-    """Where the tag whose name starts at raw[at] ends, just past its ">", or -1 when raw ends first:
-    as Python 3.13's html.parser finds it (its locatetagend), but walked one token at a time, each
-    a pattern that holds no state per character. Unreadable once the tag has more than
-    MAX_TAG_ATTRIBUTES attributes, more than MAX_TAG_REFERENCES "&" in their values, or a run of
-    spaces and slashes longer than MAX_TAG_SPACE: before the parser's own patterns walk it whole."""
+def _tag_end(raw, at, final=True):
+    """(where the tag whose name starts at raw[at] ends, just past its ">", or -1 when raw ends
+    first; what it waits for then: the quote that closes a value, or ">"), as Python 3.13's
+    html.parser finds the tag's end (its locatetagend) in the whole input, but walked one token at a
+    time, each a pattern that holds no state per character. A quoted value not closed in raw waits
+    for more input unless raw is all of it (final): only then does it take the pattern's fallback
+    (an empty value, or none). Unreadable once the tag has more than MAX_TAG_ATTRIBUTES attributes,
+    more than MAX_TAG_REFERENCES "&" in their values, or a run of spaces and slashes longer than
+    MAX_TAG_SPACE: before the parser's own patterns walk it whole."""
     def space(pos):
         end = _TAG_SPACE.match(raw, pos).end()
         if end - pos > MAX_TAG_SPACE:
@@ -1288,9 +1292,11 @@ def _tag_end(raw, at):
                 close = raw.find(quote, value + 1)
                 if close >= 0:
                     end = close + 1
-                elif raw[value - 1] != "=":  # unclosed after a space: the pattern backs off to an empty value
+                elif not final:  # its closing quote may be in the input still to come
+                    return -1, quote
+                elif raw[value - 1] != "=":  # never closed, after a space: the pattern backs off to an empty value
                     end = value - 1
-                else:  # unclosed right after "=": no value at all
+                else:  # never closed, right after "=": no value at all
                     end = None
             else:
                 end = _BARE_VALUE.match(raw, value).end()
@@ -1300,39 +1306,69 @@ def _tag_end(raw, at):
                     raise Unreadable()
                 pos = end
         pos = space(pos)
-    return pos + 1 if raw.startswith(">", pos) else -1
+    return (pos + 1 if raw.startswith(">", pos) else -1), ">"
 
 
 class _BoundedHtml(HTMLParser):
     """html.parser with convert_charrefs, fed a piece at a time (read), so it never turns more than a
     piece of text's references into characters at once, and bounded where it starts each tag
-    (_tag_end) and where it holds text back: a title's or a textarea's whole text, which it turns
-    at once, at most MAX_BLOCK_CHARS with MAX_TAG_REFERENCES references, and other text held
-    between pieces at most MAX_HTML_PENDING."""
+    (_tag_end), where it starts a title or a textarea (whose whole text it turns at once: at most
+    MAX_BLOCK_CHARS with MAX_TAG_REFERENCES references, wherever it falls), and where it holds
+    input back: text at most MAX_HTML_PENDING, a tag or comment at most MAX_HTML_TOKEN, fed whole to
+    where it can end rather than rescanned a piece at a time. Such a token costs about seven times its
+    length while it is parsed (the text fed, and html.parser's copies of the whole tag, of the
+    attribute, of its value and of the value unquoted), about 56 MiB at the bound."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
+        self.final, self.waiting, self.fed = False, ">", 0
 
     def parse_starttag(self, i):
-        if _tag_end(self.rawdata, i + 1) < 0:
-            return -1  # not all here yet: as the parser would find it
-        return super().parse_starttag(i)
+        end, self.waiting = _tag_end(self.rawdata, i + 1, self.final)
+        if end < 0:
+            return -1  # not all here yet
+        k = super().parse_starttag(i)
+        if k >= 0 and self.cdata_elem and self._escapable:  # a title or a textarea: its text checked before it is turned
+            begin = self.fed - len(self.rawdata) + k
+            close = self.interesting.search(self.source, begin)
+            close = close.start() if close else len(self.source)
+            if close - begin > MAX_BLOCK_CHARS or self.source.count("&", begin, close) > MAX_TAG_REFERENCES:
+                raise Unreadable()
+        return k
 
     def parse_endtag(self, i):
         raw = self.rawdata
-        if raw.find(">", i + 2) >= 0 and _TAG_NAME.match(raw, i + 2):  # an end tag the parser walks as a tag
-            _tag_end(raw, i + 2)
+        if _TAG_NAME.match(raw, i + 2):  # an end tag the parser walks as a tag
+            end, self.waiting = _tag_end(raw, i + 2, self.final)
+            if end < 0:
+                return -1
         return super().parse_endtag(i)
 
     def read(self, source):
-        for at in range(0, len(source), 64 * 1024):
-            self.feed(source[at:at + 64 * 1024])
-            held = self.rawdata
-            if self.cdata_elem and self._escapable:
-                if len(held) > MAX_BLOCK_CHARS or held.count("&") > MAX_TAG_REFERENCES:
+        self.source, at = source, 0
+        while at < len(source):
+            end, held = min(at + 64 * 1024, len(source)), self.rawdata
+            if held.startswith("<"):  # a tag or comment not yet ended: fed to where it can end, at once
+                if held.startswith("<!--"):
+                    ends = [p for p in (source.find("-->", at), source.find("--!>", at)) if p >= 0]
+                    close = min(ends) + 4 if ends else len(source)
+                else:
+                    close = source.find(self.waiting, at)
+                    close = close + 1 if close >= 0 else len(source)
+                if close - (at - len(held)) > MAX_HTML_TOKEN:
                     raise Unreadable()
-            elif not self.cdata_elem and len(held) > MAX_HTML_PENDING and not held.startswith("<"):
+                end = max(end, min(close, len(source)))
+            elif self.cdata_elem:  # a script's or a style's text: fed to its end, at once
+                close = self.interesting.search(source, at)
+                end = max(end, close.start() if close else len(source))
+            self.fed = end
+            self.rawdata = source[at - len(held):end]  # as feed() would, with one copy rather than two
+            self.goahead(0)
+            at = end
+            held = self.rawdata
+            if not self.cdata_elem and len(held) > MAX_HTML_PENDING and not held.startswith("<"):
                 raise Unreadable()
+        self.final = True
         self.close()
 
 

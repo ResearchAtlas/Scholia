@@ -793,6 +793,35 @@ def test_html_references_are_turned_a_piece_at_a_time_and_bounded(where):
         == ["a & b \u00a9", "\u00a9right \u2209 x"]  # turned as before
 
 
+@pytest.mark.parametrize("value", ['"a > attribute only ' + "x" * 100 + '"',
+                                   '"data:image/svg+xml;utf8,<svg><text>Inside</text></svg>"',
+                                   '"' + " ".join(["ordinary words in a long alt text"] * 3000) + '"'])
+def test_a_quoted_value_across_the_pieces_fed_stays_a_value(value):
+    source = "<p>Before</p><!--" + "x" * 65470 + "--><img alt= " + value + "><p>After</p>"  # its quote opens near a piece's end
+    assert [p.text for p in extract(source.encode(), extraction.HTML).passages] == ["Before", "After"]
+
+
+@pytest.mark.parametrize("where", ["within one piece fed", "across two pieces"])
+def test_a_title_past_its_references_is_refused_wherever_it_falls(where):
+    padding = "<!--" + "x" * 60_050 + "-->" if where == "across two pieces" else ""
+    for references, readable in ((1000, True), (1100, False)):
+        source = f"{padding}<title>{'&amp;' * references}</title><p>x</p>".encode()
+        if readable:
+            assert extract(source, extraction.HTML).passages[0].text == "&" * references
+        else:
+            with pytest.raises(extraction.Unreadable):
+                extract(source, extraction.HTML)
+
+
+def test_a_tag_held_across_pieces_is_fed_whole_once_and_bounded():
+    image = b"<p>Before</p><img src=\"data:image/png;base64," + b"A" * (4 * 2**20) + b"\"><p>After</p>"  # a 4 MiB image
+    peak, refused = _peak(lambda: extract(image, extraction.HTML))
+    assert not refused and peak < 8 * len(image), f"{peak / 2**20:.1f} MiB"  # the copies html.parser makes of it
+    too_long = b"<p>Before</p><img src=\"" + b"A" * (extraction.MAX_HTML_TOKEN + 1) + b"\"><p>After</p>"
+    peak, refused = _peak(lambda: extract(too_long, extraction.HTML))
+    assert refused and peak < 1.5 * len(too_long), f"{peak / 2**20:.1f} MiB"  # its text decoded, not held again
+
+
 def test_a_pdf_readings_rectangles_are_counted_as_they_are_made(monkeypatch):
     page = [(72, 780 - i * 12, 10, "ab") for i in range(60)]  # a short line on each of 60 rows: 60 rectangles
     data = synthetic.pdf([page] * 100)
