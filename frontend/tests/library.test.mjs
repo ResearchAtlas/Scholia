@@ -245,6 +245,26 @@ test('a paper\'s details name the record they came from, whatever its latest loo
   }
 });
 
+test('a latest lookup that ended without an outcome for the paper shows how it ended, beside the details kept', () => {
+  const t = makeT('en');
+  const date = (value) => value.slice(0, 10);
+  const kept = { checked_by: 'lookup', source_key: 'openalex:W1', resolved_at: '2026-01-02T00:00:00.000Z' };
+  const failed = { ...kept, lookup: { status: 'failed', outcome: null, reason: 'internal' } };
+  assert.equal(detailsSource(t, failed, {}, date), 'From OpenAlex, 2026-01-02');
+  assert.equal(latestLookup(t, failed), en['errors.internal']);
+  assert.equal(latestLookup(t, { ...kept, lookup: { status: 'failed', outcome: null, reason: 'unavailable' } }),
+    en['errors.unavailable']); // its recorded reason
+  assert.equal(latestLookup(t, { ...kept, lookup: { status: 'interrupted', outcome: null } }), en['runs.interrupted']);
+  assert.equal(latestLookup(t, { ...kept, lookup: { status: 'cancelled', outcome: null } }), en['runs.stopped']);
+  const edited = { checked_by: 'researcher', checked_at: '2026-03-04T00:00:00.000Z', lookup: { status: 'failed', outcome: null } };
+  assert.equal(latestLookup(t, edited), en['errors.internal']);
+  const file = { checked_by: null, lookup: { status: 'failed', outcome: null, reason: 'internal' } };
+  assert.equal(detailsSource(t, file, {}, date), en['library.source.fromFile']);
+  assert.equal(latestLookup(t, file), en['errors.internal']); // the details from the file say nothing of it
+  const resolvedThenFailed = { ...kept, lookup: { status: 'failed', outcome: 'resolved' } }; // another paper's step failed
+  assert.equal(latestLookup(t, resolvedThenFailed), null);
+});
+
 test('a drop sent in several requests is one batch: the first opens it, the next add to it, the last closes it', async () => {
   const MiB = 1024 * 1024;
   const realFetch = globalThis.fetch;

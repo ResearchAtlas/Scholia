@@ -2,6 +2,7 @@
 // how a paper's state and reason are named, its details as the edit form holds them, and where a
 // passage's boxes sit on its page image (backend/materials.py, backend/extraction.py).
 import { ApiError, get, getBlob, post } from './api.js';
+import { errorText } from './text.js';
 
 export const ACCEPT = '.pdf,.docx,.html,.htm,.xhtml,.md,.markdown,.tex,.latex';
 const SUPPORTED = new Set(ACCEPT.split(','));
@@ -133,15 +134,19 @@ export function detailsSource(t, material, project, date) {
 }
 
 // What a paper's latest lookup did, as text, beside details that came from elsewhere (an edit or an
-// earlier lookup's record); null when the details say it already (they are the file's), or when it
-// has nothing to tell (it found their record, or its file was replaced meanwhile).
+// earlier lookup's record), or beside the file's when it ended with no outcome for the paper (failed,
+// with its recorded reason, or interrupted); null when the details say it already, or when it has
+// nothing to tell (it found their record, or its file was replaced meanwhile).
 export function latestLookup(t, material) {
   const lookup = material.lookup;
-  if (!lookup || !material.checked_by) return null;
+  if (!lookup) return null;
+  const ended = lookup.outcome != null ? null : lookup.status === 'failed' ? errorText(t, lookup.reason ?? 'internal')
+    : lookup.status === 'interrupted' ? t('runs.interrupted') : null;
+  if (!material.checked_by) return ended;
   if (lookup.waiting) return t('library.source.waiting');
   if (lookup.status === 'running') return t('library.source.lookingUp');
   if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
-  return LOOKUP_OUTCOMES.includes(lookup.outcome) ? t(`library.lookup.${lookup.outcome}`) : null;
+  return LOOKUP_OUTCOMES.includes(lookup.outcome) ? t(`library.lookup.${lookup.outcome}`) : ended;
 }
 
 const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file',
