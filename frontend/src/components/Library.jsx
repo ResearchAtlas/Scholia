@@ -1,9 +1,10 @@
 // i18n: migrated
-// The Library (S7; slice-1 spec F3a): Add files and a drop zone, the confirmations its work waits
-// on, and the project's papers, each Reading, Ready, or Needs attention with its reason, with its
-// details under Details. A paper opens its own page (Paper.jsx). Search comes with S1-17.
-import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { FilePlus2, FileText, TriangleAlert, Upload } from 'lucide-react';
+// The Library (S7; slice-1 spec F3a): search, Add files and a drop zone, the confirmations its work
+// waits on, and the project's papers, each Reading, Ready, or Needs attention with its reason, with
+// its details under Details. A paper opens its own page (Paper.jsx); a search result opens it at its
+// passage.
+import { useCallback, useContext, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react';
+import { FilePlus2, FileText, Search, TriangleAlert, Upload, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
 import { useAction } from '../action.js';
@@ -16,6 +17,11 @@ import { Ask } from './Ask.jsx';
 import { Paper } from './Paper.jsx';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+// S1-17: search and the search index
+import { Input } from '@/components/ui/input';
+import { downloadOffered } from '../helper.js';
+import { fieldKey, indexBusy, indexStatus, paperIndexed, queryOf, searchNote, searchProject, whereIs } from '../search.js';
+import { LocalOnlySearchNote } from './LocalHelper.jsx';
 
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
 
@@ -73,7 +79,9 @@ export async function addTo(projectId, fileList, t, notify, options) {
 export function Library({ project }) {
   const t = useT();
   const { listing, problem, load } = useLibrary(project?.id);
-  const [open, setOpen] = useState(null); // the paper whose page is shown
+  const [open, setOpen] = useState(null); // the paper whose page is shown: { id, target } (a result's passage)
+  const index = useIndex(project?.id, listing);
+  const search = useSearch(project?.id);
   const [notice, setNotice] = useState(null);
   const adding = useSyncExternalStore(watchUploads, uploadsWaiting) > 0; // while any upload is still to finish
   const [over, setOver] = useState(false);
@@ -86,10 +94,12 @@ export function Library({ project }) {
     load();
   }
 
-  const paper = open && listing?.materials.find((m) => m.id === open);
+  const paper = open && listing?.materials.find((m) => m.id === open.id);
   if (paper) {
-    return <Paper material={paper} project={project} onBack={() => { setOpen(null); load(); }} onChanged={load} />;
+    return <Paper material={paper} project={project} index={index} target={open.target}
+      onBack={() => { setOpen(null); load(); }} onChanged={load} />;
   }
+  const searching = Boolean(search.shown);
   const materials = listing?.materials ?? [];
   return (
     <div className={cn('flex h-full min-h-0 flex-col', over && 'bg-brand-soft/40')}
@@ -106,7 +116,11 @@ export function Library({ project }) {
           <FilePlus2 aria-hidden="true" />{t('library.addFiles')}
         </Button>
       </div>
+      {project && <SearchField search={search} />}
       <div className="scroll-thin min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+        {project?.sensitivity === 'local_only' && <LocalOnlySearchNote />}
+        <SearchResults search={search} project={project}
+          onOpen={(result) => setOpen({ id: result.material_id, target: { id: result.passage_id, ordinal: result.ordinal } })} />
         {problem && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{errorText(t, problem)}</p>}
         {notice && <p role="status" className="rounded-md bg-muted px-3 py-2 text-sm">{notice}</p>}
         {adding && <p role="status" className="text-sm text-muted-foreground">{t('library.adding')}</p>}
@@ -114,13 +128,13 @@ export function Library({ project }) {
           <Ask key={ask.ask_id} ask={ask} onAnswered={load} />
         ))}
         {listing === null && !problem && <p role="status" className="text-sm text-muted-foreground">{t('common.loading')}</p>}
-        {listing && materials.length > 0 && (
+        {listing && materials.length > 0 && !searching && (
           <ul className="divide-y rounded-lg border" aria-label={t('library.papers')}>
-            {materials.map((material) => <PaperRow key={material.id} material={material} project={project}
-              onOpen={() => setOpen(material.id)} onChanged={load} />)}
+            {materials.map((material) => <PaperRow key={material.id} material={material} project={project} index={index}
+              onOpen={() => setOpen({ id: material.id })} onChanged={load} />)}
           </ul>
         )}
-        {listing && (
+        {listing && !searching && (
           <button type="button" onClick={() => input.current?.click()} disabled={adding}
             className={cn('flex w-full flex-col items-center gap-2 rounded-xl border-2 border-dashed px-4 text-center text-sm text-muted-foreground transition-colors hover:border-brand/50 hover:text-foreground',
               materials.length ? 'py-5' : 'py-12', over && 'border-brand text-foreground')}>
@@ -192,7 +206,7 @@ export function Progress({ material }) {
   );
 }
 
-function PaperRow({ material, project, onOpen, onChanged }) {
+function PaperRow({ material, project, index, onOpen, onChanged }) {
   const t = useT();
   const reason = reasonKey(material.reason);
   return (
@@ -215,15 +229,16 @@ function PaperRow({ material, project, onOpen, onChanged }) {
           <summary className="w-fit cursor-pointer select-none rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
             {t('library.details')}
           </summary>
-          <Facts material={material} project={project} />
+          <Facts material={material} project={project} index={index} />
         </details>
       </div>
     </li>
   );
 }
 
-// What is known of a paper: its file, its reading, its details' source and its retraction check.
-export function Facts({ material, project }) {
+// What is known of a paper: its file, its reading, whether it is in the search index, its details'
+// source and its retraction check.
+export function Facts({ material, project, index }) {
   const t = useT();
   const language = useContext(LanguageContext);
   const date = (value) => new Intl.DateTimeFormat(language, { dateStyle: 'medium' }).format(new Date(value));
@@ -234,6 +249,7 @@ export function Facts({ material, project }) {
     extraction?.pages != null && [t('library.fact.pages'), String(extraction.pages)],
     extraction && [t('library.fact.passages'), String(extraction.passages)],
     extraction?.ocr_pages > 0 && [t('library.fact.ocr'), t('library.ocrWaiting', { count: extraction.ocr_pages })],
+    index && extraction && [t('search.indexTitle'), t(...paperIndexed(index, material.id))],
     [t('library.fact.details'), detailsSource(t, material, project, date)],
     latestLookup(t, material) && [t('library.fact.lookup'), latestLookup(t, material)],
     material.lookup?.identifier && [t('library.fact.identifier'), material.lookup.identifier.replace(/^(doi|arxiv):/, '')],
@@ -251,5 +267,140 @@ export function Facts({ material, project }) {
         </div>
       ))}
     </dl>
+  );
+}
+
+// S1-17: search and the search index
+
+// The project's search index status (backend/search.py), read with the papers and again while an
+// index run runs; null until read, or when it cannot be.
+export function useIndex(projectId, listing) {
+  const [index, setIndex] = useState(null);
+  const [asked] = useState(newest);
+  const load = useCallback(async () => {
+    const current = asked();
+    if (!projectId) return;
+    try {
+      const found = await indexStatus(projectId);
+      if (current()) setIndex(found);
+    } catch {
+      if (current()) setIndex(null);
+    }
+  }, [projectId, asked]);
+  useEffect(() => { setIndex(null); }, [projectId]);
+  useEffect(() => { load(); }, [load, listing]);
+  useEffect(() => {
+    if (!indexBusy(index)) return undefined;
+    const timer = setTimeout(load, POLL_MS);
+    return () => clearTimeout(timer);
+  }, [index, load]);
+  return index;
+}
+
+// The search field's text and the newest search's results; a search asked before a later one, or
+// for another project, is dropped.
+function useSearch(projectId) {
+  const [text, setText] = useState('');
+  const [shown, setShown] = useState(null); // { query, found }
+  const [asked] = useState(newest);
+  const { busy, problem, run, reset } = useAction();
+  useEffect(() => { asked(); setText(''); setShown(null); reset(); }, [projectId]);
+  async function search() {
+    const query = queryOf(text);
+    if (!query || !projectId) return;
+    const current = asked();
+    const found = await run(() => searchProject(projectId, query));
+    if (found && current()) setShown({ query, found });
+  }
+  function clear() {
+    asked();
+    setText('');
+    setShown(null);
+    reset();
+  }
+  return { text, setText, shown, busy, problem, search, clear };
+}
+
+// The search field: Enter searches (not while an input method composes), Escape clears.
+function SearchField({ search }) {
+  const t = useT();
+  const id = useId();
+  function onKeyDown(event) {
+    const action = fieldKey({ key: event.key, isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode });
+    if (action === 'clear') {
+      event.preventDefault();
+      search.clear();
+    } else if (event.key === 'Enter' && action === null) {
+      event.preventDefault(); // confirming composed characters, not searching
+    }
+  }
+  return (
+    <form role="search" className="flex shrink-0 items-center gap-1.5 border-b px-4 py-2"
+      onSubmit={(event) => { event.preventDefault(); search.search(); }}>
+      <label htmlFor={id} className="sr-only">{t('search.label')}</label>
+      <div className="relative min-w-0 flex-1">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+        <Input id={id} value={search.text} placeholder={t('search.placeholder')} autoComplete="off" spellCheck={false}
+          className="h-8 pl-8" onChange={(event) => search.setText(event.target.value)} onKeyDown={onKeyDown} />
+      </div>
+      {(search.shown || search.text) && (
+        <Button type="button" size="icon" variant="ghost" className="size-8" title={t('search.clear')} aria-label={t('search.clear')}
+          onClick={search.clear}><X aria-hidden="true" /></Button>
+      )}
+      <Button type="submit" size="sm" variant="outline" className="h-8" disabled={search.busy || !queryOf(search.text)}>
+        {t('search.submit')}
+      </Button>
+    </form>
+  );
+}
+
+// The newest search's passages, in rank order (never a score), each opening its paper at it, with
+// what the search says of how they were found.
+function SearchResults({ search, project, onOpen }) {
+  const t = useT();
+  const { shown, busy, problem } = search;
+  if (!shown && !busy && !problem) return null;
+  const note = shown && searchNote(shown.found, downloadOffered(project));
+  const keywordOnly = shown?.found.mode === 'keyword_only';
+  const results = shown?.found.results ?? [];
+  return (
+    <section className="grid gap-3" aria-label={t('search.label')}>
+      {problem && <p role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{problem}</p>}
+      {busy && <p role="status" className="text-sm text-muted-foreground">{t('search.searching')}</p>}
+      {shown && (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <p aria-live="polite" className="text-xs text-muted-foreground">{t('search.results', { count: results.length })}</p>
+            <Button variant="ghost" size="sm" className="h-7" onClick={search.clear}>{t('search.backToPapers')}</Button>
+          </div>
+          {note && (
+            <p role="status" className={cn('flex gap-2 rounded-md border px-3 py-2 text-xs leading-relaxed',
+              keywordOnly ? 'border-warning/40 text-warning' : 'text-muted-foreground')}>
+              {keywordOnly && <TriangleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />}
+              <span className="min-w-0">{t(note[0], note[1].reasonKey ? { reason: t(note[1].reasonKey) } : note[1])}</span>
+            </p>
+          )}
+          {results.length === 0 ? <p className="text-sm text-muted-foreground">{t('search.none')}</p> : (
+            <ol className="divide-y rounded-lg border">
+              {results.map((result) => (
+                <li key={result.passage_id}>
+                  <button type="button" onClick={() => onOpen(result)} title={t('search.open', { title: result.title })}
+                    className="grid w-full gap-1 px-3 py-2.5 text-left transition-colors hover:bg-accent/60 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring">
+                    <span className="flex min-w-0 items-baseline gap-2">
+                      <span className="min-w-0 truncate text-sm font-medium">{result.title}</span>
+                      {result.kind !== 'paragraph' && (
+                        <span className="shrink-0 text-[11px] font-medium uppercase tracking-wide text-brand">{t(`paper.kind.${result.kind}`)}</span>
+                      )}
+                    </span>
+                    {whereIs(t, result) && <span className="truncate text-xs text-muted-foreground">{whereIs(t, result)}</span>}
+                    <span className="line-clamp-3 break-words text-sm leading-relaxed text-foreground/90">{result.text}</span>
+                  </button>
+                </li>
+              ))}
+            </ol>
+          )}
+        </>
+      )}
+    </section>
   );
 }
