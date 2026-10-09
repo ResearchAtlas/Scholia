@@ -20,7 +20,7 @@ import { cn } from '@/lib/utils';
 // S1-17: search and the search index
 import { Input } from '@/components/ui/input';
 import { downloadOffered } from '../helper.js';
-import { fieldKey, indexBusy, indexStatus, paperIndexed, queryOf, searchNote, searchProject, whereIs } from '../search.js';
+import { fieldKey, indexPoll, indexStatus, paperIndexed, queryOf, searchNote, searchProject, whereIs } from '../search.js';
 import { LocalOnlySearchNote } from './LocalHelper.jsx';
 
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
@@ -290,8 +290,7 @@ export function useIndex(projectId, listing) {
   useEffect(() => { setIndex(null); }, [projectId]);
   useEffect(() => { load(); }, [load, listing]);
   useEffect(() => {
-    if (!indexBusy(index)) return undefined;
-    const timer = setTimeout(load, POLL_MS);
+    const timer = setTimeout(load, indexPoll(index));
     return () => clearTimeout(timer);
   }, [index, load]);
   return index;

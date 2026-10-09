@@ -11,8 +11,12 @@ the folder of synthetic materials (a PDF, DOCX, HTML, Markdown and LaTeX file, a
 for the walkthrough to add. The local model helper's search model is a synthetic file with a pin
 of its own, served by a test-owned download source (each source redirecting to the file host
 it uses, the file sent slowly so a download can be watched and cancelled), and written to an
-"offline" folder for the import flow, whose path is printed; the helper binary is a stand-in in
-a bundle with its manifest, never started (the network block refuses child processes). --dev serves no interface and admits the Vite server on
+"offline" folder for the import flow, whose path is printed. The helper binary is a test-owned
+stand-in in a bundle with its manifest (S1-17): a small program, the one child process the network
+block allows, that opens no socket and only prints the line a llama-server prints once it listens;
+its HTTP side is answered here, behind the outbound gate's transport, with synthetic vectors
+(synthetic_materials.embedding). While the file named by "helper control" exists, it answers
+embedding requests 503, as a helper that stopped answering. --dev serves no interface and admits the Vite server on
 127.0.0.1:5173 instead (`npm run dev` in frontend/), with no session, on port 8765, where
 that server sends API requests. Without --port, a free port is used. --request-log appends
 each request the test-owned provider receives to FILE, one JSON line each.
@@ -113,6 +117,9 @@ def write_materials():
         "long-notes.md": long_notes(),
         "crowded-page.pdf": synthetic_materials.pdf(  # one page of 220 passages, a line of three items each
             [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]]),
+        # S1-17's search flows: an English and a Chinese paper with no identifier.
+        "Wage floors and employment.md": synthetic_materials.SEARCH_NOTES,
+        "最低工资与就业笔记.md": synthetic_materials.CHINESE_NOTES,
     }
     for name, data in files.items():
         (folder / name).write_bytes(data)
@@ -144,8 +151,29 @@ def download_source(request):
     return httpx.Response(200, stream=SlowFile())
 
 
+# S1-17: the stand-in helper. It prints its listening line and waits; it reads no model and opens no socket.
+STAND_IN = """#!{python}
+import time
+print("srv  llama_server: listening on http://127.0.0.1:50001", flush=True)
+while True:
+    time.sleep(1)
+"""
+
+
+def helper_answer(request, control):
+    """The stand-in helper's HTTP side: health, and synthetic embeddings (503 while control exists)."""
+    if request.url.path == "/health":
+        return httpx.Response(200, json={"status": "ok"})
+    if request.url.path != "/v1/embeddings" or control.exists():
+        return httpx.Response(503, json={"error": "unavailable"})
+    texts = json.loads(request.content)["input"]
+    return httpx.Response(200, json={"data": [{"index": i, "embedding": synthetic_materials.embedding(text)}
+                                              for i, text in enumerate(texts)]})
+
+
 class SyntheticProvider(MockProvider):
     log = None  # the --request-log file
+    control = None  # the stand-in helper's control file (S1-17)
 
     async def __call__(self, request):
         if self.log is not None:
@@ -153,6 +181,8 @@ class SyntheticProvider(MockProvider):
             with open(self.log, "a", encoding="utf-8") as out:
                 out.write(json.dumps({"method": request.method, "host": request.url.host, "path": request.url.path,
                                       "model": body.get("model") if isinstance(body, dict) else None}) + "\n")
+        if request.url.host == "127.0.0.1":  # the stand-in helper (S1-17)
+            return helper_answer(request, self.control)
         if request.url.host in FILE_HOSTS or request.url.host in FILE_HOSTS.values():
             return download_source(request)
         if request.url.path.endswith("/models"):
@@ -184,11 +214,12 @@ def main(argv=None):
     offline = harness / "offline" / MODEL["file"]  # the file the import flow names
     offline.parent.mkdir()
     offline.write_bytes(MODEL_BYTES)
-    binary = harness / "Scholia.app" / "Contents" / "MacOS" / "llama-server"  # a stand-in, never started
+    binary = harness / "Scholia.app" / "Contents" / "MacOS" / "llama-server"  # the stand-in (S1-17)
     for folder in (binary.parent, binary.parents[1] / "Frameworks" / "llama-cpp", binary.parents[1] / "Resources"):
         folder.mkdir(parents=True)
-    binary.write_text("#!/bin/sh\nexit 1\n")
+    binary.write_text(STAND_IN.format(python=sys.executable))
     binary.chmod(0o755)
+    provider.control = harness / "helper-offline"
     local_helper.write_manifest(binary.parents[1])
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -203,9 +234,11 @@ def main(argv=None):
     print(f"data folder: {data_dir}", flush=True)
     print(f"materials: {write_materials()}", flush=True)
     print(f"model file: {offline}", flush=True)
+    print(f"helper control: {provider.control}", flush=True)
     print(f"open: {origin}/" + ("" if args.dev else f"#session={session}"), flush=True)
     server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", log_level="warning"))
-    asyncio.run(server.serve(sockets=[sock]))
+    with network_guard.allow_subprocess(str(binary)):  # the stand-in helper only (S1-17)
+        asyncio.run(server.serve(sockets=[sock]))
 
 
 if __name__ == "__main__":

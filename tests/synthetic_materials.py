@@ -2,7 +2,9 @@
 made here, with made-up text and identifiers (10.5555 is a test prefix). Never real papers."""
 
 import ctypes
+import hashlib
 import io
+import math
 import zipfile
 
 DOI = "10.5555/scholia.synthetic.001"
@@ -154,3 +156,43 @@ We model wage floors in a synthetic economy. DOI {doi}
 
 def _xml(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def embedding(text, dimensions=1024):
+    """A synthetic stand-in for the search model's embedding of text (a query's retrieval instruction
+    left out), never a model's: its search tokens hashed into dimensions and normalized, so texts that
+    share words are near. For the test-owned helper of tests and walkthroughs (S1-17)."""
+    from backend.search_index import tokens
+
+    values = [0.0] * dimensions
+    for _, _, token, _ in tokens(text.split("Query:", 1)[-1]):
+        values[int(hashlib.sha256(token.encode()).hexdigest(), 16) % dimensions] += 1.0
+    norm = math.sqrt(sum(v * v for v in values)) or 1.0
+    return [v / norm for v in values]
+
+
+# Papers for the search walkthrough (S1-17): English and Chinese, with no identifier.
+SEARCH_NOTES = b"""# Wage Floors and Employment
+
+## Findings
+
+Minimum wage increases raised the earnings of low-paid workers in every synthetic region.
+
+Employment fell slightly in the smallest firms, and stayed flat elsewhere in the synthetic panel.
+
+## Methods
+
+The synthetic panel follows 120 regions over ten years, with a wage floor raised in half of them.
+"""
+CHINESE_NOTES = """# 最低工资与就业笔记
+
+## 研究发现
+
+最低工资上调后，各合成地区低收入工人的收入都有所提高。
+
+小企业的就业略有下降，其他企业的就业基本不变。
+
+## 研究方法
+
+合成面板追踪 120 个地区十年的数据，其中一半地区上调了最低工资。
+""".encode()

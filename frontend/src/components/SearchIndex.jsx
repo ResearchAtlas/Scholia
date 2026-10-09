@@ -9,11 +9,10 @@ import { useT } from '../i18n/index.js';
 import { useAction } from '../action.js';
 import { downloadOffered, keywordOnlyReason } from '../helper.js';
 import { fraction, followRun } from '../runs.js';
-import { indexBusy, indexStatus, rebuildIndex } from '../search.js';
+import { indexPoll, indexStatus, rebuildIndex } from '../search.js';
 import { LoadState } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 
-const POLL_MS = 1500;
 
 export function IndexSection({ project }) {
   const t = useT();
@@ -25,8 +24,7 @@ export function IndexSection({ project }) {
     .catch((error) => setProblem(error?.code ?? 'internal')), [project.id]);
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
-    if (!indexBusy(index)) return undefined;
-    const timer = setTimeout(load, POLL_MS);
+    const timer = setTimeout(load, indexPoll(index));
     return () => clearTimeout(timer);
   }, [index, load]);
 

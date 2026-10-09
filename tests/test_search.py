@@ -10,16 +10,15 @@ text's tokens hashed into 1024 dimensions, so texts sharing words are near), nev
 
 import asyncio
 import contextlib
-import hashlib
 import json
-import math
 
 import httpx
 import pytest
 
 from backend import local_helper
 from backend.local_helper import EMBEDDING, Config
-from backend.search_index import DIMENSIONS, SearchIndex, tokens
+from backend.search_index import SearchIndex
+import synthetic_materials as synthetic
 from network_guard import allow_subprocess
 from scholia_app import run_finished, started
 from test_local_helper import PIN, TIMINGS, WEIGHTS, Fake
@@ -28,14 +27,7 @@ from test_materials import added, project_of, rows
 pytestmark = pytest.mark.asyncio
 
 
-def vector(text):
-    """A synthetic embedding of text (a query's instruction left out): its tokens hashed into DIMENSIONS
-    and normalized."""
-    values = [0.0] * DIMENSIONS
-    for _, _, token, _ in tokens(text.split("Query:", 1)[-1]):
-        values[int(hashlib.sha256(token.encode()).hexdigest(), 16) % DIMENSIONS] += 1.0
-    norm = math.sqrt(sum(v * v for v in values)) or 1.0
-    return [v / norm for v in values]
+vector = synthetic.embedding
 
 
 class Remote:

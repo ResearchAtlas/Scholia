@@ -28,7 +28,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -118,7 +118,9 @@ async function startServer(dir) {
   const child = spawn('uv', ['run', '--no-sync', 'python', 'tests/walkthrough.py', '--request-log', log],
     { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = '';
+  let exit = null;  // how the server ended, if it ended before the run stopped it
   child.stderr.on('data', (chunk) => { stderr += chunk; });
+  child.on('exit', (code, signal) => { exit = { code, signal }; });
   const lines = { };
   await new Promise((resolve, reject) => {
     let text = '';
@@ -143,7 +145,8 @@ async function startServer(dir) {
     throw new Error(`the server's listener on port ${url.port} was not found`);
   }
   return { child, pid, origin: url.origin, session: url.hash.replace('#session=', ''), dataFolder: lines['data folder'],
-           materials: lines.materials, modelFile: lines['model file'], log, stderr: () => stderr };
+           materials: lines.materials, modelFile: lines['model file'], helperControl: lines['helper control'], log,
+           stderr: () => stderr, exit: () => exit };
 }
 
 // Every file of the build, fetched from the server, must be byte for byte the built file.
@@ -842,6 +845,214 @@ async function materials(ctx) {
   await page.keyboard.press('Escape'); await page.waitForTimeout(500);
 }
 
+// The S1-17 flows: the search model's offer at a project's first material (none in a Local only
+// project, which shows the keyword-only note; Later in another; Download from ModelScope), the index
+// built once the model is installed, Library search in English and Chinese with a result opening its
+// paper at its passage, keyword-only search when the helper does not answer, and a rebuild under
+// This project. The search model the S1-16 flow imported is removed first, as on a Mac that never had it.
+async function s117(ctx) {
+  const { page, L, P, C, step, check, get } = ctx;
+  const { dialog, openSidebar, openSettings, scrollTo } = navigation(ctx);
+  const panel = () => page.getByRole('complementary', { name: L('panel.library') });
+  const named = C.lang === 'en'
+    ? { local: 'Field notes (synthetic, Local only)', offer: 'Wage floors review (synthetic)', later: 'Reading list (synthetic)' }
+    : { local: '田野笔记（合成数据，仅本机）', offer: '最低工资综述（合成数据）', later: '阅读清单（合成数据）' };
+  const notes = 'Wage floors and employment';
+  const chinese = '最低工资与就业笔记';
+  const file = (name) => join(C.materials, `${name}.md`);
+  const requests = () => readFileSync(C.requestLog, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const downloads = () => requests().filter((r) => /huggingface|hf\.co|modelscope/.test(r.host));
+  const helper = () => get('/api/helper').then((r) => r.body);
+  const index = (id) => get(`/api/projects/${id}/index`).then((r) => r.body);
+  const asks = (id) => get(`/api/asks?project_id=${id}`).then((r) => r.body.asks);
+  const runs = (id, workflow) => get('/api/activity?limit=200').then((r) => r.body.runs
+    .filter((run) => run.project_id === id && run.workflow === workflow));
+  const offerAsk = () => panel().getByRole('group', { name: L('ask.label') });
+  const until = async (what, test, tries = 150) => {
+    for (let i = 0; i < tries; i += 1) { const value = await test(); if (value) return value; await page.waitForTimeout(200); }
+    throw new Error(`${what} did not happen in time`);
+  };
+  const create = async (name, sensitivity = 'normal') => {
+    const made = await get('/api/projects', { method: 'POST', body: JSON.stringify({ name, sensitivity }) });
+    check(`the project is made (${sensitivity})`, made.body?.sensitivity === sensitivity);
+    return made.body.id;
+  };
+  const switchTo = async (name) => {
+    await page.reload(); await page.getByRole('textbox', { name: L('composer.label') }).waitFor(); // its list, read again
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+    await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(1200);
+    if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+  };
+  const add = async (id, name) => {
+    await page.getByTestId('library-files').setInputFiles(file(name));
+    await until('the paper being read', async () => (await get(`/api/projects/${id}/materials`)).body.materials
+      .some((m) => m.title === name && m.state === 'ready'));
+    await until('its indexing', async () => !(await runs(id, 'index')).some((r) => r.status === 'running'));
+    await panel().getByRole('listitem').filter({ hasText: name }).getByText(L('library.state.ready'), { exact: true })
+      .waitFor({ timeout: 10000 });  // as the Library shows it
+  };
+  const search = async (query) => {
+    const field = panel().getByRole('textbox', { name: L('search.label') });
+    await field.fill(query); await field.press('Enter');
+    await panel().getByRole('button', { name: L('search.backToPapers') }).waitFor(); await page.waitForTimeout(600);
+  };
+
+  await page.keyboard.press('Escape'); await page.waitForTimeout(400);
+  const model = (await helper()).models[0];
+  rmSync(join(C.dataFolder, 'models', model.id, model.file));
+  check('the harness removed the search model', !(await helper()).models[0].installed);
+  const downloadsBefore = downloads().length;
+
+  const localId = await create(named.local, 'local_only');
+  await step('33-local-only-no-offer', async () => {
+    await switchTo(named.local);
+    await add(localId, notes);
+    await panel().getByRole('note').getByText(L('helper.localOnlyTitle'), { exact: true }).waitFor();
+    check('the Library says search is keyword-only until the model is imported, under Settings, Advanced',
+      await panel().getByText(L('helper.localOnlyBody'), { exact: true }).count() === 1);
+    check('a Local only project raises no offer', (await asks(localId)).length === 0 && (await runs(localId, 'model_offer')).length === 0
+      && await offerAsk().count() === 0);
+    const status = await index(localId);
+    check('its papers are indexed for keyword search', status.passages.indexed > 0 && status.mode === 'keyword_only'
+      && status.reason === 'model_missing');
+  });
+
+  const offerId = await create(named.offer);
+  await step('34-first-material-offer', async () => {
+    await switchTo(named.offer);
+    await add(offerId, notes);
+    await offerAsk().waitFor({ timeout: 20000 });
+    const [open] = await asks(offerId);
+    check('one offer, through the shared confirmation, naming its project', open?.kind === 'model_download'
+      && open.options.join() === 'huggingface,modelscope,later' && open.text_box === false
+      && (await offerAsk().innerText()).includes(L('ask.project').replace('{name}', named.offer)));
+    for (const option of ['huggingface', 'modelscope', 'later']) {
+      check(`it offers ${option}`, await offerAsk().getByRole('button', { name: L(`ask.model_download.option.${option}`), exact: true }).count() === 1);
+    }
+    check('nothing was downloaded or probed before the answer', downloads().length === downloadsBefore);
+  });
+  await step('34b-offer-details', async () => {
+    await offerAsk().locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(600);
+    const shown = await offerAsk().innerText();
+    check('its details show the size, both sources, the SHA-256, the license and the folder', shown.includes(model.sha256)
+      && shown.includes(model.sources.huggingface) && shown.includes(model.sources.modelscope) && shown.includes(model.license)
+      && shown.includes(model.folder));
+  });
+  await step('35-keyword-only-search', async () => {
+    await offerAsk().locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(300);
+    await search('earnings of low-paid workers');
+    const said = L('helper.keywordOnly').replace('{reason}', L('helper.reason.model_missing'));
+    check('the results say search is keyword-only, for want of the model', await panel().getByText(said, { exact: true }).count() === 1);
+    const found = (await get(`/api/projects/${offerId}/search`, { method: 'POST', body: JSON.stringify({ query: 'earnings' }) })).body;
+    check('keyword search finds the paper', found.mode === 'keyword_only' && found.reason === 'model_missing'
+      && found.results.some((r) => r.title === notes));
+  });
+
+  const laterId = await create(named.later);
+  await step('35b-later', async () => {
+    await switchTo(named.later);
+    await add(laterId, chinese);
+    await offerAsk().waitFor({ timeout: 20000 });
+    await offerAsk().getByRole('button', { name: L('ask.model_download.option.later'), exact: true }).click();
+    await offerAsk().waitFor({ state: 'hidden' });
+    await add(laterId, notes);
+    await page.waitForTimeout(1000);
+    const offers = await runs(laterId, 'model_offer');
+    check('Later is saved and sends nothing', offers.length === 1 && offers[0].result?.answer === 'later'
+      && downloads().length === downloadsBefore);
+    check('and the project is not asked again at its next paper', (await asks(laterId)).length === 0 && await offerAsk().count() === 0);
+    const audited = (await get(`/api/audit?project_id=${laterId}`)).body.entries;
+    check('the answer is audited', audited.some((e) => e.event === 'ask_answered' && e.data.question === 'model_download'
+      && e.data.answer === 'later'));
+  });
+
+  await step('36-download-answer', async () => {
+    await switchTo(named.offer);
+    await offerAsk().waitFor();
+    await offerAsk().getByRole('button', { name: L('ask.model_download.option.modelscope'), exact: true }).click();
+    await offerAsk().waitFor({ state: 'hidden' });
+    await until('the model installed', async () => (await helper()).models[0].installed, 300);
+    const [offer] = await runs(offerId, 'model_offer');
+    check('the answer started one download, from ModelScope', offer?.result?.answer === 'modelscope' && offer.result.outcome === 'started');
+    const read = await helper();
+    check('the model is installed, and its source remembered', read.models[0].installed && read.model_source === 'modelscope');
+    check('the download went to ModelScope and its file host only, once', downloads().slice(downloadsBefore).map((r) => r.host).join()
+      === 'modelscope.cn,cdn-lfs-cn-1.modelscope.cn');
+  });
+  await step('36b-index-built', async () => {
+    const material = (await get(`/api/projects/${offerId}/materials`)).body.materials.find((m) => m.title === notes);
+    const status = await until('the embeddings', async () => {
+      const read = await index(offerId);
+      const mine = read.materials[material.id];
+      return read.mode === 'hybrid' && mine?.embeddable > 0 && mine.embedded === mine.embeddable && read;
+    });
+    const row = panel().getByRole('listitem').filter({ hasText: notes });
+    await row.locator('summary', { hasText: L('library.details') }).click();
+    await row.getByText(L('search.paperIndexed'), { exact: true }).waitFor({ timeout: 10000 }); // read again within 5 s
+    check('its Details say it is indexed for keyword and meaning search',
+      await row.getByText(L('search.paperIndexed'), { exact: true }).count() === 1);
+    check('the index holds its passages, every one embedded', status.passages.embedded === status.passages.embeddable);
+    await row.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(300);
+  });
+
+  await step('37-search-english', async () => {
+    await add(offerId, chinese);
+    await until('every embedding', async () => { const r = await index(offerId); return r.passages.embedded === r.passages.embeddable; });
+    await search('employment in small firms');
+    check('the results show no keyword-only note', await panel().getByText(P('helper.keywordOnly')).count() === 0);
+    const found = (await get(`/api/projects/${offerId}/search`, { method: 'POST', body: JSON.stringify({ query: 'employment in small firms' }) })).body;
+    check('search runs by keywords and meaning, and ranks the passage first',
+      found.mode === 'hybrid' && found.results[0]?.text.startsWith('Employment fell slightly'));
+    const first = await panel().getByRole('listitem').first().innerText();
+    check('each result shows its paper, its section and its text, never a score', first.includes(notes) && first.includes('Findings')
+      && first.includes('Employment fell slightly') && !('score' in found.results[0]));
+  });
+  await step('37b-search-chinese', async () => {
+    await search('最低工资 收入');
+    const found = (await get(`/api/projects/${offerId}/search`, { method: 'POST', body: JSON.stringify({ query: '最低工资 收入' }) })).body;
+    check('a Chinese query finds the Chinese passage first', found.results[0]?.title === chinese
+      && found.results[0].text.startsWith('最低工资上调后'));
+    check('the Library shows it first', (await panel().getByRole('listitem').first().innerText()).includes('最低工资上调后'));
+  });
+  await step('37c-result-opened', async () => {
+    const found = (await get(`/api/projects/${offerId}/search`, { method: 'POST', body: JSON.stringify({ query: '最低工资 收入' }) })).body;
+    await panel().getByRole('listitem').first().getByRole('button').click();
+    await until('the passage focused', () => page.evaluate((id) => document.activeElement?.dataset?.passage === id, found.results[0].passage_id), 50);
+    check('the paper opens at the passage, shown and highlighted', await page.evaluate(() => {
+      const box = document.activeElement.getBoundingClientRect();
+      return box.top >= 0 && box.bottom <= window.innerHeight;
+    }));
+  });
+
+  await step('38-helper-unavailable', async () => {
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    writeFileSync(C.helperControl, 'offline');
+    try {
+      await search('employment in small firms');
+      const said = L('helper.keywordOnly').replace('{reason}', L('search.reason.request_failed'));
+      check('the results say search is keyword-only this time, and why', await panel().getByText(said, { exact: true }).count() === 1);
+      const found = (await get(`/api/projects/${offerId}/search`, { method: 'POST', body: JSON.stringify({ query: 'employment' }) })).body;
+      check('keyword results are still returned', found.mode === 'keyword_only' && found.reason === 'request_failed' && found.results.length > 0);
+    } finally {
+      rmSync(C.helperControl, { force: true });
+    }
+  });
+
+  await step('39-rebuild', async () => {
+    await panel().getByRole('button', { name: L('search.backToPapers') }).click(); await page.waitForTimeout(300);
+    await openSettings('settings.page.project');
+    await scrollTo('search.indexTitle');
+    await dialog().getByRole('button', { name: L('search.rebuild'), exact: true }).click();
+    await dialog().getByText(L('search.rebuilt'), { exact: true }).waitFor({ timeout: 30000 });
+    const status = await index(offerId);
+    check('"Rebuilt" is said once the rebuild run succeeded, every passage indexed and embedded again', status.run?.rebuild
+      && status.run.status === 'succeeded' && status.passages.embedded === status.passages.embeddable && status.passages.indexed > 0);
+    await dialog().getByText(L('search.rebuilt'), { exact: true }).scrollIntoViewIfNeeded();
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+}
+
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
 // of its animations, read with them paused (Web Animations API). The box shows the composed
 // motion, whichever properties (transform, translate) carry it.
@@ -1166,6 +1377,7 @@ async function run(combo, build, outRoot) {
                 project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
                 localProject: combo.lang === 'en' ? 'Interview transcripts (synthetic, Local only)' : '访谈记录（合成数据，仅本机）',
                 dataFolder: server?.dataFolder, modelFile: server?.modelFile, requestLog: server?.log,
+                helperControl: server?.helperControl,
                 question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
     const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
     const step = async (name, body, before) => {
@@ -1188,6 +1400,7 @@ async function run(combo, build, outRoot) {
     await m1(ctx);
     if (server) await s116(ctx);  // its synthetic model and download source are the test server's
     if (C.materials) await materials(ctx);  // an attached app has no synthetic materials of its own
+    if (C.materials) await s117(ctx);  // S1-17: its stand-in helper and download source are the test server's
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);
@@ -1211,6 +1424,8 @@ async function run(combo, build, outRoot) {
       manifest.network.blockedRequests = blocked;
       manifest.console = consoleMessages;
       if (server) manifest.serverErrors = server.stderr().split('\n').filter((line) => /error|traceback/i.test(line));
+      if (server) writeFileSync(join(out, 'server.log'), server.stderr());  // the server's own output, kept with the run
+      if (server?.exit()) manifest.serverExit = server.exit();  // it ended before the run stopped it
     } finally {
       try {
         if (browser) await browser.close().catch((error) => { manifest.closeError = String(error); });

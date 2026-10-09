@@ -63,8 +63,13 @@ export function paperIndexed(index, materialId) {
   return ['search.paperIndexed', {}];
 }
 
-// Whether the index status is worth reading again soon: an index run is running.
+// Whether the index status is worth reading again soon: an index run is running, or the index is
+// being rebuilt.
 export const indexBusy = (index) => index?.run?.status === 'running' || index?.state === 'building';
+
+// How long until the index status is read again while it is shown: soon while it is busy, else now
+// and then, since the search model can arrive from elsewhere (a download, an import) at any time.
+export const indexPoll = (index) => (indexBusy(index) ? 1500 : 5000);
 
 // Bring a passage of the paper's text view into view and focus it (which highlights it), once its
 // stretch of passages (PASSAGE_STRETCH, read only near the view) has loaded: the stretch is scrolled
