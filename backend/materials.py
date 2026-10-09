@@ -70,6 +70,7 @@ log = logging.getLogger(__name__)
 
 EXTRACTION_SECONDS = 30 * 60  # per material version (section 13)
 READINGS = 2  # readings at once, each holding its file's bytes; the others wait their turn without them
+RENDERS = 2  # page images rendered at once, as READINGS
 MAX_FILES = 20  # per request
 AUTHOR_CHARS = 2 * lookup.NAME_CHARS + 2  # an author as the details form sends one: "Family, Given", each part a lookup's
 BATCH_IDLE_SECONDS = 120  # an open batch (a drop still being sent) with no addition for this long closes itself
@@ -961,7 +962,8 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
         return extraction.render_page(state["content"].read(row[0]), number, max(0.5, min(scale, 3.0)))
 
     try:
-        image = await asyncio.to_thread(render)
+        async with state.setdefault("renders", asyncio.Semaphore(RENDERS)):  # held to the render's end
+            image = await _to_end(asyncio.to_thread(render))
     except IndexError:
         raise _refused(404, "not_found", "No such page") from None
     except (extraction.Unreadable, FileNotFoundError, ContentCorruptError):

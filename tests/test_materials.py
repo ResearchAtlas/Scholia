@@ -672,6 +672,36 @@ async def test_a_docx_declaring_an_entity_is_refused_and_nothing_of_it_is_writte
         assert (refused["state"], refused["reason"]) == ("needs_attention", "unreadable_file")
 
 
+async def test_at_most_two_page_images_hold_their_files_at_once(tmp_path, monkeypatch):
+    lock, holding, most = threading.Lock(), [0], [0]
+    real_read, real_render = ContentStore.read, extraction.render_page
+
+    def read(store, sha256):  # a page image's bytes are held from here to its render's end
+        with lock:
+            holding[0] += 1
+            most[0] = max(most[0], holding[0])
+        return real_read(store, sha256)
+
+    def render(data, number, scale=2.0):
+        try:
+            threading.Event().wait(0.1)
+            return real_render(data, number, scale)
+        finally:
+            with lock:
+                holding[0] -= 1
+
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, PDF)
+        [paper] = await settled(client, project)
+        monkeypatch.setattr(ContentStore, "read", read)
+        monkeypatch.setattr(extraction, "render_page", render)
+        pages = await asyncio.gather(*[client.get(f"/api/material-versions/{paper['version']['id']}/pages/{1 + i % 2}")
+                                       for i in range(6)])
+        assert [page.status_code for page in pages] == [200] * 6
+        assert most[0] == 2
+
+
 async def test_a_pdf_page_is_rendered_as_a_png_and_only_a_pdf_has_pages(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
