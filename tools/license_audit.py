@@ -118,6 +118,11 @@ LIBRARIES = {
     # MIT); zlib (Zlib).
     PDFIUM: ("BSD-3-Clause AND MIT AND Apache-2.0 AND LicenseRef-AGG-2.3 AND FTL AND Unicode-3.0 AND IJG AND Zlib"
              " AND BSD-2-Clause AND Libpng AND (Apache-2.0 WITH LLVM-exception) AND (Apache-2.0 OR MIT)", []),
+    # The Unicode Character Database 17.0's properties, names and break rules, built into APSW's
+    # _unicode extension as tables (apsw 3.53.4.0: tools/ucdprops2code.py generates src/_unicodedb.c
+    # from the UCD's data files, and src/unicode.c includes it). The UCD is under the Unicode License
+    # v3; its text, as https://www.unicode.org/license.txt served it on 2026-10-10, ships.
+    "Unicode-data": ("Unicode-3.0", [ROOT / "tools/notices/unicode-data/LICENSE"]),
     # The search model's license files. The model never ships; the app installs these beside it
     # when it is downloaded or imported (backend/local_helper.py; slice 1 section 18).
     "Qwen3-Embedding-0.6B": ("Apache-2.0", [ROOT / "tools/notices/Qwen3-Embedding-0.6B/LICENSE",
@@ -146,7 +151,13 @@ MPL_PACKAGES = {
 # Distributions whose native code was reviewed: for each native file (a pattern on its path
 # in the installed distribution), the third-party libraries it embeds (names in LIBRARIES).
 REVIEWED_NATIVE: dict[str, dict[str, list[str]]] = {
-    "apsw": {"apsw/__init__.*": ["SQLite"]},  # the SQLite amalgamation, linked statically
+    "apsw": {
+        "apsw/__init__.*": ["SQLite"],  # the SQLite amalgamation, linked statically
+        # Reviewed for 3.53.4.0 (S1-17's search tokenizer loads it through apsw.fts5): built from APSW's
+        # own src/unicode.c (zlib, Roger Binns) with the UCD tables it includes; links only libSystem; its
+        # symbols are APSW's functions and the generated tables; no other project's notice in it.
+        "apsw/_unicode.*": ["Unicode-data"],
+    },
     "sqlite-vec": {"sqlite_vec/vec0.dylib": []},  # one C source file, no dependencies
     # Bindings to Apple's frameworks; libffi comes from the system, not the wheel.
     "pyobjc-core": {"objc/*": []},
