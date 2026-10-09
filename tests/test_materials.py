@@ -85,6 +85,14 @@ def hold_extraction(monkeypatch):
 PDF = ("paper.pdf", synthetic.paper_pdf())
 
 
+@pytest.fixture
+def kept_queue(monkeypatch):
+    """The search index (S1-17) applies the index queue and takes the rows it applied off it; with this,
+    it leaves them, so what was queued can be read back."""
+    from backend.search_index import SearchIndex
+    monkeypatch.setattr(SearchIndex, "_prune", lambda self, seq: None)
+
+
 # Lifecycle: cancellation, deletion, limits, restarts
 
 
@@ -134,7 +142,7 @@ async def test_deleting_a_material_while_it_is_read_revokes_its_run_and_nothing_
 
 
 async def test_one_projects_deletion_revokes_only_its_own_reading_of_a_file_another_project_reads(
-        tmp_path, monkeypatch):
+        tmp_path, kept_queue, monkeypatch):
     reached, go = hold_extraction(monkeypatch)
     async with started(tmp_path / "data") as client:
         mine, theirs = await project_of(client, "Mine"), await project_of(client, "Theirs")
@@ -166,7 +174,7 @@ async def test_deleting_the_project_while_its_material_is_read_leaves_nothing_of
         assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
 
 
-async def test_deleting_a_read_material_queues_its_removals_after_its_additions(tmp_path):
+async def test_deleting_a_read_material_queues_its_removals_after_its_additions(tmp_path, kept_queue):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, PDF))["materials"]
@@ -314,7 +322,7 @@ async def test_the_runs_of_added_files_start_with_their_commit_and_never_read_in
     ("notes.md", synthetic.paper_markdown(), {"title", "paragraph", "table", "reference"}),
     ("model.tex", synthetic.paper_latex(), {"title", "abstract", "paragraph", "caption", "table", "reference"}),
 ])
-async def test_each_format_is_stored_once_and_read_into_passages(tmp_path, name, data, kinds):
+async def test_each_format_is_stored_once_and_read_into_passages(tmp_path, kept_queue, name, data, kinds):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, (name, data)))["materials"]
@@ -335,7 +343,7 @@ async def test_each_format_is_stored_once_and_read_into_passages(tmp_path, name,
             p["id"] for p in passages)
 
 
-async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_with_another(tmp_path):
+async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_with_another(tmp_path, kept_queue):
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
         [paper] = (await added(client, first, PDF))["materials"]
@@ -353,7 +361,7 @@ async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_wi
             [(first, count), (second, count)])
 
 
-async def test_two_projects_reading_the_same_file_at_once_queue_each_passage_once_for_each(tmp_path, monkeypatch):
+async def test_two_projects_reading_the_same_file_at_once_queue_each_passage_once_for_each(tmp_path, kept_queue, monkeypatch):
     reached, go = hold_extraction(monkeypatch)
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
@@ -460,7 +468,7 @@ async def ops(client, extraction_id):
     return found
 
 
-async def test_a_newer_reading_takes_the_earlier_readings_passages_out_of_every_index_that_has_them(tmp_path, monkeypatch):
+async def test_a_newer_reading_takes_the_earlier_readings_passages_out_of_every_index_that_has_them(tmp_path, kept_queue, monkeypatch):
     notes = b"# Notes\n\nA first paragraph.\n\nA second paragraph.\n"
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
@@ -480,7 +488,7 @@ async def test_a_newer_reading_takes_the_earlier_readings_passages_out_of_every_
         assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", older) == [(n,)]  # kept
 
 
-async def test_a_replaced_file_leaves_its_projects_index_unless_another_paper_there_still_reads_it(tmp_path):
+async def test_a_replaced_file_leaves_its_projects_index_unless_another_paper_there_still_reads_it(tmp_path, kept_queue):
     one, two, three = (f"# Paper {n}\n\nIts own text, {n}.\n".encode() for n in ("one", "two", "three"))
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
@@ -503,7 +511,7 @@ async def test_a_replaced_file_leaves_its_projects_index_unless_another_paper_th
 
 
 @pytest.mark.parametrize("change", ["replaced", "read by a newer version"])
-async def test_passages_the_index_has_applied_still_leave_it(tmp_path, monkeypatch, change):
+async def test_passages_the_index_has_applied_still_leave_it(tmp_path, monkeypatch, change, kept_queue):
     notes = b"# Notes\n\nA paragraph of synthetic text.\n"
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
@@ -523,7 +531,7 @@ async def test_passages_the_index_has_applied_still_leave_it(tmp_path, monkeypat
         assert await ops(client, reading) == {project: [("remove", n)]}  # once, though no add is left in the queue
 
 
-async def test_a_removal_already_queued_is_not_queued_again_and_one_for_passages_never_added_is_harmless(tmp_path):
+async def test_a_removal_already_queued_is_not_queued_again_and_one_for_passages_never_added_is_harmless(tmp_path, kept_queue):
     async with started(tmp_path / "data") as client:
         project, other = await project_of(client), await project_of(client, "Other")
         await added(client, project, PDF)
@@ -540,7 +548,8 @@ async def test_a_removal_already_queued_is_not_queued_again_and_one_for_passages
         assert await ops(client, reading) == {project: [("add", n), ("remove", n), ("add", n)], other: [("remove", n)]}
 
 
-async def test_deleting_the_paper_that_reads_a_file_takes_it_out_of_the_index_though_another_once_had_it(tmp_path):
+async def test_deleting_the_paper_that_reads_a_file_takes_it_out_of_the_index_though_another_once_had_it(tmp_path,
+                                                                                                kept_queue):
     x, y = b"# File X\n\nIts own text.\n", b"# File Y\n\nAnother text.\n"
     async with started(tmp_path / "data") as client:
         project = await project_of(client)

@@ -8,12 +8,12 @@ import pytest
 
 import synthetic_materials as synthetic
 from scholia_app import started
-from test_materials import added, project_of, rows, settled
+from test_materials import added, kept_queue, project_of, rows, settled  # noqa: F401
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_a_deleted_material_is_read_back_nowhere_and_leaves_its_projects_index(tmp_path):
+async def test_a_deleted_material_is_read_back_nowhere_and_leaves_its_projects_index(tmp_path, kept_queue):
     async with started(tmp_path / "data") as client:
         mine, theirs = await project_of(client, "Mine"), await project_of(client, "Theirs")
         file = ("paper.pdf", synthetic.paper_pdf())  # one file: each PDF made is a new document
@@ -39,7 +39,7 @@ async def test_a_deleted_material_is_read_back_nowhere_and_leaves_its_projects_i
 
 
 @pytest.mark.parametrize("deleted", ["markdown", "latex"])
-async def test_deleting_one_reading_of_a_file_read_two_ways_removes_its_passages_only(tmp_path, deleted):
+async def test_deleting_one_reading_of_a_file_read_two_ways_removes_its_passages_only(tmp_path, deleted, kept_queue):
     source = b"\\section{Method}\n\nText with \\emph{emphasis} here.\n"  # Markdown and LaTeX alike
     async with started(tmp_path / "data") as client:
         project = await project_of(client)

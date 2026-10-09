@@ -33,6 +33,7 @@ from backend import APP_VERSION, credentials, openrouter, openrouter_client, pro
 from backend import backups
 from backend import asks, materials
 from backend import local_helper
+from backend import search  # S1-17: the search index, index runs and the search model's offer
 from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
@@ -298,6 +299,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         # Local background work: reading materials and looking their identifiers up; full backups and exports.
         materials.register(harness, content)
         backups.register(harness, state)
+        search.register(harness, state)  # S1-17: indexing and the search model's offer
         loop = asyncio.get_running_loop()
 
         def damaged():  # a backup's full check found it damaged: the app is limited, so its work stops too
@@ -312,6 +314,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         state.update(db=db, content=content, gate=gate, harness=harness)
         state.pop("damaged", None)
         state.pop("damaged_code", None)
+        await search.open_index(state, db)  # S1-17: checked against this database, the one before closed
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
@@ -345,6 +348,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
             if state.get("harness") is not None:
                 await state["harness"].shutdown()
+            if state.get("index") is not None:  # S1-17: its writer stops before the database closes
+                await asyncio.to_thread(state.pop("index").close)
             await asyncio.to_thread(db.close)
             state.clear()
 
@@ -354,6 +359,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app.include_router(materials.router)  # materials, passages, page images and retries (S1-13)
     app.include_router(asks.router)  # the shared confirmation (S1-13)
     app.include_router(local_helper.router)  # the local model helper and its models, under Advanced
+    app.include_router(search.router)  # S1-17: search, and the index's status and rebuild
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)

@@ -25,7 +25,7 @@ from backend.runs import _event
 from backend.settings import visible
 
 # The kinds that rule the text box out, and how many options an ask may offer.
-NO_TEXT = {"identifier_lookup"}
+NO_TEXT = {"identifier_lookup", "model_download"}
 MAX_OPTIONS = 3
 
 router = APIRouter()

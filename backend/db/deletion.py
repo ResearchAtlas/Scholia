@@ -30,6 +30,13 @@ log = logging.getLogger(__name__)
 # commits, to another project than one read beforehand (a conversation moved meanwhile, say).
 REVOKING = weakref.WeakKeyDictionary()
 
+# The search index open over a database, if any, by database: delete() calls its cleanup after the
+# deletion commits (and after the WAL truncation), so the index's removals are applied, with secure
+# delete, and checked gone without waiting for an index run (backend/search_index.py). A failure is
+# logged; the removals stay queued for the index's next pass, and search checks access in this
+# database meanwhile.
+CLEANUP = weakref.WeakKeyDictionary()
+
 # What can be deleted: kind -> (table, column holding the tombstone's title).
 KINDS = {
     "project": ("projects", "name"),
@@ -198,6 +205,11 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
             log.warning("the WAL could not be truncated after a deletion; a reader still needed it")
     except Exception as error:
         log.warning("WAL truncation after a deletion failed (%s)", type(error).__name__)
+    if (cleanup := CLEANUP.get(db)) is not None:
+        try:
+            cleanup()
+        except Exception as error:
+            log.warning("the search index's cleanup after a deletion failed (%s)", type(error).__name__)
     return revoked
 
 
