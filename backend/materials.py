@@ -911,9 +911,12 @@ _PASSAGE_COLUMNS = "id, ordinal, page, section_path, kind, text, char_start, cha
 
 
 @router.get("/api/material-versions/{version_id}/passages")
-async def version_passages(version_id: str, request: Request, offset: int = 0, limit: int = PASSAGE_PAGE):
-    """A version's passages in order, a page at a time."""
+async def version_passages(version_id: str, request: Request, offset: int = 0, limit: int = PASSAGE_PAGE,
+                           page: int | None = None):
+    """A version's passages in order, a page of the API at a time; with page, only those on that page of
+    its file (the page viewer's, read as its page comes near the view). total counts them all."""
     limit, offset = max(1, min(limit, PASSAGE_PAGE)), max(0, offset)
+    on_page = () if page is None else (page,)
 
     def fetch(conn):
         row = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v"
@@ -923,8 +926,11 @@ async def version_passages(version_id: str, request: Request, offset: int = 0, l
         extracted = _extraction(conn, *row)
         if extracted is None:
             return {"passages": [], "total": 0}
-        rows = conn.execute(f"SELECT {_PASSAGE_COLUMNS} FROM passages WHERE extraction_id = ? ORDER BY ordinal"
-                            " LIMIT ? OFFSET ?", (extracted[0], limit, offset)).fetchall()
+        # ponytail: a page's passages are found through the version's (extraction_id, ordinal) index, about
+        # 30 ms at 200,000 passages; an index on (extraction_id, page) if that ever shows.
+        rows = conn.execute(f"SELECT {_PASSAGE_COLUMNS} FROM passages WHERE extraction_id = ?"
+                            f"{' AND page = ?' if on_page else ''} ORDER BY ordinal LIMIT ? OFFSET ?",
+                            (extracted[0], *on_page, limit, offset)).fetchall()
         return {"passages": [_passage(r) for r in rows], "total": extracted[6], "pages": extracted[4]}
 
     return await asyncio.to_thread(_state(request)["db"].read, fetch)

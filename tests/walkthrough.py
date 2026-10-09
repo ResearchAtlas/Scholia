@@ -88,6 +88,16 @@ RECORDS = MockScholarly(
     arxiv={ARXIV_ID: "Labour Market Notes on a Synthetic Economy"})
 
 
+def long_notes(paragraphs=3000):
+    """A long synthetic Markdown paper: its title, then numbered paragraphs, a section every 150 of them."""
+    parts = ["# Long Synthetic Notes\n"]
+    for i in range(1, paragraphs + 1):
+        if i % 150 == 1:
+            parts.append(f"## Part {i // 150 + 1}\n")
+        parts.append(f"Paragraph {i} of the long synthetic notes, written for the walkthrough.\n")
+    return "\n".join(parts).encode()
+
+
 def write_materials():
     """The synthetic files the walkthrough adds, written to a new temporary folder, which is returned."""
     folder = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-materials-"))
@@ -100,6 +110,7 @@ def write_materials():
         "scanned-appendix.pdf": synthetic_materials.paper_pdf(title="Scanned Appendix", doi=None, scanned=2),
         "damaged.pdf": b"%PDF-1.7\n" + b"\x00 not a whole PDF " * 40,
         "interview-codebook.md": f"# Interview Codebook\n\ndoi:{DOIS['local']}\n\nSynthetic codes only.\n".encode(),
+        "long-notes.md": long_notes(),
     }
     for name, data in files.items():
         (folder / name).write_bytes(data)

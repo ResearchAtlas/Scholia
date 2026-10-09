@@ -1,7 +1,7 @@
 // Components' handlers and render work, checked in their source parsed with ESLint's parser: files
 // dropped in the docked Library are imported once, by the Library, and the window's drop overlay
-// goes with the drop; the page viewer groups a paper's passages by page once per set of passages;
-// a button that starts work is disabled while its request is pending (React applies that before it
+// goes with the drop; each read of a paper's text made for a part near the view (a page's image,
+// its passages, a stretch of passages) goes when the part is let go; a button that starts work is disabled while its request is pending (React applies that before it
 // handles the next click, so a double click sends one request); the Library says it is adding while
 // any upload is still to finish.
 import test from 'node:test';
@@ -82,35 +82,6 @@ test('a drop elsewhere in the window imports there, and a drag that leaves the w
   assert.equal(state.dropping, false);
 });
 
-// Each byPage call in a source, with the dependencies of the useMemo it is made in ('' when none).
-function groupings(text) {
-  return parsed(text, (context, found) => ({
-    CallExpression(call) {
-      if (call.callee.name !== 'byPage') return;
-      let memo = '';
-      for (let node = call.parent, inner = call; node; inner = node, node = node.parent) {
-        if (node.type === 'CallExpression' && node.callee.name === 'useMemo' && node.arguments[0] === inner) {
-          memo = context.sourceCode.getText(node.arguments[1]);
-          break;
-        }
-        if (['ArrowFunctionExpression', 'FunctionExpression'].includes(node.type) && node.parent?.callee?.name !== 'useMemo') break;
-      }
-      (found.calls ??= []).push(memo);
-    },
-  })).calls ?? [];
-}
-
-test('the page viewer groups the passages by page once per set of passages, not for each page it shows', () => {
-  assert.deepEqual(groupings(source('Paper.jsx')), ['[passages]']);
-});
-
-test('the check finds a grouping made inside the pages\' loop', () => {
-  const inLoop = 'function C({ passages, n }) { return Array.from({ length: n }, (_, i) => <P passages={byPage(passages).get(i)} />); }';
-  const once = 'function C({ passages, n }) { const pages = useMemo(() => passages && byPage(passages), [passages]); return n; }';
-  assert.deepEqual(groupings(inLoop), ['']);
-  assert.deepEqual(groupings(once), ['[passages]']);
-});
-
 // The disabled attribute of each Button showing one of these labels, with the names the component it
 // is in takes from useAction()'s busy (or '' and [] when it has none).
 function pendingButtons(text, labels) {
@@ -147,22 +118,23 @@ test('the check finds a button its pending request does not disable', () => {
   assert.deepEqual(pendingButtons(button('disabled={busy}'), ['runs.retry']), { 'runs.retry': ['busy'] });
 });
 
-// The page image request each effect makes, and whether that effect's cleanup aborts it.
-function imageRequests(text) {
+// The reads of a paper's text each effect makes, and whether that effect's cleanup aborts them.
+const READS = ['pageImage', 'pagePassages', 'passageStretch'];
+function textReads(text) {
   return parsed(text, (context, found) => ({
     CallExpression(call) {
-      if (call.callee.name !== 'pageImage') return;
+      if (!READS.includes(call.callee.name)) return;
       let effect = call.parent;
       while (effect && !(effect.type === 'ArrowFunctionExpression' && effect.parent?.callee?.name === 'useEffect')) effect = effect.parent;
       const body = effect ? context.sourceCode.getText(effect) : '';
-      (found.calls ??= []).push({ signal: call.arguments.length === 4 && context.sourceCode.getText(call.arguments[3]),
+      (found.calls ??= []).push({ read: call.callee.name, signal: context.sourceCode.getText(call.arguments.at(-1)),
         aborted: /return \(\) => \{[^}]*\.abort\(\)/.test(body) });
     },
   })).calls ?? [];
 }
 
-test('a page let go while its image loads aborts that request, so no stale render waits for a slot', () => {
-  assert.deepEqual(imageRequests(source('Paper.jsx')), [{ signal: 'controller.signal', aborted: true }]);
+test('a page or a stretch of passages let go while it loads aborts its requests, so no stale read waits for a slot', () => {
+  assert.deepEqual(textReads(source('Paper.jsx')), READS.map((read) => ({ read, signal: 'controller.signal', aborted: true })));
 });
 
 // What the Library's adding is made from, as source text.

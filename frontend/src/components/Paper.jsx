@@ -4,14 +4,15 @@
 // them; every format also shows its passages as text, in order. The cited passage's highlight comes
 // with S1-19's citations; here a passage is highlighted while it is pointed at or focused, and Tab
 // reaches each passage, in the text and on the page.
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
-import { ACCEPT, byPage, changes, detailsOf, heldPages, hovering, isPdf, isPointed, libraryChanged, loadPassages,
-  NOT_POINTED, pageImage, pointing, rectStyle, reasonKey, takeSaved, unionRect, validYear, viewOf, withNear } from '../library.js';
+import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageImage,
+  pagePassages, PASSAGE_STRETCH, passageStretch, pointing, rectStyle, reasonKey, takeSaved, unionRect, validYear, viewOf,
+  withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -137,27 +138,18 @@ function Details({ material, onSaved }) {
 }
 
 // The paper's text: a PDF's pages with their passages' boxes, or its passages in order. Each version
-// has its own (keyed by it), and the view follows the version's kind: only a PDF has pages.
+// has its own (keyed by it), and the view follows the version's kind: only a PDF has pages. Neither
+// holds the whole text: each part (a page, a stretch of passages) reads what it shows as it comes near
+// the view and lets it go as it leaves, and a part far from the view is an empty box of its size.
 function Contents({ material }) {
   const t = useT();
   const pdf = isPdf(material);
   const [chosen, setChosen] = useState('pages');
   const view = viewOf(material, chosen);
-  const [passages, setPassages] = useState(null);
-  const pages = useMemo(() => passages && byPage(passages), [passages]); // once per set, not for each page shown
-  const [failed, setFailed] = useState(false);
   const [pointed, setPointed] = useState(NOT_POINTED); // the passages with focus and under the pointer
-  const [near, setNear] = useState(() => new Set()); // the pages within two screens of the view
-  const onNear = useCallback((page, isNear) => setNear((current) => withNear(current, page, isNear)), []);
-  const held = heldPages(near); // the pages holding their images: a bounded number, near the view
   const version = material.version.id;
-  useEffect(() => {
-    let live = true;
-    setPassages(null);
-    setPointed(NOT_POINTED); // their elements go: no blur or leave may come for them
-    loadPassages(version).then((found) => live && setPassages(found)).catch(() => live && setFailed(true));
-    return () => { live = false; };
-  }, [version, material.extraction?.passages]);
+  const count = material.extraction.passages ?? 0;
+  useEffect(() => setPointed(NOT_POINTED), [count]); // read again: its passages go, with no blur or leave for them
   return (
     <section className="grid gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -165,22 +157,24 @@ function Contents({ material }) {
         {pdf && <Segmented label={t('paper.view')} value={view} onChange={setChosen}
           options={[{ value: 'pages', label: t('paper.pages') }, { value: 'text', label: t('paper.passages') }]} />}
       </div>
-      {failed && <p role="alert" className="text-sm text-destructive">{t('paper.loadFailed')}</p>}
-      {!passages && !failed && <p role="status" className="text-sm text-muted-foreground">{t('common.loading')}</p>}
-      {passages && view === 'pages' && (
-        <div className="grid gap-4">
-          {Array.from({ length: material.extraction.pages ?? 0 }, (_, i) => (
-            <PageView key={i} version={version} number={i + 1} passages={pages.get(i + 1) ?? []}
-              pointed={pointed} onPoint={setPointed} held={held.has(i + 1)} onNear={onNear} />
-          ))}
-        </div>
-      )}
-      {passages && view === 'text' && <PassageList passages={passages} pointed={pointed} onPoint={setPointed} />}
+      {/* Read again (its count changes), its parts start anew and read the new reading's passages. */}
+      {view === 'pages' ? <PageList key={count} version={version} pages={material.extraction.pages ?? 0}
+        pointed={pointed} onPoint={setPointed} />
+        : <PassageList key={count} version={version} count={count} pointed={pointed} onPoint={setPointed} />}
     </section>
   );
 }
 
-// The element that scrolls the page viewer: the root its pages are near or far from.
+// The parts that hold what they show: those near the view and the one holding focus (heldPages).
+function useHeld() {
+  const [near, setNear] = useState(() => new Set()); // the parts within two screens of the view
+  const [within, setWithin] = useState(null); // the part holding focus
+  const onNear = useCallback((part, isNear) => setNear((current) => withNear(current, part, isNear)), []);
+  const onWithin = useCallback((part, inside) => setWithin((current) => (inside ? part : current === part ? null : current)), []);
+  return { held: heldPages(near, within), onNear, onWithin };
+}
+
+// The element that scrolls the paper's text: the root its parts are near or far from.
 function scroller(element) {
   for (let node = element.parentElement; node; node = node.parentElement) {
     if (/(auto|scroll)/.test(getComputedStyle(node).overflowY)) return node;
@@ -188,41 +182,84 @@ function scroller(element) {
   return null;
 }
 
-// One PDF page with the boxes of its passages over it: its image held only while held (near the
-// view, heldPages), fetched when it is and let go when it is not, its shape kept meanwhile.
-function PageView({ version, number, passages, pointed, onPoint, held, onNear }) {
-  const t = useT();
-  const frame = useRef(null);
-  const [src, setSrc] = useState(null);
-  const [failed, setFailed] = useState(false);
-  const [aspect, setAspect] = useState(null); // its image's width over height, once one was shown
-  useEffect(() => { // says whether it is within two screens of the view, for as long as it is shown
+// A part of the text (a page, a stretch of passages): says whether it is within two screens of the
+// view for as long as it is shown, and whether focus is in it. While its passages are not shown it
+// takes Tab's focus in their place; once they show, it passes focus on to the first of them, or to
+// the last when focus came back from after it, so Tab reaches every passage in order. Returns the
+// props of its element.
+function usePart(frame, part, shown, onNear, onWithin) {
+  const entering = useRef(null);
+  useEffect(() => {
     const element = frame.current;
     if (!element) return undefined;
-    if (typeof IntersectionObserver === 'undefined') { onNear(number, true); return () => onNear(number, false); }
-    const observer = new IntersectionObserver((entries) => onNear(number, entries.some((entry) => entry.isIntersecting)),
+    if (typeof IntersectionObserver === 'undefined') { onNear(part, true); return () => onNear(part, false); }
+    const observer = new IntersectionObserver((entries) => onNear(part, entries.some((entry) => entry.isIntersecting)),
       { root: scroller(element), rootMargin: '200% 0px' });
     observer.observe(element);
-    return () => { observer.disconnect(); onNear(number, false); };
-  }, [number, onNear]);
+    return () => { observer.disconnect(); onNear(part, false); };
+  }, [frame, part, onNear]);
   useEffect(() => {
-    if (!held) { setSrc(null); return undefined; } // let go: fetched again (no-store) once it is near
-    if (src) return undefined;
-    let live = true;
-    const controller = new AbortController(); // let go before it came: its request goes too
-    pageImage(version, number, 1.5, controller.signal).then((url) => live && setSrc(url)).catch(() => live && setFailed(true));
-    return () => { live = false; controller.abort(); };
-  }, [held, src, version, number]);
+    if (!shown || !entering.current) return;
+    const passages = frame.current?.querySelectorAll('[data-passage]') ?? [];
+    (entering.current === 'last' ? passages[passages.length - 1] : passages[0])?.focus();
+    entering.current = null;
+  }, [frame, shown]);
+  return {
+    tabIndex: shown ? undefined : 0,
+    onFocus: (event) => {
+      onWithin(part, true);
+      if (shown || event.target !== event.currentTarget) return;
+      const from = event.relatedTarget;
+      entering.current = from && event.currentTarget.compareDocumentPosition(from) & Node.DOCUMENT_POSITION_FOLLOWING
+        ? 'last' : 'first';
+    },
+    onBlur: (event) => { if (!event.currentTarget.contains(event.relatedTarget)) onWithin(part, false); },
+  };
+}
+
+// A PDF's pages, each holding its image and its passages only while it is held.
+function PageList({ version, pages, pointed, onPoint }) {
+  const { held, onNear, onWithin } = useHeld();
   return (
-    <figure ref={frame} className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs"
+    <div className="grid gap-4">
+      {Array.from({ length: pages }, (_, i) => (
+        <PageView key={i} version={version} number={i + 1} pointed={pointed} onPoint={onPoint}
+          held={held.has(i + 1)} onNear={onNear} onWithin={onWithin} />
+      ))}
+    </div>
+  );
+}
+
+// One PDF page with the boxes of its passages over it: its image and its passages held only while
+// held (near the view or holding focus, heldPages), fetched when it is and let go when it is not, its
+// shape kept meanwhile.
+function PageView({ version, number, pointed, onPoint, held, onNear, onWithin }) {
+  const t = useT();
+  const frame = useRef(null);
+  const [shown, setShown] = useState(null); // { src, passages }
+  const [failed, setFailed] = useState(false);
+  const [aspect, setAspect] = useState(null); // its image's width over height, once one was shown
+  const part = usePart(frame, number, Boolean(shown), onNear, onWithin);
+  useEffect(() => {
+    if (!held) { setShown(null); return undefined; } // let go: fetched again (no-store) once it is near
+    if (shown) return undefined;
+    let live = true;
+    const controller = new AbortController(); // let go before they came: its requests go too
+    Promise.all([pageImage(version, number, 1.5, controller.signal), pagePassages(version, number, controller.signal)])
+      .then(([src, passages]) => live && setShown({ src, passages })).catch(() => live && setFailed(true));
+    return () => { live = false; controller.abort(); };
+  }, [held, shown, version, number]);
+  return (
+    <figure ref={frame} {...part}
+      className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
       aria-label={t('paper.page', { number })}>
-      {src ? <img src={src} alt={t('paper.page', { number })} className="block w-full" draggable={false}
+      {shown ? <img src={shown.src} alt={t('paper.page', { number })} className="block w-full" draggable={false}
         onLoad={(event) => setAspect(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />
         : <div className={cn('grid place-items-center text-xs', !aspect && 'aspect-[612/792]', failed ? 'text-destructive' : 'text-muted-foreground')}
           style={aspect ? { aspectRatio: aspect } : undefined}>
           {failed ? t('paper.pageFailed') : t('common.loading')}
         </div>}
-      {src && passages.map((passage) => (passage.boxes?.rects ?? []).map((rect, i) => (
+      {shown?.passages.map((passage) => (passage.boxes?.rects ?? []).map((rect, i) => (
         <span key={`${passage.id}:${i}`} aria-hidden="true" title={passage.text}
           {...hovering(passage.id, onPoint)}
           className={cn('absolute rounded-[2px] transition-colors duration-150',
@@ -230,7 +267,7 @@ function PageView({ version, number, passages, pointed, onPoint, held, onNear })
           style={rectStyle(rect)} />
       )))}
       {/* One focusable region per passage, around its lines: the keyboard's way to it, with the same highlight. */}
-      {src && passages.filter((passage) => passage.boxes?.rects?.length).map((passage) => (
+      {shown?.passages.filter((passage) => passage.boxes?.rects?.length).map((passage) => (
         <span key={passage.id} role="note" aria-label={passage.text} data-passage={passage.id}
           {...pointing(passage.id, onPoint)}
           className="pointer-events-none absolute rounded-[3px] outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
@@ -250,30 +287,57 @@ const KIND_STYLES = {
   paragraph: 'text-sm leading-relaxed',
 };
 
-// The passages in order, under their section headings, each with its kind and page.
-function PassageList({ passages, pointed, onPoint }) {
+// The passages in order, under their section headings, each with its kind and page: a stretch of
+// PASSAGE_STRETCH at a time, each holding its passages only while it is held.
+function PassageList({ version, count, pointed, onPoint }) {
   const t = useT();
-  let section = null;
+  const { held, onNear, onWithin } = useHeld();
   return (
-    <ol className="grid gap-3" aria-label={t('paper.passages')}>
-      {passages.map((passage) => {
-        const path = passage.section_path.join(' › ');
-        const heading = path && path !== section ? path : null;
-        section = path || section;
-        return (
-          <li key={passage.id} data-passage={passage.id} {...pointing(passage.id, onPoint)}
-            className="grid gap-1.5 rounded-md outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
-            {heading && <p className="pt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{heading}</p>}
-            <div className={cn('rounded-md px-2 py-1 transition-colors duration-150', isPointed(pointed, passage.id) && 'bg-brand-soft')}>
-              {passage.kind !== 'paragraph' && (
-                <span className="mr-2 text-[11px] font-medium uppercase tracking-wide text-brand">{t(`paper.kind.${passage.kind}`)}</span>
-              )}
-              {passage.page != null && <span className="mr-2 text-[11px] tabular-nums text-muted-foreground">{t('paper.onPage', { number: passage.page })}</span>}
-              <p className={cn('break-words', KIND_STYLES[passage.kind])}>{passage.text}</p>
-            </div>
-          </li>
-        );
-      })}
-    </ol>
+    <div role="list" className="grid gap-3" aria-label={t('paper.passages')}>
+      {Array.from({ length: Math.ceil(count / PASSAGE_STRETCH) }, (_, i) => (
+        <PassageStretch key={i} version={version} index={i} size={Math.min(PASSAGE_STRETCH, count - i * PASSAGE_STRETCH)}
+          pointed={pointed} onPoint={onPoint} held={held.has(i)} onNear={onNear} onWithin={onWithin} />
+      ))}
+    </div>
+  );
+}
+
+// One stretch of the passages: read when it is held and let go when it is not, its height kept
+// meanwhile (estimated until it was first shown).
+function PassageStretch({ version, index, size, pointed, onPoint, held, onNear, onWithin }) {
+  const t = useT();
+  const frame = useRef(null);
+  const [shown, setShown] = useState(null); // { passages, before }
+  const [failed, setFailed] = useState(false);
+  const [height, setHeight] = useState(null); // as it was last shown
+  const part = usePart(frame, index, Boolean(shown), onNear, onWithin);
+  useEffect(() => {
+    if (!held) { setShown(null); return undefined; }
+    if (shown) return undefined;
+    let live = true;
+    const controller = new AbortController();
+    passageStretch(version, index, controller.signal).then((found) => live && setShown(found)).catch(() => live && setFailed(true));
+    return () => { live = false; controller.abort(); };
+  }, [held, shown, version, index]);
+  useLayoutEffect(() => { if (shown) setHeight(frame.current.offsetHeight); }, [shown]);
+  const over = shown && headings(shown.passages, shown.before);
+  return (
+    <div ref={frame} {...part} className="grid gap-3 rounded-md outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+      style={shown ? undefined : { height: height ?? size * 64 }}>
+      {shown ? shown.passages.map((passage, i) => (
+        <div role="listitem" key={passage.id} data-passage={passage.id} {...pointing(passage.id, onPoint)}
+          className="grid gap-1.5 rounded-md outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
+          {over[i] && <p className="pt-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{over[i]}</p>}
+          <div className={cn('rounded-md px-2 py-1 transition-colors duration-150', isPointed(pointed, passage.id) && 'bg-brand-soft')}>
+            {passage.kind !== 'paragraph' && (
+              <span className="mr-2 text-[11px] font-medium uppercase tracking-wide text-brand">{t(`paper.kind.${passage.kind}`)}</span>
+            )}
+            {passage.page != null && <span className="mr-2 text-[11px] tabular-nums text-muted-foreground">{t('paper.onPage', { number: passage.page })}</span>}
+            <p className={cn('break-words', KIND_STYLES[passage.kind])}>{passage.text}</p>
+          </div>
+        </div>
+      )) : <p className={cn('text-sm', failed ? 'text-destructive' : 'text-muted-foreground')}>
+        {failed ? t('paper.loadFailed') : t('common.loading')}</p>}
+    </div>
   );
 }

@@ -337,38 +337,58 @@ export async function readAsks(asked, conversationId, show) {
   if (current()) show(found);
 }
 
-// Every passage of a version, read a page of the API at a time.
-export async function loadPassages(versionId) {
+// The text view shows a version's passages a stretch at a time, each read when it comes near the view
+// and let go when it leaves (heldPages): the stretch's passages and the section the one before it is
+// in, so its first heading shows as it does in the whole text. A section's path is never empty once
+// a heading has begun one, so the passage just before says which section a stretch continues.
+export const PASSAGE_STRETCH = 100;
+export async function passageStretch(versionId, index, signal) {
+  const first = index * PASSAGE_STRETCH;
+  const from = Math.max(0, first - 1);
+  const found = await get(`/api/material-versions/${encodeURIComponent(versionId)}/passages?offset=${from}`
+    + `&limit=${first - from + PASSAGE_STRETCH}`, { signal });
+  const before = from < first ? found.passages.shift() : null;
+  return { passages: found.passages, before: before ? before.section_path.join(' › ') : null };
+}
+
+// The section heading over each passage: its section's path where that differs from the section
+// before it (`before` for the first one), or null.
+export function headings(passages, before = null) {
+  let section = before;
+  return passages.map((passage) => {
+    const path = passage.section_path.join(' › ');
+    const heading = path && path !== section ? path : null;
+    section = path || section;
+    return heading;
+  });
+}
+
+// The passages on one page of a PDF, for the page viewer: read when its page comes near the view.
+export async function pagePassages(versionId, number, signal) {
   const all = [];
   for (let offset = 0; ; offset += 500) {
-    const page = await get(`/api/material-versions/${encodeURIComponent(versionId)}/passages?offset=${offset}&limit=500`);
-    all.push(...page.passages);
-    if (!page.passages.length || all.length >= page.total) return all;
+    const found = await get(`/api/material-versions/${encodeURIComponent(versionId)}/passages?page=${number}`
+      + `&offset=${offset}&limit=500`, { signal });
+    all.push(...found.passages);
+    if (found.passages.length < 500) return all;
   }
 }
 
-// Passages grouped by page, for the page viewer.
-export function byPage(passages) {
-  const pages = new Map();
-  for (const passage of passages) {
-    if (passage.page == null) continue;
-    if (!pages.has(passage.page)) pages.set(passage.page, []);
-    pages.get(passage.page).push(passage);
-  }
-  return pages;
-}
-
-// The pages of a PDF holding their rendered images: those near the view (within two screens of the
-// panel's scrolled view), at most MAX_HELD_PAGES, the ones around the middle of that stretch first.
-// Any other page lets its image go, and fetches it again (no-store) once it comes near.
+// The parts of a paper's text that hold what they show (a PDF's pages their images and passages, the
+// text view's stretches their passages): those near the view (within two screens of the panel's
+// scrolled view), at most MAX_HELD_PAGES, the ones around the middle of that stretch first, and the
+// one holding focus wherever it is, so focus never goes with its passage. Any other part lets what it
+// holds go, and fetches it again (no-store) once it comes near.
 export const MAX_HELD_PAGES = 8;
-export function heldPages(near, limit = MAX_HELD_PAGES) {
+export function heldPages(near, within = null, limit = MAX_HELD_PAGES) {
   const pages = [...near].sort((a, b) => a - b);
   const first = Math.max(0, Math.floor((pages.length - limit) / 2));
-  return new Set(pages.slice(first, first + limit));
+  const held = new Set(pages.slice(first, first + limit));
+  if (within != null) held.add(within);
+  return held;
 }
 
-// The pages near the view once one page says whether it is: the same set when that changes nothing.
+// The parts near the view once one says whether it is: the same set when that changes nothing.
 export function withNear(near, page, isNear) {
   if (near.has(page) === isNear) return near;
   const next = new Set(near);

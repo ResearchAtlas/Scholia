@@ -1,8 +1,8 @@
 // The Library's and background runs' helpers (src/library.js, src/runs.js).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES,
+import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePassages, PASSAGE_STRETCH,
   detailsSource, latestLookup, pageImage } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -57,8 +57,6 @@ test('the details form sends only what changed, authors one per line', () => {
 test('a passage box sits over its page by fractions of the page', () => {
   assert.deepEqual(rectStyle([0.1, 0.2, 0.55, 0.25]), { left: '10%', top: '20%', width: '45%', height: '5%' });
   assert.deepEqual(rectStyle([0.5, 0.5, 0.4, 0.4]).width, '0%'); // never negative
-  const pages = byPage([{ id: 'a', page: 1 }, { id: 'b', page: 2 }, { id: 'c', page: 1 }, { id: 'd', page: null }]);
-  assert.deepEqual([...pages.entries()].map(([n, ps]) => [n, ps.map((p) => p.id)]), [[1, ['a', 'c']], [2, ['b']]]);
 });
 
 test('a material is deleted through its own endpoint, with the dialog choices', () => {
@@ -566,4 +564,56 @@ test('a long PDF holds the rendered images of the pages near the view only, a bo
   assert.deepEqual([...heldPages(near)].sort((a, b) => a - b), [20, 21, 22, 23, 24, 25, 26, 27]); // the middle of it
   assert.equal(heldPages(near).size, MAX_HELD_PAGES);
   assert.ok(!heldPages(near).has(1)); // a page far behind lets its image go
+  assert.deepEqual([...heldPages(near, 1)].sort((a, b) => a - b), [1, 20, 21, 22, 23, 24, 25, 26, 27]); // but not with focus in it
+  assert.equal(heldPages(near, 22).size, MAX_HELD_PAGES); // one near holding focus is held already
+});
+
+test('a long text holds a bounded window of its passages, read a stretch at a time as each comes near', async () => {
+  const realFetch = globalThis.fetch;
+  const text = Array.from({ length: 20_000 }, (_, i) => ({ id: `p${i}`, page: Math.floor(i / 40) + 1, kind: 'paragraph',
+    text: `Passage ${i}`, section_path: [`Section ${Math.floor(i / 150)}`] }));
+  const asked = [];
+  globalThis.fetch = async (path) => { // the backend: a page of the API, at most 500, of the whole text or of one PDF page
+    const query = new URL(path, 'http://x').searchParams;
+    asked.push(Object.fromEntries(query));
+    const on = query.has('page') ? text.filter((p) => p.page === Number(query.get('page'))) : text;
+    const offset = Number(query.get('offset')), limit = Math.min(500, Number(query.get('limit')));
+    return new Response(JSON.stringify({ passages: on.slice(offset, offset + limit), total: text.length }), { status: 200 });
+  };
+  try {
+    // Scrolled through the whole text: at most MAX_HELD_PAGES stretches held at any time, with the one holding focus.
+    let near = new Set();
+    let most = 0;
+    const stretches = Math.ceil(text.length / PASSAGE_STRETCH);
+    for (let top = 0; top < stretches; top += 1) {
+      for (let i = Math.max(0, top - 15); i <= Math.min(stretches - 1, top + 15); i += 1) near = withNear(near, i, Math.abs(i - top) <= 12);
+      most = Math.max(most, heldPages(near, 0).size);
+    }
+    assert.equal(most, MAX_HELD_PAGES + 1);
+    assert.ok((MAX_HELD_PAGES + 1) * PASSAGE_STRETCH <= 1000); // passages held at once, of 20,000
+
+    // A stretch is read with the passage before it, for the section it continues; the first has none before it.
+    const first = await passageStretch('v1', 0);
+    assert.deepEqual([first.passages.length, first.passages[0].id, first.before], [PASSAGE_STRETCH, 'p0', null]);
+    const second = await passageStretch('v1', 1);
+    assert.deepEqual([second.passages[0].id, second.passages.length, second.before], ['p100', PASSAGE_STRETCH, 'Section 0']);
+    assert.deepEqual(asked.slice(-2).map((q) => [q.offset, q.limit]), [['0', '100'], ['99', '101']]);
+    const last = await passageStretch('v1', stretches - 1);
+    assert.deepEqual([last.passages.at(-1).id, last.passages.length], ['p19999', PASSAGE_STRETCH]);
+
+    // Its headings are those of the whole text, wherever a stretch begins.
+    const whole = headings(text.slice(0, 600));
+    const pieces = [0, 1, 2, 3, 4, 5].flatMap((i) => headings(text.slice(i * 100, i * 100 + 100), i ? text[i * 100 - 1].section_path.join(' › ') : null));
+    assert.deepEqual(pieces, whole);
+    assert.deepEqual(whole.filter(Boolean), ['Section 0', 'Section 1', 'Section 2', 'Section 3']);
+    assert.deepEqual(headings([{ section_path: [] }, { section_path: ['A'] }, { section_path: [] }, { section_path: ['A'] }]),
+      [null, 'A', null, null]); // a passage with no section keeps the one before it
+
+    // A PDF page's passages, for the page viewer, read on their own.
+    asked.length = 0;
+    assert.deepEqual((await pagePassages('v1', 3)).map((p) => p.id), text.filter((p) => p.page === 3).map((p) => p.id));
+    assert.deepEqual(asked, [{ page: '3', offset: '0', limit: '500' }]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

@@ -827,6 +827,13 @@ async def test_a_pdf_page_is_rendered_as_a_png_and_only_a_pdf_has_pages(tmp_path
         other = papers[extraction.MARKDOWN]["version"]["id"]
         assert (await client.get(f"/api/material-versions/{other}/pages/1")).json()["code"] == "not_a_pdf"
         passages = (await client.get(f"/api/material-versions/{version}/passages")).json()["passages"]
+        for number in (1, 2):  # a page's own passages, in order, a page of the API at a time
+            first = (await client.get(f"/api/material-versions/{version}/passages",
+                                      params={"page": number, "limit": 1})).json()
+            rest = (await client.get(f"/api/material-versions/{version}/passages",
+                                     params={"page": number, "offset": 1})).json()
+            assert first["passages"] + rest["passages"] == [p for p in passages if p["page"] == number]
+            assert first["total"] == len(passages) and len(first["passages"]) == 1
         boxed = [p for p in passages if p["boxes"]]
         assert boxed and all(0 <= v <= 1 for p in boxed for rect in p["boxes"]["rects"] for v in rect)
         one = (await client.get(f"/api/passages/{passages[2]['id']}")).json()

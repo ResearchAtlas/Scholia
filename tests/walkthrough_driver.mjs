@@ -574,7 +574,7 @@ async function materials(ctx) {
     // The PDF replaced by a Markdown file read already (shared, so no new reading): its text shows at once.
     await page.getByTestId('paper-replace').setInputFiles(files('labour-notes.md'));
     const list = panel().getByRole('list', { name: L('paper.passages'), exact: true });
-    await list.waitFor({ timeout: 20000 });
+    await list.getByRole('listitem').first().waitFor({ timeout: 20000 }); // its first stretch, read as it shows
     const paperNow = (await listing(projectId)).materials.find((m) => m.version?.seq === 1);
     check('the replacement is a new version, read by Markdown', paperNow?.version.media_type === 'text/markdown'
       && paperNow.reading === null);
@@ -583,7 +583,50 @@ async function materials(ctx) {
     await list.getByRole('listitem').first().focus();
     await page.waitForTimeout(300);
     check('a passage in the text is reached by focus and highlighted', await page.evaluate(() => Boolean(document.activeElement?.dataset.passage))
-      && await list.locator('li:focus > div[class*="bg-brand-soft"]').count() === 1);
+      && await list.locator('[role="listitem"]:focus > div[class*="bg-brand-soft"]').count() === 1);
+  });
+
+  await step('28c-long-text', async () => {
+    // A paper of 3,001 passages: its text holds the stretches near the view only, read as they come near.
+    const reads = [];
+    const read = (request) => { if (request.url().includes('/passages?')) reads.push(new URL(request.url()).searchParams); };
+    page.on('request', read);
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    await page.getByTestId('library-files').setInputFiles(files('long-notes.md'));
+    const long = (await settled(projectId, 8)).materials.find((m) => m.title === 'long-notes');
+    await paper('long-notes').click(); // named by its file: it has no identifier to look up
+    const list = panel().getByRole('list', { name: L('paper.passages'), exact: true });
+    const passage = (n) => list.getByText(`Paragraph ${n} of the long synthetic notes, written for the walkthrough.`, { exact: true });
+    await passage(1).waitFor({ timeout: 20000 });
+    const shown = () => list.locator('[data-passage]').count();
+    const toEnd = () => page.evaluate(() => { // the panel's scrolling element, scrolled to its end
+      let node = document.querySelector('aside [role="list"]');
+      while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
+      node.scrollTop = node.scrollHeight;
+    });
+    check('it is read into 3,001 passages', long?.extraction.passages === 3001);
+    const first = await shown();
+    check('at first only the stretches near the view are read and shown', first > 0 && first <= 300
+      && reads.every((q) => Number(q.get('limit')) <= 101));
+    // By keyboard, past the end of what is shown: Tab reaches the next stretch's first passage, read for it.
+    await passage(99).evaluate((element) => element.closest('[data-passage]').focus({ preventScroll: true }));
+    await page.keyboard.press('Tab');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('Tab goes on to the next passage, though its stretch was not read yet',
+      await page.evaluate(() => document.activeElement.textContent.includes('Paragraph 100 of')));
+    check('and highlights it', await list.locator('[role="listitem"]:focus > div[class*="bg-brand-soft"]').count() === 1);
+    // Scrolled to the end: the end is read and shown, and the beginning let go.
+    await toEnd();
+    for (let i = 0; i < 20 && !(await passage(3000).count()); i += 1) { await page.waitForTimeout(300); await toEnd(); }
+    await passage(3000).waitFor();
+    await page.waitForTimeout(500);
+    check('scrolled to its end, its last passage shows', await passage(3000).isVisible());
+    check('its beginning is let go, but for the stretch holding focus', await passage(1).count() === 0
+      && await passage(150).count() === 1 && await passage(250).count() === 0);
+    const last = await shown();
+    check('at most nine stretches are held at once', last <= 900);
+    page.off('request', read);
+    ctx.current().measured = { passages: long?.extraction.passages, shownAtFirst: first, shownAtEnd: last, reads: reads.length };
   });
 
   await step('29-details-saved', async () => {
