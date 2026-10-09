@@ -488,6 +488,14 @@ export function pageWindow(offsets, [first, last], held = []) {
   return items;
 }
 
+// The part holding focus once one says focus came into it (inside) or left it: none once focus left
+// the list, but the same while it goes on to another part of the list (toList), until that part says
+// it came: a list that mounts only some parts (pageWindow) keeps the next one mounted meanwhile.
+export function withFocus(current, part, inside, toList) {
+  if (inside) return part;
+  return current === part && !toList ? null : current;
+}
+
 // The parts near the view once one says whether it is: the same set when that changes nothing.
 export function withNear(near, page, isNear) {
   if (near.has(page) === isNear) return near;

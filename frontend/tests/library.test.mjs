@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, withFocus,
   detailsSource, latestLookup, pageImage } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -716,4 +716,12 @@ test('a PDF of 100,000 pages mounts only the pages near the view, with spacers k
   // Focus or a selection far from the view keeps its page mounted, with one on each side.
   assert.deepEqual(pagesOf(at(offsets[70_000], [1, 100_000])).filter((n) => n < 60_000 || n > 80_000), [1, 2, 99_999, 100_000]);
   assert.deepEqual(pageWindow(pageOffsets(0, 900, new Map()), [1, 0]), []); // no pages, nothing to lay out
+});
+
+test('focus going on from one part of the list to another keeps the one it leaves held until the next says it came', () => {
+  assert.equal(withFocus(null, 4, true, false), 4);
+  assert.equal(withFocus(4, 4, false, true), 4); // Tab to page 5: page 4 (and page 5 beside it) stay mounted meanwhile
+  assert.equal(withFocus(4, 5, true, false), 5); // page 5 says focus came
+  assert.equal(withFocus(5, 5, false, false), null); // focus left the list
+  assert.equal(withFocus(5, 3, false, false), 5); // a part focus had already left says so late: nothing changes
 });

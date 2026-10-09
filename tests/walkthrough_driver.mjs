@@ -869,8 +869,29 @@ async function materials(ctx) {
       most = Math.max(most, await figures().count());
     }
     check('Shift+Tab goes back page by page', back.every((n, i) => n !== null && (i === 0 || n < back[i - 1])));
-    check('with only the pages near the view mounted throughout', most <= 16);
-    ctx.current().measured = { forward: visited, back, mostMounted: most };
+    // Scrolled far from the page holding focus, Tab and Shift+Tab still go on from it to the next page.
+    const away = async (screens) => {
+      await page.evaluate((count) => {
+        let node = document.querySelector('aside figure');
+        while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
+        node.scrollTop += count * node.clientHeight;
+      }, screens);
+      await page.waitForTimeout(800);
+    };
+    const from = await at();
+    await away(10);
+    const kept = await at();
+    await page.keyboard.press('Tab'); await page.waitForTimeout(300);
+    const after = await at();
+    await away(-10);
+    await page.keyboard.press('Shift+Tab'); await page.waitForTimeout(300);
+    const before = await at();
+    ctx.current().measured = { forward: visited, back, away: [from, kept, after, before] };
+    check('scrolled away, focus stays on its page, and Tab and Shift+Tab go on from it',
+      kept === from && after > from && before !== null && before < after);
+    most = Math.max(most, await figures().count());
+    check('with only the pages near the view mounted throughout', most <= 20);
+    ctx.current().measured = { forward: visited, back, away: [from, kept, after, before], mostMounted: most };
   });
 
   await step('29-details-saved', async () => {

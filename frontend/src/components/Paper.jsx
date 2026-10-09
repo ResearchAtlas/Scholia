@@ -12,7 +12,7 @@ import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageImage,
   pageLines, pageOffsets, pagePart, pagesWithin, pageWindow, PAGE_WIDTH, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing,
-  rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withNear } from '../library.js';
+  rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withFocus, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -166,13 +166,18 @@ function Contents({ material }) {
 }
 
 // The parts of a list (list, a ref to its element) that hold what they show: those near the view,
-// the one holding focus and the shown ones the reader's selection takes in (heldPages).
+// the one holding focus and the shown ones the reader's selection takes in (heldPages). Focus going
+// from one part to another keeps the one it leaves until the next takes it (to: where it goes), so
+// the part it goes to, held or mounted beside it, is never let go before focus arrives.
 function useHeld(list) {
   const [near, setNear] = useState(() => new Set()); // the parts within two screens of the view
   const [within, setWithin] = useState(null); // the part holding focus
   const [selected, setSelected] = useState([]); // the shown parts the selection takes in
   const onNear = useCallback((part, isNear) => setNear((current) => withNear(current, part, isNear)), []);
-  const onWithin = useCallback((part, inside) => setWithin((current) => (inside ? part : current === part ? null : current)), []);
+  const onWithin = useCallback((part, inside, to) => {
+    const toList = Boolean(to && list.current?.contains(to)); // read as focus moves, not when React runs the update
+    setWithin((current) => withFocus(current, part, inside, toList));
+  }, [list]);
   useEffect(() => {
     const changed = () => {
       const found = list.current ? selectedParts(document.getSelection(), [...list.current.querySelectorAll('[data-part][data-shown]')]) : [];
@@ -229,7 +234,7 @@ function usePart(frame, part, showing, onNear, onWithin) {
     },
     onBlur: (event) => {
       if (event.target === event.currentTarget) entering.current = null; // left before its passages came
-      if (!event.currentTarget.contains(event.relatedTarget)) onWithin(part, false);
+      if (!event.currentTarget.contains(event.relatedTarget)) onWithin(part, false, event.relatedTarget);
     },
   };
   const focusOn = (where) => { frame.current?.focus(); entering.current = where; }; // after onFocus, which sets it too
