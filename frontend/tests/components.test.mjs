@@ -1,6 +1,8 @@
 // Components' handlers and render work, checked in their source parsed with ESLint's parser: files
 // dropped in the docked Library are imported once, by the Library, and the window's drop overlay
-// goes with the drop; the page viewer groups a paper's passages by page once per set of passages.
+// goes with the drop; the page viewer groups a paper's passages by page once per set of passages;
+// a button that starts work is disabled while its request is pending (React applies that before it
+// handles the next click, so a double click sends one request).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -106,4 +108,40 @@ test('the check finds a grouping made inside the pages\' loop', () => {
   const once = 'function C({ passages, n }) { const pages = useMemo(() => passages && byPage(passages), [passages]); return n; }';
   assert.deepEqual(groupings(inLoop), ['']);
   assert.deepEqual(groupings(once), ['[passages]']);
+});
+
+// The disabled attribute of each Button showing one of these labels, with the names the component it
+// is in takes from useAction()'s busy (or '' and [] when it has none).
+function pendingButtons(text, labels) {
+  return parsed(text, (context, found) => {
+    const busy = [];
+    return {
+      VariableDeclarator(node) {
+        if (node.init?.callee?.name !== 'useAction' || node.id.type !== 'ObjectPattern') return;
+        for (const property of node.id.properties) if (property.key.name === 'busy') busy.push(property.value.name);
+      },
+      'JSXElement:exit'(element) {
+        if (element.openingElement.name.name !== 'Button') return;
+        const label = labels.find((key) => context.sourceCode.getText(element).includes(`'${key}'`));
+        if (!label) return;
+        const disabled = element.openingElement.attributes.find((a) => a.name?.name === 'disabled');
+        const names = disabled ? busy.filter((name) => context.sourceCode.getText(disabled).includes(name)) : [];
+        (found.buttons ??= {})[label] = names;
+      },
+    };
+  }).buttons ?? {};
+}
+
+test('Retry, Cancel, Read again and Replace file are disabled while their request is pending', () => {
+  assert.deepEqual(pendingButtons(source('Settings.jsx'), ['runs.retry', 'settings.cancelRun']),
+    { 'runs.retry': ['busy'], 'settings.cancelRun': ['busy'] });
+  assert.deepEqual(pendingButtons(source('Library.jsx'), ['library.readAgain']), { 'library.readAgain': ['busy'] });
+  assert.deepEqual(pendingButtons(source('Paper.jsx'), ['paper.replace']), { 'paper.replace': ['replacing'] });
+});
+
+test('the check finds a button its pending request does not disable', () => {
+  const button = (disabled) => `function R() { const { busy, run } = useAction();
+    return <Button ${disabled} onClick={() => run(retry)}>{t('runs.retry')}</Button>; }`;
+  assert.deepEqual(pendingButtons(button(''), ['runs.retry']), { 'runs.retry': [] });
+  assert.deepEqual(pendingButtons(button('disabled={busy}'), ['runs.retry']), { 'runs.retry': ['busy'] });
 });

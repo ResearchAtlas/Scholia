@@ -6,6 +6,7 @@ import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'r
 import { ArrowDown, ArrowUp, X } from 'lucide-react';
 import { LANGUAGES, LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, patch, post } from '../api.js';
+import { useAction } from '../action.js';
 import { errorText, money } from '../text.js';
 import { projectName } from '../projects.js';
 import { BUDGET_SUGGESTIONS, loadModels, useInstructions, useSettingsFile, utf8Bytes, valueAt } from '../settings.js';
@@ -452,6 +453,7 @@ function BackgroundRuns() {
 // question it waits on, Cancel while it runs and Retry where a new run can do it again.
 function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
   const t = useT();
+  const { busy, run: press } = useAction(); // Cancel and Retry, each disabled while either is pending
   const language = useContext(LanguageContext);
   const share = fraction(run.progress);
   const outcome = run.status === 'running' ? null : runOutcome(run);
@@ -476,9 +478,9 @@ function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
           running: 'bg-brand-soft text-brand', succeeded: 'bg-success/10 text-success', failed: 'bg-destructive/10 text-destructive',
         }[run.status] ?? 'bg-muted text-muted-foreground')}>{t(`status.${run.status}`)}</span>
         {run.status === 'running' && (
-          <Button size="sm" variant="outline" className="h-7" onClick={onCancel}>{t('settings.cancelRun')}</Button>
+          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => press(onCancel)}>{t('settings.cancelRun')}</Button>
         )}
-        {run.retryable && <Button size="sm" variant="outline" className="h-7" onClick={onRetry}>{t('runs.retry')}</Button>}
+        {run.retryable && <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => press(onRetry)}>{t('runs.retry')}</Button>}
       </div>
       {run.status === 'running' && share !== null && (
         <div className="flex items-center gap-2" role="progressbar" aria-label={t('runs.progressLabel')}

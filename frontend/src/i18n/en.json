@@ -332,6 +332,7 @@
   "library.lookup.refused": "This project's protection did not allow it",
   "paper.back": "Library",
   "paper.replace": "Replace file",
+  "paper.replacing": "Uploading…",
   "paper.about": "About this paper",
   "paper.deleteTitle": "Delete {title}?",
   "paper.deleteBody": "Its file, its versions and its passages are deleted from this project. Citations of it keep their quotes.",

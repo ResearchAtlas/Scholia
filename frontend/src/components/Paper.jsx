@@ -26,11 +26,13 @@ export function Paper({ material, project, onBack, onChanged }) {
   const [notice, setNotice] = useState(null);
   const replace = useRef(null);
   const reason = reasonKey(material.reason);
+  const { busy: replacing, run } = useAction(); // one replacement at a time: none finishes after a later choice
 
-  async function replaceFile(files) {
+  function replaceFile(files) {
     setNotice(null);
-    const result = await addTo(project.id, [...files].slice(0, 1), t, setNotice, { materialId: material.id });
-    if (result) onChanged();
+    return run(async () => {
+      if (await addTo(project.id, [...files].slice(0, 1), t, setNotice, { materialId: material.id })) onChanged();
+    });
   }
 
   return (
@@ -42,8 +44,8 @@ export function Paper({ material, project, onBack, onChanged }) {
         <span className="flex-1" />
         <input ref={replace} type="file" accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
           data-testid="paper-replace" onChange={(event) => { replaceFile(event.target.files); event.target.value = ''; }} />
-        <Button variant="ghost" size="sm" className="h-8" onClick={() => replace.current?.click()}>
-          <FileUp aria-hidden="true" />{t('paper.replace')}
+        <Button variant="ghost" size="sm" className="h-8" disabled={replacing} onClick={() => replace.current?.click()}>
+          <FileUp aria-hidden="true" />{replacing ? t('paper.replacing') : t('paper.replace')}
         </Button>
         <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive" onClick={() => setDeleting(true)}>
           <Trash2 aria-hidden="true" />{t('common.delete')}

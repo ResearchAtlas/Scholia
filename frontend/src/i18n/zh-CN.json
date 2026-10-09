@@ -326,6 +326,7 @@
   "library.lookup.refused": "本项目的保护级别不允许查询",
   "paper.back": "文献库",
   "paper.replace": "替换文件",
+  "paper.replacing": "正在上传…",
   "paper.about": "关于这篇论文",
   "paper.deleteTitle": "删除“{title}”？",
   "paper.deleteBody": "它的文件、各个版本和段落会从本项目中删除。引用它的地方会保留引文。",
