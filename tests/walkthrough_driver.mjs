@@ -1005,6 +1005,11 @@ async function parts(ctx) {
     await panel.getByRole('button', { name: 'A Codebook for Synthetic Interviews', exact: true }).click();
     await panel.getByText(L('errors.part_not_loaded')).waitFor();
     check('a paper whose page cannot load says so in the panel, with Try again', await retry(panel).isVisible());
+    // The browser remembers the refused script for the page's life: Try again reloads the window, so
+    // the flows after this one start on a window whose parts load.
+    await Promise.all([page.waitForEvent('load'), retry(panel).click()]);
+    await composer().waitFor(); await page.waitForTimeout(500);
+    check('Try again reloads the window', await composer().isVisible());
   });
 }
 
