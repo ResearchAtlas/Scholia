@@ -371,3 +371,19 @@ test('a PDF too long to lay out says, after its last page shown, that the others
     (view) => calls.push(`chosen ${view}`))();
   assert.deepEqual(calls, ['Passages', 'chosen text']); // focus on the switch's Passages, not lost with the button
 });
+
+// What the background-run list's act does once a run is tried again or stopped, as source text.
+function actBody(text) {
+  return parsed(text, (context, found) => ({
+    FunctionDeclaration(node) {
+      if (node.id?.name === 'act') found.body = context.sourceCode.getText(node.body);
+    },
+  })).body ?? '';
+}
+
+test('a run tried again or stopped in the background-run list wakes the Library open on its project', () => {
+  const body = actBody(source('Settings.jsx'));
+  assert.match(body, /load\(\);\s*libraryChanged\(projectId\);/);
+  assert.match(source('Settings.jsx'), /act\(\(\) => retryRun\(run\.run_id\), run\.project_id\)/);
+  assert.match(source('Settings.jsx'), /act\(\(\) => post\(`\/api\/runs\/\$\{run\.run_id\}\/cancel`\), run\.project_id\)/);
+});

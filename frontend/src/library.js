@@ -177,7 +177,14 @@ export function latestLookup(t, material) {
 }
 
 const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file',
-  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated']);
+  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed']);
+
+// A reading's scanned pages under Details: read by text recognition, or waiting for it where no OCR
+// engine read them (status ocr_needed); null when it has none.
+export function ocrPages(t, extraction) {
+  if (!(extraction?.ocr_pages > 0)) return null;
+  return t(extraction.status === 'ocr_needed' ? 'library.ocrWaiting' : 'library.ocrRead', { count: extraction.ocr_pages });
+}
 
 export function reasonKey(reason) {
   return reason ? `library.reason.${REASONS.has(reason) ? reason : 'other'}` : null;
