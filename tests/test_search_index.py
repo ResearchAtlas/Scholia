@@ -133,7 +133,7 @@ async def test_another_tokenizer_version_tokenizes_the_keyword_rows_again(tmp_pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cause", ["restored", "damaged", "unfinished"])
+@pytest.mark.parametrize("cause", ["restored", "damaged", "unfinished", "another schema"])
 async def test_a_stale_or_damaged_file_is_rebuilt_from_the_main_database_without_holding_up_launch(tmp_path, cause):
     async with app(tmp_path) as client:
         project = await project_of(client)
@@ -152,7 +152,8 @@ async def test_a_stale_or_damaged_file_is_rebuilt_from_the_main_database_without
     else:
         import apsw
         conn = apsw.Connection(str(path))
-        conn.execute("UPDATE index_meta SET value = 'building' WHERE key = 'state'")
+        key, value = ("state", "building") if cause == "unfinished" else ("schema", "0")
+        conn.execute("UPDATE index_meta SET value = ? WHERE key = ?", (value, key))
         conn.close()
     async with app(tmp_path) as client:
         index = client.state["index"]

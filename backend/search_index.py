@@ -13,7 +13,8 @@ thread makes every change, in order; searches read on connections of their own.
 - `index_rows`: the rowid the two share for one project's passage, its material and kind, a digest
   of its index text and whether it is embedded; no text.
 - `index_meta`: the model, its revision, quantization, runtime and dimensions, the tokenizer and its
-  version, the last index_queue sequence applied, and whether a whole rebuild is under way.
+  version, the file's schema version, the last index_queue sequence applied, and whether a whole
+  rebuild is under way.
 
 Rows are kept per project. The writer applies the main database's index_queue in order (`apply`):
 an add takes the passage's index text from the main database if a current version of a material
@@ -23,7 +24,7 @@ follows; a remove deletes the passage's rows. Removed rows are checked gone befo
 truncated, and the applied queue rows are deleted from the main database. Reference passages are
 indexed for keywords, marked by kind and never embedded; search leaves them out.
 
-At open: a file that cannot be read, one a whole rebuild did not finish, or one whose last applied
+At open: a file that cannot be read, one of another schema, one a whole rebuild did not finish, or one whose last applied
 sequence the main database cannot have (a restored or replaced database: its queue's high-water mark
 is lower) is replaced and rebuilt from the main database's current readings, in the writer, while
 the app runs; another tokenizer version re-tokenizes the keyword rows; another model, revision,
@@ -55,6 +56,7 @@ log = logging.getLogger(__name__)
 FILE = Path("index") / "search.sqlite3"
 DIMENSIONS = 1024
 TOKENIZER, TOKENIZER_VERSION = "scholia", "1"
+SCHEMA_VERSION = "1"  # a file of another schema is replaced and rebuilt
 QUEUE_PAGE = 1000  # queue rows applied in one index transaction
 MAX_TERMS = 64  # a query's distinct tokens, at most
 # Han characters: CJK unified ideographs, extension A, the compatibility ideographs and extensions B on.
@@ -75,7 +77,7 @@ CREATE TABLE index_rows (
     embedded INTEGER NOT NULL DEFAULT 0,
     UNIQUE (project_id, passage_id)
 ) STRICT;
-CREATE INDEX index_rows_by_material ON index_rows (project_id, material_id, embedded);
+CREATE INDEX index_rows_by_material ON index_rows (project_id, material_id, embedded, kind);
 CREATE VIRTUAL TABLE fts_passages USING fts5(text, project_id UNINDEXED, passage_id UNINDEXED, tokenize = '{TOKENIZER}');
 INSERT INTO fts_passages (fts_passages, rank) VALUES ('secure-delete', 1);
 """
@@ -306,7 +308,8 @@ class SearchIndex:
             if "index_meta" not in tables:
                 return False, True
             meta = dict(self._conn.execute("SELECT key, value FROM index_meta"))
-            if meta.get("state") != "ready" or int(meta.get("last_seq", -1)) > self.db.read(high_water):
+            if meta.get("state") != "ready" or meta.get("schema") != SCHEMA_VERSION \
+                    or int(meta.get("last_seq", -1)) > self.db.read(high_water):
                 return False, True
             self._vector_tables()
             if (meta.get("tokenizer"), meta.get("tokenizer_version")) != (TOKENIZER, TOKENIZER_VERSION):
@@ -357,8 +360,8 @@ class SearchIndex:
             self._conn.execute("PRAGMA journal_mode = WAL")
             with self._conn:
                 self._conn.execute(SCHEMA)
-                self._meta(state="building", last_seq=0, tokenizer=TOKENIZER, tokenizer_version=TOKENIZER_VERSION,
-                           **self.identity)
+                self._meta(state="building", last_seq=0, schema=SCHEMA_VERSION, tokenizer=TOKENIZER,
+                           tokenizer_version=TOKENIZER_VERSION, **self.identity)
             self._vector_tables()
             last = self.db.read(high_water)
             for (project,) in self.db.read(lambda conn: conn.execute("SELECT id FROM projects").fetchall()):
