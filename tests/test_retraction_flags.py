@@ -3,6 +3,7 @@ identifier resolves through OpenAlex or Crossref, whether the work is retracted 
 when it was checked, over fixture records with known retractions (made up, never real works)."""
 
 import asyncio
+import json
 
 import pytest
 
@@ -55,7 +56,8 @@ async def test_every_resolved_reference_records_its_retraction_and_when_it_was_c
         assert sorted(listed.values()).count("retracted") == 3  # the Library flags each one
 
 
-@pytest.mark.parametrize("updates", [7, "retraction", [7], [{"DOI": "10.5555/notice"}], [{"type": 7}]])
+@pytest.mark.parametrize("updates", [7, "retraction", None, [7], [{"DOI": "10.5555/notice"}], [{"type": 7}],
+                                     [{"type": ""}], [{"type": "  "}]])
 async def test_a_later_answer_whose_retraction_cannot_be_read_leaves_the_flag_as_it_was(tmp_path, updates):
     doi = "10.5555/crossref.retracted"
     mock = MockScholarly(crossref={doi: crossref_work(doi, "CR retracted", retracted=True)})
@@ -72,3 +74,8 @@ async def test_a_later_answer_whose_retraction_cannot_be_read_leaves_the_flag_as
         [paper] = await settled(client, project)
         assert paper["title"] == "CR retracted, again"  # its readable fields are kept
         assert (paper["retraction"], paper["retraction_checked_at"]) == ("retracted", flagged["retraction_checked_at"])
+
+
+async def test_a_crossref_record_with_no_updates_is_not_retracted():
+    record = crossref_work("10.5555/x", "Standing")
+    assert "updated-by" not in record and lookup._crossref("10.5555/x", json.dumps({"message": record}).encode()).retracted is False
