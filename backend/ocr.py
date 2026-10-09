@@ -39,9 +39,10 @@ class Failed(Exception):
 
 class Vision:
     """macOS Vision (section 15): VNRecognizeTextRequest's revision 3 at the accurate level, Simplified
-    Chinese first, then English (Chinese is read only when it comes first). Text as small as
-    MIN_TEXT_PIXELS is looked for: Vision may ignore text under its minimum height, which is set
-    rather than left to the system's default."""
+    Chinese first, then English (Chinese is read only when it comes first), without automatic language
+    detection (which reads English lines better but drops the Han characters of a mixed line). Text
+    as small as MIN_TEXT_PIXELS is looked for: Vision may ignore text under its minimum height, which
+    is set rather than left to the system's default. Each setting is set, not left to the system."""
 
     version = "vision-3"
     LANGUAGES = ("zh-Hans", "en-US")
@@ -65,6 +66,7 @@ class Vision:
             request.setRevision_(vision.VNRecognizeTextRequestRevision3)
             request.setRecognitionLevel_(vision.VNRequestTextRecognitionLevelAccurate)
             request.setRecognitionLanguages_(list(self.LANGUAGES))
+            request.setAutomaticallyDetectsLanguage_(False)
             request.setMinimumTextHeight_(min(1.0, self.MIN_TEXT_PIXELS / bitmap.height))
             handler = vision.VNImageRequestHandler.alloc().initWithCGImage_options_(
                 image, Foundation.NSDictionary.dictionary())
