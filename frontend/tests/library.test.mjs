@@ -2,7 +2,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES,
+  detailsSource, latestLookup } from '../src/library.js';
+import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -212,6 +214,33 @@ test('a request over the body limit has its text in both catalogs', () => {
 test('every lookup outcome a paper\'s details name has its text in both catalogs, a file not read yet included', () => {
   assert.ok(LOOKUP_OUTCOMES.includes('not_read'));
   for (const key of [...LOOKUP_OUTCOMES.map((outcome) => `library.source.${outcome}`), 'errors.not_read', 'library.readAgain']) {
+    assert.ok(key in en && key in zh, key);
+  }
+});
+
+test('a paper\'s details name the record they came from, whatever its latest lookup did, which shows on its own line', () => {
+  const t = makeT('en');
+  const date = (value) => value.slice(0, 10);
+  const resolved = { checked_by: 'lookup', source_key: 'doi:10.5555/x', resolved_at: '2026-01-02T00:00:00.000Z',
+    checked_at: '2026-01-02T00:00:00.000Z' };
+  // Resolved through Crossref, then the file replaced and its new lookup found no record: the details are Crossref's still.
+  const failed = { ...resolved, lookup: { status: 'succeeded', outcome: 'not_found', source: null } };
+  assert.equal(detailsSource(t, failed, {}, date), 'From Crossref, 2026-01-02');
+  assert.equal(latestLookup(t, failed), en['library.lookup.not_found']);
+  for (const [key, service] of [['openalex:W1', 'OpenAlex'], ['arxiv:2401.00001', 'arXiv']]) {
+    const found = { ...resolved, source_key: key, lookup: { status: 'succeeded', outcome: 'resolved', source: null } };
+    assert.equal(detailsSource(t, found, {}, date), `From ${service}, 2026-01-02`);
+    assert.equal(latestLookup(t, found), null); // the lookup that gave them says nothing more
+  }
+  const running = { ...resolved, lookup: { status: 'running' } };
+  assert.equal(latestLookup(t, running), en['library.source.lookingUp']);
+  const edited = { checked_by: 'researcher', checked_at: '2026-03-04T00:00:00.000Z', lookup: { status: 'succeeded', outcome: 'unavailable' } };
+  assert.equal(detailsSource(t, edited, {}, date), 'Edited by you, 2026-03-04');
+  assert.equal(latestLookup(t, edited), en['library.lookup.unavailable']);
+  const file = { checked_by: null, lookup: { status: 'succeeded', outcome: 'not_found' } };
+  assert.equal(detailsSource(t, file, {}, date), en['library.source.not_found']); // from the file: said there once
+  assert.equal(latestLookup(t, file), null);
+  for (const key of [...LOOKUP_OUTCOMES.map((outcome) => `library.lookup.${outcome}`), 'library.fact.lookup']) {
     assert.ok(key in en && key in zh, key);
   }
 });

@@ -9,7 +9,7 @@ import { ApiError, get, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, LOOKUP_OUTCOMES, addFiles, cancelledKey, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey,
+import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEvents, newest, reasonKey, sortFiles, stateKey,
   typeKey, unsettled, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
@@ -237,6 +237,7 @@ export function Facts({ material, project }) {
     extraction && [t('library.fact.passages'), String(extraction.passages)],
     extraction?.ocr_pages > 0 && [t('library.fact.ocr'), t('library.ocrWaiting', { count: extraction.ocr_pages })],
     [t('library.fact.details'), detailsSource(t, material, project, date)],
+    latestLookup(t, material) && [t('library.fact.lookup'), latestLookup(t, material)],
     material.lookup?.identifier && [t('library.fact.identifier'), material.lookup.identifier.replace(/^(doi|arxiv):/, '')],
     [t('library.fact.retraction'), material.retraction === 'retracted' ? t('library.retractedOn', { date: date(material.retraction_checked_at) })
       : material.retraction === 'none' ? t('library.notRetracted', { date: date(material.retraction_checked_at) })
@@ -253,18 +254,4 @@ export function Facts({ material, project }) {
       ))}
     </dl>
   );
-}
-
-function detailsSource(t, material, project, date) {
-  if (material.checked_by === 'researcher') return t('library.source.edited', { date: date(material.checked_at) });
-  const lookup = material.lookup;
-  if (material.checked_by === 'lookup') {
-    return t('library.source.lookedUp', { source: t(`ask.service.${lookup?.source ?? 'openalex'}`), date: date(material.checked_at) });
-  }
-  if (!lookup) return t(project?.review_lock ? 'library.source.locked' : 'library.source.fromFile');
-  if (lookup.waiting) return t('library.source.waiting');
-  if (lookup.status === 'running') return t('library.source.lookingUp');
-  if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
-  const outcome = lookup.outcome;
-  return t(LOOKUP_OUTCOMES.includes(outcome) ? `library.source.${outcome}` : 'library.source.fromFile');
 }

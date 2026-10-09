@@ -110,6 +110,40 @@ export function stateKey(material) {
 // A finished lookup's outcome for a paper, each with its text (library.source.*): what its details say.
 export const LOOKUP_OUTCOMES = ['no_identifier', 'not_read', 'not_found', 'unavailable', 'refused'];
 
+// The service a lookup took a paper's details from, by the key of their record (backend/lookup.py
+// Found.source_key): an OpenAlex work, a DOI's Crossref record or an arXiv ID.
+const SERVICES = { openalex: 'openalex', doi: 'crossref', arxiv: 'arxiv' };
+
+// Where a paper's details come from, as text: the researcher's edit; the record a lookup took them
+// from, and when (kept as they are whatever a later lookup does); or else the file, with what its
+// latest lookup did.
+export function detailsSource(t, material, project, date) {
+  if (material.checked_by === 'researcher') return t('library.source.edited', { date: date(material.checked_at) });
+  const service = SERVICES[material.source_key?.split(':')[0]];
+  if (material.checked_by === 'lookup' && service) {
+    return t('library.source.lookedUp', { source: t(`ask.service.${service}`), date: date(material.resolved_at) });
+  }
+  const lookup = material.lookup;
+  if (!lookup) return t(project?.review_lock ? 'library.source.locked' : 'library.source.fromFile');
+  if (lookup.waiting) return t('library.source.waiting');
+  if (lookup.status === 'running') return t('library.source.lookingUp');
+  if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
+  const outcome = lookup.outcome;
+  return t(LOOKUP_OUTCOMES.includes(outcome) ? `library.source.${outcome}` : 'library.source.fromFile');
+}
+
+// What a paper's latest lookup did, as text, beside details that came from elsewhere (an edit or an
+// earlier lookup's record); null when the details say it already (they are the file's), or when it
+// has nothing to tell (it found their record, or its file was replaced meanwhile).
+export function latestLookup(t, material) {
+  const lookup = material.lookup;
+  if (!lookup || !material.checked_by) return null;
+  if (lookup.waiting) return t('library.source.waiting');
+  if (lookup.status === 'running') return t('library.source.lookingUp');
+  if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
+  return LOOKUP_OUTCOMES.includes(lookup.outcome) ? t(`library.lookup.${lookup.outcome}`) : null;
+}
+
 const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file',
   'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated']);
 
