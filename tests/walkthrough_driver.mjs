@@ -475,7 +475,7 @@ async function s116(ctx) {
 // test-owned OpenAlex, Crossref and arXiv stand-ins; a paper's details and its page viewer; a Local
 // only project's lookup confirmation, answered in the Library; and the background-run list.
 async function materials(ctx) {
-  const { page, L, C, step, check, get } = ctx;
+  const { page, L, P, C, step, check, get } = ctx;
   const panel = () => page.getByRole('complementary', { name: L('panel.library') });
   const dialog = () => page.getByRole('dialog', { name: L('sidebar.settings') });
   const openSidebar = async () => {
@@ -911,6 +911,33 @@ async function materials(ctx) {
     most = Math.max(most, await figures().count());
     check('with only the pages near the view mounted throughout', most <= 20);
     ctx.current().measured = { forward: visited, back, away: [from, kept, after, before], mostMounted: most };
+  });
+
+  await step('59-many-pages-cut', async () => {
+    // Widened until its pages are 720 px wide, the list lays out only the pages under its height cap: focus on page
+    // 19,000, past the new cut, goes to the note after the last page shown, whose button opens the text view.
+    const size = page.viewportSize();
+    await scrollPanel(18_999 * ((await pageList()).laidOut + 16) / 20000);
+    await page.waitForTimeout(800);
+    await pageFigure(19000).focus();
+    const show = panel().getByRole('button', { name: L('paper.showPassages'), exact: true });
+    check('at this width every page is laid out: no note', await show.count() === 0);
+    await page.setViewportSize({ width: 1900, height: size.height });
+    await show.waitFor({ timeout: 10000 });
+    await page.waitForTimeout(500);
+    const cut = await page.evaluate(() => [...document.querySelectorAll('aside figure')].map((f) => Number(f.getAttribute('aria-label')
+      .replace(/\D/g, ''))).reduce((a, b) => Math.max(a, b), 0));
+    check('widened, the list lays out the pages under the cap, page 19,000 not among them', await pageFigure(19000).count() === 0
+      && await panel().getByText(P('paper.pagesCut')).count() === 1);
+    check('and focus, which was on that page, is on the note\'s button', await show.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    const passages = panel().getByRole('radio', { name: L('paper.passages'), exact: true });
+    await panel().getByRole('list', { name: L('paper.passages'), exact: true }).waitFor();
+    check('which opens the text view, focus on its switch', await passages.evaluate((radio) => radio === document.activeElement
+      && radio.getAttribute('aria-checked') === 'true'));
+    await page.setViewportSize(size);
+    await page.waitForTimeout(500);
+    ctx.current().measured = { lastShownNearCut: cut };
   });
 
   await step('29-details-saved', async () => {

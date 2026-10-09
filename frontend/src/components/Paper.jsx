@@ -188,7 +188,7 @@ function useHeld(list) {
     document.addEventListener('selectionchange', changed);
     return () => document.removeEventListener('selectionchange', changed);
   }, [list]);
-  return { held: heldPages(near, [within, ...selected]), onNear, onWithin };
+  return { held: heldPages(near, [within, ...selected]), within, onNear, onWithin };
 }
 
 // The element that scrolls the paper's text: the root its parts are near or far from.
@@ -256,7 +256,7 @@ function usePart(frame, part, showing, onNear, onWithin) {
 function PageList({ version, pages, pointed, onPoint, onText }) {
   const t = useT();
   const list = useRef(null);
-  const { held, onNear, onWithin } = useHeld(list);
+  const { held, within, onNear, onWithin } = useHeld(list);
   const aspects = useRef(new Map()); // each page's width over its height, once its image was shown
   const [learned, learn] = useReducer((n) => n + 1, 0);
   const [width, setWidth] = useState(PAGE_WIDTH);
@@ -289,6 +289,17 @@ function PageList({ version, pages, pointed, onPoint, onText }) {
   }, []);
   const parts = useRef(new Map()); // the part of its passages each page last showed
   const onPart = useCallback((number, part) => parts.current.set(number, part), []);
+  const shown = offsets.length - 1; // the pages laid out: all of them, or those under the cap
+  const note = useRef(null);
+  // The cut coming before the page holding focus (the list widened, or a taller page's shape was learned) takes
+  // that page away, and focus with it: focus goes to the note, which says where its text is. Focus that had
+  // already left the list stays where it went.
+  useLayoutEffect(() => {
+    if (within == null || within <= shown) return;
+    const lost = !document.activeElement || document.activeElement === document.body;
+    onWithin(within, false);
+    if (lost) note.current?.focus();
+  }, [within, shown]);
   return (
     <div ref={list} className="grid gap-4">
       {pageWindow(offsets, span, held).map((item) => (item.page
@@ -296,9 +307,9 @@ function PageList({ version, pages, pointed, onPoint, onText }) {
           held={held.has(item.page)} onNear={onNear} onWithin={onWithin} aspect={aspects.current.get(item.page)} onAspect={onAspect}
           startPart={parts.current.get(item.page) ?? 0} onPart={onPart} />
         : <div key={`before-${item.spacer}`} aria-hidden="true" style={{ height: item.height }} />))}
-      {offsets.length - 1 < pages && <div className="grid justify-items-center gap-2 py-4 text-center">
-        <p className="text-sm text-muted-foreground">{t('paper.pagesCut', { number: offsets.length - 1 })}</p>
-        <Button type="button" variant="outline" size="sm" onClick={onText}>{t('paper.showPassages')}</Button>
+      {shown < pages && <div className="grid justify-items-center gap-2 py-4 text-center">
+        <p className="text-sm text-muted-foreground">{t('paper.pagesCut', { number: shown })}</p>
+        <Button ref={note} type="button" variant="outline" size="sm" onClick={onText}>{t('paper.showPassages')}</Button>
       </div>}
     </div>
   );

@@ -736,6 +736,16 @@ test('a PDF too long to lay out lays out the pages under the height cap, and say
   assert.equal(pageOffsets(10_000, 900, new Map()).length - 1, 10_000);
   // The first page always shows, however tall (a page 1 px wide and 20,000 high, as rendered).
   assert.equal(pageOffsets(5, 900, new Map([[1, 1 / 20_000]]), 1000).length - 1, 1);
+  // A held page the cut comes to pass, as the list widens: laid out at 400 px wide, not at 720, so the list gives its
+  // focus to the note (Paper.jsx) rather than let it go with the page.
+  const narrow = pageOffsets(20_000, 400, new Map());
+  const wide = pageOffsets(20_000, 900, new Map());
+  assert.deepEqual([narrow.length - 1, wide.length - 1 < 19_000], [20_000, true]);
+  const at = (offsets, y) => pageWindow(offsets, pagesWithin(offsets, y - 1000, y + 1000), [19_000])
+    .filter((item) => item.page).map((item) => item.page);
+  assert.ok(at(narrow, narrow[18_999]).includes(19_000)); // the view at it, and held
+  const bottom = wide[wide.length - 1]; // widened: the view where the list now ends, the page still held
+  assert.ok(!at(wide, bottom).includes(19_000) && at(wide, bottom).at(-1) === wide.length - 1);
 });
 
 test('focus going on from one part of the list to another keeps the one it leaves held until the next says it came', () => {

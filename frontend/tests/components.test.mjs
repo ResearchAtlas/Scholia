@@ -363,7 +363,7 @@ function pagesCut(text) {
 
 test('a PDF too long to lay out says, after its last page shown, that the others are in the text view, with a button to it', () => {
   const found = pagesCut(source('Paper.jsx'));
-  assert.equal(found.when, 'offsets.length - 1 < pages'); // only when pages did not fit under the cap (pageOffsets)
+  assert.equal(found.when, 'shown < pages'); // only when pages did not fit under the cap (pageOffsets)
   assert.equal(found.click, 'onText');
   const calls = [];
   const radios = [{ focus: () => calls.push('Pages') }, { focus: () => calls.push('Passages') }];
@@ -386,4 +386,37 @@ test('a run tried again or stopped in the background-run list wakes the Library 
   assert.match(body, /load\(\);\s*libraryChanged\(projectId\);/);
   assert.match(source('Settings.jsx'), /act\(\(\) => retryRun\(run\.run_id\), run\.project_id\)/);
   assert.match(source('Settings.jsx'), /act\(\(\) => post\(`\/api\/runs\/\$\{run\.run_id\}\/cancel`\), run\.project_id\)/);
+});
+
+// The effect that gives focus to the note once the cut comes before the page holding it, as source text.
+function focusPastCut(text) {
+  return parsed(text, (context, found) => ({
+    CallExpression(call) {
+      if (call.callee.name === 'useLayoutEffect' && context.sourceCode.getText(call.arguments[0]).includes('note.current')) {
+        found.effect = context.sourceCode.getText(call.arguments[0]);
+        found.deps = call.arguments[1].elements.map((name) => name.name);
+      }
+    },
+    VariableDeclarator(node) {
+      if (node.id.name === 'shown' && node.init) found.shown = context.sourceCode.getText(node.init);
+    },
+  }));
+}
+
+test('focus in a page the height cut comes before (the list widened) goes to the note, never to the body', () => {
+  const found = focusPastCut(source('Paper.jsx'));
+  assert.equal(found.shown, 'offsets.length - 1');
+  assert.deepEqual(found.deps, ['within', 'shown']);
+  const run = (within, shown, active) => {
+    const calls = [];
+    const body = { tag: 'body' };
+    new Function('within', 'shown', 'document', 'onWithin', 'note', `return (${found.effect});`)(within, shown,
+      { activeElement: active === 'body' ? body : active, body }, (page, inside) => calls.push(['onWithin', page, inside]),
+      { current: { focus: () => calls.push(['note']) } })();
+    return calls;
+  };
+  assert.deepEqual(run(19_000, 15_836, 'body'), [['onWithin', 19_000, false], ['note']]); // its page gone: to the note
+  assert.deepEqual(run(19_000, 15_836, { composer: true }), [['onWithin', 19_000, false]]); // focus elsewhere stays there
+  assert.deepEqual(run(15_000, 15_836, 'body'), []); // a page still laid out keeps focus
+  assert.deepEqual(run(null, 15_836, 'body'), []);
 });
