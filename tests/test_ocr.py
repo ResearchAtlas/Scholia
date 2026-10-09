@@ -249,6 +249,78 @@ async def test_a_newer_readings_failed_commit_leaves_the_older_reading_and_its_c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fails", ["resolving citations", "the run's terminal record"])
+async def test_a_failure_after_the_earlier_reading_is_superseded_rolls_the_whole_commit_back(tmp_path, monkeypatch, quick,
+                                                                                            fails):
+    """Charter section 10, a commit followed by a failure: supersede runs to its end (passages and
+    reading deleted, tombstone written, citations re-pointed), then the same transaction fails; nothing
+    of it stays, and Retry reads the paper."""
+    import backend.runs as runs_module
+
+    use(monkeypatch, None)  # read first by S1-13's extractor: scanned pages waiting
+    data = tmp_path / "data"
+    async with started(data) as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, ("paper.pdf", synthetic.paper_pdf(scanned=1))))["materials"]
+        await settled(client, project)
+        [(older,)] = await rows(client, "SELECT id FROM extractions")
+        passages = await rows(client, "SELECT id, text FROM passages WHERE extraction_id = ? ORDER BY ordinal", older)
+        cited = next(p for p, text in passages if text.startswith("Minimum wages raise"))
+        kept = await cite(client, paper["id"], cited, "Minimum wages raise")
+        lost = await cite(client, paper["id"], None, "A quote no reading holds.", existence="not_found")
+        citations = await rows(client, "SELECT * FROM citations ORDER BY id")
+        queue = await rows(client, "SELECT * FROM index_queue ORDER BY seq")
+    use(monkeypatch, Engine())
+    superseded = []  # what the transaction held once supersede had run, as the failure struck
+
+    def seen(conn):
+        superseded.append((conn.execute("SELECT count(*) FROM passages WHERE extraction_id = ?", (older,)).fetchone()[0],
+                           conn.execute("SELECT count(*) FROM tombstones WHERE kind = 'reading'").fetchone()[0],
+                           conn.execute("SELECT passage_id FROM citations WHERE id = ?", (kept,)).fetchone()[0]))
+
+    if fails == "resolving citations":
+        def failing(conn, *args):
+            seen(conn)
+            raise RuntimeError("a failure after the earlier reading was superseded")
+
+        real, target = materials_module._resolve, (materials_module, "_resolve")
+    else:
+        real_event = runs_module._event
+
+        def failing(conn, run_id, event_type, data):
+            if event_type == "run_finished" and data.get("status") == "succeeded":
+                seen(conn)
+                raise RuntimeError("the run's terminal record failed")
+            return real_event(conn, run_id, event_type, data)
+
+        real, target = real_event, (runs_module, "_event")
+    monkeypatch.setattr(*target, failing)
+    async with started(data, setup=False) as client:
+        await asyncio.sleep(0.5)
+        await background_idle(client, timeout=10)
+        assert superseded and superseded[0][0] == 0 and superseded[0][1] == 1 and superseded[0][2] != cited  # it had run
+        [(run,)] = await rows(client, "SELECT id FROM runs WHERE workflow = 'extract'"
+                                      " AND json_extract(inputs, '$.outdated') IS NOT NULL")
+        [row] = (await client.get("/api/activity", params={"run_id": run})).json()["runs"]
+        assert (row["status"], row["retryable"]) == ("interrupted", True)  # not finished as succeeded
+        assert await rows(client, "SELECT id FROM extractions") == [(older,)]
+        assert await rows(client, "SELECT id, text FROM passages WHERE extraction_id = ? ORDER BY ordinal", older) == passages
+        assert await rows(client, "SELECT count(*) FROM tombstones WHERE kind = 'reading'") == [(0,)]
+        assert await rows(client, "SELECT * FROM citations ORDER BY id") == citations
+        assert await rows(client, "SELECT * FROM index_queue ORDER BY seq") == queue
+        monkeypatch.setattr(*target, real)
+        again = await client.post(f"/api/runs/{run}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [ready] = await settled(client, project)
+        assert (ready["state"], ready["extraction"]["ocr_pages"]) == ("ready", 1)
+        assert await rows(client, "SELECT count(*) FROM extractions WHERE id = ?", older) == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM tombstones WHERE kind = 'reading'") == [(1,)]
+        [(now, existence)] = await rows(client, "SELECT passage_id, existence FROM citations WHERE id = ?", kept)
+        assert now not in (None, cited) and existence == "ok"
+        assert await rows(client, "SELECT passage_id, existence FROM citations WHERE id = ?", lost) == [(None, "not_found")]
+
+
+@pytest.mark.asyncio
 async def test_a_reading_stopped_by_a_shutdown_mid_page_starts_again_at_the_next_launch_and_writes_once(
         tmp_path, monkeypatch):
     data, engine = tmp_path / "data", use(monkeypatch, Engine(hold=True))
