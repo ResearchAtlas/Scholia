@@ -191,11 +191,21 @@ def _retry_after(response):
 def _json(body):
     try:
         data = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):  # not JSON, or nested past what the parser follows
         raise Failed("unavailable") from None
     if not isinstance(data, dict):
         raise Failed("unavailable")
     return data
+
+
+def _dict(value):
+    """A record's field as a mapping: an empty one when it holds anything else, so a malformed entry
+    is skipped rather than failing the whole record."""
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value):
+    return value if isinstance(value, list) else []
 
 
 def _text(value, limit=1000):
@@ -209,16 +219,16 @@ def _openalex(doi, body):
         raise Failed("not_found")
     csl = {"type": "article-journal" if work.get("type") in ("article", None) else str(work.get("type")),
            "title": title, "DOI": doi}
-    authors = [_text((a.get("author") or {}).get("display_name"), NAME_CHARS) for a in work.get("authorships") or []
-               if isinstance(a, dict)]
+    authors = [_text(_dict(_dict(a).get("author")).get("display_name"), NAME_CHARS)
+               for a in _list(work.get("authorships"))]
     if authors := [{"literal": name} for name in authors if name]:
         csl["author"] = authors[:100]
     if isinstance(work.get("publication_year"), int):
         csl["issued"] = {"date-parts": [[work["publication_year"]]]}
-    source = ((work.get("primary_location") or {}).get("source") or {})
+    source = _dict(_dict(work.get("primary_location")).get("source"))
     if venue := _text(source.get("display_name"), 300):
         csl["container-title"] = venue
-    biblio = work.get("biblio") or {}
+    biblio = _dict(work.get("biblio"))
     for key, field in (("volume", "volume"), ("issue", "issue")):
         if value := _text(biblio.get(field), 50):
             csl[key] = value
@@ -226,7 +236,8 @@ def _openalex(doi, body):
         csl["page"] = first + (f"-{last}" if (last := _text(biblio.get("last_page"), 20)) else "")
     retracted = work.get("is_retracted") if isinstance(work.get("is_retracted"), bool) else None
     key = work.get("id") if isinstance(work.get("id"), str) else ""
-    key = key.removeprefix("https://openalex.org/") if re.fullmatch(r"https://openalex\.org/W\d{1,20}", key) else f"doi:{doi}"
+    key = (key.removeprefix("https://openalex.org/") if re.fullmatch(r"https://openalex\.org/W\d{1,20}", key)
+           else f"doi:{doi}")
     return Found("openalex", csl, retracted, f"openalex:{key}")
 
 
@@ -240,7 +251,7 @@ def _crossref(doi, body):
         raise Failed("not_found")
     csl = {"type": str(work.get("type") or "article-journal"), "title": title, "DOI": doi}
     authors = []
-    for author in work.get("author") or []:
+    for author in _list(work.get("author")):
         if isinstance(author, dict):
             family, given = _text(author.get("family"), NAME_CHARS), _text(author.get("given"), NAME_CHARS)
             if family:
@@ -249,16 +260,16 @@ def _crossref(doi, body):
                 authors.append({"literal": name})
     if authors:
         csl["author"] = authors[:100]
-    parts = ((work.get("issued") or {}).get("date-parts") or [[None]])[0]
-    if parts and isinstance(parts[0], int):
-        csl["issued"] = {"date-parts": [[parts[0]]]}
+    parts = _list(_dict(work.get("issued")).get("date-parts"))
+    if (first := _list(parts[0]) if parts else []) and isinstance(first[0], int):
+        csl["issued"] = {"date-parts": [[first[0]]]}
     containers = work.get("container-title") or []
     if venue := _text(containers[0] if isinstance(containers, list) and containers else None, 300):
         csl["container-title"] = venue
     for key in ("volume", "issue", "page"):
         if value := _text(work.get(key), 50):
             csl[key] = value
-    updates = work.get("updated-by") or []
+    updates = _list(work.get("updated-by"))
     retracted = any(isinstance(u, dict) and str(u.get("type", "")).lower() in _RETRACTED for u in updates)
     return Found("crossref", csl, retracted, f"doi:{doi}")
 

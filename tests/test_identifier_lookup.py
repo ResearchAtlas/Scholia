@@ -479,6 +479,24 @@ async def test_an_openalex_records_key_is_its_openalex_id_or_else_the_doi_it_was
         assert lookup._openalex(DOI, json.dumps(record).encode()).source_key == key
 
 
+async def test_a_record_with_malformed_entries_skips_them_and_still_resolves():
+    openalex = {**openalex_work(DOI, TITLE), "authorships": [{"author": "invalid"}, "x", 5, {"author": {"display_name": "Ana"}}],
+                "primary_location": "x", "biblio": 5}
+    found = lookup._openalex(DOI, json.dumps(openalex).encode())
+    assert (found.csl["title"], found.csl["author"]) == (TITLE, [{"literal": "Ana"}])
+    openalex["authorships"] = 5
+    assert "author" not in lookup._openalex(DOI, json.dumps(openalex).encode()).csl
+    crossref = {**crossref_work(DOI, TITLE), "author": ["x", 5, {"family": "Example"}], "issued": {"date-parts": [5]},
+                "updated-by": 7}
+    found = lookup._crossref(DOI, json.dumps({"message": crossref}).encode())
+    assert (found.csl["author"], found.retracted, "issued" in found.csl) == ([{"family": "Example"}], False, False)
+    for record in ({**crossref, "author": 5, "issued": "2020"}, {**crossref, "issued": {"date-parts": 5}}):
+        assert lookup._crossref(DOI, json.dumps({"message": record}).encode()).csl["title"] == TITLE
+    with pytest.raises(lookup.Failed) as failed:  # nested past what the parser follows: no answer it can read
+        lookup._openalex(DOI, b"[" * 100_000 + b"]" * 100_000)
+    assert failed.value.code == "unavailable"
+
+
 async def test_a_doi_after_many_short_passages_but_within_the_first_characters_is_found(tmp_path):
     late = "10.5555/after.many.notes"
     notes = "".join(f"Note {n}.\n\n" for n in range(250))  # 250 short passages, about 2,400 characters
