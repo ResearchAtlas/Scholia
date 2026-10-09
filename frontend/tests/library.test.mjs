@@ -265,6 +265,23 @@ test('a latest lookup that ended without an outcome for the paper shows how it e
   assert.equal(latestLookup(t, resolvedThenFailed), null);
 });
 
+test('a lookup that ended while it waited for an answer reads as how it ended, not as waiting', () => {
+  const t = makeT('en');
+  const date = (value) => value.slice(0, 10);
+  const kept = { checked_by: 'lookup', source_key: 'doi:10.5555/x', resolved_at: '2026-01-02T00:00:00.000Z' };
+  const ended = (status, extra = {}) => ({ status, waiting: true, outcome: null, ...extra });
+  assert.equal(latestLookup(t, { ...kept, lookup: ended('interrupted') }), en['runs.interrupted']);
+  assert.equal(latestLookup(t, { ...kept, lookup: ended('failed', { reason: 'internal' }) }), en['errors.internal']);
+  assert.equal(latestLookup(t, { ...kept, lookup: ended('cancelled') }), en['runs.stopped']);
+  const file = { checked_by: null, lookup: ended('interrupted') };
+  assert.equal(detailsSource(t, file, {}, date), en['library.source.fromFile']);
+  assert.equal(latestLookup(t, file), en['runs.interrupted']);
+  assert.equal(detailsSource(t, { checked_by: null, lookup: ended('cancelled') }, {}, date), en['runs.stopped']);
+  const waiting = { status: 'running', waiting: true, outcome: null }; // still running: it waits
+  assert.equal(latestLookup(t, { ...kept, lookup: waiting }), en['library.source.waiting']);
+  assert.equal(detailsSource(t, { checked_by: null, lookup: waiting }, {}, date), en['library.source.waiting']);
+});
+
 test('a drop sent in several requests is one batch: the first opens it, the next add to it, the last closes it', async () => {
   const MiB = 1024 * 1024;
   const realFetch = globalThis.fetch;

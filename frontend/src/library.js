@@ -126,8 +126,7 @@ export function detailsSource(t, material, project, date) {
   }
   const lookup = material.lookup;
   if (!lookup) return t(project?.review_lock ? 'library.source.locked' : 'library.source.fromFile');
-  if (lookup.waiting) return t('library.source.waiting');
-  if (lookup.status === 'running') return t('library.source.lookingUp');
+  if (lookup.status === 'running') return t(lookup.waiting ? 'library.source.waiting' : 'library.source.lookingUp');
   if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
   const outcome = lookup.outcome;
   return t(LOOKUP_OUTCOMES.includes(outcome) ? `library.source.${outcome}` : 'library.source.fromFile');
@@ -136,15 +135,15 @@ export function detailsSource(t, material, project, date) {
 // What a paper's latest lookup did, as text, beside details that came from elsewhere (an edit or an
 // earlier lookup's record), or beside the file's when it ended with no outcome for the paper (failed,
 // with its recorded reason, or interrupted); null when the details say it already, or when it has
-// nothing to tell (it found their record, or its file was replaced meanwhile).
+// nothing to tell (it found their record, or its file was replaced meanwhile). Only a running lookup
+// waits for an answer: one that ended while it waited reads as how it ended.
 export function latestLookup(t, material) {
   const lookup = material.lookup;
   if (!lookup) return null;
   const ended = lookup.outcome != null ? null : lookup.status === 'failed' ? errorText(t, lookup.reason ?? 'internal')
     : lookup.status === 'interrupted' ? t('runs.interrupted') : null;
   if (!material.checked_by) return ended;
-  if (lookup.waiting) return t('library.source.waiting');
-  if (lookup.status === 'running') return t('library.source.lookingUp');
+  if (lookup.status === 'running') return t(lookup.waiting ? 'library.source.waiting' : 'library.source.lookingUp');
   if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
   return LOOKUP_OUTCOMES.includes(lookup.outcome) ? t(`library.lookup.${lookup.outcome}`) : ended;
 }
