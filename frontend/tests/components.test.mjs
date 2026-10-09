@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { Linter } from 'eslint';
+import { waitsOn } from '../src/library.js';
 
 const source = (name) => readFileSync(fileURLToPath(new URL(`../src/components/${name}`, import.meta.url)), 'utf8');
 
@@ -171,8 +172,8 @@ test('each passage of the text says where it is in the whole text, as only the s
 
 // A PDF page's move to another part of its passages, as source text: the inert of the element
 // around each passage and each button to another part, the onClick of each button such a button
-// comes with, the page's keydown handler, go, the effect reading a part and what it depends on, and
-// the effect giving focus to Retry.
+// comes with, the page's keydown handler, go, the effect reading a part and what it depends on, the
+// effect giving focus to Retry, and passTo, through which it does.
 function partMoves(text) {
   return parsed(text, (context, found) => {
     const code = (node) => context.sourceCode.getText(node);
@@ -203,6 +204,7 @@ function partMoves(text) {
       },
       VariableDeclarator(node) {
         if (node.id.name === 'go') found.go = code(node.init);
+        if (node.id.name === 'passTo') found.passTo = code(node.init);
       },
     };
   });
@@ -246,4 +248,11 @@ test('a PDF page keeps what it shows out of reach while another part loads, and 
   toRetry(false);
   toRetry(true);
   assert.deepEqual(passed, ['Retry']);
+  const focused = (active, entering) => {
+    let got = false;
+    new Function('waitsOn', 'frame', 'document', 'entering', `return (${found.passTo});`)(waitsOn, { current: 'page' },
+      { activeElement: active }, { current: entering })({ focus: () => { got = true; } });
+    return got;
+  };
+  assert.deepEqual([focused('page', 'first'), focused('page', null), focused('elsewhere', 'first')], [true, false, false]);
 });
