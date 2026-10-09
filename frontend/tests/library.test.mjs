@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
   typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn,
-  detailsSource, latestLookup, pageImage } from '../src/library.js';
+  detailsSource, latestLookup, pageImage, ocrPages } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
@@ -21,7 +21,7 @@ test('only the formats Scholia reads are sent; the rest are named', () => {
 
 test('every state, reason and type the backend gives has its text in both catalogs', () => {
   const reasons = ['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file', 'encrypted_file',
-    'file_missing', 'interrupted', 'not_found', 'outdated', 'something new'];
+    'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'something new'];
   const keys = [...['reading', 'ready', 'needs_attention'].map((s) => `library.state.${s}`), ...reasons.map(reasonKey),
     ...['application/pdf', 'text/html', 'text/markdown', 'application/x-tex', 'x/unknown',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].map(typeKey)];
@@ -90,7 +90,7 @@ test('the reasons a run ends with have their texts in both catalogs', () => {
   for (const code of ['unsupported_file', 'file_too_large', 'not_retryable', 'not_a_pdf', 'file_missing', 'unreadable_file',
     'encrypted_file', 'time_limit', 'title_needed', 'invalid_doi', 'ask_closed', 'ask_invalid', 'invalid_answer',
     'lookup_locked', 'declined', 'project_changed', 'closing', 'disk_full', 'write_failed', 'passphrase_required', 'unavailable',
-    'refused']) {
+    'refused', 'ocr_failed']) {
     assert.ok(`errors.${code}` in en && `errors.${code}` in zh, code);
   }
 });
@@ -677,4 +677,18 @@ test('a page moving to another part keeps what it shows out of reach while that 
   // read again once let go and held again (its failure cleared).
   assert.deepEqual(partMove(null, 1, true), { read: false, loading: false, failed: false });
   assert.deepEqual(partMove(null, 1, false), { read: true, loading: false, failed: false });
+});
+
+test('Details counts a reading\'s scanned pages: read by text recognition, or waiting where no engine read them', () => {
+  for (const language of ['en', 'zh-CN']) {
+    const t = makeT(language);
+    assert.equal(ocrPages(t, null), null);
+    assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 0 }), null);
+    assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 1 }), t('library.ocrRead', { count: 1 }));
+    assert.equal(ocrPages(t, { status: 'ocr_needed', ocr_pages: 2 }), t('library.ocrWaiting', { count: 2 }));
+  }
+  const t = makeT('en');
+  assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 1 }), '1 page read by text recognition');
+  assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 3 }), '3 pages read by text recognition');
+  assert.equal(t(reasonKey('ocr_failed')), 'Text recognition failed. Try again from Settings, Advanced.');
 });
