@@ -262,9 +262,14 @@ async def background_idle(client, timeout=5.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         await asyncio.sleep(0)
-        asking = await asyncio.to_thread(harness.db.read, lambda conn: {r for (r,) in conn.execute(
-            "SELECT id FROM runs WHERE status = 'running' AND waiting = 'ask'")})
-        busy = [a for a in harness.registry.runs.values() if a.kind == "background" and a.run_id not in asking]
+        busy = [a for a in harness.registry.runs.values() if a.kind == "background"]
+        if busy:
+            try:  # a test may have made the database refuse reads: then none is taken for waiting
+                asking = await asyncio.to_thread(harness.db.read, lambda conn: {r for (r,) in conn.execute(
+                    "SELECT id FROM runs WHERE status = 'running' AND waiting = 'ask'")})
+            except Exception:
+                asking = set()
+            busy = [a for a in busy if a.run_id not in asking]
         pending = [t for t in harness._tasks if not t.done()]
         if not busy and not pending:
             return
