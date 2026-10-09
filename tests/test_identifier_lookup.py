@@ -620,6 +620,22 @@ async def test_retry_after_is_read_as_seconds_or_as_a_date(value, expected):
     assert after is None if expected is None else expected[0] <= after <= expected[1]
 
 
+@pytest.mark.parametrize("doi", ["10.1234/../../works", "10.1234/./x", "10.1234/a/../b", "10.1234/a/.."])
+async def test_a_doi_with_a_dot_segment_is_no_doi_and_never_leaves_its_single_record_path(doi):
+    cleaned = extraction.clean_doi(doi)  # neither from a file nor typed by the researcher
+    assert cleaned is None or not {".", ".."} & set(cleaned.split("/"))  # trailing dots are punctuation
+    sent = []
+
+    def answer(request):
+        sent.append(request.url.raw_path)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        with pytest.raises(lookup.Failed):  # handed one all the same, neither source is asked
+            await lookup.resolve(client, "doi", doi, lookup.Pace())
+    assert sent == []
+
+
 async def test_the_starting_values_for_pacing_retries_and_time():
     spacing, retries, timeout = DEFAULTS  # sections 7.6 and 13
     assert (spacing["arxiv"], retries, timeout) == (3.0, (1.0, 4.0), 20.0)

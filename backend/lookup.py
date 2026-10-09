@@ -88,13 +88,23 @@ async def resolve(client, scheme, identifier, pace) -> Found:
     if scheme == "arxiv":
         return _arxiv(identifier, await _get(client, ARXIV.format(quote(identifier, safe="/.")), "arxiv", pace))
     try:
-        return _openalex(identifier, await _get(client, OPENALEX.format(quote(identifier, safe="/")), "openalex", pace))
+        return _openalex(identifier, await _get(client, _record(OPENALEX, identifier), "openalex", pace))
     except Failed as failed:
         openalex = failed.code
     try:
-        return _crossref(identifier, await _get(client, CROSSREF.format(quote(identifier, safe="/")), "crossref", pace))
+        return _crossref(identifier, await _get(client, _record(CROSSREF, identifier), "crossref", pace))
     except Failed as failed:
         raise Failed("unavailable" if "unavailable" in (openalex, failed.code) else "not_found") from None
+
+
+def _record(template, doi):
+    """The DOI's single-record URL, its path checked as the client will send it: a path the URL
+    parser reads as any other (a dot segment resolved away) is Failed not_found, never sent."""
+    path = quote(doi, safe="/")
+    url = template.format(path)
+    if httpx.URL(url).raw_path != httpx.URL(template.format("")).raw_path + path.encode("ascii"):
+        raise Failed("not_found")
+    return url
 
 
 async def _get(client, url, source, pace):

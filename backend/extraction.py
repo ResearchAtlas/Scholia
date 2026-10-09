@@ -259,12 +259,15 @@ def identifiers(passages):
 
 
 def clean_doi(text):
-    """A DOI as found in text, without trailing punctuation, in lower case; None if it fails the pattern."""
+    """A DOI as found in text, without trailing punctuation, in lower case; None if it fails the
+    pattern or holds a "." or ".." segment."""
     doi = text.strip().rstrip(".,;:'\"")
     while doi.endswith((")", "]")) and doi.count(doi[-1]) > doi.count({")": "(", "]": "["}[doi[-1]]):
         doi = doi[:-1].rstrip(".,;:")
     doi = doi.lower()
-    return doi if DOI.fullmatch(doi) else None
+    if not DOI.fullmatch(doi) or {".", ".."} & set(doi.split("/")):
+        return None  # a dot segment: a URL holding it would name another path once resolved
+    return doi
 
 
 # Passages

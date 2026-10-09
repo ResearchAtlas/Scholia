@@ -678,7 +678,7 @@ async def test_the_researchers_edit_of_a_papers_details_is_checked_and_kept(tmp_
         await settled(client, project)
         url = f"/api/materials/{paper['id']}"
         for body, code in (({"title": " \u200b "}, "title_needed"), ({"title": ""}, "title_needed"),
-                           ({"doi": "not a doi"}, "invalid_doi")):
+                           ({"doi": "not a doi"}, "invalid_doi"), ({"doi": "10.1234/../../works"}, "invalid_doi")):
             refused = await client.patch(url, json=body)
             assert (refused.status_code, refused.json()["code"]) == (400, code)
         assert (await rows(client, "SELECT checked_by FROM materials"))[0] == (None,)
