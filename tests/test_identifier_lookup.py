@@ -8,6 +8,7 @@ import contextlib
 import gzip
 import json
 import threading
+import time
 
 import httpx
 import pytest
@@ -553,6 +554,29 @@ async def test_an_answer_past_the_body_limit_is_given_up_as_it_streams_in(tmp_pa
         assert paper["lookup"]["outcome"] == "unavailable" and paper["checked_by"] is None
     assert len(streams) == 2  # OpenAlex's answer, then Crossref's: neither is tried again
     assert all(stream.read <= 7 for stream in streams)  # each stopped once past the limit, not read to its end
+
+
+async def test_an_answer_that_trickles_in_is_given_up_once_its_request_passes_the_time_bound(monkeypatch):
+    monkeypatch.setattr(lookup, "TIMEOUT", 0.3)
+    streams = []
+
+    class Trickle(Chunks):  # one byte every 50 ms: each read is quick, the whole would take 10 s
+        async def __aiter__(self):
+            for chunk in self.chunks:
+                await asyncio.sleep(0.05)
+                self.read += 1
+                yield chunk
+
+    def answer(request):
+        streams.append(Trickle([b" "] * 200))
+        return httpx.Response(200, stream=streams[-1])
+
+    began = time.monotonic()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        with pytest.raises(lookup.Failed) as failed:
+            await lookup.resolve(client, "doi", DOI, lookup.Pace())
+    assert failed.value.code == "unavailable" and len(streams) == 6  # three tries at each source
+    assert all(stream.read < 10 for stream in streams) and time.monotonic() - began < 4
 
 
 async def test_a_compressed_answer_within_the_limit_is_read(tmp_path):

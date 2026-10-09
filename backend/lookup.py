@@ -5,11 +5,11 @@ and returns what it found: a DOI to OpenAlex, then to Crossref when OpenAlex has
 arXiv ID to export.arxiv.org. Each request is an anonymous single-record GET: no key, no contact
 address, no credentials (the outbound gate refuses any). Each source is asked one request at a
 time across every lookup, held until its answer, and paced (`SPACING`: arXiv asks for one request
-every 3 seconds); a request that meets 429, a server error or a network failure is retried at
-most twice, after 1 and 4 seconds (a Retry-After within RETRY_AFTER_MAX instead, in seconds or as
-a date), each within TIMEOUT seconds; an answer is read as it streams in, at most MAX_BODY bytes
-once decoded. The client is the outbound gate's, made for the project with its dispatch check, so
-a refusal (OutboundDenied) is final and is raised.
+every 3 seconds); a request that meets 429, a server error or a network failure (a request past
+TIMEOUT seconds, from its connection to its last byte, included) is retried at most twice, after 1
+and 4 seconds (a Retry-After within RETRY_AFTER_MAX instead, in seconds or as a date); an answer is
+read as it streams in, at most MAX_BODY bytes once decoded. The client is the outbound gate's,
+made for the project with its dispatch check, so a refusal (OutboundDenied) is final and is raised.
 
 A DOI resolved through OpenAlex or Crossref records whether the work is retracted (OpenAlex's
 `is_retracted`; a retraction, withdrawal or removal in Crossref's `updated-by`); arXiv says
@@ -113,10 +113,11 @@ async def _get(client, url, source, pace):
         delay = RETRIES[attempt] if attempt < len(RETRIES) else None
         async with pace.turn(source):  # the source's one request in flight, to its whole answer
             try:
-                status, after, body = await _fetch(client, url)
+                async with asyncio.timeout(TIMEOUT):  # connect to last byte: httpx bounds each read alone
+                    status, after, body = await _fetch(client, url)
             except OutboundDenied:
                 raise
-            except httpx.HTTPError:
+            except (httpx.HTTPError, TimeoutError):
                 status = None
         if status == 200:
             return body
