@@ -20,6 +20,8 @@ import asyncio
 import contextlib
 import email.utils
 import json
+import math
+import re
 import time
 import zlib
 from dataclasses import dataclass
@@ -39,6 +41,7 @@ RETRIES = (1.0, 4.0)
 RETRY_AFTER_MAX = 30.0
 TIMEOUT = 20.0
 MAX_BODY = 4 * 1024 * 1024
+NAME_CHARS = 200  # a person's name as kept, or each part of one (family, given): the details form sends them back
 _RETRACTED = {"retraction", "withdrawal", "removal"}
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _ARXIV_NS = "{http://arxiv.org/schemas/atom}"
@@ -156,19 +159,21 @@ async def _fetch(client, url):
 
 
 def _retry_after(response):
-    """Retry-After as seconds from now (RFC 9110 section 10.2.3): its delay-seconds, or the time until
-    its HTTP-date. None, so the fixed delays apply, when it is absent, malformed or already past;
-    _get then bounds it by RETRY_AFTER_MAX."""
+    """Retry-After as seconds from now (RFC 9110 section 10.2.3): its delay-seconds (ASCII digits), or
+    the time until its HTTP-date. None, so the fixed delays apply, when it is absent, malformed (a
+    number or a date past what can be held included) or already past; _get then bounds it by
+    RETRY_AFTER_MAX. Nothing it is given raises."""
     value = response.headers.get("retry-after", "").strip()
-    if value.isdigit():
-        return float(value)
+    if re.fullmatch(r"[0-9]+", value):  # delay-seconds
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) else None
     try:
         when = email.utils.parsedate_to_datetime(value)
-    except (TypeError, ValueError, IndexError):
+        if when.tzinfo is None:  # an HTTP-date is in GMT
+            when = when.replace(tzinfo=UTC)
+        wait = (when - datetime.now(UTC)).total_seconds()
+    except (TypeError, ValueError, OverflowError, IndexError):
         return None
-    if when.tzinfo is None:  # an HTTP-date is in GMT
-        when = when.replace(tzinfo=UTC)
-    wait = (when - datetime.now(UTC)).total_seconds()
     return wait if wait > 0 else None
 
 
@@ -193,7 +198,7 @@ def _openalex(doi, body):
         raise Failed("not_found")
     csl = {"type": "article-journal" if work.get("type") in ("article", None) else str(work.get("type")),
            "title": title, "DOI": doi}
-    authors = [_text((a.get("author") or {}).get("display_name"), 200) for a in work.get("authorships") or []
+    authors = [_text((a.get("author") or {}).get("display_name"), NAME_CHARS) for a in work.get("authorships") or []
                if isinstance(a, dict)]
     if authors := [{"literal": name} for name in authors if name]:
         csl["author"] = authors[:100]
@@ -224,10 +229,10 @@ def _crossref(doi, body):
     authors = []
     for author in work.get("author") or []:
         if isinstance(author, dict):
-            family, given = _text(author.get("family"), 200), _text(author.get("given"), 200)
+            family, given = _text(author.get("family"), NAME_CHARS), _text(author.get("given"), NAME_CHARS)
             if family:
                 authors.append({"family": family, **({"given": given} if given else {})})
-            elif name := _text(author.get("name"), 200):
+            elif name := _text(author.get("name"), NAME_CHARS):
                 authors.append({"literal": name})
     if authors:
         csl["author"] = authors[:100]
@@ -258,7 +263,7 @@ def _arxiv(identifier, body):
         raise Failed("not_found")
     csl = {"type": "article", "title": title, "publisher": "arXiv", "number": f"arXiv:{identifier}",
            "URL": f"https://arxiv.org/abs/{identifier}"}
-    authors = [_text(a.findtext(f"{_ATOM}name"), 200) for a in entry.findall(f"{_ATOM}author")]
+    authors = [_text(a.findtext(f"{_ATOM}name"), NAME_CHARS) for a in entry.findall(f"{_ATOM}author")]
     if authors := [{"literal": name} for name in authors if name]:
         csl["author"] = authors[:100]
     published = entry.findtext(f"{_ATOM}published") or ""

@@ -70,6 +70,7 @@ log = logging.getLogger(__name__)
 
 EXTRACTION_SECONDS = 30 * 60  # per material version (section 13)
 MAX_FILES = 20  # per request
+AUTHOR_CHARS = 2 * lookup.NAME_CHARS + 2  # an author as the details form sends one: "Family, Given", each part a lookup's
 BATCH_IDLE_SECONDS = 120  # an open batch (a drop still being sent) with no addition for this long closes itself
 WAIT_SECONDS = 0.5  # a lookup's look at whether its materials have been read, and at its ask
 LOOKUP_WAIT_SECONDS = EXTRACTION_SECONDS + 60  # how long a lookup waits for its readings, at most
@@ -104,8 +105,8 @@ class Upload(BaseModel):
 
 class MaterialChange(BaseModel):
     title: str | None = Field(default=None, max_length=1000)
-    # "Family, Given" or a name, one each, each as long as a looked-up one may be (backend/lookup.py)
-    authors: list[Annotated[str, Field(max_length=200)]] | None = Field(default=None, max_length=100)
+    # "Family, Given" or a name, one each: each as long as a looked-up one may be when sent back
+    authors: list[Annotated[str, Field(max_length=AUTHOR_CHARS)]] | None = Field(default=None, max_length=100)
     year: int | None = Field(default=None, ge=1000, le=2200)
     venue: str | None = Field(default=None, max_length=1000)
     doi: str | None = Field(default=None, max_length=300)

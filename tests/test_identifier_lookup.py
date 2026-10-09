@@ -604,6 +604,8 @@ async def test_a_rate_limited_request_is_retried_and_resolves(tmp_path):
 @pytest.mark.parametrize("value, expected", [
     ("7", (7.0, 7.0)), ("0", (0.0, 0.0)),  # delay-seconds
     ("in 5", None), ("-3", None), ("", None), ("Fri, 32 Foo 9999 99:99:99 GMT", None),  # malformed: no delay
+    ("\u00b2", None), ("9" * 400, None),  # a digit that is not ASCII; a number past any float
+    ("Fri, 31 Dec 9999999999 23:59:59 GMT", None), ("Fri, 31 Dec 99999999999999999999 23:59:59 GMT", None),  # years
     ("past", None),  # a date already past: no delay
     ("future", (3.0, 5.5)),  # an HTTP-date: the seconds until then
 ])
@@ -613,7 +615,8 @@ async def test_retry_after_is_read_as_seconds_or_as_a_date(value, expected):
     now = datetime.now(UTC)
     value = {"past": format_datetime(now - timedelta(minutes=5), usegmt=True),
              "future": format_datetime(now + timedelta(seconds=5), usegmt=True)}.get(value, value)
-    after = lookup._retry_after(httpx.Response(429, headers={"retry-after": value} if value else {}))
+    sent = [(b"retry-after", value.encode("latin-1"))] if value else []  # as a server's bytes arrive
+    after = lookup._retry_after(httpx.Response(429, headers=sent))
     assert after is None if expected is None else expected[0] <= after <= expected[1]
 
 
@@ -650,6 +653,21 @@ async def test_a_sources_next_request_waits_for_a_slow_one_to_be_answered():
         found = await asyncio.gather(*(lookup.resolve(client, "arxiv", "2401.00001", pace) for _ in range(3)))
     assert [f.source for f in found] == ["arxiv"] * 3 and len(seen["paths"]) == 3
     assert seen["most"] == 1  # never two requests to arXiv at once, across lookups
+
+
+async def test_a_looked_up_author_with_the_longest_names_survives_an_edit_of_another(tmp_path):
+    family, given = "F" * lookup.NAME_CHARS, "G" * lookup.NAME_CHARS  # as long as a lookup keeps
+    record = {**crossref_work(DOI, TITLE), "author": [{"family": family, "given": given}]}
+    async with started(tmp_path / "data", MockProvider(scholarly=MockScholarly(crossref={DOI: record}))) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["csl"]["author"] == [{"family": family, "given": given}]
+        # The form sends every author back, as "Family, Given", with one more added.
+        edited = await client.patch(f"/api/materials/{result['materials'][0]['id']}",
+                                    json={"authors": [f"{family}, {given}", "Example, Ana"]})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["csl"]["author"] == [{"family": family, "given": given}, {"family": "Example", "given": "Ana"}]
 
 
 async def test_a_researchers_edit_is_kept_and_its_retraction_still_checked(tmp_path):
