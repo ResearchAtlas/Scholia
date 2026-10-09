@@ -803,6 +803,16 @@ def test_a_pdf_readings_rectangles_are_counted_as_they_are_made(monkeypatch):
     assert refused and peak < 2 * 2**20, f"{peak / 2**20:.1f} MiB"
 
 
+def test_a_tall_thin_page_is_rendered_within_its_side_bound_and_compressed_a_row_at_a_time():
+    data = _raw_pdf([b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                     b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1000000] >>"])  # under the pixel bound: 2.8 million rows
+    image = []
+    peak, refused = _peak(lambda: image.append(extraction.render_page(data, 1, 3.0)))
+    width, height = struct.unpack(">II", image[0][16:24])
+    assert not refused and (width, height) == (1, extraction.MAX_PAGE_SIDE)
+    assert peak < 4 * 2**20, f"{peak / 2**20:.1f} MiB"  # 424 MiB before, an object for each row
+
+
 def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
     import pypdfium2
 

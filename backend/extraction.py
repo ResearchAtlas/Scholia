@@ -90,6 +90,7 @@ EXTRACTORS = {PDF: ("pdf", "pdf-3"), DOCX: ("docx", "docx-2"), HTML: ("html", "h
               MARKDOWN: ("markdown", "markdown-2"), LATEX: ("latex", "latex-2")}
 PDFIUM = threading.Lock()
 MAX_PAGE_PIXELS = 8 * 1024 * 1024  # a rendered page image's pixels: a letter page at scale 3 has 4.4 million
+MAX_PAGE_SIDE = 20_000  # a rendered page image's width or height: a letter page at scale 3 is 2,376 by 1,836
 
 # pylatexenc logs what it parses: a tolerated parse error with the source around it (INFO), an
 # unknown node whole (WARNING), each node (DEBUG). Its loggers never write, at any level. The other
@@ -908,8 +909,9 @@ def _han(char):
 
 def render_page(data, number, scale=2.0):
     """Page number (from 1) of a PDF as a PNG image, rendered by pdfium in memory, at scale or less:
-    never more than MAX_PAGE_PIXELS, however large the page says it is. Raises IndexError for a page
-    it does not have, Unreadable for a file it cannot open or a page with no area."""
+    never more than MAX_PAGE_PIXELS nor wider or taller than MAX_PAGE_SIDE, however large the page
+    says it is. Raises IndexError for a page it does not have, Unreadable for a file it cannot open
+    or a page with no area."""
     import pypdfium2 as pdfium
 
     with PDFIUM:
@@ -928,7 +930,7 @@ def render_page(data, number, scale=2.0):
                 width, height = page.get_size()
                 if not (width > 0 and height > 0):
                     raise Unreadable()
-                scale = min(scale, math.sqrt(MAX_PAGE_PIXELS / (width * height)))
+                scale = min(scale, math.sqrt(MAX_PAGE_PIXELS / (width * height)), MAX_PAGE_SIDE / max(width, height))
                 while math.ceil(width * scale) * math.ceil(height * scale) > MAX_PAGE_PIXELS:  # pypdfium2 rounds up
                     scale *= 0.99
                 bitmap = page.render(scale=scale, rev_byteorder=True)
@@ -943,14 +945,19 @@ def render_page(data, number, scale=2.0):
 
 
 def _png(pixels, width, height, stride, channels):
-    """A PNG of 8-bit RGB or RGBA rows, with the standard library only."""
-    rows = b"".join(b"\x00" + pixels[y * stride:y * stride + width * channels] for y in range(height))
+    """A PNG of 8-bit RGB or RGBA rows, with the standard library only: its rows compressed as they
+    are read, one at a time, with no object kept for each."""
+    rows, compressed, view = zlib.compressobj(6), io.BytesIO(), memoryview(pixels)
+    for y in range(height):
+        compressed.write(rows.compress(b"\x00"))
+        compressed.write(rows.compress(view[y * stride:y * stride + width * channels]))
+    compressed.write(rows.flush())
 
     def chunk(tag, body):
         return struct.pack(">I", len(body)) + tag + body + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF)
 
     header = struct.pack(">IIBBBBB", width, height, 8, 6 if channels == 4 else 2, 0, 0, 0)
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b"")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", compressed.getvalue()) + chunk(b"IEND", b"")
 
 
 # DOCX
