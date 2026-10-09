@@ -789,15 +789,16 @@ async def test_a_file_being_read_or_read_by_this_version_is_not_read_again(tmp_p
 def test_a_page_without_chinese_keeps_its_first_reading_when_the_second_fails(monkeypatch):
     calls = []
 
-    def read(bitmap, detect):
+    def read(self, bitmap, detect):
         calls.append(detect)
         if detect:
             raise ocr.Failed()
         return [LINE]
 
-    monkeypatch.setattr(ocr.VISION, "_read", read)
+    monkeypatch.setattr(ocr.Vision, "_read", read)  # on the class: the engine object keeps no state of its own
     assert ocr.VISION.recognize(None) == [LINE] and calls == [False, True]
-    monkeypatch.setattr(ocr.VISION, "_read", lambda bitmap, detect: [ocr.Line("最低工资", LINE.box, 0.5)] if not detect else 1 / 0)
+    monkeypatch.setattr(ocr.Vision, "_read", lambda self, bitmap, detect: [ocr.Line("最低工资", LINE.box, 0.5)]
+                        if not detect else 1 / 0)
     assert ocr.VISION.recognize(None)[0].text == "最低工资"  # a page with Chinese is read once
 
 
