@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, withFocus,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, MAX_LIST_HEIGHT, withFocus,
   detailsSource, latestLookup, pageImage } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -683,7 +683,7 @@ test('a page moving to another part keeps what it shows out of reach while that 
 test('a PDF of 100,000 pages mounts only the pages near the view, with spacers keeping every page\'s place', () => {
   const pages = 100_000;
   const aspects = new Map([[2, 2], [50_000, 0.5], [99_999, 612 / 792]]); // a wide page, a tall one, an ordinary one
-  const offsets = pageOffsets(pages, 900, aspects); // a list wider than a page: pages PAGE_WIDTH wide
+  const offsets = pageOffsets(pages, 900, aspects, Infinity); // a list wider than a page: pages PAGE_WIDTH wide; no cap
   const height = (n) => offsets[n] - offsets[n - 1] - PAGE_GAP;
   assert.equal(height(1), (PAGE_WIDTH - 2) / PAGE_ASPECT + 2);
   assert.equal(height(2), (PAGE_WIDTH - 2) / 2 + 2);
@@ -716,6 +716,26 @@ test('a PDF of 100,000 pages mounts only the pages near the view, with spacers k
   // Focus or a selection far from the view keeps its page mounted, with one on each side.
   assert.deepEqual(pagesOf(at(offsets[70_000], [1, 100_000])).filter((n) => n < 60_000 || n > 80_000), [1, 2, 99_999, 100_000]);
   assert.deepEqual(pageWindow(pageOffsets(0, 900, new Map()), [1, 0]), []); // no pages, nothing to lay out
+});
+
+test('a PDF too long to lay out lays out the pages under the height cap, and says the later ones are in the text view', () => {
+  const pages = 100_000;
+  const offsets = pageOffsets(pages, 900, new Map([[3, 0.5]]));
+  const shown = offsets.length - 1;
+  const one = (PAGE_WIDTH - 2) / PAGE_ASPECT + 2 + PAGE_GAP;
+  assert.ok(shown < pages && shown > 15_000, shown); // the note shows (shown < pages): some 15,800 letter pages
+  assert.ok(offsets[shown] - PAGE_GAP <= MAX_LIST_HEIGHT && offsets[shown] - PAGE_GAP + one > MAX_LIST_HEIGHT);
+  assert.ok(MAX_LIST_HEIGHT < 16_777_214); // under the lowest cap measured (Chromium), and WebKit's 33,554,432
+  assert.deepEqual(Array.from(offsets), Array.from(pageOffsets(pages, 900, new Map([[3, 0.5]]), Infinity).subarray(0, shown + 1)));
+  // Laid out wherever the view is, the list stays under the cap: at its end, the last page shown and nothing after.
+  const end = pageWindow(offsets, pagesWithin(offsets, offsets[shown] - 1000, offsets[shown] + 5000));
+  assert.equal(end.filter((item) => item.page).at(-1).page, shown);
+  assert.ok(end.reduce((sum, item) => sum + (item.page ? offsets[item.page] - offsets[item.page - 1] - PAGE_GAP : item.height), 0)
+    + PAGE_GAP * (end.length - 1) <= MAX_LIST_HEIGHT);
+  // A PDF that fits is laid out whole, as before: no note.
+  assert.equal(pageOffsets(10_000, 900, new Map()).length - 1, 10_000);
+  // The first page always shows, however tall (a page 1 px wide and 20,000 high, as rendered).
+  assert.equal(pageOffsets(5, 900, new Map([[1, 1 / 20_000]]), 1000).length - 1, 1);
 });
 
 test('focus going on from one part of the list to another keeps the one it leaves held until the next says it came', () => {

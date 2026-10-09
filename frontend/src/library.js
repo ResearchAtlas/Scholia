@@ -440,14 +440,22 @@ export const PAGE_WIDTH = 720;
 export const PAGE_GAP = 16;
 export const PAGE_ASPECT = 612 / 792;
 
-// Where each page begins in the list, from its top: offsets[n - 1] for page n, and offsets[pages]
-// the list's height and a gap. aspects holds the known ones, by page number.
+// The tallest the page list is laid out: under the lowest height an engine lays an element out to
+// (16,777,214 px in some Chromium builds, 33,554,432 px in the app's WebKit), with room to spare.
+export const MAX_LIST_HEIGHT = 15_000_000;
+
+// Where each page begins in the list, from its top: offsets[n - 1] for page n, and offsets[length - 1]
+// the list's height and a gap, for the pages that fit within most (the first at least): the list
+// shows those, and says the others are in the text view. aspects holds the known ones, by page number.
 // ponytail: rebuilt whole for each aspect learned (a millisecond for 100,000 pages); a Fenwick tree if
 // documents of millions of pages are read.
-export function pageOffsets(pages, width, aspects) {
+export function pageOffsets(pages, width, aspects, most = MAX_LIST_HEIGHT) {
   const offsets = new Float64Array(pages + 1);
   const inner = Math.min(width, PAGE_WIDTH) - 2;
-  for (let i = 0; i < pages; i += 1) offsets[i + 1] = offsets[i] + inner / (aspects.get(i + 1) ?? PAGE_ASPECT) + 2 + PAGE_GAP;
+  for (let i = 0; i < pages; i += 1) {
+    offsets[i + 1] = offsets[i] + inner / (aspects.get(i + 1) ?? PAGE_ASPECT) + 2 + PAGE_GAP;
+    if (i > 0 && offsets[i + 1] - PAGE_GAP > most) return offsets.subarray(0, i + 1);
+  }
   return offsets;
 }
 

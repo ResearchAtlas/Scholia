@@ -344,3 +344,30 @@ test('a PDF page mounted again comes back on the part of its passages it last sh
   assert.equal(found.start, 'startPart'); // the list's record of it, 0 for a page never shown
   assert.deepEqual(found.recorded, ['onPart(number, part)']); // recorded once that part shows, not one asked for or failed
 });
+
+// The note after the pages a PDF's list lays out, as source text: what it shows on, its button's handler,
+// and the handler Contents gives the list for it.
+function pagesCut(text) {
+  return parsed(text, (context, found) => ({
+    LogicalExpression(node) {
+      if (context.sourceCode.getText(node.right).includes("'paper.pagesCut'")) found.when = context.sourceCode.getText(node.left);
+    },
+    JSXOpeningElement(element) {
+      const attribute = (name) => element.attributes.find((a) => a.name?.name === name);
+      const code = (a) => context.sourceCode.getText(a.value.expression);
+      if (element.name.name === 'PageList') found.onText = code(attribute('onText'));
+      if (element.name.name === 'Button' && context.sourceCode.getText(element.parent).includes("'paper.showPassages'")) found.click = code(attribute('onClick'));
+    },
+  }));
+}
+
+test('a PDF too long to lay out says, after its last page shown, that the others are in the text view, with a button to it', () => {
+  const found = pagesCut(source('Paper.jsx'));
+  assert.equal(found.when, 'offsets.length - 1 < pages'); // only when pages did not fit under the cap (pageOffsets)
+  assert.equal(found.click, 'onText');
+  const calls = [];
+  const radios = [{ focus: () => calls.push('Pages') }, { focus: () => calls.push('Passages') }];
+  new Function('views', 'setChosen', `return (${found.onText});`)({ current: { querySelectorAll: () => radios } },
+    (view) => calls.push(`chosen ${view}`))();
+  assert.deepEqual(calls, ['Passages', 'chosen text']); // focus on the switch's Passages, not lost with the button
+});

@@ -145,6 +145,7 @@ function Contents({ material }) {
   const t = useT();
   const pdf = isPdf(material);
   const [chosen, setChosen] = useState('pages');
+  const views = useRef(null); // the view's switch, whose Passages focus goes to when a note opens that view
   const view = viewOf(material, chosen);
   const [pointed, setPointed] = useState(NOT_POINTED); // the passages with focus and under the pointer
   const version = material.version.id;
@@ -154,12 +155,13 @@ function Contents({ material }) {
     <section className="grid gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h4 className="text-sm font-semibold">{t('paper.text')}</h4>
-        {pdf && <Segmented label={t('paper.view')} value={view} onChange={setChosen}
-          options={[{ value: 'pages', label: t('paper.pages') }, { value: 'text', label: t('paper.passages') }]} />}
+        {pdf && <div ref={views}><Segmented label={t('paper.view')} value={view} onChange={setChosen}
+          options={[{ value: 'pages', label: t('paper.pages') }, { value: 'text', label: t('paper.passages') }]} /></div>}
       </div>
       {/* Read again (its count changes), its parts start anew and read the new reading's passages. */}
       {view === 'pages' ? <PageList key={count} version={version} pages={material.extraction.pages ?? 0}
-        pointed={pointed} onPoint={setPointed} />
+        pointed={pointed} onPoint={setPointed}
+        onText={() => { views.current?.querySelectorAll('[role="radio"]')[1]?.focus(); setChosen('text'); }} />
         : <PassageList key={count} version={version} count={count} pointed={pointed} onPoint={setPointed} />}
     </section>
   );
@@ -247,10 +249,12 @@ function usePart(frame, part, showing, onNear, onWithin) {
 // (pageWindow); the others are spacers of their height, each page's from its own image once shown,
 // so the list keeps its height and every page its place, however many pages there are.
 // Each page also keeps the part of its passages it last showed (startPart), mounted again or not.
-// ponytail: laid out at its whole height, which engines cap (33,554,432 px measured in the app's WebKit
-// and one Chromium build, 16,777,214 px in another; about 35,000 and 17,700 letter pages 720 px wide);
-// pages past the cap cannot be scrolled to. A scaled or paged list if longer PDFs are read.
-function PageList({ version, pages, pointed, onPoint }) {
+// Engines cap an element's height (16,777,214 px in some Chromium builds), so the list lays out the
+// pages that fit in MAX_LIST_HEIGHT (pageOffsets: about 15,800 letter pages 720 px wide) and after the
+// last says the later ones are not shown here, with a button to the text view, which holds their text.
+// ponytail: a scaled or paged list if every page of longer PDFs must be shown as a page.
+function PageList({ version, pages, pointed, onPoint, onText }) {
+  const t = useT();
   const list = useRef(null);
   const { held, onNear, onWithin } = useHeld(list);
   const aspects = useRef(new Map()); // each page's width over its height, once its image was shown
@@ -292,6 +296,10 @@ function PageList({ version, pages, pointed, onPoint }) {
           held={held.has(item.page)} onNear={onNear} onWithin={onWithin} aspect={aspects.current.get(item.page)} onAspect={onAspect}
           startPart={parts.current.get(item.page) ?? 0} onPart={onPart} />
         : <div key={`before-${item.spacer}`} aria-hidden="true" style={{ height: item.height }} />))}
+      {offsets.length - 1 < pages && <div className="grid justify-items-center gap-2 py-4 text-center">
+        <p className="text-sm text-muted-foreground">{t('paper.pagesCut', { number: offsets.length - 1 })}</p>
+        <Button type="button" variant="outline" size="sm" onClick={onText}>{t('paper.showPassages')}</Button>
+      </div>}
     </div>
   );
 }
