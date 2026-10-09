@@ -1213,8 +1213,8 @@ def _retry(conn, run_id, registry, derived=None):
         if (refusal := _unreadable(conn, inputs.get("version_id"), registry)) is not None:
             return None, refusal
         return (project_id, workflow, {"material_ids": kept, "version_id": inputs["version_id"]}), None
-    if workflow == "index":  # embeds what its papers still lack (S1-17)
-        return (project_id, workflow, {"material_ids": kept}), None
+    if workflow == "index":  # embeds what its papers still lack (S1-17); a project's rebuild rebuilds again
+        return (project_id, workflow, {"material_ids": kept, **({"rebuild": True} if inputs.get("rebuild") else {})}), None
     if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
         return None, (403, "lookup_locked", "A review-locked project never looks identifiers up")
     return (project_id, workflow, {"material_ids": kept, "origin": None, "versions": dict(conn.execute(

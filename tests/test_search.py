@@ -1113,3 +1113,33 @@ async def test_a_cancelled_runs_index_change_still_waiting_its_turn_is_withdrawn
         assert await rows(client, "SELECT count(*) FROM index_queue") == [(4,)]  # left to the next pass
         await asyncio.to_thread(index.apply)
         assert len(await index_rows(client, project)) == 4
+
+
+async def test_retrying_a_stopped_rebuild_rebuilds_again(tmp_path):
+    """Retry of a cancelled project rebuild is a rebuild (its flag kept), not an index run that finds nothing
+    to embed and succeeds without rebuilding."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        client.remote.hold, client.remote.free = asyncio.Event(), len(client.remote.indexing)
+        rebuild = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        await asyncio.wait_for(client.remote.reached.wait(), 10)  # its rows rebuilt, its embeddings under way
+        cancel = await _cancelling(client, rebuild)
+        client.remote.hold.set()
+        assert (await run_finished(client, rebuild))["status"] == "cancelled"
+        await cancel
+        await idle(client, project)
+        before = len(client.remote.indexing)
+        again = await client.post(f"/api/runs/{rebuild}/retry")
+        assert again.status_code == 201, again.text
+        retried = again.json()["run_id"]
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", retried)
+        assert json.loads(inputs)["rebuild"] is True
+        assert (await run_finished(client, retried))["status"] == "succeeded"
+        meta = await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+            "SELECT key FROM index_meta WHERE key LIKE 'rebuilt:%'").fetchall())
+        assert meta == [(f"rebuilt:{retried}",)]  # rebuilt by the retry
+        assert len(client.remote.indexing) - before == 4  # and every passage embedded again
+        status = await idle(client, project)
+        assert status["run"]["rebuild"] is True and status["passages"]["embedded"] == 4
