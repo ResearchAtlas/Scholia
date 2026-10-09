@@ -251,7 +251,8 @@ export function Facts({ material, project, index }) {
     extraction?.ocr_pages > 0 && [t('library.fact.ocr'), t('library.ocrWaiting', { count: extraction.ocr_pages })],
     index && extraction && [t('search.indexTitle'), t(...paperIndexed(index, material.id))
       + (index.mode === 'keyword_only' && index.materials?.[material.id]  // and why meaning search is not there
-        ? ` ${t('helper.keywordOnly', { reason: t(indexReason(index.reason, downloadOffered(project))) })}` : '')],
+        ? (language.startsWith('zh') ? '' : ' ') + t('helper.keywordOnly', { reason: t(indexReason(index.reason, downloadOffered(project))) })
+        : '')],
     [t('library.fact.details'), detailsSource(t, material, project, date)],
     latestLookup(t, material) && [t('library.fact.lookup'), latestLookup(t, material)],
     material.lookup?.identifier && [t('library.fact.identifier'), material.lookup.identifier.replace(/^(doi|arxiv):/, '')],

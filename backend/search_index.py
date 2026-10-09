@@ -324,6 +324,7 @@ class SearchIndex:
                 # without them, so no deletion leaves one behind and none of another model is kept.
                 return False, True
             self._vector_tables()
+            self._checkpoint()  # a truncation a reader held off before the last close
             wanted = self.vectors and "vec_passages" not in tables and bool(self._conn.execute(
                 "SELECT 1 FROM index_rows WHERE kind != 'reference' LIMIT 1").fetchone())  # sqlite-vec loads again
             if (meta.get("tokenizer"), meta.get("tokenizer_version")) != (TOKENIZER, TOKENIZER_VERSION):
@@ -339,12 +340,11 @@ class SearchIndex:
             return False, True
 
     def _database(self):
-        """Which main database file the index was built from: its device and inode. A restore puts another
+        """Which main database file the index was built from: its inode. A restore puts another
         file in place, and putting the previous one back after a failed restore brings back its own, so
         an index built in between is never taken for this database's (the queue's high-water mark alone
         cannot tell them apart)."""
-        found = os.stat(self.db.path)
-        return f"{found.st_dev}:{found.st_ino}"
+        return str(os.stat(self.db.path).st_ino)  # not the device number, which a removable volume's mount can change
 
     def _vector_tables(self):
         if self.vectors:
@@ -450,7 +450,7 @@ class SearchIndex:
                 if target == "passage" and op == "add":
                     wanted.setdefault(project, set()).add(pid)
             found = self.db.read(lambda conn: {project: readings(conn, project, ids) for project, ids in wanted.items()})
-            removed = []
+            removed, replaced = [], False
             with self._conn:
                 for _, target, pid, project, op in rows:
                     if target != "passage":
@@ -458,9 +458,9 @@ class SearchIndex:
                     if op == "remove":
                         removed += self._remove(project, pid)
                     elif (reading := found[project].get(pid)) is not None:
-                        self._add(project, pid, reading)
+                        replaced = self._add(project, pid, reading) or replaced
                 self._meta(last_seq=rows[-1][0])
-            if removed:
+            if removed or replaced:  # what was removed or replaced is in old WAL frames
                 self._checkpoint()
             applied += len(rows)
             self._prune(rows[-1][0])
@@ -474,7 +474,8 @@ class SearchIndex:
             log.warning("the applied index queue rows could not be deleted (%s)", type(error).__name__)
 
     def _add(self, project, pid, reading):
-        """A passage's rows, or its new index text (its title changed): an embedding of the old text goes."""
+        """A passage's rows, or its new index text (its title changed, or another paper's now): an embedding
+        of the old text goes. Returns whether text was replaced."""
         material, title, path, kind, text = reading[:5]
         indexed = index_text(title, path, text)
         mark = digest(indexed)
@@ -485,15 +486,16 @@ class SearchIndex:
                                " VALUES (?, ?, ?, ?, ?)", (project, pid, material, kind, mark))
             self._conn.execute("INSERT INTO fts_passages (rowid, text, project_id, passage_id) VALUES (?, ?, ?, ?)",
                                (self._conn.last_insert_rowid(), indexed, project, pid))
-            return
+            return False
         rowid, before, embedded = row
         self._conn.execute("UPDATE index_rows SET material_id = ?, kind = ? WHERE id = ?", (material, kind, rowid))
         if before == mark:
-            return
+            return False
         self._conn.execute("UPDATE fts_passages SET text = ? WHERE rowid = ?", (indexed, rowid))
         if embedded and self.vectors:
             self._conn.execute("DELETE FROM vec_passages WHERE rowid = ?", (rowid,))
         self._conn.execute("UPDATE index_rows SET digest = ?, embedded = 0 WHERE id = ?", (mark, rowid))
+        return True
 
     def _remove(self, project, pid):
         row = self._conn.execute("SELECT id, embedded FROM index_rows WHERE project_id = ? AND passage_id = ?",

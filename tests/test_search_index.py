@@ -383,5 +383,42 @@ async def test_an_index_built_from_another_database_file_is_rebuilt(tmp_path):
         index = client.state["index"]
         assert await asyncio.to_thread(index.keyword, project, "ghost", 50) == []
         meta = dict(await asyncio.to_thread(index._read, lambda conn: conn.execute("SELECT key, value FROM index_meta").fetchall()))
-        found = os.stat(database)
-        assert meta["database"] == f"{found.st_dev}:{found.st_ino}"
+        assert meta["database"] == str(os.stat(database).st_ino)
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_papers_title_leaves_the_file_when_another_paper_keeps_its_passages(tmp_path):
+    """The passages stay (another paper in the project reads the same file), retitled; the deleted title's
+    bytes leave the file and its WAL too."""
+    file = ("Quixotic Ledger.md", b"# Plain Heading\n\n## Part\n\nPlain text with nothing special.\n")
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        [first] = (await added(client, project, file))["materials"]
+        [second] = (await added(client, project, paper("Zephyr Accounts", "Other text.")))["materials"]
+        await idle(client, project)
+        await added(client, project, ("zephyr.md", file[1]), material_id=second["id"])  # the same bytes
+        await idle(client, project)
+        index = client.state["index"]
+        files = [index.path, Path(f"{index.path}-wal")]
+        assert b"quixotic" in b"".join(f.read_bytes() for f in files if f.exists())
+        assert (await client.delete(f"/api/materials/{first['id']}")).status_code == 200
+        await idle(client, project)
+        assert {r[1] for r in await index_rows(client, project)} == {second["id"]}
+        left = b"".join(f.read_bytes() for f in files if f.exists())
+        assert b"quixotic" not in left and b"Quixotic" not in left
+
+
+@pytest.mark.asyncio
+async def test_an_index_unreadable_at_open_does_not_stop_the_launch(tmp_path, monkeypatch):
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+
+    def unreadable(self):
+        raise search_index.apsw.CorruptError("damaged")
+    monkeypatch.setattr(SearchIndex, "unembedded", unreadable)
+    async with app(tmp_path) as client:  # the model in place, the index unreadable: the app runs
+        assert (await client.get(f"/api/projects/{project}/index")).status_code == 200
+        runs = [r for r in (await client.get("/api/activity")).json()["runs"] if r["workflow"] == "index"]
+        assert len(runs) == 2  # the first launch's, and one this launch recorded: its papers taken as pending

@@ -306,6 +306,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             loop.call_soon_threadsafe(lambda: asyncio.ensure_future(harness.shutdown()))
 
         db.on_damage = damaged
+        # S1-17: the index, checked against this database (the one before closed), before the background
+        # runs start, so the index runs it records start with them.
+        await search.open_index(state, db)
         try:
             await (harness.recover() if kick else harness.recover(kick=False))
         except BaseException:
@@ -314,7 +317,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         state.update(db=db, content=content, gate=gate, harness=harness)
         state.pop("damaged", None)
         state.pop("damaged_code", None)
-        await search.open_index(state, db)  # S1-17: checked against this database, the one before closed
 
     @contextlib.asynccontextmanager
     async def lifespan(app):

@@ -125,7 +125,11 @@ async def open_index(state, db):
         index.apply_soon()
     if not _installed(state):
         return
-    pending = None if wanted else await asyncio.to_thread(index.unembedded)
+    try:
+        pending = None if wanted else await asyncio.to_thread(index.unembedded)
+    except Exception as error:  # unreadable now (being replaced): the papers it cannot tell about are taken as pending
+        log.warning("the search index could not be read at open (%s)", type(error).__name__)
+        pending = None
 
     def record(conn):
         papers = _read_papers(conn)
@@ -500,7 +504,8 @@ async def search(state, project_id, query, limit=None):
     ranked = fuse([[p for p in keyword if p in found], [p for p in dense if p in found]], values["rrf_k"])[:limit]
     results = [{"passage_id": pid, "material_id": r[0], "title": r[1], "section_path": r[2], "kind": r[3], "text": r[4],
                 "page": r[5], "ordinal": r[6], "version_id": r[7]} for pid in ranked for r in [found[pid]]]
-    return {"results": results, "mode": mode, "reason": reason, "index": "building" if index.building else "ready",
+    return {"results": results, "mode": mode, "reason": reason,
+            "index": "building" if index.building or index.damaged else "ready",
             "coverage": coverage}
 
 
@@ -530,7 +535,7 @@ async def index_status(project_id: str, request: Request):
     mode, reason = search_mode(state)
     status = run and derived_status(run[1], run[0], registry)
     active = run and registry.runs.get(run[0])
-    return {"state": "unavailable" if index is None else "building" if index.building else "ready",
+    return {"state": "unavailable" if index is None else "building" if index.building or index.damaged else "ready",
             "mode": mode, "reason": reason,
             "passages": {"indexed": sum(c[0] for c in counts.values()), "embedded": sum(c[1] for c in counts.values()),
                          "embeddable": sum(c[2] for c in counts.values())},

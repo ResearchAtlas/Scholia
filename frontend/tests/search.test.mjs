@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
-import { fieldKey, offerOutcome, paperIndexed, queryOf, searchNote, whereIs } from '../src/search.js';
+import { fieldKey, indexReason, offerOutcome, paperIndexed, queryOf, searchNote, whereIs } from '../src/search.js';
 
 const t = makeT('en');
 
@@ -79,4 +79,15 @@ test('the offer asks in its own words, with the three options in order', () => {
   assert.equal(en['ask.model_download.option.huggingface'], 'Download from Hugging Face');
   assert.equal(en['ask.model_download.option.modelscope'], 'Download from ModelScope');
   assert.equal(en['ask.model_download.option.later'], 'Later');
+});
+
+test('an index run or a paper says why search is keyword-only, in words for each reason', () => {
+  assert.equal(indexReason('deadline'), 'search.reason.deadline');
+  assert.equal(indexReason('model_missing'), 'helper.reason.model_missing');
+  assert.equal(indexReason('model_missing', false), 'helper.reasonImport.model_missing'); // Local only: import
+  assert.equal(indexReason('never_seen'), 'helper.reason.other');
+  for (const reason of ['request_failed', 'start_failed', 'start_timeout', 'helper_failed', 'index_unavailable', 'model_changed',
+    'binary_missing', 'binary_changed', 'crashed', 'unhealthy', 'helper_unavailable']) {
+    for (const catalog of [en, zhCN]) assert.ok(`errors.${reason}` in catalog, reason); // a failed index run's reason
+  }
 });
