@@ -12,7 +12,7 @@ import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageImage,
   pageLines, pagePart, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing, rectStyle, reasonKey, selectedParts, takeSaved,
-  unionRect, validYear, viewOf, withNear } from '../library.js';
+  unionRect, validYear, viewOf, waitsOn, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -197,7 +197,8 @@ function scroller(element) {
 // whether focus is in it. While its passages are not shown it takes Tab's focus in their place; once
 // they show, it passes focus on to the first of them, or to the last when focus came back from after
 // it (passOn), so Tab reaches every passage in order. focusOn(where) asks the same of what it shows
-// next. Focus that leaves it meanwhile stays where it went. Returns its element's props and focusOn.
+// next, and passTo(element) gives focus waiting so to element instead (Retry, once a read failed).
+// Focus that leaves it meanwhile stays where it went. Returns its element's props, focusOn and passTo.
 function usePart(frame, part, showing, onNear, onWithin) {
   const entering = useRef(null);
   const shown = showing != null;
@@ -232,7 +233,8 @@ function usePart(frame, part, showing, onNear, onWithin) {
     },
   };
   const focusOn = (where) => { entering.current = where; frame.current?.focus(); };
-  return [props, focusOn];
+  const passTo = (element) => { if (waitsOn(frame.current, document.activeElement, entering.current)) element?.focus(); };
+  return [props, focusOn, passTo];
 }
 
 // A PDF's pages, each holding its image and its passages only while it is held.
@@ -265,7 +267,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
   const [shown, setShown] = useState(null); // { src, part, passages, more }
   const [failed, setFailed] = useState(false); // read again once asked to, or let go and held again
   const [aspect, setAspect] = useState(null); // its image's width over height, once one was shown
-  const [props, focusOn] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
+  const [props, focusOn, passTo] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
   const move = partMove(shown, part, failed);
   useEffect(() => {
     if (!held) { setShown(null); setFailed(false); return undefined; } // let go: fetched again (no-store) once it is near
@@ -277,7 +279,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
     return () => { live = false; controller.abort(); };
   }, [held, shown, version, number, part, failed]);
   useEffect(() => { // focus waiting on the page for the part goes to Retry once its read failed
-    if (move.failed && document.activeElement === frame.current) retry.current?.focus();
+    if (move.failed) passTo(retry.current);
   }, [move.failed]);
   const lines = shown && pageLines(shown.passages);
   const go = (to, where) => { focusOn(where); setPart(to); setFailed(false); };

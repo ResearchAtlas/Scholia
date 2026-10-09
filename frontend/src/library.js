@@ -417,12 +417,17 @@ export function selectedParts(selection, shown) {
   return shown.filter((element) => selection.containsNode(element, true)).map((element) => Number(element.dataset.part));
 }
 
+// Whether focus is on a part waiting for what it was asked to show (entering): not once focus has
+// left the part, as entering is cleared then, and focus is checked to be on it still.
+export function waitsOn(part, active, entering) {
+  return Boolean(entering && part && active === part);
+}
+
 // Where focus goes once a part shows what it was asked for (its passages read, or another part of a
-// page's), when focus was on the part itself waiting for them: its first passage, or its last when
-// it came back from after it. Nowhere once focus has left the part: entering is cleared then, and
-// focus is checked to be on it still.
+// page's), when focus was on the part itself waiting for them (waitsOn): its first passage, or its
+// last when it came back from after it.
 export function passOn(part, active, entering) {
-  if (!entering || !part || active !== part) return null;
+  if (!waitsOn(part, active, entering)) return null;
   const passages = part.querySelectorAll('[data-passage]');
   return (entering === 'last' ? passages[passages.length - 1] : passages[0]) ?? null;
 }

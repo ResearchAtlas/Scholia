@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn,
   detailsSource, latestLookup, pageImage } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -656,6 +656,10 @@ test('a part the selection takes in is kept, and a part waiting to pass focus on
   assert.equal(passOn(stretch, stretch, null), null); // left and come back by a click: nothing pending
   const empty = { querySelectorAll: () => [] };
   assert.equal(passOn(empty, empty, 'first'), null); // nothing to pass it to
+  // Focus waits on a part only while a pass is pending and focus is on it: a page whose read failed
+  // gives that focus to Retry, and none that left and came back by a click.
+  assert.deepEqual([waitsOn(stretch, stretch, 'first'), waitsOn(stretch, { elsewhere: true }, 'first'), waitsOn(stretch, stretch, null),
+    waitsOn(null, null, 'first')], [true, false, false, false]);
 });
 
 test('a page moving to another part keeps what it shows out of reach while that part loads, and a failed read shows until asked again', () => {
