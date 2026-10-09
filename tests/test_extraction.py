@@ -701,6 +701,14 @@ def test_a_latex_files_breaks_are_counted_as_blocks_as_they_are_found(monkeypatc
     assert len(extract(data, extraction.LATEX).passages) == 600
 
 
+def test_a_pdf_page_of_no_width_or_height_is_unreadable_not_an_error(monkeypatch):
+    import pypdfium2
+    real = pypdfium2.PdfPage.get_size
+    monkeypatch.setattr(pypdfium2.PdfPage, "get_size", lambda page: (0.0, real(page)[1]))  # as a page may declare
+    with pytest.raises(extraction.Unreadable):
+        extract(synthetic.paper_pdf(), extraction.PDF)
+
+
 def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
     import pypdfium2
 

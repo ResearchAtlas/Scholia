@@ -568,6 +568,8 @@ def _pdf_page(page, raw, measure=False):
     from its bottom left. With measure, only each line's text and size are true: no box is read and no
     line is checked for bold, the rest (lines, sizes, the scanned check) as without it."""
     width, height = page.get_size()  # as displayed: a page turned a quarter is as wide as it was high
+    if not (width > 0 and height > 0):  # no area to place its text on, as render_page refuses it
+        raise Unreadable()
     shown = _displayed(page, raw, width, height)
     textpage = page.get_textpage()
     try:
