@@ -150,6 +150,22 @@ async def test_a_footprint_that_cannot_be_read_as_a_wrong_frame_is_weighed_fails
 
 
 @pytest.mark.asyncio
+async def test_any_other_failure_on_a_childs_value_is_a_wrong_frame_and_this_process_out_of_memory_is_not(
+        tmp_path, monkeypatch, caplog):
+    path, sha256 = stored(tmp_path, synthetic.paper_pdf())  # its passages have boxes
+    for failure, outcome in ((ZeroDivisionError, extraction.Unreadable), (MemoryError, MemoryError)):
+        def failing(value, failure=failure):
+            raise failure()
+
+        monkeypatch.setattr(reading, "_number", failing)  # a check that fails on a value, as an unforeseen one would
+        with pytest.raises(outcome) as raised:
+            await asyncio.to_thread(reading.read, path, sha256, extraction.PDF)
+        assert gone()
+    assert "a frame its checks could not take (ZeroDivisionError)" in caplog.text  # its type, never its content
+    assert raised.type is MemoryError  # the app's own memory, not the file's fault: the run fails internal
+
+
+@pytest.mark.asyncio
 async def test_a_selector_that_cannot_be_made_starts_no_child_and_fails_internal(tmp_path, monkeypatch):
     def never(*args, **kwargs):
         raise AssertionError("a child was started")
@@ -374,7 +390,7 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path):
     (("frame", "nested"), "unreadable_file"),  # nested past the JSON parser's depth
     (("frame", "list-kind"), "unreadable_file"),  # a list where a name is due
     (("frame", "list-error"), "unreadable_file"),
-    (("frame", "bigint-rect"), "unreadable_file"),  # past a float: any value the checks cannot take
+    (("frame", "bigint-rect"), "unreadable_file"),  # an integer past a float, where a box's number is due
     (("frame", "no-page"), "unreadable_file"),  # a page image's report, not a reading's
     (("after-done", "beat"), "unreadable_file"),
     (("after-done", "exit"), "unreadable_file"),

@@ -241,9 +241,11 @@ def _run(request, ceiling, limit, stop, received, stats):
                     peak = now
                     if peak > ceiling:
                         raise _Ceiling(peak) from None
-                    if isinstance(error, (_Bad, extraction.Unreadable, FileNotFoundError, IndexError, ChildError)):
-                        raise  # what a frame may say, or a wrong frame found as one
-                    raise _Bad("a frame its checks could not take") from None  # any other failure on a value
+                    if isinstance(error, (_Bad, extraction.Unreadable, FileNotFoundError, IndexError, ChildError,
+                                          MemoryError)):
+                        raise  # what a frame may say, a wrong frame found as one, or this process out of memory
+                    # Any other failure on a value the child sent: a wrong frame, its type logged (never content).
+                    raise _Bad(f"a frame its checks could not take ({type(error).__name__})") from None
             if time.monotonic() - last > STEP_SECONDS:
                 log.warning("a reading's child sent nothing for %d s; it was stopped", STEP_SECONDS)
                 raise extraction.Unreadable("step_limit")
