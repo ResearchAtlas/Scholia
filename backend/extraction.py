@@ -53,8 +53,10 @@ MAX_BLOCKS = 200_000  # its blocks: paragraphs, headings, tables and captions, a
 MAX_PAGE_CHARS = 100_000  # a PDF page's characters, as PDFium counts them before any is read
 # A LaTeX file's marks: what may start one of pylatexenc's nodes (a macro, a group, a comment, math,
 # or a special: & ~ -- `` '' !` ?`), counted before parsing. It holds a node for each and one for
-# the text between two, about 570 bytes a mark as measured: 500,000 marks come to about 280 MiB. A
-# paper has some thousands; a heavily marked-up book of 700 pages, at 700 a page, still fits.
+# the text between two, about 570 bytes a mark as measured: 500,000 marks come to about 280 MiB.
+# Measured, dense mathematics has about 160 marks in 1,000 characters (480 on a 3,000-character page)
+# and ordinary prose about 60: a paper has some thousands, and a 1,000-page mathematical book in one
+# file still fits.
 MAX_LATEX_MARKS = 500_000
 MAX_STYLES = 10_000  # a DOCX's styles by name: a file of more is refused, never read with some left out
 MAX_TAG_ATTRIBUTES = 1024  # an HTML tag's attributes, counted before the parser lists them
