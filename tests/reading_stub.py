@@ -49,6 +49,11 @@ FRAMES = {
     "bad-boxes": json.dumps({"passage": ["paragraph", "Text.", 1, [], 0, 5, {"rects": [[0, 0, 1]]}]}).encode(),
     "two-keys": json.dumps({"beat": 1, "progress": [0, 1]}).encode(),
     "unknown-error": json.dumps({"error": ["no_such_code"]}).encode(),
+    "unknown-kind": json.dumps({"passage": ["poem", "Text.", None, [], 0, 5, None]}).encode(),
+    "surrogate": json.dumps({"passage": ["paragraph", "Half \ud800 a pair.", None, [], 0, 5, None]}).encode(),
+    "not-finite": json.dumps({"passage": ["paragraph", "Text.", 1, [], 0, 5, {"rects": [[0, 0, float("nan"), 1]]}]}).encode(),
+    "negative": json.dumps({"passage": ["paragraph", "Text.", -1, [], 0, 5, None]}).encode(),
+    "past-int64": json.dumps({"passage": ["paragraph", "Text.", 2**64, [], 0, 5, None]}).encode(),
 }
 real_extract, real_render, real_extractor_of = extraction.extract, extraction.render_page, extraction.extractor_of
 real_file = reading._file

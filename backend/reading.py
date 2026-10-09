@@ -47,6 +47,7 @@ import ctypes
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import selectors
@@ -272,14 +273,27 @@ def _message(body):
 
 
 def _number(value):
-    return type(value) in (int, float)
+    """A finite number: a box's edge or a confidence (a non-finite one is not JSON the database keeps)."""
+    return type(value) in (int, float) and math.isfinite(value)
 
 
-def _optional_int(value):
-    return value is None or type(value) is int
+def _count(value):
+    """A page, an offset or a count: never negative, and within what the database stores."""
+    return type(value) is int and 0 <= value < 2**53
+
+
+def _optional_count(value):
+    return value is None or _count(value)
+
+
+def _text(value):
+    """A string the database can store: no unpaired surrogate (UTF-8 has none)."""
+    return type(value) is str and not _SURROGATE.search(value)
 
 
 _ERRORS = {"unreadable_file", "encrypted_file", "ocr_failed", "file_missing", "no_page", "internal"}
+_KINDS = {"paragraph", "table", "caption", "reference", "abstract", "title"}  # the passages table's
+_SURROGATE = re.compile("[\ud800-\udfff]")
 _TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,99}")
 _WHERE = re.compile(r"[A-Za-z0-9_.-]{1,100}:\d{1,7}")
 
@@ -349,14 +363,14 @@ class _Reading(_Received):
         if key == "beat":
             return
         if key == "progress":
-            if type(value) is not list or len(value) != 2 or not all(type(v) is int and v >= 0 for v in value):
+            if type(value) is not list or len(value) != 2 or not all(map(_count, value)):
                 raise _Bad("a progress that is not one")
             return self.progress(*value)
         if key == "passage":
             return self.passages.append(self._passage(value))
         if key == "done":
-            if type(value) is not list or len(value) != 3 or not _optional_int(value[0]) \
-                    or type(value[1]) is not int or value[1] < 0 or value[2] not in ("complete", "ocr_needed"):
+            if type(value) is not list or len(value) != 3 or not _optional_count(value[0]) \
+                    or not _count(value[1]) or value[2] not in ("complete", "ocr_needed"):
                 raise _Bad("a done that is not one")
             self.done = value
             return
@@ -365,13 +379,14 @@ class _Reading(_Received):
         raise _Bad("a frame of other fields")
 
     def _passage(self, value):
-        """A passage, its fields' types checked and counted against the reading's bounds."""
+        """A passage, its fields checked as the database will take them, and counted against the
+        reading's bounds."""
         if type(value) is not list or len(value) != 7:
             raise _Bad("a passage that is not one")
         kind, text, page, path, start, end, boxes = value
-        if type(kind) is not str or len(kind) > 32 or type(text) is not str or not _optional_int(page) \
-                or type(path) is not list or not all(type(p) is str for p in path) \
-                or not _optional_int(start) or not _optional_int(end):
+        if kind not in _KINDS or not _text(text) or not _optional_count(page) \
+                or type(path) is not list or not all(map(_text, path)) \
+                or not _optional_count(start) or not _optional_count(end):
             raise _Bad("a passage that is not one")
         rects = self._boxes(boxes)
         self.chars += len(text)

@@ -286,6 +286,11 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path):
     (("frame", "bad-boxes"), "unreadable_file"),
     (("frame", "two-keys"), "unreadable_file"),
     (("frame", "unknown-error"), "unreadable_file"),
+    (("frame", "unknown-kind"), "unreadable_file"),  # each as the database would refuse it at the commit
+    (("frame", "surrogate"), "unreadable_file"),
+    (("frame", "not-finite"), "unreadable_file"),
+    (("frame", "negative"), "unreadable_file"),
+    (("frame", "past-int64"), "unreadable_file"),
     (("after-done", "beat"), "unreadable_file"),
     (("after-done", "exit"), "unreadable_file"),
     (("version",), "internal"),
