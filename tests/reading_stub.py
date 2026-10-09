@@ -18,10 +18,16 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     canary TEXT       print TEXT to stdout and stderr, then abort
     probe DIR PORT    try a connection to 127.0.0.1:PORT, a name lookup and a process start, writing
                       how each went to DIR/probe; then read for real
+    walkthrough DIR   the walkthrough server's child (tests/walkthrough.py): a file holding
+                      WALKTHROUGH-MEMORY takes memory without end, one holding WALKTHROUGH-SLOW says
+                      nothing for ever, so each is stopped as a crafted file would be; and this Mac's
+                      OCR engine fails its first recognition of a page with dark ink, once (DIR/ocr-failed
+                      records it across children); every other file is read for real
 """
 
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -32,7 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend import extraction, reading  # noqa: E402
+from backend import extraction, ocr, reading  # noqa: E402
 
 MODE, ARGS = sys.argv[1], sys.argv[2:]
 FRAMES = {
@@ -79,9 +85,16 @@ def hold(what, stop=lambda: None, progress=lambda done, total: None):
         time.sleep(0.01)
 
 
-def before(what, stop, progress):
+def before(what, stop, progress, data=b""):
     """What the mode does where the child would parse."""
-    if MODE == "hold":
+    if MODE == "walkthrough" and b"WALKTHROUGH-MEMORY" in data:
+        kept = []
+        while True:
+            kept.append(touch(64))
+    elif MODE == "walkthrough" and b"WALKTHROUGH-SLOW" in data:
+        while True:
+            time.sleep(1)
+    elif MODE == "hold":
         if ARGS[1:] != ["file"]:
             hold(what, stop, progress)
     elif MODE == "sleep":
@@ -124,7 +137,7 @@ def before(what, stop, progress):
 
 
 def extract(data, kind, stop=lambda: None, progress=lambda done, total: None):
-    before(kind, stop, progress)
+    before(kind, stop, progress, data)
     return real_extract(data, kind, stop, progress)
 
 
@@ -146,7 +159,25 @@ def extractor_of(kind):
     return name, version + ("-other" if MODE == "version" else "")
 
 
+class FailsOnce:
+    """This Mac's OCR engine, whose first recognition of a page with dark ink fails, once (the
+    walkthrough's scanned appendix is an even gray); its version is the engine's."""
+
+    def __init__(self, engine):
+        self.engine, self.version = engine, engine.version
+
+    def recognize(self, bitmap):
+        failed = Path(ARGS[0], "ocr-failed")
+        if not failed.exists() and re.search(rb"[\x00-\x3f]", bitmap.pixels):
+            failed.touch()
+            raise ocr.Failed()
+        return self.engine.recognize(bitmap)
+
+
 extraction.extract, extraction.render_page, extraction.extractor_of = extract, render_page, extractor_of
+if MODE == "walkthrough" and (engine := ocr.engine()) is not None:
+    failing = FailsOnce(engine)
+    ocr.engine = lambda: failing
 reading._Out, reading._file = Out, stored_file
 
 if __name__ == "__main__":
