@@ -35,6 +35,10 @@ const SEARCH_REASONS = new Set(['deadline', 'vectors_unavailable', 'index_unavai
 export const indexReason = (reason, offered = true) => (SEARCH_REASONS.has(reason) ? `search.reason.${reason}`
   : keywordOnlyReason({ search: { mode: 'keyword_only', reason } }, offered));
 
+// Why an index run (a row of the background-run list) ended keyword-only, as a catalog key, worded as
+// its own project offers the search model (the row's download_offered), not the project open now.
+export const runReason = (run) => indexReason(run.result?.reason, run.download_offered !== false);
+
 export function searchNote(found, offered = true) {
   if (!found) return null;
   if (found.mode === 'keyword_only') {

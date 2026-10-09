@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
-import { fieldKey, indexReason, offerOutcome, paperIndexed, queryOf, searchNote, whereIs } from '../src/search.js';
+import { fieldKey, indexReason, offerOutcome, paperIndexed, queryOf, runReason, searchNote, whereIs } from '../src/search.js';
 
 const t = makeT('en');
 
@@ -94,18 +94,31 @@ test('an index run or a paper says why search is keyword-only, in words for each
   }
 });
 
-test("every view of the index, a search or an index run words its reason by indexReason, as its page offers the model", () => {
+test("every view of the index, a search or an index run words its reason by indexReason, as its project offers the model", () => {
   const source = (name) => readFileSync(fileURLToPath(new URL(`../src/components/${name}`, import.meta.url)), 'utf8');
   for (const name of ['SearchIndex.jsx', 'Library.jsx', 'Settings.jsx']) {
-    const text = source(name);
-    assert.doesNotMatch(text, /keywordOnlyReason/, name); // the helper's own reasons only (LocalHelper.jsx)
-    const calls = [...text.matchAll(/indexReason\(([^()]*(?:\([^()]*\))?[^()]*)\)/g)].map((m) => m[1]);
-    assert.ok(calls.length > 0, name);
-    for (const args of calls) assert.match(args, /,/, `${name}: indexReason(${args}) says nothing of the offer`);
+    assert.doesNotMatch(source(name), /keywordOnlyReason/, name); // the helper's own reasons only (LocalHelper.jsx)
   }
+  for (const name of ['SearchIndex.jsx', 'Library.jsx']) { // the project open: its own offer
+    const calls = [...source(name).matchAll(/indexReason\(([^()]*(?:\([^()]*\))?[^()]*)\)/g)].map((m) => m[1]);
+    assert.ok(calls.length > 0, name);
+    for (const args of calls) assert.match(args, /downloadOffered\(project\)/, `${name}: indexReason(${args})`);
+  }
+  // The background-run list holds every project's runs: each row is worded by its own project.
+  assert.match(source('Settings.jsx'), /t\(runReason\(run\)\)/);
+  assert.doesNotMatch(source('Settings.jsx'), /indexReason\(/);
   // A healthy helper with sqlite-vec missing, or the index unavailable, is not "the helper is not available".
   for (const reason of ['vectors_unavailable', 'index_unavailable']) {
     assert.notEqual(t(indexReason(reason)), t('helper.reason.other'), reason);
     assert.notEqual(t(indexReason(reason)), t('helper.reason.helper_failed'), reason);
   }
+});
+
+test("an index run's reason is worded as its own project offers the model, whichever project is open", () => {
+  const run = (offered) => ({ workflow: 'index', result: { mode: 'keyword_only', reason: 'model_missing' }, download_offered: offered });
+  assert.equal(runReason(run(true)), 'helper.reason.model_missing'); // Download it, or import its file
+  assert.equal(runReason(run(false)), 'helper.reasonImport.model_missing'); // a Local only project: import only
+  assert.match(t(runReason(run(true))), /Download/);
+  assert.doesNotMatch(t(runReason(run(false))), /Download/);
+  assert.equal(runReason({ result: { reason: 'vectors_unavailable' }, download_offered: false }), 'search.reason.vectors_unavailable');
 });

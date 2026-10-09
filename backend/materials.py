@@ -1132,7 +1132,8 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
 
 def run_details(conn, run_id, workflow, status, inputs, registry):
     """What the background-run list shows of a material's run beside its status: the titles of the
-    papers it works on (up to three, with their count), its open ask, and whether Retry applies."""
+    papers it works on (up to three, with their count), its open ask, whether Retry applies, and for
+    an index run whether its project offers the search model's download (S1-17)."""
     if workflow not in _WORKFLOWS:
         return {}
     ids = json.loads(inputs or "{}").get("material_ids") or []
@@ -1142,8 +1143,13 @@ def run_details(conn, run_id, workflow, status, inputs, registry):
     (kept,) = conn.execute("SELECT count(*) FROM materials WHERE id IN (SELECT value FROM json_each(?))",
                            (json.dumps(ids),)).fetchone()
     ask = asks.open_asks(conn, run_id=run_id) if status == "running" else []
-    return {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
-            "retryable": _retry(conn, run_id, registry)[1] is None}
+    details = {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
+               "retryable": _retry(conn, run_id, registry)[1] is None}
+    if workflow == "index":  # S1-17: why it was keyword-only is worded as its own project offers the model
+        level = conn.execute("SELECT p.sensitivity FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?",
+                             (run_id,)).fetchone()
+        details["download_offered"] = level is not None and level[0] != "local_only"
+    return details
 
 
 def _live(run_id, registry):
