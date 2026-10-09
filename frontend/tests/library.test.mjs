@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, byPage, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS } from '../src/library.js';
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey } from '../src/library.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
@@ -361,4 +361,14 @@ test('a read of a conversation\'s questions that fails keeps the view looking un
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test('a lookup stopped says why by what it recorded: skipped on its question, stopped, or its project changed', () => {
+  assert.equal(cancelledKey({ status: 'cancelled', cancel_reason: 'researcher', reason: 'declined' }), 'library.source.declined');
+  assert.equal(cancelledKey({ status: 'cancelled', cancel_reason: 'researcher', reason: null }), 'runs.stopped'); // Cancel
+  assert.equal(cancelledKey({ status: 'cancelled', cancel_reason: 'revoked', reason: 'project_changed' }),
+    'library.source.projectChanged');
+  for (const key of ['library.source.declined', 'runs.stopped', 'library.source.projectChanged']) assert.ok(key in en && key in zh);
+  // The background-run list follows the same rule.
+  assert.deepEqual(runOutcome({ status: 'cancelled', cancel_reason: 'researcher', result: null }), { ok: false, key: 'runs.stopped' });
 });

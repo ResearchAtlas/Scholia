@@ -9,7 +9,7 @@ import { ApiError, get, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, LOOKUP_OUTCOMES, addFiles, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey,
+import { ACCEPT, LOOKUP_OUTCOMES, addFiles, cancelledKey, authorNames, libraryEvents, newest, reasonKey, sortFiles, stateKey,
   typeKey, unsettled, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
@@ -264,9 +264,7 @@ function detailsSource(t, material, project, date) {
   if (!lookup) return t(project?.review_lock ? 'library.source.locked' : 'library.source.fromFile');
   if (lookup.waiting) return t('library.source.waiting');
   if (lookup.status === 'running') return t('library.source.lookingUp');
-  if (lookup.status === 'cancelled') {
-    return t(lookup.cancel_reason === 'revoked' ? 'library.source.projectChanged' : 'library.source.declined');
-  }
+  if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
   const outcome = lookup.outcome;
   return t(LOOKUP_OUTCOMES.includes(outcome) ? `library.source.${outcome}` : 'library.source.fromFile');
 }

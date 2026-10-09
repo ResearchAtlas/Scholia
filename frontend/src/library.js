@@ -96,6 +96,12 @@ export const isPdf = (material) => material?.version?.media_type === 'applicatio
 // passages as text (whatever was chosen for an earlier version that was a PDF).
 export const viewOf = (material, chosen) => (isPdf(material) && chosen === 'pages' ? 'pages' : 'text');
 
+// A stopped lookup's line in a paper's details, by what it recorded, as runOutcome reads a stopped run
+// for the background-run list: its project changed (revoked), the researcher chose not to on its
+// question (declined), or it was stopped (Cancel).
+export const cancelledKey = (lookup) => (lookup.cancel_reason === 'revoked' ? 'library.source.projectChanged'
+  : lookup.reason === 'declined' ? 'library.source.declined' : 'runs.stopped');
+
 // A paper's state (reading, ready, needs_attention) and its reason, as catalog keys.
 export function stateKey(material) {
   return `library.state.${material.state}`;

@@ -708,7 +708,7 @@ def _describe(conn, row, registry):
     else:  # no reading by this extractor version: one by an earlier version (its own or shared), or none
         state, reason = "needs_attention", "outdated" if _earlier(conn, sha256, media_type) else "not_read"
     found = conn.execute(
-        "SELECT r.id, r.status, r.cancel_reason, r.waiting FROM runs r, json_each(r.inputs, '$.material_ids') j"
+        "SELECT r.id, r.status, r.cancel_reason, r.waiting, r.summary FROM runs r, json_each(r.inputs, '$.material_ids') j"
         " WHERE r.workflow = 'lookup' AND j.value = ? ORDER BY r.rowid DESC LIMIT 1", (material,)).fetchone()
     looked = None
     if found is not None:
@@ -718,7 +718,8 @@ def _describe(conn, row, registry):
         outcome = json.loads(event[0]) if event else {}
         looked = {"run_id": found[0], "status": derived_status(found[1], found[0], registry),
                   "cancel_reason": found[2], "waiting": found[3] == "ask", "outcome": outcome.get("outcome"),
-                  "identifier": outcome.get("identifier"), "source": outcome.get("source")}
+                  "identifier": outcome.get("identifier"), "source": outcome.get("source"),
+                  "reason": json.loads(found[4] or "{}").get("reason")}  # what it recorded on ending: declined, say
     return {
         "id": material, "project_id": project, "title": title, "csl": json.loads(csl) if csl else {},
         "source": source, "source_key": source_key, "evidence_type": evidence, "resolved_at": resolved_at,

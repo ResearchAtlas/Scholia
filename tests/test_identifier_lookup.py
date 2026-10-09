@@ -757,6 +757,8 @@ async def test_a_local_only_project_asks_once_per_batch_and_the_answer_covers_th
         assert declined.status_code == 200
         run = await run_finished(client, later["lookup_run_id"])
         assert (run["status"], run["cancel_reason"], run["result"]) == ("cancelled", "researcher", {"reason": "declined"})
+        skipped = next(p for p in (await listing(client, project))["materials"] if p["lookup"]["run_id"] == run["run_id"])
+        assert skipped["lookup"]["reason"] == "declined"  # the paper says it was skipped, not stopped
         assert len(client.provider.scholarly.requests) == 2  # nothing sent for it
         retried = await client.post(f"/api/runs/{later['lookup_run_id']}/retry")
         assert retried.status_code == 201
@@ -841,3 +843,5 @@ async def test_a_local_only_lookup_cancelled_while_it_asks_closes_its_ask(tmp_pa
         late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "lookup"})
         assert (late.status_code, late.json()["code"]) == (409, "ask_closed")
         assert (await listing(client, project))["asks"] == [] and client.provider.scholarly.requests == []
+        [paper] = (await listing(client, project))["materials"]
+        assert (paper["lookup"]["status"], paper["lookup"]["reason"]) == ("cancelled", None)  # stopped, not skipped
