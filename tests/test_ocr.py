@@ -129,6 +129,7 @@ async def test_a_failed_recognition_writes_nothing_says_so_and_retry_reads_the_p
         assert await rows(client, "SELECT count(*) FROM extractions") == [(1,)]
         (n,) = (await rows(client, "SELECT count(*) FROM passages"))[0]
         assert await rows(client, "SELECT count(*), count(DISTINCT target_id) FROM index_queue WHERE op = 'add'") == [(n, n)]
+        assert await rows(client, "SELECT count(*) FROM audit_log WHERE event = 'outbound'") == [(0,)]  # OCR sends nothing
 
 
 @pytest.mark.asyncio
