@@ -826,8 +826,8 @@ async def _status_of(client, run_id):
 @pytest.mark.parametrize("change", ["store", "rebuild"])
 async def test_a_cancelled_run_ends_only_after_its_index_change_has(tmp_path, monkeypatch, change):
     """Cancel while the run's change waits in the index's writer (vectors stored, or a project's rows
-    rebuilt and its vectors dropped): the run's end is recorded only once that change is done, as the
-    harness drains blocking work (Harness.work), never before it."""
+    rebuilt): the run's end is recorded only once that change has returned, as the harness drains
+    blocking work (Harness.work), and nothing changes after it. A rebuild that sees the cancel rolls back."""
     async with app(tmp_path) as client:
         project = await project_of(client)
         if change == "rebuild":
@@ -840,14 +840,17 @@ async def test_a_cancelled_run_ends_only_after_its_index_change_has(tmp_path, mo
             await client.post(f"/api/projects/{project}/index/rebuild")
         assert await asyncio.to_thread(reached.wait, 10)
         [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
-        await client.post(f"/api/runs/{run['run_id']}/cancel")
+        cancel = asyncio.ensure_future(client.post(f"/api/runs/{run['run_id']}/cancel"))  # answered once it ends
         await asyncio.sleep(0.3)
         assert await _status_of(client, run["run_id"]) == "running"  # its change is still to come
         go.set()
         ended = await run_finished(client, run["run_id"])
         assert (ended["status"], ended["cancel_reason"]) == ("cancelled", "researcher")
         embedded = sum(1 for r in await index_rows(client, project) if r[3])
-        assert embedded == (4 if change == "store" else 0)  # what it changed was done before its end
+        assert embedded == 4  # stored before its end; or, the rebuild rolled back, the rows as they were
+        await cancel
+        await asyncio.sleep(0.2)
+        assert sum(1 for r in await index_rows(client, project) if r[3]) == embedded  # nothing after its end
 
 
 @pytest.mark.parametrize("then", ["cancelled", "revoked"])
@@ -922,20 +925,20 @@ async def test_a_default_result_count_above_the_apis_bound_is_held_to_it(tmp_pat
         assert len((await find(client, project, "common", limit=10))["results"]) == 10
 
 
-async def test_a_run_that_found_the_model_missing_as_it_was_installed_leaves_an_index_run_for_its_papers(
-        tmp_path, monkeypatch):
-    """The install's own index runs leave out papers a running run names; one that had already found the
-    model missing records a run for them as it ends, so they are embedded without a restart."""
+async def test_a_model_installed_as_a_run_finds_it_missing_gets_that_runs_papers_embedded(tmp_path, monkeypatch):
+    """The install comes as an index run has found the model missing and is ending: the install's runs
+    take every paper still without embeddings, that run's too, so they are embedded without a restart."""
     import sys
     import backend.search as search
     real = search.search_mode
 
-    def missing_once(state):  # the first index run looks just before the model is in place
-        if sys._getframe(1).f_code.co_name == "_index_run" and not getattr(missing_once, "seen", False):
-            missing_once.seen = True
+    def installed_as_it_looks(state):  # the first index run looks just before the model is in place
+        if sys._getframe(1).f_code.co_name == "_index_run" and not getattr(installed_as_it_looks, "seen", False):
+            installed_as_it_looks.seen = True
+            state["local_helper"].helpers[EMBEDDING].model_installed()  # what a download or an import calls
             return "keyword_only", "model_missing"
         return real(state)
-    monkeypatch.setattr(search, "search_mode", missing_once)
+    monkeypatch.setattr(search, "search_mode", installed_as_it_looks)
     async with app(tmp_path) as client:
         project = await project_of(client)
         await added(client, project, WAGES)
@@ -945,7 +948,41 @@ async def test_a_run_that_found_the_model_missing_as_it_was_installed_leaves_an_
             await asyncio.sleep(0.05)
         first, *_ = sorted(await runs_of(client, "index", project), key=lambda r: r["started_at"])
         assert first["result"] == {"mode": "keyword_only", "reason": "model_missing"}
-        assert len(await runs_of(client, "index", project)) == 2
+
+
+async def test_the_installs_runs_take_the_papers_of_a_running_run_too(tmp_path):
+    """No window in which an ending run's papers are left to no one: the install's runs name them too (a
+    second run for papers the first embeds finds nothing missing)."""
+    import backend.search as search
+    async with app(tmp_path, batch=1) as client:
+        client.remote.hold, client.remote.free = asyncio.Event(), 1  # the run embeds one passage, then waits
+        project = await project_of(client)
+        [material] = (await added(client, project, WAGES))["materials"]
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [running] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
+        await search._embed_all(client.state)  # as the model's install calls it
+        runs = await runs_of(client, "index", project)
+        assert len(runs) == 2 and {r["materials"]["titles"][0] for r in runs} == {"Wage Floors"}
+        client.remote.hold.set()
+        assert (await run_finished(client, running["run_id"]))["status"] == "succeeded"
+        status = await idle(client, project)
+        assert status["passages"]["embedded"] == 4 and status["materials"][material["id"]]["embedded"] == 4
+        assert all(r["status"] == "succeeded" for r in await runs_of(client, "index", project))
+
+
+async def test_a_helper_still_saying_the_model_is_missing_records_no_chain_of_runs(tmp_path):
+    """The file in place but the helper's last check still saying model_missing (until an install or a
+    start says otherwise): the run ends keyword-only, and no run follows it."""
+    async with app(tmp_path) as client:
+        helper = client.state["local_helper"].helpers[EMBEDDING]
+        helper.state, helper.problem = "stopped", "model_missing"
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        await asyncio.sleep(0.5)
+        await idle(client, project)
+        [run] = await runs_of(client, "index", project)
+        assert run["result"] == {"mode": "keyword_only", "reason": "model_missing"}
 
 
 async def test_a_rebuild_under_way_shows_in_the_status_though_a_newer_run_follows(tmp_path):
@@ -967,3 +1004,77 @@ async def test_a_rebuild_under_way_shows_in_the_status_though_a_newer_run_follow
         client.remote.hold.set()
         assert (await run_finished(client, rebuild))["status"] == "succeeded"
         await idle(client, project)
+
+
+async def test_each_index_run_in_the_activity_says_whether_its_own_project_offers_the_model(tmp_path):
+    async with app(tmp_path, install=False) as client:
+        normal, local = await project_of(client, "Normal"), await project_of(client, "Local", level="local_only")
+        await added(client, normal, WAGES)
+        await added(client, local, paper("Local Paper", "Text kept on this Mac."))
+        await idle(client, normal)
+        await idle(client, local)
+        [in_normal] = await runs_of(client, "index", normal)
+        [in_local] = await runs_of(client, "index", local)
+        assert in_normal["result"]["reason"] == in_local["result"]["reason"] == "model_missing"
+        assert (in_normal["download_offered"], in_local["download_offered"]) == (True, False)
+
+
+async def test_a_cancelled_run_stops_its_pass_between_pages_and_leaves_the_rest_queued(tmp_path, monkeypatch):
+    """Cancel and shutdown wait for at most the page under way (QUEUE_PAGE rows), not the whole queue."""
+    import threading
+    import backend.search_index as search_index
+    monkeypatch.setattr(search_index, "QUEUE_PAGE", 2)
+    reached, go, real = threading.Event(), threading.Event(), SearchIndex._add
+
+    def held(self, *args):
+        reached.set()
+        go.wait(20)
+        return real(self, *args)
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        monkeypatch.setattr(SearchIndex, "_add", held)
+        await added(client, project, paper("Pages", *[f"Paragraph number {i}." for i in range(10)]))
+        assert await asyncio.to_thread(reached.wait, 10)
+        [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
+        cancel = asyncio.ensure_future(client.post(f"/api/runs/{run['run_id']}/cancel"))
+        await asyncio.sleep(0.3)
+        go.set()
+        ended = await run_finished(client, run["run_id"])
+        assert ended["status"] == "cancelled"
+        [(passages,)] = await rows(client, "SELECT count(*) FROM passages")
+        assert len(await index_rows(client, project)) == 2  # the page under way, and no more
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(passages - 2,)]  # left to the next pass
+        await cancel
+        monkeypatch.setattr(SearchIndex, "_add", real)
+        await asyncio.to_thread(client.state["index"].apply)
+        assert len(await index_rows(client, project)) == passages >= 10
+
+
+async def test_a_cancelled_rebuild_rolls_back_without_finishing_and_leaves_the_rows_as_they_were(tmp_path, monkeypatch):
+    import threading
+    import backend.search_index as search_index
+    monkeypatch.setattr(search_index, "STOP_EVERY", 1)
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        before = await idle(client, project)
+        assert before["passages"]["embedded"] == 4
+        reached, go, real = threading.Event(), threading.Event(), SearchIndex._add
+
+        def held(self, *args):  # the rebuild's first new row: its old rows already removed in its transaction
+            reached.set()
+            go.wait(20)
+            return real(self, *args)
+        monkeypatch.setattr(SearchIndex, "_add", held)
+        rebuild = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        assert await asyncio.to_thread(reached.wait, 10)
+        cancel = asyncio.ensure_future(client.post(f"/api/runs/{rebuild}/cancel"))
+        await asyncio.sleep(0.3)
+        go.set()
+        assert (await run_finished(client, rebuild))["status"] == "cancelled"
+        await cancel
+        status = await idle(client, project)
+        assert status["passages"] == before["passages"]  # rolled back: every row and its embedding as before
+        meta = await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+            "SELECT key FROM index_meta WHERE key LIKE 'rebuilt:%'").fetchall())
+        assert meta == []  # not marked rebuilt: a Rebuild later does it whole

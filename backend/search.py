@@ -126,7 +126,7 @@ async def open_index(state, db):
     def rebuilt():  # a damaged file replaced while the app runs (in the writer): its papers are embedded again
         if _installed(state):
             try:
-                loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_embed_all(state, running_too=True)))
+                loop.call_soon_threadsafe(state["model_installed"])
             except RuntimeError:  # the app stopped meanwhile: the next launch embeds them (index.unembedded)
                 pass
     index.rebuilt = rebuilt
@@ -186,22 +186,18 @@ def _downloading(state):
     return local is not None and local.download is not None and local.download.state == "running"
 
 
-async def _embed_all(state, running_too=False):
-    """The model was just installed: every project whose index has passages without embeddings gets an
-    index run for those papers, but those a running index run names (it embeds them or, having found the
-    model missing, records one as it ends). running_too: those too (a damaged file rebuilt while the app
-    runs, under a run that may have finished embedding in the file it replaced)."""
+async def _embed_all(state):
+    """The model was just installed, or a damaged file was rebuilt while the app runs: every project whose
+    index has passages without embeddings gets an index run for those papers, those a running index run
+    names too. That run may already have found the model missing, or be ending; a second run for papers it
+    embeds finds nothing missing and ends."""
     index, harness = state.get("index"), state.get("harness")
     if index is None or harness is None:
         return
     try:
         pending = await asyncio.to_thread(index.unembedded)
-        named = set() if running_too else await asyncio.to_thread(harness.db.read, lambda conn: {m for (m,) in conn.execute(
-            "SELECT j.value FROM runs r, json_each(r.inputs, '$.material_ids') j"
-            " WHERE r.workflow = 'index' AND r.status = 'running'")})
         for project, materials in pending.items():
-            if rest := [m for m in materials if m not in named]:
-                await _record(harness, project, {"material_ids": rest})
+            await _record(harness, project, {"material_ids": materials})
     except Exception as error:
         log.warning("index runs after the model's install could not be recorded (%s)", type(error).__name__)
 
@@ -337,10 +333,11 @@ async def _index_run(state, harness, active, project_id, inputs):
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         return done
+    stop = active.cancel_requested.is_set  # asked between pages of the queue and every STOP_EVERY rebuilt rows
     if inputs.get("rebuild"):
-        await drained(index.rebuild_project, project_id, run_id)
+        await drained(index.rebuild_project, project_id, run_id, stop)
     else:
-        await drained(index.apply)
+        await drained(index.apply, stop)
     # At launch, background runs start before the helper's own startup has run: a moment's wait.
     for _ in range(int(HELPER_WAIT_SECONDS / 0.05)):
         if state.get("local_helper") is not None or harness.registry.closed:
@@ -348,11 +345,7 @@ async def _index_run(state, harness, active, project_id, inputs):
         await asyncio.sleep(0.05)
     mode, reason = search_mode(state)
     if mode != "hybrid" and reason in WAITING_REASONS:  # keyword search only until that changes, said
-
-        def installed_meanwhile(conn):  # in the run's terminal transaction: the install's runs left these out
-            if reason == "model_missing" and _installed(state):
-                harness.record_in(conn, active, project_id, "index", {"material_ids": materials})
-        return {"mode": "keyword_only", "reason": reason}, installed_meanwhile
+        return {"mode": "keyword_only", "reason": reason}, None  # the model's install embeds them (_embed_all)
     if mode != "hybrid":  # the helper cannot serve now: failed with its reason, and Retry embeds what is missing
         raise RunOutcome("failed", reason)
     batch = load_settings(state["data_dir"]).values["retrieval"]["embedding_batch"]

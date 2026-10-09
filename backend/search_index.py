@@ -63,6 +63,7 @@ SCHEMA_VERSION = "1"  # a file of another schema is replaced and rebuilt
 QUEUE_PAGE = 1000  # queue rows applied in one index transaction
 MAX_TERMS = 64  # a query's distinct tokens, at most
 RETRY_SECONDS = (1, 60)  # a failed pass or WAL truncation is tried again after 1 s, doubling to at most 60 s
+STOP_EVERY = 1000  # rows between a project rebuild's looks at whether its run was stopped
 # Han characters: CJK unified ideographs, extension A, the compatibility ideographs and extensions B on.
 _HAN = "㐀-䶿一-鿿豈-﫿\U00020000-\U0003134f"
 # A run of Han characters, or a run of other letters and digits (combining marks kept with them).
@@ -95,6 +96,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(
 
 class CleanupFailed(Exception):
     """Removed rows were still found before the pass committed: it rolled back."""
+
+
+class _Stopped(Exception):
+    """The run a project's rebuild works for was stopped: its transaction rolls back."""
 
 
 # Tokens
@@ -262,7 +267,16 @@ class SearchIndex:
     def _write(self, fn, *args):
         if self.closed:
             raise DatabaseClosedError("the search index is closed")
-        return self._writer.submit(fn, *args).result()
+        return self._writer.submit(self._guarded, fn, *args).result()
+
+    def _guarded(self, fn, *args):
+        """fn in the writer: one that finds the file damaged (storing vectors, a project's rebuild, a
+        pass, a truncation) has it replaced and rebuilt, as a read that finds it so does."""
+        try:
+            return fn(*args)
+        except _DAMAGE:
+            self._damaged()
+            raise
 
     def _read(self, fn):
         """fn(conn) on an idle read connection, in one read transaction."""
@@ -377,9 +391,14 @@ class SearchIndex:
                 log.error("rebuilding the search index failed (%s)", type(future.exception()).__name__)
 
         def rebuild():
-            self._rebuild_all()
-            if then is not None and not self.closed:
+            if not self._rebuild_all():
+                return
+            if then is not None:  # once the file is ready, whatever the pass after it meets
                 then()
+            try:
+                self._apply()  # what the queue brought meanwhile
+            except Exception as error:  # the file is rebuilt; the pass is tried again soon (_apply)
+                log.warning("applying the index queue after its rebuild failed (%s)", type(error).__name__)
         future = self._writer.submit(rebuild)
         future.add_done_callback(done)
         return future
@@ -388,8 +407,9 @@ class SearchIndex:
         """Replace the file with a new one built from the main database's current readings: marked
         building until every project's rows are in, so a launch that finds it unfinished starts
         again. The last sequence applied is the queue's high-water mark read first; the queue then
-        brings in what changed meanwhile. Readers never make the file (connect), so the new one is
-        this writer's, owner-only."""
+        brings in what changed meanwhile (the caller's next pass). Readers never make the file
+        (connect), so the new one is this writer's, owner-only. Returns whether it finished (else the
+        index closed meanwhile)."""
         self.building = True
         try:
             if self._conn is not None:
@@ -409,7 +429,7 @@ class SearchIndex:
             last = self.db.read(high_water)
             for (project,) in self.db.read(lambda conn: conn.execute("SELECT id FROM projects").fetchall()):
                 if self.closed:
-                    return
+                    return False
                 found = self.db.read(lambda conn: readings(conn, project))
                 with self._conn:
                     for pid, reading in found.items():
@@ -419,7 +439,7 @@ class SearchIndex:
             self.damaged = False
         finally:
             self.building = False
-        self._apply()
+        return True
 
     def _damaged(self):
         """A read or a pass found the file damaged: it is replaced and rebuilt in the writer, once, and its
@@ -433,9 +453,11 @@ class SearchIndex:
 
     # Applying the queue
 
-    def apply(self):
-        """Apply the queue's rows not applied yet (from any thread; see the module's docstring)."""
-        return self._write(self._apply)
+    def apply(self, stop=None):
+        """Apply the queue's rows not applied yet (from any thread; see the module's docstring), a page
+        (QUEUE_PAGE rows, one transaction) at a time; stop(), if given, is asked before each page, and a
+        true answer leaves the rest to the next pass."""
+        return self._write(self._apply, stop)
 
     def apply_soon(self):
         """apply, in the writer, without waiting for it; a failure is logged."""
@@ -445,11 +467,11 @@ class SearchIndex:
         if not self.closed:
             self._writer.submit(self._apply).add_done_callback(done)
 
-    def _apply(self):
+    def _apply(self, stop=None):
         """A pass over the queue. One that fails is tried again soon (_retry_later), so a removal it
         did not apply never waits on other work; one that finds the file damaged has it rebuilt."""
         try:
-            applied = self._apply_queue()
+            applied = self._apply_queue(stop)
         except _DAMAGE:
             self._damaged()
             raise
@@ -480,11 +502,11 @@ class SearchIndex:
         except RuntimeError:  # the writer stopped meanwhile (closing)
             pass
 
-    def _apply_queue(self):
+    def _apply_queue(self, stop=None):
         applied = 0
         if self._truncate and self._conn is not None:
             self._checkpoint()
-        while self._conn is not None and not self.closed and not self.building:
+        while self._conn is not None and not self.closed and not self.building and not (stop and stop()):
             last = int(self._conn.execute("SELECT value FROM index_meta WHERE key = 'last_seq'").fetchone()[0])
             rows = self.db.read(lambda conn: conn.execute(
                 "SELECT seq, target, target_id, project_id, op FROM index_queue WHERE seq > ? ORDER BY seq LIMIT ?",
@@ -583,26 +605,36 @@ class SearchIndex:
 
     # A project's rebuild
 
-    def rebuild_project(self, project_id, run_id):
+    def rebuild_project(self, project_id, run_id, stop=None):
         """Replace the project's rows from the main database (keyword rows; its vectors go, to be
         embedded again), in one transaction, so search keeps its keyword rows throughout. Done once
-        per run: a run started again after a restart goes on to its embeddings."""
-        return self._write(self._rebuild_project, project_id, run_id)
+        per run: a run started again after a restart goes on to its embeddings. stop(), if given, is
+        asked every STOP_EVERY rows: a true answer rolls the rebuild back, leaving the rows as they were."""
+        return self._write(self._rebuild_project, project_id, run_id, stop)
 
-    def _rebuild_project(self, project_id, run_id):
-        self._apply()
+    def _rebuild_project(self, project_id, run_id, stop=None):
+        def check(count):
+            if stop is not None and count % STOP_EVERY == 0 and stop():
+                raise _Stopped()
+        self._apply(stop)
         if self.building or self._conn.execute("SELECT 1 FROM index_meta WHERE key = ?",
                                                 (f"rebuilt:{run_id}",)).fetchone():
             return False
-        found = self.db.read(lambda conn: readings(conn, project_id))
-        with self._conn:
-            for (pid,) in self._conn.execute("SELECT passage_id FROM index_rows WHERE project_id = ?",
-                                             (project_id,)).fetchall():
-                self._remove(project_id, pid)
-            for pid, reading in found.items():
-                self._add(project_id, pid, reading)
-            self._conn.execute("DELETE FROM index_meta WHERE key LIKE 'rebuilt:%'")
-            self._meta(**{f"rebuilt:{run_id}": 1})
+        try:
+            check(0)
+            found = self.db.read(lambda conn: readings(conn, project_id))
+            with self._conn:
+                old = self._conn.execute("SELECT passage_id FROM index_rows WHERE project_id = ?", (project_id,)).fetchall()
+                for count, (pid,) in enumerate(old, start=1):
+                    self._remove(project_id, pid)
+                    check(count)
+                for count, (pid, reading) in enumerate(found.items(), start=len(old) + 1):
+                    self._add(project_id, pid, reading)
+                    check(count)
+                self._conn.execute("DELETE FROM index_meta WHERE key LIKE 'rebuilt:%'")
+                self._meta(**{f"rebuilt:{run_id}": 1})
+        except _Stopped:
+            return False
         self._checkpoint()
         return True
 

@@ -13,7 +13,7 @@ import pytest
 
 import backend.search_index as search_index
 from backend.search_index import DIMENSIONS, SearchIndex, match, tokens
-from scholia_app import started
+from scholia_app import run_finished, started
 from test_materials import added, project_of, rows
 from test_search import CHINESE, WAGES, app, find, idle, index_rows, paper, vector
 
@@ -463,3 +463,78 @@ async def test_a_file_found_damaged_while_the_app_runs_is_rebuilt_with_its_embed
         after = [r for r in (await client.get("/api/activity")).json()["runs"] if r["workflow"] == "index"]
         assert len(after) == runs + 1 and after[0]["status"] == "succeeded"
         assert (await find(client, project, "最低工资"))["mode"] == "hybrid"
+
+
+async def until_rebuilt(index, timeout=10.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while index.damaged or index.building:  # replaced and rebuilt in the writer
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+async def test_a_rebuilt_file_is_embedded_again_though_the_pass_after_its_rebuild_fails(tmp_path, monkeypatch):
+    """The papers' runs are asked for once the file is ready, whatever the pass that follows the rebuild
+    meets (here a failure, tried again later)."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        before = await until_embedded(client, project)
+        index, real, failed = client.state["index"], SearchIndex._apply_queue, []
+
+        def fails_once(self, stop=None):  # the first pass after the damage: the one that follows the rebuild
+            if not failed:
+                failed.append(True)
+                raise search_index.apsw.IOError("disk I/O error")
+            return real(self, stop)
+        monkeypatch.setattr(SearchIndex, "_apply_queue", fails_once)
+
+        def damaged(conn):
+            raise search_index.apsw.CorruptError("database disk image is malformed")
+        with pytest.raises(search_index.apsw.CorruptError):
+            await asyncio.to_thread(index._read, damaged)
+        await until_rebuilt(index)
+        status = await until_embedded(client, project)
+        assert failed and status["passages"] == before["passages"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("where", ["_apply_queue", "_store", "_rebuild_project"])
+async def test_a_change_that_finds_the_file_damaged_has_it_rebuilt_and_embedded_again(tmp_path, monkeypatch, where):
+    """A pass, storing vectors or a project's rebuild that meets a damaged file is routed as a read is: the
+    file is replaced and rebuilt, and its papers embedded again."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES, CHINESE)
+        before = await until_embedded(client, project)
+        index, real, met = client.state["index"], getattr(SearchIndex, where), []
+        rebuilt, rebuild_all = [], SearchIndex._rebuild_all
+
+        def damaged_once(self, *args):
+            if not met:
+                met.append(True)
+                raise search_index.apsw.CorruptError("database disk image is malformed")
+            return real(self, *args)
+
+        def counted(self):
+            rebuilt.append(True)
+            return rebuild_all(self)
+        monkeypatch.setattr(SearchIndex, where, damaged_once)
+        monkeypatch.setattr(SearchIndex, "_rebuild_all", counted)
+        if where == "_apply_queue":
+            with pytest.raises(search_index.apsw.CorruptError):
+                await asyncio.to_thread(index.apply)
+        elif where == "_store":
+            with pytest.raises(search_index.apsw.CorruptError):
+                await asyncio.to_thread(index.store, project, [])
+        else:
+            response = await client.post(f"/api/projects/{project}/index/rebuild")
+            await run_finished(client, response.json()["run_id"])
+        assert met
+        deadline = asyncio.get_running_loop().time() + 10
+        while not rebuilt:  # the file is replaced and rebuilt, as when a read finds it damaged
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        await until_rebuilt(index)
+        status = await until_embedded(client, project)
+        assert status["passages"] == before["passages"] and status["state"] == "ready" and rebuilt == [True]
