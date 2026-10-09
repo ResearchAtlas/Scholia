@@ -822,6 +822,28 @@ def test_a_tag_held_across_pieces_is_fed_whole_once_and_bounded():
     assert refused and peak < 1.5 * len(too_long), f"{peak / 2**20:.1f} MiB"  # its text decoded, not held again
 
 
+@pytest.mark.parametrize("close", ["-->", "--!>"])
+@pytest.mark.parametrize("split", [1, 2, 3])
+def test_a_comment_whose_end_straddles_two_pieces_ends_there(close, split):
+    opening = "<p>Before</p><!--"
+    comment = opening + "x" * (64 * 1024 - len(opening) - split) + close  # its end begins split characters before a piece's end
+    image = '<img src="data:image/png;base64,' + "A" * (5 * 2**20) + '">'  # each within the bound, together past it
+    source = (comment + image + "<p>Between</p>" + image + "<p>After</p>").encode()
+    assert [p.text for p in extract(source, extraction.HTML).passages] == ["Before", "Between", "After"]
+
+
+@pytest.mark.parametrize("split", [0, 3, 9])
+def test_a_scripts_text_is_passed_over_unread(split):
+    opening = "<p>Before</p><script>"
+    near = opening + "x" * (64 * 1024 - len(opening) - split) + "</script><p>Between</p>"  # its closing tag across a piece's end
+    source = (near + "<script>" + "x" * (30 * 2**20) + "</script><p>After</p>").encode()
+    peak, refused = _peak(lambda: extract(source, extraction.HTML))
+    assert not refused and peak < 1.5 * len(source), f"{peak / 2**20:.1f} MiB"  # the decoded text, not its script again
+    assert [p.text for p in extract(source, extraction.HTML).passages] == ["Before", "Between", "After"]
+    with pytest.raises(extraction.Unreadable):  # other such text is kept: at most a block
+        extract(("<xmp>" + "x" * (extraction.MAX_BLOCK_CHARS + 1) + "</xmp>").encode(), extraction.HTML)
+
+
 def test_a_pdf_readings_rectangles_are_counted_as_they_are_made(monkeypatch):
     page = [(72, 780 - i * 12, 10, "ab") for i in range(60)]  # a short line on each of 60 rows: 60 rectangles
     data = synthetic.pdf([page] * 100)

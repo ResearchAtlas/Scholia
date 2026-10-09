@@ -1258,6 +1258,7 @@ _BLOCKS = {"p", "div", "section", "article", "header", "footer", "main", "aside"
 _HEADINGS = {f"h{n}": n for n in range(1, 7)}
 
 
+_COMMENT_CLOSE = re.compile(r"--!?>")  # html.parser's commentclose
 _TAG_NAME = re.compile(r"[a-zA-Z][^\t\n\r\f />]*")
 _TAG_SPACE = re.compile(r"[\t\n\r\f /]*")
 _ATTRIBUTE_NAME = re.compile(r"[^\t\n\r\f />][^\t\n\r\f /=>]*")
@@ -1315,7 +1316,8 @@ class _BoundedHtml(HTMLParser):
     (_tag_end), where it starts a title or a textarea (whose whole text it turns at once: at most
     MAX_BLOCK_CHARS with MAX_TAG_REFERENCES references, wherever it falls), and where it holds
     input back: text at most MAX_HTML_PENDING, a tag or comment at most MAX_HTML_TOKEN, fed whole to
-    where it can end rather than rescanned a piece at a time. Such a token costs about seven times its
+    where it can end rather than rescanned a piece at a time; a script's or style's text is passed
+    over unread (none of it is kept), other such text at most MAX_BLOCK_CHARS. Such a token costs about seven times its
     length while it is parsed (the text fed, and html.parser's copies of the whole tag, of the
     attribute, of its value and of the value unquoted), about 56 MiB at the bound."""
 
@@ -1336,6 +1338,15 @@ class _BoundedHtml(HTMLParser):
                 raise Unreadable()
         return k
 
+    def parse_comment(self, i, report=True):
+        # Its end may be in input not yet fed: then it waits for it, as one whole feed finds it, rather
+        # than taking html.parser's fallback for a comment that never ends (an abrupt "<!-->").
+        if not self.final:
+            found = _COMMENT_CLOSE.search(self.source, self.fed - len(self.rawdata) + i + 4)
+            if found and found.end() > self.fed:
+                return -1
+        return super().parse_comment(i, report)
+
     def parse_endtag(self, i):
         raw = self.rawdata
         if _TAG_NAME.match(raw, i + 2):  # an end tag the parser walks as a tag
@@ -1344,23 +1355,40 @@ class _BoundedHtml(HTMLParser):
                 return -1
         return super().parse_endtag(i)
 
+    def past(self, start, end):
+        """Move the parser's position over source[start:end], as if it had read it."""
+        lines = self.source.count("\n", start, end)
+        if lines:
+            self.lineno += lines
+            self.offset = end - self.source.rfind("\n", start, end) - 1
+        else:
+            self.offset += end - start
+
     def read(self, source):
         self.source, at = source, 0
         while at < len(source):
             end, held = min(at + 64 * 1024, len(source)), self.rawdata
-            if held.startswith("<"):  # a tag or comment not yet ended: fed to where it can end, at once
-                if held.startswith("<!--"):
-                    ends = [p for p in (source.find("-->", at), source.find("--!>", at)) if p >= 0]
-                    close = min(ends) + 4 if ends else len(source)
+            if self.cdata_elem:  # its text, to its closing tag (looked for from where the text began)
+                start = at - len(held)
+                found = self.interesting.search(source, start)
+                close = found.start() if found else len(source)
+                if self.cdata_elem in _SKIPPED:  # a script's, a style's: none of it is kept, so it is passed over
+                    self.past(start, close)  # and the piece fed from its closing tag on
+                    held, at, end = "", close, min(close + 64 * 1024, len(source))
+                elif close - start > MAX_BLOCK_CHARS:  # kept as text: at most a block, before it is fed
+                    raise Unreadable()
+                else:
+                    end = max(end, close)
+            elif held.startswith("<"):  # a tag or comment not yet ended: fed to where it can end, at once
+                if held.startswith("<!--"):  # its end looked for from its start: it may have begun before at
+                    found = _COMMENT_CLOSE.search(source, at - len(held) + 4)
+                    close = found.end() if found else len(source)
                 else:
                     close = source.find(self.waiting, at)
                     close = close + 1 if close >= 0 else len(source)
                 if close - (at - len(held)) > MAX_HTML_TOKEN:
                     raise Unreadable()
                 end = max(end, min(close, len(source)))
-            elif self.cdata_elem:  # a script's or a style's text: fed to its end, at once
-                close = self.interesting.search(source, at)
-                end = max(end, close.start() if close else len(source))
             self.fed = end
             self.rawdata = source[at - len(held):end]  # as feed() would, with one copy rather than two
             self.goahead(0)
