@@ -304,21 +304,21 @@ async def test_cancel_ends_a_child_in_the_middle_of_one_long_step_at_once(tmp_pa
 
 
 def long_html():
-    """Some 12 MB of HTML whose reading takes about 3 s, its reader calling stop() as it goes."""
+    """Some 16 MB of HTML whose reading takes some 3 to 4 s, its reader calling stop() as it goes."""
     sentence = "Minimum wages raise the earnings of low-paid workers in the synthetic panel. "
-    return ("<html><body>" + "".join(f"<p>Paragraph {i}. <b>{sentence}</b> <i>{sentence}</i></p>" for i in range(60_000))
+    return ("<html><body>" + "".join(f"<p>Paragraph {i}. <b>{sentence}</b> <i>{sentence}</i></p>" for i in range(80_000))
             + "</body></html>").encode()
 
 
 @pytest.mark.asyncio
 async def test_a_long_text_reading_reports_through_its_readers_calls_to_stop_and_is_never_stopped_for_time(
         tmp_path, monkeypatch):
-    monkeypatch.setattr(reading, "STEP_SECONDS", 2.5)
+    monkeypatch.setattr(reading, "STEP_SECONDS", 1.8)  # the child reports each BEAT_SECONDS (1 s) while it works
     data = long_html()
     path, sha256 = stored(tmp_path, data)
     stats = {}
     read = await asyncio.to_thread(reading.read, path, sha256, extraction.HTML, stats=stats)
-    assert stats["seconds"] > reading.STEP_SECONDS and stats["longest_step_seconds"] < 2  # a report each second
+    assert stats["seconds"] > reading.STEP_SECONDS > stats["longest_step_seconds"]  # longer in all, never silent so long
     assert read == extraction.extract(data, extraction.HTML) and gone()
 
 
