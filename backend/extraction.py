@@ -23,6 +23,7 @@ libraries it drives are kept from logging it.
 """
 
 import collections
+import contextvars
 import ctypes
 import io
 import logging
@@ -39,6 +40,16 @@ from xml.etree import ElementTree
 
 MAX_PASSAGE = 2000
 MAX_FILE_BYTES = 100 * 1024 * 1024  # ponytail: uploads travel as base64 JSON; a streamed upload if books matter
+# What any reading keeps, whatever its file's shape (_Reading): a reading never holds an object for
+# each of a file's lines or characters, only what it keeps, and a file past one of these is
+# unreadable_file before its memory grows. Every extractor goes through them: its blocks reach
+# _pieces and its headings _Sections.heading, which count them; text built piece by piece is a
+# _Text; and each format's own structure has its bound below, checked before it is read.
+MAX_TEXT_CHARS = 16 * 1024 * 1024  # the text a reading keeps: its passages and headings together
+MAX_BLOCKS = 200_000  # its blocks: paragraphs, headings, tables and captions, and tables' rows and cells
+MAX_PAGE_CHARS = 100_000  # a PDF page's characters, as PDFium counts them before any is read
+MAX_LATEX_MARKS = 250_000  # a LaTeX file's markup characters, each of which may start a node, counted before parsing
+MAX_STYLES = 10_000  # a DOCX's paragraph styles taken by name
 MAX_XML_BYTES = 64 * 1024 * 1024  # a DOCX part's size once unpacked, and the parts read together
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024  # a DOCX's members together, as the archive declares them unpacked
 MAX_ARCHIVE_MEMBERS = 10_000
@@ -52,8 +63,8 @@ EXTENSIONS = {".pdf": PDF, ".docx": DOCX, ".html": HTML, ".htm": HTML, ".xhtml":
               ".markdown": MARKDOWN, ".tex": LATEX, ".latex": LATEX}
 # Each media type's extractor and its version. Bump a version when its parser's output changes:
 # extractions are shared by file and extractor version.
-EXTRACTORS = {PDF: ("pdf", "pdf-2"), DOCX: ("docx", "docx-1"), HTML: ("html", "html-1"),
-              MARKDOWN: ("markdown", "markdown-1"), LATEX: ("latex", "latex-1")}
+EXTRACTORS = {PDF: ("pdf", "pdf-3"), DOCX: ("docx", "docx-2"), HTML: ("html", "html-2"),
+              MARKDOWN: ("markdown", "markdown-2"), LATEX: ("latex", "latex-2")}
 PDFIUM = threading.Lock()
 MAX_PAGE_PIXELS = 8 * 1024 * 1024  # a rendered page image's pixels: a letter page at scale 3 has 4.4 million
 
@@ -232,9 +243,13 @@ def extract(data, kind, stop=lambda: None, progress=lambda done, total: None):
     """The passages of a file of a supported media type. stop() is called between pages or
     blocks and may raise to abandon the work; progress(done, total) reports it."""
     parser = {PDF: _pdf, DOCX: _docx, HTML: _html, MARKDOWN: _markdown, LATEX: _latex}[kind]
-    if kind == PDF:
-        return parser(data, stop, progress)
-    extracted = parser(_text(data) if kind != DOCX else data, stop)
+    reading = _READING.set(_Reading())  # this reading's bounds, wherever its extractor keeps something
+    try:
+        if kind == PDF:
+            return parser(data, stop, progress)
+        extracted = parser(_text(data) if kind != DOCX else data, stop)
+    finally:
+        _READING.reset(reading)
     progress(1, 1)
     return extracted
 
@@ -296,6 +311,49 @@ def clean_doi(text):
 # Passages
 
 
+class _Reading:
+    """What one reading has kept so far, against MAX_TEXT_CHARS and MAX_BLOCKS."""
+
+    def __init__(self):
+        self.chars = self.blocks = 0
+
+    def keep(self, text=""):
+        self.blocks += 1
+        self.chars += len(text)
+        if self.blocks > MAX_BLOCKS or self.chars > MAX_TEXT_CHARS:
+            raise Unreadable()
+
+
+_READING = contextvars.ContextVar("reading", default=None)  # set by extract for its reading
+
+
+def _keep(text=""):
+    """Count a block (and its text) against the reading's bounds; Unreadable past one."""
+    reading = _READING.get()
+    if reading is not None:
+        reading.keep(text)
+
+
+class _Text:
+    """Text built piece by piece, held as one growing buffer rather than a list of its pieces, and
+    given up (Unreadable) once longer than a reading may keep."""
+
+    def __init__(self):
+        self.buffer, self.size = io.StringIO(), 0
+
+    def add(self, piece):
+        self.size += len(piece)
+        if self.size > MAX_TEXT_CHARS:
+            raise Unreadable()
+        self.buffer.write(piece)
+
+    def __bool__(self):
+        return self.size > 0
+
+    def value(self):
+        return self.buffer.getvalue()
+
+
 def _normal(text):
     """Text with its whitespace runs as single spaces, trimmed, in NFC."""
     return unicodedata.normalize("NFC", re.sub(r"\s+", " ", text)).strip()
@@ -314,27 +372,51 @@ def _split(text, limit=MAX_PASSAGE):
     return cuts
 
 
-def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None):
-    """One block as passages: split at sentence boundaries when longer than MAX_PASSAGE. char_boxes
-    (one per character of text, or None) give each piece its line rectangles."""
+def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None, source=None, base=0):
+    """One block as passages, counted against the reading's bounds (_keep): split at sentence
+    boundaries when longer than MAX_PASSAGE. char_boxes (one per character of text, or None) give
+    each piece its line rectangles and its own range of PDFium's characters. Otherwise each piece
+    takes its own part of the block's source range [start, end), where source (the document's text,
+    or a DOCX paragraph's own, base its offset) is searched for each later piece's start (_located)."""
     if not text:
         return []
+    _keep(text)
     bounds = [0, *_split(text), len(text)]
+    spans = [(a, b, text[a:b].strip()) for a, b in zip(bounds, bounds[1:])]
+    spans = [span for span in spans if span[2]]
+    located = (_located([piece for _, _, piece in spans], source, base, start, end)
+               if char_boxes is None and start is not None and end is not None else None)
     passages = []
-    for a, b in zip(bounds, bounds[1:]):
-        piece = text[a:b].strip()
-        if not piece:
-            continue
+    for n, (a, b, piece) in enumerate(spans):
         rects = _rects(char_boxes[a:b], page_size) if char_boxes and page_size else None
-        # Offsets: a PDF piece's own character range; a text piece's share of its block's source range.
-        if char_boxes is not None:
-            span = [i for i in char_boxes[a:b] if i is not None]
-            first, last = (span[0][4], span[-1][4] + 1) if span else (start, end)
+        if char_boxes is not None:  # a PDF piece: PDFium's characters it is made of
+            chars = [i for i in char_boxes[a:b] if i is not None]
+            first, last = (chars[0][4], chars[-1][4] + 1) if chars else (start, end)
+        elif located is not None:
+            first, last = located[n], located[n + 1] if n + 1 < len(located) else end
         else:
             first, last = start, end
         passages.append(Passage(kind, piece, page, list(path), first, last,
                                 {"rects": rects} if rects else None))
     return passages
+
+
+def _located(pieces, source, base, start, end):
+    """Where each of a block's pieces begins in its source range [start, end): the first at start,
+    and each later one where its first words are next found in source, no sooner than the piece
+    before it is long (a piece's text is never longer than its source); else, as when there is no
+    source, at its share of the range. In order, and within the range."""
+    found, total, done = [start], sum(map(len, pieces)) or 1, 0
+    for before, piece in zip(pieces, pieces[1:]):
+        done += len(before)
+        lower = min(found[-1] + len(before), end)
+        at = None
+        if source is not None:
+            words = r"\s+".join(map(re.escape, piece.split()[:3]))
+            match = re.compile(words).search(source, lower - base, end - base)
+            at = match.start() + base if match else None
+        found.append(at if at is not None else min(max(start + (end - start) * done // total, lower), end))
+    return found
 
 
 def _rects(boxes, size):
@@ -369,6 +451,7 @@ class _Sections:
         text = _normal(text)
         if not text:
             return
+        _keep(text)
         while self.levels and self.levels[-1][0] >= level:
             self.levels.pop()
         self.levels.append((level, text))
@@ -454,6 +537,8 @@ def _pdf_page(page, raw, measure=False):
     textpage = page.get_textpage()
     try:
         count = textpage.count_chars()
+        if count > MAX_PAGE_CHARS:  # refused before its text is decoded: a small page can hold a great deal
+            raise Unreadable()
         text = textpage.get_text_range() if count else ""
         # The text leaves out some characters PDFium counts (control characters) when it is shorter:
         # each of its characters is then found among them by PDFium's own map (-1 for one it put in).
@@ -822,22 +907,64 @@ _DOCX_PARTS = ("word/document.xml", "word/styles.xml")
 _DECLARATION = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
 
 
-def untrusted_xml(content):
-    """Parse XML from a file or a response that is not ours: refused (Unreadable) when it declares a
-    document type or an entity, so the parser never sees one (no expansion, no external entity)."""
+def _undeclared(content):
+    """Refuse (Unreadable) XML that declares a document type or an entity, so no parser sees one
+    (no expansion, no external entity)."""
     probe = content
     if content[:2] in (b"\xff\xfe", b"\xfe\xff"):  # UTF-16: looked at as text
         probe = content.decode("utf-16", errors="replace").encode("utf-8", errors="replace")
     if _DECLARATION.search(probe) or b"\x00<\x00!" in probe or b"<\x00!\x00" in probe:
         raise Unreadable()
+
+
+def untrusted_xml(content):
+    """Parse XML from a file or a response that is not ours, refused as _undeclared refuses it."""
+    _undeclared(content)
     try:
         return ElementTree.fromstring(content)
     except ElementTree.ParseError:
         raise Unreadable() from None
 
 
+class _XmlEvents:
+    """An expat parser's target: its events as (event, tag, attributes or text), with no tree built."""
+
+    def __init__(self):
+        self.events = []
+
+    def start(self, tag, attrib):
+        self.events.append(("start", tag, attrib))
+
+    def end(self, tag):
+        self.events.append(("end", tag, None))
+
+    def data(self, text):
+        self.events.append(("data", None, text))
+
+    def close(self):
+        return None
+
+
+def _xml_events(content):
+    """An untrusted XML part's events, ("start", tag, attributes), ("data", None, text) and ("end",
+    tag, None), as it is parsed 64 KiB at a time (refused as _undeclared refuses it): no element is
+    built, so nothing is held for the whole part but its bytes."""
+    _undeclared(content)
+    target = _XmlEvents()
+    parser = ElementTree.XMLParser(target=target)
+    try:
+        for at in range(0, len(content), 1 << 16):
+            parser.feed(content[at:at + (1 << 16)])
+            events, target.events = target.events, []
+            yield from events
+        parser.close()
+        yield from target.events
+    except ElementTree.ParseError:
+        raise Unreadable() from None
+
+
 def _part(archive, name, budget):
-    """A part read and parsed within what is left of the budget of bytes the parts may take unpacked."""
+    """A part's bytes, read within what is left of the budget of bytes the parts may take unpacked."""
     try:
         info = archive.getinfo(name)
     except KeyError:
@@ -849,7 +976,7 @@ def _part(archive, name, budget):
     if len(content) > budget[0]:  # the archive understated its size
         raise Unreadable()
     budget[0] -= len(content)
-    return untrusted_xml(content)
+    return content
 
 
 def _docx(data, stop):
@@ -868,55 +995,149 @@ def _docx(data, stop):
         raise Unreadable() from None
     if document is None:
         raise Unreadable()
-    names = {}
-    for style in (styles.iter(f"{_W}style") if styles is not None else ()):
-        name = style.find(f"{_W}name")
-        names[style.get(f"{_W}styleId")] = (name.get(f"{_W}val") if name is not None else "").lower()
-    body = document.find(f"{_W}body")
+    names = _docx_styles(styles) if styles is not None else {}
     sections, passages, offset = _Sections(), [], 0
-    for element in (body if body is not None else ()):
-        stop()
-        if element.tag == f"{_W}p":
-            text = _docx_text(element)
-            style = element.find(f"{_W}pPr/{_W}pStyle")
-            name = names.get(style.get(f"{_W}val"), style.get(f"{_W}val", "").lower()) if style is not None else ""
+    for tag, text, style in _docx_body(document, stop):
+        if tag == "p":
+            name = names.get(style, style.lower()) if style is not None else ""
             heading = re.fullmatch(r"heading ?(\d)", name)
             clean = _normal(text)
             if not clean:
                 pass
             elif name == "title":
-                passages += _pieces(clean, "title", None, [], offset, offset + len(text))
+                passages += _pieces(clean, "title", None, [], offset, offset + len(text), source=text, base=offset)
             elif heading:
                 sections.heading(int(heading.group(1)), clean)
             else:
                 kind = "caption" if name == "caption" else sections.kind(clean)
                 if kind == "abstract":
                     clean = _ABSTRACT.sub("", clean, count=1) or clean
-                passages += _pieces(clean, kind, None, sections.path, offset, offset + len(text))
-            offset += len(text) + 1
-        elif element.tag == f"{_W}tbl":
-            rows = [" | ".join(_normal(_docx_text(cell)) for cell in row.iter(f"{_W}tc"))
-                    for row in element.iter(f"{_W}tr")]
-            text = "\n".join(row for row in rows if row.strip(" |"))
-            if text:
-                passages += _pieces(text, "table", None, sections.path, offset, offset + len(text))
-            offset += len(text) + 1
+                passages += _pieces(clean, kind, None, sections.path, offset, offset + len(text), source=text,
+                                    base=offset)
+        elif text:
+            passages += _pieces(text, "table", None, sections.path, offset, offset + len(text), source=text, base=offset)
+        offset += len(text) + 1
     return Extracted(*extractor_of(DOCX), passages)
 
 
-def _docx_text(element):
-    """A paragraph's or cell's visible text: runs, tabs and breaks, not deleted text or field codes."""
-    parts = []
-    for node in element.iter():
-        if node.tag == f"{_W}t":
-            parts.append(node.text or "")
-        elif node.tag == f"{_W}tab":
-            parts.append("\t")
-        elif node.tag in (f"{_W}br", f"{_W}cr"):
-            parts.append("\n")
-        elif node.tag == f"{_W}p" and node is not element and parts:
-            parts.append("\n")
-    return "".join(parts)
+def _docx_styles(content):
+    """A styles part's style names (lower case) by style id, read event by event: each style's first
+    name of its own; at most MAX_STYLES of them."""
+    names, path, open_ = {}, [], []  # path: the open elements' tags; open_: the styles being read, [id, name]
+    for event, tag, value in _xml_events(content):
+        if event == "start":
+            if tag == f"{_W}style":
+                open_.append([value.get(f"{_W}styleId"), None])
+            elif tag == f"{_W}name" and path and path[-1] == f"{_W}style" and open_[-1][1] is None:
+                open_[-1][1] = value.get(f"{_W}val", "")
+            path.append(tag)
+        elif event == "end":
+            path.pop()
+            if tag == f"{_W}style":
+                style, name = open_.pop()
+                if style in names or len(names) < MAX_STYLES:
+                    names[style] = (name or "").lower()
+    return names
+
+
+class _Collected(_Text):
+    """A paragraph's or a cell's visible text gathered from events (_docx_body), counting
+    its pieces (a paragraph within it is set apart only after some), and once it ends (done), its
+    text as a cell keeps it."""
+
+    def __init__(self):
+        super().__init__()
+        self.pieces, self.cell = 0, None
+
+    def add(self, piece):
+        super().add(piece)
+        self.pieces += 1
+
+    def done(self):
+        self.cell, self.buffer = _normal(self.value()), None
+
+
+def _docx_body(content, stop):
+    """Each paragraph and table directly in a DOCX document's body, in order, as (tag, text, style):
+    "p", its visible text and its style id (or None); or "tbl", its rows (each its cells' text, a
+    nested table's cells and rows included) and None. Visible text: its runs' text, tabs and breaks,
+    a paragraph within it set apart by a line break once some text has come; not deleted text or
+    field codes. Read event by event (_xml_events): nothing is held for the whole part but its
+    bytes, and a table's rows and cells count against the reading's bounds (_keep) as they start."""
+    T, P, TBL, TR, TC = (f"{_W}{name}" for name in ("t", "p", "tbl", "tr", "tc"))
+    path, in_body, block, style = [], False, None, None  # path: the open elements' tags, the document's first
+    collectors, rows, open_rows, text, bodies = [], [], [], None, 0
+    for event, tag, value in _xml_events(content):
+        if event == "data":
+            if text is not None and path[-1] == T:  # a w:t's own text, before any child of it
+                text.append(value)
+            continue
+        if event == "start":
+            depth = len(path)  # the document 0, its body 1, the body's blocks 2
+            if text is not None:
+                text.append(None)  # a child: no more of the w:t's own text
+            path.append(tag)
+            if depth == 1 and tag == f"{_W}body":
+                bodies += 1
+                in_body = bodies == 1
+            if not in_body or depth < 2:
+                continue
+            if depth == 2:  # a block of the body
+                stop()
+                block, style, rows, open_rows = tag, None, [], []
+                collectors = [_Collected()] if tag == P else []
+            elif block not in (P, TBL):
+                continue
+            elif tag == T:
+                text = []
+            elif tag == P:
+                for collector in collectors:
+                    if collector.pieces:
+                        collector.add("\n")
+            elif tag == f"{_W}tab":
+                for collector in collectors:
+                    collector.add("\t")
+            elif tag in (f"{_W}br", f"{_W}cr"):
+                for collector in collectors:
+                    collector.add("\n")
+            elif tag == f"{_W}pStyle" and block == P and depth == 4 and path[3] == f"{_W}pPr" and style is None:
+                style = value.get(f"{_W}val")
+            elif tag == TR and block == TBL:
+                _keep()  # a row, as a block
+                row = []
+                rows.append(row)
+                open_rows.append(row)
+            elif tag == TC and block == TBL:
+                _keep()  # a cell, as a block
+                cell = _Collected()
+                for row in open_rows:
+                    row.append(cell)
+                collectors.append(cell)
+            continue
+        path.pop()
+        depth = len(path)
+        if depth == 1 and tag == f"{_W}body":
+            in_body = False
+        if not in_body or depth < 2:
+            continue
+        if depth == 2:  # the block ends
+            if block == P:
+                yield "p", collectors[0].value(), style
+            elif block == TBL:
+                yield "tbl", "\n".join(row[0] for row in rows if row[0].strip(" |")), None
+            block, collectors, rows, open_rows = None, [], [], []
+        elif block not in (P, TBL):
+            continue
+        elif tag == T and text is not None:
+            own = "".join(piece for piece in text[:text.index(None)] if piece) if None in text else "".join(text)
+            for collector in collectors:
+                collector.add(own)
+            text = None
+        elif tag == TC and block == TBL:
+            collectors.pop().done()
+        elif tag == TR and block == TBL:
+            row = open_rows.pop()
+            row[:] = [" | ".join(cell.cell for cell in row)]  # its cells, nested ones included, have ended
 
 
 # HTML
@@ -928,28 +1149,50 @@ _BLOCKS = {"p", "div", "section", "article", "header", "footer", "main", "aside"
 _HEADINGS = {f"h{n}": n for n in range(1, 7)}
 
 
-class _HtmlReader(HTMLParser):
-    """Blocks of an HTML document, in order: (kind, text, start, end, level). Its own text only:
-    no resource it names is ever loaded."""
+class _HtmlTitle(HTMLParser):
+    """An HTML document's <title> text (title): what every <title> element holds, together."""
 
-    def __init__(self, source):
+    def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.lines = [0]
-        for match in re.finditer("\n", source):
-            self.lines.append(match.end())
-        self.blocks, self.skip, self.title = [], 0, None
-        self.text, self.start, self.end, self.kind, self.level = [], None, None, "paragraph", 0
-        self.table, self.row, self.cell, self.in_title, self.pre = None, None, None, False, 0
+        self.title, self.in_title = _Text(), False
+
+    def handle_starttag(self, tag, attrs):
+        self.in_title = self.in_title or tag == "title"
+
+    def handle_endtag(self, tag):
+        self.in_title = self.in_title and tag != "title"
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title.add(data)
+
+
+class _HtmlReader(HTMLParser):
+    """An HTML document's blocks, each given to emit(kind, text, start, end, level) as it ends. Its
+    own text only: no resource it names is ever loaded. Nothing is held for the whole document but
+    the parser's own input: positions are found from the line the parser is on, a block's text and
+    a table's are each a _Text, and a table's cells count against the reading's bounds as they end."""
+
+    def __init__(self, source, emit):
+        super().__init__(convert_charrefs=True)
+        self.source, self.emit, self.line, self.line_start = source, emit, 1, 0
+        self.skip, self.in_title = 0, False
+        self.text, self.start, self.end, self.kind, self.level = _Text(), None, None, "paragraph", 0
+        self.table, self.row, self.cell, self.pre = None, None, None, 0
 
     def _at(self):
         line, column = self.getpos()
-        return self.lines[line - 1] + column
+        while self.line < line:  # the parser only moves on: each newline is looked for once
+            self.line_start = self.source.index("\n", self.line_start) + 1
+            self.line += 1
+        return self.line_start + column
 
     def _flush(self):
-        text = "".join(self.text)
-        if text.strip():
-            self.blocks.append((self.kind, text if self.pre else _normal(text), self.start, self.end, self.level))
-        self.text, self.start, self.end, self.kind, self.level = [], None, None, "paragraph", 0
+        if self.text:
+            text = self.text.value()
+            if text.strip():
+                self.emit(self.kind, text if self.pre else _normal(text), self.start, self.end, self.level)
+        self.text, self.start, self.end, self.kind, self.level = _Text(), None, None, "paragraph", 0
 
     def handle_starttag(self, tag, attrs):
         if tag in _SKIPPED:
@@ -960,19 +1203,19 @@ class _HtmlReader(HTMLParser):
         elif self.skip:
             return
         elif tag == "br":
-            (self.cell if self.cell is not None else self.text).append("\n" if self.pre else " ")
+            (self.cell if self.cell is not None else self.text).add("\n" if self.pre else " ")
         elif tag == "table":
             if self.table is None:
                 self._flush()
-                self.table, self.table_start, self.depth = [], self._at(), 0
+                self.table, self.table_start, self.depth = _Text(), self._at(), 0
             self.depth += 1
         elif self.table is not None:  # a nested table's cells are its outer cell's text
             if tag == "tr" and self.depth == 1:
-                self.row = []
+                self.row, self.row_cells, self.row_any = _Text(), 0, False
             elif tag in ("td", "th", "caption") and self.depth == 1:
-                self.cell = []
+                self.cell = _Text()
             elif tag in ("td", "th") and self.cell is not None:
-                self.cell.append(" ")
+                self.cell.add(" ")
         elif tag in _HEADINGS:
             self._flush()
             self.kind, self.level = "heading", _HEADINGS[tag]
@@ -995,40 +1238,41 @@ class _HtmlReader(HTMLParser):
             if self.depth > 1 and tag != "table":
                 return
             if tag in ("td", "th") and self.cell is not None and self.row is not None:
-                self.row.append(_normal("".join(self.cell)))
-                self.cell = None
+                cell = _normal(self.cell.value())
+                _keep()  # a cell, as a block
+                if self.row_cells:
+                    self.row.add(" | ")
+                self.row.add(cell)
+                self.row_cells, self.row_any, self.cell = self.row_cells + 1, self.row_any or bool(cell), None
             elif tag == "tr" and self.row is not None:
-                if any(self.row):
-                    self.table.append(" | ".join(self.row))
+                if self.row_any:
+                    self.table.add(("\n" if self.table else "") + self.row.value())
                 self.row = None
             elif tag == "caption" and self.cell is not None:
-                caption = _normal("".join(self.cell))
+                caption = _normal(self.cell.value())
                 if caption:
-                    self.blocks.append(("caption", caption, self.table_start, self._at(), 0))
+                    self.emit("caption", caption, self.table_start, self._at(), 0)
                 self.cell = None
             elif tag == "table" and self.depth > 1:
                 self.depth -= 1
             elif tag == "table":
                 if self.table:
-                    self.blocks.append(("table", "\n".join(self.table), self.table_start, self._at(), 0))
+                    self.emit("table", self.table.value(), self.table_start, self._at(), 0)
                 self.table, self.row, self.cell = None, None, None
         elif tag in _HEADINGS or tag in ("figcaption", "caption") or tag in _BLOCKS:
             self._flush()
             self.pre -= tag == "pre" and self.pre > 0
 
     def handle_data(self, data):
-        if self.in_title:
-            self.title = (self.title or "") + data
-            return
-        if self.skip:
+        if self.in_title or self.skip:  # the title is _HtmlTitle's
             return
         if self.table is not None:
             if self.cell is not None:
-                self.cell.append(data)
+                self.cell.add(data)
             return
         if self.start is None and data.strip():
             self.start = self._at()
-        self.text.append(data)
+        self.text.add(data)
         self.end = self._at() + len(data)
 
     def close(self):
@@ -1037,28 +1281,38 @@ class _HtmlReader(HTMLParser):
 
 
 def _html(source, stop):
-    reader = _HtmlReader(source)
+    """An HTML document's passages: its title first (its <title>, read in a first pass, or else its
+    first h1), then its blocks as the reader gives them."""
+    sections, passages = _Sections(), []
+    titles = _HtmlTitle()
+    try:
+        titles.feed(source)
+        titles.close()
+    except (AssertionError, ValueError):
+        raise Unreadable() from None
+    title = [_normal(titles.title.value())]
+    if title[0]:
+        passages += _pieces(title[0], "title", None, [], None, None)
+
+    def emit(kind, text, start, end, level):
+        stop()
+        if kind == "heading":
+            if level == 1 and not title[0]:
+                title[0] = text
+                passages.extend(_pieces(text, "title", None, [], start, end, source=source))
+            else:
+                sections.heading(level, text)
+            return
+        kind = kind if kind in ("table", "caption") else sections.kind(text)
+        passages.extend(_pieces(_ABSTRACT.sub("", text, count=1) if kind == "abstract" else text, kind, None,
+                                sections.path, start, end, source=source))
+
+    reader = _HtmlReader(source, emit)
     try:
         reader.feed(source)
         reader.close()
     except (AssertionError, ValueError):
         raise Unreadable() from None
-    sections, passages = _Sections(), []
-    title = _normal(reader.title or "")
-    if title:
-        passages += _pieces(title, "title", None, [], None, None)
-    for kind, text, start, end, level in reader.blocks:
-        stop()
-        if kind == "heading":
-            if level == 1 and not title:
-                title = text
-                passages += _pieces(text, "title", None, [], start, end)
-            else:
-                sections.heading(level, text)
-            continue
-        kind = kind if kind in ("table", "caption") else sections.kind(text)
-        passages += _pieces(_ABSTRACT.sub("", text, count=1) if kind == "abstract" else text, kind, None,
-                            sections.path, start, end)
     return Extracted(*extractor_of(HTML), passages)
 
 
@@ -1083,92 +1337,107 @@ def _markdown_inline(text):
 
 
 def _markdown(source, stop):
-    lines = source.split("\n")
-    offsets, total = [], 0
-    for line in lines:
-        offsets.append(total)
-        total += len(line) + 1
-    blocks, i = [], 0  # (kind, text, start, end, level)
-    if lines and lines[0].strip() == "---":  # front matter
-        for j in range(1, len(lines)):
-            if lines[j].strip() in ("---", "..."):
-                i = j + 1
-                break
-    paragraph, start = [], None
+    """A Markdown file's blocks, read line by line from the text itself (no list of its lines), each
+    made into passages as it ends; a paragraph's text is taken from its range of the source then,
+    rather than held line by line."""
+    sections, passages, titled = _Sections(), [], [False]
+
+    def emit(kind, text, start, end, level=0):
+        if kind == "heading":
+            if level == 1 and not titled[0] and not passages:
+                passages.extend(_pieces(text, "title", None, [], start, end, source=source))
+                titled[0] = True
+            else:
+                sections.heading(level, text)
+            return
+        kind = kind if kind in ("table", "caption") else sections.kind(text)
+        passages.extend(_pieces(_ABSTRACT.sub("", text, count=1) if kind == "abstract" else text, kind, None,
+                                sections.path, start, end, source=source))
+
+    def line_at(at):
+        """The line that starts at at and where the next one starts; (None, at) past the last."""
+        if at > len(source):
+            return None, at
+        end = source.find("\n", at)
+        end = len(source) if end < 0 else end
+        return source[at:end], end + 1
+
+    paragraph = None  # (where it starts, where its last line ends, whether a list item starts it)
 
     def flush(end):
-        nonlocal paragraph, start
-        if paragraph:
-            text = _normal(_markdown_inline(" ".join(paragraph)))
+        nonlocal paragraph
+        if paragraph is not None:
+            start, last, item = paragraph
+            first, _, rest = source[start:last].partition("\n") if item else ("", "", source[start:last])
+            rest = re.sub(r"(?m)^[^\S\n]{0,3}>[^\S\n]?", "", rest)  # each line's quote mark
+            joined = re.sub(r"\s*\n\s*", " ", (_LIST.sub("", first, count=1) + "\n" if item else "") + rest).strip()
+            text = _normal(_markdown_inline(joined))
             if text:
-                image = _IMAGE.fullmatch(" ".join(paragraph).strip())
-                blocks.append(("caption" if image else "paragraph", text, start, end, 0))
-        paragraph, start = [], None
+                emit("caption" if _IMAGE.fullmatch(joined) else "paragraph", text, start, end)
+        paragraph = None
 
-    while i < len(lines):
-        if i % 200 == 0:
+    at = 0
+    line, after = line_at(0)
+    if line is not None and line.strip() == "---":  # front matter
+        scan, past = line_at(after)
+        while scan is not None:
+            if scan.strip() in ("---", "..."):
+                at = past
+                break
+            scan, past = line_at(past)
+    line, after = line_at(at)
+    count = 0
+    while line is not None:
+        count += 1
+        if count % 200 == 0:
             stop()
-        line = lines[i]
-        here = offsets[i]
+        following, beyond = line_at(after)
         if _FENCE.match(line):
-            flush(here)
+            flush(at)
             fence = _FENCE.match(line).group(1)
-            code, j = [], i + 1
-            while j < len(lines) and not lines[j].strip().startswith(fence):
-                code.append(lines[j])
-                j += 1
-            if "\n".join(code).strip():
-                blocks.append(("paragraph", "\n".join(code).strip(), here, offsets[min(j, len(lines) - 1)], 0))
-            i = j + 1
+            closing, (scan, past) = after, (following, beyond)  # the closing line's start, and the line there
+            while scan is not None and not scan.strip().startswith(fence):
+                closing, (scan, past) = past, line_at(past)
+            code = source[after:closing - 1 if scan is not None else len(source)].strip()
+            if code:
+                emit("paragraph", code, at, closing if scan is not None else source.rfind("\n") + 1)
+            at, (line, after) = past, line_at(past)
             continue
         heading = _ATX.match(line)
         if heading:
-            flush(here)
-            blocks.append(("heading", _normal(_markdown_inline(heading.group(2))), here, here + len(line),
-                           len(heading.group(1))))
-            i += 1
+            flush(at)
+            emit("heading", _normal(_markdown_inline(heading.group(2))), at, at + len(line), len(heading.group(1)))
+            at, (line, after) = after, line_at(after)
             continue
-        if line.strip() and i + 1 < len(lines) and re.fullmatch(r" {0,3}(=+|-+)\s*", lines[i + 1]) and not paragraph \
-                and not _LIST.match(line):
-            blocks.append(("heading", _normal(_markdown_inline(line)), here, offsets[i + 1] + len(lines[i + 1]),
-                           1 if "=" in lines[i + 1] else 2))
-            i += 2
+        if line.strip() and following is not None and re.fullmatch(r" {0,3}(=+|-+)\s*", following) \
+                and paragraph is None and not _LIST.match(line):
+            emit("heading", _normal(_markdown_inline(line)), at, after + len(following), 1 if "=" in following else 2)
+            at, (line, after) = beyond, line_at(beyond)
             continue
-        if "|" in line and i + 1 < len(lines) and _TABLE_RULE.match(lines[i + 1]):
-            flush(here)
-            rows, j = [line], i + 2
-            while j < len(lines) and "|" in lines[j] and lines[j].strip():
-                rows.append(lines[j])
-                j += 1
-            cells = [" | ".join(_normal(_markdown_inline(cell)) for cell in row.strip().strip("|").split("|"))
-                     for row in rows]
-            blocks.append(("table", "\n".join(cells), here, offsets[j - 1] + len(lines[j - 1]), 0))
-            i = j
+        if "|" in line and following is not None and _TABLE_RULE.match(following):
+            flush(at)
+            table, end = _Text(), after + len(following)  # a table of no row but its header ends at its rule
+            cells = lambda row: " | ".join(_normal(_markdown_inline(cell)) for cell in row.strip().strip("|").split("|"))
+            table.add(cells(line))
+            row_at, (row, past) = beyond, line_at(beyond)
+            while row is not None and "|" in row and row.strip():
+                _keep()  # a row, as a block
+                table.add("\n" + cells(row))
+                end = row_at + len(row)
+                row_at, (row, past) = past, line_at(past)
+            emit("table", table.value(), at, end)
+            at, (line, after) = row_at, line_at(row_at)
             continue
         if not line.strip():
-            flush(here)
+            flush(at)
         elif _LIST.match(line):
-            flush(here)
-            paragraph, start = [_LIST.sub("", line, count=1)], here
+            flush(at)
+            paragraph = (at, at + len(line), True)
         else:
-            stripped = re.sub(r"^\s{0,3}>\s?", "", line)
-            if start is None:
-                start = here
-            paragraph.append(stripped.strip())
-        i += 1
-    flush(total)
-    sections, passages, titled = _Sections(), [], False
-    for kind, text, start, end, level in blocks:
-        if kind == "heading":
-            if level == 1 and not titled and not passages:
-                passages += _pieces(text, "title", None, [], start, end)
-                titled = True
-            else:
-                sections.heading(level, text)
-            continue
-        kind = kind if kind in ("table", "caption") else sections.kind(text)
-        passages += _pieces(_ABSTRACT.sub("", text, count=1) if kind == "abstract" else text, kind, None,
-                            sections.path, start, end)
+            paragraph = ((at, at + len(line), False) if paragraph is None
+                         else (paragraph[0], at + len(line), paragraph[2]))  # it goes on to this line
+        at, (line, after) = after, line_at(after)
+    flush(len(source))
     return Extracted(*extractor_of(MARKDOWN), passages)
 
 
@@ -1200,6 +1469,10 @@ def _latex(source, stop):
 
     # The arguments the default context does not know, so a caption's text, a reference's key and
     # a bibliography's width are read as arguments rather than as text.
+    # pylatexenc holds the whole file's nodes at once: their number is bounded first, by the markup
+    # characters that can start one (with the text between them, at most twice as many nodes).
+    if sum(source.count(mark) for mark in "\\{}%$&~^_#[]") > MAX_LATEX_MARKS:
+        raise Unreadable()
     context = get_default_latex_context_db()
     context.add_context_category("scholia", macros=[MacroSpec("caption", "[{"), MacroSpec("bibitem", "[{")],
                                  environments=[EnvironmentSpec("thebibliography", "{")], prepend=True)
@@ -1218,15 +1491,15 @@ def _latex(source, stop):
             chosen = kind or sections.kind(text)
             if chosen == "abstract":
                 text = _ABSTRACT.sub("", text, count=1) or text
-            passages.extend(_pieces(text, chosen, None, sections.path, span[0], span[1]))
+            passages.extend(_pieces(text, chosen, None, sections.path, span[0], span[1], source=source))
         pending.clear()
         span[0] = span[1] = None
 
-    def add(text, node):
+    def add(text, start, end):
         if text:
             pending.append(text)
-            span[0] = node.pos if span[0] is None else span[0]
-            span[1] = node.pos + node.len
+            span[0] = start if span[0] is None else span[0]
+            span[1] = end
 
     def arg(node, last=True):
         args = [a for a in (node.nodeargd.argnlist if node.nodeargd else []) if a is not None]
@@ -1243,12 +1516,14 @@ def _latex(source, stop):
                 stop()
             if isinstance(node, LatexCommentNode):
                 continue
-            if isinstance(node, LatexCharsNode):
-                parts = re.split(r"\n[ \t]*\n", node.chars)
-                for n, part in enumerate(parts):
-                    if n:
+            if isinstance(node, LatexCharsNode):  # paragraphs apart at blank lines, each its own range
+                at = 0
+                for gap in [*re.finditer(r"\n[ \t]*\n", node.chars), None]:
+                    if at:
                         flush(kind)
-                    add(part, node)
+                    end = gap.start() if gap else len(node.chars)
+                    add(node.chars[at:end], node.pos + at, node.pos + end)
+                    at = gap.end() if gap else at
                 continue
             if isinstance(node, LatexMacroNode):
                 name = node.macroname.rstrip("*")
@@ -1260,16 +1535,17 @@ def _latex(source, stop):
                 elif name == "caption":
                     flush(kind)
                     caption = _normal(arg(node))
-                    passages.extend(_pieces(caption, "caption", None, sections.path, node.pos, node.pos + node.len))
+                    passages.extend(_pieces(caption, "caption", None, sections.path, node.pos, node.pos + node.len,
+                                            source=source))
                 elif name in ("bibitem", "item", "par"):
                     flush(kind)
                 elif name in _LATEX_DROPPED:
                     if name == "maketitle" and title:
                         flush(kind)
-                        passages.extend(_pieces(title, "title", None, [], node.pos, node.pos + node.len))
+                        passages.extend(_pieces(title, "title", None, [], node.pos, node.pos + node.len, source=source))
                         title = ""
                 else:
-                    add(text_of([node]), node)
+                    add(text_of([node]), node.pos, node.pos + node.len)
                 continue
             if isinstance(node, LatexEnvironmentNode):
                 env = node.environmentname.rstrip("*")
@@ -1289,7 +1565,8 @@ def _latex(source, stop):
                             for row in re.split(r"\\\\|\\hline|\\toprule|\\midrule|\\bottomrule",
                                                 _latex_table_text(node, text_of))]
                     table = "\n".join(row for row in rows if row.strip(" |"))
-                    passages.extend(_pieces(table, "table", None, sections.path, node.pos, node.pos + node.len))
+                    passages.extend(_pieces(table, "table", None, sections.path, node.pos, node.pos + node.len,
+                                            source=source))
                 elif env in ("figure", "table"):
                     flush(kind)
                     walk(node.nodelist, kind)
@@ -1299,11 +1576,11 @@ def _latex(source, stop):
                     walk(node.nodelist, kind)
                     flush(kind)
                 elif env in _LATEX_MATH:
-                    add(text_of([node]), node)
+                    add(text_of([node]), node.pos, node.pos + node.len)
                 else:
                     walk(node.nodelist, kind)
                 continue
-            add(text_of([node]), node)
+            add(text_of([node]), node.pos, node.pos + node.len)
 
     body = next((n for n in nodes if isinstance(n, LatexEnvironmentNode) and n.environmentname == "document"), None)
     if body is not None:

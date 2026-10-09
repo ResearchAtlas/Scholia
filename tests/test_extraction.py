@@ -4,6 +4,7 @@ references marked, and each format read from its own structure with nothing fetc
 
 import io
 import struct
+import textwrap
 import zipfile
 import zlib
 
@@ -483,6 +484,93 @@ def test_a_pdfs_first_pass_holds_its_font_sizes_not_one_entry_per_line(monkeypat
         tracemalloc.stop()
     assert read_whole.pages == 500
     assert peak < 2 * 2**20, f"{peak / 2**20:.1f} MiB"  # a (size, length) for each line would be over 60 MiB
+
+
+# What a reading keeps (MAX_TEXT_CHARS, MAX_BLOCKS and each format's own bound)
+
+LONG = " ".join(f"Sentence {i} of a long paragraph says something new about wages." for i in range(90))
+
+
+@pytest.mark.parametrize("media", ["html", "markdown", "docx", "latex"])
+def test_a_long_paragraphs_pieces_each_take_their_own_range_of_its_source(media):
+    wrapped = textwrap.fill(LONG, 70)  # its lines, as an editor wraps them
+    if media == "html":
+        source, kind = f"<html><body><h1>Title</h1><p>{wrapped}</p></body></html>", extraction.HTML
+    elif media == "markdown":
+        source, kind = f"# Title\n\nAn introduction.\n\n{wrapped}\n", extraction.MARKDOWN
+    elif media == "latex":
+        source, kind = f"\\documentclass{{article}}\\begin{{document}}\n\\section{{S}}\nFirst.\n\n{wrapped}\n\\end{{document}}", \
+            extraction.LATEX
+    else:  # a DOCX's ranges are of its paragraphs' text, each after the one before and a line break
+        source, kind = f"An introduction.\n{LONG}", extraction.DOCX
+    data = synthetic.docx([(None, "An introduction."), (None, LONG)]) if media == "docx" else source.encode()
+    pieces = [p for p in extract(data, kind).passages if "Sentence" in p.text]
+    assert len(pieces) >= 2 and " ".join(p.text for p in pieces) == LONG
+    assert [p.char_start for p in pieces] == sorted({p.char_start for p in pieces})  # each its own, in order
+    for piece in pieces:
+        assert extraction._normal(source[piece.char_start:piece.char_end]) == piece.text
+
+
+@pytest.mark.parametrize("bound", ["MAX_TEXT_CHARS", "MAX_BLOCKS"])
+@pytest.mark.parametrize("media", [extraction.PDF, extraction.DOCX, extraction.HTML, extraction.MARKDOWN, extraction.LATEX])
+def test_a_reading_past_what_it_may_keep_is_unreadable(monkeypatch, media, bound):
+    data = {extraction.PDF: synthetic.paper_pdf(), extraction.DOCX: synthetic.paper_docx(),
+            extraction.HTML: synthetic.paper_html(), extraction.MARKDOWN: synthetic.paper_markdown(),
+            extraction.LATEX: synthetic.paper_latex()}[media]
+    assert extract(data, media).passages  # within the bounds as they are
+    monkeypatch.setattr(extraction, bound, 50 if bound == "MAX_TEXT_CHARS" else 2)
+    with pytest.raises(extraction.Unreadable) as unreadable:
+        extract(data, media)
+    assert unreadable.value.code == "unreadable_file"
+
+
+def _docx_of(body):
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", f"<w:document {w}><w:body>{body}</w:body></w:document>")
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("shape", ["Markdown of newlines", "an HTML paragraph of newlines", "a DOCX of empty paragraphs"])
+def test_a_files_shape_holds_no_memory_for_each_of_its_lines(shape):
+    import tracemalloc
+    data, media, bound = {  # each once held an object for every line or paragraph: 24, 36 and 23 MiB here
+        "Markdown of newlines": (b"\n" * 500_000, extraction.MARKDOWN, 4),
+        "an HTML paragraph of newlines": (b"<p>" + b"\n" * 1_000_000 + b"x</p>", extraction.HTML, 8),
+        "a DOCX of empty paragraphs": (_docx_of("<w:p/>" * 250_000), extraction.DOCX, 8)}[shape]
+    tracemalloc.start()
+    try:
+        extract(data, media)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < bound * 2**20, f"{peak / 2**20:.1f} MiB"
+
+
+def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
+    import pypdfium2
+
+    def never(*args, **kwargs):
+        raise AssertionError("the page's text was read")
+
+    monkeypatch.setattr(extraction, "MAX_PAGE_CHARS", 50)
+    monkeypatch.setattr(pypdfium2.PdfTextPage, "get_text_range", never)
+    with pytest.raises(extraction.Unreadable) as unreadable:
+        extract(synthetic.paper_pdf(), extraction.PDF)
+    assert unreadable.value.code == "unreadable_file"
+
+
+def test_a_latex_file_of_more_markup_than_its_bound_is_refused_before_it_is_parsed(monkeypatch):
+    import pylatexenc.latexwalker as walker
+
+    def never(*args, **kwargs):
+        raise AssertionError("the file was parsed")
+
+    monkeypatch.setattr(extraction, "MAX_LATEX_MARKS", 100)
+    monkeypatch.setattr(walker, "LatexWalker", never)
+    with pytest.raises(extraction.Unreadable):
+        extract(("\\x " * 101).encode(), extraction.LATEX)
 
 
 def _end_records(entries, size, zip64):
