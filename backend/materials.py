@@ -377,15 +377,16 @@ def _store(conn, version_id, sha256, extracted, look_up):
         extraction_id = new_id()
         conn.execute("INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status, pages, ocr_pages)"
                      " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                     (extraction_id, sha256, extracted.extractor, extracted.version,
-                      "ocr_needed" if extracted.ocr_pages else "complete", extracted.pages, extracted.ocr_pages))
+                     (extraction_id, sha256, extracted.extractor, extracted.version, extracted.status, extracted.pages,
+                      extracted.ocr_pages))
         conn.executemany(
             "INSERT INTO passages (id, extraction_id, ordinal, page, section_path, kind, text, char_start, char_end, boxes)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ((new_id(), extraction_id, ordinal, p.page, json.dumps(p.section_path), p.kind, p.text, p.char_start,
               p.char_end, json.dumps(p.boxes) if p.boxes else None)  # each row made as it is written
              for ordinal, p in enumerate(extracted.passages)))
-    _serve(conn, sha256, (extracted.extractor, extracted.version), extraction_id, look_up)
+    _serve(conn, sha256, (extracted.extractor, extracted.version), extraction_id, look_up,
+           bool(extraction.identifiers(extracted.passages)))
 
 
 def _unread_out(conn, project_id, sha256, name):
@@ -402,13 +403,15 @@ def _unread_out(conn, project_id, sha256, name):
             _queue_removes(conn, extraction_id, project_id)
 
 
-def _serve(conn, sha256, extractor, extraction_id, look_up):
+def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
     """A reading of the file just committed: every current version it reads, in any project, has its
     passages queued for that project's index (once, see _queue_adds), and each whose latest lookup
-    recorded not_read (it concluded before any reading of its file had) gets a lookup now, as at
-    import: a Local only project's asks first, a review-locked project's gets none, and it starts
-    where the lookup it continues started (a conversation shows its ask). A lookup made for that
-    version since, or one that has still to read its identifiers, covers it."""
+    recorded not_read (it concluded before any reading of its file had), or no_identifier when this
+    reading gives one (gives: an earlier reading had none, as a page read by OCR now does), gets a
+    lookup now, as at import: a Local only project's asks first, a review-locked project's gets
+    none, and it starts where the lookup it continues started (a conversation shows its ask). A
+    lookup made for that version since, or one that has still to read its identifiers, covers it.
+    The earlier readings are then removed (_supersede)."""
     # Readings of the file by an earlier version of the extractor are no version's reading now: their
     # passages leave the index of every project whose current version reads the file (the readings
     # themselves stay; a replaced version's left at its replacement).
@@ -430,10 +433,70 @@ def _serve(conn, sha256, extractor, extraction_id, look_up):
                               (material, version)).fetchone()
         if latest is not None and conn.execute(
                 "SELECT 1 FROM run_events WHERE run_id = ? AND type = 'step_finished'"
-                " AND json_extract(data, '$.material_id') = ? AND json_extract(data, '$.outcome') = 'not_read'",
-                (latest[0], material)).fetchone():  # it continues that lookup: where it started, its ask is shown
+                " AND json_extract(data, '$.material_id') = ? AND json_extract(data, '$.outcome') IN (?, ?)",
+                (latest[0], material, "not_read", "no_identifier" if gives else "not_read")).fetchone():
+            # it continues that lookup: where it started, its ask is shown
             look_up(conn, project, {"material_ids": [material], "versions": {material: version},
                                     "origin": json.loads(latest[1]) if latest[1] else None})
+    for earlier in older:  # each project's index has its removal queued now (above, or when its paper left)
+        _supersede(conn, earlier, extraction_id)
+
+
+def _supersede(conn, earlier, newer):
+    """An earlier reading of a file by the same extractor, replaced by a newer one in the newer one's
+    commit (section 7.1: a re-parse rebuilds passages, and citations re-resolve through their
+    quotes). Each citation of one of its passages is pointed at the first of the newer reading's
+    passages that holds its quote, one on the citation's page first, or left unresolved (passage_id
+    null, section 4.2); then its passages and the reading itself are deleted, so no index, access
+    check or passage request reaches them again. (S1-21: memory sources naming a passage are to be
+    pointed again in the same way.)"""
+    for citation, quote, page in conn.execute(
+            "SELECT c.id, c.quote, c.page FROM citations c JOIN passages p ON p.id = c.passage_id"
+            " WHERE p.extraction_id = ?", (earlier,)).fetchall():
+        found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
+                             " ORDER BY page IS NOT ?, ordinal LIMIT 1", (newer, quote, page)).fetchone() if quote else None
+        conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page) WHERE id = ?",
+                     (found[0] if found else None, found[1] if found else None, citation))
+    conn.execute("DELETE FROM passages WHERE extraction_id = ?", (earlier,))
+    conn.execute("DELETE FROM extractions WHERE id = ?", (earlier,))
+
+
+async def read_outdated(harness):
+    """Read again every current version whose only reading is by an earlier version of its extractor
+    (S1-20 changed the PDF extractor's version, so every PDF read before it, the scanned pages S1-13
+    left waiting for OCR among them): a reading run each, recorded with the extractor version it is
+    for (inputs.outdated). Called when background work starts (backups.start_background: at launch
+    once the database is checked, and after a restore commits; never while the app is limited). A
+    version is read so once for each extractor version: one with a reading by this version, one
+    being read, or one read so already gets none (Retry and Read again cover a reading that failed).
+    Local work, so at every sensitivity level and in a review-locked project too."""
+    def outdated(conn):
+        found = []
+        for version, material, project, sha256, kind in conn.execute(
+                f"SELECT v.id, v.material_id, m.project_id, v.file_sha256, {_VERSION_TYPE} FROM material_versions v"
+                " JOIN materials m ON m.id = v.material_id JOIN content_files c ON c.sha256 = v.file_sha256"
+                " WHERE v.is_current = 1 ORDER BY m.created_at").fetchall():
+            if kind not in extraction.EXTRACTORS or _extraction(conn, sha256, kind) is not None \
+                    or not _earlier(conn, sha256, kind):
+                continue
+            mark = "/".join(extraction.extractor_of(kind))
+            if conn.execute("SELECT 1 FROM runs WHERE workflow = 'extract' AND json_extract(inputs, '$.version_id') = ?"
+                            " AND (status = 'running' OR json_extract(inputs, '$.outdated') = ?)",
+                            (version, mark)).fetchone() is None:
+                found.append((version, material, project, mark))
+        return found
+
+    def record(conn, ids):  # found again in the transaction that records them
+        used = []
+        for (version, material, project, mark), run in zip(outdated(conn), ids):
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', 'extract', ?)",
+                         (run, project, json.dumps({"material_ids": [material], "version_id": version, "outdated": mark})))
+            used.append(run)
+        return len(used), used
+
+    wanted = await asyncio.to_thread(harness.db.read, outdated)
+    if wanted:
+        await harness.record_background(len(wanted), record)
 
 
 # Looking up identifiers
@@ -714,7 +777,7 @@ def _describe(conn, row, registry):
         active = registry.runs.get(run[0])
         progress = active.progress if active is not None else None
     elif extracted is not None:
-        if extracted[5]:
+        if extracted[3] == "ocr_needed":  # no engine read its scanned pages
             state, reason = "needs_attention", "ocr_waiting"
         elif not extracted[6]:
             state, reason = "needs_attention", "no_text"
