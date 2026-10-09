@@ -385,8 +385,8 @@ async def test_an_answered_offer_that_crashed_after_starting_its_download_never_
             conn.execute("UPDATE runs SET waiting = NULL WHERE id = ?", (run_id,))
         await asyncio.to_thread(client.state["db"].write, answered_and_started)
     async with app(tmp_path, install=False) as client:
-        ended = await run_finished(client, run_id)
-        assert (ended["status"], ended["result"]) == ("succeeded", {"answer": "modelscope", "outcome": "started"})
+        ended = await run_finished(client, run_id)  # its download never ran: it says so, and starts none
+        assert (ended["status"], ended["result"]) == ("succeeded", {"answer": "modelscope", "outcome": "start_interrupted"})
         assert client.remote.sources == [] and client.state["local_helper"].download is None
 
 

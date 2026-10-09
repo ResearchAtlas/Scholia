@@ -168,10 +168,12 @@ def readings(conn, project_id, passage_ids=None, references=True):
     return found
 
 
-def connect(path):
+def connect(path, create=False):
     """An APSW connection to the index file at path, with the tokenizer registered, secure delete on (freed
-    pages are zeroed) and sqlite-vec loaded if it can be: (connection, whether it loaded)."""
-    conn = apsw.Connection(str(path))
+    pages are zeroed) and sqlite-vec loaded if it can be: (connection, whether it loaded). Only with create
+    may it make the file; the index makes it owner-only first (_create), so no connection ever makes it."""
+    flags = apsw.SQLITE_OPEN_READWRITE | (apsw.SQLITE_OPEN_CREATE if create else 0)
+    conn = apsw.Connection(str(path), flags=flags)
     conn.set_busy_timeout(5000)
     conn.register_fts5_tokenizer(TOKENIZER, _tokenizer)
     conn.execute("PRAGMA secure_delete = ON")
@@ -191,7 +193,7 @@ def self_check(folder):
     """The packaged app's check of this module (backend/self_test.py), on a new file in folder: its
     SQLite, the schema with FTS5 secure-delete and the tokenizer, one passage found by a Chinese bigram
     and one by its vector within its project's partition, then removed and checked gone."""
-    conn, loaded = connect(Path(folder) / "search.sqlite3")
+    conn, loaded = connect(Path(folder) / "search.sqlite3", create=True)
     try:
         if not loaded:
             raise RuntimeError("sqlite-vec could not be loaded")
@@ -240,6 +242,7 @@ class SearchIndex:
         self.closed = False
         self.damaged = False  # a read found the file damaged: it is being replaced
         self._conn = None
+        self._truncate = False  # a WAL truncation a reader held off, tried again at each pass
         self._readers = queue.SimpleQueue()  # idle read connections
         self._generation = 0  # a replaced file's readers are closed, not used again
         self._lock = threading.Lock()
@@ -292,15 +295,19 @@ class SearchIndex:
         whether its vectors are wanted again (dropped, or the file is being rebuilt) and the whole
         rebuild's future, if one was needed, which runs on in the writer."""
         dropped, rebuild = self._write(self._open)
-        return dropped or rebuild, self._writer.submit(self._rebuild_all) if rebuild else None
+        return dropped or rebuild, self._rebuild_soon() if rebuild else None
 
-    def _open(self):
+    def _create(self):
+        """The file, made owner-only before SQLite opens it (SQLite gives its WAL and shared-memory files
+        the file's mode)."""
         _make_private_dirs(self.path.parent)
         try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)  # owner-only from its first byte
-            os.close(fd)
+            os.close(os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
         except FileExistsError:
             pass
+
+    def _open(self):
+        self._create()
         try:
             self._conn, self.vectors = self._connect()
             self._conn.execute("PRAGMA journal_mode = WAL")
@@ -311,7 +318,14 @@ class SearchIndex:
             if meta.get("state") != "ready" or meta.get("schema") != SCHEMA_VERSION \
                     or int(meta.get("last_seq", -1)) > self.db.read(high_water):
                 return False, True
+            if "vec_passages" in tables and not self.vectors:
+                # Vectors it can neither use nor remove (sqlite-vec did not load): replaced by a file
+                # without them, so no deletion leaves one behind and none of another model is kept.
+                return False, True
             self._vector_tables()
+            if self.vectors and "vec_passages" not in tables and self._conn.execute(
+                    "SELECT 1 FROM index_rows WHERE kind != 'reference' LIMIT 1").fetchone():
+                return True, False  # sqlite-vec loads again: its passages are embedded
             if (meta.get("tokenizer"), meta.get("tokenizer_version")) != (TOKENIZER, TOKENIZER_VERSION):
                 with self._conn:  # stored text, tokenized again
                     self._conn.execute("INSERT INTO fts_passages (fts_passages) VALUES ('rebuild')")
@@ -342,20 +356,31 @@ class SearchIndex:
         self._conn.executemany("INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
                                [(key, str(value)) for key, value in values.items()])
 
+    def _rebuild_soon(self):
+        """_rebuild_all in the writer, without waiting for it; a failure is logged (the next launch finds
+        the file unfinished and rebuilds it again)."""
+        def done(future):
+            if not future.cancelled() and future.exception() is not None:
+                log.error("rebuilding the search index failed (%s)", type(future.exception()).__name__)
+        future = self._writer.submit(self._rebuild_all)
+        future.add_done_callback(done)
+        return future
+
     def _rebuild_all(self):
         """Replace the file with a new one built from the main database's current readings: marked
         building until every project's rows are in, so a launch that finds it unfinished starts
         again. The last sequence applied is the queue's high-water mark read first; the queue then
-        brings in what changed meanwhile."""
+        brings in what changed meanwhile. Readers never make the file (connect), so the new one is
+        this writer's, owner-only."""
         self.building = True
         try:
             if self._conn is not None:
                 self._conn.close()
+                self._conn = None
             self._close_readers()
             for suffix in ("", "-wal", "-shm"):
                 Path(f"{self.path}{suffix}").unlink(missing_ok=True)
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.close(fd)
+            self._create()
             self._conn, self.vectors = self._connect()
             self._conn.execute("PRAGMA journal_mode = WAL")
             with self._conn:
@@ -385,7 +410,7 @@ class SearchIndex:
                 return
             self.damaged = True
         log.warning("the search index is damaged; it is rebuilt")
-        self._writer.submit(self._rebuild_all)
+        self._rebuild_soon()
 
     # Applying the queue
 
@@ -403,6 +428,8 @@ class SearchIndex:
 
     def _apply(self):
         applied = 0
+        if self._truncate and self._conn is not None:
+            self._checkpoint()
         while self._conn is not None and not self.closed and not self.building:
             last = int(self._conn.execute("SELECT value FROM index_meta WHERE key = 'last_seq'").fetchone()[0])
             rows = self.db.read(lambda conn: conn.execute(
@@ -483,11 +510,14 @@ class SearchIndex:
             raise CleanupFailed()
 
     def _checkpoint(self):
-        """Old WAL frames hold what was deleted: copied into the file, and the WAL truncated."""
+        """Old WAL frames hold what was deleted: copied into the file, and the WAL truncated. One a reader
+        holds off is tried again at the start of every pass until it succeeds."""
         try:
             self._conn.wal_checkpoint(mode=apsw.SQLITE_CHECKPOINT_TRUNCATE)
-        except apsw.BusyError:  # a reader needs it still; the next removal's pass truncates it
-            log.warning("the search index's WAL could not be truncated; a reader still needed it")
+            self._truncate = False
+        except apsw.BusyError:
+            self._truncate = True
+            log.warning("the search index's WAL could not be truncated yet; a reader still needed it")
 
     # A project's rebuild
 

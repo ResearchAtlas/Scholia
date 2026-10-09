@@ -257,3 +257,104 @@ async def test_a_restore_reopens_the_index_against_the_restored_database_and_reb
         keyword = client.state["index"].keyword
         assert await asyncio.to_thread(keyword, project, "最低工资", 50) == []
         assert (await find(client, project, "earnings"))["results"]
+
+
+@pytest.mark.asyncio
+async def test_a_read_during_a_rebuild_never_makes_the_file_and_the_rebuilt_file_is_owner_only(tmp_path):
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        path = index.path
+        await asyncio.to_thread(index._write, lambda: index._conn.close())
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
+        index._close_readers()
+        with pytest.raises(Exception):  # as a read landing while the file is replaced: refused, the file not made
+            await asyncio.to_thread(index.counts, project)
+        assert not path.exists()
+        await asyncio.to_thread(index._write, index._rebuild_all)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600 and len(await index_rows(client, project)) == 4
+        found = (await client.post(f"/api/projects/{project}/search", json={"query": "earnings"})).json()
+        assert found["results"]
+
+
+@pytest.mark.asyncio
+async def test_vectors_sqlite_vec_cannot_reach_are_replaced_with_the_file_and_embedded_again_later(tmp_path, monkeypatch):
+    english = "Zanzibarite cormorants quarrel over vermilion parsnips"
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [material] = (await added(client, project, paper("Canary Paper", english)))["materials"]
+        await idle(client, project)
+        path = client.state["index"].path
+    real = search_index.sqlite_vec.loadable_path
+    monkeypatch.setattr(search_index.sqlite_vec, "loadable_path", lambda: str(tmp_path / "missing" / "vec0"))
+    async with app(tmp_path) as client:  # sqlite-vec does not load: the file with vectors is replaced
+        status = await idle(client, project)
+        assert (status["mode"], status["reason"]) == ("keyword_only", "vectors_unavailable")
+        tables = {n for (n,) in await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table'").fetchall())}
+        assert "vec_passages" not in tables and status["passages"]["indexed"] == 2
+        embedding = vector(f"Canary Paper\nFindings\n{english}")
+        first = next(i for i, value in enumerate(embedding) if value)
+        assert search_index.sqlite_vec.serialize_float32(embedding)[4 * first:4 * first + 64] not in path.read_bytes()
+    monkeypatch.setattr(search_index.sqlite_vec, "loadable_path", real)
+    async with app(tmp_path) as client:  # it loads again: the passages are embedded again
+        status = await until_embedded(client, project)
+        assert status["passages"]["embedded"] == 2 and status["materials"][material["id"]]["embedded"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_wal_truncation_a_reader_holds_off_is_tried_again_at_the_next_pass(tmp_path):
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [material] = (await added(client, project, WAGES))["materials"]
+        await idle(client, project)
+        index = client.state["index"]
+        calls = []
+
+        class Busy:  # the writer's connection, its first truncation held off by a reader
+            def __init__(self, conn):
+                self.conn = conn
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+            def __enter__(self):
+                return self.conn.__enter__()
+
+            def __exit__(self, *exc):
+                return self.conn.__exit__(*exc)
+
+            def wal_checkpoint(self, **options):
+                calls.append(options)
+                if len(calls) == 1:
+                    raise search_index.apsw.BusyError("a reader")
+                return self.conn.wal_checkpoint(**options)
+
+        real = index._conn
+        index._conn = Busy(real)
+        try:
+            assert (await client.delete(f"/api/materials/{material['id']}")).status_code == 200
+            assert index._truncate is True and len(calls) == 1
+            await asyncio.to_thread(index.apply)
+            assert index._truncate is False and len(calls) == 2
+        finally:
+            index._conn = real
+        assert not Path(f"{index.path}-wal").exists() or Path(f"{index.path}-wal").stat().st_size == 0
+
+
+@pytest.mark.asyncio
+async def test_a_search_that_finds_the_file_unreadable_answers_without_an_error(tmp_path, monkeypatch):
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+
+        def unreadable(self, project_id):
+            raise search_index.apsw.CorruptError("damaged")
+        monkeypatch.setattr(SearchIndex, "counts", unreadable)
+        response = await client.post(f"/api/projects/{project}/search", json={"query": "earnings"})
+        assert response.status_code == 200 and response.json()["coverage"] == {"embedded": 0, "total": 0}
+        assert (await client.get(f"/api/projects/{project}/index")).status_code == 200

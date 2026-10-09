@@ -766,6 +766,7 @@ async function materials(ctx) {
     await panel().getByRole('button', { name: L('common.save'), exact: true }).click();
     await panel().getByText(L('paper.saved')).waitFor();
     const saved = (await listing(projectId)).materials.find((m) => m.title === titles.docx);
+    await panel().getByText(L('library.retractionUnchecked'), { exact: true }).waitFor(); // the page read again after the save
     check('the old DOI\'s retraction and source are cleared with it', saved?.csl.DOI === '10.5555/scholia.walkthrough.corrected'
       && saved.retraction === 'unknown' && saved.retraction_checked_at === null && saved.source_key === null
       && saved.checked_by === 'researcher');

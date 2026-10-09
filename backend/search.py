@@ -348,8 +348,9 @@ async def _offer_run(state, harness, active, project_id, inputs):
     started = await read(lambda conn: conn.execute(
         "SELECT json_extract(data, '$.download') FROM run_events WHERE run_id = ? AND type = 'step_started'"
         " AND json_extract(data, '$.download') IS NOT NULL", (run_id,)).fetchone())
-    if started is not None:  # started before a restart: never again (no automatic resume)
-        return {"answer": started[0], "outcome": "started"}, None
+    if started is not None:  # its start was recorded before a restart: never again (no automatic resume)
+        return {"answer": started[0], "outcome": "started" if _installed(state) or _downloading(state)
+                else "start_interrupted"}, None
     while True:
         ask, answer = await read(lambda conn: asks.asked(conn, run_id))
         if answer is not None:
@@ -403,6 +404,15 @@ async def _offer_run(state, harness, active, project_id, inputs):
 # Search
 
 
+async def _counts(index, project_id):
+    """The index's counts for the project, or none while the file cannot be read (being replaced)."""
+    try:
+        return await asyncio.to_thread(index.counts, project_id)
+    except Exception as error:
+        log.warning("the search index could not be read (%s)", type(error).__name__)
+        return {}
+
+
 def fuse(ranked_lists, k):
     """Reciprocal rank fusion: each passage scores the sum of 1 / (k + rank) over the lists it is in;
     best first, ties in the order first seen."""
@@ -434,7 +444,7 @@ async def search(state, project_id, query, limit=None):
     if index is None or index.closed:  # it could not be opened, or a restore is putting another in place
         return {"results": [], "mode": mode, "reason": reason, "index": "unavailable", "coverage": None}
     keyword = asyncio.ensure_future(asyncio.to_thread(index.keyword, project_id, text, values["bm25_candidates"]))
-    counts = await asyncio.to_thread(index.counts, project_id)
+    counts = await _counts(index, project_id)
     coverage = {"embedded": sum(c[1] for c in counts.values()), "total": sum(c[2] for c in counts.values())}
     dense = []
     if mode == "hybrid" and coverage["embedded"]:
@@ -482,7 +492,7 @@ async def index_status(project_id: str, request: Request):
     index = state.get("index")
     if index is not None and index.closed:
         index = None
-    counts = await asyncio.to_thread(index.counts, project_id) if index is not None else {}
+    counts = await _counts(index, project_id) if index is not None else {}
     mode, reason = search_mode(state)
     status = run and derived_status(run[1], run[0], registry)
     active = run and registry.runs.get(run[0])

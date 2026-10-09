@@ -540,6 +540,7 @@
   "search.offer.not_needed": "No longer asked: the search model is installed or on its way.",
   "search.offer.local_only": "No longer asked: the project became Local only.",
   "search.offer.later": "You chose Later. Nothing was downloaded.",
+  "search.offer.start_interrupted": "The download may not have finished when Scholia closed. If the search model is not installed, download it under Settings, Advanced.",
   "settings.workflowIndex": "Indexing for search",
   "settings.workflowModelOffer": "Search model offer",
   "ask.model_download.question": "Download the search model?",

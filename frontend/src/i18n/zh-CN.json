@@ -532,6 +532,7 @@
   "search.offer.not_needed": "不再询问：搜索模型已安装或正在下载。",
   "search.offer.local_only": "不再询问：项目已改为仅本机。",
   "search.offer.later": "你选择了“以后再说”。未下载任何内容。",
+  "search.offer.start_interrupted": "Scholia 关闭时下载可能尚未完成。如果搜索模型没有安装，请在“设置 › 高级”中下载。",
   "settings.workflowIndex": "建立搜索索引",
   "settings.workflowModelOffer": "搜索模型下载询问",
   "ask.model_download.question": "下载搜索模型吗？",
