@@ -461,6 +461,19 @@ def test_native_code_is_reviewed_file_by_file(bundle):
     ]
 
 
+def test_apsws_shipped_native_files_are_reviewed_at_the_reviewed_version(bundle):
+    # The review of each is of this version: another one is reviewed again before it ships.
+    assert metadata.version("apsw") == "3.53.4.0"
+    modules = sorted(f.as_posix() for f in metadata.distribution("apsw").files if f.suffix == ".so")
+    assert modules == ["apsw/__init__.cpython-313-darwin.so", "apsw/_unicode.cpython-313-darwin.so"]
+    for native in modules:
+        _put(bundle, f"Contents/Frameworks/{native}", MACHO)
+    _ship(bundle, "apsw")
+    _ship(bundle, "Unicode-data")
+    found, problems = la.audit(bundle)
+    assert problems == [] and {"apsw", "SQLite", "Unicode-data"} <= set(found)
+
+
 def test_the_unicode_data_notice_is_the_unicode_license_v3():
     license, [(source, dest)] = la.component("Unicode-data")
     text = source.read_text(encoding="utf-8")

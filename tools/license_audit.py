@@ -152,7 +152,7 @@ MPL_PACKAGES = {
 # in the installed distribution), the third-party libraries it embeds (names in LIBRARIES).
 REVIEWED_NATIVE: dict[str, dict[str, list[str]]] = {
     "apsw": {
-        "apsw/__init__.*": ["SQLite"],  # the SQLite amalgamation, linked statically
+        "apsw/__init__.*": ["SQLite"],  # the SQLite amalgamation, linked statically; reviewed for 3.53.4.0
         # Reviewed for 3.53.4.0 (S1-17's search tokenizer loads it through apsw.fts5): built from APSW's
         # own src/unicode.c (zlib, Roger Binns) with the UCD tables it includes; links only libSystem; its
         # symbols are APSW's functions and the generated tables; no other project's notice in it.
