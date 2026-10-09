@@ -58,6 +58,11 @@ QUERY_CHARS = 1000
 MAX_LIMIT = 50
 WAIT_SECONDS = 0.5  # an offer's look at its answer
 HELPER_WAIT_SECONDS = 30  # how long an index run started at launch waits for the helper's startup
+# Why search is keyword-only where an index run ends with its keyword part, succeeded: the model is not
+# installed (its install starts the embeddings), or sqlite-vec did not load (the next launch where it
+# loads embeds them). For any other reason (the helper cannot serve now) it fails, and Retry applies.
+WAITING_REASONS = ("model_missing", "vectors_unavailable")
+DENSE_LIMIT = 4096  # vec0's largest k
 OFFER_OPTIONS = ["huggingface", "modelscope", "later"]
 # Qwen3-Embedding's instruction for retrieval queries (its model card); passages are embedded without one.
 QUERY_INSTRUCTION = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
@@ -97,10 +102,12 @@ def identity(config):
 
 async def open_index(state, db):
     """Open the index for db (at launch, and again on the database a restore puts in place), closing
-    the one before. When its vectors are wanted again (dropped, or the file is rebuilt) and the model
-    is installed, each project with read papers gets an index run, recorded unstarted: the app's
-    background runs start them (backups.start_background), never before. A failure leaves search
-    keyword-only with nothing indexed (index_unavailable), and the app runs."""
+    the one before. While the model is installed, papers whose passages lack embeddings get index runs,
+    one per project, recorded unstarted (the app's background runs start them, backups.start_background,
+    never before): every read paper when the vectors are wanted again (dropped, or the file rebuilt),
+    else those the index holds unembedded (work an earlier run left: a helper that could not serve, a
+    Cancel, a crash), but those a running index run names. A failure leaves search keyword-only with
+    nothing indexed (index_unavailable), and the app runs."""
     previous = state.pop("index", None)
     if previous is not None:
         await asyncio.to_thread(previous.close)
@@ -116,9 +123,18 @@ async def open_index(state, db):
     deletion.CLEANUP[db] = index.apply  # a deletion's removals, applied after its commit
     if rebuilding is None:
         index.apply_soon()
-    if wanted and _installed(state):
-        await asyncio.to_thread(db.write, lambda conn: [_insert_run(conn, None, project, {"material_ids": materials})
-                                                        for project, materials in _read_papers(conn).items()])
+    if not _installed(state):
+        return
+    pending = None if wanted else await asyncio.to_thread(index.unembedded)
+
+    def record(conn):
+        papers = _read_papers(conn)
+        if pending is not None:
+            papers = {project: [m for m in materials if m in pending.get(project, ())] for project, materials in papers.items()}
+        for project, materials in papers.items():
+            if materials:
+                _insert_run(conn, None, project, {"material_ids": materials})
+    await asyncio.to_thread(db.write, record)
 
 
 def _read_papers(conn):
@@ -183,22 +199,33 @@ async def _record(harness, project_id, inputs):
     return await harness.record_background(1, write)
 
 
-async def after_deletion(state, revoked):
-    """A deletion revoked these runs: each index run's papers that are still there, and still lack
-    embeddings, get a new run."""
+async def after_deletion(state, revoked, project_id=None, files=()):
+    """After a material's deletion, papers whose passages lack embeddings get a new index run: those of
+    the index runs it revoked that are still there, and those of the project whose current file the
+    deleted material also had (the deletion queued their passages again, with their own title)."""
     index, harness = state.get("index"), state.get("harness")
-    if index is None or harness is None or not revoked:
+    if index is None or harness is None:
         return
+
+    def wanted(conn):
+        found = {}
+        for project, inputs in conn.execute("SELECT project_id, inputs FROM runs WHERE workflow = 'index'"
+                                            " AND id IN (SELECT value FROM json_each(?))", (json.dumps(list(revoked)),)):
+            found.setdefault(project, set()).update(json.loads(inputs or "{}").get("material_ids") or [])
+        if project_id is not None and files:
+            found.setdefault(project_id, set()).update(m for (m,) in conn.execute(
+                "SELECT m.id FROM materials m JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
+                " WHERE m.project_id = ? AND v.file_sha256 IN (SELECT value FROM json_each(?))",
+                (project_id, json.dumps(list(files)))))
+        return {project: materials & {m for (m,) in conn.execute("SELECT id FROM materials WHERE project_id = ?",
+                                                                  (project,))} for project, materials in found.items()}
     try:
-        runs = await asyncio.to_thread(harness.db.read, lambda conn: conn.execute(
-            "SELECT project_id, inputs FROM runs WHERE workflow = 'index' AND id IN (SELECT value FROM json_each(?))",
-            (json.dumps(list(revoked)),)).fetchall())
-        for project, inputs in runs:
-            wanted = set(json.loads(inputs or "{}").get("material_ids") or [])
-            pending = (await asyncio.to_thread(index.unembedded)).get(project, [])
-            kept = await asyncio.to_thread(harness.db.read, lambda conn: {m for (m,) in conn.execute(
-                "SELECT id FROM materials WHERE project_id = ?", (project,))})
-            if rest := [m for m in pending if m in wanted and m in kept]:
+        papers = await asyncio.to_thread(harness.db.read, wanted)
+        if not any(papers.values()):
+            return
+        pending = await asyncio.to_thread(index.unembedded)
+        for project, materials in papers.items():
+            if rest := [m for m in pending.get(project, []) if m in materials]:
                 await _record(harness, project, {"material_ids": rest})
     except Exception as error:
         log.warning("index runs after a deletion could not be recorded (%s)", type(error).__name__)
@@ -295,8 +322,10 @@ async def _index_run(state, harness, active, project_id, inputs):
             break
         await asyncio.sleep(0.05)
     mode, reason = search_mode(state)
-    if mode != "hybrid":  # keyword search only, and said
+    if mode != "hybrid" and reason in WAITING_REASONS:  # keyword search only until that changes, said
         return {"mode": "keyword_only", "reason": reason}, None
+    if mode != "hybrid":  # the helper cannot serve now: failed with its reason, and Retry embeds what is missing
+        raise RunOutcome("failed", reason)
     batch = load_settings(state["data_dir"]).values["retrieval"]["embedding_batch"]
 
     async def progress():
@@ -330,6 +359,8 @@ async def _index_run(state, harness, active, project_id, inputs):
                         skip.append(rowid)
                         continue
                     raise RunOutcome("failed", unavailable.reason) from None
+                if len(vector) != DIMENSIONS:  # not this model's: nothing would ever be stored
+                    raise RunOutcome("failed", "request_failed")
                 vectors.append((rowid, pid, mark, vector))
             embedded += await asyncio.to_thread(index.store, project_id, vectors)
             await progress()
@@ -449,12 +480,15 @@ async def search(state, project_id, query, limit=None):
     dense = []
     if mode == "hybrid" and coverage["embedded"]:
         try:  # the deadline covers the query's embedding: past it, keyword results, said; a helper start goes on
-            dense = await asyncio.wait_for(_dense(state, index, project_id, text, values["dense_candidates"]),
-                                           values["hybrid_ms"] / 1000)
+            dense = await asyncio.wait_for(_dense(state, index, project_id, text,
+                                                  min(values["dense_candidates"], DENSE_LIMIT)), values["hybrid_ms"] / 1000)
         except TimeoutError:
             mode, reason = "keyword_only", "deadline"
         except HelperUnavailable as unavailable:
             mode, reason = "keyword_only", unavailable.reason
+        except Exception as error:  # the file being replaced: keyword results, said
+            log.warning("a dense search failed (%s)", type(error).__name__)
+            mode, reason = "keyword_only", "index_unavailable"
     try:
         keyword = await keyword
     except Exception as error:  # the file damaged: replaced meanwhile (search_index), nothing found now

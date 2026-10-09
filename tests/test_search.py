@@ -71,7 +71,8 @@ class Remote:
             await self.hold.wait()
         if self.failing:
             return httpx.Response(500, json={"error": "failed"})
-        return httpx.Response(200, json={"data": [{"index": i, "embedding": vector(t)} for i, t in enumerate(texts)]})
+        return httpx.Response(200, json={"data": [{"index": i, "embedding": synthetic.embedding(t)}
+                                                  for i, t in enumerate(texts)]})
 
 
 @pytest.fixture(autouse=True)
@@ -662,3 +663,74 @@ async def test_a_shutdown_during_embedding_resumes_at_the_next_launch_with_only_
         status = await idle(client, project)
         assert status["passages"]["embedded"] == 4 and len(client.remote.indexing) == 2
         assert (await run_finished(client, run["run_id"]))["status"] == "succeeded"
+
+
+# From the independent review
+
+
+async def test_an_empty_reading_raises_no_offer_and_no_index_run(tmp_path):
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        await added(client, project, ("blank.md", b"\n\n"), ("empty.html", b"<html><body></body></html>"))
+        await idle(client, project)
+        await asyncio.sleep(0.2)
+        assert await runs_of(client, "model_offer", project) == [] and await runs_of(client, "index", project) == []
+        await added(client, project, WAGES)
+        assert len(await until_offer(client, project)) == 1  # the first reading with passages is the first material
+
+
+async def test_deleting_one_of_two_papers_reading_one_file_leaves_the_other_its_own_rows(tmp_path):
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [first] = (await added(client, project, paper("Alpha Deleted Title", "A shared paragraph about wages.")))[
+            "materials"]
+        [second] = (await added(client, project, paper("Beta Kept", "Its own first text.")))["materials"]
+        await idle(client, project)
+        await added(client, project, paper("Alpha Deleted Title", "A shared paragraph about wages."),
+                    material_id=second["id"])  # the second now reads the first's file
+        await idle(client, project)
+        assert (await client.delete(f"/api/materials/{first['id']}")).status_code == 200
+        status = await idle(client, project)
+        deadline = asyncio.get_running_loop().time() + 10
+        while (status := await idle(client, project))["passages"]["embedded"] < status["passages"]["embeddable"]:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.05)
+        assert {r[1] for r in await index_rows(client, project)} == {second["id"]}
+        assert list(status["materials"]) == [second["id"]]
+        texts = await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+            "SELECT text FROM fts_passages").fetchall())
+        assert texts and all(text.startswith("Beta Kept") for (text,) in texts)  # the deleted title is gone
+
+
+async def test_papers_left_unembedded_get_index_runs_at_the_next_launch_with_the_model(tmp_path):
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        status = await idle(client, project)
+        assert status["passages"]["embedded"] == 0
+    async with app(tmp_path) as client:  # the model is in place now: the launch embeds what waited
+        deadline = asyncio.get_running_loop().time() + 10
+        while (await idle(client, project))["passages"]["embedded"] < 4:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.05)
+
+
+async def test_a_helper_answering_vectors_of_another_dimension_fails_the_run_after_one_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(synthetic, "embedding", lambda text, dimensions=512: [1.0] * dimensions)
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        [run] = await runs_of(client, "index", project)
+        assert (run["status"], run["result"]["reason"]) == ("failed", "request_failed")
+        assert len(client.remote.indexing) == 1
+
+
+async def test_a_dense_depth_above_what_vec0_takes_is_bounded(tmp_path):
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        await setting(client, "retrieval.dense_candidates", 5000)
+        found = await find(client, project, "earnings")
+        assert found["mode"] == "hybrid" and found["results"]

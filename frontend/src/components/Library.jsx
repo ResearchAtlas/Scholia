@@ -20,7 +20,7 @@ import { cn } from '@/lib/utils';
 // S1-17: search and the search index
 import { Input } from '@/components/ui/input';
 import { downloadOffered } from '../helper.js';
-import { fieldKey, indexPoll, indexStatus, paperIndexed, queryOf, searchNote, searchProject, whereIs } from '../search.js';
+import { fieldKey, indexPoll, indexReason, indexStatus, paperIndexed, queryOf, searchNote, searchProject, whereIs } from '../search.js';
 import { LocalOnlySearchNote } from './LocalHelper.jsx';
 
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
@@ -249,7 +249,9 @@ export function Facts({ material, project, index }) {
     extraction?.pages != null && [t('library.fact.pages'), String(extraction.pages)],
     extraction && [t('library.fact.passages'), String(extraction.passages)],
     extraction?.ocr_pages > 0 && [t('library.fact.ocr'), t('library.ocrWaiting', { count: extraction.ocr_pages })],
-    index && extraction && [t('search.indexTitle'), t(...paperIndexed(index, material.id))],
+    index && extraction && [t('search.indexTitle'), t(...paperIndexed(index, material.id))
+      + (index.mode === 'keyword_only' && index.materials?.[material.id]  // and why meaning search is not there
+        ? ` ${t('helper.keywordOnly', { reason: t(indexReason(index.reason, downloadOffered(project))) })}` : '')],
     [t('library.fact.details'), detailsSource(t, material, project, date)],
     latestLookup(t, material) && [t('library.fact.lookup'), latestLookup(t, material)],
     material.lookup?.identifier && [t('library.fact.identifier'), material.lookup.identifier.replace(/^(doi|arxiv):/, '')],

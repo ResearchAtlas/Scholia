@@ -217,8 +217,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
                 f" AND status IN {_SHARED}", (sha256, extractor, extractor_version)).fetchone()
             run = None
             if shared is not None:  # read already, for another project or version: shared, not read again
-                _queue_adds(conn, shared[0], project_id)
-                search.queued(conn, harness, project_id, [material], origin, recorded)
+                if _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
+                    search.queued(conn, harness, project_id, [material], origin, recorded)
             else:
                 run = next(ids)
                 used.append(run)
@@ -298,16 +298,17 @@ def _queue_adds(conn, extraction_id, project_id):
     adding a passage the project's index holds already changes nothing there), unless the project's
     latest queued operation for them is already an add, so no reading queues them twice. They are
     queued and removed (backend/db/deletion.py) a whole extraction at a time, so its first passage
-    stands for all of them."""
+    stands for all of them. Returns whether the extraction has passages."""
     first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1",
                          (extraction_id,)).fetchone()
     last = first and conn.execute("SELECT op FROM index_queue WHERE target = 'passage' AND target_id = ?"
                                   " AND project_id = ? ORDER BY seq DESC LIMIT 1", (first[0], project_id)).fetchone()
     if first is None or (last is not None and last[0] == "add"):
-        return
+        return first is not None
     conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
                  " SELECT 'passage', id, ?, 'add' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
                  (project_id, extraction_id))
+    return True
 
 
 # Reading
@@ -436,8 +437,8 @@ def _serve(conn, sha256, extractor, extraction_id, record, harness=None, origins
             continue
         for earlier in older:
             _queue_removes(conn, earlier, project)
-        _queue_adds(conn, extraction_id, project)
-        search.queued(conn, harness, project, [material], (origins or {}).get(version), record)
+        if _queue_adds(conn, extraction_id, project):  # a reading with passages: indexed, offered for
+            search.queued(conn, harness, project, [material], (origins or {}).get(version), record)
         if locked:
             continue
         latest = conn.execute("SELECT r.id, json_extract(r.inputs, '$.origin') FROM runs r, json_each(r.inputs, '$.versions') j"
@@ -890,13 +891,16 @@ async def delete_material(material_id: str, request: Request, purge_backups: boo
         "SELECT project_id FROM materials WHERE id = ?", (material_id,)).fetchone())
     if project is None:
         raise _refused(404, "not_found", "No such material")
+    files = await asyncio.to_thread(state["db"].read, lambda conn: [f for (f,) in conn.execute(  # S1-17, below
+        "SELECT DISTINCT file_sha256 FROM material_versions WHERE material_id = ? AND file_sha256 IS NOT NULL",
+        (material_id,))])
 
     async def deleting():
         revoked = await asyncio.to_thread(
             delete, state["db"], state["content"], "material", material_id, remove_all_trace=remove_all_trace,
             on_committed=lambda ids: loop.call_soon_threadsafe(harness.revoke, ids))
         harness.revoke(revoked)
-        await search.after_deletion(state, revoked)  # an index run's other papers get a new run
+        await search.after_deletion(state, revoked, project[0], files)  # what lacks embeddings now gets a run
         if not purge_backups:
             return {"ok": True}
         try:

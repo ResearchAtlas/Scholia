@@ -366,6 +366,21 @@ def _queue_index_removals(conn):
             WHERE {_reads_now('w', 'e')} AND n.project_id = m.project_id
             AND w.rowid NOT IN {_doomed('material_versions')})
         ORDER BY p.id""")
+    # A reading another current version in the project still reads stays; its passages are queued
+    # again, so the index takes them as that paper's, with its title (S1-17), and keeps nothing of the
+    # deleted one's.
+    conn.execute(f"""INSERT INTO index_queue (target, target_id, project_id, op)
+        SELECT DISTINCT 'passage', p.id, m.project_id, 'add'
+        FROM material_versions v
+        JOIN materials m ON m.id = v.material_id
+        JOIN extractions e ON {_reads('v', 'e')}
+        JOIN passages p ON p.extraction_id = e.id
+        WHERE v.rowid IN {_doomed('material_versions')}
+        AND EXISTS (
+            SELECT 1 FROM material_versions w JOIN materials n ON n.id = w.material_id
+            WHERE {_reads_now('w', 'e')} AND n.project_id = m.project_id
+            AND w.rowid NOT IN {_doomed('material_versions')})
+        ORDER BY p.id""")
     conn.execute(f"""INSERT INTO index_queue (target, target_id, project_id, op)
         SELECT 'memory', id, project_id, 'remove' FROM memory_records
         WHERE rowid IN {_doomed('memory_records')} ORDER BY id""")

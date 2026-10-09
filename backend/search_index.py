@@ -13,8 +13,8 @@ thread makes every change, in order; searches read on connections of their own.
 - `index_rows`: the rowid the two share for one project's passage, its material and kind, a digest
   of its index text and whether it is embedded; no text.
 - `index_meta`: the model, its revision, quantization, runtime and dimensions, the tokenizer and its
-  version, the file's schema version, the last index_queue sequence applied, and whether a whole
-  rebuild is under way.
+  version, the file's schema version, the main database file it was built from, the last index_queue
+  sequence applied, and whether a whole rebuild is under way.
 
 Rows are kept per project. The writer applies the main database's index_queue in order (`apply`):
 an add takes the passage's index text from the main database if a current version of a material
@@ -24,7 +24,8 @@ follows; a remove deletes the passage's rows. Removed rows are checked gone befo
 truncated, and the applied queue rows are deleted from the main database. Reference passages are
 indexed for keywords, marked by kind and never embedded; search leaves them out.
 
-At open: a file that cannot be read, one of another schema, one a whole rebuild did not finish, or one whose last applied
+At open: a file that cannot be read, one of another schema or built from another database file (a
+restore, or one undone), one a whole rebuild did not finish, or one whose last applied
 sequence the main database cannot have (a restored or replaced database: its queue's high-water mark
 is lower) is replaced and rebuilt from the main database's current readings, in the writer, while
 the app runs; another tokenizer version re-tokenizes the keyword rows; another model, revision,
@@ -316,27 +317,34 @@ class SearchIndex:
                 return False, True
             meta = dict(self._conn.execute("SELECT key, value FROM index_meta"))
             if meta.get("state") != "ready" or meta.get("schema") != SCHEMA_VERSION \
-                    or int(meta.get("last_seq", -1)) > self.db.read(high_water):
+                    or meta.get("database") != self._database() or int(meta.get("last_seq", -1)) > self.db.read(high_water):
                 return False, True
             if "vec_passages" in tables and not self.vectors:
                 # Vectors it can neither use nor remove (sqlite-vec did not load): replaced by a file
                 # without them, so no deletion leaves one behind and none of another model is kept.
                 return False, True
             self._vector_tables()
-            if self.vectors and "vec_passages" not in tables and self._conn.execute(
-                    "SELECT 1 FROM index_rows WHERE kind != 'reference' LIMIT 1").fetchone():
-                return True, False  # sqlite-vec loads again: its passages are embedded
+            wanted = self.vectors and "vec_passages" not in tables and bool(self._conn.execute(
+                "SELECT 1 FROM index_rows WHERE kind != 'reference' LIMIT 1").fetchone())  # sqlite-vec loads again
             if (meta.get("tokenizer"), meta.get("tokenizer_version")) != (TOKENIZER, TOKENIZER_VERSION):
                 with self._conn:  # stored text, tokenized again
                     self._conn.execute("INSERT INTO fts_passages (fts_passages) VALUES ('rebuild')")
                     self._meta(tokenizer=TOKENIZER, tokenizer_version=TOKENIZER_VERSION)
             if any(meta.get(key) != value for key, value in self.identity.items()):
                 self._drop_vectors()
-                return True, False
-            return False, False
+                wanted = True
+            return wanted, False
         except apsw.Error as error:  # a file SQLite cannot use (damaged, not a database): replaced
             log.warning("the search index could not be used (%s); it is rebuilt", type(error).__name__)
             return False, True
+
+    def _database(self):
+        """Which main database file the index was built from: its device and inode. A restore puts another
+        file in place, and putting the previous one back after a failed restore brings back its own, so
+        an index built in between is never taken for this database's (the queue's high-water mark alone
+        cannot tell them apart)."""
+        found = os.stat(self.db.path)
+        return f"{found.st_dev}:{found.st_ino}"
 
     def _vector_tables(self):
         if self.vectors:
@@ -385,8 +393,8 @@ class SearchIndex:
             self._conn.execute("PRAGMA journal_mode = WAL")
             with self._conn:
                 self._conn.execute(SCHEMA)
-                self._meta(state="building", last_seq=0, schema=SCHEMA_VERSION, tokenizer=TOKENIZER,
-                           tokenizer_version=TOKENIZER_VERSION, **self.identity)
+                self._meta(state="building", last_seq=0, schema=SCHEMA_VERSION, database=self._database(),
+                           tokenizer=TOKENIZER, tokenizer_version=TOKENIZER_VERSION, **self.identity)
             self._vector_tables()
             last = self.db.read(high_water)
             for (project,) in self.db.read(lambda conn: conn.execute("SELECT id FROM projects").fetchall()):

@@ -358,3 +358,30 @@ async def test_a_search_that_finds_the_file_unreadable_answers_without_an_error(
         response = await client.post(f"/api/projects/{project}/search", json={"query": "earnings"})
         assert response.status_code == 200 and response.json()["coverage"] == {"embedded": 0, "total": 0}
         assert (await client.get(f"/api/projects/{project}/index")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_an_index_built_from_another_database_file_is_rebuilt(tmp_path):
+    """A restore puts another database file in place, and undoing a failed one puts the previous back;
+    an index built from the other file is never taken for this one's, though the queue's mark allows it."""
+    import shutil
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        database = client.state["db"].path
+        index = client.state["index"]
+        await asyncio.to_thread(index._write, lambda: index._conn.execute(  # a row the database never had
+            "INSERT INTO fts_passages (rowid, text, project_id, passage_id) VALUES (999999, 'stale ghost', ?, 'x')",
+            (project,)))
+    copy = database.with_name("copy.sqlite3")
+    shutil.copy2(database, copy)
+    copy.replace(database)  # the same content, another file
+    async with app(tmp_path) as client:
+        status = await until_embedded(client, project)
+        assert status["passages"]["indexed"] == 4
+        index = client.state["index"]
+        assert await asyncio.to_thread(index.keyword, project, "ghost", 50) == []
+        meta = dict(await asyncio.to_thread(index._read, lambda conn: conn.execute("SELECT key, value FROM index_meta").fetchall()))
+        found = os.stat(database)
+        assert meta["database"] == f"{found.st_dev}:{found.st_ino}"

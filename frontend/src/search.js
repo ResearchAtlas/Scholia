@@ -31,12 +31,14 @@ export const queryOf = (text) => visible(text);
 // much of the library meaning search covers so far.
 const SEARCH_REASONS = new Set(['deadline', 'vectors_unavailable', 'index_unavailable', 'request_failed', 'closing']);
 
+// Why search is keyword-only, as a catalog key: the search's own reasons, else the helper's.
+export const indexReason = (reason, offered = true) => (SEARCH_REASONS.has(reason) ? `search.reason.${reason}`
+  : keywordOnlyReason({ search: { mode: 'keyword_only', reason } }, offered));
+
 export function searchNote(found, offered = true) {
   if (!found) return null;
   if (found.mode === 'keyword_only') {
-    const reason = SEARCH_REASONS.has(found.reason) ? `search.reason.${found.reason}`
-      : keywordOnlyReason({ search: found }, offered);
-    return ['helper.keywordOnly', { reasonKey: reason }]; // the reason's own text goes in as {reason}
+    return ['helper.keywordOnly', { reasonKey: indexReason(found.reason, offered) }]; // its text goes in as {reason}
   }
   if (found.index === 'building') return ['search.building', {}];
   const coverage = found.coverage;

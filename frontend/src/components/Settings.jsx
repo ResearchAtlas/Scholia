@@ -19,7 +19,7 @@ import { Ask } from './Ask.jsx';
 import { fraction, retryRun, runOutcome } from '../runs.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { IndexSection } from './SearchIndex.jsx'; // S1-17
-import { offerOutcome } from '../search.js'; // S1-17
+import { indexReason, offerOutcome } from '../search.js'; // S1-17
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
@@ -502,6 +502,9 @@ function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
       )}
       {run.workflow === 'model_offer' && run.status === 'succeeded' && offerOutcome(t, run.result) && (
         <p className="text-xs text-muted-foreground">{offerOutcome(t, run.result)}</p>
+      )}
+      {run.workflow === 'index' && run.status === 'succeeded' && run.result?.mode === 'keyword_only' && (
+        <p className="text-xs text-muted-foreground">{t('helper.keywordOnly', { reason: t(indexReason(run.result.reason)) })}</p>
       )}
       {run.ask && <Ask ask={run.ask} onAnswered={onChanged} />}
     </li>
