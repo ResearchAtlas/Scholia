@@ -9,8 +9,8 @@ import { ApiError, get, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEvents, newest, reasonKey, sortFiles, stateKey,
-  typeKey, unsettled, uploadsWaiting, watchUploads, yearOf } from '../library.js';
+import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEvents, newest, ocrPages, reasonKey, sortFiles,
+  stateKey, typeKey, unsettled, uploadsWaiting, watchUploads, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { Paper } from './Parts.jsx';
@@ -233,7 +233,7 @@ export function Facts({ material, project }) {
       + (material.version.seq ? ` · ${t('library.version', { number: material.version.seq + 1 })}` : '')],
     extraction?.pages != null && [t('library.fact.pages'), String(extraction.pages)],
     extraction && [t('library.fact.passages'), String(extraction.passages)],
-    extraction?.ocr_pages > 0 && [t('library.fact.ocr'), t('library.ocrWaiting', { count: extraction.ocr_pages })],
+    ocrPages(t, extraction) && [t('library.fact.ocr'), ocrPages(t, extraction)],
     [t('library.fact.details'), detailsSource(t, material, project, date)],
     latestLookup(t, material) && [t('library.fact.lookup'), latestLookup(t, material)],
     material.lookup?.identifier && [t('library.fact.identifier'), material.lookup.identifier.replace(/^(doi|arxiv):/, '')],

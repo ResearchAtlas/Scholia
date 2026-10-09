@@ -311,6 +311,12 @@
     "one": "{count} page waiting",
     "other": "{count} pages waiting"
   },
+  "library.ocrRead": {
+    "one": "{count} page read",
+    "other": "{count} pages read"
+  },
+  "library.reason.ocr_failed": "Text recognition failed. Try again from Settings, Advanced.",
+  "errors.ocr_failed": "Text recognition failed on a scanned page. Try again.",
   "library.retractedOn": "Retracted (checked {date})",
   "library.notRetracted": "Not retracted (checked {date})",
   "library.retractionUnchecked": "Not checked",

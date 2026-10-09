@@ -770,6 +770,12 @@ async def start_background(state):
     """Start the app's background runs (start ran with kick false): after a restore commits, and at
     launch once the launch backup has checked the database. A failure is logged: the app runs on,
     and they start at the next launch."""
+    from backend import materials  # S1-20: papers read only by an earlier extractor version are read again
+
+    try:
+        await materials.read_outdated(state["harness"])
+    except Exception as error:
+        log.warning("reading papers again for a newer extractor failed (%s)", type(error).__name__)
     try:
         await state["harness"].kick_background()
     except Exception as error:

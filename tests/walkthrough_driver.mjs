@@ -520,12 +520,13 @@ async function materials(ctx) {
     await paper(titles.pdf).waitFor(); await page.waitForTimeout(2000);
     const by = Object.fromEntries(listed.materials.map((m) => [m.title, m]));
     check('seven papers are saved, each stored once', listed.materials.length === 7);
-    check('five are Ready, read into passages', listed.materials.filter((m) => m.state === 'ready' && m.extraction?.passages > 0).length === 5);
-    check('the Library shows five Ready', await panel().getByText(L('library.state.ready'), { exact: true }).count() === 5);
-    check('the scanned pages wait for text recognition', by['scanned-appendix']?.reason === 'ocr_waiting'
-      && by['scanned-appendix'].extraction.ocr_pages === 2);
+    check('six are Ready, read into passages', listed.materials.filter((m) => m.state === 'ready' && m.extraction?.passages > 0).length === 6);
+    check('the Library shows six Ready', await panel().getByText(L('library.state.ready'), { exact: true }).count() === 6);
+    // S1-20: the appendix's image-only pages are read by text recognition (they hold no text).
+    check('the scanned pages are read by text recognition', by['scanned-appendix']?.state === 'ready'
+      && by['scanned-appendix'].extraction.status === 'complete' && by['scanned-appendix'].extraction.ocr_pages === 2);
     check('the damaged file needs attention with its reason', by.damaged?.reason === 'unreadable_file');
-    check('two need attention in the Library', await panel().getByText(L('library.state.needs_attention'), { exact: true }).count() === 2);
+    check('one needs attention in the Library', await panel().getByText(L('library.state.needs_attention'), { exact: true }).count() === 1);
     check('details were looked up and saved', Object.values(titles).every((title) => by[title]?.checked_by === 'lookup'));
     check('a retraction is recorded and flagged', by[titles.docx]?.retraction === 'retracted'
       && await panel().getByText(L('library.retracted'), { exact: true }).count() === 1);
@@ -840,6 +841,117 @@ async function materials(ctx) {
     await dialog().getByRole('button', { name: L('runs.retry'), exact: true }).first().scrollIntoViewIfNeeded();
   });
   await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+}
+
+// S1-20: OCR of a scanned page. A synthetic scanned letter (an image of English lines, a Chinese line
+// and a made-up DOI, no text layer) is read by this Mac's Vision; the test server's wrapper fails its
+// first recognition once, so the paper first needs attention, is tried again from the background-run
+// list, and is then Ready with its page read by text recognition, its lines drawn over the page, and
+// the DOI read from the scan looked up alone.
+async function s120(ctx) {
+  const { page, L, C, step, check, get } = ctx;
+  const { dialog, openSidebar, openSettings } = navigation(ctx);
+  const panel = () => page.getByRole('complementary', { name: L('panel.library') });
+  const projectId = (await get('/api/projects')).body.projects.find((p) => p.name === C.project).id;
+  const title = 'A Scanned Letter on Synthetic Wages';  // its record's, once looked up
+  const scanned = async () => (await get(`/api/projects/${projectId}/materials`)).body.materials
+    .find((m) => m.version?.media_type === 'application/pdf' && (m.title === 'scanned-letter' || m.title === title));
+  const until = async (test, what) => {
+    for (let i = 0; i < 300; i += 1) {
+      const found = await scanned();
+      if (found && test(found)) return found;
+      await page.waitForTimeout(200);
+    }
+    throw new Error(`the scanned letter did not ${what} in time`);
+  };
+  const row = () => panel().getByRole('listitem').filter({ hasText: /scanned-letter|A Scanned Letter on Synthetic Wages/ });
+  const requests = () => readFileSync(join(C.out, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const forms = L('library.ocrRead');  // plural forms: the text for one page
+  const onePage = (forms.one ?? forms.other).replace('{count}', '1');
+
+  await openSidebar();
+  await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+  await page.getByRole('menuitem', { name: C.project, exact: true }).click(); await page.waitForTimeout(1000);
+  if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+  const back = panel().getByRole('button', { name: L('paper.back'), exact: true });
+  if (await back.count()) { await back.click(); await page.waitForTimeout(500); }
+
+  let failedRun;
+  await step('50-ocr-needs-attention', async () => {
+    await page.getByTestId('library-files').setInputFiles(join(C.materials, 'scanned-letter.pdf'));
+    const paper = await until((m) => m.state !== 'reading' && m.lookup?.status !== 'running', 'finish reading');
+    await row().getByText(L('library.reason.ocr_failed'), { exact: true }).waitFor();
+    check('the paper needs attention: text recognition failed', paper.state === 'needs_attention' && paper.reason === 'ocr_failed'
+      && await row().getByText(L('library.state.needs_attention'), { exact: true }).count() === 1);
+    check('nothing of the failed reading was saved', paper.extraction === null);
+    [failedRun] = (await get(`/api/activity?run_id=${paper.reading.run_id}`)).body.runs;
+    check('its reading failed, and Retry applies', failedRun?.status === 'failed' && failedRun.result?.reason === 'ocr_failed'
+      && failedRun.retryable === true);
+    check('no identifier was sent before the page was read', !requests().some((r) => r.path.includes('walkthrough.scan')));
+  });
+
+  await step('51-ocr-retry', async () => {
+    await openSettings('settings.page.advanced');
+    await dialog().getByRole('heading', { name: L('settings.backgroundRuns') }).scrollIntoViewIfNeeded(); await page.waitForTimeout(1500);
+    const run = dialog().getByRole('listitem').filter({ hasText: 'scanned-letter' }).filter({ hasText: L('settings.workflowExtract') })
+      .filter({ hasText: L('errors.ocr_failed') });
+    await run.first().scrollIntoViewIfNeeded();
+    check('the failed reading is listed with its reason', await run.count() === 1);
+    await run.getByRole('button', { name: L('runs.retry'), exact: true }).click();
+    await page.waitForTimeout(1500);
+    const listed = (await get('/api/activity')).body.runs;
+    check('Retry started a new reading', listed.some((r) => r.workflow === 'extract' && r.run_id !== failedRun.run_id
+      && r.materials?.titles?.some((t) => t === 'scanned-letter' || t === title)));
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+
+  await step('52-ocr-ready', async () => {
+    const paper = await until((m) => m.state === 'ready' && m.lookup?.status !== 'running', 'become Ready');
+    await row().getByText(L('library.state.ready'), { exact: true }).waitFor();
+    await row().locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    check('Details says its page was read by text recognition', await row().getByText(onePage, { exact: true }).count() === 1);
+    check('its reading is saved: complete, one page by OCR, through Vision', paper.extraction?.status === 'complete'
+      && paper.extraction.ocr_pages === 1 && paper.extraction.pages === 1 && /\+vision-\d+$/.test(paper.extraction.version));
+    const passages = (await get(`/api/material-versions/${paper.version.id}/passages`)).body.passages;
+    check('its passages hold the English and the Chinese lines',
+      passages.some((p) => p.text.includes('Minimum wages in the synthetic panel rose by ten percent.'))
+      && passages.some((p) => p.text.includes('合成扫描信件')));
+    check('each passage is anchored to its lines and marked as recognized',
+      passages.every((p) => p.boxes?.rects?.length >= 1 && typeof p.boxes.ocr?.confidence === 'number'));
+  });
+
+  await step('53-ocr-page-viewer', async () => {
+    await row().getByRole('button', { name: title, exact: true }).click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded();
+    const image = panel().locator('figure img').first();
+    await image.waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('aside figure img')].some((i) => i.naturalWidth > 0));
+    check('the scanned page is shown', await image.evaluate((i) => i.naturalWidth) > 0);
+    check('its recognized lines are drawn over it', await panel().locator('figure span[title]').count() >= 4);
+    let focused = null;
+    for (let i = 0; i < 60 && !focused; i += 1) {
+      await page.keyboard.press('Tab');
+      focused = await page.evaluate(() => document.activeElement?.closest('figure') && document.activeElement.dataset.passage);
+    }
+    check('Tab reaches a recognized passage on the page', Boolean(focused));
+    await page.waitForTimeout(300);
+    check('and its lines are highlighted', await panel().locator('figure span[title][class*="bg-brand/25"]').count() > 0);
+  });
+
+  await step('54-ocr-lookup', async () => {
+    const back2 = panel().getByRole('button', { name: L('paper.back'), exact: true });
+    if (await back2.count()) { await back2.click(); await page.waitForTimeout(500); }
+    const paper = await scanned();
+    await row().locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    const sent = requests().filter((r) => r.path.includes('walkthrough.scan'));
+    check('the DOI read from the scan was sent alone to OpenAlex', sent.length >= 1
+      && sent.every((r) => r.host === 'api.openalex.org' && r.path === '/works/doi:10.5555/scholia.walkthrough.scan'));
+    check('its details were looked up and saved', paper.title === title && paper.checked_by === 'lookup'
+      && paper.lookup?.identifier === 'doi:10.5555/scholia.walkthrough.scan');
+    check('Details names the identifier and where the details came from',
+      await row().getByText('10.5555/scholia.walkthrough.scan', { exact: true }).count() === 1
+      && await row().getByText(/OpenAlex/).count() >= 1);
+  });
 }
 
 // The parts of the window loaded when first opened (frontend/src/parts.js), on a window just loaded:
@@ -1242,6 +1354,7 @@ async function run(combo, build, outRoot) {
     await m1(ctx);
     if (server) await s116(ctx);  // its synthetic model and download source are the test server's
     if (C.materials) await materials(ctx);  // an attached app has no synthetic materials of its own
+    if (C.materials) await s120(ctx);  // S1-20: OCR of a scanned page
     await parts(ctx);
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
