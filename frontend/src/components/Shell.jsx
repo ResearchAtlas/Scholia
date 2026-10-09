@@ -152,7 +152,8 @@ export function Shell({ health, settings, onLanguage }) {
   }, [panel, projectId, fail]);
 
   // Files dropped on the window go to the open project; its Library opens to show them and any
-  // question their lookup asks (a drop in the Library itself is the Library's).
+  // question their lookup asks (a drop in the Library itself is the Library's, and goes no further:
+  // the window's overlay is cleared on the way down, at every drop).
   const hasFiles = (event) => Boolean(event.dataTransfer?.types?.includes('Files')) && !settingsOpen && Boolean(projectId);
   async function dropFiles(files) {
     if (panel !== 'library') togglePanel('library');
@@ -194,7 +195,8 @@ export function Shell({ health, settings, onLanguage }) {
     <div className="relative flex h-full"
       onDragOver={(event) => { if (hasFiles(event)) { event.preventDefault(); setDropping(true); } }}
       onDragLeave={(event) => { if (!event.relatedTarget) setDropping(false); }}
-      onDrop={(event) => { if (!hasFiles(event)) return; event.preventDefault(); setDropping(false); dropFiles(event.dataTransfer.files); }}>
+      onDropCapture={() => setDropping(false)}
+      onDrop={(event) => { if (!hasFiles(event)) return; event.preventDefault(); dropFiles(event.dataTransfer.files); }}>
       {dropping && (
         <div aria-hidden="true" className="pointer-events-none fixed inset-3 z-50 grid place-items-center rounded-2xl border-2 border-dashed border-brand bg-brand-soft/70 animate-in fade-in-0">
           <p className="rounded-lg bg-background/90 px-4 py-2 text-sm font-medium shadow-sm">{t('library.dropOnWindow', { name: projectName(t, project) })}</p>
