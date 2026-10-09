@@ -709,6 +709,23 @@ def test_a_pdf_page_of_no_width_or_height_is_unreadable_not_an_error(monkeypatch
         extract(synthetic.paper_pdf(), extraction.PDF)
 
 
+@pytest.mark.parametrize("media", ["markdown", "html", "docx", "latex"])
+def test_a_long_heading_over_many_paragraphs_is_cut_and_its_copies_counted(monkeypatch, media):
+    heading = " ".join(["Heading"] * 512)  # 4,095 characters, carried by each of 5,000 passages under it
+    data = {"markdown": (f"## {heading}\n\n" + "p\n\n" * 5000).encode(),
+            "html": (f"<h2>{heading}</h2>" + "<p>p</p>" * 5000).encode(),
+            "docx": synthetic.docx([("Heading2", heading)] + [(None, "p")] * 5000),
+            "latex": (f"\\documentclass{{article}}\\begin{{document}}\\section{{{heading}}}\n\n"
+                      + "p\n\n" * 5000 + "\\end{document}").encode()}[media]
+    kind = {"markdown": extraction.MARKDOWN, "html": extraction.HTML, "docx": extraction.DOCX, "latex": extraction.LATEX}
+    passages = extract(data, kind[media]).passages
+    assert len(passages) == 5000 and {len(p.section_path[0]) for p in passages} == {extraction.MAX_HEADING_CHARS}
+    assert heading.startswith(passages[0].section_path[0])  # cut at the bound
+    monkeypatch.setattr(extraction, "MAX_BUILT_CHARS", 2**20)  # 5,000 copies of a 500-character path: 2.5 Mi
+    with pytest.raises(extraction.Unreadable):
+        extract(data, kind[media])
+
+
 def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
     import pypdfium2
 

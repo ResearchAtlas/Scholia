@@ -50,6 +50,10 @@ MAX_TEXT_CHARS = 16 * 1024 * 1024  # the text a reading keeps: its passages and 
 MAX_BUILT_CHARS = 4 * MAX_TEXT_CHARS  # the text it builds on the way (_Text, joined rows), each copy counted
 MAX_BLOCK_CHARS = 1024 * 1024  # one block's text, or its source, before regular expressions run over it
 MAX_BLOCKS = 200_000  # its blocks: paragraphs, headings, tables and captions, and tables' rows and cells
+# A heading as a section's name, which every passage under it carries in its path: one longer is
+# almost always a paragraph read as a heading, and is cut to this length rather than refused, so the
+# file still reads; each passage's path is also counted against MAX_BUILT_CHARS as it is made.
+MAX_HEADING_CHARS = 500
 MAX_PAGE_CHARS = 100_000  # a PDF page's characters, as PDFium counts them before any is read
 # A LaTeX file's marks: what may start one of pylatexenc's nodes (a macro, a group, a comment, math,
 # or a special: & ~ -- `` '' !` ?`), counted before parsing. It holds a node for each and one for
@@ -413,6 +417,7 @@ def _pieces(text, kind, page, path, start, end, char_boxes=None, page_size=None,
     bounds = [0, *_split(text), len(text)]
     spans = [(a, b, text[a:b].strip()) for a, b in zip(bounds, bounds[1:])]
     spans = [span for span in spans if span[2]]
+    _build(len(spans) * sum(map(len, path)))  # each piece's section path, as it will be written out
     located = (_located([piece for _, _, piece in spans], source, base, start, end)
                if char_boxes is None and start is not None and end is not None else None)
     passages = []
@@ -482,7 +487,7 @@ class _Sections:
         return [text for _, text in self.levels]
 
     def heading(self, level, text):
-        text = _normal(text)
+        text = _normal(text)[:MAX_HEADING_CHARS].rstrip()  # every passage under it carries it
         if not text:
             return
         _keep(text)

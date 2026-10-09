@@ -220,6 +220,31 @@ async def test_at_most_two_readings_hold_their_files_and_a_third_waits_unread(tm
         assert len(reads) == 3  # the cancelled one never read its file
 
 
+async def test_a_readings_passages_are_written_one_row_at_a_time(tmp_path):
+    import tracemalloc
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, ("notes.md", synthetic.paper_markdown(arxiv="")))
+        [ready] = await settled(client, project)
+        [(sha256,)] = await rows(client, "SELECT file_sha256 FROM material_versions WHERE id = ?", ready["version"]["id"])
+        path = ["h" * extraction.MAX_HEADING_CHARS] * 6  # each passage's path written out: 3,000 characters
+        passages = [extraction.Passage("paragraph", f"Passage {n}.", None, path) for n in range(20_000)]
+        written = extraction.Extracted("markdown", "test-1", passages)
+
+        def write(conn):
+            tracemalloc.start()
+            try:
+                materials_module._store(conn, ready["version"]["id"], sha256, written, lambda *args: None)
+                return tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+
+        peak = await asyncio.to_thread(client.state["db"].write, write)
+        assert peak < 16 * 2**20, f"{peak / 2**20:.1f} MiB"  # every row made at once: about 70 MiB
+        assert await rows(client, "SELECT count(*) FROM passages p JOIN extractions e ON e.id = p.extraction_id"
+                                  " WHERE e.extractor_version = 'test-1'") == [(20_000,)]
+
+
 async def test_a_reading_past_its_limit_stops_and_says_so(tmp_path, monkeypatch):
     hold_extraction(monkeypatch)  # never let go: only the limit ends it
     monkeypatch.setattr(materials_module, "EXTRACTION_SECONDS", 0.2)

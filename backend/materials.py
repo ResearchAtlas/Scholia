@@ -382,8 +382,9 @@ def _store(conn, version_id, sha256, extracted, look_up):
         conn.executemany(
             "INSERT INTO passages (id, extraction_id, ordinal, page, section_path, kind, text, char_start, char_end, boxes)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [(new_id(), extraction_id, ordinal, p.page, json.dumps(p.section_path), p.kind, p.text, p.char_start,
-              p.char_end, json.dumps(p.boxes) if p.boxes else None) for ordinal, p in enumerate(extracted.passages)])
+            ((new_id(), extraction_id, ordinal, p.page, json.dumps(p.section_path), p.kind, p.text, p.char_start,
+              p.char_end, json.dumps(p.boxes) if p.boxes else None)  # each row made as it is written
+             for ordinal, p in enumerate(extracted.passages)))
     _serve(conn, sha256, (extracted.extractor, extracted.version), extraction_id, look_up)
 
 
