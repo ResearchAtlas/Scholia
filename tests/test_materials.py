@@ -105,6 +105,8 @@ async def test_a_cancelled_reading_writes_nothing_and_can_be_tried_again(tmp_pat
         again = await client.post(f"/api/runs/{paper['run_id']}/retry")
         assert again.status_code == 201
         assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        twice = await client.post(f"/api/runs/{paper['run_id']}/retry")  # a second press: the first's run, no error
+        assert (twice.status_code, twice.json()) == (201, again.json())
         [ready] = await settled(client, project)
         assert ready["state"] == "ready" and ready["extraction"]["passages"] > 0
         assert (await client.post(f"/api/runs/{again.json()['run_id']}/retry")).json()["code"] == "not_retryable"

@@ -1044,6 +1044,8 @@ def _retry(conn, run_id, registry):
         return None, (404, "not_found", "No such run")
     project_id, workflow, status, inputs = row
     inputs = json.loads(inputs or "{}")
+    if inputs.get("retried_by"):  # tried again already: that run is the one to follow, or to try again
+        return None, (409, "not_retryable", "This run was tried again already")
     status = derived_status(status, run_id, registry)
     if workflow not in _WORKFLOWS or (status not in ("failed", "cancelled", "interrupted")
                                       and (workflow, status) != ("extract", "succeeded")):  # read by an earlier version
@@ -1089,16 +1091,22 @@ async def retry_run(run_id: str, request: Request):
     """Read a version again, or look a batch up again, after a run that failed, was stopped or was
     interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again.
     A version read again whose lookup concluded unread gets a lookup once the reading commits
-    (_serve)."""
+    (_serve). Once per run: the old run records its retry in the same transaction, and a later
+    retry of it (a second press) gets that same run."""
     state = _state(request)
 
     def again(conn, ids):
+        row = conn.execute("SELECT json_extract(inputs, '$.retried_by') FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is not None and row[0] is not None:
+            return row[0], []
         retry, refusal = _retry(conn, run_id, state["harness"].registry)
         if refusal is not None:
             raise _refused(*refusal)
         project_id, workflow, inputs = retry
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
                      (ids[0], project_id, workflow, json.dumps(inputs)))
+        conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
+                     (ids[0], run_id))
         return ids[0], ids
 
     return {"run_id": await state["harness"].record_background(1, again)}

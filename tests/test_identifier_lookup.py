@@ -539,6 +539,25 @@ async def test_a_failed_lookup_leaves_the_material_imported_with_incomplete_meta
         assert paper["title"] == TITLE and paper["checked_by"] == "lookup"
 
 
+async def test_a_failed_lookup_tried_again_twice_at_once_is_tried_again_once(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    mock.answers = {"api.openalex.org": [503] * 3, "api.crossref.org": [503] * 3}
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await settled(client, project)
+        first = result["lookup_run_id"]
+        assert (await run_finished(client, first))["status"] == "failed"
+        sent = len(mock.hosts)
+        both = await asyncio.gather(*[client.post(f"/api/runs/{first}/retry") for _ in range(2)])  # a double click
+        assert [r.status_code for r in both] == [201, 201] and both[0].json() == both[1].json()  # the same new run
+        again = both[0].json()["run_id"]
+        assert (await run_finished(client, again))["status"] == "succeeded"
+        assert await lookups(client) == [first, again] and len(mock.hosts) == sent + 1  # asked once more, not twice
+        assert (await client.post(f"/api/runs/{first}/retry")).json()["run_id"] == again  # later too: that run
+        assert (await run_finished(client, first))["retryable"] is False  # the list no longer offers it
+
+
 async def test_openalex_unavailable_and_crossref_without_the_record_is_unavailable_not_not_found(tmp_path):
     mock = MockScholarly()  # Crossref holds no record for it
     mock.answers = {"api.openalex.org": [503, 503, 503]}  # OpenAlex never answers
