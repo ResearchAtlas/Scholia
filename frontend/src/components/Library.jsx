@@ -13,7 +13,7 @@ import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEven
   stateKey, typeKey, unsettled, uploadsWaiting, watchUploads, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
-import { Paper } from './Paper.jsx';
+import { Paper } from './Parts.jsx';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
