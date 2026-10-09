@@ -1072,14 +1072,18 @@ def test_each_markdown_scan_calls_stop_as_it_reads_lines(shape):
         assert kept == [0, 0, 0]
 
 
-def test_a_markdown_front_matter_never_closed_is_refused_at_the_structural_bound(monkeypatch):
-    with pytest.raises(extraction.Unreadable):  # read whole twice before: once looking for its end, once as text
-        extract(b"---\n" + b"\n" * (extraction.MAX_BLOCKS + 1), extraction.MARKDOWN)
+def test_a_markdown_front_matter_is_looked_for_within_the_structural_bound_then_read_as_text(monkeypatch):
+    """Its closing line is looked for in at most MAX_BLOCKS lines: one not closed within them is no front matter,
+    and the file is read as text, as f962e62 read it, but without reading all its lines twice."""
+    newlines = b"---\n" + b"\n" * (extraction.MAX_BLOCKS + 1)
+    assert kinds(extract(newlines, extraction.MARKDOWN).passages) == [("paragraph", "---")]
+    never = b"---\n" + b"a\n\n" * 120_000  # a rule, then more lines than blocks with no other rule: read as before
+    assert len(extract(never, extraction.MARKDOWN).passages) == 120_000
     monkeypatch.setattr(extraction, "MAX_BLOCKS", 1000)
     closed = b"---\n" + b"key: value\n" * 1000 + b"---\n# Title\n\nText.\n"
     assert kinds(extract(closed, extraction.MARKDOWN).passages) == [("title", "Title"), ("paragraph", "Text.")]
-    with pytest.raises(extraction.Unreadable):
-        extract(b"---\n" + b"key: value\n" * 1001 + b"---\n# Title\n", extraction.MARKDOWN)
+    past = extract(b"---\n" + b"key: value\n" * 1001 + b"---\n# Title\n", extraction.MARKDOWN).passages
+    assert {p.kind for p in past} == {"paragraph"} and past[0].text.startswith("--- key: value key: value")  # as text
 
 
 # A Markdown line of each shape, n characters long, which its patterns once read in time growing with the

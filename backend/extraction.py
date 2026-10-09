@@ -1741,15 +1741,13 @@ def _markdown(source, stop):
 
     at = 0
     line, after = line_at(0)
-    if line is not None and line.strip() == "---":  # front matter, to its closing line
+    if line is not None and line.strip() == "---":  # front matter, to its closing line within MAX_BLOCKS lines
         lines, (scan, past) = 0, line_at(after)
-        while scan is not None:
+        while scan is not None and lines <= MAX_BLOCKS:  # past them it is none: all read as text, those lines twice
             if scan.strip() in ("---", "..."):
                 at = past
                 break
             lines += 1
-            if lines > MAX_BLOCKS:  # at most as many lines as a reading's blocks, not all read to be read again
-                raise Unreadable()
             scan, past = line_at(past)
     line, after = line_at(at)
     while line is not None:
