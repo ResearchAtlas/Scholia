@@ -79,15 +79,19 @@ def _current_policy(conn, project_id):
     return None if row is None else {"level": row[0], "locked": bool(row[1])}
 
 
-def answer(conn, run_id, ask_id, option=None, text=None):
-    """The researcher's answer, in the caller's transaction, or AskRefused having changed nothing."""
+def answer(conn, run_id, ask_id, option=None, text=None, registry=None):
+    """The researcher's answer, in the caller's transaction, or AskRefused having changed nothing. A
+    run with a cancel requested (registry's, read in this transaction) is ending: its ask is closed,
+    though its terminal record is not written yet."""
     if (option is None) == (text is None):
         raise AskRefused(400, "invalid_answer", "Answer with one option or with text")
     run = conn.execute("SELECT status, cancel_reason, waiting FROM runs WHERE id = ?", (run_id,)).fetchone()
     ask, answered = asked(conn, run_id) if run else (None, None)
     if ask is None or ask["ask_id"] != ask_id:
         raise AskRefused(404, "not_found", "No such question")
-    if answered is not None or run[0] != "running" or run[1] is not None or run[2] != "ask":
+    active = registry.runs.get(run_id) if registry is not None else None
+    if answered is not None or run[0] != "running" or run[1] is not None or run[2] != "ask" \
+            or (active is not None and active.cancel_requested.is_set()):
         raise AskRefused(409, "ask_closed", "This question can no longer be answered")
     if _current_policy(conn, ask["project_id"]) != ask["policy"]:
         raise AskRefused(409, "ask_invalid", "The project's protection changed since this was asked")
@@ -155,8 +159,10 @@ async def list_asks(request: Request, project_id: str | None = None, conversatio
 @router.post("/api/runs/{run_id}/asks/{ask_id}")
 async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
     """The one way an ask is answered: by the researcher, here."""
-    db = request.app.state.scholia["db"]
+    state = request.app.state.scholia
+    registry = state["harness"].registry
     try:
-        return await asyncio.to_thread(db.write, lambda conn: answer(conn, run_id, ask_id, body.option, body.text))
+        return await asyncio.to_thread(state["db"].write,
+                                       lambda conn: answer(conn, run_id, ask_id, body.option, body.text, registry))
     except AskRefused as refused:
         return JSONResponse({"code": refused.code, "message": refused.message}, status_code=refused.status)

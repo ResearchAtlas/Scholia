@@ -1009,6 +1009,22 @@ async def test_a_request_for_a_batch_whose_cancel_is_requested_gets_a_lookup_of_
         assert papers["drop-0"]["lookup"]["status"] == "cancelled"
 
 
+async def test_an_answer_that_comes_while_its_lookup_is_being_cancelled_is_refused(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        active = client.state["harness"].registry.runs[result["lookup_run_id"]]
+        active.cancel_requested.set()  # Cancel requested; its terminal record not yet written
+        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "lookup"})
+        assert (late.status_code, late.json()["code"]) == (409, "ask_closed")
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'ask_answered'",
+                          ask["run_id"]) == [(0,)]
+        active.cancel_requested.clear()
+        assert (await client.post(f"/api/runs/{result['lookup_run_id']}/cancel")).json()["status"] == "cancelled"
+        assert client.provider.scholarly.requests == []
+
+
 async def test_a_local_only_lookup_cancelled_while_it_asks_closes_its_ask(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client, level="local_only")
