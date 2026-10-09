@@ -688,7 +688,7 @@ test('Details counts a reading\'s scanned pages: read by text recognition, or wa
     assert.equal(ocrPages(t, { status: 'ocr_needed', ocr_pages: 2 }), t('library.ocrWaiting', { count: 2 }));
   }
   const t = makeT('en');
-  assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 1 }), '1 page read by text recognition');
-  assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 3 }), '3 pages read by text recognition');
+  assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 1 }), '1 page read');  // beside its term, Text recognition
+  assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 3 }), '3 pages read');
   assert.equal(t(reasonKey('ocr_failed')), 'Text recognition failed. Try again from Settings, Advanced.');
 });

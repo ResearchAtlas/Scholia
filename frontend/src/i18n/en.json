@@ -311,8 +311,8 @@
     "other": "{count} pages waiting"
   },
   "library.ocrRead": {
-    "one": "{count} page read by text recognition",
-    "other": "{count} pages read by text recognition"
+    "one": "{count} page read",
+    "other": "{count} pages read"
   },
   "library.reason.ocr_failed": "Text recognition failed. Try again from Settings, Advanced.",
   "errors.ocr_failed": "Text recognition failed on a scanned page. Try again.",

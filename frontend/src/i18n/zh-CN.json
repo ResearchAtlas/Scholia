@@ -305,7 +305,7 @@
     "other": "{count} 页等待识别"
   },
   "library.ocrRead": {
-    "other": "{count} 页经文字识别读取"
+    "other": "{count} 页已识别"
   },
   "library.reason.ocr_failed": "文字识别失败。可在“设置”中的“高级”里重试。",
   "errors.ocr_failed": "扫描页面的文字识别失败。请重试。",
