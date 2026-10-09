@@ -143,6 +143,11 @@ class Registry:
         # released it reads interrupted, as its record still says running (Harness._ended).
         # ponytail: one id per background run finished in this launch; a bounded log if that grows large
         self.finished: set[str] = set()
+        # Background runs a retry has taken over (materials.retry_run): never held from then on. The
+        # lock makes holding a run (add_background) and retiring it (retire, from a write
+        # transaction's thread) one decision: whichever comes first, the other is refused.
+        self.retired: set[str] = set()
+        self.lock = threading.Lock()
 
     def claim_turn(self, conversation_id: str) -> ActiveRun:
         if self.closed:
@@ -163,11 +168,21 @@ class Registry:
         return claim
 
     def add_background(self, run_id: str) -> ActiveRun | None:
-        if self.closed or run_id in self.runs:
-            return None
-        active = ActiveRun(run_id, "background", None)
-        self.runs[run_id] = active
-        return active
+        with self.lock:
+            if self.closed or run_id in self.runs or run_id in self.retired:
+                return None
+            active = ActiveRun(run_id, "background", None)
+            self.runs[run_id] = active
+            return active
+
+    def retire(self, run_id: str) -> bool:
+        """Keep a run this process does not hold from ever being held here: False, retiring nothing,
+        when it is held."""
+        with self.lock:
+            if run_id in self.runs:
+                return False
+            self.retired.add(run_id)
+            return True
 
     def release(self, active: ActiveRun) -> None:
         if self.runs.get(active.run_id) is active:
@@ -879,8 +894,8 @@ class Harness:
                 "SELECT r.project_id, r.workflow, r.attempts, r.inputs, r.status, t.user_message, r.cancel_reason"
                 " FROM runs r LEFT JOIN turns t ON t.run_id = r.source_turn_id WHERE r.id = ?",
                 (active.run_id,)).fetchone())
-            if row is None or row[4] != "running":
-                return  # rule 1: finished (or deleted); never run again
+            if row is None or row[4] != "running" or json.loads(row[3] or "{}").get("retried_by"):
+                return  # rule 1: finished (or deleted), or tried again (its retry does its work); never run again
             project_id, workflow, attempts, inputs, _, source, cancel_reason = row
             inputs = json.loads(inputs or "{}")
             if cancel_reason == "revoked":  # revoked while it waited, or before a crash: no call, no effect

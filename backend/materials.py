@@ -1099,23 +1099,29 @@ async def retry_run(run_id: str, request: Request):
     A version read again whose lookup concluded unread gets a lookup once the reading commits
     (_serve). Once per run: the old run records its retry in the same transaction, and a later
     retry of it (a second press) gets that same run. An old run left running in the record, held by
-    no process (it reads interrupted), is recorded interrupted then, so no launch starts it again."""
+    no process (it reads interrupted), is retired (Registry.retire), so no kick holds it from then on,
+    and recorded interrupted, so no launch starts it again; one a kick has held again meanwhile is
+    running, and is not tried again."""
     state = _state(request)
 
     def again(conn, ids):
         row = conn.execute("SELECT json_extract(inputs, '$.retried_by') FROM runs WHERE id = ?", (run_id,)).fetchone()
         if row is not None and row[0] is not None:
             return row[0], []
-        retry, refusal = _retry(conn, run_id, state["harness"].registry)
+        registry = state["harness"].registry
+        retry, refusal = _retry(conn, run_id, registry)
         if refusal is not None:
             raise _refused(*refusal)
+        left_running = _running(conn, run_id)  # it reads interrupted: running in the record, held by no process
+        if left_running and not registry.retire(run_id):  # held again meanwhile (a kick started it): running
+            raise _refused(409, "not_retryable", "This run is running")
         project_id, workflow, inputs = retry
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
                      (ids[0], project_id, workflow, json.dumps(inputs)))
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
                      (ids[0], run_id))
-        if _running(conn, run_id) and not state["harness"].registry.is_active(run_id):  # read as interrupted:
-            _event(conn, run_id, "run_finished", {"status": "interrupted"})  # so it is in the record, never restarted
+        if left_running:  # retired: no kick holds it here from now on, and the record says it ended
+            _event(conn, run_id, "run_finished", {"status": "interrupted"})
             conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
                          (utc_now(), run_id))
         return ids[0], ids

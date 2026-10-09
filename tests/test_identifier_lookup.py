@@ -607,6 +607,48 @@ async def test_a_run_tried_again_while_left_running_in_the_record_ends_there_and
         assert (await run_finished(client, first))["status"] == "interrupted"
 
 
+@pytest.mark.parametrize("kick", ["holds it after the retry commits", "holds it during the retry"])
+async def test_a_kick_and_a_retry_of_a_run_left_running_never_both_run_it(tmp_path, monkeypatch, kick):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await settled(client, project)
+        first, harness, loop = result["lookup_run_id"], client.state["harness"], asyncio.get_running_loop()
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # as a lost worker leaves it
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (first,)))
+        harness.registry.finished.discard(first)
+        asked = len(mock.requests)
+        if kick == "holds it after the retry commits":  # the kick selects it, the retry commits, the kick goes on
+            real_read, retried = harness._read, []
+
+            async def read(fn):
+                found = await real_read(fn)
+                if "kick_background" in fn.__qualname__ and not retried:
+                    retried.append((await client.post(f"/api/runs/{first}/retry")).json()["run_id"])
+                return found
+
+            monkeypatch.setattr(harness, "_read", read)
+            await harness.kick_background()
+            assert (await run_finished(client, retried[0]))["status"] == "succeeded"
+            assert not harness.registry.is_active(first) and await lookups(client) == [first, retried[0]]
+        else:  # the kick holds it and starts it while the retry's transaction is open
+            real_retry = materials_module._retry
+
+            def retry(conn, run_id, registry):
+                found = real_retry(conn, run_id, registry)
+                active = registry.add_background(run_id)
+                loop.call_soon_threadsafe(lambda: setattr(active, "task", loop.create_task(harness._background(active))))
+                return found
+
+            monkeypatch.setattr(materials_module, "_retry", retry)
+            refused = await client.post(f"/api/runs/{first}/retry")
+            assert (refused.status_code, refused.json()["code"]) == (409, "not_retryable")  # it is running
+            assert (await run_finished(client, first))["status"] == "succeeded" and await lookups(client) == [first]
+        await background_idle(client)
+        assert len(mock.requests) == asked + 1  # one of them asked, never both
+
+
 async def test_openalex_unavailable_and_crossref_without_the_record_is_unavailable_not_not_found(tmp_path):
     mock = MockScholarly()  # Crossref holds no record for it
     mock.answers = {"api.openalex.org": [503, 503, 503]}  # OpenAlex never answers
