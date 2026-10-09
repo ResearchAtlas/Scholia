@@ -56,9 +56,9 @@ class Vision:
     def recognize(self, bitmap):
         lines = self._read(bitmap, detect=False)
         if not any(_HAN.search(line.text) for line in lines):  # no Chinese on the page: its English read whole
-            try:
-                lines = self._read(bitmap, detect=True)
-            except Failed:  # the first reading stands
+            try:  # the first reading stands unless the second finds lines
+                lines = self._read(bitmap, detect=True) or lines
+            except Failed:
                 pass
         return lines
 
