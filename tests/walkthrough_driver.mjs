@@ -1041,8 +1041,8 @@ async function parts(ctx) {
   // up to 5 s; a view that scrolled before its answers took their height never gets there).
   const atEnd = () => page.waitForFunction(() => {
     const box = document.getElementById('composer').closest('section').querySelector('.overflow-y-auto');
-    const end = box.firstElementChild.lastElementChild;  // the marker after the turns, scrolled into view
-    return box.scrollHeight > box.clientHeight && Math.abs(end.getBoundingClientRect().bottom - box.getBoundingClientRect().bottom) <= 2;
+    const end = box.firstElementChild.lastElementChild;  // the marker after the turns, before the bottom padding
+    return box.scrollHeight > box.clientHeight && end.getBoundingClientRect().bottom <= box.getBoundingClientRect().bottom + 2;
   }, null, { timeout: 5000 }).then(() => true, () => false);
   await step('64-answers-not-loaded', async () => {
     await page.route('**/assets/markdown-*.js', (route) => route.abort(), { times: 1 });
