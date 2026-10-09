@@ -325,6 +325,21 @@ test('a PDF\'s page list mounts its pages only through the window near the view,
   assert.deepEqual(pageItems(source('Paper.jsx')), ['pageWindow(offsets, span, held)']);
 });
 
+// What a PDF's page list does first when it measures, as source text.
+function measureStart(text) {
+  return parsed(text, (context, found) => ({
+    AssignmentExpression(node) {
+      if (context.sourceCode.getText(node.left) === 'measure.current' && node.right.body?.type === 'BlockStatement') {
+        found.first = node.right.body.body.slice(0, 2).map((statement) => context.sourceCode.getText(statement));
+      }
+    },
+  })).first;
+}
+
+test('a PDF\'s page list measures only while it is mounted, so a resize or scroll delivered after it went reads nothing', () => {
+  assert.deepEqual(measureStart(source('Paper.jsx')), ['const element = list.current;', 'if (!element) return;']);
+});
+
 // Where a PDF page's part of its passages starts, and what its read records once a part shows, as source text.
 function pagePartMemory(text) {
   return parsed(text, (context, found) => ({
