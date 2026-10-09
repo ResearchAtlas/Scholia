@@ -740,6 +740,67 @@ async function materials(ctx) {
       && (await focused()).startsWith('Item 597.'));
   });
 
+  // A request of the paper's text answered with a failure once it may: held until the returned function is called.
+  const failOnce = async (match) => {
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    await page.route(match, async (route) => {
+      await held;
+      await route.fulfill({ status: 500, contentType: 'application/json', body: '{"code":"http_error"}' });
+    }, { times: 1 });
+    return release;
+  };
+
+  await step('55-stretch-retry', async () => {
+    // A stretch of the text view whose first read fails says so in its place, with Retry; focus waiting on the
+    // stretch goes to Retry, which reads it again, focus going on to its first passage once it shows.
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    const firstStretch = (url) => url.pathname.endsWith('/passages') && !url.searchParams.has('page')
+      && url.searchParams.get('offset') === '0';
+    const release = await failOnce(firstStretch);
+    await paper('long-notes').click();
+    const list = panel().getByRole('list', { name: L('paper.passages'), exact: true });
+    const stretch = list.locator('[data-part="0"]');
+    await stretch.waitFor();
+    await stretch.focus();
+    release();
+    const retry = list.getByRole('button', { name: L('common.retry'), exact: true });
+    await retry.waitFor({ timeout: 5000 });
+    check('the stretch says its passages could not be loaded, with Retry',
+      await list.getByRole('alert').getByText(L('paper.loadFailed'), { exact: true }).count() === 1 && await retry.count() === 1);
+    check('focus waiting on the stretch goes to Retry', await retry.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('Retry reads it again: its passages show, focus on the first of them (the title)', await retry.count() === 0
+      && await list.locator('[data-passage]').first().evaluate((passage) => passage === document.activeElement
+        && passage.textContent.includes('Long Synthetic Notes')));
+    await page.unroute(firstStretch);
+  });
+
+  await step('56-page-retry', async () => {
+    // A PDF page whose own first read fails says so in its place, with Retry, which reads it again.
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    const firstPage = (url) => /\/pages\/1$/.test(url.pathname);
+    const release = await failOnce(firstPage);
+    await paper('crowded-page').click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded();
+    const figure = panel().locator('figure').first();
+    await figure.waitFor();
+    await figure.focus();
+    release();
+    const retry = figure.getByRole('button', { name: L('common.retry'), exact: true });
+    await retry.waitFor({ timeout: 5000 });
+    check('the page says it could not be shown, with Retry',
+      await figure.getByRole('alert').getByText(L('paper.pageFailed'), { exact: true }).count() === 1 && await retry.count() === 1);
+    check('focus waiting on the page goes to Retry', await retry.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('Retry reads it again: the page shows, focus on its first passage', await retry.count() === 0
+      && await figure.locator('img').count() === 1
+      && (await page.evaluate(() => document.activeElement.getAttribute('aria-label'))).startsWith('Item 0.'));
+    await page.unroute(firstPage);
+  });
+
   await step('29-details-saved', async () => {
     await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
     await paper(titles.latex).click();

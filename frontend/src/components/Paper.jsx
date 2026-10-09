@@ -232,7 +232,7 @@ function usePart(frame, part, showing, onNear, onWithin) {
       if (!event.currentTarget.contains(event.relatedTarget)) onWithin(part, false);
     },
   };
-  const focusOn = (where) => { entering.current = where; frame.current?.focus(); };
+  const focusOn = (where) => { frame.current?.focus(); entering.current = where; }; // after onFocus, which sets it too
   const passTo = (element) => { if (waitsOn(frame.current, document.activeElement, entering.current)) element?.focus(); };
   return [props, focusOn, passTo];
 }
@@ -258,7 +258,8 @@ function PageList({ version, pages, pointed, onPoint }) {
 // to that part's passages; while that part loads, what the page shows is out of Tab's and the
 // pointer's reach and Tab toward it (Shift+Tab toward the part before) waits on the page, and a
 // read that fails shows beside the button, with Retry, which (as the button does) reads it again
-// (partMove). The line boxes a part draws are bounded (pageLines).
+// (partMove); a page whose first read fails says so in its place, with Retry. The line boxes a part
+// draws are bounded (pageLines).
 function PageView({ version, number, pointed, onPoint, held, onNear, onWithin }) {
   const t = useT();
   const frame = useRef(null);
@@ -304,7 +305,10 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
         onLoad={(event) => setAspect(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />
         : <div className={cn('grid place-items-center text-xs', !aspect && 'aspect-[612/792]', failed ? 'text-destructive' : 'text-muted-foreground')}
           style={aspect ? { aspectRatio: aspect } : undefined}>
-          {failed ? t('paper.pageFailed') : t('common.loading')}
+          {move.failed ? <div className="grid justify-items-center gap-2">
+            <p role="alert">{t('paper.pageFailed')}</p>
+            <button ref={retry} type="button" className={button} onClick={() => go(part, 'first')}>{t('common.retry')}</button>
+          </div> : t('common.loading')}
         </div>}
       <div className="contents" inert={move.loading}>
         {shown?.part > 0 && control(shown.part - 1, 'last', t('paper.earlierPassages'), 'top-2')}
@@ -359,23 +363,30 @@ function PassageList({ version, count, pointed, onPoint }) {
 
 // One stretch of the passages: read when it is held and let go when it is not, its height kept
 // meanwhile (estimated until it was first shown). Each passage says where it is in the whole text
-// (aria-posinset of aria-setsize), as only the stretches held are in the page.
+// (aria-posinset of aria-setsize), as only the stretches held are in the page. A read that fails
+// says so with Retry, which reads it again, as a page's part does (partMove): focus waiting on the
+// stretch goes to Retry, and from Retry back to the stretch, on to its first passage once it shows.
 function PassageStretch({ version, index, count, pointed, onPoint, held, onNear, onWithin }) {
   const t = useT();
   const frame = useRef(null);
+  const retry = useRef(null);
   const [shown, setShown] = useState(null); // { passages, before }
-  const [failed, setFailed] = useState(false);
+  const [failed, setFailed] = useState(false); // read again once asked to, or let go and held again
   const [height, setHeight] = useState(null); // as it was last shown
-  const [part] = usePart(frame, index, shown && index, onNear, onWithin);
+  const [part, focusOn, passTo] = usePart(frame, index, shown && index, onNear, onWithin);
+  const move = partMove(shown && { part: index }, index, failed);
   const size = Math.min(PASSAGE_STRETCH, count - index * PASSAGE_STRETCH);
   useEffect(() => {
-    if (!held) { setShown(null); return undefined; }
-    if (shown) return undefined;
+    if (!held) { setShown(null); setFailed(false); return undefined; }
+    if (!move.read) return undefined;
     let live = true;
     const controller = new AbortController();
     passageStretch(version, index, controller.signal).then((found) => live && setShown(found)).catch(() => live && setFailed(true));
     return () => { live = false; controller.abort(); };
-  }, [held, shown, version, index]);
+  }, [held, shown, failed, version, index]);
+  useEffect(() => { // focus waiting on the stretch for its passages goes to Retry once its read failed
+    if (move.failed) passTo(retry.current);
+  }, [move.failed]);
   useLayoutEffect(() => { if (shown) setHeight(frame.current.offsetHeight); }, [shown]);
   const over = shown && headings(shown.passages, shown.before);
   return (
@@ -394,8 +405,11 @@ function PassageStretch({ version, index, count, pointed, onPoint, held, onNear,
             <p className={cn('break-words', KIND_STYLES[passage.kind])}>{passage.text}</p>
           </div>
         </div>
-      )) : <p className={cn('text-sm', failed ? 'text-destructive' : 'text-muted-foreground')}>
-        {failed ? t('paper.loadFailed') : t('common.loading')}</p>}
+      )) : move.failed ? <div className="flex flex-wrap items-center gap-2">
+        <p role="alert" className="text-sm text-destructive">{t('paper.loadFailed')}</p>
+        <Button ref={retry} type="button" variant="outline" size="sm" onClick={() => { focusOn('first'); setFailed(false); }}>
+          {t('common.retry')}</Button>
+      </div> : <p className="text-sm text-muted-foreground">{t('common.loading')}</p>}
     </div>
   );
 }

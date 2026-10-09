@@ -375,11 +375,12 @@ export async function pagePart(versionId, number, part, signal) {
 // null): read it unless it shows already or its read failed, until it is asked for again; loading
 // while it is read in place of another, what the page shows then out of Tab's and the pointer's
 // reach and Tab toward it waiting on the page, so focus stays there for passOn; failed once that
-// read failed, the page showing its part as before, with the failure and Retry beside the button
-// to the other.
+// read failed, with Retry: beside the button to the other part, the page showing its part as
+// before, or in the page's place when it showed nothing yet. A stretch of the text view is a part
+// of its own (shown { part: its index } or null).
 export function partMove(shown, part, failed) {
   const moving = shown != null && shown.part !== part;
-  return { read: shown?.part !== part && !failed, loading: moving && !failed, failed: moving && failed };
+  return { read: shown?.part !== part && !failed, loading: moving && !failed, failed: shown?.part !== part && failed };
 }
 
 // Each passage's line boxes to draw, in order, while they fit in budget; null for each from the

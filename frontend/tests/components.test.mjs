@@ -256,3 +256,55 @@ test('a PDF page keeps what it shows out of reach while another part loads, and 
   };
   assert.deepEqual([focused('page', 'first'), focused('page', null), focused('elsewhere', 'first')], [true, false, false]);
 });
+
+// Each Retry of a paper's text, as source text: the component it is in and its onClick; each effect that
+// reads a stretch of passages, with what it depends on; and each effect giving focus to Retry, by component.
+function retries(text) {
+  return parsed(text, (context, found) => {
+    const code = (node) => context.sourceCode.getText(node);
+    const component = (node) => {
+      for (let around = node.parent; around; around = around.parent) if (around.type === 'FunctionDeclaration') return around.id.name;
+      return null;
+    };
+    return {
+      JSXElement(element) {
+        if (!element.children.some((child) => child.type === 'JSXExpressionContainer' && code(child.expression) === "t('common.retry')")) return;
+        const click = element.openingElement.attributes.find((a) => a.name?.name === 'onClick');
+        (found.buttons ??= []).push([component(element), code(click.value.expression)]);
+      },
+      CallExpression(call) {
+        if (call.callee.name === 'useEffect' && code(call.arguments[0]).includes('passTo(retry.current)')) {
+          (found.toRetry ??= []).push([component(call), code(call.arguments[0])]);
+        }
+        if (call.callee.name !== 'passageStretch') return;
+        let effect = call.parent;
+        while (effect && effect.callee?.name !== 'useEffect') effect = effect.parent;
+        found.read = code(effect.arguments[0]);
+        found.reads = effect.arguments[1].elements.map((name) => name.name);
+      },
+    };
+  });
+}
+
+test('a stretch or a page whose first read failed offers Retry, which reads it again, focus going on as for a part', () => {
+  const found = retries(source('Paper.jsx'));
+  assert.deepEqual(found.buttons.map(([where]) => where), ['PageView', 'PageView', 'PassageStretch']);
+  assert.deepEqual(found.buttons[1][1], "() => go(part, 'first')"); // the page's own: as its part's button, on the part it asked for
+  const calls = [];
+  new Function('focusOn', 'setFailed', `return (${found.buttons[2][1]});`)(
+    (where) => calls.push(['focusOn', where]), (failed) => calls.push(['setFailed', failed]))();
+  assert.deepEqual(calls, [['focusOn', 'first'], ['setFailed', false]]); // focus waits on the stretch, then its first passage
+  assert.deepEqual(found.toRetry.map(([where]) => where), ['PageView', 'PassageStretch']);
+  // The stretch reads again once its failure is cleared (Retry), not before; let go, its failure is cleared.
+  assert.ok(found.reads.includes('failed'), found.reads);
+  const effect = (held, move) => {
+    const set = [];
+    new Function('held', 'move', 'setShown', 'setFailed', 'passageStretch', 'version', 'index', 'AbortController', `return (${found.read});`)(
+      held, move, (value) => set.push(['shown', value]), (value) => set.push(['failed', value]),
+      () => { set.push(['read']); return new Promise(() => {}); }, 'v', 0, AbortController)();
+    return set;
+  };
+  assert.deepEqual(effect(true, { read: false }), []);
+  assert.deepEqual(effect(true, { read: true }), [['read']]);
+  assert.deepEqual(effect(false, { read: false }), [['shown', null], ['failed', false]]);
+});
