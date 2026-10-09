@@ -306,15 +306,16 @@ async def run(args):
     return results
 
 
-def run_desktop(args):
+def run_desktop(args, workload=None):
     """The workload inside the desktop application: its backend, its window and the interface,
     started as backend/desktop.py starts them, on a new temporary data folder with an in-memory
-    credential store. The window closes when the workload ends, and the data folder is removed."""
+    credential store. The window closes when the workload ends, and the data folder is removed.
+    workload: a measure function of the same form as this module's (S1-17's search timings pass theirs)."""
     with tempfile.TemporaryDirectory(prefix="scholia-timings-desktop-") as folder:
-        return _run_desktop(args, Path(folder))
+        return _run_desktop(args, Path(folder), workload or measure)
 
 
-def _run_desktop(args, data):
+def _run_desktop(args, data, measured):
     import webview
 
     import backend.app
@@ -345,7 +346,7 @@ def _run_desktop(args, data):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=found["app"]), base_url=origin,
                                              headers={"X-Scholia-Client": "local", "X-Scholia-Session": session},
                                              timeout=600) as client:
-                    return await measure(args, found["app"].app.state.scholia, client, data, processes)
+                    return await measured(args, found["app"].app.state.scholia, client, data, processes)
 
             found["results"] = asyncio.run_coroutine_threadsafe(workload(), found["loop"]["loop"]).result()
         except BaseException as error:  # reported once the window has closed

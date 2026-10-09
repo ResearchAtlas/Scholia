@@ -3,8 +3,8 @@ rule), for S1-17.
 
     sandbox-exec -f tests/loopback-only.sb uv run --no-sync python -I tools/search_timings.py \\
         --helper <app>/Contents/MacOS/llama-server --model <Qwen3-Embedding-0.6B-Q8_0.gguf> \\
-        --qasper <folder holding qasper-{train,dev,test}-v0.3.json> --size 10k|100k \\
-        [--vectors helper|synthetic] [--sustained SECONDS] [--out FILE]
+        [--corpus qasper --qasper <folder holding qasper-{train,dev,test}-v0.3.json> | --corpus synthetic] \\
+        --size 10k|100k [--vectors helper|synthetic] [--sustained SECONDS] [--desktop] [--out FILE]
 
 The workload is named before anything runs (WORKLOAD, printed first and with the results): QASPER
 v0.3, AllenAI's public papers (CC BY 4.0), read as untrusted data from the folder given (downloaded
@@ -16,6 +16,10 @@ order of their ids until about 10,000 passages; 100k: every paper (about 85,000 
 has). Queries: QASPER's own questions on those papers (the first 200, in the same order), and 20
 Chinese development queries written for this run about the same kind of papers (cross-language:
 Chinese queries over English papers).
+
+With --corpus synthetic the papers are generated instead, from S1-16's synthetic vocabulary and
+seed (tools/helper_timings.py; SYNTHETIC): English and Chinese papers of four sections of six
+paragraphs, to about 10,000 or 100,000 passages, and S1-16's synthetic questions; no real or public data.
 
 The backend runs in this process on a new temporary data folder, with an in-memory credential store
 (never the Keychain); the model is imported through the API, verified like any import, and the app
@@ -33,8 +37,12 @@ Recorded: the index build (keyword part, embeddings, its file's size, the passag
 distribution, the audit rows indexing wrote and the main database's growth); warm search latency
 end to end through the search API (median and p95), with the keyword and dense parts timed apart; the
 first search after a cold helper (stopped, as after its idle stop or a launch); searches while a
-rebuild embeds (sustained); the share of searches past the hybrid deadline; whole-app peak memory,
-memory pressure and swap.
+rebuild embeds (sustained); the share of searches past the hybrid deadline; peak memory, memory
+pressure and swap. Without --desktop, memory covers this process (the backend) and its helper
+processes only. With --desktop the whole application runs as the desktop entry runs it (S1-16's
+helper_timings.run_desktop: the backend, its window and the interface in it, on a new temporary data
+folder), the same workload is driven inside its backend, and memory covers the whole app: its
+process, its helper processes and its window's WebKit processes.
 """
 
 import argparse
@@ -59,7 +67,9 @@ from backend.local_helper import EMBEDDING  # noqa: E402
 from backend.search import QUERY_INSTRUCTION  # noqa: E402
 from backend.search_index import DIMENSIONS, readings  # noqa: E402
 from backend.self_test import _Keys  # noqa: E402
-from helper_timings import Memory, helpers_of, not_loopback, sockets, summary, uncached_copy, vm_counters  # noqa: E402
+from helper_timings import (EN_SENTENCES, EN_WORDS, SECTIONS_EN, SECTIONS_ZH, TITLES_EN, TITLES_ZH,  # noqa: E402
+                            ZH_SENTENCES, ZH_WORDS, Memory, _length, _paragraph, helpers_of, not_loopback, questions,
+                            run_desktop, sockets, summary, uncached_copy, vm_counters)
 
 ORIGIN = "http://127.0.0.1:1"
 SEED = 20261009
@@ -89,6 +99,47 @@ ZH_QUERIES = [
     "本文提出的方法有哪些局限？", "如何检测社交媒体上的仇恨言论？", "对话系统的评价指标有哪些？",
     "跨语言迁移学习的效果如何？", "文本摘要模型如何避免重复？", "知识图谱如何用于问答？", "模型的训练时间和计算成本是多少？",
     "词向量是如何训练的？", "阅读理解任务中的错误分析发现了什么？", "多任务学习是否提高了性能？"]
+
+
+SYNTHETIC = {
+    "name": "S1-17 search timings on synthetic papers, seed 20261009",
+    "corpus": "generated papers, alternately English and Chinese, from S1-16's synthetic vocabulary and sentence "
+              "forms (tools/helper_timings.py): a title and four sections of six paragraphs each, every paragraph "
+              "up to 2,000 characters with S1-16's length mix; no real or public data",
+    "cut": WORKLOAD["cut"],
+    "sizes": {"10k": "papers until about 10,000 passages", "100k": "papers until about 100,000 passages"},
+    "queries": "100 English and 100 Chinese synthetic questions in S1-16's question forms",
+    "search": WORKLOAD["search"],
+    "machine": WORKLOAD["machine"],
+}
+
+
+def synthetic_papers(size, rng):
+    """[(file name, Markdown)]: generated papers until about 10,000 or 100,000 passages (SYNTHETIC)."""
+    files, count = [], 0
+    while count < (10_000 if size == "10k" else 100_000):
+        english = len(files) % 2 == 0
+        words, sentences, joiner = (EN_WORDS, EN_SENTENCES, " ") if english else (ZH_WORDS, ZH_SENTENCES, "")
+        parts = [f"# {rng.choice(TITLES_EN if english else TITLES_ZH)} {len(files) + 1}"]
+        for section in SECTIONS_EN if english else SECTIONS_ZH:
+            parts.append(f"## {section.replace(' > ', ': ')}")
+            parts += [_paragraph(rng, words, sentences, _length(rng), joiner) for _ in range(6)]
+            count += 6
+        files.append((f"synthetic-{len(files) + 1:05d}.md", "\n\n".join(parts).encode()))
+    return files
+
+
+def corpus(args):
+    """(workload, [(file name, Markdown)], [(language, query)]) for --corpus."""
+    if args.corpus == "synthetic":
+        rng = random.Random(SEED)
+        files = synthetic_papers(args.size, rng)[:args.papers or None]
+        return SYNTHETIC, files, [("en", q) for q in questions("en", 100, rng)] + [("zh", q) for q in questions("zh", 100, rng)]
+    picked = chosen(papers(args.qasper), args.size)
+    if args.papers:  # a quick check of the tool itself, not a measurement
+        picked = dict(list(picked.items())[:args.papers])
+    files = [(f"{pid}.md", markdown(paper)) for pid, paper in picked.items()]
+    return WORKLOAD, files, [("en", q) for q in english_queries(picked)] + [("zh", q) for q in ZH_QUERIES]
 
 
 def papers(folder):
@@ -177,11 +228,8 @@ async def measure(args, state, client, data, processes):
     async def read(fn):
         return await asyncio.to_thread(db.read, fn)
 
-    picked = chosen(papers(args.qasper), args.size)
-    if args.papers:  # a quick check of the tool itself, not a measurement
-        picked = dict(list(picked.items())[:args.papers])
-    queries = [("en", q) for q in english_queries(picked)] + [("zh", q) for q in ZH_QUERIES]
-    results = {"workload": WORKLOAD, "size": args.size, "vectors": args.vectors, "papers": len(picked),
+    workload, papers_added, queries = corpus(args)
+    results = {"workload": workload, "size": args.size, "vectors": args.vectors, "papers": len(papers_added),
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "load_average_start": os.getloadavg()}
     memory = Memory(processes)
     vm_before = vm_counters()
@@ -203,7 +251,7 @@ async def measure(args, state, client, data, processes):
     before = {**sizes(data), "audit_rows": await read(lambda c: c.execute("SELECT count(*) FROM audit_log").fetchone()[0])}
 
     # The build: every paper added, read, keyword-indexed, then embedded.
-    files = [(f"{pid}.md", base64.b64encode(markdown(paper)).decode()) for pid, paper in picked.items()]
+    files = [(name, base64.b64encode(text).decode()) for name, text in papers_added]
     began = time.perf_counter()
     for start in range(0, len(files), 20):
         response = await client.post(f"/api/projects/{project}/materials",
@@ -331,6 +379,7 @@ async def measure(args, state, client, data, processes):
     memory.stop.set()
     memory.thread.join()
     results["memory"] = memory.peak()
+    # The backend's and its helpers' figures only; with --desktop, run_desktop says it covers the whole app.
     results["memory"]["covers"] = "this backend process and its helper processes, from their launch"
     results["vm_before"], results["vm_after"] = vm_before, vm_counters()
     results["helper_sockets"] = sockets(helper._process.pid) if helper._process else None
@@ -344,15 +393,20 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--helper", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--qasper", required=True)
+    parser.add_argument("--corpus", choices=("qasper", "synthetic"), default="qasper")
+    parser.add_argument("--qasper", help="the folder holding QASPER's files (--corpus qasper)")
     parser.add_argument("--size", choices=("10k", "100k"), default="10k")
     parser.add_argument("--vectors", choices=("helper", "synthetic"), default="helper")
     parser.add_argument("--sustained", type=int, default=60)
     parser.add_argument("--papers", type=int, help="only this many papers: a quick check of the tool, not a measurement")
+    parser.add_argument("--desktop", action="store_true", help="run the workload inside the desktop app")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
-    print(json.dumps({"workload": WORKLOAD}, ensure_ascii=False, indent=2), flush=True)
-    results = asyncio.run(run(args))
+    if args.corpus == "qasper" and not args.qasper:
+        parser.error("--corpus qasper needs --qasper")
+    print(json.dumps({"workload": SYNTHETIC if args.corpus == "synthetic" else WORKLOAD}, ensure_ascii=False, indent=2),
+          flush=True)
+    results = run_desktop(args, measure) if args.desktop else asyncio.run(run(args))
     text = json.dumps(results, ensure_ascii=False, indent=2)
     print(text)
     if args.out:
