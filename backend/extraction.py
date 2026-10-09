@@ -4,8 +4,9 @@
 - PDF with pypdfium2: per page, text with PDFium's character range and the characters' boxes
   merged per line (fractions of the page as displayed and rendered, its rotation applied, from its
   top left). A page with fewer than 100 characters whose images cover more than 60% of it, or
-  whose characters mostly have no Unicode mapping, is scanned: it yields no passage and is
-  counted for OCR (S1-20).
+  whose characters mostly have no Unicode mapping, is scanned: its text layer gives no passage,
+  and it is rendered at 300 dpi and read by the platform's OCR engine (backend/ocr.py, S1-20), or
+  counted as waiting for OCR where there is none.
 - DOCX from its XML (zip and the standard library): paragraphs by style, tables.
 - HTML with the standard library's parser: text only; nothing it names is fetched.
 - Markdown with a small parser of its own.
@@ -38,6 +39,8 @@ import zlib
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from xml.etree import ElementTree
+
+from backend import ocr
 
 MAX_PASSAGE = 2000
 MAX_FILE_BYTES = 100 * 1024 * 1024  # ponytail: uploads travel as base64 JSON; a streamed upload if books matter
@@ -147,7 +150,8 @@ class Extracted:
     version: str
     passages: list
     pages: int | None = None
-    ocr_pages: int = 0  # scanned pages, waiting for OCR
+    ocr_pages: int = 0  # scanned pages: read by OCR, or waiting for it (status ocr_needed) where no engine read them
+    status: str = "complete"
 
 
 def media_type(name, data):
@@ -258,6 +262,8 @@ def extractor_of(kind):
     if kind == PDF:
         import pypdfium2
         version += f"+pypdfium2-{pypdfium2.version.PYPDFIUM_INFO}"
+        if (engine := ocr.engine()) is not None:  # its scanned pages are read by it (S1-20)
+            version += f"+{engine.version}"
     elif kind == LATEX:
         from pylatexenc.version import version_str
         version += f"+pylatexenc-{version_str}"
@@ -534,6 +540,7 @@ def _pdf(data, stop, progress):
     import pypdfium2 as pdfium
     import pypdfium2.raw as raw
 
+    engine, (name, version) = ocr.engine(), extractor_of(PDF)
     with PDFIUM:
         try:
             document = pdfium.PdfDocument(data)
@@ -559,11 +566,14 @@ def _pdf(data, stop, progress):
                 stop()
                 lines, size, is_scanned = _pdf_read(document, number, raw)
                 scanned += is_scanned
-                passages += _pdf_blocks(number + 1, lines, size, body, sections)
+                if is_scanned and engine is not None:
+                    passages += _recognized(document, number, size, engine, body, sections, stop)
+                else:
+                    passages += _pdf_blocks(number + 1, lines, size, body, sections)
                 progress(count + number + 1, 2 * count)
         finally:
             document.close()
-    return Extracted(*extractor_of(PDF), passages, count, scanned)
+    return Extracted(name, version, passages, count, scanned, "ocr_needed" if scanned and engine is None else "complete")
 
 
 def _pdf_read(document, number, raw, measure=False):
@@ -692,10 +702,12 @@ def _body_size(weights):
     return max(weights, key=weights.get) if weights else 0.0
 
 
-def _pdf_blocks(number, lines, size, body, sections):
+def _pdf_blocks(number, lines, size, body, sections, recognized=False):
     """A page's lines grouped into headings and paragraphs, as passages. A larger font than the
     body's marks a heading (the largest on the first page, the title); a vertical gap, a change of
-    size, a short line ending a sentence, or a caption's start ends a paragraph."""
+    size, a short line ending a sentence, or a caption's start ends a paragraph. Recognized lines
+    (OCR, _recognized) have no font size: none is a heading by its size or the title, and a line set
+    above the one before it (the next column) also ends a paragraph."""
     passages, block, heading, previous, after_table = [], [], [], None, 0
     right_edge = max((line["right"] for line in lines), default=0.0)
     largest = max((line["size"] for line in lines), default=0.0)
@@ -705,7 +717,7 @@ def _pdf_blocks(number, lines, size, body, sections):
         if heading:  # consecutive heading lines of one size are one heading
             text, boxes = _join(heading)
             if number == 1 and heading[0]["size"] == largest and largest >= body * 1.3 and not sections.path \
-                    and not any(p.kind == "title" for p in passages):
+                    and not recognized and not any(p.kind == "title" for p in passages):
                 passages.extend(_pieces(text, "title", number, [], None, None, boxes, size))
             else:
                 sections.heading(1 if heading[0]["size"] >= body * 1.4 else 2, text)
@@ -730,7 +742,7 @@ def _pdf_blocks(number, lines, size, body, sections):
                 previous, after_table = None, end
                 continue
         text = line["text"].strip()
-        larger = body and line["size"] >= body * 1.15 and len(text) < 200 and not text.endswith(".")
+        larger = not recognized and body and line["size"] >= body * 1.15 and len(text) < 200 and not text.endswith(".")
         if larger or (len(text) < 40 and (_REFERENCES.match(text) or _ABSTRACT.fullmatch(text))):
             if block or (heading and abs(heading[-1]["size"] - line["size"]) > 0.6):
                 flush()
@@ -745,7 +757,7 @@ def _pdf_blocks(number, lines, size, body, sections):
             short = previous["right"] < right_edge * 0.8 and previous["text"].rstrip().endswith(
                 (".", "?", "!", "。", "？", "！", ":"))
             if gap > height * 0.8 or abs(line["size"] - previous["size"]) > 0.6 or short or _CAPTION.match(text) \
-                    or (sections.mode == "reference" and _reference_start(text)):
+                    or (sections.mode == "reference" and _reference_start(text)) or (recognized and gap < -height):
                 flush()
         block.append(line)
         previous = line
@@ -906,6 +918,74 @@ def _han(char):
     """Whether a character is Han, or CJK punctuation or a full-width form (no space goes between them)."""
     return "\u4e00" <= char <= "\u9fff" or "\u3400" <= char <= "\u4dbf" or "\u3000" <= char <= "\u303f" \
         or "\uff00" <= char <= "\uffef"
+
+
+# Scanned pages (S1-20)
+
+OCR_DPI = 300  # section 13
+MAX_OCR_PIXELS = 24 * 1024 * 1024  # a page rendered for OCR, one byte a pixel: A3 at 300 dpi has 17.4 million
+
+
+def _recognized(document, number, size, engine, body, sections, stop):
+    """A scanned page's passages, from its text as the engine recognizes it on the page rendered for
+    OCR (_ocr_bitmap). PDFIUM, which the reading holds, is let go while the engine reads, so page
+    images keep rendering meanwhile. Its lines become passages as a text page's do (_pdf_blocks), each
+    line with one box, its characters' (line-level anchors); each passage's boxes also record that it
+    was recognized and the lowest confidence among its lines. No line is left out for its confidence.
+    Offsets are into the page's recognized text: its lines in the engine's order, one a line."""
+    bitmap = _ocr_bitmap(document, number)
+    stop()
+    PDFIUM.release()
+    try:
+        found = engine.recognize(bitmap)
+    except ocr.Failed:
+        raise Unreadable("ocr_failed") from None
+    finally:
+        bitmap = None
+        PDFIUM.acquire()
+    stop()
+    if sum(len(line.text) for line in found) > MAX_PAGE_CHARS:
+        raise Unreadable()
+    width, height = size
+    lines, spans, at = [], [], 0
+    for line in found:
+        text = re.sub(r"[\r\n]+", " ", line.text)
+        if not text.strip():
+            continue
+        left, top, right, bottom = line.box
+        box = (left * width, (1 - bottom) * height, right * width, (1 - top) * height)  # points, from the bottom left
+        boxes = [None if char.isspace() else (*box, at + i, len(lines), 0.0) for i, char in enumerate(text)]
+        lines.append(dict(_line(list(text), boxes), bold=False))
+        spans.append((at, at + len(text), line.confidence))
+        at += len(text) + 1
+    passages = _pdf_blocks(number + 1, lines, size, body, sections, recognized=True)
+    for passage in passages:
+        lowest = min((c for start, end, c in spans if start < passage.char_end and end > passage.char_start), default=0.0)
+        passage.boxes = {**(passage.boxes or {}), "ocr": {"confidence": round(lowest, 3)}}
+    return passages
+
+
+def _ocr_bitmap(document, number):
+    """Page number (from 0) as displayed, rendered gray in memory for OCR: at OCR_DPI, or less for a
+    page larger than MAX_OCR_PIXELS or MAX_PAGE_SIDE allow."""
+    import pypdfium2 as pdfium
+
+    try:
+        page = document[number]
+        try:
+            width, height = page.get_size()
+            scale = min(OCR_DPI / 72, math.sqrt(MAX_OCR_PIXELS / (width * height)), MAX_PAGE_SIDE / max(width, height))
+            while math.ceil(width * scale) * math.ceil(height * scale) > MAX_OCR_PIXELS:  # pypdfium2 rounds up
+                scale *= 0.99
+            bitmap = page.render(scale=scale, grayscale=True)
+            try:
+                return ocr.Bitmap(bytes(bitmap.buffer), bitmap.width, bitmap.height, bitmap.stride)
+            finally:
+                bitmap.close()
+        finally:
+            page.close()
+    except pdfium.PdfiumError:
+        raise Unreadable() from None
 
 
 def render_page(data, number, scale=2.0):

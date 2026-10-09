@@ -35,7 +35,9 @@ def test_the_interface_check_serves_the_page_and_what_it_names(tmp_path):
 
 
 def test_the_materials_check_reads_a_pdf_and_latex_and_renders_a_page():
-    assert st.check_materials() == {"pdf": "pdf-3+pypdfium2-5.14.0", "latex": "latex-2+pylatexenc-2.11"}
+    from backend import extraction
+    assert st.check_materials() == {"pdf": extraction.extractor_of(extraction.PDF)[1], "latex": "latex-2+pylatexenc-2.11"}
+    assert extraction.extractor_of(extraction.PDF)[1].startswith("pdf-3+pypdfium2-5.14.0")
 
 
 def test_the_encrypted_zip_check_writes_and_reads_back_an_aes_zip():
@@ -59,8 +61,9 @@ def test_sqlite_checks_refuse_a_version_before_secure_delete(monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Vision is macOS only")
-def test_ocr_reads_the_english_and_chinese_lines():
-    assert st.check_ocr()["lines"] == st.OCR_LINES
+def test_ocr_reads_the_english_and_chinese_lines_of_a_scanned_page_through_the_apps_reading():
+    found = st.check_ocr()
+    assert found["lines"] == st.OCR_LINES and found["engine"] == "vision-3"
 
 
 def test_helper_flags():

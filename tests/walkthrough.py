@@ -8,7 +8,9 @@ stand-ins for OpenAlex, Crossref and arXiv that answer made-up records, behind t
 block (network_guard.py), so this process reaches nothing but its own listener. It serves the
 built interface (frontend/dist) and prints the window's address with this launch's session, and
 the folder of synthetic materials (a PDF, DOCX, HTML, Markdown and LaTeX file, and more) it wrote
-for the walkthrough to add. The local model helper's search model is a synthetic file with a pin
+for the walkthrough to add. Scanned pages are read by this Mac's own OCR engine (Vision), through a
+test-owned wrapper whose first recognition of a page with dark ink fails once, so the walkthrough
+shows a failed reading and its retry (S1-20). The local model helper's search model is a synthetic file with a pin
 of its own, served by a test-owned download source (each source redirecting to the file host
 it uses, the file sent slowly so a download can be watched and cancelled), and written to an
 "offline" folder for the import flow, whose path is printed; the helper binary is a stand-in in
@@ -24,6 +26,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 import socket
 import sys
@@ -46,7 +49,7 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 from scholia_app import FakeKeyring, MockProvider, MockScholarly, crossref_work, openalex_work  # noqa: E402
 
-from backend import local_helper  # noqa: E402
+from backend import local_helper, ocr  # noqa: E402
 from backend.app import create_app  # noqa: E402
 from backend.budget_router import MODEL_TIERS  # noqa: E402
 
@@ -76,14 +79,17 @@ CATALOG += [{"id": "example/long-context-mini", "name": "Long Context Mini", "co
 
 # Made-up identifiers (10.5555 is a test prefix) and the records the stand-ins answer for them.
 DOIS = {"pdf": "10.5555/scholia.walkthrough.wages", "docx": "10.5555/scholia.walkthrough.cities",
-        "latex": "10.5555/scholia.walkthrough.floors", "local": "10.5555/scholia.walkthrough.codebook"}
+        "latex": "10.5555/scholia.walkthrough.floors", "local": "10.5555/scholia.walkthrough.codebook",
+        "scan": "10.5555/scholia.walkthrough.scan"}
 ARXIV_ID = "2401.00001"
 RECORDS = MockScholarly(
     openalex={DOIS["pdf"]: openalex_work(DOIS["pdf"], "Minimum Wages and Employment in a Synthetic Panel",
                                          authors=("Ana Example", "Bo Sample"), year=2024),
               DOIS["latex"]: openalex_work(DOIS["latex"], "最低工资的合成模型：一项方法说明",
                                            authors=("Chen Example",), year=2023, venue="合成经济研究"),
-              DOIS["local"]: openalex_work(DOIS["local"], "A Codebook for Synthetic Interviews", year=2022)},
+              DOIS["local"]: openalex_work(DOIS["local"], "A Codebook for Synthetic Interviews", year=2022),
+              DOIS["scan"]: openalex_work(DOIS["scan"], "A Scanned Letter on Synthetic Wages",
+                                          authors=("Dana Example",), year=1998)},
     crossref={DOIS["docx"]: crossref_work(DOIS["docx"], "Wages Across Synthetic Cities", retracted=True)},
     arxiv={ARXIV_ID: "Labour Market Notes on a Synthetic Economy"})
 
@@ -113,6 +119,7 @@ def write_materials():
         "long-notes.md": long_notes(),
         "crowded-page.pdf": synthetic_materials.pdf(  # one page of 220 passages, a line of three items each
             [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]]),
+        "scanned-letter.pdf": synthetic_materials.scanned_letter(DOIS["scan"]),  # S1-20: an image, no text layer
     }
     for name, data in files.items():
         (folder / name).write_bytes(data)
@@ -142,6 +149,21 @@ def download_source(request):
     if request.url.host in FILE_HOSTS:
         return httpx.Response(302, headers={"Location": f"https://{FILE_HOSTS[request.url.host]}/files/model?signed=0"})
     return httpx.Response(200, stream=SlowFile())
+
+
+class FailsOnce:
+    """The test-owned wrapper around this Mac's OCR engine (S1-20): its first recognition of a page with
+    dark ink fails, once (the scanned appendix's image-only pages are an even gray); every other is
+    the engine's own. Its version is the engine's, so readings are as the app makes them."""
+
+    def __init__(self, engine):
+        self.engine, self.version, self.failed = engine, engine.version, False
+
+    def recognize(self, bitmap):
+        if not self.failed and re.search(rb"[\x00-\x3f]", bitmap.pixels):
+            self.failed = True
+            raise ocr.Failed()
+        return self.engine.recognize(bitmap)
 
 
 class SyntheticProvider(MockProvider):
@@ -174,6 +196,9 @@ def main(argv=None):
     parser.add_argument("--request-log", type=Path)
     args = parser.parse_args(argv)
 
+    if (engine := ocr.engine()) is not None:
+        failing = FailsOnce(engine)
+        ocr.engine = lambda: failing
     provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]],  # half have zero retention
                                  scholarly=RECORDS)
     provider.replies = [synthetic] * 1000

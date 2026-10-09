@@ -67,3 +67,57 @@ async def test_deleting_one_reading_of_a_file_read_two_ways_removes_its_passages
         [current] = (await client.get(f"/api/projects/{project}/materials")).json()["materials"]
         texts = (await client.get(f"/api/material-versions/{current['version']['id']}/passages")).json()["passages"]
         assert current["id"] == survivor["id"] and {p["id"] for p in texts} == passages[kept_reading]
+
+
+async def test_a_deleted_scanned_papers_recognized_passages_are_read_back_nowhere_and_leave_its_index(tmp_path, monkeypatch):
+    from backend import ocr
+    from test_ocr import Engine, scan
+
+    monkeypatch.setattr(ocr, "engine", lambda: Engine())  # S1-20: its page read by a test-owned engine
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, ("scan.pdf", scan())))["materials"]
+        [ready] = await settled(client, project)
+        version = ready["version"]["id"]
+        [passage] = (await client.get(f"/api/material-versions/{version}/passages")).json()["passages"]
+        assert passage["boxes"]["ocr"]
+        assert (await client.delete(f"/api/materials/{paper['id']}")).status_code == 200
+        for path in (f"/api/material-versions/{version}/passages", f"/api/material-versions/{version}/pages/1",
+                     f"/api/passages/{passage['id']}"):
+            assert (await client.get(path)).status_code == 404, path
+        assert await rows(client, "SELECT op FROM index_queue WHERE target_id = ? ORDER BY seq", passage["id"]) == [
+            ("add",), ("remove",)]
+        assert await rows(client, "SELECT count(*) FROM passages") == [(0,)]
+
+
+async def test_a_superseded_reading_is_removed_through_the_deletion_service_and_read_back_nowhere(tmp_path, monkeypatch):
+    """S1-20: a reading another reading of its file replaced leaves each index it was in, its passages
+    are read back nowhere, and its removal leaves a tombstone (section 4.2) and no dangling reference."""
+    import backend.extraction as extraction
+    from test_ocr import cite
+    from scholia_app import run_finished
+
+    notes = b"# Notes\n\nA paragraph of synthetic text.\n"
+    async with started(tmp_path / "data") as client:
+        mine, theirs = await project_of(client, "Mine"), await project_of(client, "Theirs")
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
+        [paper] = (await added(client, mine, ("notes.md", notes)))["materials"]
+        [read] = await settled(client, mine)
+        await added(client, theirs, ("notes.md", notes))
+        await settled(client, theirs)
+        [(older,)] = await rows(client, "SELECT id FROM extractions")
+        earlier = [p for (p,) in await rows(client, "SELECT id FROM passages WHERE extraction_id = ?", older)]
+        await cite(client, paper["id"], earlier[0], "synthetic text")
+        monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-1"))
+        again = await client.post(f"/api/material-versions/{read['version']['id']}/read")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        for passage in earlier:
+            assert (await client.get(f"/api/passages/{passage}")).status_code == 404
+            assert {p for (_, p, op) in await rows(client, "SELECT target_id, project_id, op FROM index_queue"
+                                                          " WHERE target_id = ? AND op = 'remove'", passage)} == {mine, theirs}
+        assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", older) == [(0,)]
+        assert await rows(client, "SELECT object_id, kind, title FROM tombstones") == [(older, "reading", None)]
+        assert await rows(client, "SELECT count(*) FROM audit_log WHERE event = 'deletion'") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM citations c LEFT JOIN passages p ON p.id = c.passage_id"
+                                  " WHERE c.passage_id IS NOT NULL AND p.id IS NULL") == [(0,)]
+

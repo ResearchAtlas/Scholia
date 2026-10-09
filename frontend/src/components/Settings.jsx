@@ -17,6 +17,7 @@ import { BackupsSection } from './Backups.jsx';
 import { ProjectExportSection } from './ProjectExport.jsx';
 import { Ask } from './Ask.jsx';
 import { fraction, retryRun, runOutcome } from '../runs.js';
+import { libraryChanged } from '../library.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -424,7 +425,9 @@ function BackgroundRuns() {
     return () => clearInterval(timer);
   }, [load]);
 
-  async function act(action) {
+  // A run tried again or stopped here changes its project's papers too: the Library open on that
+  // project reads them again, and follows the new reading until it ends (S1-20's retried OCR).
+  async function act(action, projectId) {
     setProblem(null);
     try {
       await action();
@@ -432,6 +435,7 @@ function BackgroundRuns() {
       setProblem(error instanceof ApiError ? error.code : 'internal');
     }
     load();
+    libraryChanged(projectId);
   }
 
   const dates = new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' });
@@ -442,7 +446,8 @@ function BackgroundRuns() {
       {runs?.length > 0 && (
         <ul className="divide-y rounded-lg border">
           {runs.map((run) => <RunRow key={run.run_id} run={run} dates={dates} onChanged={load}
-            onCancel={() => act(() => post(`/api/runs/${run.run_id}/cancel`))} onRetry={() => act(() => retryRun(run.run_id))} />)}
+            onCancel={() => act(() => post(`/api/runs/${run.run_id}/cancel`), run.project_id)}
+            onRetry={() => act(() => retryRun(run.run_id), run.project_id)} />)}
         </ul>
       )}
     </Section>
