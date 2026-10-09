@@ -1996,6 +1996,7 @@ def _latex_table(node, text_of):
     def end(row):  # a cell's end, and with row its row's: a row of no such text is left out
         nonlocal cell, held, cells, kept
         _keep(blocks=1)
+        _stop()  # a table is one of walk's steps, however many cells it has
         text = _normal(cell.value())
         cell = _Text(MAX_BLOCK_CHARS)
         if kept:

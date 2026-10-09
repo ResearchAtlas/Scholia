@@ -1143,6 +1143,13 @@ def test_a_latex_texts_paragraph_breaks_each_call_stop():
     assert len(calls) == 3
 
 
+def test_a_latex_tables_cells_each_call_stop():
+    stop, calls = _stops_at(3)
+    with pytest.raises(_Stopped):  # one tabular of 1,000 cells: once no call, as one of walk's nodes
+        extract(b"\\begin{tabular}{l}" + b"a&" * 1000 + b"\\end{tabular}", extraction.LATEX, stop)
+    assert len(calls) == 3
+
+
 @pytest.mark.parametrize("texts", [["a" * (30 * 2**20) + "\n\nb"], ["a" * 2**20] * 30])
 def test_a_latex_paragraph_past_the_block_bound_is_refused_before_its_pieces_are_copied_and_joined(monkeypatch, texts):
     """Text nodes as pylatexenc makes them: a paragraph of 30 MiB in one (copied out before), and one of 30
