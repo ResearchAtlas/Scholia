@@ -33,3 +33,17 @@ async def test_an_uploaded_file_is_full_text_and_a_looked_up_abstract_adds_no_pa
         assert not any("Abstract-Only-Canary" in p["text"] for p in passages)
         assert await rows(client, "SELECT count(*) FROM passages WHERE text LIKE '%Abstract-Only-Canary%'") == [(0,)]
         assert "Abstract-Only-Canary" not in str(paper["csl"])  # nor kept as the paper's metadata
+
+
+async def test_a_scanned_papers_recognized_text_is_its_full_text(tmp_path, monkeypatch):
+    from backend import ocr
+    from test_ocr import LINE, Engine, scan
+
+    monkeypatch.setattr(ocr, "engine", lambda: Engine())  # S1-20: its page read by a test-owned engine
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, ("scan.pdf", scan()))
+        [paper] = await settled(client, project)
+        assert (paper["evidence_type"], paper["state"]) == ("full_text", "ready")
+        [passage] = (await client.get(f"/api/material-versions/{paper['version']['id']}/passages")).json()["passages"]
+        assert (passage["kind"], passage["text"]) == ("paragraph", LINE.text)

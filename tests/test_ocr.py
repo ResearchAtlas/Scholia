@@ -704,13 +704,20 @@ async def test_a_doi_found_only_by_ocr_is_looked_up_after_the_reread_as_the_leve
 async def test_reading_scanned_pages_logs_no_recognized_text_or_file_name(tmp_path, monkeypatch, caplog, quick):
     caplog.set_level(logging.DEBUG)
     secret = "Participant-Eight-Canary"
-    use(monkeypatch, Engine(lambda call: [ocr.Line(f"{secret} said this on a scanned page.", (0.1, 0.1, 0.9, 0.12), 0.4)],
-                            fail={2}))
+    def lines(call):
+        if call == 3:  # an engine's own error, its text quoting the page: logged by its type only
+            raise RuntimeError(f"{secret} could not be read")
+        return [ocr.Line(f"{secret} said this on a scanned page.", (0.1, 0.1, 0.9, 0.12), 0.4)]
+
+    use(monkeypatch, Engine(lines, fail={2}))
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
-        await added(client, project, (f"{secret}.pdf", scan()), (f"{secret}-two.pdf", synthetic.paper_pdf(scanned=1)))
-        await settled(client, project)
-    assert secret not in caplog.text
+        for name, data in ((f"{secret}.pdf", scan()), (f"{secret}-two.pdf", scan()), (f"{secret}-three.pdf", scan())):
+            await added(client, project, (name, data))  # one at a time: the engine's calls in this order
+            await settled(client, project)
+        reasons = sorted(m["reason"] or "" for m in await settled(client, project))
+        assert reasons == ["", "internal", "ocr_failed"]
+    assert secret not in caplog.text and "RuntimeError" in caplog.text
 
 
 @pytest.mark.asyncio
