@@ -3,6 +3,9 @@ on one page, at most 2,000 characters split at sentence boundaries, tables and c
 references marked, and each format read from its own structure with nothing fetched or included."""
 
 import io
+import itertools
+import random
+import re
 import struct
 import textwrap
 import zipfile
@@ -354,6 +357,47 @@ def test_markdown_inline_marks_go_and_names_with_underscores_stay():
     read = extract(b"Some **bold** and *em* and `code` with snake_case_name and a [link](https://example.org).",
                    extraction.MARKDOWN)
     assert kinds(read.passages) == [("paragraph", "Some bold and em and code with snake_case_name and a link.")]
+
+
+# The patterns the Markdown reader's scans replaced, as f962e62 had them (they rescan a line from each mark
+# not closed): each scan gives what its pattern gave, here over every short string of the marks.
+OLD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+OLD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+OLD_INLINE = re.compile(r"(\*\*|\*|`|~~)(?=\S)(.+?)(?<=\S)\1|(?<!\w)(__|_)(?=\S)(.+?)(?<=\S)\3(?!\w)")
+OLD_ATX = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+OLD_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def old_inline(text):
+    text = re.sub(r"<[^>]+>", "", OLD_LINK.sub(r"\1", OLD_IMAGE.sub(r"\1", text)))
+    for _ in range(3):
+        text = OLD_INLINE.sub(lambda m: m.group(2) if m.group(2) is not None else m.group(4), text)
+    return text
+
+
+def strings(alphabet, longest):
+    for size in range(longest + 1):
+        yield from map("".join, itertools.product(alphabet, repeat=size))
+
+
+@pytest.mark.parametrize("alphabet", ["*_`~ a", "![]()a", "<> a!["])
+def test_markdown_inline_scans_give_what_the_patterns_they_replace_gave(alphabet):
+    for text in strings(alphabet, 6):
+        assert extraction._markdown_inline(text) == old_inline(text), repr(text)
+    rng = random.Random(alphabet)  # and longer lines, with spaces, word characters and marks of every kind
+    marks = list("![]()<>*_`~#|:- ") + ["**", "__", "~~", "\t", "\u3000", "\u00a0", "a", "\u00e9", "\u4e2d", "1"]
+    for _ in range(3000):
+        text = "".join(rng.choice(marks) for _ in range(rng.randint(0, 40)))
+        assert extraction._markdown_inline(text) == old_inline(text), repr(text)
+
+
+def test_markdown_heading_and_table_rule_scans_give_what_their_patterns_gave():
+    for line in strings("# a\t", 7):
+        old, new = OLD_ATX.match(line), extraction._ATX.match(line)
+        assert bool(old) == bool(new) and (not old or (old.group(1), old.group(2))
+                                           == (new.group(1), extraction._atx_text(line, new))), repr(line)
+    for line in strings(" |:-x", 7):
+        assert bool(OLD_TABLE_RULE.match(line)) == bool(extraction._TABLE_RULE.match(line)), repr(line)
 
 
 def test_latex_reads_no_other_file_and_no_comment(tmp_path):
