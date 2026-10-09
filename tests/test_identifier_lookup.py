@@ -1,0 +1,1080 @@
+"""Identifier lookups (slice-1 spec F3a step 3, sections 7.5, 10 and 13; ticket 71), with test-owned
+OpenAlex, Crossref and arXiv stand-ins behind the outbound gate's mock transport and synthetic files.
+Lifecycle cases first: a change of level, a lock or a deletion between a lookup's start and its
+dispatch."""
+
+import asyncio
+import contextlib
+import gzip
+import json
+import threading
+import time
+
+import httpx
+import pytest
+
+import backend.extraction as extraction
+import backend.lookup as lookup
+from backend.db import new_id
+import backend.materials as materials_module
+import synthetic_materials as synthetic
+from scholia_app import (Chunks, MockProvider, MockScholarly, arxiv_feed, background_idle, crossref_work, openalex_work,
+                         run_finished, started, streamed)
+from test_materials import added, hold_extraction, listing, project_of, rows, settled
+
+pytestmark = pytest.mark.asyncio
+
+DOI = synthetic.DOI
+DEFAULTS = (dict(lookup.SPACING), lookup.RETRIES, lookup.TIMEOUT)  # as the module sets them, before the fixture
+TITLE = "A Synthetic Study of Minimum Wages, Resolved"
+
+
+@pytest.fixture(autouse=True)
+def quick(monkeypatch):
+    monkeypatch.setattr(lookup, "SPACING", {source: 0.0 for source in lookup.SPACING})
+    monkeypatch.setattr(lookup, "RETRIES", (0.01, 0.02))
+    monkeypatch.setattr(materials_module, "WAIT_SECONDS", 0.01)
+
+
+def scholarly(**records):
+    return MockProvider(scholarly=MockScholarly(**records))
+
+
+async def gate_log(client):
+    return [json.loads(data) for (data,) in await rows(
+        client, "SELECT data FROM audit_log WHERE event = 'outbound' AND data ->> 'kind' = 'scholarly_api' ORDER BY seq")]
+
+
+async def ask_of(client, project):
+    deadline = asyncio.get_running_loop().time() + 10
+    while not (asks := (await listing(client, project))["asks"]):
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.02)
+    return asks
+
+
+# Lifecycle
+
+
+async def test_a_project_made_local_only_before_dispatch_sends_nothing(tmp_path, monkeypatch):
+    reached, go = hold_extraction(monkeypatch)  # the lookup waits for its material to be read
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await asyncio.to_thread(reached.wait, 10)
+        tightened = await client.post(f"/api/projects/{project}/sensitivity", json={"level": "local_only"})
+        assert tightened.status_code == 200
+        go.set()
+        run = await run_finished(client, result["lookup_run_id"])
+        assert (run["status"], run["cancel_reason"]) == ("cancelled", "revoked")
+        await background_idle(client)
+        assert client.provider.scholarly.requests == [] and await gate_log(client) == []
+        [paper] = await settled(client, project)
+        assert paper["checked_by"] is None and paper["title"] == "paper"  # left as it was
+
+
+@pytest.mark.parametrize("change", ["lock", "delete the material", "delete the project", "made private"])
+async def test_a_change_while_a_lookup_is_in_flight_sends_nothing_more_and_writes_nothing(tmp_path, change):
+    records = {DOI: openalex_work(DOI, TITLE), "10.5555/second.paper": openalex_work("10.5555/second.paper", "Second")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client)
+        mock = client.provider.scholarly
+        mock.hold = asyncio.Event()
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()),
+                             ("second.md", f"# Second\n\ndoi:10.5555/second.paper\n".encode()))
+        await asyncio.wait_for(mock.started.wait(), 10)
+        first = result["materials"][0]["id"]
+        if change == "lock":
+            response = await client.post(f"/api/projects/{project}/review-lock", json={"locked": True})
+        elif change == "delete the material":
+            response = await client.delete(f"/api/materials/{first}")
+        elif change == "delete the project":
+            response = await client.delete(f"/api/projects/{project}")
+        else:
+            response = await client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"})
+        assert response.status_code == 200, response.text
+        mock.hold.set()
+        await background_idle(client)
+        assert len(mock.requests) == 1  # the one in flight; nothing after the change
+        if change != "delete the project":
+            assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", result["lookup_run_id"]) == [
+                ("cancelled", "revoked")]
+            assert await rows(client, "SELECT count(*) FROM materials WHERE checked_by = 'lookup'") == [(0,)]
+
+
+async def test_a_local_only_projects_ask_is_withdrawn_when_it_no_longer_needs_one(tmp_path):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        token = (await client.post(f"/api/projects/{project}/sensitivity", json={"level": "normal"})).json()["token"]
+        assert (await client.post(f"/api/projects/{project}/sensitivity",
+                                  json={"level": "normal", "token": token})).status_code == 200
+        run = await run_finished(client, result["lookup_run_id"])
+        assert run["status"] == "succeeded"
+        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "lookup"})
+        assert late.status_code == 409  # closed: the project changed
+        [paper] = await settled(client, project)
+        assert paper["title"] == TITLE and paper["checked_by"] == "lookup"
+        assert [entry["approved"] for entry in await gate_log(client)] == [False]  # Normal needs no approval
+
+
+async def test_a_lookup_resumed_after_a_restart_keeps_its_answer(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    async with started(data, scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client, level="local_only")
+        mock = client.provider.scholarly
+        mock.hold = asyncio.Event()
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200
+        await asyncio.wait_for(mock.started.wait(), 10)
+    async with started(data, scholarly(openalex={DOI: openalex_work(DOI, TITLE)}), setup=False) as client:
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        assert (await listing(client, project))["asks"] == []  # not asked again
+        [paper] = await settled(client, project)
+        assert paper["title"] == TITLE
+
+
+async def test_a_restarted_lookup_whose_identifiers_changed_asks_again(tmp_path):
+    data, other = tmp_path / "data", "10.5555/read.again"
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "As Read Again")}
+    async with started(data, scholarly(openalex=records)) as client:
+        project = await project_of(client, level="local_only")
+        mock = client.provider.scholarly
+        mock.hold = asyncio.Event()
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200  # for the PDF's DOI alone
+        await asyncio.wait_for(mock.started.wait(), 10)
+        version = result["materials"][0]["version_id"]
+
+        def read_again(conn):  # the same version read again by this extractor, giving another DOI
+            (sha,) = conn.execute("SELECT file_sha256 FROM material_versions WHERE id = ?", (version,)).fetchone()
+            extraction_id = new_id()
+            conn.execute("INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status, pages,"
+                         " ocr_pages) VALUES (?, ?, ?, ?, 'complete', 1, 0)",
+                         (extraction_id, sha, *extraction.extractor_of(extraction.PDF)))
+            conn.execute("INSERT INTO passages (id, extraction_id, ordinal, page, kind, text) VALUES (?, ?, 0, 1,"
+                         " 'paragraph', ?)", (new_id(), extraction_id, f"doi:{other}"))
+
+        await asyncio.to_thread(client.state["db"].write, read_again)
+    first = result["lookup_run_id"]
+    async with started(data, scholarly(openalex=records), setup=False) as client:
+        mock = client.provider.scholarly
+        deadline = asyncio.get_running_loop().time() + 10
+        while not (asks := (await listing(client, project))["asks"]):
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        [again] = asks
+        assert again["run_id"] == first and again["ask_id"] != ask["ask_id"] and again["params"]["identifiers"] == 1
+        assert mock.requests == []  # the earlier answer covered the earlier DOI only: nothing went out
+        assert (await client.post(f"/api/runs/{first}/asks/{ask['ask_id']}", json={"option": "lookup"})).status_code == 404
+        assert (await client.post(f"/api/runs/{first}/asks/{again['ask_id']}", json={"option": "lookup"})).status_code == 200
+        assert (await run_finished(client, first))["status"] == "succeeded"
+        assert [path for _, path, _ in mock.requests] == [f"/works/doi:{other}"]
+
+
+async def test_a_lookup_is_for_the_version_it_was_made_for_and_a_replaced_ones_ask_closes(tmp_path):
+    other = "10.5555/replacement.version"
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Replacement")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [first] = await ask_of(client, project)  # version A's, left unanswered
+        material = result["materials"][0]["id"]
+        replaced = await added(client, project, ("v2.md", f"# Version two\n\ndoi:{other}\n".encode()), material_id=material)
+        deadline = asyncio.get_running_loop().time() + 10
+        while [a["run_id"] for a in (await listing(client, project))["asks"]] != [replaced["lookup_run_id"]]:
+            assert asyncio.get_running_loop().time() < deadline  # A's ask is closed, B's is open
+            await asyncio.sleep(0.02)
+        [second] = (await listing(client, project))["asks"]
+        assert (await client.post(f"/api/runs/{second['run_id']}/asks/{second['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200
+        assert (await run_finished(client, replaced["lookup_run_id"]))["status"] == "succeeded"
+        late = await client.post(f"/api/runs/{first['run_id']}/asks/{first['ask_id']}", json={"option": "lookup"})
+        assert (late.status_code, late.json()["code"]) == (409, "ask_closed")  # A approved too late: refused
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert (paper["title"], paper["source_key"]) == ("The Replacement", "openalex:W0000000001")
+        assert [path for _, path, _ in client.provider.scholarly.requests] == [f"/works/doi:{other}"]  # A's: never sent
+
+
+async def test_a_file_replaced_while_its_identifier_waits_for_its_turn_keeps_it_from_being_sent(tmp_path, monkeypatch):
+    class Watched(lookup.Pace):  # says when a request waits for a source another request holds
+        waiting = asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def turn(self, source):
+            if source in self.locks and self.locks[source].locked():
+                Watched.waiting.set()
+            async with super().turn(source):
+                yield
+
+    monkeypatch.setattr(lookup, "Pace", Watched)
+    first = "10.5555/first.in.line"
+    mock = MockScholarly(openalex={first: openalex_work(first, "First In Line"), DOI: openalex_work(DOI, TITLE)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        mock.hold = asyncio.Event()
+        await added(client, project, ("first.md", f"# First\n\ndoi:{first}\n".encode()))
+        await asyncio.wait_for(mock.started.wait(), 10)  # its request holds OpenAlex's turn
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await asyncio.wait_for(Watched.waiting.wait(), 10)  # the paper's DOI, checked current, waits for the turn
+        await added(client, project, ("v2.md", b"# Version two\n\nNo identifier in this one.\n"),
+                    material_id=result["materials"][0]["id"])
+        mock.hold.set()
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        assert [path for _, path, _ in mock.requests] == [f"/works/doi:{first}"]  # the replaced file's DOI: never sent
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'",
+                               result["lookup_run_id"])
+        assert json.loads(data)["outcome"] == "replaced"
+
+
+async def test_a_lookup_waits_only_for_the_reading_of_the_version_it_is_for(tmp_path, monkeypatch):
+    slow, real = synthetic.paper_pdf(), extraction.extract
+    reached, go = threading.Event(), threading.Event()
+
+    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):  # only the first file's reading waits
+        if data == slow:
+            reached.set()
+            while not go.wait(0.01):
+                stop()
+        return real(data, kind, stop, progress)
+
+    monkeypatch.setattr(extraction, "extract", held)
+    other = "10.5555/quick.replacement"
+    async with started(tmp_path / "data", scholarly(openalex={other: openalex_work(other, "The Quick Replacement")})) \
+            as client:
+        project = await project_of(client)
+        first = await added(client, project, ("large.pdf", slow))
+        await asyncio.to_thread(reached.wait, 10)  # version A is being read, and stays so
+        replaced = await added(client, project, ("v2.md", f"# Version two\n\ndoi:{other}\n".encode()),
+                               material_id=first["materials"][0]["id"])
+        run = await run_finished(client, replaced["lookup_run_id"], timeout=5)  # not behind A's reading
+        assert run["status"] == "succeeded"
+        [paper] = (await listing(client, project))["materials"]
+        assert paper["title"] == "The Quick Replacement"
+        go.set()
+        assert (await run_finished(client, first["lookup_run_id"]))["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("level", ["normal", "local_only", "review_locked"])
+async def test_a_reading_tried_again_brings_the_lookup_its_version_never_had(tmp_path, monkeypatch, level):
+    reached, go = hold_extraction(monkeypatch)
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        if level == "review_locked":
+            project = (await client.post("/api/projects", json={"name": "Review", "sensitivity": "local_only",
+                                                               "review_lock": True})).json()["id"]
+        else:
+            project = await project_of(client, level=level)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = result["materials"]
+        await asyncio.to_thread(reached.wait, 10)
+        assert (await client.post(f"/api/runs/{paper['run_id']}/cancel")).json()["status"] == "cancelled"
+        [stopped] = await settled(client, project)
+        if level != "review_locked":  # its lookup had no text to read: not read, not "no identifier", and failed
+            assert (stopped["lookup"]["status"], stopped["lookup"]["outcome"]) == ("failed", "not_read")
+            run = await run_finished(client, result["lookup_run_id"])
+            assert (run["result"], run["retryable"]) == ({"reason": "not_read"}, True)
+        go.set()
+        again = await client.post(f"/api/runs/{paper['run_id']}/retry")
+        assert again.status_code == 201
+        if level == "local_only":  # the version's lookup asks first, as at import
+            [ask] = await ask_of(client, project)
+            assert ask["params"]["identifiers"] == 1 and client.provider.scholarly.requests == []
+            assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                      json={"option": "lookup"})).status_code == 200
+        [read] = await settled(client, project)
+        assert read["state"] == "ready"
+        if level == "review_locked":  # never looks up
+            assert read["lookup"] is None and client.provider.scholarly.requests == []
+            assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(0,)]
+        else:
+            assert (read["title"], read["checked_by"]) == (TITLE, "lookup")
+            assert read["lookup"]["outcome"] == "resolved" and read["lookup"]["run_id"] != result["lookup_run_id"]
+            assert [path for _, path, _ in client.provider.scholarly.requests] == [f"/works/doi:{DOI}"]
+
+
+async def test_a_reading_past_the_lookups_wait_brings_the_lookup_once_it_commits(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "LOOKUP_WAIT_SECONDS", 0.3)
+    release, real = threading.Event(), extraction.extract
+
+    def overrunning(data, kind, stop=lambda: None, progress=lambda d, t: None):  # a long step that checks no limit
+        release.wait(20)
+        return real(data, kind, lambda: None, progress)
+
+    monkeypatch.setattr(extraction, "extract", overrunning)
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        try:
+            first = await run_finished(client, result["lookup_run_id"])  # it stopped waiting, the reading still on
+            assert (first["status"], first["result"], first["retryable"]) == ("failed", {"reason": "not_read"}, True)
+            [waiting] = (await listing(client, project))["materials"]
+            assert waiting["state"] == "reading" and waiting["lookup"]["outcome"] == "not_read"
+            assert client.provider.scholarly.requests == []
+        finally:
+            release.set()
+        assert (await run_finished(client, result["materials"][0]["run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert (paper["title"], paper["lookup"]["outcome"]) == (TITLE, "resolved")
+        assert paper["lookup"]["run_id"] != result["lookup_run_id"]  # recorded with the reading's commit
+
+
+async def test_the_lookup_a_late_reading_brings_asks_in_the_conversation_its_file_was_attached_in(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "LOOKUP_WAIT_SECONDS", 0.3)
+    release, real = threading.Event(), extraction.extract
+
+    def overrunning(data, kind, stop=lambda: None, progress=lambda d, t: None):
+        release.wait(20)
+        return real(data, kind, lambda: None, progress)
+
+    monkeypatch.setattr(extraction, "extract", overrunning)
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client, level="local_only")
+        conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()), conversation_id=conversation)
+        try:
+            assert (await run_finished(client, result["lookup_run_id"]))["result"] == {"reason": "not_read"}
+        finally:
+            release.set()
+        [ask] = await ask_of(client, project)  # the lookup the reading brought, asking first
+        assert ask["run_id"] != result["lookup_run_id"]
+        here = (await client.get("/api/asks", params={"conversation_id": conversation})).json()["asks"]
+        assert [a["ask_id"] for a in here] == [ask["ask_id"]]  # shown where the file was attached
+
+
+@pytest.mark.parametrize("level", ["normal", "local_only"])
+async def test_another_projects_reading_of_the_file_brings_the_lookup_a_stopped_reading_never_gave(
+        tmp_path, monkeypatch, level):
+    reached, go = hold_extraction(monkeypatch)
+    pdf = synthetic.paper_pdf()
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        first = await project_of(client, "First", level=level)
+        result = await added(client, first, ("paper.pdf", pdf))
+        [paper] = result["materials"]
+        await asyncio.to_thread(reached.wait, 10)
+        assert (await client.post(f"/api/runs/{paper['run_id']}/cancel")).json()["status"] == "cancelled"
+        assert (await run_finished(client, result["lookup_run_id"]))["result"] == {"reason": "not_read"}
+        go.set()
+        second = await project_of(client, "Second")
+        theirs = await added(client, second, ("same.pdf", pdf))  # read there: its reading is this one's too
+        assert (await run_finished(client, theirs["materials"][0]["run_id"]))["status"] == "succeeded"
+        if level == "local_only":  # the lookup it brings asks first, as at import
+            [ask] = await ask_of(client, first)
+            assert ask["run_id"] not in (result["lookup_run_id"], theirs["lookup_run_id"])
+            assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                      json={"option": "lookup"})).status_code == 200
+        [shared] = await settled(client, first)
+        assert (shared["state"], shared["title"], shared["lookup"]["outcome"]) == ("ready", TITLE, "resolved")
+        assert shared["lookup"]["run_id"] not in (result["lookup_run_id"], theirs["lookup_run_id"])
+        assert [p["title"] for p in await settled(client, second)] == [TITLE]
+        # Its passages reach both projects' search index, each once.
+        (passages,) = (await rows(client, "SELECT count(*) FROM passages"))[0]
+        queued = await rows(client, "SELECT project_id, count(*), count(DISTINCT target_id) FROM index_queue"
+                                    " WHERE op = 'add' GROUP BY project_id ORDER BY project_id")
+        assert passages and queued == sorted([(first, passages, passages), (second, passages, passages)])
+
+
+async def test_a_reading_tried_again_while_its_batchs_lookup_still_waits_is_looked_up_once(tmp_path, monkeypatch):
+    other = "10.5555/the.long.read"
+    long_read, paper = f"# The Long Read\n\ndoi:{other}\n".encode(), synthetic.paper_pdf()
+    real, release, readings = extraction.extract, threading.Event(), []
+
+    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):
+        readings.append(data)
+        if data == long_read or readings.count(paper) == 1:  # the long read, and the paper's first reading
+            while not release.wait(0.01):
+                stop()
+        return real(data, kind, stop, progress)
+
+    monkeypatch.setattr(extraction, "extract", held)
+    records = {DOI: openalex_work(DOI, TITLE), other: openalex_work(other, "The Long Read, Resolved")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("long.md", long_read), ("paper.pdf", paper))
+        [_, first] = result["materials"]
+        while readings.count(paper) < 1:
+            await asyncio.sleep(0.01)
+        assert (await client.post(f"/api/runs/{first['run_id']}/cancel")).json()["status"] == "cancelled"
+        again = await client.post(f"/api/runs/{first['run_id']}/retry")  # the batch's lookup still waits
+        assert again.status_code == 201
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        release.set()
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        papers = {p["id"]: p for p in await settled(client, project)}
+        assert papers[first["id"]]["title"] == TITLE
+        assert papers[first["id"]]["lookup"]["run_id"] == result["lookup_run_id"]  # it waited for that reading
+        assert sorted(path for _, path, _ in client.provider.scholarly.requests) == [
+            f"/works/doi:{DOI}", f"/works/doi:{other}"]  # each identifier once
+
+
+async def test_an_older_lookup_answered_after_its_file_was_replaced_writes_nothing(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)}, arxiv={synthetic.ARXIV: "The Replacement Preprint"})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        mock.hold, mock.held = asyncio.Event(), {"api.openalex.org"}  # the DOI's answer is slow
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await asyncio.wait_for(mock.started.wait(), 10)  # version A's DOI is in flight
+        replaced = await added(client, project, ("v2.md", synthetic.paper_markdown()),
+                               material_id=result["materials"][0]["id"])
+        assert (await run_finished(client, replaced["lookup_run_id"]))["status"] == "succeeded"  # B's arXiv ID first
+        mock.hold.set()
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert (paper["title"], paper["source_key"]) == ("The Replacement Preprint", f"arxiv:{synthetic.ARXIV}")
+        assert paper["lookup"]["run_id"] == replaced["lookup_run_id"] and paper["lookup"]["outcome"] == "resolved"
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'",
+                               result["lookup_run_id"])
+        assert json.loads(data)["outcome"] == "replaced"  # A's answer came, and was not applied
+
+
+# What is sent, and where
+
+
+async def test_a_doi_from_the_file_is_sent_alone_and_anonymously_to_openalex(tmp_path):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        [(host, path, headers)] = client.provider.scholarly.requests
+        assert (host, path) == ("api.openalex.org", f"/works/doi:{DOI}")  # the identifier alone
+        assert not {"authorization", "cookie", "x-api-key", "mailto"} & {h.lower() for h in headers}
+        assert "mailto" not in path and "api_key" not in path
+        assert paper["title"] == TITLE and paper["checked_by"] == "lookup" and paper["resolved_at"]
+        assert paper["csl"]["DOI"] == DOI and paper["csl"]["author"] == [{"literal": "A. Researcher"}]
+        assert (paper["source_key"], paper["retraction"]) == ("openalex:W0000000001", "none")  # the OpenAlex work
+        assert paper["retraction_checked_at"] == paper["checked_at"]
+        assert paper["lookup"]["outcome"] == "resolved" and paper["lookup"]["source"] == "openalex"
+        [decision] = await gate_log(client)
+        assert decision["decision"] == "allow" and decision["approved"] is False and decision["sensitivity"] == "normal"
+        assert await rows(client, "SELECT count(*) FROM materials WHERE checked_by = 'lookup'") == [(1,)]
+
+
+async def test_crossref_answers_when_openalex_has_no_record_and_arxiv_ids_go_to_arxiv(tmp_path):
+    other = "10.5555/crossref.only"
+    mock = MockScholarly(crossref={other: crossref_work(other, "Only In Crossref")},
+                         arxiv={synthetic.ARXIV: "An arXiv Preprint"})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client, level="private")  # Private looks up without asking
+        await added(client, project, ("a.md", f"# A\n\ndoi:{other}\n".encode()),
+                    ("b.md", synthetic.paper_markdown()))
+        papers = {p["title"]: p for p in await settled(client, project)}
+        assert set(papers) == {"Only In Crossref", "An arXiv Preprint"}
+        assert papers["Only In Crossref"]["csl"]["author"] == [{"family": "Example", "given": "Ana"}]
+        assert papers["An arXiv Preprint"]["retraction"] == "unknown"  # arXiv says nothing on retraction
+        assert papers["An arXiv Preprint"]["source_key"] == f"arxiv:{synthetic.ARXIV}"
+        assert papers["Only In Crossref"]["source_key"] == f"doi:{other}"  # each record's key names its source
+        assert sorted(mock.hosts) == ["api.crossref.org", "api.openalex.org", "export.arxiv.org"]
+        assert {p["lookup"]["source"] for p in papers.values()} == {"crossref", "arxiv"}
+
+
+async def test_an_openalex_records_key_is_its_openalex_id_or_else_the_doi_it_was_asked_for():
+    for given, key in (("https://openalex.org/W123", "openalex:W123"), (None, f"openalex:doi:{DOI}"),
+                       ("https://example.org/W123", f"openalex:doi:{DOI}"), ("https://openalex.org/W1/../x", f"openalex:doi:{DOI}")):
+        record = {**openalex_work(DOI, TITLE), "id": given}
+        assert lookup._openalex(DOI, json.dumps(record).encode()).source_key == key
+
+
+async def test_a_record_with_malformed_entries_skips_them_and_still_resolves():
+    openalex = {**openalex_work(DOI, TITLE), "authorships": [{"author": "invalid"}, "x", 5, {"author": {"display_name": "Ana"}}],
+                "primary_location": "x", "biblio": 5}
+    found = lookup._openalex(DOI, json.dumps(openalex).encode())
+    assert (found.csl["title"], found.csl["author"]) == (TITLE, [{"literal": "Ana"}])
+    openalex["authorships"] = 5
+    assert "author" not in lookup._openalex(DOI, json.dumps(openalex).encode()).csl
+    crossref = {**crossref_work(DOI, TITLE), "author": ["x", 5, {"family": "Example"}], "issued": {"date-parts": [5]},
+                "updated-by": 7}
+    found = lookup._crossref(DOI, json.dumps({"message": crossref}).encode())
+    assert (found.csl["author"], found.retracted, "issued" in found.csl) == ([{"family": "Example"}], None, False)
+    for record in ({**crossref, "author": 5, "issued": "2020"}, {**crossref, "issued": {"date-parts": 5}}):
+        assert lookup._crossref(DOI, json.dumps({"message": record}).encode()).csl["title"] == TITLE
+    with pytest.raises(lookup.Failed) as failed:  # nested past what the parser follows: no answer it can read
+        lookup._openalex(DOI, b"[" * 100_000 + b"]" * 100_000)
+    assert failed.value.code == "unavailable"
+
+
+async def test_a_records_fields_reach_the_csl_only_as_short_strings_and_plausible_years():
+    def openalex(**fields):
+        return lookup._openalex(DOI, json.dumps({**openalex_work(DOI, TITLE), **fields}).encode()).csl
+
+    def crossref(**fields):
+        return lookup._crossref(DOI, json.dumps({"message": {**crossref_work(DOI, TITLE), **fields}}).encode()).csl
+
+    for bad in ("x" * 100_000, ["journal-article"], {"a": 1}, 7, "Journal Article", "a--b"):
+        assert openalex(type=bad)["type"] == "article-journal"
+        assert crossref(type=bad)["type"] == "article-journal"
+    assert (openalex(type="book-chapter")["type"], crossref(type="posted-content")["type"]) == ("book-chapter", "posted-content")
+    for year in (10 ** 30, True, -5, 2024.5, "2024"):
+        assert "issued" not in openalex(publication_year=year)
+        assert "issued" not in crossref(issued={"date-parts": [[year]]})
+    assert openalex()["issued"] == crossref(issued={"date-parts": [[2024]]})["issued"] == {"date-parts": [[2024]]}
+    for given in ("not a doi", "10.5555/" + "x" * 300):
+        feed = arxiv_feed(synthetic.ARXIV, "A Preprint").replace(
+            b"</entry>", f"<arxiv:doi>{given}</arxiv:doi></entry>".encode())
+        assert "DOI" not in lookup._arxiv(synthetic.ARXIV, feed).csl
+    assert extraction.clean_doi("10.5555/" + "x" * 300) is None and extraction.clean_doi("10.5555/" + "x" * 292)
+    feed = arxiv_feed(synthetic.ARXIV, "A Preprint").replace(b"</entry>", b"<arxiv:doi>10.5555/Pub.1</arxiv:doi></entry>")
+    assert lookup._arxiv(synthetic.ARXIV, feed).csl["DOI"] == "10.5555/pub.1"
+
+
+async def test_a_doi_after_many_short_passages_but_within_the_first_characters_is_found(tmp_path):
+    late = "10.5555/after.many.notes"
+    notes = "".join(f"Note {n}.\n\n" for n in range(250))  # 250 short passages, about 2,400 characters
+    async with started(tmp_path / "data", scholarly(openalex={late: openalex_work(late, "Found Late")})) as client:
+        project = await project_of(client)
+        await added(client, project, ("notes.md", f"# Many Notes\n\n{notes}doi:{late}\n".encode()))
+        [paper] = await settled(client, project)
+        assert paper["extraction"]["passages"] == 252  # the title, the notes and the DOI's
+        assert (paper["title"], paper["lookup"]["identifier"]) == ("Found Late", f"doi:{late}")
+
+
+async def test_a_doi_only_in_the_reference_list_or_with_none_sends_nothing(tmp_path):
+    references_only = b"# A Paper\n\nNo identifier here.\n\n## References\n\n- Smith (2020). doi:10.5555/cited.paper.002\n"
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, ("a.md", references_only))
+        [paper] = await settled(client, project)
+        assert client.provider.scholarly.requests == []
+        assert paper["lookup"]["outcome"] == "no_identifier" and paper["checked_by"] is None
+
+
+async def test_a_failed_lookup_leaves_the_material_imported_with_incomplete_metadata(tmp_path):
+    mock = MockScholarly()
+    mock.answers = {"api.openalex.org": [503, 503, 503], "api.crossref.org": [500, 500, 500]}
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["state"] == "ready" and paper["title"] == "paper" and paper["checked_by"] is None
+        assert paper["lookup"]["outcome"] == "unavailable" and paper["retraction"] == "unknown"
+        assert mock.hosts == ["api.openalex.org"] * 3 + ["api.crossref.org"] * 3  # each retried twice, no more
+        # The run failed with its reason, so Retry is offered, and taken once the services answer again.
+        run = await run_finished(client, result["lookup_run_id"])
+        assert (run["status"], run["result"], run["retryable"]) == ("failed", {"reason": "unavailable"}, True)
+        mock.openalex[DOI] = openalex_work(DOI, TITLE)
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert again.status_code == 201
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert paper["title"] == TITLE and paper["checked_by"] == "lookup"
+
+
+async def test_a_failed_lookup_tried_again_twice_at_once_is_tried_again_once(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    mock.answers = {"api.openalex.org": [503] * 3, "api.crossref.org": [503] * 3}
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await settled(client, project)
+        first = result["lookup_run_id"]
+        assert (await run_finished(client, first))["status"] == "failed"
+        sent = len(mock.hosts)
+        both = await asyncio.gather(*[client.post(f"/api/runs/{first}/retry") for _ in range(2)])  # a double click
+        assert [r.status_code for r in both] == [201, 201] and both[0].json() == both[1].json()  # the same new run
+        again = both[0].json()["run_id"]
+        assert (await run_finished(client, again))["status"] == "succeeded"
+        assert await lookups(client) == [first, again] and len(mock.hosts) == sent + 1  # asked once more, not twice
+        assert (await client.post(f"/api/runs/{first}/retry")).json()["run_id"] == again  # later too: that run
+        assert (await run_finished(client, first))["retryable"] is False  # the list no longer offers it
+
+
+async def test_a_run_tried_again_while_left_running_in_the_record_ends_there_and_never_runs_again(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    provider, data = MockProvider(scholarly=mock), tmp_path / "data"
+    async with started(data, provider) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await settled(client, project)
+        first = result["lookup_run_id"]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # as a lost worker leaves it
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (first,)))
+        client.state["harness"].registry.finished.discard(first)
+        assert (await run_finished(client, first))["status"] == "interrupted"  # held by no process
+        again = (await client.post(f"/api/runs/{first}/retry")).json()["run_id"]
+        assert (await run_finished(client, again))["status"] == "succeeded"
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", first) == [("interrupted",)]  # in the record too
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # one left running all the same
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (first,)))
+        asked = len(mock.requests)
+    async with started(data, provider, setup=False) as client:
+        await background_idle(client)
+        await asyncio.sleep(0.2)
+        assert len(mock.requests) == asked  # its retry ran it: it is never started again
+        assert (await run_finished(client, first))["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("kick", ["holds it after the retry commits", "holds it during the retry"])
+async def test_a_kick_and_a_retry_of_a_run_left_running_never_both_run_it(tmp_path, monkeypatch, kick):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await settled(client, project)
+        first, harness, loop = result["lookup_run_id"], client.state["harness"], asyncio.get_running_loop()
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # as a lost worker leaves it
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?", (first,)))
+        harness.registry.finished.discard(first)
+        asked = len(mock.requests)
+        if kick == "holds it after the retry commits":  # the kick selects it, the retry commits, the kick goes on
+            real_read, retried = harness._read, []
+
+            async def read(fn):
+                found = await real_read(fn)
+                if "kick_background" in fn.__qualname__ and not retried:
+                    retried.append((await client.post(f"/api/runs/{first}/retry")).json()["run_id"])
+                return found
+
+            monkeypatch.setattr(harness, "_read", read)
+            await harness.kick_background()
+            assert (await run_finished(client, retried[0]))["status"] == "succeeded"
+            assert not harness.registry.is_active(first) and await lookups(client) == [first, retried[0]]
+        else:  # the kick holds it and starts it while the retry's transaction is open
+            real_retry = materials_module._retry
+
+            def retry(conn, run_id, registry):
+                found = real_retry(conn, run_id, registry)
+                active = registry.add_background(run_id)
+                loop.call_soon_threadsafe(lambda: setattr(active, "task", loop.create_task(harness._background(active))))
+                return found
+
+            monkeypatch.setattr(materials_module, "_retry", retry)
+            refused = await client.post(f"/api/runs/{first}/retry")
+            assert (refused.status_code, refused.json()["code"]) == (409, "not_retryable")  # it is running
+            assert (await run_finished(client, first))["status"] == "succeeded" and await lookups(client) == [first]
+        await background_idle(client)
+        assert len(mock.requests) == asked + 1  # one of them asked, never both
+
+
+async def test_openalex_unavailable_and_crossref_without_the_record_is_unavailable_not_not_found(tmp_path):
+    mock = MockScholarly()  # Crossref holds no record for it
+    mock.answers = {"api.openalex.org": [503, 503, 503]}  # OpenAlex never answers
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "unavailable"  # OpenAlex may hold it: not known to be missing
+        run = await run_finished(client, result["lookup_run_id"])
+        assert (run["status"], run["result"], run["retryable"]) == ("failed", {"reason": "unavailable"}, True)
+        assert mock.hosts == ["api.openalex.org"] * 3 + ["api.crossref.org"]
+
+
+@pytest.mark.parametrize("body", ["long", "compressed", "more members", "a tail"])
+async def test_an_answer_past_the_body_limit_is_given_up_as_it_streams_in(tmp_path, monkeypatch, body):
+    monkeypatch.setattr(lookup, "MAX_BODY", 5000)
+    record = gzip.compress(json.dumps(openalex_work(DOI, TITLE)).encode())  # a small, valid answer
+    gzipped = {"content-encoding": "gzip"}
+    if body == "long":  # 50,000 bytes in 50 chunks
+        chunks, headers = [b" " * 1000] * 50, {}
+    elif body == "compressed":  # 10 MB of spaces as about 10 kB of gzip, in 1 kB chunks
+        packed = gzip.compress(b" " * 10_000_000)
+        chunks, headers = [packed[i:i + 1000] for i in range(0, len(packed), 1000)], gzipped
+    elif body == "more members":  # the record, then 50 more gzip members of 1,000 bytes each, the first in its chunk
+        member = gzip.compress(b" " * 1000)
+        chunks, headers = [record + member] + [member] * 49, gzipped
+    else:  # the record, then 50,000 bytes after its end
+        chunks, headers = [record] + [b"\0" * 1000] * 50, gzipped
+    streams = []
+
+    async def answer(request):
+        streams.append(Chunks(chunks))
+        return httpx.Response(200, headers=headers, stream=streams[-1])
+
+    async with started(tmp_path / "data", MockProvider(scholarly=answer)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "unavailable" and paper["checked_by"] is None
+    assert len(streams) == 2  # OpenAlex's answer, then Crossref's: neither is tried again
+    assert all(stream.read <= 7 for stream in streams)  # each stopped once past the limit, not read to its end
+
+
+async def test_an_answer_that_trickles_in_is_given_up_once_its_request_passes_the_time_bound(monkeypatch):
+    monkeypatch.setattr(lookup, "TIMEOUT", 0.3)
+    streams = []
+
+    class Trickle(Chunks):  # one byte every 50 ms: each read is quick, the whole would take 10 s
+        async def __aiter__(self):
+            for chunk in self.chunks:
+                await asyncio.sleep(0.05)
+                self.read += 1
+                yield chunk
+
+    def answer(request):
+        streams.append(Trickle([b" "] * 200))
+        return httpx.Response(200, stream=streams[-1])
+
+    began = time.monotonic()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        with pytest.raises(lookup.Failed) as failed:
+            await lookup.resolve(client, "doi", DOI, lookup.Pace())
+    assert failed.value.code == "unavailable" and len(streams) == 6  # three tries at each source
+    assert all(stream.read < 10 for stream in streams) and time.monotonic() - began < 4
+
+
+async def test_a_compressed_answer_within_the_limit_is_read(tmp_path):
+    record = json.dumps(openalex_work(DOI, TITLE)).encode()
+
+    async def answer(request):
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Chunks([gzip.compress(record)]))
+
+    async with started(tmp_path / "data", MockProvider(scholarly=answer)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["title"] == TITLE
+
+
+async def test_a_compressed_answer_cut_before_its_end_is_refused(tmp_path):
+    record = gzip.compress(json.dumps(openalex_work(DOI, TITLE)).encode())
+
+    async def answer(request):  # the whole record, but not the gzip trailer that checks it
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, stream=Chunks([record[:-8]]))
+
+    async with started(tmp_path / "data", MockProvider(scholarly=answer)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "unavailable" and paper["title"] == "paper"
+
+
+async def test_an_identifier_no_service_knows_is_a_finished_lookup_not_a_failed_one(tmp_path):
+    async with started(tmp_path / "data") as client:  # neither stand-in holds a record for it
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["lookup"]["outcome"] == "not_found" and paper["checked_by"] is None
+        run = await run_finished(client, result["lookup_run_id"])
+        assert (run["status"], run["retryable"]) == ("succeeded", False)
+
+
+async def test_a_rate_limited_request_is_retried_and_resolves(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE)})
+    mock.answers = {"api.openalex.org": [(429, {"retry-after": "0"})]}
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["title"] == TITLE and mock.hosts == ["api.openalex.org"] * 2
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("7", (7.0, 7.0)), ("0", (0.0, 0.0)),  # delay-seconds
+    ("in 5", None), ("-3", None), ("", None), ("Fri, 32 Foo 9999 99:99:99 GMT", None),  # malformed: no delay
+    ("\u00b2", None), ("9" * 400, None),  # a digit that is not ASCII; a number past any float
+    ("Fri, 31 Dec 9999999999 23:59:59 GMT", None), ("Fri, 31 Dec 99999999999999999999 23:59:59 GMT", None),  # years
+    ("past", None),  # a date already past: no delay
+    ("future", (3.0, 5.5)),  # an HTTP-date: the seconds until then
+])
+async def test_retry_after_is_read_as_seconds_or_as_a_date(value, expected):
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+    now = datetime.now(UTC)
+    value = {"past": format_datetime(now - timedelta(minutes=5), usegmt=True),
+             "future": format_datetime(now + timedelta(seconds=5), usegmt=True)}.get(value, value)
+    sent = [(b"retry-after", value.encode("latin-1"))] if value else []  # as a server's bytes arrive
+    after = lookup._retry_after(httpx.Response(429, headers=sent))
+    assert after is None if expected is None else expected[0] <= after <= expected[1]
+
+
+@pytest.mark.parametrize("doi", ["10.1234/../../works", "10.1234/./x", "10.1234/a/../b", "10.1234/a/.."])
+async def test_a_doi_with_a_dot_segment_is_no_doi_and_never_leaves_its_single_record_path(doi):
+    cleaned = extraction.clean_doi(doi)  # neither from a file nor typed by the researcher
+    assert cleaned is None or not {".", ".."} & set(cleaned.split("/"))  # trailing dots are punctuation
+    sent = []
+
+    def answer(request):
+        sent.append(request.url.raw_path)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        with pytest.raises(lookup.Failed):  # handed one all the same, neither source is asked
+            await lookup.resolve(client, "doi", doi, lookup.Pace())
+    assert sent == []
+
+
+async def test_the_starting_values_for_pacing_retries_and_time():
+    spacing, retries, timeout = DEFAULTS  # sections 7.6 and 13
+    assert (spacing["arxiv"], retries, timeout) == (3.0, (1.0, 4.0), 20.0)
+
+
+async def test_pacing_spaces_one_sources_requests():
+    pace = lookup.Pace()
+    lookup.SPACING["arxiv"] = 0.15
+    loop = asyncio.get_running_loop()
+    times = []
+    for _ in range(3):
+        async with pace.turn("arxiv"):
+            times.append(loop.time())
+    assert all(b - a >= 0.14 for a, b in zip(times, times[1:]))
+
+
+async def test_a_sources_next_request_waits_for_a_slow_one_to_be_answered():
+    seen = {"in_flight": 0, "most": 0, "paths": []}
+
+    async def slow(request):  # each answer takes longer than the source's spacing
+        seen["in_flight"] += 1
+        seen["most"] = max(seen["most"], seen["in_flight"])
+        seen["paths"].append(request.url.path)
+        await asyncio.sleep(0.2)
+        seen["in_flight"] -= 1
+        return streamed(httpx.Response(200, content=arxiv_feed("2401.00001", "A Synthetic Preprint")))
+
+    pace = lookup.Pace()
+    lookup.SPACING["arxiv"] = 0.05  # shorter than an answer takes
+    async with httpx.AsyncClient(transport=httpx.MockTransport(slow)) as client:
+        found = await asyncio.gather(*(lookup.resolve(client, "arxiv", "2401.00001", pace) for _ in range(3)))
+    assert [f.source for f in found] == ["arxiv"] * 3 and len(seen["paths"]) == 3
+    assert seen["most"] == 1  # never two requests to arXiv at once, across lookups
+
+
+async def test_a_looked_up_author_with_the_longest_names_survives_an_edit_of_another(tmp_path):
+    family, given = "F" * lookup.NAME_CHARS, "G" * lookup.NAME_CHARS  # as long as a lookup keeps
+    record = {**crossref_work(DOI, TITLE), "author": [{"family": family, "given": given}]}
+    async with started(tmp_path / "data", MockProvider(scholarly=MockScholarly(crossref={DOI: record}))) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [paper] = await settled(client, project)
+        assert paper["csl"]["author"] == [{"family": family, "given": given}]
+        # The form sends every author back, as "Family, Given", with one more added.
+        edited = await client.patch(f"/api/materials/{result['materials'][0]['id']}",
+                                    json={"authors": [f"{family}, {given}", "Example, Ana"]})
+        assert edited.status_code == 200, edited.text
+        assert edited.json()["csl"]["author"] == [{"family": family, "given": given}, {"family": "Example", "given": "Ana"}]
+
+
+async def test_a_researchers_edit_is_kept_and_its_retraction_still_checked(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE, retracted=True)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        await settled(client, project)
+        material = result["materials"][0]["id"]
+        await client.patch(f"/api/materials/{material}", json={"title": "My Own Title"})
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert again.status_code == 409  # a lookup that succeeded is not tried again
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'failed' WHERE id = ?", (result["lookup_run_id"],)))
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [paper] = await settled(client, project)
+        assert (paper["title"], paper["checked_by"], paper["retraction"]) == ("My Own Title", "researcher", "retracted")
+
+
+@pytest.mark.parametrize("doi", ["changed", "cleared", "unchanged"])
+async def test_a_doi_the_researcher_changes_or_clears_takes_its_lookups_provenance_and_retraction_with_it(tmp_path, doi):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE, retracted=True)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [looked] = await settled(client, project)
+        assert (looked["retraction"], looked["source_key"], looked["csl"]["volume"]) == ("retracted", "openalex:W0000000001", "3")
+        material = result["materials"][0]["id"]
+        typed = {"changed": "10.5555/another.paper", "cleared": "", "unchanged": f"https://doi.org/{DOI.upper()}"}[doi]
+        saved = await client.patch(f"/api/materials/{material}", json={"title": "My Own Title", "doi": typed})
+        assert saved.status_code == 200, saved.text
+        paper = saved.json()
+        assert (paper["title"], paper["checked_by"]) == ("My Own Title", "researcher")
+        if doi == "unchanged":  # the lookup's record still describes it: all of it is kept
+            assert (paper["retraction"], paper["source_key"], paper["csl"]["DOI"]) == ("retracted", "openalex:W0000000001", DOI)
+            assert paper["resolved_at"] and paper["retraction_checked_at"] and paper["csl"]["volume"] == "3"
+        else:  # nothing of the old DOI's record stays: no retraction flag, no provenance, none of its fields
+            assert (paper["retraction"], paper["retraction_checked_at"]) == ("unknown", None)
+            assert (paper["source_key"], paper["resolved_at"]) == (None, None)
+            assert set(paper["csl"]) <= {"title", "author", "issued", "container-title", "DOI"}
+            assert paper["csl"].get("DOI") == (typed or None) and paper["csl"]["author"] == looked["csl"]["author"]
+            assert paper["evidence_type"] == looked["evidence_type"] == "full_text"  # the file's, not the lookup's
+        # The file's DOI looked up again: a retraction is recorded only for the DOI the details carry.
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'failed' WHERE id = ?", (result["lookup_run_id"],)))
+        again = await client.post(f"/api/runs/{result['lookup_run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        [later] = await settled(client, project)
+        assert later["retraction"] == ("retracted" if doi == "unchanged" else "unknown")
+        assert (later["title"], later["checked_by"]) == ("My Own Title", "researcher")
+
+
+async def test_a_retracted_papers_file_replaced_by_one_known_only_to_arxiv_reads_unchecked(tmp_path):
+    mock = MockScholarly(openalex={DOI: openalex_work(DOI, TITLE, retracted=True)},
+                         arxiv={synthetic.ARXIV: "The Replacement Preprint"})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [retracted] = await settled(client, project)
+        assert (retracted["retraction"], retracted["source_key"]) == ("retracted", "openalex:W0000000001")
+        await added(client, project, ("v2.md", synthetic.paper_markdown()), material_id=result["materials"][0]["id"])
+        [replaced] = await settled(client, project)
+        assert (replaced["title"], replaced["source_key"]) == ("The Replacement Preprint", f"arxiv:{synthetic.ARXIV}")
+        assert (replaced["retraction"], replaced["retraction_checked_at"]) == ("unknown", None)  # arXiv says nothing
+
+
+# By level
+
+
+async def test_a_review_locked_project_never_looks_up(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Review", "sensitivity": "local_only",
+                                                           "review_lock": True})).json()["id"]
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        assert result["lookup_run_id"] is None
+        await settled(client, project)
+        assert client.provider.scholarly.requests == [] and await gate_log(client) == []
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(0,)]
+
+
+async def test_a_local_only_project_asks_once_per_batch_and_the_answer_covers_that_batch_only(tmp_path):
+    records = {DOI: openalex_work(DOI, TITLE)}
+    async with started(tmp_path / "data", scholarly(openalex=records, arxiv={synthetic.ARXIV: "Preprint"})) as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()),
+                             ("same.docx", synthetic.paper_docx()),  # the same DOI: counted once
+                             ("notes.md", synthetic.paper_markdown()))
+        [ask] = await ask_of(client, project)
+        assert ask["run_id"] == result["lookup_run_id"] and ask["kind"] == "identifier_lookup"
+        assert ask["params"] == {"services": ["arxiv", "crossref", "openalex"], "identifiers": 2}
+        assert ask["options"] == ["lookup", "skip"] and ask["text_box"] is False and ask["project_id"] == project
+        assert client.provider.scholarly.requests == []  # nothing before the answer
+        answered = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "lookup"})
+        assert answered.status_code == 200
+        papers = await settled(client, project)
+        assert sum(p["checked_by"] == "lookup" for p in papers) == 3
+        assert {e["approved"] for e in await gate_log(client)} == {True}
+        assert len(client.provider.scholarly.requests) == 2  # each distinct identifier once
+        # A later import asks again: the answer covered its own batch.
+        later = await added(client, project, ("later.md", f"# Later\n\ndoi:{DOI}\n".encode()))
+        [again] = await ask_of(client, project)
+        assert again["run_id"] == later["lookup_run_id"] and again["params"]["identifiers"] == 1
+        declined = await client.post(f"/api/runs/{again['run_id']}/asks/{again['ask_id']}", json={"option": "skip"})
+        assert declined.status_code == 200
+        run = await run_finished(client, later["lookup_run_id"])
+        assert (run["status"], run["cancel_reason"], run["result"]) == ("cancelled", "researcher", {"reason": "declined"})
+        skipped = next(p for p in (await listing(client, project))["materials"] if p["lookup"]["run_id"] == run["run_id"])
+        assert skipped["lookup"]["reason"] == "declined"  # the paper says it was skipped, not stopped
+        assert len(client.provider.scholarly.requests) == 2  # nothing sent for it
+        retried = await client.post(f"/api/runs/{later['lookup_run_id']}/retry")
+        assert retried.status_code == 201
+        [asked_again] = await ask_of(client, project)  # a retry from the list asks again
+        assert asked_again["run_id"] == retried.json()["run_id"]
+
+
+def drop_files(count, prefix="drop"):
+    """count Markdown files, each with an identifier of its own, and the records for them."""
+    dois = [f"10.5555/{prefix}.paper.{i}" for i in range(count)]
+    return ([(f"{prefix}-{i}.md", f"# Paper {i}\n\ndoi:{d}\n".encode()) for i, d in enumerate(dois)],
+            {d: openalex_work(d, f"Paper {i}") for i, d in enumerate(dois)})
+
+
+async def lookups(client):
+    return [r for (r,) in await rows(client, "SELECT id FROM runs WHERE workflow = 'lookup' ORDER BY rowid")]
+
+
+async def test_a_drop_sent_in_several_requests_asks_once_counting_every_identifier(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 60)  # closed by its last request, not by waiting
+    files, records = drop_files(45)
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client, level="local_only")
+        batch = None
+        for start in range(0, 45, 20):  # as the interface sends it: requests of at most 20 files
+            more = start + 20 < 45
+            sent = await added(client, project, *files[start:start + 20], **({"more": True} if more else {}),
+                               **({"batch": batch} if batch else {}))
+            assert sent["lookup_run_id"] == (batch or sent["lookup_run_id"])  # the first's run is the drop's batch
+            batch = sent["lookup_run_id"]
+        [ask] = await ask_of(client, project)
+        assert ask["run_id"] == batch and ask["params"]["identifiers"] == 45  # one question for all of it
+        assert await lookups(client) == [batch]
+        assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200
+        papers = await settled(client, project)
+        assert sum(p["checked_by"] == "lookup" for p in papers) == 45
+
+
+@pytest.mark.parametrize("ending", ["window closed", "app restarted"])
+async def test_a_drop_whose_last_request_never_comes_is_still_looked_up_once(tmp_path, monkeypatch, ending):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 0.3)
+    files, records = drop_files(3)
+    data = tmp_path / "data"
+    async with started(data, scholarly(openalex=records)) as client:
+        project = await project_of(client, level="local_only")
+        first = await added(client, project, files[0], more=True)
+        batch = first["lookup_run_id"]
+        assert (await added(client, project, files[1], batch=batch, more=True))["lookup_run_id"] == batch
+        if ending == "window closed":  # nothing more comes: the batch closes itself once it waits too long
+            [ask] = await ask_of(client, project)
+            assert ask["run_id"] == batch and ask["params"]["identifiers"] == 2
+            assert await lookups(client) == [batch]
+            return
+    async with started(data, scholarly(openalex=records), setup=False) as client:  # the batch was open at the stop
+        [ask] = await ask_of(client, project)
+        assert ask["run_id"] == batch and ask["params"]["identifiers"] == 2
+        assert await lookups(client) == [batch]
+
+
+async def test_a_request_for_a_batch_closed_meanwhile_gets_a_lookup_of_its_own(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 0.2)
+    files, records = drop_files(2)
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client)
+        batch = (await added(client, project, files[0], more=True))["lookup_run_id"]
+        assert (await run_finished(client, batch))["status"] == "succeeded"  # closed by waiting, then looked up
+        late = await added(client, project, files[1], batch=batch)
+        assert late["lookup_run_id"] not in (None, batch)  # never lost: it is looked up on its own
+        papers = await settled(client, project)
+        assert sorted(p["title"] for p in papers) == ["Paper 0", "Paper 1"]
+        refused = await client.post(f"/api/projects/{project}/materials", json={"files": []})
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")  # nothing to add or close
+
+
+async def test_a_request_for_a_batch_whose_cancel_is_requested_gets_a_lookup_of_its_own(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 60)
+    files, records = drop_files(2)
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client)
+        batch = (await added(client, project, files[0], more=True))["lookup_run_id"]
+        active = client.state["harness"].registry.runs[batch]
+        while not active.started:  # waiting for the rest of its drop
+            await asyncio.sleep(0.01)
+        active.cancel_requested.set()  # Cancel requested; its terminal record not yet written, so it reads running
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", batch) == [("running", None)]
+        late = await added(client, project, files[1], batch=batch)
+        assert late["lookup_run_id"] not in (None, batch)  # not taken into a batch that is ending
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", batch)
+        assert json.loads(inputs)["material_ids"] == [m["id"] for m in (await listing(client, project))["materials"]
+                                                       if m["title"] == "drop-0"]
+        active.cancel_requested.clear()
+        assert (await client.post(f"/api/runs/{batch}/cancel")).json()["status"] == "cancelled"
+        papers = {p["title"]: p for p in await settled(client, project)}
+        assert papers["Paper 1"]["lookup"]["run_id"] == late["lookup_run_id"]  # looked up by its own run
+        assert papers["drop-0"]["lookup"]["status"] == "cancelled"
+
+
+async def test_an_answer_that_comes_while_its_lookup_is_being_cancelled_is_refused(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        active = client.state["harness"].registry.runs[result["lookup_run_id"]]
+        active.cancel_requested.set()  # Cancel requested; its terminal record not yet written
+        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "lookup"})
+        assert (late.status_code, late.json()["code"]) == (409, "ask_closed")
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'ask_answered'",
+                          ask["run_id"]) == [(0,)]
+        active.cancel_requested.clear()
+        assert (await client.post(f"/api/runs/{result['lookup_run_id']}/cancel")).json()["status"] == "cancelled"
+        assert client.provider.scholarly.requests == []
+
+
+async def test_a_local_only_lookup_cancelled_while_it_asks_closes_its_ask(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        assert (await client.post(f"/api/runs/{result['lookup_run_id']}/cancel")).json()["status"] == "cancelled"
+        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "lookup"})
+        assert (late.status_code, late.json()["code"]) == (409, "ask_closed")
+        assert (await listing(client, project))["asks"] == [] and client.provider.scholarly.requests == []
+        [paper] = (await listing(client, project))["materials"]
+        assert (paper["lookup"]["status"], paper["lookup"]["reason"]) == ("cancelled", None)  # stopped, not skipped

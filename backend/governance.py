@@ -305,10 +305,20 @@ def policy(conn, project_id):
     return Policy(row[0], bool(row[1]), declared_origins(conn), tuple(allowlist(conn)))
 
 
+# Local work that sends nothing off this Mac, so a stricter level or the review lock takes nothing
+# from it: reading a material, and full backups and exports (an unencrypted one stops through
+# backups.Archives). Identifier lookups and model calls are revoked.
+UNSENT_WORKFLOWS = ("extract", "full_backup", "project_export")
+
+
 def revoke_running(conn, project_id):
-    """Revoke every running run of the project, in the caller's transaction (a tightening, or the
-    review lock): its next dispatch is refused. Returns their ids, for the harness to stop them."""
+    """Revoke every running run of the project that may send something, in the caller's transaction
+    (a tightening, or the review lock): its next dispatch is refused. Returns their ids, for the
+    harness to stop them."""
+    unsent = f"coalesce(workflow, '') NOT IN ({', '.join('?' * len(UNSENT_WORKFLOWS))})"
     ids = [run_id for (run_id,) in conn.execute(
-        "SELECT id FROM runs WHERE project_id = ? AND status = 'running' ORDER BY id", (project_id,))]
-    conn.execute("UPDATE runs SET cancel_reason = 'revoked' WHERE project_id = ? AND status = 'running'", (project_id,))
+        f"SELECT id FROM runs WHERE project_id = ? AND status = 'running' AND {unsent} ORDER BY id",
+        (project_id, *UNSENT_WORKFLOWS))]
+    conn.execute(f"UPDATE runs SET cancel_reason = 'revoked' WHERE project_id = ? AND status = 'running' AND {unsent}",
+                 (project_id, *UNSENT_WORKFLOWS))
     return ids

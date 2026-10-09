@@ -2,7 +2,8 @@
 // The window (slice-1 spec section 3): the sidebar, the conversation, and the side panel,
 // with resizable, remembered dividers. Under 1,000 pixels the sidebar becomes a drawer, and
 // when the conversation and the panel do not both fit, the panel slides over the
-// conversation. The layout is kept in [ui.layout]; each project keeps its open panel.
+// conversation. The layout is kept in [ui.layout]; each project keeps its open panel. Files
+// dropped anywhere on the window are added to the open project, whose Library then opens (F3a).
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as Drawer from '@radix-ui/react-dialog';
 import { useT } from '../i18n/index.js';
@@ -10,6 +11,9 @@ import { ApiError, get, saveSettings } from '../api.js';
 import { DEFAULTS, LIMITS, clamp, columns, fromSettings, panelShareAt, toSettings } from '../layout.js';
 import { errorText } from '../text.js';
 import { subscribe } from '../live.js';
+import { libraryChanged } from '../library.js';
+import { projectName } from '../projects.js';
+import { addTo } from './Library.jsx';
 import { Divider } from './Divider.jsx';
 import { Sidebar } from './Sidebar.jsx';
 import { ConversationView } from './ConversationView.jsx';
@@ -57,6 +61,7 @@ export function Shell({ health, settings, onLanguage }) {
   const [conversationId, setConversationId] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notice, setNotice] = useState(null);
+  const [dropping, setDropping] = useState(false); // files are dragged over the window
   const saved = useRef(layout);
   const shown = useRef(null); // the project shown now: a list read for another is dropped
   const opener = useRef(null); // what opened an overlaid panel, focused again when it closes
@@ -146,6 +151,15 @@ export function Shell({ health, settings, onLanguage }) {
     if (projectId) saveSettings({ 'ui.panel': next }, projectId).catch(fail);
   }, [panel, projectId, fail]);
 
+  // Files dropped on the window go to the open project; its Library opens to show them and any
+  // question their lookup asks (a drop in the Library itself is the Library's, and goes no further:
+  // the window's overlay is cleared on the way down, at every drop).
+  const hasFiles = (event) => Boolean(event.dataTransfer?.types?.includes('Files')) && !settingsOpen && Boolean(projectId);
+  async function dropFiles(files) {
+    if (panel !== 'library') togglePanel('library');
+    if (await addTo(projectId, files, t, setNotice)) libraryChanged(projectId);
+  }
+
   const view = columns({ width, ...layout, panelOpen: panel !== 'none' });
   const overlaid = panel !== 'none' && view.overlay; // the panel covers the conversation, which is inert meanwhile
 
@@ -176,8 +190,18 @@ export function Shell({ health, settings, onLanguage }) {
   const conversation = useMemo(() => conversations.find((c) => c.id === conversationId) ?? null,
     [conversations, conversationId]);
 
+  const project = projects.find((p) => p.id === projectId);
   return (
-    <div className="flex h-full">
+    <div className="relative flex h-full"
+      onDragOver={(event) => { if (hasFiles(event)) { event.preventDefault(); setDropping(true); } }}
+      onDragLeave={(event) => { if (!event.relatedTarget) setDropping(false); }}
+      onDropCapture={() => setDropping(false)}
+      onDrop={(event) => { if (!hasFiles(event)) return; event.preventDefault(); dropFiles(event.dataTransfer.files); }}>
+      {dropping && (
+        <div aria-hidden="true" className="pointer-events-none fixed inset-3 z-50 grid place-items-center rounded-2xl border-2 border-dashed border-brand bg-brand-soft/70 animate-in fade-in-0">
+          <p className="rounded-lg bg-background/90 px-4 py-2 text-sm font-medium shadow-sm">{t('library.dropOnWindow', { name: projectName(t, project) })}</p>
+        </div>
+      )}
       {view.sidebarShown && <>
         <div className="h-full shrink-0" style={{ width: view.sidebar }}>{sidebar}</div>
         <Divider
@@ -213,6 +237,7 @@ export function Shell({ health, settings, onLanguage }) {
                 : (() => { const next = { ...layout, sidebarOpen: true }; setLayout(next); saveLayout(next); })())}
               onPanel={togglePanel}
               onCreated={(id) => { setConversationId(id); loadConversations().catch(fail); }}
+              onLibrary={() => panel !== 'library' && togglePanel('library')}
             />
           </div>
           {panel !== 'none' && !view.overlay && (
@@ -231,13 +256,13 @@ export function Shell({ health, settings, onLanguage }) {
           {panel !== 'none' && (
             <div className={cn('shrink-0 bg-background', view.overlay && 'absolute inset-y-0 right-0 z-30 border-l shadow-2xl')}
               style={{ width: view.panel }}>
-              <SidePanel which={panel} overlay={overlaid} onClose={() => togglePanel(panel)} />
+              <SidePanel which={panel} overlay={overlaid} onClose={() => togglePanel(panel)} project={project} />
             </div>
           )}
         </div>
       </div>
       <Settings open={settingsOpen} onOpenChange={setSettingsOpen} health={health} onLanguage={onLanguage}
-        project={projects.find((p) => p.id === projectId)} onProjectChanged={() => loadProjects(projectId).catch(fail)} />
+        project={project} onProjectChanged={() => loadProjects(projectId).catch(fail)} />
       {notice && (
         <div role="alert" className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 animate-fade-up rounded-lg border bg-card px-4 py-2.5 text-sm shadow-lg"
           onClick={() => setNotice(null)}>

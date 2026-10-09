@@ -1,9 +1,11 @@
 """Backups, restore and project export: the API under Settings, then Advanced.
 
 Automatic backups (backend.db.database) are taken at launch, while the app is idle
-(once a day, checked every IDLE_CHECK_SECONDS when no run is active), and before a
+(once a day, checked every IDLE_CHECK_SECONDS when no run is at work), and before a
 bulk deletion (backup_before_deletion). purge() takes them out of deleted data's way.
 Full backups and project exports are zip files in a folder the researcher chose,
+written by background runs (`register`): the request checks what it can and answers with the
+run's id, and the run's progress, Cancel and result show in the background-run list. Each is
 written under a temporary name and renamed when complete. One that holds a Private
 or Local only project is AES-encrypted with the researcher's passphrase (pyzipper)
 and refused without one; others are plain zip files. Neither holds a stored key, the
@@ -47,7 +49,7 @@ from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseClosedError,
 from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
     list_generations
 from backend.db.migrations import MIGRATIONS
-from backend.runs import _through
+from backend.runs import RunOutcome, _through
 from backend.settings import known_only, write_private
 
 log = logging.getLogger(__name__)
@@ -232,12 +234,23 @@ router = APIRouter(lifespan=lifespan, route_class=_Route)
 
 
 async def _idle_backups(state):
-    """While the app stays open, take the day's backup at a check that finds no run active."""
+    """While the app stays open, take the day's backup at a check that finds no run at work. A run
+    waiting on its question (a Local only lookup's confirmation) is not at work: it writes nothing
+    while it waits, and an unanswered question would otherwise hold the backup off for as long as
+    the app stays open."""
     while True:
         await asyncio.sleep(IDLE_CHECK_SECONDS)
         async with state["backups_lock"]:
             db, harness = state.get("db"), state.get("harness")
-            if db is None or harness is None or harness.registry.runs:
+            if db is None or harness is None:
+                continue
+            held = set(harness.registry.runs)
+            try:
+                asking = await asyncio.to_thread(db.read, lambda conn: {run for (run,) in conn.execute(
+                    "SELECT id FROM runs WHERE status = 'running' AND waiting = 'ask'")}) if held else set()
+            except Exception:  # the next check reads again
+                continue
+            if held - asking:
                 continue
             try:
                 await asyncio.to_thread(db.backup_if_due)
@@ -491,22 +504,66 @@ def _watched(archives, projects, passphrase):
 # Full backups
 
 
-@router.post("/api/backups/full")
+@router.post("/api/backups/full", status_code=202)
 async def full_backup(body: FullBackup, request: Request):
+    """Start a full backup as a background run of the General project: {"run_id"}. A folder that
+    will not do, or no passphrase while a Private or Local only project exists, is refused first."""
     state = request.app.state.scholia
     destination = await asyncio.to_thread(_destination, body.destination, state["data_dir"])
-    async with state["backups_lock"]:
-        db = _db(state)
-        return await _to_end(asyncio.to_thread(_full_backup, db, destination, body.passphrase or None,
-                                               state["archives"]))
+    db = _db(state)
+    general, sensitive = await asyncio.to_thread(db.read, lambda conn: conn.execute(
+        "SELECT (SELECT id FROM projects WHERE kind = 'general'),"
+        f" (SELECT count(*) FROM projects WHERE sensitivity IN {SENSITIVE})").fetchone())
+    if sensitive and not body.passphrase:
+        raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
+    run_id = await _to_end(state["harness"].start_local(
+        general, "full_backup", {"destination": str(destination), "encrypted": bool(body.passphrase)},
+        {"passphrase": body.passphrase or None}))
+    return {"run_id": run_id}
 
 
-def _full_backup(db, destination, passphrase, archives):
+def register(harness, state):
+    """Full backups and project exports as the harness's local background work. The passphrase is
+    held in memory only, so a run a restart left unfinished ends interrupted. A run holds
+    backups_lock while it writes, as every backup, restore and export does."""
+
+    async def archive(harness, active, project_id, inputs):
+        if active.context is None:
+            raise RunOutcome("interrupted")
+        passphrase = active.context.get("passphrase")
+
+        def progress(done, total):
+            active.progress = {"done": done, "total": total}
+
+        try:
+            async with state["backups_lock"]:
+                db = _db(state)
+                stop = lambda: db.closed or active.cancel_requested.is_set()  # noqa: E731
+                destination = Path(inputs["destination"])
+                if inputs.get("project_id"):  # an export; else a full backup
+                    write = lambda: _export(db, inputs["project_id"], destination, passphrase,  # noqa: E731
+                                            inputs.get("language", "en"), state["archives"], stop, progress)
+                else:
+                    write = lambda: _full_backup(db, destination, passphrase, state["archives"], stop,  # noqa: E731
+                                                 progress)
+                result = await harness.work(active, write)
+        except BackupError as error:
+            raise RunOutcome("failed", error.code) from None
+        except DatabaseClosedError:  # the app is closing, or a restore replaced the database
+            raise RunOutcome("failed", "closing") from None
+        result.pop("ok", None)
+        return result, None
+
+    harness.workflows["full_backup"] = archive
+    harness.workflows["project_export"] = archive
+
+
+def _full_backup(db, destination, passphrase, archives, stop=None, progress=None):
     with _written(), _watched(archives, None, passphrase) as archive:
-        return _write_full_backup(db, destination, passphrase, archive)
+        return _write_full_backup(db, destination, passphrase, archive, stop, progress)
 
 
-def _write_full_backup(db, destination, passphrase, archive):
+def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None):
     staging = _staging(db.data_dir)
     try:
         with _backup_errors():
@@ -541,7 +598,8 @@ def _write_full_backup(db, destination, passphrase, archive):
                 missing += 1
         record = {"encrypted": passphrase is not None, "projects": projects, "content_files": len(hashes) - missing,
                   "missing_files": missing, "settings_left_out": left_out, "schema_version": info["schema_version"]}
-        path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=lambda: db.closed, archive=archive,
+        path = _write_zip(destination, "scholia-backup", entries, passphrase, stop=stop or (lambda: db.closed),
+                          archive=archive, progress=progress,
                           audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
                               "INSERT INTO audit_log (event, data) VALUES ('full_backup', ?)",
                               (json.dumps({"file": str(file), **record}),))))
@@ -1239,22 +1297,32 @@ def _referenced_content(conn):
 # Project export
 
 
-@router.post("/api/projects/{project_id}/export")
+@router.post("/api/projects/{project_id}/export", status_code=202)
 async def export_project(project_id: str, body: Export, request: Request):
+    """Start a project export as a background run of the project: {"run_id"}. An unknown project,
+    a folder that will not do, or no passphrase for a Private or Local only project is refused first."""
     state = request.app.state.scholia
     destination = await asyncio.to_thread(_destination, body.destination, state["data_dir"])
-    async with state["backups_lock"]:
-        db = _db(state)
-        return await _to_end(asyncio.to_thread(_export, db, project_id, destination, body.passphrase or None,
-                                               body.language, state["archives"]))
+    db = _db(state)
+    row = await asyncio.to_thread(db.read, lambda conn: conn.execute(
+        "SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone())
+    if row is None:
+        raise BackupError(404, "not_found", "No such project")
+    if row[0] in SENSITIVE and not body.passphrase:
+        raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
+    run_id = await _to_end(state["harness"].start_local(
+        project_id, "project_export", {"project_id": project_id, "destination": str(destination),
+                                       "encrypted": bool(body.passphrase), "language": body.language},
+        {"passphrase": body.passphrase or None}))
+    return {"run_id": run_id}
 
 
-def _export(db, project_id, destination, passphrase, language, archives):
+def _export(db, project_id, destination, passphrase, language, archives, stop=None, progress=None):
     with _written(), _watched(archives, {project_id}, passphrase) as archive:
-        return _write_export(db, project_id, destination, passphrase, language, archive)
+        return _write_export(db, project_id, destination, passphrase, language, archive, stop, progress)
 
 
-def _write_export(db, project_id, destination, passphrase, language, archive):
+def _write_export(db, project_id, destination, passphrase, language, archive, stop=None, progress=None):
     data = db.read(lambda conn: _project_records(conn, project_id))
     if data is None:
         raise BackupError(404, "not_found", "No such project")
@@ -1293,8 +1361,8 @@ def _write_export(db, project_id, destination, passphrase, language, archive):
     record = {"encrypted": passphrase is not None, "conversations": len(data["conversations"]),
               "turns": sum(len(c["turns"]) for c in data["conversations"]), "artifacts": len(data["artifacts"]),
               "materials": len(data["materials"])}
-    path = _write_zip(destination, f"scholia-project-{project_id[:8]}", entries, passphrase, stop=lambda: db.closed,
-                      archive=archive,
+    path = _write_zip(destination, f"scholia-project-{project_id[:8]}", entries, passphrase,
+                      stop=stop or (lambda: db.closed), archive=archive, progress=progress,
                       audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
                           "INSERT INTO audit_log (event, project_id, data) VALUES ('project_export', ?, ?)",
                           (project_id, json.dumps({"file": str(file), **record})))))
@@ -1338,7 +1406,8 @@ def _project_records(conn, project_id):
     for material in materials:
         material["csl"] = json.loads(material["csl"]) if material["csl"] else None
         material["versions"] = rows(
-            "SELECT v.seq, v.file_sha256, v.is_current, c.media_type, v.created_at FROM material_versions v"
+            "SELECT v.seq, v.file_sha256, v.is_current, coalesce(v.media_type, c.media_type) AS media_type, v.created_at"
+            " FROM material_versions v"
             " LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE v.material_id = ? ORDER BY v.seq",
             material["id"])
     artifacts = rows("SELECT id, kind, title, language, citation_style, template_id, authors, venue, doc, doc_rev,"
@@ -1444,14 +1513,15 @@ def _publish(tmp, final):
             raise
 
 
-def _write_zip(destination, prefix, entries, passphrase, *, stop, audit, archive=None):
+def _write_zip(destination, prefix, entries, passphrase, *, stop, audit, archive=None, progress=None):
     """Write entries [(name, bytes or a file's path)] to a new zip file in destination, owner-only:
     AES-encrypted with passphrase when given. audit(path) records it first, before anything is
     written there, so no file ever leaves the data folder unrecorded; a failure afterwards leaves
     the record of an attempt. It is written under a temporary name and given its name when complete
     and synced, never replacing a file that appeared there meanwhile (it takes the next free name,
     recorded too); on any failure, what was written there is removed. stop() is checked before each
-    entry and chunk; when true (the app is closing), it stops with 503 closing. archive (see
+    entry and chunk, and before the file is named; when true (the app is closing, or the run was
+    cancelled), it stops with 503 closing. progress(done, total), if given, counts entries. archive (see
     Archives) is given when it is written without a passphrase: the file is made, written and named
     only through it, unbuffered, and once it is stopped it writes nothing more and its file is
     removed, with 400 passphrase_required. Returns the file's path."""
@@ -1481,7 +1551,9 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop, audit, archive
                 with zipped:
                     if passphrase:
                         zipped.setpassword(passphrase.encode("utf-8"))
-                    for entry_name, source in entries:
+                    for done, (entry_name, source) in enumerate(entries):
+                        if progress is not None:
+                            progress(done, len(entries))
                         go_on()
                         info = zipped.zipinfo_cls(entry_name, date_time=datetime.now().timetuple()[:6])
                         info.external_attr = 0o600 << 16
@@ -1500,6 +1572,7 @@ def _write_zip(destination, prefix, entries, passphrase, *, stop, audit, archive
                 zipped.fp = None  # failed: its file is removed, and nothing is written to it, even when collected
                 raise
         _fsync(tmp)
+        go_on()
         while True:
             try:
                 with held():  # once named, it is complete: a change waiting for it comes after

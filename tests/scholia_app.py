@@ -44,7 +44,8 @@ class MockProvider:
     zero-retention endpoints those in `zero_retention`: an id (one endpoint tagged "example"
     with a 128K window) or a listing row of its own; both are empty by default."""
 
-    def __init__(self, *replies, cost=0.002, catalog=(), zero_retention=()):
+    def __init__(self, *replies, cost=0.002, catalog=(), zero_retention=(), scholarly=None):
+        self.scholarly = scholarly if scholarly is not None else MockScholarly()  # OpenAlex, Crossref and arXiv
         self.catalog = list(catalog)
         self.zero_retention = list(zero_retention)
         self.replies = list(replies)
@@ -61,6 +62,8 @@ class MockProvider:
                                "cost": self.cost if cost is None else cost, **usage}}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.host in MockScholarly.HOSTS:
+            return streamed(await self.scholarly(request))
         body = json.loads(request.content) if request.content else None
         self.requests.append((request.method, request.url.path, body))
         self.headers.append(request.headers)
@@ -101,6 +104,94 @@ class MockProvider:
     @property
     def titles(self):
         return [body for body in self.chats if _is_title(body)]
+
+
+class Chunks(httpx.AsyncByteStream):
+    """A body that arrives in these chunks, each only as the client reads it; `read` counts them."""
+
+    def __init__(self, chunks):
+        self.chunks, self.read = list(chunks), 0
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.read += 1
+            yield chunk
+
+
+def streamed(response):
+    """A test's answer as a server's arrives: streamed, not already read (as httpx reads one made from bytes)."""
+    if not response.is_stream_consumed:
+        return response
+    return httpx.Response(response.status_code, headers=response.headers, stream=Chunks([response.content]))
+
+
+class MockScholarly:
+    """Test-owned stand-ins for OpenAlex, Crossref and arXiv's identifier endpoints, behind the gate's
+    mock transport: records by DOI or arXiv ID (made-up ones, never real works), each request kept in
+    `requests` as (host, path and query, headers). `answers[host]` is a list of statuses (or (status,
+    headers) pairs) answered first, before any record; `hold`, when set to an asyncio.Event, keeps
+    requests waiting until it is set, after `started` is set: those to the hosts in `held` only,
+    when it is set."""
+
+    HOSTS = {"api.openalex.org", "api.crossref.org", "export.arxiv.org"}
+
+    def __init__(self, openalex=None, crossref=None, arxiv=None):
+        self.openalex, self.crossref, self.arxiv = dict(openalex or {}), dict(crossref or {}), dict(arxiv or {})
+        self.requests, self.answers, self.hold, self.started, self.held = [], {}, None, asyncio.Event(), None
+
+    async def __call__(self, request):
+        self.requests.append((request.url.host, request.url.raw_path.decode(), dict(request.headers)))
+        self.started.set()
+        if self.hold is not None and (self.held is None or request.url.host in self.held):
+            await self.hold.wait()
+        queued = self.answers.get(request.url.host) or []
+        if queued:
+            status, headers = (queued.pop(0), {}) if isinstance(queued[0], int) else queued.pop(0)
+            return httpx.Response(status, headers=headers, json={})
+        path = request.url.path
+        if request.url.host == "api.openalex.org" and path.startswith("/works/doi:"):
+            record = self.openalex.get(path.removeprefix("/works/doi:"))
+            return httpx.Response(200, json=record) if record else httpx.Response(404, json={"error": "Not found"})
+        if request.url.host == "api.crossref.org" and path.startswith("/works/"):
+            record = self.crossref.get(path.removeprefix("/works/"))
+            return httpx.Response(200, json={"status": "ok", "message": record}) if record else \
+                httpx.Response(404, text="Resource not found.")
+        if request.url.host == "export.arxiv.org" and path == "/api/query":
+            identifier = request.url.params.get("id_list")
+            return httpx.Response(200, content=arxiv_feed(identifier, self.arxiv.get(identifier)),
+                                  headers={"content-type": "application/atom+xml"})
+        return httpx.Response(404)
+
+    @property
+    def hosts(self):
+        return [host for host, _, _ in self.requests]
+
+
+def openalex_work(doi, title, *, authors=("A. Researcher",), year=2024, venue="Journal of Synthetic Studies",
+                  retracted=False):
+    """An OpenAlex work record, made up."""
+    return {"id": "https://openalex.org/W0000000001", "doi": f"https://doi.org/{doi}", "title": title,
+            "display_name": title, "publication_year": year, "type": "article", "is_retracted": retracted,
+            "authorships": [{"author": {"display_name": name}} for name in authors],
+            "primary_location": {"source": {"display_name": venue}}, "biblio": {"volume": "3", "first_page": "1"}}
+
+
+def crossref_work(doi, title, *, retracted=False):
+    """A Crossref work record (the message), made up."""
+    return {"DOI": doi, "title": [title], "type": "journal-article", "author": [{"given": "Ana", "family": "Example"}],
+            "issued": {"date-parts": [[2023, 5]]}, "container-title": ["Synthetic Review"],
+            **({"updated-by": [{"type": "retraction", "DOI": "10.5555/notice", "label": "Retraction"}]} if retracted else {})}
+
+
+def arxiv_feed(identifier, title):
+    """An arXiv Atom answer: one entry for a known ID, else arXiv's error entry."""
+    if title is None:
+        entry = "<entry><id>http://arxiv.org/api/errors#incorrect_id_format</id><title>Error</title></entry>"
+    else:
+        entry = (f"<entry><id>http://arxiv.org/abs/{identifier}v1</id><title>{title}</title>"
+                 "<published>2024-01-02T00:00:00Z</published><author><name>Bo Example</name></author></entry>")
+    return (f'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"'
+            f' xmlns:arxiv="http://arxiv.org/schemas/atom">{entry}</feed>').encode()
 
 
 def _is_title(body):
@@ -177,6 +268,18 @@ async def background_idle(client, timeout=5.0):
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError("background work did not finish")
         await asyncio.sleep(0.01)
+
+
+async def run_finished(client, run_id, timeout=15.0):
+    """A background run's row in the background-run list once it has ended."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        rows = (await client.get("/api/activity", params={"run_id": run_id})).json()["runs"]
+        if rows and rows[0]["status"] != "running":
+            return rows[0]
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"run {run_id} did not end: {rows}")
+        await asyncio.sleep(0.02)
 
 
 async def confirm_key(client, provider="openrouter"):

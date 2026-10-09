@@ -24,6 +24,8 @@ DISTRIBUTIONS = [
     "jaraco.context", "jaraco.functools", "more-itertools", "platformdirs",
     # Encrypted backups and exports
     "pyzipper", "pycryptodomex",
+    # Reading materials: PDF text, boxes and page images; text from LaTeX source
+    "pypdfium2", "pylatexenc",
     # The window
     "pywebview", "bottle", "proxy_tools", "pyobjc-framework-WebKit", "pyobjc-framework-UniformTypeIdentifiers",
 ]

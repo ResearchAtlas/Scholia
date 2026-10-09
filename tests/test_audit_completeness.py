@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from backend import governance
-from scholia_app import MockProvider, background_idle, confirm_key, declare, send, started
+from scholia_app import MockProvider, background_idle, confirm_key, declare, run_finished, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -227,9 +227,10 @@ async def test_backups_restores_exports_and_purges_are_logged_with_text_for_each
     async with started(tmp_path / "data") as client:
         project = (await client.post("/api/projects", json={"name": "Study"})).json()["id"]
         await client.post("/api/conversations", json={"project_id": project})
-        assert (await client.post("/api/backups/full", json={"destination": str(destination)})).status_code == 200
-        exported = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
-        assert exported.status_code == 200
+        for path in ("/api/backups/full", f"/api/projects/{project}/export"):
+            started_run = await client.post(path, json={"destination": str(destination)})
+            assert started_run.status_code == 202
+            assert (await run_finished(client, started_run.json()["run_id"]))["status"] == "succeeded"
         backup = (await client.post("/api/backups")).json()["id"]
         assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
         assert (await client.delete(f"/api/projects/{project}", params={"purge_backups": "true"})).status_code == 200

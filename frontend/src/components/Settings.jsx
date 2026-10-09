@@ -6,6 +6,7 @@ import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'r
 import { ArrowDown, ArrowUp, X } from 'lucide-react';
 import { LANGUAGES, LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, patch, post } from '../api.js';
+import { useAction } from '../action.js';
 import { errorText, money } from '../text.js';
 import { projectName } from '../projects.js';
 import { BUDGET_SUGGESTIONS, loadModels, useInstructions, useSettingsFile, utf8Bytes, valueAt } from '../settings.js';
@@ -14,6 +15,8 @@ import { AuditLog, PrivateAllowlist, ProjectProtection } from './Governance.jsx'
 import { Providers } from './Providers.jsx';
 import { BackupsSection } from './Backups.jsx';
 import { ProjectExportSection } from './ProjectExport.jsx';
+import { Ask } from './Ask.jsx';
+import { fraction, retryRun, runOutcome } from '../runs.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -21,7 +24,8 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/compone
 import { cn } from '@/lib/utils';
 
 const PAGES = ['general', 'providers', 'subagents', 'project', 'advanced'];
-const WORKFLOWS = { title: 'settings.workflowTitle' };
+const WORKFLOWS = { title: 'settings.workflowTitle', extract: 'settings.workflowExtract', lookup: 'settings.workflowLookup',
+  full_backup: 'settings.workflowFullBackup', project_export: 'settings.workflowExport' };
 const POLL_MS = 2000; // ponytail: polled while open; a pushed event stream if the list grows
 const EFFORT_SUGGESTIONS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const LIMITS = ['agent_steps', 'tool_calls', 'turn_minutes'];
@@ -420,10 +424,10 @@ function BackgroundRuns() {
     return () => clearInterval(timer);
   }, [load]);
 
-  async function cancel(runId) {
+  async function act(action) {
     setProblem(null);
     try {
-      await post(`/api/runs/${runId}/cancel`);
+      await action();
     } catch (error) {
       setProblem(error instanceof ApiError ? error.code : 'internal');
     }
@@ -437,25 +441,60 @@ function BackgroundRuns() {
       {runs?.length === 0 && <p className="text-sm text-muted-foreground">{t('settings.noRuns')}</p>}
       {runs?.length > 0 && (
         <ul className="divide-y rounded-lg border">
-          {runs.map((run) => (
-            <li key={run.run_id} className="flex items-center gap-3 px-3 py-2.5 text-sm">
-              <div className="min-w-0 flex-1">
-                <p className="truncate font-medium">{WORKFLOWS[run.workflow] ? t(WORKFLOWS[run.workflow]) : run.workflow}</p>
-                <p className="truncate text-xs text-muted-foreground">
-                  {projectName(t, { kind: run.project_kind, name: run.project_name })} · {t('runs.started', { date: dates.format(new Date(run.started_at)) })}
-                </p>
-              </div>
-              {run.cost_usd > 0 && <span className="text-xs tabular-nums text-muted-foreground">{t('common.cost', { cost: money(run.cost_usd, language) })}</span>}
-              <span className={cn('rounded-full px-2 py-0.5 text-xs', {
-                running: 'bg-brand-soft text-brand', succeeded: 'bg-success/10 text-success', failed: 'bg-destructive/10 text-destructive',
-              }[run.status] ?? 'bg-muted text-muted-foreground')}>{t(`status.${run.status}`)}</span>
-              {run.status === 'running' && (
-                <Button size="sm" variant="outline" className="h-7" onClick={() => cancel(run.run_id)}>{t('settings.cancelRun')}</Button>
-              )}
-            </li>
-          ))}
+          {runs.map((run) => <RunRow key={run.run_id} run={run} dates={dates} onChanged={load}
+            onCancel={() => act(() => post(`/api/runs/${run.run_id}/cancel`))} onRetry={() => act(() => retryRun(run.run_id))} />)}
         </ul>
       )}
     </Section>
+  );
+}
+
+// One background run: what it does and for whom, its status and progress, why it stopped, the
+// question it waits on, Cancel while it runs and Retry where a new run can do it again.
+function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
+  const t = useT();
+  const { busy, run: press } = useAction(); // Cancel and Retry, each disabled while either is pending
+  const language = useContext(LanguageContext);
+  const share = fraction(run.progress);
+  const outcome = run.status === 'running' ? null : runOutcome(run);
+  const project = projectName(t, { kind: run.project_kind, name: run.project_name });
+  const papers = run.materials?.titles?.length
+    ? (run.materials.count > run.materials.titles.length
+      ? t('runs.papersMore', { titles: run.materials.titles.join(', '), count: run.materials.count - run.materials.titles.length })
+      : run.materials.titles.join(', '))
+    : null;
+  return (
+    <li className="grid grid-cols-1 gap-2 px-3 py-2.5 text-sm">
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <p className="truncate font-medium">{WORKFLOWS[run.workflow] ? t(WORKFLOWS[run.workflow]) : run.workflow}</p>
+          {papers && <p className="truncate text-xs" title={papers}>{papers}</p>}
+          <p className="truncate text-xs text-muted-foreground">
+            {project} · {t('runs.started', { date: dates.format(new Date(run.started_at)) })}
+          </p>
+        </div>
+        {run.cost_usd > 0 && <span className="text-xs tabular-nums text-muted-foreground">{t('common.cost', { cost: money(run.cost_usd, language) })}</span>}
+        <span className={cn('rounded-full px-2 py-0.5 text-xs', {
+          running: 'bg-brand-soft text-brand', succeeded: 'bg-success/10 text-success', failed: 'bg-destructive/10 text-destructive',
+        }[run.status] ?? 'bg-muted text-muted-foreground')}>{t(`status.${run.status}`)}</span>
+        {run.status === 'running' && (
+          <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => press(onCancel)}>{t('settings.cancelRun')}</Button>
+        )}
+        {run.retryable && <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={() => press(onRetry)}>{t('runs.retry')}</Button>}
+      </div>
+      {run.status === 'running' && share !== null && (
+        <div className="flex items-center gap-2" role="progressbar" aria-label={t('runs.progressLabel')}
+          aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(share * 100)}>
+          <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+            <div className="h-full rounded-full bg-brand transition-[width] duration-200" style={{ width: `${Math.max(3, share * 100)}%` }} />
+          </div>
+          <span className="text-xs tabular-nums text-muted-foreground">{t('runs.progress', { done: run.progress.done, total: run.progress.total })}</span>
+        </div>
+      )}
+      {outcome && !outcome.ok && (
+        <p className="text-xs text-muted-foreground">{outcome.code ? errorText(t, outcome.code) : t(outcome.key)}</p>
+      )}
+      {run.ask && <Ask ask={run.ask} onAnswered={onChanged} />}
+    </li>
   );
 }

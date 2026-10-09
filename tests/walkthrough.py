@@ -3,10 +3,12 @@
     uv run python tests/walkthrough.py [--port N] [--dev] [--request-log FILE]
 
 The backend runs on a new temporary data folder, with an in-memory credential store
-(never the Keychain) and a test-owned provider that answers with synthetic text, behind
-the test network block (network_guard.py), so this process reaches nothing but its own
-listener. It serves the built interface (frontend/dist) and prints the window's address
-with this launch's session. The local model helper's search model is a synthetic file with a pin
+(never the Keychain), a test-owned provider that answers with synthetic text, and test-owned
+stand-ins for OpenAlex, Crossref and arXiv that answer made-up records, behind the test network
+block (network_guard.py), so this process reaches nothing but its own listener. It serves the
+built interface (frontend/dist) and prints the window's address with this launch's session, and
+the folder of synthetic materials (a PDF, DOCX, HTML, Markdown and LaTeX file, and more) it wrote
+for the walkthrough to add. The local model helper's search model is a synthetic file with a pin
 of its own, served by a test-owned download source (each source redirecting to the file host
 it uses, the file sent slowly so a download can be watched and cancelled), and written to an
 "offline" folder for the import flow, whose path is printed; the helper binary is a stand-in in
@@ -30,6 +32,7 @@ from pathlib import Path
 
 sys.path[:0] = [str(Path(__file__).parent), str(Path(__file__).parents[1])]
 import network_guard  # noqa: E402
+import synthetic_materials  # noqa: E402
 
 # pycryptodomex learns the CPU architecture once, through platform.architecture(), which runs
 # the local `file` command; the network block refuses every subprocess, so encrypted backups
@@ -41,7 +44,7 @@ network_guard.start()
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
-from scholia_app import FakeKeyring, MockProvider  # noqa: E402
+from scholia_app import FakeKeyring, MockProvider, MockScholarly, crossref_work, openalex_work  # noqa: E402
 
 from backend import local_helper  # noqa: E402
 from backend.app import create_app  # noqa: E402
@@ -69,6 +72,51 @@ CATALOG = [{"id": model, "name": model.split("/", 1)[1].replace("-", " ").title(
 CATALOG += [{"id": "example/long-context-mini", "name": "Long Context Mini", "context_length": 1000000,
              "pricing": {"prompt": "0.0000001", "completion": "0.0000004"}},
             {"id": "example/unlisted-window", "name": "Unlisted Window", "pricing": {"prompt": "0", "completion": "0"}}]
+
+
+# Made-up identifiers (10.5555 is a test prefix) and the records the stand-ins answer for them.
+DOIS = {"pdf": "10.5555/scholia.walkthrough.wages", "docx": "10.5555/scholia.walkthrough.cities",
+        "latex": "10.5555/scholia.walkthrough.floors", "local": "10.5555/scholia.walkthrough.codebook"}
+ARXIV_ID = "2401.00001"
+RECORDS = MockScholarly(
+    openalex={DOIS["pdf"]: openalex_work(DOIS["pdf"], "Minimum Wages and Employment in a Synthetic Panel",
+                                         authors=("Ana Example", "Bo Sample"), year=2024),
+              DOIS["latex"]: openalex_work(DOIS["latex"], "最低工资的合成模型：一项方法说明",
+                                           authors=("Chen Example",), year=2023, venue="合成经济研究"),
+              DOIS["local"]: openalex_work(DOIS["local"], "A Codebook for Synthetic Interviews", year=2022)},
+    crossref={DOIS["docx"]: crossref_work(DOIS["docx"], "Wages Across Synthetic Cities", retracted=True)},
+    arxiv={ARXIV_ID: "Labour Market Notes on a Synthetic Economy"})
+
+
+def long_notes(paragraphs=3000):
+    """A long synthetic Markdown paper: its title, then numbered paragraphs, a section every 150 of them."""
+    parts = ["# Long Synthetic Notes\n"]
+    for i in range(1, paragraphs + 1):
+        if i % 150 == 1:
+            parts.append(f"## Part {i // 150 + 1}\n")
+        parts.append(f"Paragraph {i} of the long synthetic notes, written for the walkthrough.\n")
+    return "\n".join(parts).encode()
+
+
+def write_materials():
+    """The synthetic files the walkthrough adds, written to a new temporary folder, which is returned."""
+    folder = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-materials-"))
+    files = {
+        "minimum-wages.pdf": synthetic_materials.paper_pdf(doi=DOIS["pdf"]),
+        "synthetic-cities.docx": synthetic_materials.paper_docx(doi=DOIS["docx"]),
+        "wage-floors.tex": synthetic_materials.paper_latex(doi=DOIS["latex"]),
+        "labour-notes.md": synthetic_materials.paper_markdown(arxiv=ARXIV_ID),
+        "city-report.html": synthetic_materials.paper_html(title="City Wage Report (synthetic)", doi=""),
+        "scanned-appendix.pdf": synthetic_materials.paper_pdf(title="Scanned Appendix", doi=None, scanned=2),
+        "damaged.pdf": b"%PDF-1.7\n" + b"\x00 not a whole PDF " * 40,
+        "interview-codebook.md": f"# Interview Codebook\n\ndoi:{DOIS['local']}\n\nSynthetic codes only.\n".encode(),
+        "long-notes.md": long_notes(),
+        "crowded-page.pdf": synthetic_materials.pdf(  # one page of 220 passages, a line of three items each
+            [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]]),
+    }
+    for name, data in files.items():
+        (folder / name).write_bytes(data)
+    return folder
 
 
 # The search model the walkthrough offers: a synthetic file, never a model, with its own pin and the
@@ -126,7 +174,8 @@ def main(argv=None):
     parser.add_argument("--request-log", type=Path)
     args = parser.parse_args(argv)
 
-    provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]])  # half have zero retention
+    provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]],  # half have zero retention
+                                 scholarly=RECORDS)
     provider.replies = [synthetic] * 1000
     provider.title_replies = [synthetic] * 1000
     provider.log = args.request_log
@@ -152,6 +201,7 @@ def main(argv=None):
                      keyring_backend=FakeKeyring(), transport=httpx.MockTransport(provider),
                      helper=local_helper.Config(binary=binary, models={MODEL["id"]: MODEL}))
     print(f"data folder: {data_dir}", flush=True)
+    print(f"materials: {write_materials()}", flush=True)
     print(f"model file: {offline}", flush=True)
     print(f"open: {origin}/" + ("" if args.dev else f"#session={session}"), flush=True)
     server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", log_level="warning"))

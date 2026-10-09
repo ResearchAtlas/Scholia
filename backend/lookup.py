@@ -1,0 +1,317 @@
+"""Identifier lookups (slice-1 spec F3a step 3, sections 7.5 and 13; ticket 71).
+
+`resolve(client, scheme, identifier, pace)` sends one identifier alone to an identifier endpoint
+and returns what it found: a DOI to OpenAlex, then to Crossref when OpenAlex has no record; an
+arXiv ID to export.arxiv.org. Each request is an anonymous single-record GET: no key, no contact
+address, no credentials (the outbound gate refuses any). Each source is asked one request at a
+time across every lookup, held until its answer, and paced (`SPACING`: arXiv asks for one request
+every 3 seconds); a request that meets 429, a server error or a network failure (a request past
+TIMEOUT seconds, from its connection to its last byte, included) is retried at most twice, after 1
+and 4 seconds (a Retry-After within RETRY_AFTER_MAX instead, in seconds or as a date); an answer is
+read as it streams in, at most MAX_BODY bytes once decoded. The client is the outbound gate's,
+made for the project with its dispatch check, so a refusal (OutboundDenied) is final and is raised.
+
+A DOI resolved through OpenAlex or Crossref records whether the work is retracted (OpenAlex's
+`is_retracted`; a retraction, withdrawal or removal in Crossref's `updated-by`); arXiv says
+nothing on retraction. Nothing here logs an identifier or a response.
+"""
+
+import asyncio
+import contextlib
+import email.utils
+import json
+import math
+import re
+import time
+import zlib
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from urllib.parse import quote
+import httpx
+
+from backend.extraction import DOI_CHARS, Unreadable, clean_doi, untrusted_xml
+from backend.outbound_gate import OutboundDenied
+
+OPENALEX = "https://api.openalex.org/works/doi:{}"
+CROSSREF = "https://api.crossref.org/works/{}"
+ARXIV = "https://export.arxiv.org/api/query?id_list={}&max_results=1"
+SERVICES = {"doi": ("openalex", "crossref"), "arxiv": ("arxiv",)}
+SPACING = {"openalex": 0.2, "crossref": 0.25, "arxiv": 3.0}  # seconds between one source's requests
+RETRIES = (1.0, 4.0)
+RETRY_AFTER_MAX = 30.0
+TIMEOUT = 20.0
+MAX_BODY = 4 * 1024 * 1024
+NAME_CHARS = 200  # a person's name as kept, or each part of one (family, given): the details form sends them back
+_RETRACTED = {"retraction", "withdrawal", "removal"}
+_ATOM = "{http://www.w3.org/2005/Atom}"
+_ARXIV_NS = "{http://arxiv.org/schemas/atom}"
+
+
+@dataclass
+class Found:
+    source: str  # openalex, crossref or arxiv
+    csl: dict
+    retracted: bool | None  # None: the source says nothing on it
+    source_key: str  # its record, naming its source: openalex:<OpenAlex ID>, doi:<DOI> (Crossref's) or arxiv:<ID>
+
+
+class Failed(Exception):
+    """The identifier could not be resolved: code not_found or unavailable."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+class Pace:
+    """Each source's turns, shared by a harness's lookups: one request at a time per source, held
+    from its start to its answer, each starting at least SPACING after the one before."""
+
+    def __init__(self):
+        self.next = {}
+        self.locks = {}
+
+    @contextlib.asynccontextmanager
+    async def turn(self, source):
+        async with self.locks.setdefault(source, asyncio.Lock()):
+            wait = self.next.get(source, 0.0) - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self.next[source] = time.monotonic() + SPACING[source]
+            yield
+
+
+async def resolve(client, scheme, identifier, pace) -> Found:
+    """What the sources hold for the identifier, or Failed: not_found only when every source asked
+    answered that it has no record (OpenAlex's outage with Crossref's not found stays unavailable,
+    so the lookup can be tried again)."""
+    if scheme == "arxiv":
+        return _arxiv(identifier, await _get(client, ARXIV.format(quote(identifier, safe="/.")), "arxiv", pace))
+    try:
+        return _openalex(identifier, await _get(client, _record(OPENALEX, identifier), "openalex", pace))
+    except Failed as failed:
+        openalex = failed.code
+    try:
+        return _crossref(identifier, await _get(client, _record(CROSSREF, identifier), "crossref", pace))
+    except Failed as failed:
+        raise Failed("unavailable" if "unavailable" in (openalex, failed.code) else "not_found") from None
+
+
+def _record(template, doi):
+    """The DOI's single-record URL, its path checked as the client will send it: a path the URL
+    parser reads as any other (a dot segment resolved away) is Failed not_found, never sent."""
+    path = quote(doi, safe="/")
+    url = template.format(path)
+    if httpx.URL(url).raw_path != httpx.URL(template.format("")).raw_path + path.encode("ascii"):
+        raise Failed("not_found")
+    return url
+
+
+async def _get(client, url, source, pace):
+    """The body of a 200 answer, retried as the module says. Raises Failed or OutboundDenied."""
+    for attempt in range(len(RETRIES) + 1):
+        delay = RETRIES[attempt] if attempt < len(RETRIES) else None
+        async with pace.turn(source):  # the source's one request in flight, to its whole answer
+            try:
+                async with asyncio.timeout(TIMEOUT):  # connect to last byte: httpx bounds each read alone
+                    status, after, body = await _fetch(client, url)
+            except OutboundDenied:
+                raise
+            except (httpx.HTTPError, TimeoutError):
+                status = None
+        if status == 200:
+            return body
+        if status is not None:
+            if status in (400, 404, 410):
+                raise Failed("not_found")
+            if status != 429 and status < 500:
+                raise Failed("unavailable")
+            if after is not None and delay is not None:
+                delay = max(delay, after) if after <= RETRY_AFTER_MAX else None
+        if delay is None:
+            break
+        await asyncio.sleep(delay)
+    raise Failed("unavailable")
+
+
+async def _fetch(client, url):
+    """(status, Retry-After, body): a 200 answer's body as it streams in, decoded here (gzip or none,
+    nothing else), counted as decoded bytes and given up (Failed unavailable) once it would pass
+    MAX_BODY, so neither a long body nor a small compressed one that expands is ever held whole. A
+    gzip body is one gzip stream, read to its end: anything after its end (another member, a tail) is
+    given up too, as it arrives, rather than read on uncounted, and a stream cut before its end (its
+    trailer's length and checksum unchecked) is given up as well."""
+    async with client.stream("GET", url, headers={"Accept-Encoding": "gzip"}, timeout=TIMEOUT,
+                             follow_redirects=False) as response:
+        if response.status_code != 200:
+            return response.status_code, _retry_after(response), None
+        encoding = response.headers.get("content-encoding", "identity").strip().lower()
+        if encoding not in ("identity", "gzip"):
+            raise Failed("unavailable")
+        inflate = zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == "gzip" else None
+        body = bytearray()
+        try:
+            async for raw in response.aiter_raw():
+                # At most what is left under the limit, and one byte more to show it is passed. Input
+                # left over was held back by the limit (unconsumed_tail) or came after the gzip
+                # stream's end (unused_data, where every later chunk goes): either is given up.
+                body += inflate.decompress(raw, MAX_BODY + 1 - len(body)) if inflate else raw
+                if len(body) > MAX_BODY or (inflate and (inflate.unconsumed_tail or inflate.unused_data)):
+                    raise Failed("unavailable")
+            if inflate:
+                body += inflate.flush()
+                if not inflate.eof:  # cut before its trailer: its length and checksum were never checked
+                    raise Failed("unavailable")
+        except zlib.error:
+            raise Failed("unavailable") from None
+        if len(body) > MAX_BODY:
+            raise Failed("unavailable")
+        return 200, None, bytes(body)
+
+
+def _retry_after(response):
+    """Retry-After as seconds from now (RFC 9110 section 10.2.3): its delay-seconds (ASCII digits), or
+    the time until its HTTP-date. None, so the fixed delays apply, when it is absent, malformed (a
+    number or a date past what can be held included) or already past; _get then bounds it by
+    RETRY_AFTER_MAX. Nothing it is given raises."""
+    value = response.headers.get("retry-after", "").strip()
+    if re.fullmatch(r"[0-9]+", value):  # delay-seconds
+        seconds = float(value)
+        return seconds if math.isfinite(seconds) else None
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+        if when.tzinfo is None:  # an HTTP-date is in GMT
+            when = when.replace(tzinfo=UTC)
+        wait = (when - datetime.now(UTC)).total_seconds()
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+    return wait if wait > 0 else None
+
+
+def _json(body):
+    try:
+        data = json.loads(body)
+    except (ValueError, RecursionError):  # not JSON, or nested past what the parser follows
+        raise Failed("unavailable") from None
+    if not isinstance(data, dict):
+        raise Failed("unavailable")
+    return data
+
+
+def _dict(value):
+    """A record's field as a mapping: an empty one when it holds anything else, so a malformed entry
+    is skipped rather than failing the whole record."""
+    return value if isinstance(value, dict) else {}
+
+
+def _list(value):
+    return value if isinstance(value, list) else []
+
+
+_TYPE = re.compile(r"[a-z]{1,30}(?:-[a-z]{1,30}){0,3}")  # a CSL type name: lower-case words joined by hyphens
+
+
+def _type(value, default="article-journal"):
+    """A record's type as its CSL keeps it: a short type name, else default."""
+    return value if isinstance(value, str) and _TYPE.fullmatch(value) else default
+
+
+def _year(value):
+    """A year as a record gives it (a whole number, not true or false), when it could be one."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 10_000 else None
+
+
+def _text(value, limit=1000):
+    return " ".join(value.split())[:limit] if isinstance(value, str) and value.strip() else None
+
+
+def _openalex(doi, body):
+    work = _json(body)
+    title = _text(work.get("title") or work.get("display_name"))
+    if not title:
+        raise Failed("not_found")
+    csl = {"type": "article-journal" if work.get("type") == "article" else _type(work.get("type")),
+           "title": title, "DOI": doi}
+    authors = [_text(_dict(_dict(a).get("author")).get("display_name"), NAME_CHARS)
+               for a in _list(work.get("authorships"))]
+    if authors := [{"literal": name} for name in authors if name]:
+        csl["author"] = authors[:100]
+    if (year := _year(work.get("publication_year"))) is not None:
+        csl["issued"] = {"date-parts": [[year]]}
+    source = _dict(_dict(work.get("primary_location")).get("source"))
+    if venue := _text(source.get("display_name"), 300):
+        csl["container-title"] = venue
+    biblio = _dict(work.get("biblio"))
+    for key, field in (("volume", "volume"), ("issue", "issue")):
+        if value := _text(biblio.get(field), 50):
+            csl[key] = value
+    if (first := _text(biblio.get("first_page"), 20)) is not None:
+        csl["page"] = first + (f"-{last}" if (last := _text(biblio.get("last_page"), 20)) else "")
+    retracted = work.get("is_retracted") if isinstance(work.get("is_retracted"), bool) else None
+    key = work.get("id") if isinstance(work.get("id"), str) else ""
+    key = (key.removeprefix("https://openalex.org/") if re.fullmatch(r"https://openalex\.org/W\d{1,20}", key)
+           else f"doi:{doi}")
+    return Found("openalex", csl, retracted, f"openalex:{key}")
+
+
+def _crossref(doi, body):
+    work = _json(body).get("message")
+    if not isinstance(work, dict):
+        raise Failed("not_found")
+    titles = work.get("title") or []
+    title = _text(titles[0] if isinstance(titles, list) and titles else titles)
+    if not title:
+        raise Failed("not_found")
+    csl = {"type": _type(work.get("type")), "title": title, "DOI": doi}
+    authors = []
+    for author in _list(work.get("author")):
+        if isinstance(author, dict):
+            family, given = _text(author.get("family"), NAME_CHARS), _text(author.get("given"), NAME_CHARS)
+            if family:
+                authors.append({"family": family, **({"given": given} if given else {})})
+            elif name := _text(author.get("name"), NAME_CHARS):
+                authors.append({"literal": name})
+    if authors:
+        csl["author"] = authors[:100]
+    parts = _list(_dict(work.get("issued")).get("date-parts"))
+    if (first := _list(parts[0]) if parts else []) and (year := _year(first[0])) is not None:
+        csl["issued"] = {"date-parts": [[year]]}
+    containers = work.get("container-title") or []
+    if venue := _text(containers[0] if isinstance(containers, list) and containers else None, 300):
+        csl["container-title"] = venue
+    for key in ("volume", "issue", "page"):
+        if value := _text(work.get(key), 50):
+            csl[key] = value
+    # Retracted when an update says so; else not, when there are none (no updated-by) or each names
+    # its type; else unknown (None): an answer whose updates cannot be read (an explicit null, an
+    # entry with no type) never clears a retraction recorded before.
+    updates = work.get("updated-by", [])
+    kinds = [_dict(u).get("type") for u in updates] if isinstance(updates, list) else [None]
+    retracted = (True if any(isinstance(k, str) and k.lower() in _RETRACTED for k in kinds)
+                 else False if all(isinstance(k, str) and k.strip() for k in kinds) else None)
+    return Found("crossref", csl, retracted, f"doi:{doi}")
+
+
+def _arxiv(identifier, body):
+    try:
+        feed = untrusted_xml(body)  # refused when it declares a document type or an entity
+    except Unreadable:
+        raise Failed("unavailable") from None
+    entry = feed.find(f"{_ATOM}entry")
+    if entry is None or "/api/errors" in (entry.findtext(f"{_ATOM}id") or ""):
+        raise Failed("not_found")
+    title = _text(entry.findtext(f"{_ATOM}title"))
+    if not title:
+        raise Failed("not_found")
+    csl = {"type": "article", "title": title, "publisher": "arXiv", "number": f"arXiv:{identifier}",
+           "URL": f"https://arxiv.org/abs/{identifier}"}
+    authors = [_text(a.findtext(f"{_ATOM}name"), NAME_CHARS) for a in entry.findall(f"{_ATOM}author")]
+    if authors := [{"literal": name} for name in authors if name]:
+        csl["author"] = authors[:100]
+    published = entry.findtext(f"{_ATOM}published") or ""
+    if published[:4].isdigit():
+        csl["issued"] = {"date-parts": [[int(published[:4])]]}
+    given = (entry.findtext(f"{_ARXIV_NS}doi") or "").strip()
+    if len(given) <= DOI_CHARS and (doi := clean_doi(given)):  # a DOI, or none kept
+        csl["DOI"] = doi
+    return Found("arxiv", csl, None, f"arxiv:{identifier}")

@@ -17,7 +17,7 @@ import pytest
 import backend.backups as backups_module
 from backend.db import DB_NAME, Database, new_id
 from backend.db.migrations import MIGRATIONS
-from scholia_app import background_idle, send, started, stored_material
+from scholia_app import background_idle, run_finished, send, started, stored_material
 
 pytestmark = pytest.mark.asyncio
 
@@ -38,6 +38,24 @@ async def new_project(client, name="Thesis", sensitivity="normal"):
 
 async def audit(client, event):
     return [json.loads(data) for (data,) in await rows(client, "SELECT data FROM audit_log WHERE event = ?", event)]
+
+
+class Archived:
+    """A full backup's or export's run once it has ended: its status, its result and a failure's code."""
+
+    def __init__(self, row):
+        self.row, self.status, self.result = row, row["status"], row["result"] or {}
+        self.code = self.result.get("reason")
+
+    def __repr__(self):
+        return repr(self.row)
+
+
+async def archived_run(client, path, body):
+    """Start a full backup or an export, which answers 202 with its run, and wait for the run."""
+    started_run = await client.post(path, json=body)
+    assert started_run.status_code == 202, started_run.text
+    return Archived(await run_finished(client, started_run.json()["run_id"]))
 
 
 def mode(path):
@@ -91,6 +109,32 @@ async def test_a_backup_is_taken_while_idle_and_never_while_a_run_is_active(tmp_
             await asyncio.sleep(0.01)
 
 
+async def test_a_run_waiting_on_its_question_does_not_hold_off_the_idle_backup_but_a_working_run_does(tmp_path,
+                                                                                                    monkeypatch):
+    from test_materials import PDF, added, hold_extraction, listing, project_of
+    checks = []
+    monkeypatch.setattr(backups_module, "IDLE_CHECK_SECONDS", 0.01)
+    monkeypatch.setattr(Database, "backup_if_due", lambda self, now=None: checks.append(now))
+    reached, go = hold_extraction(monkeypatch)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client, level="local_only")
+        await added(client, project, PDF)
+        await asyncio.to_thread(reached.wait, 10)  # its reading works
+        checks.clear()
+        await asyncio.sleep(0.1)
+        assert checks == []  # a working run holds the backup off
+        go.set()
+        deadline = asyncio.get_running_loop().time() + 10
+        while not (await listing(client, project))["asks"]:  # read; its lookup now waits on its question
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        checks.clear()
+        while not checks:  # nothing works meanwhile: the backup is taken
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        assert (await listing(client, project))["asks"]  # the question still open
+
+
 # Full backups
 
 
@@ -106,9 +150,9 @@ async def test_a_full_backup_holds_the_database_content_and_settings_and_never_k
         (data / "scholia.lock").write_text("")
         (data / "logs").mkdir(exist_ok=True)
         (data / "logs" / "scholia.log").write_text("a log line")
-        response = await client.post("/api/backups/full", json={"destination": str(destination)})
-        assert response.status_code == 200, response.text
-        result = response.json()
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+        result = run.result
         [audited] = await audit(client, "full_backup")
     path = destination / result["file"].rsplit("/", 1)[1]
     assert result["encrypted"] is False and result["content_files"] == 1 and result["missing_files"] == 0
@@ -132,9 +176,8 @@ async def test_a_full_backup_holding_a_private_project_needs_a_passphrase_and_is
         refused = await client.post("/api/backups/full", json={"destination": str(destination)})
         assert (refused.status_code, refused.json()["code"]) == (400, "passphrase_required")
         assert list(destination.iterdir()) == []
-        response = await client.post("/api/backups/full", json={"destination": str(destination),
-                                                                "passphrase": PASSPHRASE})
-        assert response.status_code == 200 and response.json()["encrypted"] is True
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination), "passphrase": PASSPHRASE})
+        assert run.status == "succeeded" and run.result["encrypted"] is True
     [path] = destination.iterdir()
     with pyzipper.AESZipFile(path) as archive:
         assert all(info.flag_bits & 1 for info in archive.infolist())  # every entry is encrypted
@@ -153,9 +196,9 @@ async def test_a_full_backup_holds_no_file_of_a_project_deleted_moments_before(t
         private = await new_project(client, "Interviews", "private")
         await stored_material(client, private, b"Participant 7 transcript", "text/plain")
         assert (await client.delete(f"/api/projects/{private}")).status_code == 200  # its file is not collected yet
-        response = await client.post("/api/backups/full", json={"destination": str(destination)})
-        assert response.status_code == 200 and response.json()["encrypted"] is False  # no Private project is left
-        assert response.json()["content_files"] == 0
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert run.status == "succeeded" and run.result["encrypted"] is False  # no Private project is left
+        assert run.result["content_files"] == 0
     [path] = destination.iterdir()
     assert not any(n.startswith("content/") for n in names(path))
     assert not any(b"Participant 7" in read(path, name) for name in names(path))
@@ -173,12 +216,12 @@ async def test_a_full_backup_never_holds_a_key_typed_into_a_settings_file(tmp_pa
         project_config.write_text(project_config.read_text() + 'token = "sk-or-typed-into-project"\n'
                                   'openrouter = "sk-or-typed-into-a-project-name"  # and sk-or-typed-into-a-note\n')
         (data / "projects" / project / "AGENTS.md").write_text("Use APA.")
-        response = await client.post("/api/backups/full", json={"destination": str(destination)})
-        assert response.status_code == 200, response.text
-        exported = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
-        assert exported.status_code == 200, exported.text
-    path = destination / response.json()["file"].rsplit("/", 1)[1]
-    export = destination / exported.json()["file"].rsplit("/", 1)[1]
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+        exported = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination)})
+        assert exported.status == "succeeded", exported
+    path = destination / run.result["file"].rsplit("/", 1)[1]
+    export = destination / exported.result["file"].rsplit("/", 1)[1]
     for archive in (path, export):  # read, not as compressed bytes
         assert not any(b"sk-or-typed-into" in read(archive, name) for name in names(archive)), archive.name
     assert b'language = "en"' in read(path, "config.toml") and b"citation_style" in read(
@@ -200,21 +243,28 @@ async def test_a_full_backup_is_recorded_before_anything_is_written_and_removed_
             real(path)
 
         monkeypatch.setattr(backups_module, "_fsync", failing)
-        response = await client.post("/api/backups/full", json={"destination": str(destination)})
-        assert response.json()["code"] == "write_failed"
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert (run.status, run.code) == ("failed", "write_failed")
         assert list(destination.iterdir()) == []  # not left half published
         [attempt] = await audit(client, "full_backup")
         assert attempt["file"].startswith(str(destination))
 
         monkeypatch.setattr(backups_module, "_fsync", real)
-        db = client.state["db"]
+        db, real_write, real_name, armed = client.state["db"], client.state["db"].write, backups_module._free_name, []
+
+        def named(*args):  # the archive's own record is the next write
+            armed.append(True)
+            return real_name(*args)
 
         def unrecordable(fn):
-            raise OSError(errno.EIO, "I/O error")
+            if armed and armed.pop():
+                raise OSError(errno.EIO, "I/O error")
+            return real_write(fn)
 
+        monkeypatch.setattr(backups_module, "_free_name", named)
         monkeypatch.setattr(db, "write", unrecordable)
-        response = await client.post("/api/backups/full", json={"destination": str(destination)})
-        assert response.json()["code"] == "write_failed"
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert (run.status, run.code) == ("failed", "write_failed")
         assert list(destination.iterdir()) == []  # nothing written where it could not be recorded
 
 
@@ -238,8 +288,8 @@ async def test_a_folder_that_cannot_be_written_gets_a_code_and_no_path_in_the_lo
         async with started(tmp_path / "data") as client:
             project = await new_project(client)
             for path, body in (("/api/backups/full", {}), (f"/api/projects/{project}/export", {})):
-                response = await client.post(path, json={"destination": str(destination), **body})
-                assert (response.status_code, response.json()["code"]) == (400, "destination_not_writable")
+                run = await archived_run(client, path, {"destination": str(destination), **body})
+                assert (run.status, run.code) == ("failed", "destination_not_writable")
             # Each attempt was recorded before anything was written there, so nothing leaves unrecorded.
             assert len(await audit(client, "full_backup")) == len(await audit(client, "project_export")) == 1
     finally:
@@ -260,9 +310,10 @@ async def test_a_full_disk_while_copying_the_database_is_disk_full(tmp_path, mon
 
     async with started(tmp_path / "data") as client:
         monkeypatch.setattr(Database, "_copy", full)
-        for path, body in (("/api/backups", None), ("/api/backups/full", {"destination": str(destination)})):
-            response = await client.post(path, json=body)
-            assert (response.status_code, response.json()["code"]) == (507, "disk_full"), path
+        response = await client.post("/api/backups")
+        assert (response.status_code, response.json()["code"]) == (507, "disk_full")
+        run = await archived_run(client, "/api/backups/full", {"destination": str(destination)})
+        assert (run.status, run.code) == ("failed", "disk_full")
     assert "SQLITE_FULL" in caplog.text and str(tmp_path) not in caplog.text
 
 
@@ -271,7 +322,7 @@ async def test_a_full_disk_while_reading_a_backup_file_is_not_called_damage(tmp_
     destination = tmp_path / "chosen"
     destination.mkdir()
     async with started(tmp_path / "data") as client:
-        file = (await client.post("/api/backups/full", json={"destination": str(destination)})).json()["file"]
+        file = (await archived_run(client, "/api/backups/full", {"destination": str(destination)})).result["file"]
 
         def full(staging, relative, source):
             raise OSError(errno.ENOSPC, "No space left on device", str(staging))
@@ -398,8 +449,8 @@ async def test_restoring_an_encrypted_full_backup_needs_its_passphrase_and_bring
     async with started(data) as client:
         project = await new_project(client, "Interviews", "private")
         sha256 = await stored_material(client, project, b"transcript one", "text/plain")
-        file = (await client.post("/api/backups/full", json={"destination": str(destination),
-                                                             "passphrase": PASSPHRASE})).json()["file"]
+        file = (await archived_run(client, "/api/backups/full", {"destination": str(destination),
+                                                             "passphrase": PASSPHRASE})).result["file"]
         await client.delete(f"/api/projects/{project}")
         (data / "content" / sha256[:2] / sha256).unlink()
 
@@ -496,9 +547,9 @@ async def test_a_project_exports_as_markdown_json_its_files_and_settings_without
                          " VALUES (?, ?, 0, ?, 1)", (version, material, sha256))
         await asyncio.to_thread(client.state["db"].write, add_material)
 
-        response = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
-        assert response.status_code == 200, response.text
-        result = response.json()
+        run = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination)})
+        assert run.status == "succeeded", run
+        result = run.result
         [audited] = await audit(client, "project_export")
     path = destination / result["file"].rsplit("/", 1)[1]
     assert audited["file"] == str(path) and (result["conversations"], result["turns"]) == (1, 1)
@@ -526,9 +577,9 @@ async def test_a_private_project_exports_only_encrypted(tmp_path):
         await client.post("/api/conversations", json={"project_id": project, "title": "Participant 7"})
         refused = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
         assert (refused.status_code, refused.json()["code"]) == (400, "passphrase_required")
-        response = await client.post(f"/api/projects/{project}/export",
-                                     json={"destination": str(destination), "passphrase": PASSPHRASE})
-        assert response.status_code == 200 and response.json()["encrypted"] is True
+        run = await archived_run(client, f"/api/projects/{project}/export",
+                            {"destination": str(destination), "passphrase": PASSPHRASE})
+        assert run.status == "succeeded" and run.result["encrypted"] is True
         missing = await client.post(f"/api/projects/{new_id()}/export", json={"destination": str(destination)})
         assert missing.status_code == 404
     [path] = destination.iterdir()
@@ -584,9 +635,9 @@ class Destination:
 
 async def archived_while(client, monkeypatch, url, destination, point, change):
     """Start an archive to destination without a passphrase, hold it at point, make change through
-    the API, let it go on, and return its response."""
+    the API, let it go on, and return its run once it has ended."""
     reached, go = held_at(monkeypatch, *point)
-    task = asyncio.create_task(client.post(url, json={"destination": str(destination)}))
+    task = asyncio.create_task(archived_run(client, url, {"destination": str(destination)}))
     await asyncio.to_thread(reached.wait, 10)
     changed = await change()
     assert changed.status_code == 200, changed.text
@@ -608,10 +659,10 @@ async def test_a_project_made_stricter_while_an_archive_is_written_stops_it(tmp_
         url = f"/api/projects/{project}/export" if archive == "export" else "/api/backups/full"
         refused = await archived_while(client, monkeypatch, url, destination, POINTS[point], lambda: client.post(
             f"/api/projects/{project}/sensitivity", json={"level": "private"}))
-        assert (refused.status_code, refused.json()["code"]) == (400, "passphrase_required")
+        assert (refused.status, refused.code) == ("failed", "passphrase_required")
         assert list(destination.iterdir()) == []  # what it wrote is gone
-        response = await client.post(url, json={"destination": str(destination), "passphrase": PASSPHRASE})
-        assert response.status_code == 200 and response.json()["encrypted"] is True
+        run = await archived_run(client, url, {"destination": str(destination), "passphrase": PASSPHRASE})
+        assert run.status == "succeeded" and run.result["encrypted"] is True
 
 
 @pytest.mark.parametrize("held", ["a write of its content", "its naming"])
@@ -627,8 +678,8 @@ async def test_a_stricter_level_applies_only_once_the_archive_can_write_no_more(
         else:
             written = Destination(monkeypatch, hold_at=backups_module._CHUNK)  # a full piece of the file
             reached, go = written.reached, written.go
-        archive = asyncio.create_task(client.post(f"/api/projects/{project}/export",
-                                                  json={"destination": str(destination)}))
+        exporting = asyncio.create_task(archived_run(client, f"/api/projects/{project}/export",
+                                                {"destination": str(destination)}))
         await asyncio.to_thread(reached.wait, 10)
         change = asyncio.create_task(client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"}))
         await asyncio.sleep(0.3)
@@ -637,12 +688,12 @@ async def test_a_stricter_level_applies_only_once_the_archive_can_write_no_more(
         assert project in client.state["gate"]._under_way  # the project's requests are held meanwhile
         go.set()
         assert (await change).status_code == 200
-        response = await archive
+        run = await exporting
         assert (await rows(client, "SELECT sensitivity FROM projects WHERE id = ?", project)) == [("private",)]
     if held == "its naming":  # complete before the change took effect
-        assert response.status_code == 200 and len(list(destination.iterdir())) == 1
+        assert run.status == "succeeded" and len(list(destination.iterdir())) == 1
     else:  # its write in progress finished; nothing more was written, and what it wrote is gone
-        assert (response.status_code, response.json()["code"]) == (400, "passphrase_required")
+        assert (run.status, run.code) == ("failed", "passphrase_required")
         assert list(destination.iterdir()) == []
 
 
@@ -659,7 +710,7 @@ async def test_locking_or_moving_a_conversation_out_stops_an_export(tmp_path, mo
                       (f"/api/conversations/{conversation}/move", {"project_id": other}))
         refused = await archived_while(client, monkeypatch, f"/api/projects/{project}/export", destination,
                                        POINTS["with its content written"], lambda: client.post(path, json=body))
-        assert (refused.status_code, refused.json()["code"]) == (400, "passphrase_required")
+        assert (refused.status, refused.code) == ("failed", "passphrase_required")
         assert list(destination.iterdir()) == []
 
 
@@ -684,14 +735,14 @@ async def test_a_move_whose_request_is_cancelled_still_stops_the_source_exports_
         await asyncio.to_thread(reached.wait, 10)
         move.cancel()  # the request goes; the move it began is still under way
         await asyncio.sleep(0.1)
-        export = asyncio.create_task(client.post(f"/api/projects/{source}/export",
-                                                 json={"destination": str(destination)}))
+        export = asyncio.create_task(archived_run(client, f"/api/projects/{source}/export",
+                                             {"destination": str(destination)}))
         await asyncio.sleep(0.1)
         go.set()
         with contextlib.suppress(asyncio.CancelledError):
             await move
-        response = await export
-        assert (response.status_code, response.json()["code"]) == (400, "passphrase_required")
+        run = await export
+        assert (run.status, run.code) == ("failed", "passphrase_required")
         assert list(destination.iterdir()) == []
         assert await rows(client, "SELECT project_id FROM conversations WHERE id = ?", conversation) == [(other,)]
 
@@ -781,9 +832,12 @@ async def test_an_export_whose_last_check_fails_leaves_no_file(tmp_path, monkeyp
 
         monkeypatch.setattr(backups_module, "_write_zip", write_zip)
         monkeypatch.setattr(db, "read", read)
-        response = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
+        started_run = await client.post(f"/api/projects/{project}/export", json={"destination": str(destination)})
+        assert started_run.status_code == 202
+        await background_idle(client)  # the list reads the database too: it is read once the run has ended
         monkeypatch.undo()
-        assert response.status_code == 503
+        run = await run_finished(client, started_run.json()["run_id"])
+        assert (run["status"], run["result"]["reason"]) == ("failed", "closing")
     assert list(destination.iterdir()) == []
 
 
@@ -811,8 +865,8 @@ async def test_a_project_export_takes_the_interface_language(tmp_path):
         url = f"/api/projects/{project}/export"
         unknown = await client.post(url, json={"destination": str(destination), "language": "fr"})
         assert (unknown.status_code, unknown.json()["code"]) == (400, "invalid_request")  # a supported one only
-        response = await client.post(url, json={"destination": str(destination), "language": "zh-CN"})
-        assert response.status_code == 200, response.text
+        run = await archived_run(client, url, {"destination": str(destination), "language": "zh-CN"})
+        assert run.status == "succeeded", run
     [path] = destination.iterdir()
     assert "## 研究者 (" in read(path, f"conversations/{conversation}.md").decode()
 

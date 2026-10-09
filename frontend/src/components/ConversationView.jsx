@@ -1,10 +1,12 @@
 // i18n: migrated
 // The conversation (S5): its turns, the live turn with Stop, Continue after an
 // interruption, a limit or a project change, and the message box. Model output is shown
-// as Markdown with no raw HTML; its images become links (links.js).
+// as Markdown with no raw HTML; its images become links (links.js). Files attached here are
+// added to the project's Library, and the questions their lookups ask are shown here (F3a,
+// section 6.2: a confirmation appears where its work started).
 import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import Markdown from 'react-markdown';
-import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, RotateCw, Square } from 'lucide-react';
+import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
 import { clear, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
@@ -13,12 +15,39 @@ import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
+import { ACCEPT, afterRead, asksChanged, followAsks, libraryChanged, newest, NO_ASKS, pollsAsks, readAsks } from '../library.js';
+import { addTo } from './Library.jsx';
+import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
 const POLL_MS = 1000; // between reads while a turn is settling, and after a failed read
+const ASKS_MS = 1500; // between reads of this conversation's questions, while files attached here are looked up
 
-export function ConversationView({ conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated }) {
+// The questions raised by work started in this conversation, read again while that work goes on, or
+// until a read succeeds after one failed (afterRead, pollsAsks). Only the newest read's answer is
+// shown, and a change of conversation clears what was shown.
+function useConversationAsks(conversationId, watching) {
+  const [known, setKnown] = useState(NO_ASKS);
+  const [reads, setReads] = useState(0);
+  const [asked] = useState(newest);
+  const load = useCallback(() => readAsks(asked, conversationId, (found) => {
+    setKnown((current) => afterRead(current, found));
+    setReads((n) => n + 1);
+  }), [conversationId, asked]);
+  useEffect(() => { setKnown(NO_ASKS); load(); }, [load]);
+  useEffect(() => followAsks(conversationId, load), [conversationId, load]); // files attached here were added
+  const polls = pollsAsks(known, watching);
+  useEffect(() => {
+    if (!polls) return undefined;
+    const timer = setTimeout(load, ASKS_MS);
+    return () => clearTimeout(timer);
+  }, [polls, reads, load]);
+  return { asks: known.asks, load };
+}
+
+export function ConversationView({ conversation, projectId, panel, showSidebarButton, onShowSidebar, onPanel, onCreated,
+  onLibrary }) {
   const t = useT();
   const [draft, setDraft] = useState(null); // a new conversation, made at its first message
   const id = conversation?.id ?? draft;
@@ -28,6 +57,9 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const [problem, setProblem] = useState(null);
   const [reads, setReads] = useState(0); // each read, failed or not, so polling goes on
   const end = useRef(null);
+  const [attached, setAttached] = useState(null); // what the last attach said, and the lookup it started
+  // Read for the conversation attach() tags its files with: a draft's too, before the window knows it.
+  const { asks, load: loadAsks } = useConversationAsks(id, attached?.lookup);
   const here = useRef(false); // still shown: a draft admitted after the researcher left selects nothing
   useEffect(() => {
     here.current = true;
@@ -85,6 +117,38 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     }
   }
 
+  // Attached files join the project's Library, named as coming from this conversation, so the
+  // question their lookup may ask is shown here. Before its first message a conversation does not
+  // exist yet: the files are added as from the Library, which opens to show them.
+  async function attach(files) {
+    setProblem(null);
+    setAttached(null);
+    const notes = [];
+    const result = await addTo(projectId, files, t, (text) => notes.push(text), id ? { conversationId: id } : {});
+    if (result) {
+      libraryChanged(projectId);
+      notes.unshift(t('conversation.attached', { count: result.materials.length }));
+      if (!id) onLibrary?.();
+    }
+    if (notes.length) setAttached({ text: notes.join(' '), lookup: id && result ? result.lookup_run_id : null });
+    if (result && id) asksChanged(id); // the view showing it now reads its questions, this one or its successor
+  }
+
+  // The watch on an attached batch's lookup ends with it.
+  useEffect(() => {
+    if (!attached?.lookup) return undefined;
+    let live = true;
+    const timer = setInterval(async () => {
+      try {
+        const [row] = (await get(`/api/activity?run_id=${encodeURIComponent(attached.lookup)}`)).runs;
+        if (live && row && row.status !== 'running') setAttached((current) => current && { ...current, lookup: null });
+      } catch {
+        // looked at again at the next turn
+      }
+    }, ASKS_MS);
+    return () => { live = false; clearInterval(timer); };
+  }, [attached?.lookup]);
+
   async function resume(turn) {
     setProblem(null);
     try {
@@ -135,7 +199,20 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
         </div>
       </div>
 
-      <Composer running={running} problem={problem} onSend={submit} projectId={projectId}
+      {(asks.length > 0 || attached) && (
+        <div className="mx-auto grid w-full max-w-3xl shrink-0 gap-2 px-4 pb-2">
+          {attached && (
+            <p role="status" className="flex flex-wrap items-center gap-x-2 text-sm text-muted-foreground">
+              {attached.text}
+              {onLibrary && <button type="button" onClick={onLibrary}
+                className="rounded-sm text-brand underline-offset-2 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
+                {t('conversation.showLibrary')}</button>}
+            </p>
+          )}
+          {asks.map((ask) => <Ask key={ask.ask_id} ask={ask} onAnswered={loadAsks} />)}
+        </div>
+      )}
+      <Composer running={running} problem={problem} onSend={submit} projectId={projectId} onAttach={attach}
         onStop={() => Promise.resolve(stop(id, live?.runId ?? shown.find((turn) => turn.status === 'running')?.run_id))
           .then(load).catch(() => {})} />
     </section>
@@ -249,11 +326,12 @@ function Answer({ text }) {
   );
 }
 
-function Composer({ running, problem, onSend, onStop, projectId }) {
+function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
   const t = useT();
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const box = useRef(null);
+  const files = useRef(null);
 
   useEffect(() => {
     const area = box.current;
@@ -287,7 +365,15 @@ function Composer({ running, problem, onSend, onStop, projectId }) {
             onChange={(event) => setText(event.target.value)} onKeyDown={key}
             className="scroll-thin block max-h-60 min-h-9 w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-relaxed outline-hidden placeholder:text-muted-foreground" />
           <div className="mt-1 flex items-center justify-between gap-2">
-          <ModelPicker projectId={projectId} />
+          <div className="flex min-w-0 items-center gap-1">
+            <input ref={files} type="file" multiple accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
+              data-testid="composer-files" onChange={(event) => { onAttach(event.target.files); event.target.value = ''; }} />
+            <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 text-muted-foreground"
+              disabled={!projectId} onClick={() => files.current?.click()} aria-label={t('composer.attach')} title={t('composer.attach')}>
+              <Paperclip aria-hidden="true" />
+            </Button>
+            <ModelPicker projectId={projectId} />
+          </div>
           {running ? (
             <Button type="button" size="icon" variant="secondary" className="size-9 shrink-0 rounded-xl" onClick={onStop} aria-label={t('composer.stop')}>
               <Square className="fill-current" aria-hidden="true" />

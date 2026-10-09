@@ -15,6 +15,7 @@ import backend.db.deletion as deletion_module
 from backend.db import DB_NAME, ContentStore, Database, delete, new_id
 from backend.db.deletion import DELETE, KINDS, NOT_DELETED, ON_DELETE
 from backend.db.migrations import MIGRATIONS
+from backend.extraction import PDF, extractor_of
 from network_guard import allow_subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,8 +98,8 @@ def populate(db, store, project, tag, paper=None):
             (x["v1"], x["m1"], paper))
         if not conn.execute("SELECT 1 FROM extractions WHERE file_sha256 = ?", (paper,)).fetchone():
             conn.execute(
-                "INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status) VALUES (?, ?, 'pdf', '1', 'done')",
-                (x["e1"], paper))
+                "INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status) VALUES (?, ?, ?, ?, 'done')",
+                (x["e1"], paper, *extractor_of(PDF)))  # the reading this app's PDF extractor makes
             conn.execute(
                 "INSERT INTO passages (id, extraction_id, ordinal, kind, text) VALUES (?, ?, 0, 'paragraph', ?)",
                 (x["s1"], x["e1"], f"text {tag}"))
@@ -393,8 +394,8 @@ def test_a_file_shared_with_another_material_keeps_its_extraction(db, store):
     same_project = new_id()
     db.write(lambda conn: conn.execute(
         "INSERT INTO materials (id, project_id, source) VALUES (?, ?, 'upload')", (same_project, x["project"])))
-    db.write(lambda conn: conn.execute(
-        "INSERT INTO material_versions (id, material_id, seq, file_sha256) VALUES (?, ?, 0, ?)",
+    db.write(lambda conn: conn.execute(  # its current file: it still uses it
+        "INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current) VALUES (?, ?, 0, ?, 1)",
         (new_id(), same_project, x["paper"])))
     assert other["s1"] == x["s1"]  # one extraction for the file
 
@@ -543,18 +544,23 @@ def test_a_row_cannot_take_a_deleted_id(db, store, kind):
 
 def test_a_database_at_schema_1_gets_the_guard_for_its_earlier_deletions(tmp_path):
     data = tmp_path / "data"
+    project, deleted = new_id(), new_id()
     with Database(data, migrations=MIGRATIONS[:1]) as db:
-        store = ContentStore(db)
-        x = populate(db, store, add_project(db, "Thesis"), "p")
-        delete(db, store, "conversation", x["c1"])
+        # A conversation deleted at schema 1, as the deletion service of that time left it: its row
+        # gone and its tombstone kept. (Today's service reads columns later migrations add.)
+        db.write(lambda conn: (
+            conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, 'Thesis', 'research')", (project,)),
+            conn.execute("INSERT INTO conversations (id, project_id) VALUES (?, ?)", (deleted, project)),
+            conn.execute("DELETE FROM conversations WHERE id = ?", (deleted,)),
+            conn.execute("INSERT INTO tombstones (object_id, kind) VALUES (?, 'conversation')", (deleted,))))
 
     with Database(data) as db:
         assert one(db, "PRAGMA user_version") == (len(MIGRATIONS),)
         with pytest.raises(sqlite3.IntegrityError, match="cannot be used again"):
             db.write(lambda conn: conn.execute(
-                "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (x["c1"], x["project"])))
+                "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (deleted, project)))
         db.write(lambda conn: conn.execute(
-            "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), x["project"])))
+            "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), project)))
     generation = sorted((data / "backups" / "daily").iterdir())[0]  # taken before the first migration it ran
     backup = sqlite3.connect(f"{(generation / DB_NAME).as_uri()}?mode=ro", uri=True)
     try:

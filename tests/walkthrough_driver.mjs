@@ -143,7 +143,7 @@ async function startServer(dir) {
     throw new Error(`the server's listener on port ${url.port} was not found`);
   }
   return { child, pid, origin: url.origin, session: url.hash.replace('#session=', ''), dataFolder: lines['data folder'],
-           modelFile: lines['model file'], log, stderr: () => stderr };
+           materials: lines.materials, modelFile: lines['model file'], log, stderr: () => stderr };
 }
 
 // Every file of the build, fetched from the server, must be byte for byte the built file.
@@ -216,8 +216,8 @@ function navigation({ page, L }) {
   return { dialog, openSidebar, openSettings, scrollTo };
 }
 
-// The M1 flows: setup, projects, conversations, settings, export, backup, a sensitivity change with
-// the audit view, restore and deletion, in 14 screenshots.
+// The M1 flows: setup, projects, conversations, settings, export (a background run since S1-13),
+// backup, a sensitivity change with the audit view, restore and deletion, in 14 screenshots.
 async function m1(ctx) {
   const { page, L, P, C, step, check, get } = ctx;
   const { dialog, openSidebar, openSettings, scrollTo } = navigation(ctx);
@@ -469,6 +469,377 @@ async function s116(ctx) {
       && files.every((name) => (statSync(join(folder(), name)).mode & 0o777) === 0o600));
     check('an import sends nothing', downloads().length === 2);
   });
+}
+
+// The S1-13 flows: adding materials, read into passages, with their details looked up through the
+// test-owned OpenAlex, Crossref and arXiv stand-ins; a paper's details and its page viewer; a Local
+// only project's lookup confirmation, answered in the Library; and the background-run list.
+async function materials(ctx) {
+  const { page, L, C, step, check, get } = ctx;
+  const panel = () => page.getByRole('complementary', { name: L('panel.library') });
+  const dialog = () => page.getByRole('dialog', { name: L('sidebar.settings') });
+  const openSidebar = async () => {
+    const show = page.getByRole('button', { name: L('sidebar.show') });
+    if (await show.count() && await show.isVisible()) { await show.click(); await page.waitForTimeout(500); }
+  };
+  const projectNamed = async (name) => (await get('/api/projects')).body.projects.find((p) => p.name === name);
+  const listing = async (id) => (await get(`/api/projects/${id}/materials`)).body;
+  const settled = async (id, count) => { // once its count of papers is in, read and looked up
+    for (let i = 0; i < 300; i += 1) {
+      const listed = await listing(id);
+      if (listed.materials.length >= count
+          && listed.materials.every((m) => m.state !== 'reading' && m.lookup?.status !== 'running')) return listed;
+      await page.waitForTimeout(200);
+    }
+    throw new Error('the papers were not read and looked up in time');
+  };
+  const requests = () => readFileSync(join(C.out, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const scholarly = (host) => requests().filter((r) => r.host === host);
+  const paper = (title) => panel().getByRole('button', { name: title, exact: true });
+  const files = (...names) => names.map((name) => join(C.materials, name));
+
+  await page.keyboard.press('Escape'); await page.waitForTimeout(400);
+  const projectId = (await projectNamed(C.project)).id;
+  // It starts from its own project: the flow before it (S1-16's) leaves its Local only project current.
+  await openSidebar();
+  await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+  await page.getByRole('menuitem', { name: C.project, exact: true }).click(); await page.waitForTimeout(1000);
+  await step('25-library', async () => {
+    check('its own project is the current one', await page.evaluate(() => localStorage.getItem('scholia.project')) === projectId);
+    await page.getByRole('button', { name: L('panel.library'), exact: true }).click();
+    await panel().getByText(L('library.empty')).waitFor();
+    check('the library is empty', (await listing(projectId)).materials.length === 0);
+  });
+
+  const titles = { pdf: 'Minimum Wages and Employment in a Synthetic Panel', docx: 'Wages Across Synthetic Cities',
+                   latex: '最低工资的合成模型：一项方法说明', markdown: 'Labour Market Notes on a Synthetic Economy' };
+  await step('26-materials-added', async () => {
+    await page.getByTestId('library-files').setInputFiles(files('minimum-wages.pdf', 'synthetic-cities.docx', 'wage-floors.tex',
+      'labour-notes.md', 'city-report.html', 'scanned-appendix.pdf', 'damaged.pdf'));
+    const listed = await settled(projectId, 7);
+    await paper(titles.pdf).waitFor(); await page.waitForTimeout(2000);
+    const by = Object.fromEntries(listed.materials.map((m) => [m.title, m]));
+    check('seven papers are saved, each stored once', listed.materials.length === 7);
+    check('five are Ready, read into passages', listed.materials.filter((m) => m.state === 'ready' && m.extraction?.passages > 0).length === 5);
+    check('the Library shows five Ready', await panel().getByText(L('library.state.ready'), { exact: true }).count() === 5);
+    check('the scanned pages wait for text recognition', by['scanned-appendix']?.reason === 'ocr_waiting'
+      && by['scanned-appendix'].extraction.ocr_pages === 2);
+    check('the damaged file needs attention with its reason', by.damaged?.reason === 'unreadable_file');
+    check('two need attention in the Library', await panel().getByText(L('library.state.needs_attention'), { exact: true }).count() === 2);
+    check('details were looked up and saved', Object.values(titles).every((title) => by[title]?.checked_by === 'lookup'));
+    check('a retraction is recorded and flagged', by[titles.docx]?.retraction === 'retracted'
+      && await panel().getByText(L('library.retracted'), { exact: true }).count() === 1);
+    check('each identifier went alone to its source', scholarly('api.openalex.org').length >= 3 && scholarly('api.crossref.org').length === 1
+      && scholarly('export.arxiv.org').length === 1 && scholarly('api.openalex.org').every((r) => r.path.startsWith('/works/doi:10.5555/')));
+  });
+
+  await step('27-paper-details', async () => {
+    const row = panel().getByRole('listitem').filter({ hasText: titles.docx });
+    await row.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    await row.getByText(L('ask.service.crossref'), { exact: false }).first().waitFor();
+    check('its details name where they came from', await row.getByText(L('library.fact.retraction'), { exact: true }).count() === 1);
+    await row.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(300);
+    const damaged = panel().getByRole('listitem').filter({ hasText: 'damaged' });
+    await damaged.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    check('a file not read says it was not looked up yet', await damaged.getByText(L('library.source.not_read'), { exact: true }).count() === 1
+      && (await listing(projectId)).materials.find((m) => m.title === 'damaged')?.lookup.outcome === 'not_read');
+    check('and it can be read again from its row', await damaged.getByRole('button', { name: L('library.readAgain'), exact: true }).count() === 1
+      && (await listing(projectId)).materials.find((m) => m.title === 'damaged')?.readable === true);
+    await damaged.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(300);
+  });
+
+  await step('28-page-viewer', async () => {
+    await paper(titles.pdf).click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded(); // pages load in view
+    const image = panel().locator('figure img').first();
+    await image.waitFor();
+    await page.waitForFunction(() => [...document.querySelectorAll('aside figure img')].some((i) => i.naturalWidth > 0));
+    check('the first page is rendered by the backend', await image.evaluate((i) => i.naturalWidth) > 0);
+    check('its passages are drawn over it', await panel().locator('figure span[title]').count() > 3);
+    check('its table is a passage of its own', (await get(`/api/material-versions/${(await listing(projectId)).materials
+      .find((m) => m.title === titles.pdf).version.id}/passages`)).body.passages.some((p) => p.kind === 'table'));
+    // By keyboard: Tab reaches a passage on the page, which shows its focus ring and its highlight.
+    let focused = null;
+    for (let i = 0; i < 150 && !focused; i += 1) {
+      await page.keyboard.press('Tab');
+      focused = await page.evaluate(() => document.activeElement?.closest('figure') && document.activeElement.dataset.passage);
+    }
+    check('Tab reaches a passage on the page', Boolean(focused));
+    await page.waitForTimeout(300);
+    check('the focused passage shows a focus ring', await page.evaluate(() => getComputedStyle(document.activeElement).boxShadow !== 'none'));
+    check('and its lines are highlighted as when pointed at', await panel().locator(`figure span[title][class*="bg-brand/25"]`).count() > 0);
+  });
+
+  await step('28b-replaced-by-text', async () => {
+    // The PDF replaced by a Markdown file read already (shared, so no new reading): its text shows at once.
+    await page.getByTestId('paper-replace').setInputFiles(files('labour-notes.md'));
+    const list = panel().getByRole('list', { name: L('paper.passages'), exact: true });
+    await list.getByRole('listitem').first().waitFor({ timeout: 20000 }); // its first stretch, read as it shows
+    const paperNow = (await listing(projectId)).materials.find((m) => m.version?.seq === 1);
+    check('the replacement is a new version, read by Markdown', paperNow?.version.media_type === 'text/markdown'
+      && paperNow.reading === null);
+    check('its passages show as text, with no page view left over', await list.getByRole('listitem').count() > 2
+      && await panel().locator('figure img').count() === 0);
+    await list.getByRole('listitem').first().focus();
+    await page.waitForTimeout(300);
+    check('a passage in the text is reached by focus and highlighted', await page.evaluate(() => Boolean(document.activeElement?.dataset.passage))
+      && await list.locator('[role="listitem"]:focus > div[class*="bg-brand-soft"]').count() === 1);
+  });
+
+  await step('28c-long-text', async () => {
+    // A paper of 3,001 passages: its text holds the stretches near the view only, read as they come near.
+    const reads = [];
+    const read = (request) => { if (request.url().includes('/passages?')) reads.push(new URL(request.url()).searchParams); };
+    page.on('request', read);
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    await page.getByTestId('library-files').setInputFiles(files('long-notes.md', 'crowded-page.pdf'));
+    const long = (await settled(projectId, 9)).materials.find((m) => m.title === 'long-notes');
+    await paper('long-notes').click(); // named by its file: it has no identifier to look up
+    const list = panel().getByRole('list', { name: L('paper.passages'), exact: true });
+    const passage = (n) => list.getByText(`Paragraph ${n} of the long synthetic notes, written for the walkthrough.`, { exact: true });
+    await passage(1).waitFor({ timeout: 20000 });
+    const shown = () => list.locator('[data-passage]').count();
+    const scrolled = (end) => page.evaluate((toEnd) => { // the panel's scrolling element, scrolled to its start or end
+      let node = document.querySelector('aside [role="list"]');
+      while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
+      node.scrollTop = toEnd ? node.scrollHeight : 0;
+    }, end);
+    const toEnd = () => scrolled(true);
+    check('it is read into 3,001 passages', long?.extraction.passages === 3001);
+    const first = await shown();
+    check('at first only the stretches near the view are read and shown', first > 0 && first <= 300
+      && reads.every((q) => Number(q.get('limit')) <= 101));
+    // By keyboard, past the end of what is shown: Tab reaches the next stretch's first passage, read for it.
+    await passage(99).evaluate((element) => element.closest('[data-passage]').focus({ preventScroll: true }));
+    await page.keyboard.press('Tab');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('Tab goes on to the next passage, though its stretch was not read yet',
+      await page.evaluate(() => document.activeElement.textContent.includes('Paragraph 100 of')));
+    check('and highlights it', await list.locator('[role="listitem"]:focus > div[class*="bg-brand-soft"]').count() === 1);
+    // Scrolled to the end: the end is read and shown, and the beginning let go.
+    await toEnd();
+    for (let i = 0; i < 20 && !(await passage(3000).count()); i += 1) { await page.waitForTimeout(300); await toEnd(); }
+    await passage(3000).waitFor();
+    await page.waitForTimeout(500);
+    check('scrolled to its end, its last passage shows', await passage(3000).isVisible());
+    check('its beginning is let go, but for the stretch holding focus', await passage(1).count() === 0
+      && await passage(150).count() === 1 && await passage(250).count() === 0);
+    const last = await shown();
+    check('at most nine stretches are held at once', last <= 900);
+    check('each passage says where it is in the whole text', await passage(3000).evaluate((element) => {
+      const item = element.closest('[role="listitem"]');
+      return item.getAttribute('aria-posinset') === '3001' && item.getAttribute('aria-setsize') === '3001';
+    }));
+    // A selection across stretches keeps them while it lasts, so a copy leaves none of its passages out.
+    await scrolled(false);
+    await passage(5).waitFor();
+    await page.evaluate(([from, to]) => {
+      const item = (text) => [...document.querySelectorAll('aside [role="listitem"]')].find((e) => e.textContent.includes(text));
+      const range = document.createRange();
+      range.setStartBefore(item(from));
+      range.setEndAfter(item(to));
+      document.getSelection().removeAllRanges();
+      document.getSelection().addRange(range);
+    }, ['Paragraph 5 of', 'Paragraph 120 of']);
+    await page.waitForTimeout(500);
+    await toEnd();
+    await passage(3000).waitFor();
+    await page.waitForTimeout(500);
+    const selected = await page.evaluate(() => document.getSelection().toString());
+    check('scrolled away, the selected stretches stay with all their text', await passage(5).count() === 1
+      && selected.includes('Paragraph 5 of') && selected.includes('Paragraph 99 of') && selected.includes('Paragraph 120 of'));
+    await page.evaluate(() => document.getSelection().removeAllRanges());
+    await page.waitForTimeout(500);
+    check('and are let go once nothing is selected', await passage(5).count() === 0);
+    page.off('request', read);
+    ctx.current().measured = { passages: long?.extraction.passages, shownAtFirst: first, shownAtEnd: last, reads: reads.length };
+  });
+
+  await step('28d-crowded-page', async () => {
+    // A PDF page of 220 passages shows 200 at a time; a button in Tab's order goes on to the others, passing focus on.
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    await paper('crowded-page').click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded();
+    const figure = panel().locator('figure').first();
+    const regions = figure.locator('[data-passage]');
+    await regions.first().waitFor({ timeout: 20000 });
+    const focused = () => page.evaluate(() => document.activeElement?.getAttribute('aria-label') ?? '');
+    const later = figure.getByRole('button', { name: L('paper.laterPassages'), exact: true });
+    const earlier = figure.getByRole('button', { name: L('paper.earlierPassages'), exact: true });
+    check('the page shows its first 200 passages, and offers the later ones', await regions.count() === 200 && await later.count() === 1);
+    await regions.last().focus();
+    await page.keyboard.press('Tab');
+    check('Tab goes from its last passage to the later ones', await later.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('which show in their place, focus on the first of them', await regions.count() === 20
+      && (await focused()).startsWith('Item 600.'));
+    check('highlighted as when pointed at', await figure.locator('span[title][class*="bg-brand/25"]').count() > 0);
+    await page.keyboard.press('Shift+Tab');
+    check('Shift+Tab reaches the earlier ones', await earlier.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('and goes back to them, focus on the last of them', await regions.count() === 200
+      && (await focused()).startsWith('Item 597.'));
+    // A read of the later ones that fails: the page keeps its passages and says so beside the control,
+    // with Retry, which reads them.
+    const read = (offset) => (url) => url.pathname.endsWith('/passages') && url.searchParams.get('page') === '1'
+      && url.searchParams.get('offset') === offset;
+    await page.route(read('200'), (route) => route.fulfill({ status: 500, contentType: 'application/json', body: '{"code":"http_error"}' }),
+      { times: 1 });
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Enter');
+    const retry = figure.getByRole('button', { name: L('common.retry'), exact: true });
+    await retry.waitFor({ timeout: 5000 });
+    check('a failed read says so beside the control, with Retry, and the page keeps its passages',
+      await figure.getByRole('alert').getByText(L('paper.loadFailed'), { exact: true }).count() === 1
+      && await later.count() === 1 && await regions.count() === 200);
+    check('focus waits on Retry', await retry.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    check('which reads them, focus on the first of them', await regions.count() === 20
+      && (await focused()).startsWith('Item 600.') && await retry.count() === 0);
+    // A part's read held here until the returned function lets it answer, once focus has gone on.
+    const hold = async (offset) => {
+      let release;
+      const held = new Promise((resolve) => { release = resolve; });
+      const match = read(offset);
+      await page.route(match, async (route) => { await held; await route.continue(); });
+      return async () => { release(); await page.waitForFunction(() => document.activeElement?.dataset.passage); await page.unroute(match); };
+    };
+    const onPage = async () => (await focused()) === L('paper.page').replace('{number}', '1');
+    // Back on the earlier ones, and on to the later ones again with their read held: Tab while they load
+    // stays on the page, out of the passages going, and focus goes on to the first of them once they show.
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.activeElement?.dataset.passage);
+    let answer = await hold('200');
+    await page.keyboard.press('Tab');
+    check('Tab goes from the last of the earlier ones to the later ones again', await regions.count() === 200
+      && await later.evaluate((button) => button === document.activeElement));
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Tab');
+    await page.waitForTimeout(300);
+    check('Tab while the later ones load stays on the page', await onPage());
+    check('and the passages going cannot take focus meanwhile',
+      await regions.first().evaluate((region) => { region.focus(); return document.activeElement !== region; }));
+    await answer();
+    check('and focus goes on to the first of them once they show', await regions.count() === 20
+      && (await focused()).startsWith('Item 600.'));
+    // And back with the earlier ones' read held: Shift+Tab toward them stays on the page as well.
+    answer = await hold('0');
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(300);
+    await page.keyboard.press('Shift+Tab');
+    await page.waitForTimeout(300);
+    check('Shift+Tab while the earlier ones load stays on the page', await onPage());
+    await answer();
+    check('and focus goes on to the last of them once they show', await regions.count() === 200
+      && (await focused()).startsWith('Item 597.'));
+  });
+
+  await step('29-details-saved', async () => {
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    await paper(titles.latex).click();
+    await panel().getByText(L('paper.kind.table'), { exact: true }).first().waitFor();
+    const title = panel().getByRole('textbox', { name: L('paper.field.title') });
+    await title.fill(`${titles.latex}（已核对）`);
+    await panel().getByRole('button', { name: L('common.save'), exact: true }).click();
+    await panel().getByText(L('paper.saved')).waitFor();
+    const saved = (await listing(projectId)).materials.find((m) => m.title.startsWith(titles.latex));
+    check('the edit is saved as the researcher\'s', saved?.title === `${titles.latex}（已核对）` && saved.checked_by === 'researcher');
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+  });
+
+  await step('29b-doi-changed', async () => {
+    // The retracted paper's DOI corrected by the researcher: the old DOI's retraction flag and source go with it.
+    await paper(titles.docx).click();
+    const doi = panel().getByRole('textbox', { name: L('paper.field.doi'), exact: true });
+    await doi.waitFor();
+    check('the paper is flagged retracted before the change', await panel().getByText(L('library.retracted'), { exact: true }).count() === 1);
+    await doi.fill('10.5555/scholia.walkthrough.corrected');
+    await panel().getByRole('button', { name: L('common.save'), exact: true }).click();
+    await panel().getByText(L('paper.saved')).waitFor();
+    const saved = (await listing(projectId)).materials.find((m) => m.title === titles.docx);
+    check('the old DOI\'s retraction and source are cleared with it', saved?.csl.DOI === '10.5555/scholia.walkthrough.corrected'
+      && saved.retraction === 'unknown' && saved.retraction_checked_at === null && saved.source_key === null
+      && saved.checked_by === 'researcher');
+    check('the page no longer flags it or names the lookup', await panel().getByText(L('library.retracted'), { exact: true }).count() === 0
+      && await panel().getByText(L('library.retractionUnchecked'), { exact: true }).count() === 1
+      && await panel().getByText(L('library.source.edited').split('{date}')[0], { exact: false }).count() === 1
+      && await panel().getByText(L('ask.service.crossref'), { exact: false }).count() === 0);
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    check('nor does the Library', await panel().getByText(L('library.retracted'), { exact: true }).count() === 0);
+  });
+
+  const local = C.lang === 'en' ? 'Interviews (synthetic, Local only)' : '访谈（合成数据，仅本机）';
+  const created = await get('/api/projects', { method: 'POST', body: JSON.stringify({ name: local, sensitivity: 'local_only' }) });
+  await step('30-local-only-ask', async () => {
+    check('a Local only project is made', created.body?.sensitivity === 'local_only');
+    await page.reload(); await page.getByRole('textbox', { name: L('composer.label') }).waitFor(); // its list, read again
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+    await page.getByRole('menuitem', { name: local, exact: true }).click(); await page.waitForTimeout(1200);
+    if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+    await page.getByTestId('library-files').setInputFiles(files('interview-codebook.md'));
+    const ask = panel().getByRole('group', { name: L('ask.label') });
+    await ask.waitFor({ timeout: 20000 });
+    const [open] = (await listing(created.body.id)).asks;
+    check('one question for the batch, naming its services and identifiers', open?.kind === 'identifier_lookup'
+      && open.params.identifiers === 1 && open.params.services.join() === 'crossref,openalex');
+    check('the question names the services', (await ask.innerText()).includes('OpenAlex') && (await ask.innerText()).includes('Crossref'));
+    check('the question names its project', (await ask.innerText()).includes(L('ask.project').replace('{name}', local)));
+    check('nothing was sent before the answer', !requests().some((r) => r.path.includes('codebook')));
+  });
+
+  await step('31-local-only-answered', async () => {
+    await panel().getByRole('button', { name: L('ask.identifier_lookup.option.lookup') }).click();
+    await paper('A Codebook for Synthetic Interviews').waitFor({ timeout: 20000 });
+    const listed = await settled(created.body.id, 1);
+    check('the answer is saved and the lookup made', listed.materials[0]?.checked_by === 'lookup' && listed.asks.length === 0);
+    check('the request went out only after the answer', requests().some((r) => r.path.includes('codebook')));
+    const audited = (await get(`/api/audit?project_id=${created.body.id}`)).body.entries;
+    check('the answer and the approved request are audited', audited.some((e) => e.event === 'ask_answered' && e.data.answer === 'lookup')
+      && audited.some((e) => e.event === 'outbound' && e.data.kind === 'scholarly_api' && e.data.approved === true));
+  });
+
+  await step('31b-project-switch', async () => {
+    // A read of one project's papers that answers only after a switch to another is never shown there.
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    const slow = `**/api/projects/${projectId}/materials`;
+    await page.route(slow, async (route) => { await held; await route.continue(); });
+    const switchTo = async (name) => {
+      await openSidebar();
+      await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+      await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(800);
+      if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+    };
+    await switchTo(C.project); // its papers' read is held
+    await switchTo(local); // and the Local only project's answers at once
+    await paper('A Codebook for Synthetic Interviews').waitFor();
+    release();
+    await page.waitForTimeout(1500); // the first project's read answers now
+    await page.unroute(slow);
+    check('the Library shows only the papers of the project it is open on', await paper('A Codebook for Synthetic Interviews').count() === 1
+      && await paper(titles.pdf).count() === 0 && await panel().getByRole('list', { name: L('library.papers') }).getByRole('listitem').count() === 1);
+  });
+
+  await step('32-background-runs', async () => {
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.settings') }).click(); await dialog().waitFor();
+    await dialog().getByRole('button', { name: L('settings.page.advanced'), exact: true }).click(); await page.waitForTimeout(1200);
+    await dialog().getByRole('heading', { name: L('settings.backgroundRuns') }).scrollIntoViewIfNeeded(); await page.waitForTimeout(2500);
+    const runs = (await get('/api/activity')).body.runs;
+    check('readings, lookups and the export are listed', ['extract', 'lookup', 'project_export'].every((w) => runs.some((r) => r.workflow === w)));
+    check('the failed reading offers Retry', runs.some((r) => r.workflow === 'extract' && r.status === 'failed' && r.retryable)
+      && await dialog().getByRole('button', { name: L('runs.retry'), exact: true }).count() >= 1);
+    check('the list names them', await dialog().getByText(L('settings.workflowExtract'), { exact: true }).count() >= 5);
+    await dialog().getByRole('button', { name: L('runs.retry'), exact: true }).first().scrollIntoViewIfNeeded();
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
 }
 
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
@@ -791,7 +1162,8 @@ async function run(combo, build, outRoot) {
     page.on('console', (message) => { if (['error', 'warning'].includes(message.type())) consoleMessages.push(`${message.type()}: ${message.text()}`); });
     page.on('pageerror', (error) => consoleMessages.push(`pageerror: ${error.message}`));
     const { label, pattern } = labels(combo.lang);
-    const C = { out, tag, exports, project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
+    const C = { out, tag, exports, lang: combo.lang, materials: server?.materials,
+                project: combo.lang === 'en' ? 'Minimum wage study (synthetic)' : '最低工资研究（合成数据）',
                 localProject: combo.lang === 'en' ? 'Interview transcripts (synthetic, Local only)' : '访谈记录（合成数据，仅本机）',
                 dataFolder: server?.dataFolder, modelFile: server?.modelFile, requestLog: server?.log,
                 question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
@@ -815,6 +1187,7 @@ async function run(combo, build, outRoot) {
     }
     await m1(ctx);
     if (server) await s116(ctx);  // its synthetic model and download source are the test server's
+    if (C.materials) await materials(ctx);  // an attached app has no synthetic materials of its own
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);

@@ -20,6 +20,8 @@ import json
 import logging
 import weakref
 
+from backend.extraction import EXTRACTORS, extractor_of
+
 log = logging.getLogger(__name__)
 
 # The outbound gate open over a database, if any, by database: delete() marks its write with the
@@ -74,9 +76,10 @@ ON_DELETE = {
     ("suggestion_sets", "run_id"): "run_id = NULL",
     ("comment_threads", "run_id"): "run_id = NULL",
     ("memory_records", "created_by_run_id"): "created_by_run_id = NULL",
-    # A material's versions; extractions shared by file go by RULES. A citation of a
-    # deleted source keeps its quote, loses every link to the source (a passage may
-    # live on in another project's material) and shows that the source was removed.
+    # A material's versions; extractions (readings, each shared by the versions that read
+    # it) go by RULES. A citation of a deleted source keeps its quote, loses every link to
+    # the source (a passage may live on in another project's material) and shows that the
+    # source was removed.
     ("material_versions", "material_id"): DELETE,
     ("passages", "extraction_id"): DELETE,
     ("candidates", "material_id"): "material_id = NULL",
@@ -104,18 +107,32 @@ def _doomed(table):
     return f"(SELECT rid FROM temp.doomed WHERE tbl = '{table}')"
 
 
+def _reads(v, e):
+    """SQL: material version v reads extraction e, its reading. A reading is a file read by one
+    extractor: v's file, by the extractor of the type it was added as (its own media_type, or its
+    stored file's for a version from before it had one). The same bytes added as Markdown and as
+    LaTeX are two readings, each with its own passages, deleted and unindexed on its own. A version
+    of no known type reads every extraction of its file, as before readings were told apart."""
+    kind = f"coalesce({v}.media_type, (SELECT c.media_type FROM content_files c WHERE c.sha256 = {v}.file_sha256))"
+    extractor = (f"CASE {kind}"
+                 + "".join(f" WHEN '{kind}' THEN '{name}'" for kind, (name, _) in EXTRACTORS.items())
+                 + f" ELSE {e}.extractor END")
+    return f"{e}.file_sha256 = {v}.file_sha256 AND {e}.extractor = {extractor}"
+
+
 # Deletions a foreign key cannot express. Each adds rows to temp.doomed and is
 # applied until nothing more is added. {deleted_ids} is the ids of every doomed row.
 RULES = (
     # A turn and its run are one object.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'runs', rowid FROM runs WHERE id IN (SELECT run_id FROM turns WHERE rowid IN {_doomed('turns')})""",
-    # An extraction is shared by every version over the same file, so it goes with the last of them.
+    # An extraction (a reading) is shared by every version that reads it, so it goes with the last of them.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'extractions', e.rowid FROM extractions e
-    WHERE e.file_sha256 IN (SELECT file_sha256 FROM material_versions WHERE rowid IN {_doomed('material_versions')})
+    WHERE EXISTS (SELECT 1 FROM material_versions v
+                  WHERE v.rowid IN {_doomed('material_versions')} AND {_reads('v', 'e')})
     AND NOT EXISTS (SELECT 1 FROM material_versions v
-                    WHERE v.file_sha256 = e.file_sha256 AND v.rowid NOT IN {_doomed('material_versions')})""",
+                    WHERE {_reads('v', 'e')} AND v.rowid NOT IN {_doomed('material_versions')})""",
     # The citations in a deleted answer or artifact.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'citations', rowid FROM citations
@@ -140,7 +157,12 @@ RULES = (
 # doomed rows as RULES do (for example a run whose context holds a deleted
 # material or memory record). Those runs, and the runs they started, are revoked
 # with the rest. The change that records such a link adds its query here.
-SCOPE_LINKS: tuple[str, ...] = ()
+SCOPE_LINKS: tuple[str, ...] = (
+    # A material's background work (reading it, looking up its identifier), which names the
+    # materials it works on in its inputs (backend/materials.py).
+    f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.material_ids') j
+    WHERE r.status = 'running' AND j.value IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
+)
 
 
 def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed=None):
@@ -300,22 +322,36 @@ def _revoke(conn):
     return revoked
 
 
+def _reads_now(w, e):
+    """SQL: material version w is current and e is its reading now: its file read by this version of
+    its type's extractor (extractor_of, as backend/materials.py's _extraction picks a paper's
+    reading). Built when it is used, so it follows the extractor versions of the app that runs."""
+    kind = f"coalesce({w}.media_type, (SELECT c.media_type FROM content_files c WHERE c.sha256 = {w}.file_sha256))"
+    reading = (f"CASE {kind}" + "".join(f" WHEN '{kind}' THEN '{'/'.join(extractor_of(kind))}'" for kind in EXTRACTORS)
+               + f" ELSE {e}.extractor || '/' || {e}.extractor_version END")
+    return (f"{w}.is_current = 1 AND {e}.file_sha256 = {w}.file_sha256"
+            f" AND {e}.extractor || '/' || {e}.extractor_version = {reading}")
+
+
 def _queue_index_removals(conn):
     """Queue the search index removals for the deleted passages and memory records.
 
-    Index rows are kept per project, so a material's passages are removed for its
-    project once no other material version there uses the same file.
+    Index rows are kept per project, and a project's index holds only what its current versions
+    read now: the passages of every reading of a deleted version's file are removed for its
+    project unless a surviving current version there reads them now. An earlier version kept after
+    a replacement, or a reading by an earlier extractor version, keeps nothing in the index (it
+    keeps its reading's rows, which go with the last version that read them: see RULES).
     """
     conn.execute(f"""INSERT INTO index_queue (target, target_id, project_id, op)
         SELECT DISTINCT 'passage', p.id, m.project_id, 'remove'
         FROM material_versions v
         JOIN materials m ON m.id = v.material_id
-        JOIN extractions e ON e.file_sha256 = v.file_sha256
+        JOIN extractions e ON {_reads('v', 'e')}
         JOIN passages p ON p.extraction_id = e.id
         WHERE v.rowid IN {_doomed('material_versions')}
         AND NOT EXISTS (
             SELECT 1 FROM material_versions w JOIN materials n ON n.id = w.material_id
-            WHERE w.file_sha256 = v.file_sha256 AND n.project_id = m.project_id
+            WHERE {_reads_now('w', 'e')} AND n.project_id = m.project_id
             AND w.rowid NOT IN {_doomed('material_versions')})
         ORDER BY p.id""")
     conn.execute(f"""INSERT INTO index_queue (target, target_id, project_id, op)

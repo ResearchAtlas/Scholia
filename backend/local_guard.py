@@ -14,7 +14,10 @@ client's disconnect, and it decides before any route parses a body.
   header `X-Scholia-Client: local`, which a page on another site cannot send
   without a preflight. A read with no Origin must be same-origin by Fetch
   Metadata or carry that header. Fetch Metadata saying cross-site is refused.
-- A request body must be JSON.
+- A request body must be JSON, with a Content-Length of at most MAX_BODY, checked before anything
+  reads it: the server reads no more than that length, so nothing larger is ever held. A request
+  with any Transfer-Encoding is refused, with a Content-Length or without: the server frames such a
+  body by its encoding, not by the length checked here. The app's pages never send one.
 - CORS: the app's own pages are same-origin with the API and never need it. An
   explicitly configured development origin (a dev server on this machine) may call
   the API across origins: its preflight is checked (origin, method, and only the
@@ -47,6 +50,10 @@ _CORS_METHODS = b"GET, POST, PUT, PATCH, DELETE"
 _CORS_HEADERS = {b"content-type", CLIENT_HEADER}
 _JSON = {b"application/json", b"application/json; charset=utf-8"}
 SESSION_HEADER = b"x-scholia-session"
+# The largest request body: one file Scholia reads (backend/extraction.py MAX_FILE_BYTES, 100 MiB) in
+# base64 within its JSON, with 64 KiB for the rest of that JSON (its name, at most 255 characters
+# however escaped, and the ids). The interface sends a larger selection in several requests.
+MAX_BODY = (100 * 1024 * 1024 + 2) // 3 * 4 + 64 * 1024
 
 
 class LocalRequestGuard:
@@ -119,12 +126,19 @@ class LocalRequestGuard:
                 return 403, "client_header_missing"
             if method not in _CHANGES and not (marked or fetch_site == b"same-origin"):
                 return 403, "client_header_missing"
-        has_body = headers.get(b"transfer-encoding") or headers.get(b"content-length", [b"0"])[-1] not in (b"0", b"")
+        if headers.get(b"transfer-encoding"):  # framed by its encoding, whatever Content-Length says
+            return 411, "length_required"
+        has_body = headers.get(b"content-length", [b"0"])[-1] not in (b"0", b"")
         if has_body:
             content_types = headers.get(b"content-type", [])
             if len(content_types) != 1 or content_types[0].lower().replace(b" ", b"") not in {
                     t.replace(b" ", b"") for t in _JSON}:
                 return 415, "json_required"
+            lengths = headers.get(b"content-length", [])
+            if len(lengths) != 1 or not lengths[0].isdigit():
+                return 411, "length_required"
+            if int(lengths[0]) > MAX_BODY:
+                return 413, "request_too_large"
         return None
 
 

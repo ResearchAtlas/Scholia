@@ -54,6 +54,23 @@ export async function api(method, path, body, { signal } = {}) {
   return data;
 }
 
+// A file the API answers with, such as a page image, as a Blob: never from or into the browser's
+// cache, so a deleted material's page cannot come back from it.
+export async function getBlob(path, signal) {
+  let response;
+  try {
+    response = await fetch(path, { headers: headers(false), cache: 'no-store', signal });
+  } catch (error) {
+    if (signal?.aborted) throw error; // given up by the caller: no failure to show
+    throw new ApiError(0, 'unreachable');
+  }
+  if (!response.ok) {
+    const data = await response.json().catch(() => null);
+    throw failure(response.status, data?.code ?? 'http_error');
+  }
+  return response.blob();
+}
+
 export const get = (path, options) => api('GET', path, undefined, options);
 export const post = (path, body = {}) => api('POST', path, body);
 export const put = (path, body) => api('PUT', path, body);

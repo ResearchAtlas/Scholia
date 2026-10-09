@@ -4,11 +4,9 @@
 // never a key. A Private or Local only project's export is encrypted with a passphrase.
 import { useContext, useState } from 'react';
 import { LanguageContext, useT } from '../i18n/index.js';
-import { post } from '../api.js';
 import { needsPassphrase } from '../backups.js';
-import { useAction } from '../action.js';
 import { FolderField } from './FolderField.jsx';
-import { Passphrase, Saved } from './Backups.jsx';
+import { ArchiveStatus, Passphrase, useArchiveRun } from './Backups.jsx';
 import { Button } from '@/components/ui/button';
 
 export function ProjectExportSection({ project }) {
@@ -16,16 +14,15 @@ export function ProjectExportSection({ project }) {
   const language = useContext(LanguageContext); // the export's headings are written in it
   const [destination, setDestination] = useState('');
   const [passphrase, setPassphrase] = useState('');
-  const [saved, setSaved] = useState(null);
-  const { busy, problem, run } = useAction();
+  const archive = useArchiveRun();
   const encrypted = needsPassphrase([project]);
 
   async function submit(event) {
     event.preventDefault();
-    setSaved(null);
-    const result = await run(() => post(`/api/projects/${encodeURIComponent(project.id)}/export`,
-      { destination: destination.trim(), language, ...(passphrase ? { passphrase } : {}) }));
-    if (result) { setSaved(result.file); setPassphrase(''); }
+    const sent = passphrase;
+    setPassphrase(''); // held by the run in memory only, and not kept in the form either
+    if (!(await archive.start(`/api/projects/${encodeURIComponent(project.id)}/export`,
+      { destination: destination.trim(), language, ...(sent ? { passphrase: sent } : {}) }))) setPassphrase(sent);
   }
 
   return (
@@ -34,11 +31,9 @@ export function ProjectExportSection({ project }) {
       {encrypted && (
         <Passphrase id="export-passphrase" value={passphrase} onChange={setPassphrase} hint={t('export.passphraseHint')} />
       )}
-      {problem && <p role="alert" className="text-sm text-destructive">{problem}</p>}
-      {busy && <p role="status" className="text-sm text-muted-foreground">{t('backups.working')}</p>}
-      {saved && <Saved text={t('backups.saved', { file: saved })} />}
+      <ArchiveStatus archive={archive} />
       <Button type="submit" className="justify-self-start"
-        disabled={busy || !destination.trim() || (encrypted && !passphrase)}>{t('export.start')}</Button>
+        disabled={archive.busy || !destination.trim() || (encrypted && !passphrase)}>{t('export.start')}</Button>
     </form>
   );
 }
