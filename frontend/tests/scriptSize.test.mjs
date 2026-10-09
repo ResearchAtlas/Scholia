@@ -73,10 +73,13 @@ test('the start script passes at 600 kB and fails one byte over, whatever waits 
   }
 });
 
-test('a build that cannot be read fails: a named script missing, or a page that names none', () => {
+test('a build that cannot be read fails: a named script missing, or no module script to start from', () => {
   for (const [files, page, reason] of [
     [{ ...FILES, 'side.js': undefined }, PAGE, /side\.js/],
-    [FILES, '<link rel="stylesheet" href="/assets/app.css">', /names no script/],
+    [FILES, '<link rel="stylesheet" href="/assets/app.css">', /names no module script/],
+    // preloads alone start nothing, however small
+    [FILES, '<link rel="modulepreload" href="/assets/vendor.js">\n<link rel="stylesheet" href="/assets/app.css">', /names no module script/],
+    [FILES, '<script src="/assets/entry.js"></script>', /names no module script/],
   ]) {
     const dist = build(Object.fromEntries(Object.entries(files).filter(([, value]) => value)), page);
     try {

@@ -21,11 +21,13 @@ const attribute = (tag, name) => tag.match(new RegExp(`\\b${name}\\s*=\\s*"([^"]
 // Every script of the build, by path under dist with its size in bytes, and whether it loads at start.
 export function scripts(dist) {
   const page = readFileSync(join(dist, 'index.html'), 'utf8');
+  const scripts = tags(page, 'script').filter((tag) => attribute(tag, 'src'));
+  // The window starts from a module script; a page that only preloads would start nothing.
+  if (!scripts.some((tag) => attribute(tag, 'type') === 'module')) throw new Error('index.html names no module script');
   const named = [
-    ...tags(page, 'script').map((tag) => attribute(tag, 'src')),
+    ...scripts.map((tag) => attribute(tag, 'src')),
     ...tags(page, 'link').filter((tag) => attribute(tag, 'rel') === 'modulepreload').map((tag) => attribute(tag, 'href')),
   ].filter(Boolean).map((path) => path.replace(/^\//, ''));
-  if (!named.length) throw new Error('index.html names no script');
   const start = new Set();
   const visit = (path) => {
     if (start.has(path)) return;
