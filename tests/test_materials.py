@@ -693,6 +693,20 @@ async def test_the_researchers_edit_of_a_papers_details_is_checked_and_kept(tmp_
         assert not {"container-title", "issued", "DOI"} & cleared["csl"].keys()
 
 
+async def test_an_author_name_past_its_length_is_refused_and_nothing_is_written(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, ("notes.md", synthetic.paper_markdown(arxiv=""))))["materials"]
+        before = (await settled(client, project))[0]
+        url = f"/api/materials/{paper['id']}"
+        refused = await client.patch(url, json={"title": "A Title", "authors": ["Example, Ana", "x" * 201]})
+        assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")
+        [after] = await settled(client, project)
+        assert (after["title"], after["csl"], after["checked_by"]) == (before["title"], before["csl"], before["checked_by"])
+        kept = await client.patch(url, json={"authors": ["x" * 200]})  # a name as long as a looked-up one may be
+        assert kept.status_code == 200 and kept.json()["csl"]["author"] == [{"literal": "x" * 200}]
+
+
 async def test_reading_and_its_failures_log_no_file_name_or_text(tmp_path, caplog):
     caplog.set_level(logging.DEBUG)
     secret = "Participant-Seven-Canary"

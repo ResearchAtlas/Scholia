@@ -53,6 +53,7 @@ import binascii
 import json
 import logging
 import time
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
@@ -103,7 +104,8 @@ class Upload(BaseModel):
 
 class MaterialChange(BaseModel):
     title: str | None = Field(default=None, max_length=1000)
-    authors: list[str] | None = Field(default=None, max_length=100)  # "Family, Given" or a name, one each
+    # "Family, Given" or a name, one each, each as long as a looked-up one may be (backend/lookup.py)
+    authors: list[Annotated[str, Field(max_length=200)]] | None = Field(default=None, max_length=100)
     year: int | None = Field(default=None, ge=1000, le=2200)
     venue: str | None = Field(default=None, max_length=1000)
     doi: str | None = Field(default=None, max_length=300)
