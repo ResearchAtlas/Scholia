@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT,
   detailsSource, latestLookup, pageImage } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -677,4 +677,43 @@ test('a page moving to another part keeps what it shows out of reach while that 
   // Retry, and is read again once asked again or let go and held again (its failure cleared).
   assert.deepEqual(partMove(null, 1, true), { read: false, loading: false, failed: true });
   assert.deepEqual(partMove(null, 1, false), { read: true, loading: false, failed: false });
+  assert.deepEqual(partMove({ part: 3 }, 3, true), { read: false, loading: false, failed: false }); // a stretch shown
+});
+
+test('a PDF of 100,000 pages mounts only the pages near the view, with spacers keeping every page\'s place', () => {
+  const pages = 100_000;
+  const aspects = new Map([[2, 2], [50_000, 0.5], [99_999, 612 / 792]]); // a wide page, a tall one, an ordinary one
+  const offsets = pageOffsets(pages, 900, aspects); // a list wider than a page: pages PAGE_WIDTH wide
+  const height = (n) => offsets[n] - offsets[n - 1] - PAGE_GAP;
+  assert.equal(height(1), (PAGE_WIDTH - 2) / PAGE_ASPECT + 2);
+  assert.equal(height(2), (PAGE_WIDTH - 2) / 2 + 2);
+  assert.equal(height(50_000), (PAGE_WIDTH - 2) * 2 + 2);
+  assert.equal(pageOffsets(3, 400, new Map())[1], (400 - 2) / PAGE_ASPECT + 2 + PAGE_GAP); // a narrow list: pages its width
+  // Laid out, a window's items take the whole list's height: each spacer its pages' and their gaps, less the list's gap after it.
+  const laid = (items) => items.reduce((sum, item) => sum + (item.page ? height(item.page) : item.height), 0)
+    + PAGE_GAP * (items.length - 1);
+  const pagesOf = (items) => items.filter((item) => item.page).map((item) => item.page);
+  const screen = 900;
+  const at = (top, held = []) => pageWindow(offsets, pagesWithin(offsets, top - 2 * screen, top + 3 * screen), held);
+  for (const [top, held] of [[0, []], [offsets[49_999] - 100, []], [offsets[pages] - screen, []], [offsets[70_000], [1, 100_000]],
+    [offsets[pages] + 5000, []], [-5000, [3]]]) {
+    const items = at(top, held);
+    const mounted = pagesOf(items);
+    assert.ok(mounted.length <= 16, `${mounted.length} pages mounted at ${top}`); // of 100,000
+    assert.ok(Math.abs(laid(items) - (offsets[pages] - PAGE_GAP)) < 1e-3, `${laid(items)} at ${top}`);
+    assert.deepEqual(mounted, [...mounted].sort((a, b) => a - b)); // in order: Tab goes from each to the next
+    for (const page of held) assert.ok([page - 1, page, page + 1].filter((n) => n >= 1 && n <= pages).every((n) => mounted.includes(n)));
+    assert.ok(items.every((item, i) => item.page || (item.height > 0 && !items[i + 1]?.spacer))); // no two spacers together
+  }
+  // At the top: the first pages, and one more past those within two screens; at the end, the last ones.
+  const top = pagesOf(at(0));
+  assert.deepEqual([top[0], top.length > 2], [1, true]);
+  assert.ok(top.at(-1) * (height(1) + PAGE_GAP) >= 3 * screen); // the pages reach past two screens below the view
+  assert.equal(pagesOf(at(offsets[pages] - screen)).at(-1), pages);
+  // Around the middle: the tall page near the view, and nothing far from it.
+  const middle = pagesOf(at(offsets[49_999] - 100));
+  assert.ok(middle.includes(50_000) && middle.every((n) => Math.abs(n - 50_000) < 8), middle);
+  // Focus or a selection far from the view keeps its page mounted, with one on each side.
+  assert.deepEqual(pagesOf(at(offsets[70_000], [1, 100_000])).filter((n) => n < 60_000 || n > 80_000), [1, 2, 99_999, 100_000]);
+  assert.deepEqual(pageWindow(pageOffsets(0, 900, new Map()), [1, 0]), []); // no pages, nothing to lay out
 });

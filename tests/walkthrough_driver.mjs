@@ -801,6 +801,78 @@ async function materials(ctx) {
     await page.unroute(firstPage);
   });
 
+  // The many-page PDF's list: its figures mounted, the one labelled for a page, and its height against
+  // the height of all its pages laid out (each the default page's shape: its pages are letter pages).
+  const figures = () => panel().locator('figure');
+  const pageFigure = (n) => panel().getByRole('figure', { exact: true, // its number as the interface writes it: 20,000
+    name: L('paper.page').replace('{number}', new Intl.NumberFormat(C.lang).format(n)) });
+  const pageList = () => page.evaluate(() => {
+    const list = document.querySelector('aside figure').parentElement;
+    const width = Math.min(list.clientWidth, 720);
+    return { height: list.offsetHeight, laidOut: 20000 * ((width - 2) * 792 / 612 + 2 + 16) - 16 };
+  });
+  const scrollPanel = (to) => page.evaluate((where) => { // the panel's scrolling element, to the list's top, a page's or its end
+    let node = document.querySelector('aside figure');
+    while (node && !/(auto|scroll)/.test(getComputedStyle(node).overflowY)) node = node.parentElement;
+    const list = document.querySelector('aside figure').parentElement;
+    const top = list.getBoundingClientRect().top - node.getBoundingClientRect().top + node.scrollTop;
+    node.scrollTop = where === 'end' ? node.scrollHeight : top + where;
+  }, to);
+
+  await step('57-many-pages', async () => {
+    // A PDF of 20,000 pages, all but the first blank: only the pages near the view are mounted, the others kept as
+    // spacers of their height, so the list is as tall as all its pages and its last page is reached by scrolling.
+    await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+    await page.getByTestId('library-files').setInputFiles(files('many-blank-pages.pdf'));
+    const many = (await settled(projectId, 10)).materials.find((m) => m.title === 'many-blank-pages');
+    check('it is read into 20,000 pages', many?.extraction.pages === 20000);
+    await paper('many-blank-pages').click();
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded();
+    await pageFigure(1).locator('img').waitFor({ timeout: 20000 });
+    await page.waitForTimeout(500);
+    const first = await figures().count();
+    check('at first only the pages near the view are mounted', first > 1 && first <= 16);
+    let list = await pageList();
+    check('the list is as tall as all its pages', Math.abs(list.height - list.laidOut) < 2);
+    await scrollPanel('end');
+    await pageFigure(20000).locator('img').waitFor({ timeout: 20000 });
+    await page.waitForTimeout(500);
+    const last = await figures().count();
+    check('scrolled to its end, its last page is mounted, labelled and shown', await pageFigure(20000).isVisible());
+    check('and still only the pages near the view: the first page is let go', last <= 16 && await pageFigure(1).count() === 0);
+    list = await pageList();
+    check('the list keeps its height', Math.abs(list.height - list.laidOut) < 2);
+    ctx.current().measured = { pages: many?.extraction.pages, mountedAtFirst: first, mountedAtEnd: last, height: list.height };
+  });
+
+  await step('58-many-pages-keyboard', async () => {
+    // Tab and Shift+Tab go from page to page in order, the next one always mounted, never out of the list.
+    await scrollPanel(10_000 * ((await pageList()).laidOut + 16) / 20000);
+    await page.waitForTimeout(800);
+    const at = () => page.evaluate(() => {
+      const figure = document.activeElement?.closest('figure');
+      return figure ? Number(figure.getAttribute('aria-label').replace(/\D/g, '')) : null;
+    });
+    await pageFigure(10001).focus();
+    const visited = [await at()];
+    let most = await figures().count();
+    for (let i = 0; i < 20; i += 1) {
+      await page.keyboard.press('Tab'); await page.waitForTimeout(150);
+      visited.push(await at());
+      most = Math.max(most, await figures().count());
+    }
+    check('Tab goes from page to later page, never out of the list', visited.every((n, i) => n !== null && (i === 0 || n > visited[i - 1])));
+    const back = [visited.at(-1)];
+    for (let i = 0; i < 8; i += 1) {
+      await page.keyboard.press('Shift+Tab'); await page.waitForTimeout(150);
+      back.push(await at());
+      most = Math.max(most, await figures().count());
+    }
+    check('Shift+Tab goes back page by page', back.every((n, i) => n !== null && (i === 0 || n < back[i - 1])));
+    check('with only the pages near the view mounted throughout', most <= 16);
+    ctx.current().measured = { forward: visited, back, mostMounted: most };
+  });
+
   await step('29-details-saved', async () => {
     await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
     await paper(titles.latex).click();

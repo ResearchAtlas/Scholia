@@ -4,15 +4,15 @@
 // them; every format also shows its passages as text, in order. The cited passage's highlight comes
 // with S1-19's citations; here a passage is highlighted while it is pointed at or focused, and Tab
 // reaches each passage, in the text and on the page.
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ArrowLeft, FileUp, Trash2 } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageImage,
-  pageLines, pagePart, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing, rectStyle, reasonKey, selectedParts, takeSaved,
-  unionRect, validYear, viewOf, waitsOn, withNear } from '../library.js';
+  pageLines, pageOffsets, pagePart, pagesWithin, pageWindow, PAGE_WIDTH, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing,
+  rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
@@ -237,16 +237,49 @@ function usePart(frame, part, showing, onNear, onWithin) {
   return [props, focusOn, passTo];
 }
 
-// A PDF's pages, each holding its image and its passages only while it is held.
+// A PDF's pages, each holding its image and its passages only while it is held. Only the pages
+// within two screens of the view are mounted, with the held ones and a page on each side of each
+// (pageWindow); the others are spacers of their height, each page's from its own image once shown,
+// so the list keeps its height and every page its place, however many pages there are.
+// ponytail: laid out at its whole height, which browsers cap at 33,554,432 px (about 35,000 letter
+// pages 720 px wide; past it Chromium squeezes the pages); a scaled or paged list if longer PDFs are read.
 function PageList({ version, pages, pointed, onPoint }) {
   const list = useRef(null);
   const { held, onNear, onWithin } = useHeld(list);
+  const aspects = useRef(new Map()); // each page's width over its height, once its image was shown
+  const [learned, learn] = useReducer((n) => n + 1, 0);
+  const [width, setWidth] = useState(PAGE_WIDTH);
+  const offsets = useMemo(() => pageOffsets(pages, width, aspects.current), [pages, width, learned]);
+  const [span, setSpan] = useState([1, 1]); // the first and last pages within two screens of the view
+  const measure = useRef(null);
+  measure.current = () => {
+    const element = list.current;
+    const root = scroller(element);
+    const view = root ? root.getBoundingClientRect() : { top: 0, bottom: window.innerHeight, height: window.innerHeight };
+    const top = element.getBoundingClientRect().top;
+    const next = pagesWithin(offsets, view.top - top - 2 * view.height, view.bottom - top + 2 * view.height);
+    setSpan((current) => (current[0] === next[0] && current[1] === next[1] ? current : next));
+  };
+  useLayoutEffect(() => measure.current(), [offsets]);
+  useEffect(() => {
+    const element = list.current;
+    const root = scroller(element) ?? window;
+    const follow = () => measure.current();
+    const resized = new ResizeObserver(() => { setWidth(element.clientWidth); follow(); });
+    resized.observe(element);
+    if (root !== window) resized.observe(root);
+    root.addEventListener('scroll', follow, { passive: true });
+    return () => { resized.disconnect(); root.removeEventListener('scroll', follow); };
+  }, []);
+  const onAspect = useCallback((number, aspect) => {
+    if (aspects.current.get(number) !== aspect) { aspects.current.set(number, aspect); learn(); }
+  }, []);
   return (
     <div ref={list} className="grid gap-4">
-      {Array.from({ length: pages }, (_, i) => (
-        <PageView key={i} version={version} number={i + 1} pointed={pointed} onPoint={onPoint}
-          held={held.has(i + 1)} onNear={onNear} onWithin={onWithin} />
-      ))}
+      {pageWindow(offsets, span, held).map((item) => (item.page
+        ? <PageView key={item.page} version={version} number={item.page} pointed={pointed} onPoint={onPoint}
+          held={held.has(item.page)} onNear={onNear} onWithin={onWithin} aspect={aspects.current.get(item.page)} onAspect={onAspect} />
+        : <div key={`before-${item.spacer}`} aria-hidden="true" style={{ height: item.height }} />))}
     </div>
   );
 }
@@ -259,15 +292,14 @@ function PageList({ version, pages, pointed, onPoint }) {
 // pointer's reach and Tab toward it (Shift+Tab toward the part before) waits on the page, and a
 // read that fails shows beside the button, with Retry, which (as the button does) reads it again
 // (partMove); a page whose first read fails says so in its place, with Retry. The line boxes a part
-// draws are bounded (pageLines).
-function PageView({ version, number, pointed, onPoint, held, onNear, onWithin }) {
+// draws are bounded (pageLines). Its shape is its image's (aspect, kept by the list: onAspect).
+function PageView({ version, number, pointed, onPoint, held, onNear, onWithin, aspect, onAspect }) {
   const t = useT();
   const frame = useRef(null);
   const retry = useRef(null);
   const [part, setPart] = useState(0); // which part of its passages it shows
   const [shown, setShown] = useState(null); // { src, part, passages, more }
   const [failed, setFailed] = useState(false); // read again once asked to, or let go and held again
-  const [aspect, setAspect] = useState(null); // its image's width over height, once one was shown
   const [props, focusOn, passTo] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
   const move = partMove(shown, part, failed);
   useEffect(() => {
@@ -302,7 +334,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin })
       className="relative mx-auto w-full max-w-[720px] overflow-hidden rounded-md border bg-white shadow-xs outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
       aria-label={t('paper.page', { number })}>
       {shown ? <img src={shown.src} alt={t('paper.page', { number })} className="block w-full" draggable={false}
-        onLoad={(event) => setAspect(event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />
+        onLoad={(event) => onAspect(number, event.currentTarget.naturalWidth / event.currentTarget.naturalHeight)} />
         : <div className={cn('grid place-items-center text-xs', !aspect && 'aspect-[612/792]', failed ? 'text-destructive' : 'text-muted-foreground')}
           style={aspect ? { aspectRatio: aspect } : undefined}>
           {move.failed ? <div className="grid justify-items-center gap-2">

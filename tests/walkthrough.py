@@ -113,6 +113,8 @@ def write_materials():
         "long-notes.md": long_notes(),
         "crowded-page.pdf": synthetic_materials.pdf(  # one page of 220 passages, a line of three items each
             [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]]),
+        "many-blank-pages.pdf": synthetic_materials.pdf(  # 20,000 pages, all but the first blank: 2.4 MB, read in 0.5 s
+            [[(72, 720, 14, "Synthetic Pages Left Blank")]] + [[]] * 19_999),
     }
     for name, data in files.items():
         (folder / name).write_bytes(data)

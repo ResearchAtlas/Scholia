@@ -308,3 +308,19 @@ test('a stretch or a page whose first read failed offers Retry, which reads it a
   assert.deepEqual(effect(true, { read: true }), [['read']]);
   assert.deepEqual(effect(false, { read: false }), [['shown', null], ['failed', false]]);
 });
+
+// What a PDF's page list renders its pages from, as source text.
+function pageItems(text) {
+  return parsed(text, (context, found) => ({
+    JSXOpeningElement(element) {
+      if (element.name.name !== 'PageView') return;
+      let call = element.parent;
+      while (call && !(call.type === 'CallExpression' && call.callee.property?.name === 'map')) call = call.parent;
+      (found.from ??= []).push(call ? context.sourceCode.getText(call.callee.object) : null);
+    },
+  })).from ?? [];
+}
+
+test('a PDF\'s page list mounts its pages only through the window near the view, never one for every page', () => {
+  assert.deepEqual(pageItems(source('Paper.jsx')), ['pageWindow(offsets, span, held)']);
+});
