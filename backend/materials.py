@@ -214,7 +214,7 @@ async def add_files(project_id: str, body: Upload, request: Request):
             looked_up[material] = version
         lookup_run = None  # a review-locked project never looks identifiers up
         if not locked and body.batch is not None:  # the drop's batch, if it is still open
-            lookup_run = _add_to_batch(conn, project_id, body.batch, looked_up, body.more)
+            lookup_run = _add_to_batch(conn, project_id, body.batch, looked_up, body.more, harness.registry)
         if not locked and lookup_run is None and looked_up:
             lookup_run = next(ids)
             used.append(lookup_run)
@@ -230,12 +230,16 @@ async def add_files(project_id: str, body: Upload, request: Request):
     return await harness.record_background(len(stored) + 1, record)
 
 
-def _add_to_batch(conn, project_id, run_id, looked_up, more):
+def _add_to_batch(conn, project_id, run_id, looked_up, more, registry):
     """Add a drop's next versions to its open batch, the lookup run its earlier requests recorded,
     and close it unless more of the drop follows; the run's id, or None when it is no open batch of
-    this project (closed meanwhile: these versions then get a lookup of their own)."""
+    this project (closed meanwhile, or ending: a cancel is requested, its terminal record not yet
+    written; these versions then get a lookup of their own)."""
     row = conn.execute("SELECT inputs FROM runs WHERE id = ? AND project_id = ? AND workflow = 'lookup'"
                        " AND status = 'running' AND cancel_reason IS NULL", (run_id, project_id)).fetchone()
+    active = registry.runs.get(run_id)
+    if active is None or active.cancel_requested.is_set():  # read in this transaction, as _finish_local reads it
+        return None
     inputs = json.loads(row[0]) if row and row[0] else {}
     if not inputs.get("open"):
         return None

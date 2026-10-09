@@ -918,6 +918,29 @@ async def test_a_request_for_a_batch_closed_meanwhile_gets_a_lookup_of_its_own(t
         assert (refused.status_code, refused.json()["code"]) == (400, "invalid_request")  # nothing to add or close
 
 
+async def test_a_request_for_a_batch_whose_cancel_is_requested_gets_a_lookup_of_its_own(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 60)
+    files, records = drop_files(2)
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client)
+        batch = (await added(client, project, files[0], more=True))["lookup_run_id"]
+        active = client.state["harness"].registry.runs[batch]
+        while not active.started:  # waiting for the rest of its drop
+            await asyncio.sleep(0.01)
+        active.cancel_requested.set()  # Cancel requested; its terminal record not yet written, so it reads running
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", batch) == [("running", None)]
+        late = await added(client, project, files[1], batch=batch)
+        assert late["lookup_run_id"] not in (None, batch)  # not taken into a batch that is ending
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", batch)
+        assert json.loads(inputs)["material_ids"] == [m["id"] for m in (await listing(client, project))["materials"]
+                                                       if m["title"] == "drop-0"]
+        active.cancel_requested.clear()
+        assert (await client.post(f"/api/runs/{batch}/cancel")).json()["status"] == "cancelled"
+        papers = {p["title"]: p for p in await settled(client, project)}
+        assert papers["Paper 1"]["lookup"]["run_id"] == late["lookup_run_id"]  # looked up by its own run
+        assert papers["drop-0"]["lookup"]["status"] == "cancelled"
+
+
 async def test_a_local_only_lookup_cancelled_while_it_asks_closes_its_ask(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client, level="local_only")
