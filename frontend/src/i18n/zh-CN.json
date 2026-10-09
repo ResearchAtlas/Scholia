@@ -198,6 +198,7 @@
   "dataFolder.where": "数据文件夹",
   "errors.internal": "出了点问题，请重试。",
   "errors.unreachable": "Scholia 的引擎没有响应。请关闭 Scholia 后重新打开。",
+  "errors.part_not_loaded": "Scholia 的这部分界面未能加载。点“重试”会重新载入窗口。",
   "errors.active_run": "这个对话仍在处理中。请等待，或停止它。",
   "errors.empty_message": "请先输入消息。",
   "errors.message_too_long": "这条消息太长了。",
