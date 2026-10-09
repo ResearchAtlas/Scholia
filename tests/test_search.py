@@ -655,3 +655,18 @@ async def test_the_index_status_and_a_rebuild_read_back(tmp_path):
         assert status["passages"]["embedded"] == 4 and len(client.remote.indexing) - before == 4
         assert (await find(client, project, "earnings"))["results"]
         assert (await client.post("/api/projects/00000000-0000-4000-8000-000000000000/index/rebuild")).status_code == 404
+
+
+async def test_a_shutdown_during_embedding_resumes_at_the_next_launch_with_only_what_is_missing(tmp_path):
+    async with app(tmp_path, batch=1) as client:
+        client.remote.hold, client.remote.free = asyncio.Event(), 2
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
+        embedded = sum(1 for r in await index_rows(client, project) if r[3])
+        assert embedded == 2
+    async with app(tmp_path, batch=1) as client:  # the run is still running in the record: started again
+        status = await idle(client, project)
+        assert status["passages"]["embedded"] == 4 and len(client.remote.indexing) == 2
+        assert (await run_finished(client, run["run_id"]))["status"] == "succeeded"

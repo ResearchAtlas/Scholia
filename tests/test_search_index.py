@@ -236,3 +236,23 @@ async def test_an_index_that_cannot_open_leaves_the_app_running_with_search_unav
         assert (found["mode"], found["reason"], found["results"]) == ("keyword_only", "index_unavailable", [])
         assert (await client.get(f"/api/projects/{project}/index")).json()["state"] == "unavailable"
         assert os.path.exists(tmp_path / "data" / "scholia.sqlite3")
+
+
+@pytest.mark.asyncio
+async def test_a_restore_reopens_the_index_against_the_restored_database_and_rebuilds_it(tmp_path):
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        backup = (await client.post("/api/backups")).json()["id"]
+        await added(client, project, CHINESE)
+        await idle(client, project)
+        assert len(await index_rows(client, project)) == 7
+        before = client.state["index"]
+        assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
+        assert client.state["index"] is not before and before.closed
+        status = await until_embedded(client, project)
+        assert status["passages"] == {"indexed": 4, "embedded": 4, "embeddable": 4}  # what the backup holds
+        keyword = client.state["index"].keyword
+        assert await asyncio.to_thread(keyword, project, "最低工资", 50) == []
+        assert (await find(client, project, "earnings"))["results"]

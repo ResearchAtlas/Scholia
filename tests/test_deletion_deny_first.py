@@ -67,3 +67,24 @@ async def test_deleting_one_reading_of_a_file_read_two_ways_removes_its_passages
         [current] = (await client.get(f"/api/projects/{project}/materials")).json()["materials"]
         texts = (await client.get(f"/api/material-versions/{current['version']['id']}/passages")).json()["passages"]
         assert current["id"] == survivor["id"] and {p["id"] for p in texts} == passages[kept_reading]
+
+
+async def test_a_stale_index_never_surfaces_a_deleted_or_replaced_paper(tmp_path, monkeypatch):
+    """S1-17: every search checks access again in the main database (slice-1 spec 4.3): passages the index
+    still holds, its removals not applied yet, are never returned."""
+    from backend.search_index import SearchIndex
+    from test_search import app, find, idle, index_rows, paper
+
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        [deleted] = (await added(client, project, paper("Deleted", "The aubergine finding.")))["materials"]
+        [replaced] = (await added(client, project, paper("Replaced", "The obsolete quince finding.")))["materials"]
+        await idle(client, project)
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self: 0)  # the index applies nothing from here
+        assert (await client.delete(f"/api/materials/{deleted['id']}")).status_code == 200
+        await added(client, project, paper("Replaced", "The current finding."), material_id=replaced["id"])
+        await idle(client, project)
+        texts = {r[0] for r in await index_rows(client, project)}
+        assert len(texts) == 4  # stale: still the old rows
+        for query in ("aubergine", "quince", "deleted", "obsolete"):
+            assert (await find(client, project, query))["results"] == [], query
