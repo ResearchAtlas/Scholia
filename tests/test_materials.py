@@ -36,6 +36,10 @@ async def project_of(client, name="Thesis", level="normal"):
 
 
 async def add(client, project, *files, **extra):
+    if "material_id" in extra and "replaces" not in extra:  # as the interface sends it: the version shown when chosen
+        found = await rows(client, "SELECT id FROM material_versions WHERE material_id = ? AND is_current = 1",
+                           extra["material_id"])
+        extra["replaces"] = found[0][0] if found else None
     response = await client.post(f"/api/projects/{project}/materials",
                                  json={"files": [{"name": n, "data": b64(d)} for n, d in files], **extra})
     return response
@@ -591,6 +595,24 @@ async def test_a_replaced_file_is_a_new_version_read_again(tmp_path):
         assert [(v["seq"], v["is_current"]) for v in versions] == [(0, False), (1, True)]
         too_many = await add(client, project, PDF, replacement, material_id=paper["id"])
         assert too_many.json()["code"] == "invalid_request"
+        unnamed = await add(client, project, replacement, material_id=paper["id"], replaces=None)
+        assert unnamed.json()["code"] == "invalid_request"  # a replacement names the version it replaces
+
+
+async def test_a_replacement_chosen_before_a_later_one_that_committed_first_is_refused(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, PDF))["materials"]
+        [shown] = await settled(client, project)
+        first_choice, later_choice = ("a.md", b"# Choice A\n\nChosen first.\n"), ("b.md", b"# Choice B\n\nChosen later.\n")
+        await added(client, project, later_choice, material_id=paper["id"], replaces=shown["version"]["id"])  # B commits first
+        slower = await add(client, project, first_choice, material_id=paper["id"], replaces=shown["version"]["id"])
+        assert (slower.status_code, slower.json()["code"]) == (409, "replaced_meanwhile")
+        [current] = await settled(client, project)
+        passages = (await client.get(f"/api/material-versions/{current['version']['id']}/passages")).json()["passages"]
+        assert current["version"]["seq"] == 1 and "Chosen later." in [p["text"] for p in passages]  # B stays current
+        versions = (await client.get(f"/api/materials/{paper['id']}/versions")).json()["versions"]
+        assert len(versions) == 2
 
 
 async def test_a_passage_names_only_the_papers_whose_current_file_it_comes_from(tmp_path):

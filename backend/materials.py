@@ -98,6 +98,7 @@ class Upload(BaseModel):
     files: list[NewFile] = Field(default_factory=list, max_length=MAX_FILES)
     conversation_id: str | None = Field(default=None, max_length=100)  # attached in a conversation
     material_id: str | None = Field(default=None, max_length=100)  # a new version of this material
+    replaces: str | None = Field(default=None, max_length=100)  # of its version current when the file was chosen
     # A drop sent in several requests (each under the body limit) is one batch, held by its lookup run:
     # its first request (more) records the run open, the next ones name it (batch) and add to it, and
     # the last (no more, files or none) closes it. See _add_to_batch and _look_up.
@@ -129,8 +130,8 @@ def _refused(status, code, message):
 async def add_files(project_id: str, body: Upload, request: Request):
     state = _state(request)
     db, content, harness = state["db"], state["content"], state["harness"]
-    if body.material_id is not None and len(body.files) != 1:
-        raise _refused(400, "invalid_request", "A file replaces one material")
+    if body.material_id is not None and (len(body.files) != 1 or body.replaces is None):
+        raise _refused(400, "invalid_request", "A file replaces one material's version")
     if not body.files and body.batch is None:
         raise _refused(400, "invalid_request", "No files to add")
     files = []
@@ -174,6 +175,11 @@ async def add_files(project_id: str, body: Upload, request: Request):
             replaced = None
             if body.material_id is not None:
                 material = body.material_id
+                # Only the version current when the file was chosen is replaced: a slower, earlier
+                # choice never supersedes a later one that committed first.
+                if conn.execute("SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1",
+                                (body.replaces, material)).fetchone() is None:
+                    raise _refused(409, "replaced_meanwhile", "The paper's file was replaced meanwhile")
                 (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM material_versions WHERE material_id = ?",
                                       (material,)).fetchone()
                 replaced = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"

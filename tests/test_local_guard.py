@@ -156,7 +156,7 @@ async def test_the_body_limit_admits_one_file_of_the_largest_size_and_no_more():
     from backend import extraction, local_guard
     encoded = (extraction.MAX_FILE_BYTES + 2) // 3 * 4  # its bytes in base64
     around = json.dumps({"files": [{"name": "\u0001" * 255, "data": ""}], "conversation_id": "x" * 100,
-                         "material_id": "x" * 100})  # its name escaped character by character, the longest ids
+                         "material_id": "x" * 100, "replaces": "x" * 100})  # its name escaped character by character, the longest ids
     assert encoded + len(around) <= local_guard.MAX_BODY < 2 * encoded
 
 

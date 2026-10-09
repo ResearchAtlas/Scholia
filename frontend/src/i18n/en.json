@@ -225,6 +225,7 @@
   "errors.malformed": "The provider's answer could not be read.",
   "errors.refused": "This request is not allowed for this project.",
   "errors.unavailable": "The service did not answer, even after trying again. Try again later.",
+  "errors.replaced_meanwhile": "The paper's file changed after you chose this one, so this one was not used.",
   "errors.save_failed": "The answer could not be saved.",
   "errors.other": "The provider reported a problem.",
   "errors.cancelled": "The message was stopped before it was sent.",

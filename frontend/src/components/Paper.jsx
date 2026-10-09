@@ -31,7 +31,8 @@ export function Paper({ material, project, onBack, onChanged }) {
   function replaceFile(files) {
     setNotice(null);
     return run(async () => {
-      if (await addTo(project.id, [...files].slice(0, 1), t, setNotice, { materialId: material.id })) onChanged();
+      if (await addTo(project.id, [...files].slice(0, 1), t, setNotice, { materialId: material.id,
+        replaces: material.version?.id })) onChanged(); // the version shown when the file was chosen
     });
   }
 

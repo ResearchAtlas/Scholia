@@ -52,7 +52,8 @@ export function requestsOf(files) {
 }
 
 // Adds files to a project: from a drop, Add files, or the conversation (conversationId), or as a
-// new version of a material (materialId), however many. A file larger than Scholia reads refuses
+// new version of a material (materialId, replacing the version named by replaces: the backend refuses
+// it once another has), however many. A file larger than Scholia reads refuses
 // the selection, as the backend would; the rest go in as few requests as fit (requestsOf), read
 // one request at a time, and stay one batch, which the backend holds in the drop's lookup run: each
 // request but the last says more follow (more), the ones after the first name the batch the first
@@ -60,10 +61,11 @@ export function requestsOf(files) {
 // identifier the drop gave. A batch the window never closes (it went away, or a request failed)
 // closes itself on the backend. Resolves to the backend's answers together; a request that fails
 // once others were added ends the sending, its error code in `problem`.
-export async function addFiles(projectId, files, { conversationId, materialId } = {}) {
+export async function addFiles(projectId, files, { conversationId, materialId, replaces } = {}) {
   if (files.some((file) => file.size > MAX_FILE_BYTES)) throw new ApiError(413, 'file_too_large');
   const send = (body) => post(`/api/projects/${encodeURIComponent(projectId)}/materials`, {
-    ...body, ...(conversationId ? { conversation_id: conversationId } : {}), ...(materialId ? { material_id: materialId } : {}),
+    ...body, ...(conversationId ? { conversation_id: conversationId } : {}),
+    ...(materialId ? { material_id: materialId, replaces } : {}),
   });
   const groups = requestsOf(files);
   const added = { materials: [], lookup_run_id: null };

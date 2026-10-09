@@ -316,6 +316,12 @@ test('a drop sent in several requests is one batch: the first opens it, the next
     assert.deepEqual(sent.map((r) => [r.body.files.length, r.body.batch, r.body.more]),
       [[20, undefined, true], [20, 'lookup1', true], [5, 'lookup1', undefined]]);
     assert.equal(many.materials.length, 45);
+
+    // A replacement names the version it replaces: the one shown when its file was chosen.
+    sent.length = 0;
+    await addFiles('p1', [new File(['# New'], 'new.md')], { materialId: 'm1', replaces: 'v1' });
+    assert.deepEqual(sent.map((r) => r.body), [{ files: ['new.md'], material_id: 'm1', replaces: 'v1' }]);
+    assert.ok('errors.replaced_meanwhile' in en && 'errors.replaced_meanwhile' in zh);
   } finally {
     globalThis.fetch = realFetch;
     globalThis.FileReader = realReader;
