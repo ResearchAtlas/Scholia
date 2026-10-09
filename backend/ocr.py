@@ -6,8 +6,8 @@ shared by file and extractor version, so a new engine is a new reading), and rec
 which returns every line it finds, whatever its confidence, each with its box as fractions of the
 image from its top left (the form passages' rectangles take), or raises Failed. An engine keeps
 nothing between calls, so no state is shared across readings. engine() is the platform's: macOS
-Vision through pyobjc-framework-Vision, or None where none loads, and scanned pages then wait for
-OCR as they did before S1-20.
+Vision through pyobjc-framework-Vision (a page fails where Vision does not load), or None on a
+platform with no engine, where scanned pages wait for OCR as they did before S1-20.
 
 Recognition is local: nothing is sent anywhere. Recognized text and an engine's error description
 (which can quote the page) are never logged or kept.
@@ -56,7 +56,10 @@ class Vision:
     def recognize(self, bitmap):
         lines = self._read(bitmap, detect=False)
         if not any(_HAN.search(line.text) for line in lines):  # no Chinese on the page: its English read whole
-            lines = self._read(bitmap, detect=True)
+            try:
+                lines = self._read(bitmap, detect=True)
+            except Failed:  # the first reading stands
+                pass
         return lines
 
     def _read(self, bitmap, detect):

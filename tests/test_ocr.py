@@ -786,6 +786,21 @@ async def test_a_file_being_read_or_read_by_this_version_is_not_read_again(tmp_p
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'extract'") == [(2,)]
 
 
+def test_a_page_without_chinese_keeps_its_first_reading_when_the_second_fails(monkeypatch):
+    calls = []
+
+    def read(bitmap, detect):
+        calls.append(detect)
+        if detect:
+            raise ocr.Failed()
+        return [LINE]
+
+    monkeypatch.setattr(ocr.VISION, "_read", read)
+    assert ocr.VISION.recognize(None) == [LINE] and calls == [False, True]
+    monkeypatch.setattr(ocr.VISION, "_read", lambda bitmap, detect: [ocr.Line("最低工资", LINE.box, 0.5)] if not detect else 1 / 0)
+    assert ocr.VISION.recognize(None)[0].text == "最低工资"  # a page with Chinese is read once
+
+
 def test_vision_is_the_engine_on_macos_and_a_copy_that_cannot_load_it_fails_the_page(monkeypatch):
     """No other version of the reading is made where Vision does not load: its scanned pages fail, to be tried again."""
     monkeypatch.setattr(sys, "platform", "darwin")
