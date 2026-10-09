@@ -726,6 +726,49 @@ def test_a_long_heading_over_many_paragraphs_is_cut_and_its_copies_counted(monke
         extract(data, kind[media])
 
 
+def _docx_document(xml):
+    """A DOCX whose document part is exactly xml."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", xml)
+    return out.getvalue()
+
+
+W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+KEPT = '<w:p><w:r><w:t>Kept</w:t></w:r></w:p>'
+
+
+@pytest.mark.parametrize("cut", ["its body and document left open", "inside another paragraph",
+                                 "inside an unfinished comment", "at a length past one piece"])
+def test_a_docx_part_cut_short_is_unreadable_not_read_as_far_as_it_goes(cut):
+    xml = {"its body and document left open": f"<w:document {W_NS}><w:body>{KEPT}",
+           "inside another paragraph": f"<w:document {W_NS}><w:body>{KEPT}<w:p><w:r><w:t>Cu",
+           "inside an unfinished comment": f"<w:document {W_NS}><w:body>{KEPT}<!-- unfinished",
+           "at a length past one piece": f"<w:document {W_NS}><w:body>{KEPT * 2000}<w:p>"}[cut]
+    assert extract(_docx_document(f"<w:document {W_NS}><w:body>{KEPT}</w:body></w:document>"),
+                   extraction.DOCX).passages[0].text == "Kept"
+    with pytest.raises(extraction.Unreadable):
+        extract(_docx_document(xml), extraction.DOCX)
+
+
+@pytest.mark.parametrize("shape", ["distinct names", "a long namespace"])
+def test_a_docx_parts_names_are_bounded_as_the_parser_reports_them(shape):
+    if shape == "distinct names":  # each an element Scholia does not read, each kept by the parser
+        body = "".join(f"<n{i}/>" for i in range(20_000))
+    else:  # every name in it would carry its 8,192 characters
+        body = f'<x:a xmlns:x="urn:{"u" * 8192}">' + "".join(f"<x:n{i}/>" for i in range(2000)) + "</x:a>"
+    data = _docx_document(f"<w:document {W_NS}><w:body>{KEPT}{body}</w:body></w:document>")
+    peak, refused = _peak(lambda: extract(data, extraction.DOCX))
+    assert refused and peak < 3 * 2**20, f"{peak / 2**20:.1f} MiB"
+
+
+def test_a_docx_text_runs_references_are_counted_as_they_come():
+    data = _docx_document(f"<w:document {W_NS}><w:body><w:p><w:r><w:t>{'&#x10000;' * 1_100_000}</w:t></w:r></w:p>"
+                          "</w:body></w:document>")  # one fragment for each, once
+    peak, refused = _peak(lambda: extract(data, extraction.DOCX))
+    assert refused and peak < 24 * 2**20, f"{peak / 2**20:.1f} MiB"  # its 10 MB part and a block: 90 MiB before
+
+
 def test_a_pdf_page_past_its_character_bound_is_refused_before_its_text_is_read(monkeypatch):
     import pypdfium2
 

@@ -31,6 +31,7 @@ import math
 import re
 import struct
 import threading
+import types
 import unicodedata
 import zipfile
 import zlib
@@ -66,6 +67,8 @@ MAX_STYLES = 10_000  # a DOCX's styles by name: a file of more is refused, never
 MAX_TAG_ATTRIBUTES = 1024  # an HTML tag's attributes, counted before the parser lists them
 MAX_XML_DEPTH = 1000  # a DOCX part's elements open at once
 MAX_XML_TOKEN = 256 * 1024  # bytes a DOCX part's parser may take in without a tag or text ending
+MAX_XML_NAMES = 4096  # distinct element and attribute names in a DOCX part: Word's own come to some hundreds
+MAX_XML_NAMESPACE = 512  # characters in a namespace's name: Word's are under 100
 MAX_XML_BYTES = 64 * 1024 * 1024  # a DOCX part's size once unpacked, and the parts read together
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024  # a DOCX's members together, as the archive declares them unpacked
 MAX_ARCHIVE_MEMBERS = 10_000
@@ -968,43 +971,69 @@ def untrusted_xml(content):
         raise Unreadable() from None
 
 
+_NO_ATTRIBUTES = types.MappingProxyType({})  # every tag without attributes shares it
+
+
 class _XmlEvents:
-    """An expat parser's target: its events as (event, tag, attributes or text), with no tree built."""
+    """An expat parser and its handlers: its events as (event, tag, attributes or text), with no
+    tree built, its text in pieces of up to 8 KiB (buffer_text), and its names bounded as it reports
+    each tag, before any more are read: at most MAX_XML_NAMES distinct element and attribute names
+    (expat keeps every one it has met), and each namespace's name, which it makes part of every
+    name in it, at most MAX_XML_NAMESPACE characters (checked as it is declared, before its tag's
+    names are expanded with it). Python's own interning of names is off."""
 
     def __init__(self):
-        self.events = []
+        from xml.parsers import expat
+
+        self.parser = expat.ParserCreate(namespace_separator="}", intern=None)
+        self.parser.buffer_text = True
+        self.parser.StartElementHandler = self.start
+        self.parser.EndElementHandler = self.end
+        self.parser.CharacterDataHandler = self.data
+        self.parser.StartNamespaceDeclHandler = self.namespace
+        self.events, self.names = [], {}  # each name as expat gives it, and as it is given on: one string each
+
+    def name(self, name):
+        fixed = self.names.get(name)
+        if fixed is None:
+            if len(self.names) >= MAX_XML_NAMES:
+                raise Unreadable()
+            fixed = self.names[name] = "{" + name if "}" in name else name  # as ElementTree names it
+        return fixed
+
+    def namespace(self, prefix, uri):
+        if uri is not None and len(uri) > MAX_XML_NAMESPACE:
+            raise Unreadable()
 
     def start(self, tag, attrib):
-        self.events.append(("start", tag, attrib))
+        attributes = {self.name(key): value for key, value in attrib.items()} if attrib else _NO_ATTRIBUTES
+        self.events.append(("start", self.name(tag), attributes))
 
     def end(self, tag):
-        self.events.append(("end", tag, None))
+        self.events.append(("end", self.name(tag), None))
 
     def data(self, text):
         self.events.append(("data", None, text))
 
-    def close(self):
-        return None
-
 
 def _xml_events(content):
     """An untrusted XML part's events, ("start", tag, attributes), ("data", None, text) and ("end",
-    tag, None), as it is parsed 64 KiB at a time (refused as _undeclared refuses it): no element is
-    built, so nothing is held for the whole part but its bytes and one piece's events. Refused too
-    (Unreadable) when more than MAX_XML_DEPTH elements are open at once, or when the parser takes in
-    MAX_XML_TOKEN bytes with nothing ending: a tag that long would have its attributes made whole."""
+    tag, None), as it is parsed 16 KiB at a time (refused as _undeclared refuses it), then finished:
+    a part cut short (an element left open, an unfinished comment) is malformed, and Unreadable. No
+    element is built, so nothing is held for the whole part but its bytes, one piece's events and
+    the names _XmlEvents bounds. Refused too when more than MAX_XML_DEPTH elements are open at once,
+    or when the parser takes in MAX_XML_TOKEN bytes with nothing ending: a tag that long would have
+    its attributes made whole."""
+    from xml.parsers.expat import ExpatError
+
     _undeclared(content)
-    target = _XmlEvents()
-    parser = ElementTree.XMLParser(target=target)
+    reader = _XmlEvents()
     depth, quiet = 0, 0
     try:
-        for at in range(0, len(content) + 1, 1 << 16):
-            piece = content[at:at + (1 << 16)]
-            if piece:
-                parser.feed(piece)
-            else:
-                parser.close()
-            events, target.events = target.events, []
+        for at in range(0, len(content) + (1 << 14), 1 << 14):
+            piece = content[at:at + (1 << 14)]
+            reader.parser.Parse(piece, not piece)  # the empty piece after the last: finished once
+            events, reader.events = reader.events, []
             quiet = 0 if events else quiet + len(piece)
             if quiet > MAX_XML_TOKEN:
                 raise Unreadable()
@@ -1013,7 +1042,9 @@ def _xml_events(content):
                 if depth > MAX_XML_DEPTH:
                     raise Unreadable()
                 yield event
-    except ElementTree.ParseError:
+            if not piece:
+                break
+    except ExpatError:
         raise Unreadable() from None
 
 
@@ -1126,7 +1157,7 @@ def _docx_body(content, stop):
     for event, tag, value in _xml_events(content):
         if event == "data":
             if text is not None and path[-1] == T and not text_ended:  # a w:t's own text, before any child of it
-                text.append(value)
+                text.add(value)  # counted as it comes, at most a block
             continue
         if event == "start":
             depth = len(path)  # the document 0, its body 1, the body's blocks 2
@@ -1144,7 +1175,7 @@ def _docx_body(content, stop):
             elif block not in (P, TBL):
                 continue
             elif tag == T:
-                text, text_ended = [], False
+                text, text_ended = _Text(MAX_BLOCK_CHARS), False
             elif tag == P:
                 for collector in collectors:
                     if collector.pieces:
@@ -1186,7 +1217,7 @@ def _docx_body(content, stop):
         elif block not in (P, TBL):
             continue
         elif tag == T and text is not None:
-            own = "".join(text)
+            own = text.value()
             for collector in collectors:
                 collector.add(own)
             text = None
