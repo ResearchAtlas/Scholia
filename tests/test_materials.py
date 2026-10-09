@@ -855,12 +855,15 @@ async def test_a_page_request_that_goes_away_holds_its_turn_to_its_render_and_no
         assert let_go.status_code == 204 and renders() == [1]
 
 
-async def test_a_shutdown_ends_the_page_image_rendering_and_the_one_waiting_starts_no_child(tmp_path, reading_stub):
+async def test_a_shutdown_ends_the_page_image_rendering_and_the_one_waiting_starts_no_child(tmp_path, monkeypatch,
+                                                                                           reading_stub):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, PDF)
         [paper] = await settled(client, project)
         held, _ = hold_extraction(reading_stub, tmp_path)  # never let go: only the shutdown ends it
+        children, command = [], reading.command
+        monkeypatch.setattr(reading, "command", lambda: children.append(1) or command())  # each child started
         url = f"/api/material-versions/{paper['version']['id']}/pages"
         rendering = asyncio.ensure_future(client.get(f"{url}/1"))
         await asyncio.to_thread(held.wait, 10)
@@ -869,8 +872,7 @@ async def test_a_shutdown_ends_the_page_image_rendering_and_the_one_waiting_star
         await client.state["harness"].shutdown()
         for response in (await rendering, await waiting):
             assert (response.status_code, response.json()["code"]) == (503, "shutting_down")
-        assert list(held.held().values()) == ["1"]  # the waiting one started no child
-        assert await ended(*held.held())
+        assert list(held.held().values()) == ["1"] and len(children) == 1  # the waiting one started no child
         assert await ended(*held.held())
 
 

@@ -114,8 +114,9 @@ def read(path, sha256, kind, stop=lambda: None, progress=lambda done, total: Non
     """The stored file at path (its SHA-256 sha256) read as media type kind, in a child: an
     extraction.Extracted equal to extraction.extract's. Raises extraction.Unreadable (its codes,
     and memory_limit or step_limit), FileNotFoundError for a missing or changed file, ChildError,
-    MemoryError when this process runs out of memory taking its result, or what stop() raised. stats, a dict, gets the child's start (to ready), its peak footprint and its
-    longest silence between two frames."""
+    MemoryError when this process runs out of memory taking its result, or what stop() raised.
+    stats, a dict, gets the child's start (to ready), its peak footprint and its longest silence
+    between two frames."""
     received = _Reading(kind, progress)
     request = {"op": "read", "path": str(path), "sha256": sha256, "kind": kind}
     received.exit = _run(request, ceiling or READING_CEILING, MAX_FRAME, stop, received, stats)

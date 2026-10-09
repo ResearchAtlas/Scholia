@@ -6,6 +6,7 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
                       type, or the page's number), and wait, calling stop(), until DIR/go exists; then
                       read for real. With file, it holds before it reads the stored file instead
     sleep SECONDS     wait SECONDS without a word; then read for real
+    beat SECONDS      the real child, reporting while it works at most every SECONDS (BEAT_SECONDS)
     allocate MIB      touch MIB MiB and keep them; then read for real
     spike MIB         touch MIB MiB and free them; then read for real
     spike-fail MIB    touch MIB MiB and free them; then fail as an unreadable file would
@@ -193,7 +194,10 @@ class FailsOnce:
         return self.engine.recognize(bitmap)
 
 
-extraction.extract, extraction.render_page, extraction.extractor_of = extract, render_page, extractor_of
+if MODE == "beat":  # the real child, its reports while it works closer together; nothing else changed
+    reading.BEAT_SECONDS = float(ARGS[0])
+else:
+    extraction.extract, extraction.render_page, extraction.extractor_of = extract, render_page, extractor_of
 if MODE == "walkthrough" and (engine := ocr.engine()) is not None:
     failing = FailsOnce(engine)
     ocr.engine = lambda: failing

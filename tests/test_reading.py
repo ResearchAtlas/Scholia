@@ -310,27 +310,43 @@ def long_html():
             + "</body></html>").encode()
 
 
+def count_reports(monkeypatch):
+    """The reports ("beat" frames) the parent takes from its children while they work, as a list."""
+    beats, real = [], reading._Reading.take
+
+    def take(self, body):
+        if body.startswith(b'{"beat"'):
+            beats.append(time.monotonic())
+        return real(self, body)
+
+    monkeypatch.setattr(reading._Reading, "take", take)
+    return beats
+
+
 @pytest.mark.asyncio
 async def test_a_long_text_reading_reports_through_its_readers_calls_to_stop_and_is_never_stopped_for_time(
-        tmp_path, monkeypatch):
-    monkeypatch.setattr(reading, "STEP_SECONDS", 1.8)  # the child reports each BEAT_SECONDS (1 s) while it works
+        tmp_path, monkeypatch, reading_stub):
+    reading_stub("beat", 0.05)  # the real child, its reports at most 50 ms apart
+    beats = count_reports(monkeypatch)
+    monkeypatch.setattr(reading, "STEP_SECONDS", 0.5)  # stops a reading whose reader is silent for half a second
     data = long_html()
     path, sha256 = stored(tmp_path, data)
     stats = {}
     read = await asyncio.to_thread(reading.read, path, sha256, extraction.HTML, stats=stats)
-    assert stats["seconds"] > reading.STEP_SECONDS > stats["longest_step_seconds"]  # longer in all, never silent so long
+    assert stats["seconds"] > 2 * reading.STEP_SECONDS and len(beats) >= 5  # reports all through its reader's work
     assert read == extraction.extract(data, extraction.HTML) and gone()
 
 
 @pytest.mark.asyncio
-async def test_cancel_ends_a_child_whose_text_reader_is_at_work(tmp_path):
+async def test_cancel_ends_a_child_whose_text_reader_is_at_work(tmp_path, monkeypatch, reading_stub):
+    reading_stub("beat", 0.05)
+    beats = count_reports(monkeypatch)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, ("long.html", long_html())))["materials"]
-        while not reading.LIVE:
-            await asyncio.sleep(0.01)
+        while not beats:  # its reader at work, and saying so
+            await asyncio.sleep(0.005)
         pids = set(reading.LIVE)
-        await asyncio.sleep(1.0)  # its reader at work
         asked = time.monotonic()
         assert (await client.post(f"/api/runs/{paper['run_id']}/cancel")).json()["status"] == "cancelled"
         assert time.monotonic() - asked < 2
