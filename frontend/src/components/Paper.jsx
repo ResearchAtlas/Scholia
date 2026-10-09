@@ -271,6 +271,7 @@ function PageList({ version, pages, pointed, onPoint, onText, toSwitch }) {
   const measure = useRef(null);
   measure.current = () => {
     const element = list.current;
+    if (!element) return; // a resize or scroll delivered after the list went
     const root = scroller(element);
     const view = root ? root.getBoundingClientRect() : { top: 0, bottom: window.innerHeight, height: window.innerHeight };
     const top = element.getBoundingClientRect().top;
