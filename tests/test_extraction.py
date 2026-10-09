@@ -423,6 +423,64 @@ def test_a_docx_declaring_too_many_entries_or_too_large_a_directory_is_refused_b
     assert media_type("paper.docx", data) is None  # nor taken as a DOCX when added
 
 
+def _zip64_of(archive, saturate=True):
+    """A ZIP archive (no comment) rewritten with ZIP64 end records, as zipfile reads them: its classic
+    record saturated, or left with its own small values beside them."""
+    at = len(archive) - 22
+    _, _, _, _, entries, size, offset, _ = struct.unpack("<4s4H2LH", archive[at:])
+    record = struct.pack("<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, entries, entries, size, offset)
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, at, 1)
+    classic = ((0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF) if saturate else (entries, entries, size, offset))
+    return archive[:at] + record + locator + struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, *classic, 0)
+
+
+def _refused_unread(monkeypatch, data):
+    def never(*args, **kwargs):
+        raise AssertionError("the archive's directory was read")
+
+    monkeypatch.setattr(zipfile, "ZipFile", never)
+    with pytest.raises(extraction.Unreadable):
+        extract(data, extraction.DOCX)
+    assert media_type("paper.docx", data) is None  # refused when added, not a server error
+
+
+@pytest.mark.parametrize("declares", ["entries", "directory size"])
+def test_a_zip64_record_beside_a_small_classic_one_governs_and_is_bounded(monkeypatch, declares):
+    body = b"PK\x03\x04" + b"\0" * 60
+    directory = b"\0" * (extraction.MAX_CENTRAL_DIRECTORY + 1 if declares == "directory size" else 46)
+    entries = 500_000 if declares == "entries" else 1
+    at = len(body) + len(directory)  # where the ZIP64 record starts: right after the directory, as zipfile checks
+    record = struct.pack("<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, entries, entries, len(directory), len(body))
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, at, 1)
+    classic = struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 1, 1, 46, len(body), 0)  # small: nothing saturated
+    _refused_unread(monkeypatch, body + directory + record + locator + classic)
+
+
+@pytest.mark.parametrize("case", ["a locator offset past any file", "a directory before the file's start",
+                                  "a directory past its end record"])
+def test_end_records_pointing_outside_the_file_are_refused_as_unreadable(monkeypatch, case):
+    body = b"PK\x03\x04" + b"\0" * 60
+    if case == "a locator offset past any file":
+        data = body + struct.pack("<4sLQL", b"PK\x06\x07", 0, 0xFFFFFFFFFFFFFFFF, 1) + struct.pack(
+            "<4s4H2LH", b"PK\x05\x06", 0, 0, 1, 1, 46, 0, 0)
+    elif case == "a directory before the file's start":
+        data = body + struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 1, 1, 10_000, 0, 0)  # larger than what precedes it
+    else:  # a ZIP64 record whose directory ends after the record it should precede
+        record = struct.pack("<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, 1, 1, 46, len(body) + 1000)
+        data = body + record + struct.pack("<4sLQL", b"PK\x06\x07", 0, len(body), 1) + struct.pack(
+            "<4s4H2LH", b"PK\x05\x06", 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0)
+    _refused_unread(monkeypatch, data)
+
+
+@pytest.mark.parametrize("saturate", [True, False])
+def test_a_zip64_docx_still_reads(saturate):
+    data = _zip64_of(synthetic.docx([(None, "A paragraph of synthetic text.")]), saturate)
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:  # zipfile reads it by its ZIP64 records
+        assert "word/document.xml" in archive.namelist()
+    assert [p.text for p in extract(data, extraction.DOCX).passages] == ["A paragraph of synthetic text."]
+    assert media_type("paper.docx", data) == extraction.DOCX
+
+
 def test_a_docx_within_its_bounds_still_reads():
     read = extract(synthetic.docx([(None, "A paragraph of synthetic text.")]), extraction.DOCX)
     assert [p.text for p in read.passages] == ["A paragraph of synthetic text."]

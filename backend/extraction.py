@@ -123,7 +123,7 @@ def media_type(name, data):
             with _zip(data) as archive:
                 if "word/document.xml" not in archive.namelist():
                     return None
-        except (Unreadable, zipfile.BadZipFile, ValueError):
+        except (Unreadable, zipfile.BadZipFile, ValueError, OSError, OverflowError, struct.error):
             return None
     return found
 
@@ -133,25 +133,62 @@ _ZIP64_LOCATOR = struct.Struct("<4sLQL")
 _ZIP64_EOCD = struct.Struct("<4sQ2H2L4Q")
 
 
+def _end_records(data):
+    """(entries, central directory size, where it starts) as the installed zipfile takes them from an
+    archive's end (CPython 3.13's _EndRecData and _EndRecData64, mirrored on the bytes), or None where
+    it would refuse the archive. As there: the end record is the last 22 bytes, or else the last one in
+    the final 64 KiB (its comment may follow it); a ZIP64 locator just before it, whenever present,
+    puts its record's count, size and offset in place of the end record's, once checked against it;
+    and the directory is read from the end record's place less its size. Every read is a slice of an
+    exact length, so no offset, however large, raises."""
+    def chunk(at, size):
+        piece = data[at:at + size] if at >= 0 else b""
+        return piece if len(piece) == size else None
+
+    at = len(data) - _EOCD.size
+    tail = chunk(at, _EOCD.size)
+    if tail is None or not (tail[:4] == b"PK\x05\x06" and tail[-2:] == b"\0\0"):
+        start = max(len(data) - 0xFFFF - _EOCD.size, 0)
+        at = data.rfind(b"PK\x05\x06", start)
+        tail = chunk(at, _EOCD.size) if at >= 0 else None
+        if tail is None:
+            return None
+    _, _, _, _, entries, size, offset, _ = _EOCD.unpack(tail)
+    location = at
+    locator = chunk(at - _ZIP64_LOCATOR.size, _ZIP64_LOCATOR.size)
+    if locator is not None and locator[:4] == b"PK\x06\x07":
+        _, disk, record_at, disks = _ZIP64_LOCATOR.unpack(locator)
+        if disk != 0 or disks > 1:
+            return None
+        before = at - _ZIP64_LOCATOR.size - _ZIP64_EOCD.size  # where the record ends, its extensible data after it
+        if record_at > before:
+            return None
+        extra = before - record_at
+        record = chunk(record_at, _ZIP64_EOCD.size)
+        if record is not None and record[:4] != b"PK\x06\x06" and record_at != before:  # data prepended
+            extra, record = 0, chunk(before, _ZIP64_EOCD.size)
+        if record is None or record[:4] != b"PK\x06\x06":
+            return None
+        _, record_size, _, _, _, _, _, entries, size, offset = _ZIP64_EOCD.unpack(record)
+        if offset + size != record_at or record_size + 12 != _ZIP64_EOCD.size + extra:
+            return None
+        location = before - extra
+    if location - size < 0:  # the directory would begin before the file does
+        return None
+    return entries, size, location - size
+
+
 def _zip(data):
-    """A ZIP archive opened, once its end records, read here from its tail, show it within bounds:
-    at most MAX_ARCHIVE_MEMBERS entries and a central directory of at most MAX_CENTRAL_DIRECTORY
-    bytes (a ZIP64 archive's by its own record, through its locator). Otherwise Unreadable, before
-    zipfile reads that directory and builds an entry for each of its records."""
-    at = data.rfind(b"PK\x05\x06", max(0, len(data) - _EOCD.size - 0xFFFF))  # its comment may follow it
+    """A ZIP archive opened, once its end records, read here as zipfile will read them
+    (_end_records), show it within bounds: at most MAX_ARCHIVE_MEMBERS entries and a central
+    directory of at most MAX_CENTRAL_DIRECTORY bytes, inside the file before its end record.
+    Otherwise Unreadable, before zipfile reads that directory and builds an entry for each of its
+    records."""
     try:
-        if at < 0:
-            raise Unreadable()
-        _, _, _, _, entries, size, offset, _ = _EOCD.unpack_from(data, at)
-        if entries == 0xFFFF or size == 0xFFFFFFFF or offset == 0xFFFFFFFF:  # ZIP64: its own record says
-            signature, _, record, _ = _ZIP64_LOCATOR.unpack_from(data, at - _ZIP64_LOCATOR.size)
-            fields = _ZIP64_EOCD.unpack_from(data, record) if signature == b"PK\x06\x07" else None
-            if at < _ZIP64_LOCATOR.size or fields is None or fields[0] != b"PK\x06\x06":
-                raise Unreadable()
-            entries, size = fields[7], fields[8]
-    except struct.error:
-        raise Unreadable() from None
-    if entries > MAX_ARCHIVE_MEMBERS or size > MAX_CENTRAL_DIRECTORY:
+        found = _end_records(data)
+    except (struct.error, OverflowError, ValueError):
+        found = None
+    if found is None or found[0] > MAX_ARCHIVE_MEMBERS or found[1] > MAX_CENTRAL_DIRECTORY:
         raise Unreadable()
     return zipfile.ZipFile(io.BytesIO(data))
 
@@ -777,7 +814,7 @@ def _docx(data, stop):
                 raise Unreadable()
             budget = [MAX_XML_BYTES]
             document, styles = (_part(archive, name, budget) for name in _DOCX_PARTS)
-    except (zipfile.BadZipFile, ValueError, OSError, RuntimeError, NotImplementedError):
+    except (zipfile.BadZipFile, ValueError, OSError, RuntimeError, NotImplementedError, OverflowError, struct.error):
         raise Unreadable() from None
     if document is None:
         raise Unreadable()
