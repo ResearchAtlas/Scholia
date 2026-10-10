@@ -30,6 +30,7 @@ const WORKFLOWS = { title: 'settings.workflowTitle', extract: 'settings.workflow
 const POLL_MS = 2000; // ponytail: polled while open; a pushed event stream if the list grows
 const EFFORT_SUGGESTIONS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const LIMITS = ['agent_steps', 'tool_calls', 'turn_minutes'];
+WORKFLOWS.merge = 'settings.workflowMerge'; // S1-14: a reference file's record merged into a paper
 const ROLES = ['council', 'chairman', 'router', 'judge', 'extractor'];
 const MAX_SUBAGENT_MODELS = 5;
 

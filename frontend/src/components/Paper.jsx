@@ -13,7 +13,7 @@ import { visible } from '../text.js';
 import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageFailedKey, pageImage,
   pageLines, pageOffsets, pagePart, pagesWithin, pageWindow, PAGE_WIDTH, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing,
   rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withFocus, withNear } from '../library.js';
-import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
+import { addTo, Byline, Facts, NoFullText, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
 import { Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -47,7 +47,8 @@ export function Paper({ material, project, onBack, onChanged }) {
         <input ref={replace} type="file" accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
           data-testid="paper-replace" onChange={(event) => { replaceFile(event.target.files); event.target.value = ''; }} />
         <Button variant="ghost" size="sm" className="h-8" disabled={replacing} onClick={() => replace.current?.click()}>
-          <FileUp aria-hidden="true" />{replacing ? t('paper.replacing') : t('paper.replace')}
+          <FileUp aria-hidden="true" />{material.version?.media_type ? t(replacing ? 'paper.replacing' : 'paper.replace')
+            : t(replacing ? 'paper.attaching' : 'paper.attach')}
         </Button>
         <Button variant="ghost" size="sm" className="h-8 text-destructive hover:text-destructive" onClick={() => setDeleting(true)}>
           <Trash2 aria-hidden="true" />{t('common.delete')}
@@ -55,7 +56,7 @@ export function Paper({ material, project, onBack, onChanged }) {
       </div>
       <div className="scroll-thin min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-5">
         <header className="grid grid-cols-1 gap-2">
-          <div className="flex flex-wrap items-center gap-2"><StateChip material={material} /><Retracted material={material} /></div>
+          <div className="flex flex-wrap items-center gap-2"><StateChip material={material} /><NoFullText material={material} /><Retracted material={material} /></div>
           <h3 className="break-words text-lg font-semibold leading-snug tracking-tight">{material.title}</h3>
           <Byline material={material} />
           <Progress material={material} />

@@ -332,3 +332,19 @@ async def test_a_purge_during_a_restore_is_not_hidden_by_clearing_the_log(tmp_pa
         assert (await clear).status_code == 200
         assert (await restore).status_code == 404  # a purge came between: not this backup
         assert kept not in {p["id"] for p in (await client.get("/api/projects")).json()["projects"]}
+
+
+async def test_a_merge_answer_is_audited_by_its_kind_and_option_only(tmp_path):
+    # S1-14: the merge confirmation, like every ask, is audited without the papers it named.
+    from test_reference_import import answer, run_finished, with_duplicate
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Study"})).json()["id"]
+        _, ask = await with_duplicate(client, project)
+        assert (await answer(client, ask, "keep_both")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        [(data,)] = await rows(client, "SELECT data FROM audit_log WHERE event = 'ask_answered'")
+        assert json.loads(data) == {"question": "merge", "answer": "keep_both"}
+        catalogs = {name: json.loads((Path(__file__).resolve().parents[1] / "frontend/src/i18n" / name).read_text())
+                    for name in ("en.json", "zh-CN.json")}
+        for catalog in catalogs.values():
+            assert {"ask.kindName.merge", "ask.answer.merge", "ask.answer.keep_both"} <= set(catalog)
