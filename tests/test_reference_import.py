@@ -622,3 +622,27 @@ async def test_a_file_attached_to_an_imported_paper_is_a_new_version_read_as_ful
         versions = (await client.get(f"/api/materials/{paper}/versions")).json()["versions"]
         assert [(v["seq"], v["is_current"], v["media_type"]) for v in versions] == [(0, False, None), (1, True, "text/markdown")]
         assert found["csl"]["issued"] == {"date-parts": [[2020]]}  # its record's details stay
+
+
+@pytest.mark.parametrize("edited", [False, True])
+async def test_a_file_attached_later_is_looked_up_by_the_records_doi_never_by_one_the_researcher_typed(tmp_path, edited):
+    typed = "10.5555/typed.by.hand"
+    records = {DOI: openalex_work(DOI, "Record's Work"), typed: openalex_work(typed, "Typed Work")}
+    async with started(tmp_path / "data", scholarly(openalex=records)) as client:
+        project = await project_of(client)
+        mock = client.provider.scholarly
+        result = await imported(client, project, ris(("Attach Later", f"DO  - {DOI}\n")))
+        await run_finished(client, result["lookup_run_id"])
+        [paper] = result["imported"]
+        if edited:
+            assert (await client.patch(f"/api/materials/{paper}", json={"doi": typed})).status_code == 200
+        sent = len(mock.requests)
+        attached = await added(client, project, ("attach.md", b"# Attach Later\n\nNo identifier in the text.\n"),
+                               material_id=paper)
+        await run_finished(client, attached["lookup_run_id"])
+        [found] = await settled(client, project)
+        paths = [path for _, path, _ in mock.requests[sent:]]
+        if edited:  # the file's text gives none, and the typed DOI is never sent
+            assert paths == [] and found["lookup"]["outcome"] == "no_identifier"
+        else:  # the record's DOI comes first, whatever the attached file holds
+            assert paths == [f"/works/doi:{DOI}"] and found["lookup"]["identifier"] == f"doi:{DOI}"

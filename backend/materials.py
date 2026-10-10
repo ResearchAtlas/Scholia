@@ -647,14 +647,17 @@ def _identifiers(conn, project_id, materials, versions):
     that version, and is sent and applied only while it is still the material's current file."""
     found = {}
     for material in materials:
-        row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE}, m.source, m.csl FROM materials m"
+        row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE}, m.source, m.csl, m.checked_by FROM materials m"
                            " JOIN material_versions v ON v.material_id = m.id AND (v.id = ?3 OR (?3 IS NULL AND v.is_current = 1))"
                            " LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE m.id = ?1 AND m.project_id = ?2",
                            (material, project_id, versions.get(material))).fetchone()
         if row is None:
             continue
-        # A reference file's paper is identified by its record (S1-14), whatever file it has since.
-        if row[3] == "reference_file" and (given := reference_files.identifier(json.loads(row[4] or "{}"))):
+        # A reference file's paper is identified by its record (S1-14), whatever file it has since, unless
+        # the researcher edited its details: an identifier they typed is not the record's, so then only a
+        # file's text gives one. A version with no file has nothing to read: it is read, giving none.
+        if row[3] == "reference_file" and row[5] != "researcher" \
+                and (given := reference_files.identifier(json.loads(row[4] or "{}"))):
             found[material] = (row[0], given, True)
             continue
         extracted = _extraction(conn, *row[1:3])
@@ -665,7 +668,7 @@ def _identifiers(conn, project_id, materials, versions):
             (extracted[0],))) if extracted else ()
         ids = extraction.identifiers(passages)
         found[material] = (row[0], next((i for i in ids if i[0] == "doi"), None) or next(iter(ids), None),
-                           extracted is not None)
+                           extracted is not None or row[1] is None)
     return found
 
 
