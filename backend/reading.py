@@ -69,7 +69,7 @@ import time
 import traceback
 from pathlib import Path
 
-from backend import extraction
+from backend import extraction, reference_files
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,10 @@ log = logging.getLogger(__name__)
 # that far past it, come to some 3.5 GiB (2 x (1,024 + 249) + 768 + 249 MiB).
 READING_CEILING = 1024 * 1024 * 1024  # bytes of physical footprint, a reading's child at its peak
 RENDER_CEILING = 768 * 1024 * 1024  # a page image's child
+# A reference file's child (S1-14), by the same rule: the largest peak measured among the files
+# backend/reference_files.py accepts is 125 MiB (10 MiB of RIS in 10,000 records); BibTeX's 10,000
+# entries 116 MiB, one 10 MiB field 101 MiB; the longest silence 1.1 s (LaTeX in a 10 MiB value).
+REFERENCES_CEILING = 512 * 1024 * 1024
 # The time ceiling: the longest silence measured in an accepted reading is 4.9 s (pylatexenc parsing
 # LaTeX of 480,000 marks, in one step); an ordinary document's is under 1.1 s (a page read by Vision).
 # pylatexenc on a run of plain text with no mark takes 21 s at 1 MiB and 82 s at 2 MiB.
@@ -140,6 +144,18 @@ def render(path, sha256, number, scale, stop=lambda: None, *, ceiling=None, stat
     received = _Render()
     request = {"op": "render", "path": str(path), "sha256": sha256, "number": number, "scale": scale}
     received.exit = _run(request, ceiling or RENDER_CEILING, MAX_PNG, stop, received, stats)
+    return received.result()
+
+
+def references(data, stop=lambda: None, *, ceiling=None, stats=None):
+    """A reference file's bytes read into CSL JSON records in a child (backend/reference_files.py, S1-14):
+    (records, skipped, format) as reference_files.parse gives them. The bytes go to the child on its
+    stdin after its request, written by a thread of their own, so the watch runs while they are taken;
+    nothing is written to disk. Raises extraction.Unreadable (reference_files' codes, and memory_limit
+    or step_limit), ChildError, MemoryError, or what stop() raised."""
+    received = _References()
+    request = {"op": "references", "size": len(data)}
+    received.exit = _run(request, ceiling or REFERENCES_CEILING, MAX_FRAME, stop, received, stats, data)
     return received.result()
 
 
@@ -265,10 +281,11 @@ class _Bad(Exception):
     """A frame that is not one; its text is a code, never content."""
 
 
-def _run(request, ceiling, limit, stop, received, stats):
-    """Start the child, send it request, and watch it to its end (see the module's docstring), giving
-    each frame to received.take. Returns its exit status; the child is always reaped."""
-    started, peak, longest, sentinel = time.monotonic(), 0, 0.0, None
+def _run(request, ceiling, limit, stop, received, stats, payload=b""):
+    """Start the child, send it request (and payload, its bytes after it), and watch it to its end
+    (see the module's docstring), giving each frame to received.take. Returns its exit status; the
+    child is always reaped."""
+    started, peak, longest, sentinel, writer = time.monotonic(), 0, 0.0, None, None
     stop()  # a run stopped while it waited for its turn starts no child
     selector = None
     try:
@@ -293,6 +310,9 @@ def _run(request, ceiling, limit, stop, received, stats):
             child.stdin.flush()
         except OSError:
             pass  # it ended already: its output ends before ready
+        if payload:  # more than a pipe holds: written while the child is watched, and given up once it ends
+            writer = threading.Thread(target=_send, args=(child.stdin, payload), daemon=True)
+            writer.start()
         fd = child.stdout.fileno()
         selector.register(fd, selectors.EVENT_READ)
         buffer, last, ended = bytearray(), time.monotonic(), False
@@ -361,6 +381,8 @@ def _run(request, ceiling, limit, stop, received, stats):
             with contextlib.suppress(ProcessLookupError):
                 child.kill()  # a child that had not made its group yet
             child.wait()
+        if writer is not None:  # done, or stopped by the pipe's end now the child is gone
+            writer.join()
         for stream in (child.stdin, child.stdout):
             with contextlib.suppress(OSError):
                 stream.close()
@@ -370,6 +392,13 @@ def _run(request, ceiling, limit, stop, received, stats):
         if stats is not None:
             stats.update(seconds=time.monotonic() - started, peak_mib=round(peak / 2**20, 1) if peak else None,
                          longest_step_seconds=longest, pid=child.pid)
+
+
+def _send(stream, payload):
+    """A payload written to the child's stdin; a child that ended before taking it all ends the write."""
+    with contextlib.suppress(OSError, ValueError):
+        stream.write(payload)
+        stream.flush()
 
 
 class _Ceiling(Exception):
@@ -608,6 +637,54 @@ class _Render(_Received):
         return self.image
 
 
+class _References(_Received):
+    """A reference file's frames (S1-14): its records, each one reference_files.parse makes
+    (reference_files.valid) and counted against its bounds (MAX_RECORDS, and MAX_CHARS together),
+    then done with the format it was read as and the records it skipped, by reason. Anything else
+    is a wrong frame."""
+
+    errors = {"unreadable_file", "unsupported_reference_file", "no_records", "too_many_records",
+              "reference_file_too_large", "internal"}
+
+    def __init__(self):
+        self.expected = list(reference_files.PARSER)
+        self.ready = False
+        self.exit = None
+        self.records, self.done, self.chars = [], None, 0
+
+    def take(self, body):
+        key, value = _message(body)
+        if not self.ready:
+            return self.started(key, value)
+        if self.done is not None:
+            raise _Bad("a frame after done")
+        if key == "beat":
+            return
+        if key == "record":
+            if len(self.records) >= reference_files.MAX_RECORDS or not reference_files.valid(value):
+                raise _Bad("a record that is not one")
+            self.chars += reference_files.size(value)
+            if self.chars > reference_files.MAX_CHARS:
+                raise _Bad("more than a file's records may hold")
+            return self.records.append(value)
+        if key == "done":
+            skipped = value.get("skipped") if type(value) is dict and set(value) == {"format", "skipped"} else None
+            if value.get("format") not in reference_files.FORMATS or type(skipped) is not dict \
+                    or not all(reason in reference_files.SKIPPED and _count(n) and n for reason, n in skipped.items()) \
+                    or not (self.records or skipped):
+                raise _Bad("a done that is not one")
+            self.done = value
+            return
+        if key == "error":
+            return self.failed(value)
+        raise _Bad("a frame of other fields")
+
+    def result(self):
+        if self.done is None or self.exit != 0:
+            self.ended()
+        return self.records, self.done["skipped"], self.done["format"]
+
+
 # The child
 
 
@@ -682,7 +759,8 @@ def _where(error):
 
 
 def _request():
-    """The parent's one request from stdin: a length and a JSON object."""
+    """The parent's one request from stdin: a length and a JSON object, then, for a reference file,
+    its bytes (its size, at most reference_files.MAX_BYTES): (request, those bytes)."""
     data = b""
     while len(data) < 4 or len(data) < 4 + int.from_bytes(data[:4], "big"):
         if len(data) >= 4 and int.from_bytes(data[:4], "big") > MAX_REQUEST:
@@ -691,7 +769,17 @@ def _request():
         if not chunk:
             raise EOFError("no request")
         data += chunk
-    return json.loads(data[4:4 + int.from_bytes(data[:4], "big")])
+    end = 4 + int.from_bytes(data[:4], "big")
+    request, payload = json.loads(data[:end][4:]), bytearray(data[end:])
+    size = request.get("size", 0) if request.get("op") == "references" else 0
+    if not (type(size) is int and 0 <= size <= reference_files.MAX_BYTES):
+        raise ValueError("the payload is too long")
+    while len(payload) < size:
+        chunk = os.read(0, min(1 << 20, size - len(payload)))
+        if not chunk:
+            raise EOFError("a payload cut short")
+        payload += chunk
+    return request, bytes(payload)
 
 
 def _orphaned():
@@ -726,9 +814,17 @@ def _child():
     os.dup2(quiet, 1)
     os.dup2(quiet, 2)
     os.close(quiet)
-    request = _request()
+    request, payload = _request()  # read whole before _orphaned reads on
     threading.Thread(target=_orphaned, daemon=True).start()
     try:
+        if request["op"] == "references":  # a reference file, its bytes sent with the request (S1-14)
+            out.send("ready", list(reference_files.PARSER))
+            records, skipped, kind = reference_files.parse(payload, out.beat)
+            payload = None
+            for csl in records:
+                out.send("record", csl, flush=False)
+            out.send("done", {"format": kind, "skipped": skipped})
+            return 0
         kind = request["kind"] if request["op"] == "read" else extraction.PDF
         out.send("ready", list(extraction.extractor_of(kind)))
         data = _file(request["path"], request["sha256"])

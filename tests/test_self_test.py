@@ -64,6 +64,12 @@ def test_the_reading_ceiling_check_stops_a_child_past_its_ceiling():
     assert not reading.LIVE
 
 
+def test_the_references_check_reads_ris_and_bibtex_in_the_child():
+    from backend import reading
+    assert st.check_references() == {"formats": ["ris", "bibtex"]}  # S1-14
+    assert not reading.LIVE
+
+
 def test_the_encrypted_zip_check_writes_and_reads_back_an_aes_zip():
     assert st.check_encrypted_zip() == {"aes": True}
 
@@ -174,7 +180,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
         raise RuntimeError("no helper")
 
     for name in ("check_sqlite", "check_index", "check_backend", "check_interface", "check_encrypted_zip",
-                 "check_materials", "check_reading_ceiling", "check_ocr"):
+                 "check_materials", "check_reading_ceiling", "check_ocr", "check_references"):
         monkeypatch.setattr(st, name, passing(name))
     monkeypatch.setattr(st, "check_embedding", failing)
     argv = ["--self-test", "--model", str(tmp_path / "m.gguf")]
@@ -183,7 +189,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
     assert result["ok"] is False
     assert result["checks"]["embedding"] == {"ok": False, "error": "RuntimeError: no helper"}
     assert result["checks"]["ocr"] == {"ok": True}
-    assert len(calls) == 9
+    assert len(calls) == 10
     monkeypatch.setattr(st, "check_embedding", passing("embedding"))
     assert st.main(argv) == 0
 

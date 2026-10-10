@@ -498,6 +498,18 @@ def check_reading_ceiling() -> dict:
     return {"reason": "memory_limit"}
 
 
+def check_references() -> dict:
+    """A reference file read as the app reads one, in its child process (backend/reading.py references,
+    S1-14): RIS by rispy and BibTeX by bibtexparser, LaTeX in it by pylatexenc, each into a record."""
+    from backend import reading
+
+    ris, _, kind = reading.references(b"TY  - JOUR\nTI  - Self-test record\nAU  - Example, Ana\nPY  - 2024\nER  - \n")
+    bibtex, _, other = reading.references(b"@article{k, title={Caf\\'e self-test}, year={2024}}")
+    if (kind, other, [r["title"] for r in ris + bibtex]) != ("ris", "bibtex", ["Self-test record", "Caf\u00e9 self-test"]):
+        raise RuntimeError("a reference file was not read back")
+    return {"formats": [kind, other]}
+
+
 def run(helper: Path, model: Path) -> dict:
     checks = {
         "sqlite": check_sqlite,
@@ -507,6 +519,7 @@ def run(helper: Path, model: Path) -> dict:
         "encrypted_zip": check_encrypted_zip,
         "materials": check_materials,
         "reading_ceiling": check_reading_ceiling,
+        "references": check_references,  # S1-14
         "embedding": lambda: check_embedding(helper, model),
         "ocr": check_ocr,
     }
