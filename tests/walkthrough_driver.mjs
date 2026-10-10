@@ -1256,8 +1256,8 @@ async function references(ctx) {
 
   await step('40-add-menu', async () => {
     await panel().getByRole('button', { name: L('library.add'), exact: true }).click(); await page.waitForTimeout(500);
-    check('Add offers files and a reference file', await page.getByRole('menuitem', { name: L('library.addMenu.files') }).count() === 1
-      && await page.getByRole('menuitem', { name: L('library.addMenu.referenceFile') }).count() === 1);
+    check('Add offers files and a reference file', await page.getByRole('menuitem', { name: L('library.addMenu.files'), exact: true }).count() === 1
+      && await page.getByRole('menuitem', { name: L('library.addMenu.referenceFile'), exact: true }).count() === 1);
   });
 
   let before;
