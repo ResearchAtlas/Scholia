@@ -43,12 +43,12 @@ group of its own beside a stopped sentinel (_sentinel), so the parent's death le
 orphaned and the kernel sends it SIGHUP, whose default action ends the child even in native code
 holding the GIL; and its stdin's end ends it too. The child starts only with its sentinel stopped,
 and the app's watch ends the child at its next tick if the sentinel is lost once it has stopped
-(killed, or continued and so ended), as the app's death would then no longer end it. What stays
-open: a sentinel lost and the app's death within one tick of each other (longer while other threads
-of the app hold the GIL), and the app's death just as the sentinel stops, before the kernel shows
-the child its new parent, when the child ends only at its stdin's end (_orphaned), which needs the
-GIL. Its environment is HOME and TMPDIR only. It never imports the database, the server or the
-window. Logs carry codes, counts and MiB, never a path, a name, a hash or text.
+(killed, or continued and so ended), before ready or after, as the app's death would then no longer
+end it. What stays open: a sentinel lost and the app's death within one tick of each other (longer
+while other threads of the app hold the GIL), and the app's death just as the sentinel stops, before
+the kernel shows the child its new parent, when the child ends only at its stdin's end (_orphaned),
+which needs the GIL. Its environment is HOME and TMPDIR only. It never imports the database, the
+server or the window. Logs carry codes, counts and MiB, never a path, a name, a hash or text.
 """
 
 import contextlib
@@ -91,6 +91,7 @@ RENDER_CEILING = 768 * 1024 * 1024  # a page image's child
 STEP_SECONDS = 60.0  # a child that sends nothing for this long is stuck in one step
 WATCH_SECONDS = 0.01
 BEAT_SECONDS = 1.0  # the child's report while it works, at most this far apart
+EXIT_SECONDS = 5.0  # a child in its exit, its sentinel gone, is waited for this long (_lost)
 MAX_REQUEST = 64 * 1024
 MAX_FRAME = 1024 * 1024  # a JSON frame: a passage's is some hundreds of KiB at most (2,000 characters, a
 # section path of ten headings of 500, a rectangle for each line)
@@ -212,8 +213,12 @@ def _stopped_member(pid, kid):
 
 
 def _find_sentinel(pid):
-    """The pid of the child's stopped sentinel, or None."""
-    return next((kid for kid in _children(pid) if _stopped_member(pid, kid)), None)
+    """The pid of the child's sentinel once it has stopped, or None while it starts: a stopped member, or
+    a child of the child with no record, its zombie (killed or continued before the watch saw it stopped;
+    the child never reaps it once stopped, and its only child is its sentinel)."""
+    kids = _children(pid)
+    return next((kid for kid in kids if _stopped_member(pid, kid)), None) \
+        or next((kid for kid in kids if _info(kid) is None), None)
 
 
 def _lost(pid, sentinel):
@@ -222,13 +227,13 @@ def _lost(pid, sentinel):
     while it is here to. The kernel lets the sentinel of a child that is itself ending go only once the
     child is in its exit, which the child's record shows (it has none, or one marked exiting) before its
     end can be waited for. A child with a record that is not exiting goes on. One with none is in its
-    exit, as only a process in its exit has none, and its end is waited for; if that takes over a
-    second, it is lost after all (the watch fails closed)."""
+    exit, as only a process in its exit has none, and its end is waited for; if that takes over
+    EXIT_SECONDS, it is lost after all (the watch fails closed)."""
     if sentinel is not None and _stopped_member(pid, sentinel):
         return False
     if (info := _info(pid)) is not None:
         return not info.flags & _INEXIT
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + EXIT_SECONDS
     while not _exited(pid):
         if time.monotonic() > deadline:
             return True
@@ -328,7 +333,7 @@ def _run(request, ceiling, limit, stop, received, stats):
                     # Any other failure on a value the child sent: a wrong frame, its type logged (never content).
                     raise _Bad(f"a frame its checks could not take ({type(error).__name__})") from None
             sentinel = sentinel or _find_sentinel(child.pid)
-            if sentinel is not None or received.ready:  # every tick from its sentinel's stop to its exit
+            if sentinel is not None or received.ready:  # every tick from its sentinel's stop (or loss) to its exit
                 if _lost(child.pid, sentinel):
                     log.error("a reading's child lost its sentinel; it was stopped")
                     raise ChildError("sentinel")

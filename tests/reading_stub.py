@@ -20,6 +20,9 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     gil-stall DIR S   say it holds by a file DIR/held-<pid>, then stall S seconds in native code holding
                       the GIL (libc's sleep through ctypes.PyDLL), as a parser stuck in C would
     gil-stall-before-ready DIR S   the same, before it sends ready (its sentinel stopped)
+    sentinel-lost-at-once DIR SIGNAL   say it holds by a file DIR/held-<pid>, send its sentinel SIGNAL as soon
+                      as it has stopped (before the parent can have seen it stopped), then stall 60 s
+                      holding the GIL, before ready
     chatter DIR       say it holds by a file DIR/held-<pid>, then send a beat every 2 ms for 60 s, so that
                       the parent has a frame to read at every tick
     frame NAME        send a frame that is not one (FRAMES), then read for real
@@ -282,6 +285,20 @@ if MODE == "sentinel-dies":
         return real_kill(pid, sig)
 
     os.kill = kill
+
+if MODE == "sentinel-lost-at-once":
+    import ctypes
+
+    real_sentinel = reading._sentinel
+
+    def lost_at_once():
+        pid = real_sentinel()
+        Path(ARGS[0], f"held-{os.getpid()}").write_text(str(pid))
+        os.kill(pid, getattr(signal, ARGS[1]))
+        ctypes.PyDLL(None).sleep(60)
+        return pid
+
+    reading._sentinel = lost_at_once
 
 if MODE == "finalize-stall":
     import atexit

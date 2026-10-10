@@ -494,7 +494,9 @@ async def test_a_sentinel_that_ends_before_it_stops_fails_the_start_and_its_pid_
         tmp_path, reading_stub):
     reading_stub("sentinel-dies", tmp_path)
     path, sha256 = stored(tmp_path, MARKDOWN[1])
-    with pytest.raises(reading.ChildError, match="ended"):  # no start without a stopped sentinel: before ready
+    # No start without a stopped sentinel, before ready ("sentinel" in the rare tick that sees its zombie
+    # before the child reaps it).
+    with pytest.raises(reading.ChildError, match="ended|sentinel"):
         await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
     sentinel = (tmp_path / "sentinel").read_text()
     kills = (tmp_path / "kills").read_text() if (tmp_path / "kills").exists() else ""
@@ -697,6 +699,27 @@ async def test_the_watch_holds_after_the_result_until_the_child_has_ended(tmp_pa
                 os.killpg(child, signal.SIGKILL)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", ["SIGKILL", "SIGCONT"])
+async def test_a_sentinel_lost_before_the_watch_has_seen_it_stopped_ends_the_child(tmp_path, reading_stub, loss):
+    """Lost as soon as it has stopped, then the child stalls holding the GIL before ready: the watch, which
+    never saw it stopped, finds it gone (the child's zombie) and ends the child's group."""
+    reading_stub("sentinel-lost-at-once", tmp_path, loss)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
+    child = None
+    try:
+        assert await asyncio.to_thread(Held(tmp_path).wait, 10)
+        [child] = Held(tmp_path).held()
+        with pytest.raises(reading.ChildError, match="sentinel"):
+            await asyncio.wait_for(pending, 5)
+        await ended_with_its_group(child, 0.5)
+    finally:
+        if child is not None:  # a failed run leaves no child for the step limit to end
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(child, signal.SIGKILL)
+
+
 def record(status=reading._SSTOP, ppid=1, pgid=1, flags=0):
     info = reading._BsdInfo()
     info.status, info.ppid, info.pgid, info.flags = status, ppid, pgid, flags
@@ -715,13 +738,29 @@ def test_a_sentinel_is_its_childs_stopped_child_in_its_group(monkeypatch):
         assert not reading._stopped_member(1, 2)
 
 
+def test_a_sentinel_is_found_once_it_has_stopped_and_still_if_lost_since(monkeypatch):
+    """Not while it starts (running, before it stops itself); once stopped; and once gone after that, the
+    child's zombie with no record, which the watch then reads as lost."""
+    records, kids = {3: record(status=2)}, [3]
+    monkeypatch.setattr(reading, "_info", records.get)
+    monkeypatch.setattr(reading, "_children", lambda pid: kids)
+    assert reading._find_sentinel(1) is None  # starting
+    records[3] = record()
+    assert reading._find_sentinel(1) == 3  # stopped
+    del records[3]
+    assert reading._find_sentinel(1) == 3  # its zombie
+    kids.clear()
+    assert reading._find_sentinel(1) is None
+
+
 def test_a_sentinel_is_lost_only_while_its_child_goes_on(monkeypatch):
     """A sentinel no longer stopped beside its child is lost while the child's record shows it going on;
     an ending child has a record marked exiting or none (its sentinel goes only then), and one with none
-    is lost unless its end can be waited for within a second."""
+    is lost unless its end can be waited for within EXIT_SECONDS."""
     records, exited, read = {1: record(ppid=0, pgid=1), 2: record()}, [False], []
     monkeypatch.setattr(reading, "_info", lambda pid: read.append(pid) or records.get(pid))
     monkeypatch.setattr(reading, "_exited", lambda pid: exited[0])
+    monkeypatch.setattr(reading, "EXIT_SECONDS", 0.2)
     assert not reading._lost(1, 2)  # still stopped beside it
     records[2] = record(status=2)  # continued
     read.clear()
@@ -733,7 +772,7 @@ def test_a_sentinel_is_lost_only_while_its_child_goes_on(monkeypatch):
     del records[1]
     started = time.monotonic()
     assert reading._lost(1, 2)  # no record, and no end to wait for: lost (fails closed)
-    assert 1 <= time.monotonic() - started < 3
+    assert 0.2 <= time.monotonic() - started < 2
     exited[0] = True
     assert not reading._lost(1, 2)  # no record, and it has exited
 
