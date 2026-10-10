@@ -438,14 +438,14 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["gil-stall", "chatter"])
+@pytest.mark.parametrize("mode", ["gil-stall", "gil-stall-before-ready", "chatter"])
 @pytest.mark.parametrize("loss", [signal.SIGKILL, signal.SIGCONT])
 async def test_a_child_whose_sentinel_is_lost_while_it_holds_the_gil_is_ended_while_the_app_lives(
         tmp_path, reading_stub, loss, mode):
-    """Its sentinel killed, or continued (it then ends), while the child stalls holding the GIL, or while
-    it sends a frame every tick: the app's watch ends the child's group at its next tick, as the app's
-    death no longer would."""
-    reading_stub(mode, tmp_path, *(["60"] if mode == "gil-stall" else []))
+    """Its sentinel killed, or continued (it then ends), while the child stalls holding the GIL (after
+    ready, or before it), or while it sends a frame every tick: the app's watch ends the child's group
+    at its next tick, as the app's death no longer would."""
+    reading_stub(mode, tmp_path, *(["60"] if mode.startswith("gil-stall") else []))
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
     child = None
@@ -666,8 +666,9 @@ async def test_a_childs_sentinel_goes_with_it(tmp_path, reading_stub, ended):
     if ended == "read to its end":
         await asyncio.to_thread(reading.read, path, sha256, kind, stop, stats=stats)
     else:
-        with pytest.raises((RuntimeError, extraction.Unreadable)):
+        with pytest.raises((RuntimeError, extraction.Unreadable)) as raised:
             await asyncio.to_thread(reading.read, path, sha256, kind, stop, stats=stats)
+        assert not isinstance(raised.value, reading.ChildError)  # never taken for a lost sentinel
     await ended_with_its_group(stats["pid"])
     assert gone(stats["pid"])
 
@@ -717,20 +718,22 @@ def test_a_sentinel_is_its_childs_stopped_child_in_its_group(monkeypatch):
 def test_a_sentinel_is_lost_only_while_its_child_goes_on(monkeypatch):
     """A sentinel no longer stopped beside its child is lost while the child's record shows it going on;
     an ending child has a record marked exiting or none (its sentinel goes only then), and one with none
-    is lost unless its end can be waited for within 20 ms."""
-    records, exited = {1: record(ppid=0, pgid=1), 2: record()}, [False]
-    monkeypatch.setattr(reading, "_info", records.get)
+    is lost unless its end can be waited for within a second."""
+    records, exited, read = {1: record(ppid=0, pgid=1), 2: record()}, [False], []
+    monkeypatch.setattr(reading, "_info", lambda pid: read.append(pid) or records.get(pid))
     monkeypatch.setattr(reading, "_exited", lambda pid: exited[0])
     assert not reading._lost(1, 2)  # still stopped beside it
     records[2] = record(status=2)  # continued
+    read.clear()
     assert reading._lost(1, 2)  # and the child going on: lost
+    assert read == [2, 1]  # the sentinel first: a child whose record was read first could go into its exit after
     assert reading._lost(1, None)  # none found after ready: lost
     records[1] = record(ppid=0, pgid=1, flags=reading._INEXIT)
     assert not reading._lost(1, 2)  # the child in its exit
     del records[1]
     started = time.monotonic()
     assert reading._lost(1, 2)  # no record, and no end to wait for: lost (fails closed)
-    assert 0.02 <= time.monotonic() - started < 1
+    assert 1 <= time.monotonic() - started < 3
     exited[0] = True
     assert not reading._lost(1, 2)  # no record, and it has exited
 

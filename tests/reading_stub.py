@@ -19,6 +19,7 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
                       it says so by a file DIR/sentinel, and every signal the child sends is listed in DIR/kills
     gil-stall DIR S   say it holds by a file DIR/held-<pid>, then stall S seconds in native code holding
                       the GIL (libc's sleep through ctypes.PyDLL), as a parser stuck in C would
+    gil-stall-before-ready DIR S   the same, before it sends ready (its sentinel stopped)
     chatter DIR       say it holds by a file DIR/held-<pid>, then send a beat every 2 ms for 60 s, so that
                       the parent has a frame to read at every tick
     frame NAME        send a frame that is not one (FRAMES), then read for real
@@ -245,6 +246,11 @@ def stored_file(path, sha256):
 def extractor_of(kind):
     if MODE == "no-start":
         os._exit(1)
+    if MODE == "gil-stall-before-ready":  # where the child is before it sends ready
+        import ctypes
+
+        Path(ARGS[0], f"held-{os.getpid()}").write_text(kind)
+        ctypes.PyDLL(None).sleep(int(ARGS[1]))
     name, version = real_extractor_of(kind)
     return name, version + ("-other" if MODE == "version" else "")
 

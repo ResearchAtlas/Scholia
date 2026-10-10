@@ -42,13 +42,13 @@ dies and whatever the child is doing, save in the two windows named below: it ru
 group of its own beside a stopped sentinel (_sentinel), so the parent's death leaves the group
 orphaned and the kernel sends it SIGHUP, whose default action ends the child even in native code
 holding the GIL; and its stdin's end ends it too. The child starts only with its sentinel stopped,
-and the app's watch ends the child at its next tick if the sentinel is lost after ready (killed, or
-continued and so ended), as the app's death would then no longer end it. What stays open: a sentinel
-lost and the app's death within one tick of each other (longer while other threads of the app hold
-the GIL), and the app's death just as the sentinel stops, before the kernel shows the child its new
-parent, when the child ends only at its stdin's end (_orphaned), which needs the GIL. Its
-environment is HOME and TMPDIR only. It never imports the database, the server or the window. Logs
-carry codes, counts and MiB, never a path, a name, a hash or text.
+and the app's watch ends the child at its next tick if the sentinel is lost once it has stopped
+(killed, or continued and so ended), as the app's death would then no longer end it. What stays
+open: a sentinel lost and the app's death within one tick of each other (longer while other threads
+of the app hold the GIL), and the app's death just as the sentinel stops, before the kernel shows
+the child its new parent, when the child ends only at its stdin's end (_orphaned), which needs the
+GIL. Its environment is HOME and TMPDIR only. It never imports the database, the server or the
+window. Logs carry codes, counts and MiB, never a path, a name, a hash or text.
 """
 
 import contextlib
@@ -221,13 +221,14 @@ def _lost(pid, sentinel):
     on: then the app's death would no longer end a child stalled with the GIL held, so the app ends it
     while it is here to. The kernel lets the sentinel of a child that is itself ending go only once the
     child is in its exit, which the child's record shows (it has none, or one marked exiting) before its
-    end can be waited for. A child with a record that is not exiting goes on; one with none is lost
-    unless its end can be waited for within 20 ms (the watch fails closed)."""
+    end can be waited for. A child with a record that is not exiting goes on. One with none is in its
+    exit, as only a process in its exit has none, and its end is waited for; if that takes over a
+    second, it is lost after all (the watch fails closed)."""
     if sentinel is not None and _stopped_member(pid, sentinel):
         return False
     if (info := _info(pid)) is not None:
         return not info.flags & _INEXIT
-    deadline = time.monotonic() + 0.02
+    deadline = time.monotonic() + 1.0
     while not _exited(pid):
         if time.monotonic() > deadline:
             return True
@@ -326,8 +327,8 @@ def _run(request, ceiling, limit, stop, received, stats):
                         raise  # what a frame may say, a wrong frame found as one, or this process out of memory
                     # Any other failure on a value the child sent: a wrong frame, its type logged (never content).
                     raise _Bad(f"a frame its checks could not take ({type(error).__name__})") from None
-            if received.ready:  # every tick from ready until the child has exited, frames or none
-                sentinel = sentinel or _find_sentinel(child.pid)
+            sentinel = sentinel or _find_sentinel(child.pid)
+            if sentinel is not None or received.ready:  # every tick from its sentinel's stop to its exit
                 if _lost(child.pid, sentinel):
                     log.error("a reading's child lost its sentinel; it was stopped")
                     raise ChildError("sentinel")
