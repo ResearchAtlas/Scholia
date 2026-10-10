@@ -1277,7 +1277,9 @@ async def retry_run(run_id: str, request: Request):
     retry of it (a second press) gets that same run. An old run left running in the record, held by
     no process (it reads interrupted), is retired (Registry.retire), so no kick holds it from then on,
     and recorded interrupted, so no launch starts it again; one a kick has held again meanwhile is
-    running, and is not tried again."""
+    running, and is not tried again. An index run with a rerun pending (its id given out, S1-17) is
+    retired before the Retry holds that id, so its end never records that run meanwhile; one still held
+    is running (refused), its end recording that run."""
     state = _state(request)
 
     def again(conn, ids):
@@ -1302,6 +1304,12 @@ async def retry_run(run_id: str, request: Request):
         retried = search.request_run(conn, registry, project_id, insert, bool(inputs.get("rebuild")),
                                      run_id=ids[0] if pending else None) if workflow == "index" \
             else insert(conn, project_id, inputs)
+        if workflow == "index" and not pending:  # S1-17: a rerun it left pending that this did not hold (it was
+            # held when this looked, and ended unrecorded since): its id, given out, ends, superseded by this run
+            left = json.loads(conn.execute("SELECT json_extract(inputs, '$.again') FROM runs WHERE id = ?",
+                                           (run_id,)).fetchone()[0] or "null")
+            if left:
+                search._close_pending(conn, project_id, left["run_id"], "superseded", left.get("rebuild"))
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
                      (retried, run_id))
         if left_running:  # retired: no kick holds it here from now on, and the record says it ended

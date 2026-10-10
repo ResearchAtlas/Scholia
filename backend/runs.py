@@ -143,9 +143,9 @@ class Registry:
         # released it reads interrupted, as its record still says running (Harness._ended).
         # ponytail: one id per background run finished in this launch; a bounded log if that grows large
         self.finished: set[str] = set()
-        # Background runs a retry has taken over (materials.retry_run): never held from then on. The
-        # lock makes holding a run (add_background) and retiring it (retire, from a write
-        # transaction's thread) one decision: whichever comes first, the other is refused.
+        # Background runs a retry takes over (materials.retry_run): never held from then on. The lock
+        # makes holding a run (add_background) and retiring it (retire, from a write transaction's
+        # thread, or the event loop) one decision: whichever comes first, the other is refused.
         self.retired: set[str] = set()
         self.lock = threading.Lock()
 
@@ -177,9 +177,9 @@ class Registry:
 
     def retire(self, run_id: str) -> bool:
         """Keep a run this process does not hold from ever being held here: False, retiring nothing,
-        when it is held."""
+        when it is held, or while the harness is closed (a resume holds its runs again)."""
         with self.lock:
-            if run_id in self.runs:
+            if self.closed or run_id in self.runs:
                 return False
             self.retired.add(run_id)
             return True

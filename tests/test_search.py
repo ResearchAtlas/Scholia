@@ -1729,3 +1729,91 @@ async def test_a_retry_of_the_run_still_running_holds_no_pending_id_its_end_reco
         assert (await retry).status_code == 409
         ended = await run_finished(client, pending)
         assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+
+
+# From recheck 3 (6bb9ce1)
+
+
+def _held_retry_write(monkeypatch):
+    """The next Retry's write waits to begin until go is set; entered is set as it waits."""
+    import threading
+    from backend.db import Database
+    real, armed, entered, go = Database.write, [True], threading.Event(), threading.Event()
+
+    def write(self, fn):
+        if armed and "record_background" in fn.__qualname__:
+            armed.clear()
+            entered.set()
+            go.wait(10)
+        return real(self, fn)
+    monkeypatch.setattr(Database, "write", write)
+    return entered, go
+
+
+async def test_a_retry_holding_the_pending_id_keeps_the_run_it_retries_from_starting_again(tmp_path, monkeypatch):
+    """P3-1: once a Retry holds the pending id, the run it retries (left running by a failed terminal write)
+    is retired, so a kick meanwhile (a turn's end) cannot start it again, end it, and record the pending run
+    unheld: the Retry records and starts it."""
+    async with app(tmp_path, batch=1) as client:
+        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        entered, go = _held_retry_write(monkeypatch)
+        retry = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
+        assert await asyncio.to_thread(entered.wait, 10)
+        await client.state["harness"].kick_background()
+        assert run not in client.state["harness"].registry.runs  # not started again
+        go.set()
+        again = await retry
+        assert again.status_code == 201 and again.json()["run_id"] == pending
+        ended = await run_finished(client, pending)
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+
+
+async def test_a_retry_refused_while_the_app_closes_retires_nothing_so_a_resume_starts_the_run_again(tmp_path,
+                                                                                                       monkeypatch):
+    """A Retry refused while the harness is closed (a restore that then does not go ahead) retires nothing:
+    the resume starts the run it would have retried, which records its pending run as it ends."""
+    async with app(tmp_path, batch=1) as client:
+        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        harness = client.state["harness"]
+        harness.registry.closed = True
+        assert (await client.post(f"/api/runs/{run}/retry")).status_code == 503
+        harness.registry.closed = False
+        await harness.kick_background()
+        assert (await run_finished(client, run))["status"] == "succeeded"
+        ended = await run_finished(client, pending)
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+
+
+async def test_a_retry_whose_run_ends_unrecorded_after_it_looked_ends_the_pending_id_superseded(tmp_path,
+                                                                                                  monkeypatch):
+    """P3-3: a Retry pressed while the project's run still runs (so it holds no pending id), that run then
+    ending without its terminal record (a write that raised): the Retry retries it, and the pending id given
+    out (a Rebuild's) ends, superseded by the Retry's run, so whoever follows it sees it end."""
+    from backend.runs import Harness
+    real = Harness._finish_local
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        pending = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+
+        def failing(self, conn, active, status, cancel_reason, summary, effect=None):
+            if active.run_id == run:
+                raise OSError("the disk is full")
+            return real(self, conn, active, status, cancel_reason, summary, effect)
+        monkeypatch.setattr(Harness, "_finish_local", failing)
+        entered, go = _held_retry_write(monkeypatch)
+        retry = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
+        assert await asyncio.to_thread(entered.wait, 10)  # it looked while the run ran: no pending id held
+        client.remote.hold.set()
+        assert (await run_finished(client, run))["status"] == "interrupted"
+        monkeypatch.setattr(Harness, "_finish_local", real)
+        go.set()
+        again = await retry
+        assert again.status_code == 201
+        lost = await run_finished(client, pending)
+        assert (lost["status"], lost["result"]["reason"], lost["rebuild"]) == ("cancelled", "superseded", True)
+        retried = await run_finished(client, again.json()["run_id"])
+        assert (retried["status"], retried["rebuild"]) == ("succeeded", True)
