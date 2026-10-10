@@ -42,7 +42,7 @@ export function IndexSection({ project }) {
   const reason = index.mode === 'keyword_only'
     ? t('helper.keywordOnly', { reason: t(indexReason(index.reason, downloadOffered(project))) })
     : t('search.indexHybrid');
-  const rebuilding = busy || (index.run?.rebuild && index.run.status === 'running');
+  const rebuilding = busy || (index.run?.status === 'running' && (index.run.rebuild || index.run.rebuild_pending));
   const share = rebuilding ? fraction(index.run?.progress) : null;
   const rows = [
     [t('search.indexState'), t(`search.indexState.${index.state}`)],

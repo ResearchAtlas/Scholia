@@ -39,6 +39,15 @@ export const indexReason = (reason, offered = true) => (SEARCH_REASONS.has(reaso
 // its own project offers the search model (the row's download_offered), not the project open now.
 export const runReason = (run) => indexReason(run.result?.reason, run.download_offered !== false);
 
+// What a finished index run did, as [key, params], or null: the embeddings it made and the project's
+// as it ended, or, keyword-only, the passages indexed for keyword search.
+export function runCounts(run) {
+  const passages = run.result?.passages;
+  if (run.status !== 'succeeded' || !passages) return null;
+  return run.result.mode === 'keyword_only' ? ['search.runKeyword', { indexed: passages.indexed }]
+    : ['search.runHybrid', { embedded: run.result.embedded ?? 0, done: passages.embedded, total: passages.embeddable }];
+}
+
 export function searchNote(found, offered = true) {
   if (!found) return null;
   if (found.mode === 'keyword_only') {

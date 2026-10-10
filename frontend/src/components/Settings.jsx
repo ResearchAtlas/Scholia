@@ -20,7 +20,7 @@ import { fraction, retryRun, runOutcome } from '../runs.js';
 import { libraryChanged } from '../library.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { IndexSection } from './SearchIndex.jsx'; // S1-17
-import { offerOutcome, runReason } from '../search.js'; // S1-17
+import { offerOutcome, runCounts, runReason } from '../search.js'; // S1-17
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
@@ -478,7 +478,8 @@ function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
     <li className="grid grid-cols-1 gap-2 px-3 py-2.5 text-sm">
       <div className="flex min-w-0 items-center gap-3">
         <div className="min-w-0 flex-1">
-          <p className="truncate font-medium">{WORKFLOWS[run.workflow] ? t(WORKFLOWS[run.workflow]) : run.workflow}</p>
+          <p className="truncate font-medium">{run.workflow === 'index' && run.rebuild ? t('settings.workflowIndexRebuild') // S1-17
+            : WORKFLOWS[run.workflow] ? t(WORKFLOWS[run.workflow]) : run.workflow}</p>
           {papers && <p className="truncate text-xs" title={papers}>{papers}</p>}
           <p className="truncate text-xs text-muted-foreground">
             {project} · {t('runs.started', { date: dates.format(new Date(run.started_at)) })}
@@ -507,6 +508,9 @@ function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
       )}
       {run.workflow === 'model_offer' && run.status === 'succeeded' && offerOutcome(t, run.result) && (
         <p className="text-xs text-muted-foreground">{offerOutcome(t, run.result)}</p>
+      )}
+      {run.workflow === 'index' && runCounts(run) && (
+        <p className="text-xs text-muted-foreground">{t(...runCounts(run))}</p>
       )}
       {run.workflow === 'index' && run.status === 'succeeded' && run.result?.mode === 'keyword_only' && (
         <p className="text-xs text-muted-foreground">{t('helper.keywordOnly', { reason: t(runReason(run)) })}</p>

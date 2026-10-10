@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
-import { fieldKey, indexReason, offerOutcome, paperIndexed, queryOf, runReason, searchNote, whereIs } from '../src/search.js';
+import { fieldKey, indexReason, offerOutcome, paperIndexed, queryOf, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
 
 const t = makeT('en');
 
@@ -121,4 +121,22 @@ test("an index run's reason is worded as its own project offers the model, which
   assert.match(t(runReason(run(true))), /Download/);
   assert.doesNotMatch(t(runReason(run(false))), /Download/);
   assert.equal(runReason({ result: { reason: 'vectors_unavailable' }, download_offered: false }), 'search.reason.vectors_unavailable');
+});
+
+test("an index run is its project's: the list says what it did in counts, and whether it rebuilt", () => {
+  const passages = { indexed: 12, embedded: 10, embeddable: 11 };
+  assert.deepEqual(runCounts({ status: 'succeeded', result: { mode: 'hybrid', embedded: 6, passages } }),
+    ['search.runHybrid', { embedded: 6, done: 10, total: 11 }]);
+  assert.equal(t(...runCounts({ status: 'succeeded', result: { mode: 'hybrid', embedded: 6, passages } })),
+    '6 embedded by this run; embeddings 10 of 11 in this project');
+  assert.deepEqual(runCounts({ status: 'succeeded', result: { mode: 'keyword_only', reason: 'model_missing', passages } }),
+    ['search.runKeyword', { indexed: 12 }]);
+  assert.equal(runCounts({ status: 'failed', result: { reason: 'request_failed' } }), null);
+  assert.equal(runCounts({ status: 'running', result: null }), null);
+  for (const key of ['search.runHybrid', 'search.runKeyword', 'settings.workflowIndexRebuild']) {
+    for (const catalog of [en, zhCN]) assert.ok(key in catalog, key);
+  }
+  const settings = readFileSync(fileURLToPath(new URL('../src/components/Settings.jsx', import.meta.url)), 'utf8');
+  assert.match(settings, /run\.workflow === 'index' && run\.rebuild \? t\('settings\.workflowIndexRebuild'\)/);
+  assert.match(settings, /t\(\.\.\.runCounts\(run\)\)/);
 });
