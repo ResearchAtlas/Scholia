@@ -288,7 +288,8 @@ class Harness:
         # (summary, effect), where effect(conn), if any, is applied in the run's terminal transaction.
         self.workflows = {}
         # By workflow: ending(conn, active, project_id), called in a local run's terminal transaction
-        # whatever its outcome (S1-17: a project's index run, asked for again while it ran, runs once more).
+        # whatever its outcome and path (_finish_local, or _finish_background for one stopped before its
+        # work began; S1-17: a project's index run, asked for again while it ran, runs once more).
         self.endings = {}
         self._tasks = set()  # detached tasks, kept referenced until they finish
         # Orders settings saves with the budget reads of call admission: a lowered budget either
@@ -951,6 +952,13 @@ class Harness:
             # running in the record: left for the next start, or by a terminal write that raised, which
             # reads interrupted from here on. At no moment does a finished run read interrupted.
             self.registry.release(active)
+            if active.follows:  # recorded mid-run by writes that committed (a run with no row ends at its start)
+                if self.registry.closed:
+                    for held in active.follows:
+                        self.registry.release(held)  # in the record: the next launch starts them
+                    active.follows.clear()
+                else:
+                    self.start_follows(active)
             if active.cancel_reason == "shutdown" and not self.registry.closed:  # admitting again (resume)
                 again = self.registry.add_background(active.run_id)  # at once: a Cancel always finds it active
                 if again is not None:
@@ -1034,14 +1042,15 @@ class Harness:
         active.task = asyncio.create_task(self._background(active))
         return run_id
 
-    async def record_background(self, count, write):
+    async def record_background(self, count, write, ids=()):
         """Record new background runs in one transaction and start them. write(conn, ids) gets count
-        fresh run ids, records the runs it needs under some of them, and returns (result, the ids it
+        run ids (ids, chosen before, then fresh ones), records the runs it needs under some of them, and
+        returns (result, the ids it
         used). Each id is held in the registry before the transaction commits, and the runs recorded
         start as soon as it has, so no read ever finds one running in the record and not held here
         (which reads as interrupted). Returns the result; a cancellation of the caller waits for the
         transaction (see _through), starts the runs, and is raised after."""
-        actives = [self.registry.add_background(new_id()) for _ in range(count)]
+        actives = [self.registry.add_background(run_id) for run_id in [*ids, *(new_id() for _ in range(count - len(ids)))]]
         if None in actives:
             for active in actives:
                 if active is not None:
@@ -1111,7 +1120,13 @@ class Harness:
             # Its effect found it could not be applied.
             await _through(self._write(lambda conn: self._finish_local(
                 conn, active, error.status, error.cancel_reason, {"reason": error.reason} if error.reason else None)))
-        for held in active.follows:  # recorded with its terminal record, which has committed
+        self.start_follows(active)  # recorded with its terminal record, which has committed
+
+    def start_follows(self, active):
+        """Start the runs active recorded with record_in once the write that recorded them has committed:
+        its terminal record, or, for local work that records one mid-run (a lookup's title change asking
+        for its project's index run, S1-17), that write."""
+        for held in active.follows:
             held.task = asyncio.create_task(self._background(held))
         active.follows.clear()
 
@@ -1135,7 +1150,12 @@ class Harness:
                      " settled_cost_usd = ? WHERE id = ?",
                      (status, cancel_reason, utc_now(), json.dumps(summary) if summary else None,
                       spending.run_cost(conn, run_id), run_id))
-        workflow, project_id = conn.execute("SELECT workflow, project_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        self._ending(conn, active)
+
+    def _ending(self, conn, active):
+        """The run's workflow's ending, if it has one (endings), in its terminal transaction."""
+        workflow, project_id = conn.execute("SELECT workflow, project_id FROM runs WHERE id = ?",
+                                            (active.run_id,)).fetchone()
         if (ending := self.endings.get(workflow)) is not None:
             ending(conn, active, project_id)
 
@@ -1161,6 +1181,7 @@ class Harness:
         conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, waiting = NULL, finished_at = ?,"
                      " settled_cost_usd = ? WHERE id = ?",
                      (status, cancel_reason, utc_now(), spending.run_cost(conn, run_id), run_id))
+        self._ending(conn, active)  # a local run cancelled before its work began ends here too
 
 
 async def _through(awaitable):
