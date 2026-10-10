@@ -646,7 +646,7 @@ def _identifiers(conn, project_id, materials, versions):
     paper's from its record (reference_files.identifier), read or not. The version is the one the lookup was made for (versions), or the
     current one for a lookup that names none; materials gone since are left out. A result is about
     that version, and is sent and applied only while it is still the material's current file."""
-    found = {}
+    found, lookups_dois = {}, None
     for material in materials:
         row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE}, m.source, m.csl, m.checked_by, m.resolved_at"
                            " FROM materials m"
@@ -659,8 +659,14 @@ def _identifiers(conn, project_id, materials, versions):
         # the researcher edited its details: an identifier they typed is not the record's, so then only a
         # file's text gives one. A version with no file has nothing to read: it is read, giving none.
         record = json.loads(row[4] or "{}") if row[3] == "reference_file" and row[5] != "researcher" else None
-        if record and row[6] and "DOI" in record and "DOI" in _lookup_filled(conn, material):
-            del record["DOI"]  # a DOI a lookup gave (arXiv's, say) is not the record's
+        if record and row[6] and "DOI" in record:
+            if lookups_dois is None:  # read once for the run's papers: the project's lookups' steps
+                lookups_dois = {m for (m,) in conn.execute(
+                    "SELECT DISTINCT json_extract(e.data, '$.material_id') FROM runs r JOIN run_events e ON e.run_id = r.id"
+                    " WHERE r.project_id = ? AND r.workflow = 'lookup' AND e.type = 'step_finished' AND EXISTS"
+                    " (SELECT 1 FROM json_each(e.data, '$.filled') WHERE value = 'DOI')", (project_id,))}
+            if material in lookups_dois:
+                del record["DOI"]  # a DOI a lookup gave (arXiv's, say) is not the record's
         if record and (given := reference_files.identifier(record)):
             found[material] = (row[0], given, True)
             continue

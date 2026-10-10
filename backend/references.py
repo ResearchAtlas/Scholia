@@ -146,7 +146,8 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
                     already.append(material)
                     continue
                 if (run := asking.get((material, json.dumps(csl, sort_keys=True)))) is not None:
-                    waiting.append({"run_id": run, "material_id": material})
+                    if not any(w["run_id"] == run for w in waiting):  # its twin in this file is counted there already
+                        waiting.append({"run_id": run, "material_id": material})
                     continue
                 run = asking[material, json.dumps(csl, sort_keys=True)] = next(ids)
                 used.append(run)

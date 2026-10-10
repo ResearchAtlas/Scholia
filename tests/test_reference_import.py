@@ -795,3 +795,13 @@ async def test_a_second_doi_change_keeps_a_field_a_merged_record_gave(tmp_path):
         await run_finished(client, ask["run_id"])
         moved = await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/the.third.doi"})
         assert moved.json()["csl"]["volume"] == "9"  # the record's, not the first DOI's lookup's
+
+
+async def test_twin_records_of_a_paper_in_one_file_are_one_waiting_question(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await imported(client, project, ris(("Here Already", f"DO  - {DOI}\n")))
+        twin = ("Here Already", f"DO  - {DOI}\nAB  - Twice.\n")
+        result = await imported(client, project, ris(twin, twin, twin))
+        assert len(result["waiting"]) == 1 and result["imported"] == []
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'merge'") == [(1,)]

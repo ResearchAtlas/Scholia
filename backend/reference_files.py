@@ -33,6 +33,7 @@ from backend.settings import visible
 MAX_BYTES = 10 * 1024 * 1024
 MAX_RECORDS = 10_000
 MAX_CHARS = 2 * MAX_BYTES  # the characters of a file's records together (size)
+MAX_BLOCKS = 2 * MAX_RECORDS  # a BibTeX file's blocks of any kind (entries, @string, @comment, @preamble)
 TITLE_CHARS = 1000  # the title and the venue, as the details form takes them
 NAME_CHARS = 200  # a name, or each part of one, as backend/lookup.py keeps one
 AUTHORS = 100
@@ -122,15 +123,15 @@ def _decode(data):
 
 def detect(text):
     """The format a file's text is in, by its content, or None."""
-    if re.search(r"^\{Reference Type\}[ \t]*:", text, re.MULTILINE):  # before JSON, whose objects start so too
-        return "noteexpress"
-    if text.lstrip()[:1] in ("[", "{"):
+    if re.match(r"\s*(?:\[|\{\s*[\"}])", text):  # a JSON list, or an object of named fields
         return "csl_json"
+    if re.search(r"^\{Reference Type\}[ \t]*:", text, re.MULTILINE):
+        return "noteexpress"
     if re.search(r"^TY  -", text, re.MULTILINE):
         return "ris"
     if re.search(r"^%0 ", text, re.MULTILINE):
         return "endnote"
-    if re.search(r"^\s*@[A-Za-z]+\s*[{(]", text, re.MULTILINE):
+    if re.search(r"^[ \t]*@[A-Za-z]+[ \t]*[{(]", text, re.MULTILINE):  # [ \t], never \s: no line's spaces read twice
         return "bibtex"
     return None
 
@@ -222,8 +223,11 @@ def _bibtex(text, beat):
     from bibtexparser.middlewares.names import parse_single_name_into_parts, split_multiple_persons_names
     from bibtexparser.model import Entry
 
-    _counted(len(re.findall(r"^\s*@(?!(?:string|comment|preamble)\b)[A-Za-z]+\s*[{(]", text,
+    _counted(len(re.findall(r"^[ \t]*@(?!(?:string|comment|preamble)\b)[A-Za-z]+[ \t]*[{(]", text,
                             re.MULTILINE | re.IGNORECASE)))
+    # Every block the parser would make, wherever it starts (an @ opens one anywhere), entries or not.
+    if len(re.findall(r"@[A-Za-z]+\s*[{(]", text)) > MAX_BLOCKS:
+        raise Unreadable("too_many_records")
     try:
         # No middleware: @string macros are resolved here, once each, never by concatenation (#),
         # so a value is never longer than the file.

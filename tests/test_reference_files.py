@@ -304,3 +304,25 @@ def test_a_noteexpress_tag_is_on_its_own_line():  # as the reader takes it, so t
     assert unreadable("Exported\n" + broken * 3) == "unsupported_reference_file"
     one = "{Reference Type}: Book\n{Title}: T\n"
     assert len(parse(one + broken * (rf.MAX_RECORDS + 1))[0]) == 1  # one record, counted as one
+
+
+# From the writer's second recheck (2026-10-10)
+
+
+@pytest.mark.parametrize("block", ["@string{a=1}\n", "@string{}", "@comment{x}", "@preamble{x}\n"])
+def test_bibtex_blocks_of_any_kind_count_toward_the_bound(block):
+    assert unreadable("@misc{k, title={T}}\n" + block * (rf.MAX_BLOCKS + 1)) == "too_many_records"
+
+
+def test_many_blank_lines_are_read_in_linear_time():
+    import time
+    started = time.monotonic()
+    assert unreadable("\n" * 1_000_000 + "hello") == "unsupported_reference_file"
+    parse("\n" * 1_000_000 + "@misc{k, title={T}}")  # BibTeX's detection and count too
+    assert time.monotonic() - started < 5
+
+
+def test_json_whose_strings_hold_other_line_ends_is_still_json():
+    text = json.dumps([{"title": "A {Reference Type}: B"}], ensure_ascii=False)
+    [record], _, kind = parse(text)
+    assert kind == "csl_json" and record["title"] == "A {Reference Type}: B"
