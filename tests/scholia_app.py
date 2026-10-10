@@ -294,3 +294,25 @@ async def declare(client, provider):
     """Declare a provider on this Mac as the card does: for the origin it showed."""
     [shown] = [p for p in (await client.get("/api/providers")).json()["providers"] if p["name"] == provider]
     return await client.post("/api/local-declarations", json={"provider": provider, "origin": shown["origin"]})
+
+
+def read_in_process(monkeypatch):
+    """Read materials in this process, as the app did before readings moved to a child process
+    (backend/reading.py): for tests that replace the parser, its version or its OCR engine here to
+    see what the app does with a reading, which a child would not see. The child's own handling is
+    tested in tests/test_reading.py, with the real child and a test-owned one."""
+    import hashlib
+    from pathlib import Path
+
+    from backend import extraction, reading
+
+    def stored(path, sha256):
+        data = Path(path).read_bytes()
+        if hashlib.sha256(data).hexdigest() != sha256:
+            raise FileNotFoundError("the stored file changed")
+        return data
+
+    monkeypatch.setattr(reading, "read", lambda path, sha256, kind, stop, progress, **options: extraction.extract(
+        stored(path, sha256), kind, stop, progress))
+    monkeypatch.setattr(reading, "render", lambda path, sha256, number, scale, stop, **options: extraction.render_page(
+        stored(path, sha256), number, scale))

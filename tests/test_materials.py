@@ -5,17 +5,19 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import stat
 import threading
+import time
 
 import pytest
 
 import backend.extraction as extraction
 import backend.materials as materials_module
-from backend import ocr
-from backend.db.content import ContentStore
+from backend import ocr, reading
 import synthetic_materials as synthetic
-from scholia_app import MockProvider, MockScholarly, background_idle, openalex_work, run_finished, started
+from scholia_app import (MockProvider, MockScholarly, background_idle, openalex_work, read_in_process, run_finished,
+                         started)
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,19 +70,98 @@ async def settled(client, project, timeout=15.0):
         await asyncio.sleep(0.02)
 
 
-def hold_extraction(monkeypatch):
-    """Hold every extraction inside its thread, checking stop() as it waits, until go is set."""
-    reached, go, real = threading.Event(), threading.Event(), extraction.extract
+class Held:
+    """Readings (and page images) held in their child, tests/reading_stub.py's hold: each child says it
+    holds by a file named by its process id, holding its media type or page number; set() lets every
+    one go on."""
 
-    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):
-        progress(0, 1)
-        reached.set()
-        while not go.wait(0.01):
-            stop()
-        return real(data, kind, stop, progress)
+    def __init__(self, folder):
+        self.folder = folder
 
-    monkeypatch.setattr(extraction, "extract", held)
-    return reached, go
+    def held(self):
+        """{pid: what it holds} of every child that has held."""
+        return {int(path.name.removeprefix("held-")): path.read_text() for path in self.folder.glob("held-*")}
+
+    def wait(self, timeout, count=1):
+        deadline = time.monotonic() + timeout
+        while len(self.held()) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return self.is_set()
+
+    def is_set(self):
+        return bool(self.held())
+
+    def set(self):
+        (self.folder / "go").touch()
+
+
+def hold_extraction(reading_stub, tmp_path, *where):
+    """Hold every reading in its child, which checks stop() as it waits, until go is set: (reached, go)."""
+    folder = tmp_path / "held"
+    folder.mkdir(exist_ok=True)
+    reading_stub("hold", folder, *where)
+    held = Held(folder)
+    return held, held
+
+
+def gone(*pids):
+    """Whether each child has ended and been reaped, and none is left (S1-16's helper tests' check)."""
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+            return False
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+            return False
+        except ChildProcessError:
+            pass
+    return not reading.LIVE
+
+
+async def until(condition, what, timeout=10.0, over=None):
+    """condition()'s value once it holds (each may be a coroutine function), failing after timeout, or
+    at once when over() says the work it waits on ended without reaching it."""
+    deadline = time.monotonic() + timeout
+    while True:
+        found = condition()
+        found = await found if asyncio.iscoroutine(found) else found
+        if found:
+            return found
+        if over is not None:
+            ended_first = over()
+            assert not (await ended_first if asyncio.iscoroutine(ended_first) else ended_first), \
+                f"{what}: the work ended first"
+        assert time.monotonic() < deadline, f"{what}: not within {timeout} s"
+        await asyncio.sleep(0.005)
+
+
+def run_over(client, run_id):
+    """over() for until: the run has ended."""
+    async def over():
+        found = (await client.get("/api/activity", params={"run_id": run_id})).json()["runs"]
+        return bool(found) and found[0]["status"] != "running"
+    return over
+
+
+async def ended(*pids, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not gone(*pids):
+        assert time.monotonic() < deadline, f"children left: {pids}, {reading.LIVE}"
+        await asyncio.sleep(0.01)
+    return True
+
+
+async def progress_shown(client, project, timeout=5.0):
+    """The project's papers once a reading's progress shows (its child's frame reached the app)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        listed = (await listing(client, project))["materials"]
+        if any(m["progress"] for m in listed):
+            return listed
+        assert time.monotonic() < deadline, listed
+        await asyncio.sleep(0.01)
 
 
 PDF = ("paper.pdf", synthetic.paper_pdf())
@@ -89,16 +170,17 @@ PDF = ("paper.pdf", synthetic.paper_pdf())
 # Lifecycle: cancellation, deletion, limits, restarts
 
 
-async def test_a_cancelled_reading_writes_nothing_and_can_be_tried_again(tmp_path, monkeypatch):
-    reached, go = hold_extraction(monkeypatch)
+async def test_a_cancelled_reading_writes_nothing_and_can_be_tried_again(tmp_path, reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, PDF))["materials"]
         await asyncio.to_thread(reached.wait, 10)
-        [reading] = (await listing(client, project))["materials"]
-        assert reading["state"] == "reading" and reading["progress"] == {"done": 0, "total": 1}
+        [read] = await progress_shown(client, project)
+        assert read["state"] == "reading" and read["progress"] == {"done": 0, "total": 1}
         cancelled = await client.post(f"/api/runs/{paper['run_id']}/cancel")
         assert cancelled.json()["status"] == "cancelled"
+        assert await ended(*reached.held())  # its child killed and reaped
         assert (await client.post(f"/api/runs/{paper['run_id']}/cancel")).json()["status"] == "cancelled"  # again: safe
         assert await rows(client, "SELECT count(*) FROM extractions") == [(0,)]
         assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
@@ -118,13 +200,14 @@ async def test_a_cancelled_reading_writes_nothing_and_can_be_tried_again(tmp_pat
 
 
 async def test_deleting_a_material_while_it_is_read_revokes_its_run_and_nothing_reaches_the_index(
-        tmp_path, monkeypatch):
-    reached, go = hold_extraction(monkeypatch)
+        tmp_path, reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, PDF))["materials"]
         await asyncio.to_thread(reached.wait, 10)
         assert (await client.delete(f"/api/materials/{paper['id']}")).status_code == 200
+        assert await ended(*reached.held())  # its child killed, before it was let go
         go.set()
         await background_idle(client)
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", paper["run_id"]) == [
@@ -135,8 +218,8 @@ async def test_deleting_a_material_while_it_is_read_revokes_its_run_and_nothing_
 
 
 async def test_one_projects_deletion_revokes_only_its_own_reading_of_a_file_another_project_reads(
-        tmp_path, monkeypatch):
-    reached, go = hold_extraction(monkeypatch)
+        tmp_path, reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         mine, theirs = await project_of(client, "Mine"), await project_of(client, "Theirs")
         [paper] = (await added(client, mine, PDF))["materials"]
@@ -153,13 +236,14 @@ async def test_one_projects_deletion_revokes_only_its_own_reading_of_a_file_anot
         assert {p for (p,) in await rows(client, "SELECT DISTINCT project_id FROM index_queue")} == {theirs}
 
 
-async def test_deleting_the_project_while_its_material_is_read_leaves_nothing_of_it(tmp_path, monkeypatch):
-    reached, go = hold_extraction(monkeypatch)
+async def test_deleting_the_project_while_its_material_is_read_leaves_nothing_of_it(tmp_path, reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, PDF))["materials"]
         await asyncio.to_thread(reached.wait, 10)
         assert (await client.delete(f"/api/projects/{project}")).status_code == 200
+        assert await ended(*reached.held())
         go.set()
         await background_idle(client)
         assert await rows(client, "SELECT count(*) FROM runs WHERE id = ?", paper["run_id"]) == [(0,)]
@@ -185,30 +269,19 @@ async def test_deleting_a_read_material_queues_its_removals_after_its_additions(
         assert (await client.get(f"/api/passages/{passages[0]['id']}")).status_code == 404
 
 
-async def test_at_most_two_readings_hold_their_files_and_a_third_waits_unread(tmp_path, monkeypatch):
-    go, reading, reads = threading.Event(), [], []
-    real_extract, real_read = extraction.extract, ContentStore.read
-
-    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):
-        progress(0, 1)
-        reading.append(kind)
-        while not go.wait(0.01):
-            stop()
-        return real_extract(data, kind, stop, progress)
-
-    def read(store, sha256):
-        reads.append(sha256)
-        return real_read(store, sha256)
-
-    monkeypatch.setattr(extraction, "extract", held)
-    monkeypatch.setattr(ContentStore, "read", read)
+async def test_at_most_two_readings_hold_their_files_and_a_third_waits_unread(tmp_path, reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, *[(f"notes{i}.md", synthetic.paper_markdown(f"Notes {i}", arxiv="")) for i in range(4)])
-        while len(reading) < 2:
-            await asyncio.sleep(0.01)
+        await asyncio.to_thread(reached.wait, 10, 2)
         await asyncio.sleep(0.3)
-        assert (len(reading), len(reads)) == (2, 2)  # the others wait for a turn without their files' bytes
+        assert len(reached.held()) == len(reading.LIVE) == 2  # two children; the others wait for a turn without one
+        assert set(reached.held()) == reading.LIVE
+        async def shown():
+            return sum(1 for m in (await listing(client, project))["materials"] if m["progress"]) >= 2
+
+        await until(shown, "two readings' progress shown")
         listed = (await listing(client, project))["materials"]
         assert {m["state"] for m in listed} == {"reading"}
         waiting = [m for m in listed if m["progress"] is None]
@@ -218,7 +291,8 @@ async def test_at_most_two_readings_hold_their_files_and_a_third_waits_unread(tm
         go.set()
         ready = await settled(client, project)
         assert sorted(m["state"] for m in ready) == ["needs_attention"] + ["ready"] * 3
-        assert len(reads) == 3  # the cancelled one never read its file
+        assert len(reached.held()) == 3  # the cancelled one never started a child, nor read its file
+        assert await ended(*reached.held())
 
 
 async def test_a_readings_passages_are_written_one_row_at_a_time(tmp_path):
@@ -246,26 +320,28 @@ async def test_a_readings_passages_are_written_one_row_at_a_time(tmp_path):
                                   " WHERE e.extractor_version = 'test-1'") == [(20_000,)]
 
 
-async def test_a_reading_past_its_limit_stops_and_says_so(tmp_path, monkeypatch):
-    hold_extraction(monkeypatch)  # never let go: only the limit ends it
-    monkeypatch.setattr(materials_module, "EXTRACTION_SECONDS", 0.2)
+async def test_a_reading_past_its_limit_stops_and_says_so(tmp_path, monkeypatch, reading_stub):
+    reached, _ = hold_extraction(reading_stub, tmp_path)  # never let go: only the limit ends it
+    monkeypatch.setattr(materials_module, "EXTRACTION_SECONDS", 1.0)  # its child's start included
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, PDF))["materials"]
         run = await run_finished(client, paper["run_id"])
         assert (run["status"], run["cancel_reason"], run["result"]) == ("cancelled", "limit", {"reason": "time_limit"})
+        assert reached.is_set() and await ended(*reached.held())
         [limited] = await settled(client, project)
         assert (limited["state"], limited["reason"]) == ("needs_attention", "time_limit")
 
 
-async def test_a_reading_stopped_by_a_restart_starts_again_from_its_inputs(tmp_path, monkeypatch):
+async def test_a_reading_stopped_by_a_restart_starts_again_from_its_inputs(tmp_path, monkeypatch, reading_stub):
     data = tmp_path / "data"
-    reached, _ = hold_extraction(monkeypatch)
+    reached, _ = hold_extraction(reading_stub, tmp_path)
     async with started(data) as client:
         project = await project_of(client)
         [paper] = (await added(client, project, PDF))["materials"]
         await asyncio.to_thread(reached.wait, 10)
     assert reached.is_set()
+    assert gone(*reached.held())  # the app's shutdown ended its child before it returned
     monkeypatch.undo()
     async with started(data, setup=False) as client:
         assert (await run_finished(client, paper["run_id"]))["status"] == "succeeded"
@@ -354,8 +430,9 @@ async def test_the_same_file_is_one_paper_in_a_project_and_shares_its_reading_wi
             [(first, count), (second, count)])
 
 
-async def test_two_projects_reading_the_same_file_at_once_queue_each_passage_once_for_each(tmp_path, monkeypatch):
-    reached, go = hold_extraction(monkeypatch)
+async def test_two_projects_reading_the_same_file_at_once_queue_each_passage_once_for_each(tmp_path, monkeypatch,
+                                                                                          reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
         [one] = (await added(client, first, PDF))["materials"]
@@ -373,6 +450,7 @@ async def test_two_projects_reading_the_same_file_at_once_queue_each_passage_onc
 
 
 async def test_a_reading_by_an_earlier_extractor_version_is_never_this_versions(tmp_path, monkeypatch):
+    read_in_process(monkeypatch)  # an earlier extractor version, as this process sees it
     doi = synthetic.DOI
     notes = f"# Notes\n\ndoi:{doi}\n\nSynthetic text.\n".encode()
     real = extraction.extract
@@ -421,6 +499,7 @@ async def test_a_reading_by_an_earlier_extractor_version_is_never_this_versions(
 
 async def test_a_paper_sharing_a_reading_by_an_earlier_version_is_read_again_without_a_run_of_its_own(tmp_path,
                                                                                                     monkeypatch):
+    read_in_process(monkeypatch)  # an earlier extractor version, as this process sees it
     notes = b"# Notes\n\nA paragraph of synthetic text.\n"
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
@@ -464,6 +543,7 @@ async def ops(client, extraction_id, passages=None):
 
 
 async def test_a_newer_reading_takes_the_earlier_readings_passages_out_of_every_index_that_has_them(tmp_path, monkeypatch):
+    read_in_process(monkeypatch)  # an earlier extractor version, as this process sees it
     notes = b"# Notes\n\nA first paragraph.\n\nA second paragraph.\n"
     async with started(tmp_path / "data") as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
@@ -510,6 +590,7 @@ async def test_a_replaced_file_leaves_its_projects_index_unless_another_paper_th
 
 @pytest.mark.parametrize("change", ["replaced", "read by a newer version"])
 async def test_passages_the_index_has_applied_still_leave_it(tmp_path, monkeypatch, change):
+    read_in_process(monkeypatch)  # an earlier extractor version, as this process sees it
     notes = b"# Notes\n\nA paragraph of synthetic text.\n"
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
@@ -565,16 +646,8 @@ async def test_deleting_the_paper_that_reads_a_file_takes_it_out_of_the_index_th
         assert await rows(client, "SELECT count(*) FROM passages WHERE extraction_id = ?", read_x) == [(n,)]  # A's version's
 
 
-async def test_a_reading_of_a_file_replaced_while_it_was_read_reaches_no_index(tmp_path, monkeypatch):
-    real, reached, release = extraction.extract, threading.Event(), threading.Event()
-
-    def held(data, kind, stop=lambda: None, progress=lambda d, t: None):  # only the PDF's reading waits
-        if data == PDF[1]:
-            reached.set()
-            release.wait(20)
-        return real(data, kind, lambda: None, progress)
-
-    monkeypatch.setattr(extraction, "extract", held)
+async def test_a_reading_of_a_file_replaced_while_it_was_read_reaches_no_index(tmp_path, reading_stub):
+    reached, release = hold_extraction(reading_stub, tmp_path)  # the replacement's reading waits too, till release
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, PDF))["materials"]
@@ -694,6 +767,7 @@ async def test_oversized_unknown_and_garbled_uploads_are_refused(tmp_path, monke
 
 
 async def test_scanned_pages_wait_for_ocr_and_the_text_pages_are_kept(tmp_path, monkeypatch):
+    read_in_process(monkeypatch)
     monkeypatch.setattr(ocr, "engine", lambda: None)  # where no OCR engine loads (S1-20)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
@@ -729,96 +803,108 @@ async def test_a_docx_declaring_an_entity_is_refused_and_nothing_of_it_is_writte
         assert (refused["state"], refused["reason"]) == ("needs_attention", "unreadable_file")
 
 
-@pytest.mark.parametrize("held", ["its file's read", "its render"])
+@pytest.mark.parametrize("held", ["its file's read", "its render", "its render, then stopped silent"])
 @pytest.mark.parametrize("deleted", ["material", "project"])
-async def test_a_page_image_whose_paper_is_deleted_while_it_renders_is_not_given(tmp_path, monkeypatch, deleted, held):
-    reached, go = threading.Event(), threading.Event()
-
-    def holding(real):
-        def wait_then(*args):
-            reached.set()
-            go.wait(10)
-            return real(*args)
-        return wait_then
-
+async def test_a_page_image_whose_paper_is_deleted_while_it_renders_is_not_given(tmp_path, monkeypatch, reading_stub,
+                                                                                 deleted, held):
+    """Not found, even when its render was stopped at a ceiling meanwhile (the step limit here)."""
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, PDF)
         [paper] = await settled(client, project)
-        if held == "its render":
-            monkeypatch.setattr(extraction, "render_page", holding(extraction.render_page))
-        else:
-            monkeypatch.setattr(ContentStore, "read", holding(ContentStore.read))
+        reached, go = hold_extraction(reading_stub, tmp_path, *(["file"] if held == "its file's read" else []))
+        if held.endswith("stopped silent"):
+            monkeypatch.setattr(reading, "STEP_SECONDS", 1.0)
         page = asyncio.ensure_future(client.get(f"/api/material-versions/{paper['version']['id']}/pages/1"))
         await asyncio.to_thread(reached.wait, 10)
         url = f"/api/materials/{paper['id']}" if deleted == "material" else f"/api/projects/{project}"
         assert (await client.delete(url)).status_code == 200
-        go.set()
+        if not held.endswith("stopped silent"):
+            go.set()
         assert (await page).status_code == 404
+        assert await ended(*reached.held())
 
 
-async def test_at_most_two_page_images_hold_their_files_at_once(tmp_path, monkeypatch):
-    lock, holding, most = threading.Lock(), [0], [0]
-    real_read, real_render = ContentStore.read, extraction.render_page
+async def test_one_page_image_at_a_time_holds_its_file_and_the_others_wait_without_a_child(tmp_path, monkeypatch,
+                                                                                           reading_stub):
+    lock, holding, most, real = threading.Lock(), [0], [0], reading._run
 
-    def read(store, sha256):  # a page image's bytes are held from here to its render's end
+    def run(*args):  # a page image's child, which holds its file's bytes, from its start to its end
         with lock:
             holding[0] += 1
             most[0] = max(most[0], holding[0])
-        return real_read(store, sha256)
-
-    def render(data, number, scale=2.0):
         try:
-            threading.Event().wait(0.1)
-            return real_render(data, number, scale)
+            return real(*args)
         finally:
             with lock:
                 holding[0] -= 1
 
+    assert materials_module.RENDERS == 1  # Harold, 2026-10-10: one page image at a time
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, PDF)
         [paper] = await settled(client, project)
-        monkeypatch.setattr(ContentStore, "read", read)
-        monkeypatch.setattr(extraction, "render_page", render)
+        reading_stub("sleep", 0.1)
+        monkeypatch.setattr(reading, "_run", run)
         pages = await asyncio.gather(*[client.get(f"/api/material-versions/{paper['version']['id']}/pages/{1 + i % 2}")
-                                       for i in range(6)])
-        assert [page.status_code for page in pages] == [200] * 6
-        assert most[0] == 2
+                                       for i in range(4)])
+        assert [page.status_code for page in pages] == [200] * 4
+        assert most[0] == 1 and not reading.LIVE
 
 
-async def test_a_page_request_that_goes_away_holds_its_turn_to_its_render_and_no_queued_one_renders(tmp_path, monkeypatch):
+async def test_a_page_request_that_goes_away_holds_its_turn_to_its_render_and_no_queued_one_renders(
+        tmp_path, monkeypatch, reading_stub):
     from starlette.requests import Request
-    renders, go, real = [], threading.Event(), extraction.render_page
-
-    def held(data, number, scale=2.0):
-        renders.append(number)
-        go.wait(10)
-        return real(data, number, scale)
 
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, PDF)
         [paper] = await settled(client, project)
-        monkeypatch.setattr(extraction, "render_page", held)
+        held, go = hold_extraction(reading_stub, tmp_path)
+
+        def renders():
+            return list(map(int, held.held().values()))
+
         url = f"/api/material-versions/{paper['version']['id']}/pages"
-        rendering = [asyncio.ensure_future(client.get(f"{url}/{n}")) for n in (1, 2)]  # both turns taken
-        while len(renders) < 2:
-            await asyncio.sleep(0.01)
-        queued = asyncio.ensure_future(client.get(f"{url}/1"))
-        await asyncio.sleep(0.1)
-        for request in [*rendering, queued]:  # every page let go: their requests go away
+        rendering = asyncio.ensure_future(client.get(f"{url}/1"))  # the one turn taken
+        await until(renders, "the first page image held in its child")
+        queued = asyncio.ensure_future(client.get(f"{url}/2"))  # the second waits for the first, without a child
+        await asyncio.sleep(0.2)
+        assert (renders(), len(reading.LIVE)) == ([1], 1)
+        for request in (rendering, queued):  # every page let go: their requests go away
             request.cancel()
         await asyncio.sleep(0.1)
-        renders_now, slots = len(renders), client.state["renders"]
-        assert slots.locked()  # the two renders still hold their turns: their threads run on
+        renders_now, slots = len(renders()), client.state["renders"]
+        assert slots.locked()  # the render still holds its turn: its thread runs on
         go.set()
-        while slots.locked():
-            await asyncio.sleep(0.01)
-        assert sorted(renders) == [1, 2] and renders_now == 2  # the queued one never rendered
+        await until(lambda: not slots.locked(), "the render's turn given back")
+        assert renders() == [1] and renders_now == 1  # the queued one never rendered
+        assert await ended(*held.held())
         monkeypatch.setattr(Request, "is_disconnected", lambda self: asyncio.sleep(0, True))  # gone once its turn came
-        gone = await client.get(f"{url}/1")
-        assert gone.status_code == 204 and len(renders) == 2
+        let_go = await client.get(f"{url}/1")
+        assert let_go.status_code == 204 and renders() == [1]
+
+
+async def test_a_shutdown_ends_the_page_image_rendering_and_the_one_waiting_starts_no_child(tmp_path, monkeypatch,
+                                                                                           reading_stub):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await added(client, project, PDF)
+        [paper] = await settled(client, project)
+        held, _ = hold_extraction(reading_stub, tmp_path)  # never let go: only the shutdown ends it
+        children, command = [], reading.command
+        monkeypatch.setattr(reading, "command", lambda: children.append(1) or command())  # each child started
+        url = f"/api/material-versions/{paper['version']['id']}/pages"
+        rendering = asyncio.ensure_future(client.get(f"{url}/1"))
+        await asyncio.to_thread(held.wait, 10)
+        waiting = asyncio.ensure_future(client.get(f"{url}/2"))
+        await asyncio.sleep(0.2)
+        await client.state["harness"].shutdown()
+        assert gone(*held.held())  # reaped by the time the shutdown returns, before any page's answer is read
+        for response in (await rendering, await waiting):
+            assert (response.status_code, response.json()["code"]) == (503, "shutting_down")
+        assert list(held.held().values()) == ["1"] and len(children) == 1  # the waiting one started no child
+        assert await ended(*held.held())
 
 
 async def test_a_pdf_page_is_rendered_as_a_png_and_only_a_pdf_has_pages(tmp_path):
@@ -945,20 +1031,22 @@ async def test_attached_in_a_conversation_names_it_and_only_its_own_project(tmp_
         await settled(client, project)
 
 
-async def test_a_markdown_paper_read_by_markdown_2_is_read_once_again_by_markdown_3_at_launch(tmp_path, monkeypatch):
+async def test_a_markdown_paper_read_by_markdown_2_is_read_once_again_by_markdown_3_at_launch(tmp_path):
     """The S1-13 hardening bumped the Markdown reader to markdown-3 (a fence past the block bound is refused, a
     front matter past the structural bound is read as text); S1-20's launch re-read reads a paper whose only
     reading is by markdown-2 once again, by markdown-3, which supersedes the earlier reading."""
     data, current = tmp_path / "data", extraction.EXTRACTORS[extraction.MARKDOWN]
     assert current == ("markdown", "markdown-3")
-    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-2"))
-    async with started(data) as client:
-        project = await project_of(client)
-        await added(client, project, ("notes.md", synthetic.paper_markdown()))
-        [read] = await settled(client, project)
-        assert read["state"] == "ready"
-        assert await rows(client, "SELECT extractor_version FROM extractions") == [("markdown-2",)]
-    monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, current)
+    with pytest.MonkeyPatch.context() as earlier:  # an earlier Scholia, as this process sees it: read here
+        read_in_process(earlier)
+        earlier.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-2"))
+        async with started(data) as client:
+            project = await project_of(client)
+            await added(client, project, ("notes.md", synthetic.paper_markdown()))
+            [read] = await settled(client, project)
+            assert read["state"] == "ready"
+            assert await rows(client, "SELECT extractor_version FROM extractions") == [("markdown-2",)]
+    assert extraction.EXTRACTORS[extraction.MARKDOWN] == current  # this one, read again in its child
     outdated = "SELECT json_extract(inputs, '$.outdated') FROM runs WHERE workflow = 'extract'" \
                " AND json_extract(inputs, '$.outdated') IS NOT NULL"
     async with started(data, setup=False) as client:

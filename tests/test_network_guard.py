@@ -255,7 +255,9 @@ def test_project_code_avoids_networking_outside_the_block():
     import re
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    exempt = {"tests/network_guard.py", "tests/test_network_guard.py"}
+    # tests/reading_stub.py's probe runs in a reading's child, outside the block, to show that the child
+    # itself refuses the C socket class.
+    exempt = {"tests/network_guard.py", "tests/test_network_guard.py", "tests/reading_stub.py"}
     pattern = re.compile(r"\b(uvloop|_socket|NSURL\w*|\w*ContentsOfURL\w*|CFNetwork|CFStream|pycurl)\b")
     offenders = [
         f"{path.relative_to(root)}:{n}"

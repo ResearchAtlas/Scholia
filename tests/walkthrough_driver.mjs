@@ -1164,6 +1164,60 @@ async function s120(ctx) {
   });
 }
 
+// The reading's ceilings (backend/reading.py): each reading runs in a child process, stopped past its
+// memory ceiling or when it says nothing past its time ceiling. The test server's reading child takes
+// memory without end for one synthetic file and says nothing for another, as crafted files would:
+// each paper then needs attention with its own reason, nothing of it is saved, and the background-run
+// list says why, with Retry.
+async function ceilings(ctx) {
+  const { page, L, C, step, check, get } = ctx;
+  const { dialog, openSettings } = navigation(ctx);
+  const panel = () => page.getByRole('complementary', { name: L('panel.library') });
+  const projectId = (await get('/api/projects')).body.projects.find((p) => p.name === C.project).id;
+  const named = async (title) => (await get(`/api/projects/${projectId}/materials`)).body.materials.find((m) => m.title === title);
+  const stopped = async (title) => {
+    for (let i = 0; i < 300; i += 1) {
+      const found = await named(title);
+      if (found && found.state !== 'reading' && found.lookup?.status !== 'running') return found;
+      await page.waitForTimeout(200);
+    }
+    throw new Error(`${title} was not stopped in time`);
+  };
+  const row = (title) => panel().getByRole('listitem').filter({ hasText: title });
+  const back = panel().getByRole('button', { name: L('paper.back'), exact: true });
+  if (await back.count()) { await back.click(); await page.waitForTimeout(500); }
+  const runs = {};
+
+  for (const [name, title, reason] of [['65-memory-limit', 'large-figures', 'memory_limit'],
+                                       ['66-time-limit', 'slow-source', 'step_limit']]) {
+    await step(name, async () => {
+      await page.getByTestId('library-files').setInputFiles(join(C.materials, `${title}.${title === 'slow-source' ? 'tex' : 'pdf'}`));
+      const paper = await stopped(title);
+      await row(title).getByText(L(`library.reason.${reason}`), { exact: true }).waitFor();
+      check(`the paper needs attention with its reason (${reason})`, paper.state === 'needs_attention' && paper.reason === reason
+        && await row(title).getByText(L('library.state.needs_attention'), { exact: true }).count() === 1);
+      check('nothing of its reading was saved', paper.extraction === null);
+      [runs[reason]] = (await get(`/api/activity?run_id=${paper.reading.run_id}`)).body.runs;
+      check('its reading failed with that reason, and Retry applies', runs[reason]?.status === 'failed'
+        && runs[reason].result?.reason === reason && runs[reason].retryable === true);
+      await row(title).locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    });
+  }
+
+  await step('67-ceilings-background-runs', async () => {
+    await openSettings('settings.page.advanced');
+    await dialog().getByRole('heading', { name: L('settings.backgroundRuns') }).scrollIntoViewIfNeeded(); await page.waitForTimeout(1500);
+    for (const [title, reason] of [['large-figures', 'memory_limit'], ['slow-source', 'step_limit']]) {
+      const listed = dialog().getByRole('listitem').filter({ hasText: title }).filter({ hasText: L('settings.workflowExtract') })
+        .filter({ hasText: L(`errors.${reason}`) });
+      check(`the stopped reading is listed with its reason (${reason}) and Retry`, await listed.count() === 1
+        && await listed.getByRole('button', { name: L('runs.retry'), exact: true }).count() === 1);
+    }
+    await dialog().getByRole('listitem').filter({ hasText: L('errors.memory_limit') }).scrollIntoViewIfNeeded(); // both readings in view
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+}
+
 // The parts of the window loaded when first opened (frontend/src/parts.js), on a window just loaded:
 // Escape while Settings loads closes it, and Settings opened from the keyboard lands focus in its
 // dialog; a part whose script is refused once by the browser says so where it would show, with Try
@@ -1660,6 +1714,7 @@ async function run(combo, build, outRoot) {
     if (C.materials) await materials(ctx);  // an attached app has no synthetic materials of its own
     await parts(ctx);  // on the materials flow's window and project, as it was written for
     if (C.materials) await s120(ctx);  // S1-20: OCR of a scanned page; it sets up its own project and panel
+    if (C.materials) await ceilings(ctx);  // a reading stopped at its memory ceiling and at its time ceiling
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);

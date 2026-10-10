@@ -10,7 +10,7 @@ import { useT } from '../i18n/index.js';
 import { patch } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
-import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageImage,
+import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPointed, libraryChanged, NOT_POINTED, pageFailedKey, pageImage,
   pageLines, pageOffsets, pagePart, pagesWithin, pageWindow, PAGE_WIDTH, partMove, passOn, PASSAGE_STRETCH, passageStretch, pointing,
   rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withFocus, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
@@ -342,7 +342,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin, a
   const retry = useRef(null);
   const [part, setPart] = useState(startPart); // which part of its passages it shows
   const [shown, setShown] = useState(null); // { src, part, passages, more }
-  const [failed, setFailed] = useState(false); // read again once asked to, or let go and held again
+  const [failed, setFailed] = useState(false); // its read's error code, or true; read again once asked to, or let go and held again
   const [props, focusOn, passTo] = usePart(frame, number, shown ? shown.part : null, onNear, onWithin);
   const move = partMove(shown, part, failed);
   useEffect(() => {
@@ -353,7 +353,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin, a
     const controller = new AbortController(); // let go before they came: its requests go too
     Promise.all([shown?.src ?? pageImage(version, number, 1.5, controller.signal), pagePart(version, number, part, controller.signal)])
       .then(([src, found]) => { if (live) { setShown({ src, part, ...found }); onPart(number, part); } })
-      .catch(() => live && setFailed(true));
+      .catch((error) => live && setFailed(error?.code || true));
     return () => { live = false; controller.abort(); };
   }, [held, shown, version, number, part, failed]);
   useEffect(() => { // focus waiting on the page for the part goes to Retry once its read failed
@@ -382,7 +382,7 @@ function PageView({ version, number, pointed, onPoint, held, onNear, onWithin, a
         : <div className={cn('grid place-items-center text-xs', !aspect && 'aspect-[612/792]', failed ? 'text-destructive' : 'text-muted-foreground')}
           style={aspect ? { aspectRatio: aspect } : undefined}>
           {move.failed ? <div className="grid justify-items-center gap-2">
-            <p role="alert">{t('paper.pageFailed')}</p>
+            <p role="alert">{t(pageFailedKey(failed))}</p>
             <button ref={retry} type="button" className={button} onClick={() => go(part, 'first')}>{t('common.retry')}</button>
           </div> : t('common.loading')}
         </div>}

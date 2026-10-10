@@ -14,7 +14,8 @@ version (or a new version of a material being replaced), and the background runs
 A request that fails validation writes nothing; the same file added again to the same project
 reports the paper it already is.
 
-An `extract` run reads its version's file (backend/extraction.py) within EXTRACTION_SECONDS and
+An `extract` run reads its version's file in a child process, under a memory and a time ceiling
+(backend/reading.py, which parses it with backend/extraction.py), within EXTRACTION_SECONDS, and
 writes the extraction, its passages and the index queue's `add` rows in its terminal transaction,
 for every project whose current version it reads (each once; a version replaced while it was read
 gets none), so a partial extraction is never written and a revoked one writes nothing. A project's
@@ -59,7 +60,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from backend import asks, backups, extraction, lookup
+from backend import asks, backups, extraction, lookup, reading
 from backend.db import ContentCorruptError, delete, new_id, utc_now
 from backend.db.deletion import supersede
 from backend.outbound_gate import OutboundDenied
@@ -70,8 +71,8 @@ from backend.settings import visible
 log = logging.getLogger(__name__)
 
 EXTRACTION_SECONDS = 30 * 60  # per material version (section 13)
-READINGS = 2  # readings at once, each holding its file's bytes; the others wait their turn without them
-RENDERS = 2  # page images rendered at once, as READINGS
+READINGS = 2  # readings at once, each in its child (backend/reading.py); the others wait their turn without one
+RENDERS = 1  # page images rendered at once, each in its child: one keeps the children's worst case near 3.5 GiB
 MAX_FILES = 20  # per request
 AUTHOR_CHARS = 2 * lookup.NAME_CHARS + 2  # an author as the details form sends one: "Family, Given", each part a lookup's
 BATCH_IDLE_SECONDS = 120  # an open batch (a drop still being sent) with no addition for this long closes itself
@@ -336,8 +337,8 @@ def register(harness, content):
         def progress(done, total):
             active.progress = {"done": done, "total": total}
 
-        def read():
-            return extraction.extract(content.read(sha256), kind, stop, progress)
+        def read():  # in a child, which reads the file itself (backend/reading.py)
+            return reading.read(content._path(sha256), sha256, kind, stop, progress)
 
         try:
             async with readings:
@@ -349,6 +350,8 @@ def register(harness, content):
             raise RunOutcome("failed", unreadable.code) from None
         except (FileNotFoundError, ContentCorruptError):
             raise RunOutcome("failed", "file_missing") from None
+        except reading.ChildError:  # logged there, as its type and place
+            raise RunOutcome("failed", "internal") from None
         summary = {"passages": len(extracted.passages), "pages": extracted.pages, "ocr_pages": extracted.ocr_pages}
         return summary, lambda conn: _store(conn, version_id, sha256, extracted, lambda conn, project, follow: (
             harness.record_in(conn, active, project, "lookup", follow)))
@@ -1046,12 +1049,20 @@ async def get_passage(passage_id: str, request: Request):
     return await asyncio.to_thread(_state(request)["db"].read, fetch)
 
 
+_RENDER_CEILINGS = {"memory_limit": "Rendering the page needed more memory than allowed",
+                    "step_limit": "Rendering the page made no progress for a minute"}
+
+
 @router.get("/api/material-versions/{version_id}/pages/{number}")
 async def page_image(version_id: str, number: int, request: Request, scale: float = 2.0):
-    """A PDF page rendered as a PNG by pypdfium2, in memory; never written to disk. The version is
-    looked for again once the page is rendered, so a page whose paper was deleted meanwhile is not
-    given."""
+    """A PDF page rendered as a PNG by pypdfium2, in memory, in a child process under its own memory
+    ceiling (backend/reading.py); never written to disk. The version is looked for again once the
+    page is rendered, so a page whose paper was deleted meanwhile is not given. The app closing ends
+    the child (503), and its shutdown returns only once the child is reaped. A render stopped at its
+    memory ceiling or after a minute without a word is answered 409 memory_limit or step_limit; one
+    that fails otherwise, 409 file_missing."""
     state = _state(request)
+    harness = state["harness"]
 
     def version(conn):
         return conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v JOIN content_files c"
@@ -1063,22 +1074,33 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
     if row[1] != extraction.PDF:
         raise _refused(400, "not_a_pdf", "Only a PDF has page images")
 
-    def render():
-        return extraction.render_page(state["content"].read(row[0]), number, max(0.5, min(scale, 3.0)))
+    def stop():
+        if harness.registry.closed:
+            raise _Stop()
 
+    def render():
+        return reading.render(state["content"]._path(row[0]), row[0], number, max(0.5, min(scale, 3.0)), stop)
+
+    ceiling = None
     try:
         # A turn is held to its render's end, even when the request goes away meanwhile (_to_end);
         # one whose page was let go while it waited for its turn (its request gone) is not rendered.
         async with state.setdefault("renders", asyncio.Semaphore(RENDERS)):
             if await request.is_disconnected():
                 return Response(status_code=204, headers={"Cache-Control": "no-store"})  # nobody waits for it
-            image = await _to_end(asyncio.to_thread(render))
+            # Held by the harness as its detached work, so a shutdown waits for its child to end and be reaped.
+            image = await _to_end(harness._detach(asyncio.to_thread(render)))
     except IndexError:
         raise _refused(404, "not_found", "No such page") from None
-    except (extraction.Unreadable, FileNotFoundError, ContentCorruptError):
-        image = None
+    except _Stop:
+        raise _refused(503, "shutting_down", "The app is closing") from None
+    except (extraction.Unreadable, FileNotFoundError, ContentCorruptError, reading.ChildError) as error:
+        image = None  # a child that did not start or failed as it did is logged there
+        ceiling = error.code if isinstance(error, extraction.Unreadable) else None
     if await asyncio.to_thread(state["db"].read, version) != row:  # deleted while it rendered, its file with it
         raise _refused(404, "not_found", "No such version")
+    if ceiling in _RENDER_CEILINGS:  # stopped at a ceiling: said as such, not as a file unread
+        raise _refused(409, ceiling, _RENDER_CEILINGS[ceiling])
     if image is None:
         raise _refused(409, "file_missing", "The file cannot be read")
     return Response(image, media_type="image/png", headers={"Cache-Control": "no-store"})  # see _no_store

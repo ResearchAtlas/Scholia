@@ -8,13 +8,17 @@ stand-ins for OpenAlex, Crossref and arXiv that answer made-up records, behind t
 block (network_guard.py), so this process reaches nothing but its own listener. It serves the
 built interface (frontend/dist) and prints the window's address with this launch's session, and
 the folder of synthetic materials (a PDF, DOCX, HTML, Markdown and LaTeX file, and more) it wrote
-for the walkthrough to add. Scanned pages are read by this Mac's own OCR engine (Vision), through a
-test-owned wrapper whose first recognition of a page with dark ink fails once, so the walkthrough
-shows a failed reading and its retry (S1-20). The local model helper's search model is a synthetic file with a pin
+for the walkthrough to add. Materials are read as the app reads them, each in a child process
+(backend/reading.py), here tests/reading_stub.py's walkthrough child, allowed by its whole command:
+scanned pages are read by this Mac's own OCR engine (Vision), whose first recognition of a page with
+dark ink fails once, so the walkthrough shows a failed reading and its retry (S1-20); and two
+synthetic files are stopped at the reading's ceilings, one taking memory without end and one
+silent past the time ceiling (lowered here to STEP_SECONDS), as crafted files would be. The local
+model helper's search model is a synthetic file with a pin
 of its own, served by a test-owned download source (each source redirecting to the file host
 it uses, the file sent slowly so a download can be watched and cancelled), and written to an
 "offline" folder for the import flow, whose path is printed; the helper binary is a stand-in in
-a bundle with its manifest, never started (the network block refuses child processes). --dev serves no interface and admits the Vite server on
+a bundle with its manifest, never started (the network block refuses every other child process). --dev serves no interface and admits the Vite server on
 127.0.0.1:5173 instead (`npm run dev` in frontend/), with no session, on port 8765, where
 that server sends API requests. Without --port, a free port is used. --request-log appends
 each request the test-owned provider receives to FILE, one JSON line each.
@@ -26,7 +30,6 @@ import argparse
 import asyncio
 import hashlib
 import json
-import re
 import secrets
 import socket
 import sys
@@ -49,7 +52,7 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 from scholia_app import FakeKeyring, MockProvider, MockScholarly, crossref_work, openalex_work  # noqa: E402
 
-from backend import local_helper, ocr  # noqa: E402
+from backend import local_helper, reading  # noqa: E402
 from backend.app import create_app  # noqa: E402
 from backend.budget_router import MODEL_TIERS  # noqa: E402
 
@@ -122,6 +125,10 @@ def write_materials():
         "many-blank-pages.pdf": synthetic_materials.pdf(  # 20,000 pages, all but the first (crowded-page's) blank: 2.4 MB
             [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]] + [[]] * 19_999),
         "scanned-letter.pdf": synthetic_materials.scanned_letter(DOIS["scan"]),  # S1-20: an image, no text layer
+        # The reading's ceilings (backend/reading.py): marked for the walkthrough's reading child.
+        "large-figures.pdf": synthetic_materials.paper_pdf(title="Large Figures").replace(
+            b"\n", b"\n%WALKTHROUGH-MEMORY\n", 1),
+        "slow-source.tex": b"% WALKTHROUGH-SLOW\n" + synthetic_materials.paper_latex(title="A Slow Source"),
     }
     for name, data in files.items():
         (folder / name).write_bytes(data)
@@ -151,21 +158,6 @@ def download_source(request):
     if request.url.host in FILE_HOSTS:
         return httpx.Response(302, headers={"Location": f"https://{FILE_HOSTS[request.url.host]}/files/model?signed=0"})
     return httpx.Response(200, stream=SlowFile())
-
-
-class FailsOnce:
-    """The test-owned wrapper around this Mac's OCR engine (S1-20): its first recognition of a page with
-    dark ink fails, once (the scanned appendix's image-only pages are an even gray); every other is
-    the engine's own. Its version is the engine's, so readings are as the app makes them."""
-
-    def __init__(self, engine):
-        self.engine, self.version, self.failed = engine, engine.version, False
-
-    def recognize(self, bitmap):
-        if not self.failed and re.search(rb"[\x00-\x3f]", bitmap.pixels):
-            self.failed = True
-            raise ocr.Failed()
-        return self.engine.recognize(bitmap)
 
 
 class SyntheticProvider(MockProvider):
@@ -198,9 +190,11 @@ def main(argv=None):
     parser.add_argument("--request-log", type=Path)
     args = parser.parse_args(argv)
 
-    if (engine := ocr.engine()) is not None:
-        failing = FailsOnce(engine)
-        ocr.engine = lambda: failing
+    # The reading child: tests/reading_stub.py's walkthrough mode (see the docstring), with its own folder.
+    child = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), "walkthrough",
+             tempfile.mkdtemp(prefix="scholia-walkthrough-reading-")]
+    reading.command = lambda: child
+    reading.STEP_SECONDS = 5.0  # the silent file is stopped in seconds; the app's ceiling is longer
     provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]],  # half have zero retention
                                  scholarly=RECORDS)
     provider.replies = [synthetic] * 1000
@@ -232,7 +226,8 @@ def main(argv=None):
     print(f"model file: {offline}", flush=True)
     print(f"open: {origin}/" + ("" if args.dev else f"#session={session}"), flush=True)
     server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", log_level="warning"))
-    asyncio.run(server.serve(sockets=[sock]))
+    with network_guard.allow_command(*child):  # the reading child alone, by its whole command
+        asyncio.run(server.serve(sockets=[sock]))
 
 
 if __name__ == "__main__":

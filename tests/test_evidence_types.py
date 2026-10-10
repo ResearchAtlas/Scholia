@@ -36,10 +36,9 @@ async def test_an_uploaded_file_is_full_text_and_a_looked_up_abstract_adds_no_pa
 
 
 async def test_a_scanned_papers_recognized_text_is_its_full_text(tmp_path, monkeypatch):
-    from backend import ocr
-    from test_ocr import LINE, Engine, scan
+    from test_ocr import LINE, Engine, scan, use
 
-    monkeypatch.setattr(ocr, "engine", lambda: Engine())  # S1-20: its page read by a test-owned engine
+    use(monkeypatch, Engine())  # S1-20: its page read by a test-owned engine (in this process)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, ("scan.pdf", scan()))
