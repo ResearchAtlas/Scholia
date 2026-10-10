@@ -1315,7 +1315,8 @@ async function references(ctx) {
       && e.data.question === 'merge' && e.data.answer === o)));
     await openSettings('settings.page.advanced');
     await dialog().getByRole('heading', { name: L('settings.backgroundRuns') }).scrollIntoViewIfNeeded(); await page.waitForTimeout(1500);
-    const listedRuns = dialog().getByRole('listitem').filter({ hasText: L('settings.workflowMerge') });
+    const listedRuns = dialog().getByRole('listitem').filter({ hasText: L('settings.workflowMerge') })
+      .filter({ hasText: new RegExp(`${duplicates.merge}|${duplicates.keep}`) }); // the runs, by their papers (not the audit's rows)
     check('the background-run list names the merges', await listedRuns.count() === 2);
     await listedRuns.first().scrollIntoViewIfNeeded();
   });
