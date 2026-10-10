@@ -1218,6 +1218,160 @@ async function ceilings(ctx) {
   await page.keyboard.press('Escape'); await page.waitForTimeout(500);
 }
 
+// S1-14: a reference file imported through the Library's Add menu: its new records become papers with
+// no full text, their details completed by the test-owned OpenAlex and Crossref (one retracted), and
+// two duplicates of papers already here each raise the merge question, answered Merge and Keep both;
+// a Local only project's import of a CNKI-style NoteExpress export asks once before its lookup; and a
+// file attached to a paper with none becomes its full text, read to Ready.
+async function references(ctx) {
+  const { page, L, P, C, step, check, get } = ctx;
+  const { dialog, openSidebar, openSettings } = navigation(ctx);
+  const panel = () => page.getByRole('complementary', { name: L('panel.library') });
+  const projects = async () => (await get('/api/projects')).body.projects;
+  const projectId = (await projects()).find((p) => p.name === C.project).id;
+  const listing = async (id) => (await get(`/api/projects/${id}/materials`)).body;
+  const requests = () => readFileSync(join(C.out, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const plural = (key, count) => { const forms = L(key); return (count === 1 && forms.one ? forms.one : forms.other).replace('{count}', String(count)); };
+  const asks = () => panel().getByRole('group', { name: L('ask.label') });
+  const row = (title) => panel().getByRole('listitem').filter({ has: page.getByRole('button', { name: title, exact: true }) });
+  const until = async (test, what, id = projectId) => {
+    for (let i = 0; i < 300; i += 1) {
+      const listed = await listing(id);
+      if (test(listed)) return listed;
+      await page.waitForTimeout(200);
+    }
+    throw new Error(`${what}: not in time`);
+  };
+  const toProject = async (name) => {
+    await openSidebar();
+    await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+    await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(1000);
+    if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+    const back = panel().getByRole('button', { name: L('paper.back'), exact: true });
+    if (await back.count()) { await back.click(); await page.waitForTimeout(500); }
+  };
+  const fromFile = ['Synthetic Evidence from Reference Files', '合成数据中的最低工资研究', 'A Chapter without an Identifier'];
+  const duplicates = { merge: 'A Scanned Letter on Synthetic Wages', keep: 'Labour Market Notes on a Synthetic Economy' };  // S1-20's, S1-13's
+  await toProject(C.project);
+
+  await step('40-add-menu', async () => {
+    await panel().getByRole('button', { name: L('library.add'), exact: true }).click(); await page.waitForTimeout(500);
+    check('Add offers files and a reference file', await page.getByRole('menuitem', { name: L('library.addMenu.files') }).count() === 1
+      && await page.getByRole('menuitem', { name: L('library.addMenu.referenceFile') }).count() === 1);
+  });
+
+  let before;
+  await step('41-reference-import', async () => {
+    await page.keyboard.press('Escape'); await page.waitForTimeout(300);
+    before = (await listing(projectId)).materials.length;
+    await page.getByTestId('library-reference-file').setInputFiles(join(C.materials, 'reference-library.ris'));
+    await panel().getByText(plural('references.imported', 3), { exact: false }).waitFor({ timeout: 20000 });
+    check('the report says three imported and two waiting, from the answer', await panel().getByRole('status')
+      .filter({ hasText: plural('references.waiting', 2) }).count() === 1);
+    const listed = await until((l) => fromFile.every((t) => l.materials.some((m) => m.title === t && m.lookup?.status !== 'running'))
+      && l.asks.filter((a) => a.kind === 'merge').length === 2, 'the imported papers looked up and the merges asked');
+    const by = Object.fromEntries(listed.materials.filter((m) => m.source === 'reference_file').map((m) => [m.title, m]));
+    // The Library looks again while a lookup runs or a question waits (every 1.5 s): it shows both once it has.
+    await asks().filter({ hasText: L('ask.merge.question') }).nth(1).waitFor();
+    await row(fromFile[0]).getByText(L('library.retracted'), { exact: true }).waitFor();
+    check('three papers with no file are saved from the file', listed.materials.length === before + 3
+      && fromFile.every((t) => by[t]?.version.media_type === null && by[t].evidence_type !== 'full_text' && by[t].state === 'ready'));
+    check('the Library says they have no full text', await panel().getByText(L('library.noFullText'), { exact: true }).count() === 3);
+    const english = by[fromFile[0]];
+    check('their own details are kept and completed by the lookup', english.csl.author?.[0]?.family === 'Example'
+      && english.source_key === 'openalex:W0000000001' && english.checked_by === null && by[fromFile[1]].source_key?.startsWith('doi:'));
+    check('the retracted one is flagged', english.retraction === 'retracted'
+      && await row(fromFile[0]).getByText(L('library.retracted'), { exact: true }).count() === 1);
+    check('nothing the file named was read or kept', !JSON.stringify(by).includes('/etc/'));
+    const merges = listed.asks.filter((a) => a.kind === 'merge');
+    check('each duplicate raises the merge question, showing both papers', merges.length === 2
+      && merges.every((a) => a.params.paper?.title && a.params.record?.title && a.options.join() === 'merge,keep_both' && !a.text_box)
+      && merges.some((a) => a.params.matched === 'doi') && merges.some((a) => a.params.matched === 'title')
+      && await asks().filter({ hasText: L('ask.merge.question') }).count() === 2);
+    await row(fromFile[0]).locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    check('Details says where its details came from', await row(fromFile[0]).getByText(P('library.source.completedFrom')).count() === 1
+      && await row(fromFile[0]).getByText(L('library.noFile'), { exact: true }).count() === 1);
+    await asks().first().scrollIntoViewIfNeeded();
+  });
+
+  await step('42-merge-and-keep-both', async () => {
+    const asked = (await listing(projectId)).asks.filter((a) => a.kind === 'merge');
+    await asks().filter({ hasText: L('ask.merge.matched.doi') }).getByRole('button', { name: L('ask.merge.option.merge'), exact: true }).click();
+    await page.waitForTimeout(800);
+    await asks().filter({ hasText: L('ask.merge.matched.title') }).getByRole('button', { name: L('ask.merge.option.keep_both'), exact: true }).click();
+    const listed = await until((l) => l.asks.length === 0 && l.materials.length === before + 4, 'both answers applied');
+    const merged = listed.materials.find((m) => m.title === duplicates.merge);
+    check('Merge filled the paper here from the record, keeping its own details', merged?.csl.abstract?.includes('reference file')
+      && merged.source === 'upload' && merged.evidence_type === 'full_text' && merged.checked_by === 'lookup');
+    const kept = listed.materials.filter((m) => m.title === duplicates.keep);  // the notes, the PDF they replaced, and now the record
+    check('Keep both made the record a paper of its own, not looked up', kept.length === 3
+      && kept.filter((m) => m.source === 'reference_file' && m.lookup === null && m.csl.abstract).length === 1);
+    const runs = (await get('/api/activity')).body.runs.filter((r) => asked.some((a) => a.run_id === r.run_id));
+    check('the merge runs succeeded with each answer', runs.length === 2 && runs.every((r) => r.status === 'succeeded')
+      && runs.map((r) => r.result.option).sort().join() === 'keep_both,merge');
+    const audited = (await get(`/api/audit?project_id=${projectId}`)).body.entries;
+    check('each answer is audited by its kind and option', ['merge', 'keep_both'].every((o) => audited.some((e) => e.event === 'ask_answered'
+      && e.data.question === 'merge' && e.data.answer === o)));
+    await openSettings('settings.page.advanced');
+    await dialog().getByRole('heading', { name: L('settings.backgroundRuns') }).scrollIntoViewIfNeeded(); await page.waitForTimeout(1500);
+    const listedRuns = dialog().getByRole('listitem').filter({ hasText: L('settings.workflowMerge') });
+    check('the background-run list names the merges', await listedRuns.count() === 2);
+    await listedRuns.first().scrollIntoViewIfNeeded();
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+
+  const local = C.lang === 'en' ? 'Interviews (synthetic, Local only)' : '访谈（合成数据，仅本机）';  // step 30's project
+  const localId = (await projects()).find((p) => p.name === local).id;
+  let sentBefore;
+  await step('43-local-only-import', async () => {
+    await toProject(local);
+    sentBefore = requests().filter((r) => r.path.includes('noteexpress')).length;
+    await page.getByTestId('library-reference-file').setInputFiles(join(C.materials, 'cnki-export.txt'));
+    await asks().filter({ hasText: L('ask.identifier_lookup.bodyReferenceFile') }).waitFor({ timeout: 20000 });
+    const [open] = (await listing(localId)).asks;
+    check('one question for the import, naming its services, its identifier and the reference file', open?.kind === 'identifier_lookup'
+      && open.params.identifiers === 1 && open.params.services.join() === 'crossref,openalex' && open.params.batch === 'reference_file');
+    check('the report says what was imported', await panel().getByText(plural('references.imported', 2), { exact: false }).count() === 1);
+    check('nothing was sent before the answer', requests().filter((r) => r.path.includes('noteexpress')).length === sentBefore);
+  });
+
+  await step('43b-local-only-answered', async () => {
+    await asks().getByRole('button', { name: L('ask.identifier_lookup.option.lookup'), exact: true }).click();
+    const listed = await until((l) => l.asks.length === 0 && l.materials.every((m) => m.lookup?.status !== 'running'),
+      'the Local only lookup done', localId);
+    const looked = listed.materials.find((m) => m.title === '虚构面板数据中的劳动力市场');
+    check('its record was completed after the answer', looked?.source_key === 'openalex:W0000000001' && looked.checked_by === null
+      && looked.csl.author?.[0]?.literal === '赵六');
+    check('the request went out only after the answer', requests().filter((r) => r.path.includes('noteexpress')).length > sentBefore);
+    const audited = (await get(`/api/audit?project_id=${localId}`)).body.entries;
+    check('the answer and the approved request are audited', audited.some((e) => e.event === 'ask_answered'
+      && e.data.question === 'identifier_lookup' && e.data.answer === 'lookup')
+      && audited.some((e) => e.event === 'outbound' && e.data.kind === 'scholarly_api' && e.data.approved === true));
+    await row('虚构面板数据中的劳动力市场').locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+  });
+
+  await step('44-attach-file', async () => {
+    await toProject(C.project);
+    const chapter = (await listing(projectId)).materials.find((m) => m.title === fromFile[2]);
+    await panel().getByRole('button', { name: fromFile[2], exact: true }).click(); await page.waitForTimeout(600);
+    check('its page offers Attach a file and says it has no full text',
+      await panel().getByRole('button', { name: L('paper.attach'), exact: true }).count() === 1
+      && await panel().getByText(L('library.noFullText'), { exact: true }).count() === 1);
+    await page.getByTestId('paper-replace').setInputFiles(join(C.materials, 'chapter-full-text.md'));
+    const listed = await until((l) => l.materials.some((m) => m.id === chapter.id && m.state === 'ready' && m.extraction?.passages > 0
+      && m.lookup?.status !== 'running'), 'the attached file read');
+    const read = listed.materials.find((m) => m.id === chapter.id);
+    const versions = (await get(`/api/materials/${chapter.id}/versions`)).body.versions;
+    check('the file is a new version, read to Ready as full text', read.evidence_type === 'full_text' && read.version.seq === 1
+      && versions.map((v) => `${v.seq}:${v.is_current}:${v.media_type}`).join() === '0:false:null,1:true:text/markdown');
+    check('its record\'s details stay', read.title === fromFile[2] && read.source === 'reference_file');
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).waitFor();
+    check('its page shows its text, and no longer says it has none', await panel().getByText(L('library.noFullText'), { exact: true }).count() === 0
+      && await panel().getByRole('button', { name: L('paper.replace'), exact: true }).count() === 1);
+    await panel().getByRole('heading', { name: L('paper.text'), exact: true }).scrollIntoViewIfNeeded();
+  });
+}
+
 // The parts of the window loaded when first opened (frontend/src/parts.js), on a window just loaded:
 // Escape while Settings loads closes it, and Settings opened from the keyboard lands focus in its
 // dialog; a part whose script is refused once by the browser says so where it would show, with Try
@@ -1715,6 +1869,7 @@ async function run(combo, build, outRoot) {
     await parts(ctx);  // on the materials flow's window and project, as it was written for
     if (C.materials) await s120(ctx);  // S1-20: OCR of a scanned page; it sets up its own project and panel
     if (C.materials) await ceilings(ctx);  // a reading stopped at its memory ceiling and at its time ceiling
+    if (C.materials) await references(ctx);  // S1-14: a reference file's import, its merges, a Local only import, Attach
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);
