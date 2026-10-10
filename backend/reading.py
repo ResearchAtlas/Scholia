@@ -34,18 +34,21 @@ never holds more than one frame and one read, and what it keeps never exceeds th
 bounds. Anything else ends the child. A result counts only after `done`, a zero exit and a peak at
 or under the ceiling.
 
-The child refuses, in an audit hook installed before it reads its request, to make any socket (so
-no connection, send or name lookup can happen, by address or by name), every name lookup and every
+The child refuses, in an audit hook installed before it reads its request, to make any socket (so no
+connection, send or name lookup can happen, by address or by name), every name lookup and every
 process start; it writes its frames to a copy of its stdout and points stdout and stderr at
 /dev/null, so nothing a library prints reaches the parent. It ends when the parent dies, however it
-dies and whatever the child is doing: it runs in a process group of its own beside a stopped
-sentinel (_sentinel), so the parent's death leaves the group orphaned and the kernel sends it
-SIGHUP, whose default action ends the child even in native code holding the GIL; and its stdin's
-end ends it too. The child starts only with its sentinel stopped, and the app's watch ends the child
-at its next quiet tick if the sentinel is lost while the child works (killed, or continued and so
-ended), as the app's death would then no longer end it. Its environment is HOME and TMPDIR only.
-It never imports the database, the server or the window. Logs carry codes, counts and MiB, never a
-path, a name, a hash or text.
+dies and whatever the child is doing, save in the two windows named below: it runs in a process
+group of its own beside a stopped sentinel (_sentinel), so the parent's death leaves the group
+orphaned and the kernel sends it SIGHUP, whose default action ends the child even in native code
+holding the GIL; and its stdin's end ends it too. The child starts only with its sentinel stopped,
+and the app's watch ends the child at its next tick if the sentinel is lost after ready (killed, or
+continued and so ended), as the app's death would then no longer end it. What stays open: a sentinel
+lost and the app's death within one tick of each other (longer while other threads of the app hold
+the GIL), and the app's death just as the sentinel stops, before the kernel shows the child its new
+parent, when the child ends only at its stdin's end (_orphaned), which needs the GIL. Its
+environment is HOME and TMPDIR only. It never imports the database, the server or the window. Logs
+carry codes, counts and MiB, never a path, a name, a hash or text.
 """
 
 import contextlib
@@ -122,8 +125,8 @@ def read(path, sha256, kind, stop=lambda: None, progress=lambda done, total: Non
     extraction.Extracted equal to extraction.extract's. Raises extraction.Unreadable (its codes,
     and memory_limit or step_limit), FileNotFoundError for a missing or changed file, ChildError,
     MemoryError when this process runs out of memory taking its result, or what stop() raised.
-    stats, a dict, gets the child's start (to ready), its peak footprint and its longest silence
-    between two frames."""
+    stats, a dict, gets the child's start (to ready), its peak footprint, its longest silence
+    between two frames and its pid."""
     received = _Reading(kind, progress)
     request = {"op": "read", "path": str(path), "sha256": sha256, "kind": kind}
     received.exit = _run(request, ceiling or READING_CEILING, MAX_FRAME, stop, received, stats)
@@ -157,7 +160,7 @@ class _BsdInfo(ctypes.Structure):  # struct proc_bsdinfo, <sys/proc_info.h>
                 ("start", ctypes.c_uint64 * 2)]
 
 
-_PROC_PIDTBSDINFO, _SSTOP = 3, 4  # <sys/proc_info.h>, <sys/proc.h>
+_PROC_PIDTBSDINFO, _INEXIT, _SSTOP = 3, 4, 4  # <sys/proc_info.h> (and PROC_FLAG_INEXIT), <sys/proc.h>
 _libproc = None
 
 
@@ -192,20 +195,44 @@ def _children(pid):
         size *= 4  # it may have had more: read again with room for them
 
 
+def _info(pid):
+    """A process's record (proc_pidinfo), or None: none once it is in its exit or a zombie."""
+    info = _BsdInfo()
+    size = ctypes.sizeof(info)
+    return info if _lib().proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) == size else None
+
+
 def _stopped_member(pid, kid):
     """Whether kid is a stopped child of the child pid, in its process group: its sentinel (_sentinel),
     which the app's death needs to bring the kernel's SIGHUP. One killed or continued (it then ends) is
-    not: a zombie's proc_pidinfo fails. Its pid stays the child's while it is a zombie (the child never
-    reaps it), and a pid taken by another process has another parent."""
-    info = _BsdInfo()
-    size = ctypes.sizeof(info)
-    return _lib().proc_pidinfo(kid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) == size \
-        and info.status == _SSTOP and info.ppid == pid and info.pgid == pid
+    not: a zombie has no record. Its pid stays the child's while it is a zombie (the child never reaps
+    it), and a pid taken by another process has another parent."""
+    info = _info(kid)
+    return info is not None and info.status == _SSTOP and info.ppid == pid and info.pgid == pid
 
 
 def _find_sentinel(pid):
     """The pid of the child's stopped sentinel, or None."""
     return next((kid for kid in _children(pid) if _stopped_member(pid, kid)), None)
+
+
+def _lost(pid, sentinel):
+    """Whether the child pid's sentinel is lost (killed, or continued and so ended) while the child goes
+    on: then the app's death would no longer end a child stalled with the GIL held, so the app ends it
+    while it is here to. The kernel lets the sentinel of a child that is itself ending go only once the
+    child is in its exit, which the child's record shows (it has none, or one marked exiting) before its
+    end can be waited for. A child with a record that is not exiting goes on; one with none is lost
+    unless its end can be waited for within 20 ms (the watch fails closed)."""
+    if sentinel is not None and _stopped_member(pid, sentinel):
+        return False
+    if (info := _info(pid)) is not None:
+        return not info.flags & _INEXIT
+    deadline = time.monotonic() + 0.02
+    while not _exited(pid):
+        if time.monotonic() > deadline:
+            return True
+        time.sleep(0.001)
+    return False
 
 
 def _exited(pid):
@@ -271,7 +298,7 @@ def _run(request, ceiling, limit, stop, received, stats):
                 raise ChildError("watch")
             if peak > ceiling:
                 raise _Ceiling(peak)
-            if ended:
+            if ended:  # its output has ended: it is ending, or stalled (in its finalization, say)
                 if _exited(child.pid):
                     break
                 time.sleep(WATCH_SECONDS)
@@ -299,17 +326,11 @@ def _run(request, ceiling, limit, stop, received, stats):
                         raise  # what a frame may say, a wrong frame found as one, or this process out of memory
                     # Any other failure on a value the child sent: a wrong frame, its type logged (never content).
                     raise _Bad(f"a frame its checks could not take ({type(error).__name__})") from None
-            elif received.ready:  # a quiet tick (nothing to read), from ready until the child has ended
+            if received.ready:  # every tick from ready until the child has exited, frames or none
                 sentinel = sentinel or _find_sentinel(child.pid)
-                if sentinel is None or not _stopped_member(child.pid, sentinel):
-                    # Its sentinel lost (killed, or continued and so ended): the app's death would no longer end
-                    # a child stalled with the GIL held, so it ends now, while the app is here to end it. A child
-                    # that is itself ending lets its sentinel go some 150 us before its end can be seen, so its
-                    # end is looked for once more first: its output's end, or its exit.
-                    time.sleep(0.002)
-                    if not selector.select(0) and not _exited(child.pid):
-                        log.error("a reading's child lost its sentinel; it was stopped")
-                        raise ChildError("sentinel")
+                if _lost(child.pid, sentinel):
+                    log.error("a reading's child lost its sentinel; it was stopped")
+                    raise ChildError("sentinel")
             if time.monotonic() - last > STEP_SECONDS:
                 log.warning("a reading's child sent nothing for %d s; it was stopped", STEP_SECONDS)
                 raise extraction.Unreadable("step_limit")

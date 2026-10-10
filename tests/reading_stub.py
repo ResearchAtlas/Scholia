@@ -19,11 +19,15 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
                       it says so by a file DIR/sentinel, and every signal the child sends is listed in DIR/kills
     gil-stall DIR S   say it holds by a file DIR/held-<pid>, then stall S seconds in native code holding
                       the GIL (libc's sleep through ctypes.PyDLL), as a parser stuck in C would
+    chatter DIR       say it holds by a file DIR/held-<pid>, then send a beat every 2 ms for 60 s, so that
+                      the parent has a frame to read at every tick
     frame NAME        send a frame that is not one (FRAMES), then read for real
     after-done NAME   read for real, then after `done`: send a frame (beat) or exit non-zero (exit)
     done NAME         read for real, its `done` changed as NAME says (see Out.send)
     done-then-stall DIR  read for real, then once `done` is sent say so by a file DIR/held-<pid> and stall
                       60 s in native code holding the GIL
+    finalize-stall DIR   read for real, then in its finalization (an atexit handler, its output closed)
+                      say so by a file DIR/held-<pid> and stall 60 s in native code holding the GIL
     png NAME          a page image whose PNG header says NAME: huge (past the page bounds), a pixel past
                       or two pixels past (MAX_PAGE_SIDE)
     version           name another extractor version in `ready`
@@ -179,6 +183,11 @@ def before(what, stop, progress, data=b""):
 
         Path(ARGS[0], f"held-{os.getpid()}").write_text(str(what))
         ctypes.PyDLL(None).sleep(int(ARGS[1]))  # PyDLL: the GIL is held through the call
+    elif MODE == "chatter":
+        Path(ARGS[0], f"held-{os.getpid()}").write_text(str(what))
+        for _ in range(30000):
+            out.send("beat", 1)
+            time.sleep(0.002)
     elif MODE == "frame":
         if ARGS[0] == "oversized":
             out.stream.write(struct.pack(">I", 0xFFFFFFFF))
@@ -268,9 +277,20 @@ if MODE == "sentinel-dies":
 
     os.kill = kill
 
+if MODE == "finalize-stall":
+    import atexit
+    import ctypes
+
+    def stall():
+        out.stream.close()  # as the real child's is once main returns (only this stub keeps it)
+        Path(ARGS[0], f"held-{os.getpid()}").write_text("finalizing")
+        ctypes.PyDLL(None).sleep(60)
+
+    atexit.register(stall)
+
 if MODE == "beat":  # the real child, its reports while it works closer together; nothing else changed
     reading.BEAT_SECONDS = float(ARGS[0])
-else:
+elif MODE != "finalize-stall":
     extraction.extract, extraction.render_page, extraction.extractor_of = extract, render_page, extractor_of
 if MODE == "walkthrough" and (engine := ocr.engine()) is not None:
     failing = FailsOnce(engine)

@@ -8,6 +8,7 @@ child too (cancellation, deletion, the 30-minute limit, a restart, two readings 
 import ast
 import asyncio
 import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -437,14 +438,17 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["gil-stall", "chatter"])
 @pytest.mark.parametrize("loss", [signal.SIGKILL, signal.SIGCONT])
 async def test_a_child_whose_sentinel_is_lost_while_it_holds_the_gil_is_ended_while_the_app_lives(
-        tmp_path, reading_stub, loss):
-    """Its sentinel killed, or continued (it then ends), while the child stalls holding the GIL: the app's
-    watch ends the child's group at its next quiet tick, as the app's death no longer would."""
-    reading_stub("gil-stall", tmp_path, 60)
+        tmp_path, reading_stub, loss, mode):
+    """Its sentinel killed, or continued (it then ends), while the child stalls holding the GIL, or while
+    it sends a frame every tick: the app's watch ends the child's group at its next tick, as the app's
+    death no longer would."""
+    reading_stub(mode, tmp_path, *(["60"] if mode == "gil-stall" else []))
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
+    child = None
     try:
         assert await asyncio.to_thread(Held(tmp_path).wait, 10)
         [child] = Held(tmp_path).held()
@@ -457,8 +461,9 @@ async def test_a_child_whose_sentinel_is_lost_while_it_holds_the_gil_is_ended_wh
         assert time.monotonic() - lost < 0.5
         await ended_with_its_group(child, 0.5)
     finally:
-        if not pending.done():
-            pending.cancel()
+        if child is not None:  # a failed run leaves no child for the step limit to end
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(child, signal.SIGKILL)
 
 
 @pytest.mark.asyncio
@@ -658,20 +663,24 @@ async def test_a_childs_sentinel_goes_with_it(tmp_path, reading_stub, ended):
             raise RuntimeError("stopped")
 
     kind = extraction.PDF if ended == "an unreadable file" else extraction.MARKDOWN
-    try:
+    if ended == "read to its end":
         await asyncio.to_thread(reading.read, path, sha256, kind, stop, stats=stats)
-    except (RuntimeError, extraction.Unreadable):
-        assert ended != "read to its end"
+    else:
+        with pytest.raises((RuntimeError, extraction.Unreadable)):
+            await asyncio.to_thread(reading.read, path, sha256, kind, stop, stats=stats)
     await ended_with_its_group(stats["pid"])
     assert gone(stats["pid"])
 
 
 @pytest.mark.asyncio
-async def test_the_watch_holds_after_the_result_until_the_child_has_ended(tmp_path, reading_stub):
-    """A child that has sent its result and then stalls holding the GIL, its sentinel lost: ended."""
-    reading_stub("done-then-stall", tmp_path)
+@pytest.mark.parametrize("mode", ["done-then-stall", "finalize-stall"])
+async def test_the_watch_holds_after_the_result_until_the_child_has_ended(tmp_path, reading_stub, mode):
+    """A child that has sent its result and then stalls holding the GIL (still talking, or in its
+    finalization with its output closed), its sentinel lost: ended."""
+    reading_stub(mode, tmp_path)
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
+    child = None
     try:
         assert await asyncio.to_thread(Held(tmp_path).wait, 10)
         [child] = Held(tmp_path).held()
@@ -682,8 +691,72 @@ async def test_the_watch_holds_after_the_result_until_the_child_has_ended(tmp_pa
             await asyncio.wait_for(pending, 5)
         await ended_with_its_group(child, 0.5)
     finally:
-        if not pending.done():
-            pending.cancel()
+        if child is not None:  # a failed run leaves no stalled child for the step limit to end
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(child, signal.SIGKILL)
+
+
+def record(status=reading._SSTOP, ppid=1, pgid=1, flags=0):
+    info = reading._BsdInfo()
+    info.status, info.ppid, info.pgid, info.flags = status, ppid, pgid, flags
+    return info
+
+
+def test_a_sentinel_is_its_childs_stopped_child_in_its_group(monkeypatch):
+    """A stopped process whose parent is the child and whose group is the child's; a pid taken by another
+    process (another parent, or another group), one continued, and one with no record (a zombie) is not."""
+    records = {}
+    monkeypatch.setattr(reading, "_info", records.get)
+    records[2] = record()
+    assert reading._stopped_member(1, 2)
+    for changed in (record(ppid=9), record(pgid=9), record(status=2), None):  # 2: SRUN
+        records[2] = changed
+        assert not reading._stopped_member(1, 2)
+
+
+def test_a_sentinel_is_lost_only_while_its_child_goes_on(monkeypatch):
+    """A sentinel no longer stopped beside its child is lost while the child's record shows it going on;
+    an ending child has a record marked exiting or none (its sentinel goes only then), and one with none
+    is lost unless its end can be waited for within 20 ms."""
+    records, exited = {1: record(ppid=0, pgid=1), 2: record()}, [False]
+    monkeypatch.setattr(reading, "_info", records.get)
+    monkeypatch.setattr(reading, "_exited", lambda pid: exited[0])
+    assert not reading._lost(1, 2)  # still stopped beside it
+    records[2] = record(status=2)  # continued
+    assert reading._lost(1, 2)  # and the child going on: lost
+    assert reading._lost(1, None)  # none found after ready: lost
+    records[1] = record(ppid=0, pgid=1, flags=reading._INEXIT)
+    assert not reading._lost(1, 2)  # the child in its exit
+    del records[1]
+    started = time.monotonic()
+    assert reading._lost(1, 2)  # no record, and no end to wait for: lost (fails closed)
+    assert 0.02 <= time.monotonic() - started < 1
+    exited[0] = True
+    assert not reading._lost(1, 2)  # no record, and it has exited
+
+
+def test_a_childs_children_are_all_listed(monkeypatch):
+    """However many there are: libproc fills what room it is given and says how many it filled."""
+    for count in (0, 1, 63, 64, 65, 300):
+        def listed(pid, buffer, size, count=count):
+            filled = min(count, size // ctypes.sizeof(ctypes.c_int))
+            ctypes.memmove(buffer, (ctypes.c_int * filled)(*range(100, 100 + filled)), filled * 4)
+            return filled
+
+        monkeypatch.setattr(reading, "_lib", lambda listed=listed: type("Lib", (), {"proc_listchildpids": listed}))
+        assert reading._children(1) == list(range(100, 100 + count))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", range(8))
+async def test_a_child_ending_at_any_point_of_a_tick_is_not_taken_for_a_lost_sentinel(tmp_path, reading_stub, count):
+    """The kernel lets an ending child's sentinel go while the child's end cannot yet be waited for: an
+    unreadable file, never ChildError (the child exits 1 some 0 to 10 ms into a tick)."""
+    reading_stub("quiet-exit", 0.05 + count * 0.00125)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    with pytest.raises(extraction.Unreadable, match="unreadable_file"):
+        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
+    assert gone()
 
 
 @pytest.mark.asyncio
@@ -715,6 +788,18 @@ async def test_a_child_whose_sigchld_is_ignored_before_its_main_starts_with_its_
     with allow_command(*command):
         read = await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
     assert read == extraction.extract(MARKDOWN[1], extraction.MARKDOWN) and gone()
+
+
+def test_a_childs_lost_sentinel_stays_its_zombie_though_sigchld_was_ignored():
+    """With SIGCHLD ignored before the sentinel is made, macOS would reap it unasked once it ends, freeing
+    its pid for another process: the child resets SIGCHLD, so a sentinel killed stays its zombie."""
+    command = [sys.executable, "-c", "import os, signal, sys, time; sys.path.insert(0, sys.argv[1]); "
+               "signal.signal(signal.SIGCHLD, signal.SIG_IGN); from backend import reading; "
+               "sentinel = reading._sentinel(); os.kill(sentinel, signal.SIGKILL); time.sleep(0.2); "
+               "sys.exit(0 if os.waitid(os.P_PID, sentinel, os.WEXITED | os.WNOHANG | os.WNOWAIT) else 3)",
+               str(ROOT)]
+    with allow_command(*command):
+        assert subprocess.run(command, stdin=subprocess.DEVNULL, timeout=30, process_group=0).returncode == 0
 
 
 @pytest.mark.asyncio
