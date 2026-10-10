@@ -94,7 +94,7 @@ async def test_dense_latex_passing_the_ceiling_while_it_is_parsed_is_killed_ther
     with pytest.raises(extraction.Unreadable) as unreadable:
         await asyncio.to_thread(reading.read, path, sha256, extraction.LATEX, ceiling=64 * 2**20, stats=stats)
     assert unreadable.value.code == "memory_limit" and gone()
-    assert 64 < stats["peak_mib"] < 64 + 300  # stopped near the ceiling, not at the parse's own peak
+    assert 64 <= stats["peak_mib"] < 64 + 300  # stopped near the ceiling (rounded to 0.1 MiB), not at the parse's peak
 
 
 @pytest.mark.asyncio
