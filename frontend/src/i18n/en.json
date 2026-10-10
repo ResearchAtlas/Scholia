@@ -445,6 +445,7 @@
   "errors.reference_file_too_large": "That reference file is larger than Scholia reads (10 MB).",
   "errors.too_many_records": "That reference file holds more than 10,000 records. Export it in parts and import each one.",
   "errors.no_records": "That reference file holds no records.",
+  "errors.readings_busy": "Scholia is reading other files. Import this reference file again once they are read.",
   "runs.started": "Started {date}",
   "runs.retry": "Try again",
   "runs.progressLabel": "Progress",

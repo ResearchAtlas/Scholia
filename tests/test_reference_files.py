@@ -296,3 +296,11 @@ def test_a_name_cut_to_its_bound_is_still_a_visible_name_or_none():
     for name in ("​" * 300 + "Visible", "​" * 199 + "AB", "Fam" + "​" * 300 + ", Given"):
         [record], _, _ = parse(f"TY  - JOUR\nTI  - T\nAU  - {name}\nAU  - Kept, Name\nER  - \n")
         assert rf.valid(record) and {"family": "Kept", "given": "Name"} in record["author"]
+
+
+def test_a_noteexpress_tag_is_on_its_own_line():  # as the reader takes it, so the count and the read agree
+    broken = "{Reference Type}\n: Book\n{Title}: T\n"
+    assert rf.detect("Exported\n" + broken) is None
+    assert unreadable("Exported\n" + broken * 3) == "unsupported_reference_file"
+    one = "{Reference Type}: Book\n{Title}: T\n"
+    assert len(parse(one + broken * (rf.MAX_RECORDS + 1))[0]) == 1  # one record, counted as one

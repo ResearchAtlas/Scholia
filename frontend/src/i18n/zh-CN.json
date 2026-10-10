@@ -433,6 +433,7 @@
   "errors.reference_file_too_large": "该参考文献文件超过了 Scholia 可读取的大小（10 MB）。",
   "errors.too_many_records": "该参考文献文件包含超过 10,000 条记录。请分批导出后逐个导入。",
   "errors.no_records": "该参考文献文件不含任何记录。",
+  "errors.readings_busy": "Scholia 正在读取其他文件。请在它们读取完成后再导入这个参考文献文件。",
   "runs.started": "开始于 {date}",
   "runs.retry": "重试",
   "runs.progressLabel": "进度",

@@ -43,7 +43,7 @@ KEYWORDS = 50
 KEYWORD_CHARS = 200
 CONTINUATION_LINES = 200  # a field's lines after its first; later ones are left out
 CONTINUATION_CHARS = 2 * ABSTRACT_CHARS  # and their characters
-RECORD_LINES = 1000  # a record's tagged lines (its fields, one an author); later ones are left out
+RECORD_LINES = 1000  # a record's lines, a field (one an author) and its continuations; later fields are left out
 BEAT_EVERY = 500  # records or lines between two beats
 PARSER = ("references", "1")  # what the child names when it is ready (backend/reading.py)
 FORMATS = ("ris", "bibtex", "csl_json", "noteexpress", "endnote")
@@ -122,7 +122,7 @@ def _decode(data):
 
 def detect(text):
     """The format a file's text is in, by its content, or None."""
-    if re.search(r"^\{Reference Type\}\s*:", text, re.MULTILINE):  # before JSON, whose objects start so too
+    if re.search(r"^\{Reference Type\}[ \t]*:", text, re.MULTILINE):  # before JSON, whose objects start so too
         return "noteexpress"
     if text.lstrip()[:1] in ("[", "{"):
         return "csl_json"
@@ -155,8 +155,8 @@ def _lines(text, beat):
 
 def _records(lines, starts, tagged, ends=lambda line: False):
     """Each record's lines, one record at a time: from a line starts() says begins one to the next such
-    line, or to a line ends() says closes it. A record keeps at most RECORD_LINES of the lines tagged()
-    takes (its fields), and each field at most CONTINUATION_LINES lines after its first, of
+    line, or to a line ends() says closes it. A record takes a line tagged() takes (a field) only while
+    it holds fewer than RECORD_LINES lines, and each field at most CONTINUATION_LINES lines after its first, of
     CONTINUATION_CHARS characters together; a field left out takes its lines with it. Lines outside
     a record are left out."""
     record, after, chars = None, 0, 0
@@ -386,7 +386,7 @@ def _endnote(text, beat):
 
 
 def _noteexpress(text, beat):
-    for fields in _tagged(text, "Reference Type", r"^\{([^{}\n]{1,40})\}\s*:\s?(.*)$", beat):
+    for fields in _tagged(text, "Reference Type", r"^\{([^{}\n]{1,40})\}[ \t]*:[ \t]?(.*)$", beat):
         one = {}
         for tag, value in fields:
             if tag == "Author":  # one a line, or several on one line, separated as CNKI's exports do

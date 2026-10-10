@@ -764,3 +764,34 @@ async def test_a_reference_file_is_read_in_one_of_the_readings_turns(tmp_path):
         assert (await importing).status_code == 201
         for _ in held[1:]:
             turns.release()
+
+
+async def test_an_import_waits_a_bounded_time_for_a_readings_turn_and_is_refused_after(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "TURN_SECONDS", 0.3)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        turns = client.state["harness"].readings
+        for _ in range(materials_module.READINGS):
+            await turns.acquire()
+        response = await post(client, project, synthetic.references_ris())
+        assert (response.status_code, response.json()["code"]) == (409, "readings_busy")
+        assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
+        for _ in range(materials_module.READINGS):
+            turns.release()
+        assert (await post(client, project, synthetic.references_ris())).status_code == 201
+
+
+async def test_a_second_doi_change_keeps_a_field_a_merged_record_gave(tmp_path):
+    other = "10.5555/the.second.doi"
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "First Work")})) as client:
+        project = await project_of(client)
+        result = await imported(client, project, ris(("Twice Moved", f"DO  - {DOI}\n")))
+        await run_finished(client, result["lookup_run_id"])
+        [paper] = result["imported"]
+        assert (await client.patch(f"/api/materials/{paper}", json={"doi": other})).json()["csl"].get("volume") is None
+        await imported(client, project, ris(("Twice Moved", f"DO  - {other}\nVL  - 9\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        moved = await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/the.third.doi"})
+        assert moved.json()["csl"]["volume"] == "9"  # the record's, not the first DOI's lookup's

@@ -28,7 +28,7 @@ test('Add offers files and a reference file, the chooser taking the reference fo
 test('a reference file larger than the backend reads is refused before anything is sent', async () => {
   await assert.rejects(importReferences('p', { size: MAX_REFERENCE_BYTES + 1, name: 'big.ris' }),
     (error) => error.code === 'reference_file_too_large');
-  for (const code of ['reference_file_too_large', 'unsupported_reference_file', 'too_many_records', 'no_records',
+  for (const code of ['reference_file_too_large', 'unsupported_reference_file', 'too_many_records', 'no_records', 'readings_busy',
     'unreadable_file', 'memory_limit', 'step_limit']) {
     assert.ok(`errors.${code}` in en && `errors.${code}` in zh, code);
   }

@@ -55,6 +55,9 @@ OPTIONS = ("merge", "keep_both")
 # ponytail: one small read for each waiting merge each time; a notice from the protection change if
 # imports leave thousands waiting at once.
 POLICY_SECONDS = 10.0
+# An import waits this long at most for one of the readings' turns (backend/materials.py READINGS), so the
+# children's memory budget holds; past it, it is refused (readings_busy) rather than left hanging.
+TURN_SECONDS = 30.0
 _STATUS = {"too_many_records": 413, "reference_file_too_large": 413, "memory_limit": 409, "step_limit": 409}
 _MESSAGES = {"unsupported_reference_file": "Scholia reads RIS, BibTeX, CSL JSON, NoteExpress and EndNote tagged files",
              "unreadable_file": "The reference file could not be read", "no_records": "The file holds no records",
@@ -100,9 +103,13 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
 
     async def parse():
         # One of the readings' turns (materials.READINGS), so the children's memory stays within the
-        # budget backend/reading.py sets out.
-        async with harness.readings:
+        # budget backend/reading.py sets out, waited for TURN_SECONDS at most.
+        async with asyncio.timeout(TURN_SECONDS):
+            await harness.readings.acquire()
+        try:
             return await asyncio.to_thread(reading.references, data, stop)
+        finally:
+            harness.readings.release()
 
     try:
         # Held by the harness as its detached work, so a shutdown waits for its child to end and be
@@ -110,6 +117,8 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
         records, skipped, kind = await _to_end(harness._detach(parse()))
     except _Stop:
         raise _refused(503, "shutting_down", "The app is closing") from None
+    except TimeoutError:  # every reading turn stayed taken: nothing was read or written
+        raise _refused(409, "readings_busy", "Scholia is reading other files; import this one once they are read") from None
     except extraction.Unreadable as unreadable:
         code = unreadable.code if unreadable.code in _MESSAGES else "unreadable_file"
         raise _refused(_STATUS.get(code, 400), code, _MESSAGES[code]) from None
