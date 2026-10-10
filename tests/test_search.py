@@ -1513,6 +1513,7 @@ async def test_an_index_run_a_lookup_records_starts_though_the_lookup_is_cancell
         await run_finished(client, result["lookup_run_id"])
         assert fired and await rows(client, "SELECT 1 FROM materials WHERE title = 'Wage Floors, as Published'")
         await idle(client, project)
+        assert {r["status"] for r in await runs_of(client, "index", project)} == {"succeeded"}  # the one recorded ran
         registry = client.state["harness"].registry
         assert [r for r in registry.runs.values() if r.kind == "background" and r.task is None] == []
         [later] = (await added(client, project, paper("Later Paper", "A paragraph after the Cancel.")))["materials"]
@@ -1636,20 +1637,23 @@ async def test_a_retrys_pending_id_that_loses_to_another_ends_superseded_as_a_re
 
 
 async def test_two_retries_at_once_of_a_run_with_a_rebuild_pending_both_get_that_rebuild(tmp_path, monkeypatch):
-    """P3: a second Retry pressed while the first holds the pending run's id (its write under way) is answered
-    with that run, not refused as if the app were closing."""
+    """P3, and the recheck of b89a308: a second Retry pressed while the first holds the pending run's id, its
+    write not yet begun, is answered with that run: never refused as if the app were closing, and never
+    recorded first under another id (which would leave the pending id, the one the interface follows,
+    without a run)."""
     import threading
-    import backend.search as search
+    from backend.db import Database
+    real, armed, entered, go = Database.write, [True], threading.Event(), threading.Event()
+
+    def write(self, fn):
+        if armed and "record_background" in fn.__qualname__:  # the first Retry's write waits to begin
+            armed.clear()
+            entered.set()
+            go.wait(10)
+        return real(self, fn)
     async with app(tmp_path, batch=1) as client:
         project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
-        real, entered, go = search.request_run, threading.Event(), threading.Event()
-
-        def held(*args, **kwargs):  # the first Retry's write waits in the writer, the pending id held
-            if not entered.is_set():
-                entered.set()
-                go.wait(10)
-            return real(*args, **kwargs)
-        monkeypatch.setattr(search, "request_run", held)
+        monkeypatch.setattr(Database, "write", write)
         first = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
         assert await asyncio.to_thread(entered.wait, 10)
         second = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
@@ -1658,3 +1662,37 @@ async def test_two_retries_at_once_of_a_run_with_a_rebuild_pending_both_get_that
         answers = [await first, await second]
         assert [(a.status_code, a.json()["run_id"]) for a in answers] == [(201, pending)] * 2
         assert (await run_finished(client, pending))["status"] == "succeeded"
+
+
+async def test_a_run_a_retry_marked_that_ends_before_the_retry_resumes_holds_and_starts_the_pending_run(
+        tmp_path, monkeypatch):
+    """Recheck of b89a308, finding 1: the project's running run the Retry marked may end between the
+    Retry's commit and its coroutine's resuming; the pending id is released inside the Retry's write, so
+    that run's end holds, records and starts it, never recording it unheld (read as interrupted)."""
+    import threading
+    from backend.db import Database
+    real, armed, committed, go = Database.write, [], threading.Event(), threading.Event()
+
+    def write(self, fn):
+        result = real(self, fn)
+        if armed and "record_background" in fn.__qualname__:  # the Retry resumes only once go is set
+            armed.clear()
+            committed.set()
+            go.wait(10)
+        return result
+    async with app(tmp_path, batch=1) as client:
+        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        later = await _a_later_run_waiting(client, project, run)
+        monkeypatch.setattr(Database, "write", write)
+        armed.append(True)
+        retry = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
+        assert await asyncio.to_thread(committed.wait, 10)
+        client.remote.hold.set()
+        deadline = asyncio.get_running_loop().time() + 10
+        while await _status_of(client, later) == "running":  # it ends, recording the pending run
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        go.set()
+        assert (await retry).json()["run_id"] == pending
+        ended = await run_finished(client, pending)
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)

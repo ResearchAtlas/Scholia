@@ -1283,7 +1283,7 @@ async def retry_run(run_id: str, request: Request):
     def again(conn, ids):
         row = conn.execute("SELECT json_extract(inputs, '$.retried_by') FROM runs WHERE id = ?", (run_id,)).fetchone()
         if row is not None and row[0] is not None:
-            return row[0], started(conn, ids[0])
+            return row[0], []
         registry = state["harness"].registry
         retry, refusal = _retry(conn, run_id, registry)
         if refusal is not None:
@@ -1311,10 +1311,9 @@ async def retry_run(run_id: str, request: Request):
         return retried, started(conn, ids[0])
 
     def started(conn, held):
-        # The id held here starts only if its run is running in the record as this commits: recorded here,
-        # or (S1-17) recorded by the run it was pending after, whose end found it held here (so recorded it
-        # unheld). One that only marks the project's running run to run once more is released, and is held
-        # when that run ends.
+        # The id held here starts only if its run was recorded here. One that only marks the project's
+        # running run to run once more (S1-17) is released, inside this transaction, and is held when that
+        # run ends.
         return [held] if _running(conn, held) else []
 
     def left_pending(conn):  # S1-17: the id of the run an index run left pending, when none has it yet
@@ -1322,12 +1321,8 @@ async def retry_run(run_id: str, request: Request):
                            " AND json_extract(inputs, '$.retried_by') IS NULL", (run_id,)).fetchone()
         unused = row and row[0] and conn.execute("SELECT 1 FROM runs WHERE id = ?", (row[0],)).fetchone() is None
         return [row[0]] if unused else []
-    pending = await asyncio.to_thread(state["db"].read, left_pending)
-    harness = state["harness"]
-    try:
-        return {"run_id": await harness.record_background(1, again, ids=pending)}
-    except AdmissionError:
-        if not pending or harness.registry.closed:
-            raise
-    pending = []  # its id is held already (its run recorded and started meanwhile): retried as it reads now
-    return {"run_id": await harness.record_background(1, again)}
+    # One Retry at a time: a second press reads what the first wrote (its run), never the pending id the first
+    # holds (S1-17), whichever write would reach the database first.
+    async with state.setdefault("retry_lock", asyncio.Lock()):
+        pending = await asyncio.to_thread(state["db"].read, left_pending)
+        return {"run_id": await state["harness"].record_background(1, again, ids=pending)}

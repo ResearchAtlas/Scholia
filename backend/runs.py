@@ -185,10 +185,11 @@ class Registry:
             return True
 
     def release(self, active: ActiveRun) -> None:
-        if self.runs.get(active.run_id) is active:
-            del self.runs[active.run_id]
-        if active.conversation_id is not None and self.turns.get(active.conversation_id) is active:
-            del self.turns[active.conversation_id]
+        with self.lock:  # from a write transaction's thread too (record_background)
+            if self.runs.get(active.run_id) is active:
+                del self.runs[active.run_id]
+            if active.conversation_id is not None and self.turns.get(active.conversation_id) is active:
+                del self.turns[active.conversation_id]
 
     def is_active(self, run_id: str) -> bool:
         return run_id in self.runs
@@ -1048,16 +1049,24 @@ class Harness:
         returns (result, the ids it
         used). Each id is held in the registry before the transaction commits, and the runs recorded
         start as soon as it has, so no read ever finds one running in the record and not held here
-        (which reads as interrupted). Returns the result; a cancellation of the caller waits for the
-        transaction (see _through), starts the runs, and is raised after."""
+        (which reads as interrupted). The ids it did not use are released inside the transaction, so no
+        later one finds them held (record_in, recording a run under an id chosen before). Returns the
+        result; a cancellation of the caller waits for the transaction (see _through), starts the runs,
+        and is raised after."""
         actives = [self.registry.add_background(run_id) for run_id in [*ids, *(new_id() for _ in range(count - len(ids)))]]
         if None in actives:
             for active in actives:
                 if active is not None:
                     self.registry.release(active)
             raise AdmissionError(503, "shutting_down", "The app is closing")
+        def releasing(conn):
+            result, used = write(conn, [a.run_id for a in actives])
+            for active in actives:
+                if active.run_id not in used:
+                    self.registry.release(active)
+            return result, used
         try:
-            (result, used), cancelled = await _through(self._write(lambda conn: write(conn, [a.run_id for a in actives])))
+            (result, used), cancelled = await _through(self._write(releasing))
         except BaseException:
             for active in actives:
                 self.registry.release(active)
@@ -1065,8 +1074,6 @@ class Harness:
         for active in actives:
             if active.run_id in used:
                 active.task = asyncio.create_task(self._background(active))
-            else:
-                self.registry.release(active)
         if cancelled:
             raise asyncio.CancelledError()
         return result
