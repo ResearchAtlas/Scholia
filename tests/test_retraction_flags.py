@@ -79,3 +79,17 @@ async def test_a_later_answer_whose_retraction_cannot_be_read_leaves_the_flag_as
 async def test_a_crossref_record_with_no_updates_is_not_retracted():
     record = crossref_work("10.5555/x", "Standing")
     assert "updated-by" not in record and lookup._crossref("10.5555/x", json.dumps({"message": record}).encode()).retracted is False
+
+
+async def test_a_reference_files_record_whose_doi_is_retracted_is_flagged(tmp_path):
+    # S1-14: a fixture reference with a known retraction, imported from a reference file.
+    from test_reference_import import imported, ris
+    doi = "10.5555/reference.retracted"
+    mock = MockScholarly(openalex={doi: openalex_work(doi, "Retracted Work", retracted=True)})
+    async with started(tmp_path / "data", MockProvider(scholarly=mock)) as client:
+        project = await project_of(client)
+        await imported(client, project, ris(("A Retracted Reference", f"DO  - {doi}\n"), ("Standing", "PY  - 2020\n")))
+        found = {p["title"]: p for p in await settled(client, project)}
+        flagged = found["A Retracted Reference"]
+        assert (flagged["retraction"], bool(flagged["retraction_checked_at"])) == ("retracted", True)
+        assert found["Standing"]["retraction"] == "unknown"  # no identifier: never looked up

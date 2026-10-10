@@ -67,6 +67,7 @@ from backend.outbound_gate import OutboundDenied
 from backend.runs import (AdmissionError, RunOutcome, _event, _revoked, _running, _through, derived_status,
                           may_dispatch)
 from backend.settings import visible
+from backend import reference_files  # S1-14: a reference file's paper is identified by its record
 
 log = logging.getLogger(__name__)
 
@@ -188,7 +189,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
                                         " content_files c ON c.sha256 = v.file_sha256 WHERE v.material_id = ?"
                                         " AND v.is_current = 1", (material,)).fetchone()
                 conn.execute("UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material,))
-                conn.execute("UPDATE materials SET updated_at = ? WHERE id = ?", (utc_now(), material))
+                conn.execute("UPDATE materials SET evidence_type = 'full_text', updated_at = ? WHERE id = ?",
+                             (utc_now(), material))  # a file read from now on: a reference file's paper has its text
             else:
                 same = conn.execute(
                     "SELECT m.id FROM materials m JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
@@ -639,18 +641,23 @@ async def _write_if_running(write, run_id, fn):
 
 def _identifiers(conn, project_id, materials, versions):
     """{material id: (version id, (scheme, identifier) or None, whether the version has a committed
-    reading)}: the first DOI the version's own text gives, else the first arXiv ID. The version is the one the lookup was made for (versions), or the
+    reading)}: the first DOI the version's own text gives, else the first arXiv ID; a reference file's
+    paper's from its record (reference_files.identifier), read or not. The version is the one the lookup was made for (versions), or the
     current one for a lookup that names none; materials gone since are left out. A result is about
     that version, and is sent and applied only while it is still the material's current file."""
     found = {}
     for material in materials:
-        row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE} FROM materials m JOIN material_versions v"
-                           " ON v.material_id = m.id AND (v.id = ?3 OR (?3 IS NULL AND v.is_current = 1))"
+        row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE}, m.source, m.csl FROM materials m"
+                           " JOIN material_versions v ON v.material_id = m.id AND (v.id = ?3 OR (?3 IS NULL AND v.is_current = 1))"
                            " LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE m.id = ?1 AND m.project_id = ?2",
                            (material, project_id, versions.get(material))).fetchone()
         if row is None:
             continue
-        extracted = _extraction(conn, *row[1:])
+        # A reference file's paper is identified by its record (S1-14), whatever file it has since.
+        if row[3] == "reference_file" and (given := reference_files.identifier(json.loads(row[4] or "{}"))):
+            found[material] = (row[0], given, True)
+            continue
+        extracted = _extraction(conn, *row[1:3])
         # Read in order only as far as identifiers() looks (its first pages or characters), however
         # many passages that takes: the cursor is read lazily, and identifiers() stops at its window.
         passages = (extraction.Passage(kind, text, page) for kind, text, page in conn.execute(
@@ -689,7 +696,9 @@ async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
             if ask is not None:
                 asks.withdraw(conn, run_id, ask["ask_id"], "identifiers_changed")
             return asks.raise_ask(conn, run_id, "identifier_lookup", ["lookup", "skip"],
-                                  {"services": services, "identifiers": len(distinct)}, inputs.get("origin"), covers)
+                                  {"services": services, "identifiers": len(distinct),  # where its papers came from:
+                                   **({"batch": inputs["batch"]} if inputs.get("batch") else {})},  # S1-14's
+                                  inputs.get("origin"), covers)
         try:
             ask_id = await write(ask_again)
         except asks.AskRefused:  # revoked or ended meanwhile
@@ -731,8 +740,9 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
         if row is None:
             continue
         mine, result = (found, outcome) if row[1] else (None, "replaced")
+        imported = mine is not None and _fill_imported(conn, material, mine)  # S1-14: its record stays
         if mine is not None:
-            if row[0] != "researcher":  # what the researcher edited stays
+            if row[0] != "researcher" and not imported:  # what the researcher edited stays
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
                              (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
@@ -746,6 +756,26 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
                              ("retracted" if mine.retracted else "none", now, material))
         _event(conn, run_id, "step_finished", {"material_id": material, "identifier": f"{scheme}:{value}",
                                                "source": mine.source if mine else None, "outcome": result})
+
+
+def _fill_imported(conn, material, found):
+    """A lookup's record for a reference file's paper (S1-14): the paper keeps its record's fields and
+    takes the lookup's only where it lacks them (references.fills, so an edited paper's form fields
+    stay as saved), and records where it resolved (source_key, resolved_at); checked_by stays unset,
+    as nobody checked its record. The retraction check is _apply's. False, writing nothing, for
+    another paper."""
+    from backend import references  # it builds on this module
+
+    row = conn.execute("SELECT source, csl, checked_by, title FROM materials WHERE id = ?", (material,)).fetchone()
+    if row is None or row[0] != "reference_file":
+        return False
+    csl = json.loads(row[1] or "{}")
+    added = references.fills(csl, row[2] == "researcher", found.csl)
+    csl.update(added)
+    now = utc_now()
+    conn.execute("UPDATE materials SET csl = ?, title = ?, source_key = ?, resolved_at = ?, updated_at = ? WHERE id = ?",
+                 (json.dumps(csl), added.get("title", row[3]), found.source_key, now, now, material))
+    return True
 
 
 # The Library
@@ -1110,7 +1140,7 @@ def run_details(conn, run_id, workflow, status, inputs, registry):
     """What the background-run list shows of a material's run beside its status: the titles of the
     papers it works on (up to three, with their count), its open ask, and whether Retry applies."""
     if workflow not in _WORKFLOWS:
-        return {}
+        return _other(conn, run_id, workflow, status)
     ids = json.loads(inputs or "{}").get("material_ids") or []
     titles = [title for (title,) in conn.execute(
         "SELECT title FROM materials WHERE id IN (SELECT value FROM json_each(?)) ORDER BY created_at LIMIT 3",
@@ -1133,6 +1163,15 @@ def _earlier(conn, sha256, kind):
     return kind in extraction.EXTRACTORS and conn.execute(
         f"SELECT 1 FROM extractions WHERE file_sha256 = ? AND extractor = ? AND status IN {_SHARED}",
         (sha256, extraction.EXTRACTORS[kind][0])).fetchone() is not None
+
+
+def _other(conn, run_id, workflow, status):
+    """Another module's run in the background-run list: S1-14's merge (backend/references.py)."""
+    if workflow != "merge":
+        return {}
+    from backend import references  # it builds on this module
+
+    return references.run_details(conn, run_id, status)
 
 
 def _unreadable(conn, version_id, registry):
@@ -1182,7 +1221,8 @@ def _retry(conn, run_id, registry):
         return (project_id, workflow, {"material_ids": kept, "version_id": inputs["version_id"]}), None
     if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
         return None, (403, "lookup_locked", "A review-locked project never looks identifiers up")
-    return (project_id, workflow, {"material_ids": kept, "origin": None, "versions": dict(conn.execute(
+    return (project_id, workflow, {"material_ids": kept, "origin": None, **({"batch": inputs["batch"]} if inputs.get(
+        "batch") else {}), "versions": dict(conn.execute(
         "SELECT material_id, id FROM material_versions WHERE is_current = 1 AND material_id IN"
         " (SELECT value FROM json_each(?))", (json.dumps(kept),)).fetchall())}), None
 

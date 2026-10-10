@@ -310,6 +310,10 @@ def policy(conn, project_id):
 # backups.Archives). Identifier lookups and model calls are revoked.
 UNSENT_WORKFLOWS = ("extract", "full_backup", "project_export")
 
+# S1-14: merging a reference file's record into a paper (backend/references.py) sends nothing either;
+# its question is asked again under the project's new policy.
+UNSENT_WORKFLOWS += ("merge",)
+
 
 def revoke_running(conn, project_id):
     """Revoke every running run of the project that may send something, in the caller's transaction
