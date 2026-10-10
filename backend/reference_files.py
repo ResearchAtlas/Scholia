@@ -62,7 +62,7 @@ _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # Unicode's control characters (C
 _SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair, which only JSON's escapes can give: no text holds one
 # bibtexparser's block start (splitter._BLOCK_START, `@[\w]*( |\t)*(?=[{(])`, a test holds them equal), its
 # run of spaces a plain repeat here: the parser's group keeps state for each space it passes.
-_BLOCK_START = re.compile(r"@(\w*)[ \t]*(?=[{(])")
+_BLOCK_START = re.compile(r"@\w*[ \t]*(?=[{(])")
 _BLOCK_SPACES = re.compile(r"(@\w*)[ \t]{2,}")
 _BREAKS = re.compile("\r\n?|[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")  # every line end str.splitlines() takes, but \n
 
@@ -230,16 +230,12 @@ def _bibtex(text, beat):
     # Spaces after an @ and its type are one space: the parser's pattern holds state for each space it passes
     # there (a few MiB of them would take the child past its ceiling), and they mean nothing in BibTeX.
     text = _BLOCK_SPACES.sub(r"\1 ", text)
-    # bibtexparser opens a block at every mark of its block start wherever it comes between blocks: each is
-    # counted as it comes, so the count is at least what the parser would make, entries (any type but
-    # @string, @comment and @preamble, by prefix, as it routes them) and blocks of any kind.
-    blocks = entries = 0
-    for start in _BLOCK_START.finditer(text):
-        blocks += 1
-        entries += not start.group(1).lower().startswith(("string", "comment", "preamble"))
+    # bibtexparser opens a block at a mark of its block start wherever one comes between blocks: every such
+    # mark is counted as it comes (those inside values too), at least the blocks the parser would make, so
+    # past the bound the parser never runs. Its entries are counted exactly once it has made them (below).
+    for blocks, _ in enumerate(_BLOCK_START.finditer(text), start=1):
         if blocks > MAX_BLOCKS:
             raise Unreadable("too_many_records")
-    _counted(entries)
     try:
         # No middleware: @string macros are resolved here, once each, never by concatenation (#),
         # so a value is never longer than the file.

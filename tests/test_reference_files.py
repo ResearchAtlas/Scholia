@@ -362,3 +362,8 @@ def test_too_many_bibtex_blocks_are_refused_before_the_parser_runs(block, monkey
 def test_a_run_of_spaces_after_an_at_sign_is_read_as_one():
     [record], _, _ = parse("@misc{k, title={T}}\n@" + " " * (4 * 1024 * 1024) + "x")
     assert record["title"] == "T"
+
+
+def test_marks_inside_values_never_refuse_a_file_within_the_record_bound():
+    entry = "@article{k%d, title={T}, author={LeQua @ {CLEF}}}\n"  # bibtexparser's own example of an @ in a value
+    assert len(parse("".join(entry % i for i in range(rf.MAX_RECORDS)))[0]) == rf.MAX_RECORDS
