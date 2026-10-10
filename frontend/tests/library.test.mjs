@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
   typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, MAX_LIST_HEIGHT, withFocus,
-  detailsSource, latestLookup, pageImage, ocrPages } from '../src/library.js';
+  detailsSource, latestLookup, pageImage, pageFailedKey, ocrPages } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
@@ -21,7 +21,7 @@ test('only the formats Scholia reads are sent; the rest are named', () => {
 
 test('every state, reason and type the backend gives has its text in both catalogs', () => {
   const reasons = ['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file', 'encrypted_file',
-    'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'something new'];
+    'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'memory_limit', 'step_limit', 'something new'];
   const keys = [...['reading', 'ready', 'needs_attention'].map((s) => `library.state.${s}`), ...reasons.map(reasonKey),
     ...['application/pdf', 'text/html', 'text/markdown', 'application/x-tex', 'x/unknown',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].map(typeKey)];
@@ -30,6 +30,8 @@ test('every state, reason and type the backend gives has its text in both catalo
     assert.ok(key in zh, key);
   }
   assert.equal(reasonKey('something new'), 'library.reason.other');
+  assert.equal(reasonKey('memory_limit'), 'library.reason.memory_limit'); // a reading's child past its ceilings
+  assert.equal(reasonKey('step_limit'), 'library.reason.step_limit');
   assert.equal(reasonKey(null), null);
 });
 
@@ -90,7 +92,7 @@ test('the reasons a run ends with have their texts in both catalogs', () => {
   for (const code of ['unsupported_file', 'file_too_large', 'not_retryable', 'not_a_pdf', 'file_missing', 'unreadable_file',
     'encrypted_file', 'time_limit', 'title_needed', 'invalid_doi', 'ask_closed', 'ask_invalid', 'invalid_answer',
     'lookup_locked', 'declined', 'project_changed', 'closing', 'disk_full', 'write_failed', 'passphrase_required', 'unavailable',
-    'refused', 'ocr_failed']) {
+    'refused', 'ocr_failed', 'memory_limit', 'step_limit']) {
     assert.ok(`errors.${code}` in en && `errors.${code}` in zh, code);
   }
 });
@@ -123,6 +125,20 @@ test('a page image let go while it loads is abandoned: its request is aborted, n
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test('a page image stopped at a ceiling says which, with its code as the page image answer gives it', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ code: 'step_limit', message: '' }), { status: 409 });
+  try {
+    await assert.rejects(pageImage('v', 1), (error) => error.code === 'step_limit');
+  } finally {
+    globalThis.fetch = original;
+  }
+  const t = makeT('en');
+  assert.match(t(pageFailedKey('memory_limit')), /more memory than Scholia allows/);
+  assert.match(t(pageFailedKey('step_limit')), /no progress for a minute/);
+  for (const other of ['file_missing', 'unreachable', true, 'constructor']) assert.equal(pageFailedKey(other), 'paper.pageFailed');
 });
 
 test('a paper shows its pages only while its version is a PDF', () => {

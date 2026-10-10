@@ -210,6 +210,12 @@ function partMoves(text) {
   });
 }
 
+test('a PDF page whose image was stopped at a ceiling says which in its place', () => {
+  const text = source('Paper.jsx');
+  assert.ok(text.includes('.catch((error) => live && setFailed(error?.code || true))'), 'its failed read keeps its code');
+  assert.ok(text.includes('<p role="alert">{t(pageFailedKey(failed))}</p>'), 'and says it by pageFailedKey');
+});
+
 test('a PDF page keeps what it shows out of reach while another part loads, and its button or Retry asks again for a part whose read failed', () => {
   const found = partMoves(source('Paper.jsx'));
   assert.deepEqual(found.passages, ['move.loading', null]); // a page's passages; the text view never shows a part in another's place

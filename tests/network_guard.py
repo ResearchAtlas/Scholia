@@ -24,8 +24,8 @@ connection is refused. Native frameworks with their own networking (for example
 Cocoa URL loading through PyObjC) and other C extensions are not covered; a source
 scan in tests/test_network_guard.py fails if backend or test code names the common
 ones. Starting a child process is refused unless the test names that program in
-`allow_subprocess()`, because the child is outside the hook; an allowed program
-must make no network connections.
+`allow_subprocess()`, or the whole command in `allow_command()`, because the child
+is outside the hook; an allowed program must make no network connections.
 """
 
 import asyncio
@@ -67,6 +67,7 @@ _listening: weakref.WeakSet = weakref.WeakSet()  # sockets that listen() in this
 _lock = threading.Lock()
 _installed = False
 _allowed_programs: list[str] = []  # stack of programs allow_subprocess() permits
+_allowed_commands: list[list[str]] = []  # stack of whole commands allow_command() permits
 _real_listen = socket.socket.listen
 
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_API_TOKEN", "_ACCESS_TOKEN", "_SECRET_KEY")
@@ -109,7 +110,8 @@ def _audit(event: str, args: tuple) -> None:
         if address is not None and not _is_allowed(sock, address):
             raise NetworkBlocked(f"test network block: connection to {address!r} refused")
     elif event in _LAUNCH_EVENTS:
-        if _launched_program(event, args) not in _allowed_programs:
+        if _launched_program(event, args) not in _allowed_programs \
+                and _launched_command(event, args) not in _allowed_commands:
             raise NetworkBlocked(f"test network block: {event} refused; use allow_subprocess()")
     elif event in _LOOKUP_EVENTS:
         _require_loopback(args[0][0] if event == "socket.getnameinfo" else args[0])
@@ -143,6 +145,16 @@ def _launched_program(event: str, args: tuple):
         return None
     program = os.fsdecode(program)
     return program if os.path.isabs(program) else None
+
+
+def _launched_command(event: str, args: tuple):
+    """The whole command a subprocess.Popen event starts, every argument a string, or None."""
+    if event != "subprocess.Popen" or isinstance(args[1], (str, bytes)):
+        return None
+    command = [os.fsdecode(arg) for arg in args[1]]
+    if not command or (args[0] is not None and os.fsdecode(args[0]) != command[0]):
+        return None
+    return command
 
 
 def _recording_listen(self, *args):
@@ -241,6 +253,21 @@ def allow_subprocess(*programs: str):
         with _lock:
             for program in programs:
                 _allowed_programs.remove(program)
+
+
+@contextmanager
+def allow_command(*command: str):
+    """Allow a test to start exactly this command, its program by absolute path and
+    every argument as given; the same program with other arguments stays refused."""
+    if not command or not os.path.isabs(command[0]):
+        raise ValueError("name the program by absolute path")
+    with _lock:
+        _allowed_commands.append(list(command))
+    try:
+        yield
+    finally:
+        with _lock:
+            _allowed_commands.remove(list(command))
 
 
 @contextmanager

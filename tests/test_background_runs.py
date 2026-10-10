@@ -29,8 +29,9 @@ def hold_naming(monkeypatch):
     return reached, go
 
 
-async def test_the_list_shows_a_readings_progress_its_papers_and_retry_once_it_failed(tmp_path, monkeypatch):
-    reached, go = hold_extraction(monkeypatch)
+async def test_the_list_shows_a_readings_progress_its_papers_and_retry_once_it_failed(tmp_path, monkeypatch,
+                                                                                    reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         [paper] = (await added(client, project, PDF))["materials"]
@@ -46,8 +47,8 @@ async def test_the_list_shows_a_readings_progress_its_papers_and_retry_once_it_f
         assert stopped["retryable"] is True and stopped["progress"] is None
 
 
-async def test_a_run_that_ends_while_the_list_is_read_never_reads_interrupted(tmp_path, monkeypatch):
-    reached, go = hold_extraction(monkeypatch)
+async def test_a_run_that_ends_while_the_list_is_read_never_reads_interrupted(tmp_path, monkeypatch, reading_stub):
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         project = (await client.post("/api/projects", json={"name": "Review", "sensitivity": "local_only",
                                                            "review_lock": True})).json()["id"]  # no lookup: one run

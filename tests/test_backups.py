@@ -110,12 +110,13 @@ async def test_a_backup_is_taken_while_idle_and_never_while_a_run_is_active(tmp_
 
 
 async def test_a_run_waiting_on_its_question_does_not_hold_off_the_idle_backup_but_a_working_run_does(tmp_path,
-                                                                                                    monkeypatch):
+                                                                                                    monkeypatch,
+                                                                                                    reading_stub):
     from test_materials import PDF, added, hold_extraction, listing, project_of
     checks = []
     monkeypatch.setattr(backups_module, "IDLE_CHECK_SECONDS", 0.01)
     monkeypatch.setattr(Database, "backup_if_due", lambda self, now=None: checks.append(now))
-    reached, go = hold_extraction(monkeypatch)
+    reached, go = hold_extraction(reading_stub, tmp_path)
     async with started(tmp_path / "data") as client:
         project = await project_of(client, level="local_only")
         await added(client, project, PDF)

@@ -21,7 +21,7 @@ from backend.local_helper import EMBEDDING, Config
 from backend.search_index import SearchIndex
 import synthetic_materials as synthetic
 from network_guard import allow_subprocess
-from scholia_app import run_finished, started
+from scholia_app import read_in_process, run_finished, started
 from test_local_helper import PIN, TIMINGS, WEIGHTS, Fake
 from test_materials import added, project_of, rows
 
@@ -751,6 +751,7 @@ async def test_a_dense_depth_above_what_vec0_takes_is_bounded(tmp_path):
 
 
 async def test_a_superseded_readings_passages_leave_the_index_for_the_newer_ones(tmp_path, monkeypatch):
+    read_in_process(monkeypatch)  # an earlier extractor version, as this process sees it
     import backend.extraction as extraction
     monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
     async with app(tmp_path) as client:
@@ -781,6 +782,7 @@ async def test_a_superseded_readings_passages_leave_the_index_for_the_newer_ones
 
 
 async def test_queued_additions_whose_passages_a_newer_reading_removed_are_passed_over(tmp_path, monkeypatch):
+    read_in_process(monkeypatch)  # an earlier extractor version, as this process sees it
     import backend.extraction as extraction
     monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
     async with app(tmp_path) as client:
@@ -900,6 +902,7 @@ async def test_text_that_gives_way_to_none_leaves_the_index_file_without_other_w
     or failing to be read): an index run takes the removals now, so the old text leaves the index file and its
     WAL, not only search (whose access check already hides it)."""
     import backend.extraction as extraction
+    read_in_process(monkeypatch)  # its extractor's version and parser changed in this process
     english = "Narwhals barter vermilion abacuses"
     monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
     async with app(tmp_path) as client:

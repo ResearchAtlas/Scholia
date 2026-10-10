@@ -49,10 +49,19 @@ def test_the_interface_check_serves_every_script_the_page_s_scripts_import(tmp_p
         st.check_interface(tmp_path)
 
 
-def test_the_materials_check_reads_a_pdf_and_latex_and_renders_a_page():
-    from backend import extraction
-    assert st.check_materials() == {"pdf": extraction.extractor_of(extraction.PDF)[1], "latex": "latex-2+pylatexenc-2.11"}
+def test_the_materials_check_reads_a_pdf_and_latex_and_renders_a_page_each_in_its_child():
+    from backend import extraction, reading
+    found = st.check_materials()
+    assert (found["pdf"], found["latex"]) == (extraction.extractor_of(extraction.PDF)[1], "latex-2+pylatexenc-2.11")
     assert extraction.extractor_of(extraction.PDF)[1].startswith("pdf-3+pypdfium2-5.14.0")
+    assert 0 < found["child_ready_seconds"] < 10 and 0 < found["child_peak_mib"] < reading.READING_CEILING >> 20
+    assert not reading.LIVE
+
+
+def test_the_reading_ceiling_check_stops_a_child_past_its_ceiling():
+    from backend import reading
+    assert st.check_reading_ceiling() == {"reason": "memory_limit"}
+    assert not reading.LIVE
 
 
 def test_the_encrypted_zip_check_writes_and_reads_back_an_aes_zip():
@@ -79,6 +88,7 @@ def test_sqlite_checks_refuse_a_version_before_secure_delete(monkeypatch):
 def test_ocr_reads_the_english_and_chinese_lines_of_a_scanned_page_through_the_apps_reading():
     found = st.check_ocr()
     assert found["lines"] == st.OCR_LINES and found["engine"] == "vision-3"
+    assert found["child_peak_mib"] > 0  # read in its child, Vision there
 
 
 def test_helper_flags():
@@ -164,7 +174,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
         raise RuntimeError("no helper")
 
     for name in ("check_sqlite", "check_index", "check_backend", "check_interface", "check_encrypted_zip",
-                 "check_materials", "check_ocr"):
+                 "check_materials", "check_reading_ceiling", "check_ocr"):
         monkeypatch.setattr(st, name, passing(name))
     monkeypatch.setattr(st, "check_embedding", failing)
     argv = ["--self-test", "--model", str(tmp_path / "m.gguf")]
@@ -173,7 +183,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
     assert result["ok"] is False
     assert result["checks"]["embedding"] == {"ok": False, "error": "RuntimeError: no helper"}
     assert result["checks"]["ocr"] == {"ok": True}
-    assert len(calls) == 8
+    assert len(calls) == 9
     monkeypatch.setattr(st, "check_embedding", passing("embedding"))
     assert st.main(argv) == 0
 

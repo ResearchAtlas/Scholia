@@ -177,7 +177,7 @@ export function latestLookup(t, material) {
 }
 
 const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file',
-  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed']);
+  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'memory_limit', 'step_limit']);
 
 // A reading's scanned pages under Details: read by text recognition, or waiting for it where no OCR
 // engine read them (status ocr_needed); null when it has none.
@@ -518,6 +518,13 @@ export function withNear(near, page, isNear) {
   if (isNear) next.add(page);
   else next.delete(page);
   return next;
+}
+
+// What a page whose read failed says in its place (the catalog key): that its image was stopped at a
+// ceiling, by name (backend/materials.py page_image), or else that it could not be shown.
+const PAGE_CEILINGS = new Map([['memory_limit', 'paper.pageMemoryLimit'], ['step_limit', 'paper.pageStepLimit']]);
+export function pageFailedKey(code) {
+  return PAGE_CEILINGS.get(code) ?? 'paper.pageFailed';
 }
 
 // A PDF page as a data URL: the request carries the session, which an <img> could not, and the
