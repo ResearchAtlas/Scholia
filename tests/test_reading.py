@@ -703,10 +703,18 @@ async def test_the_watch_holds_after_the_result_until_the_child_has_ended(tmp_pa
 @pytest.mark.parametrize("loss", ["SIGKILL", "SIGCONT"])
 async def test_a_sentinel_lost_before_the_watch_has_seen_it_stopped_ends_the_child(tmp_path, reading_stub, loss):
     """Lost as soon as it has stopped, then the child stalls holding the GIL before ready: the watch, which
-    never saw it stopped, finds it gone (the child's zombie) and ends the child's group."""
+    never saw it stopped (its first look waits for the loss), finds it gone (the child's zombie) and ends
+    the child's group."""
     reading_stub("sentinel-lost-at-once", tmp_path, loss)
     path, sha256 = stored(tmp_path, MARKDOWN[1])
-    pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
+    looks = []
+
+    def stop():  # called once before the child starts, then at every tick: the first tick waits for the loss
+        looks.append(None)
+        if len(looks) == 2:
+            Held(tmp_path).wait(10)
+
+    pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN, stop))
     child = None
     try:
         assert await asyncio.to_thread(Held(tmp_path).wait, 10)
@@ -760,7 +768,6 @@ def test_a_sentinel_is_lost_only_while_its_child_goes_on(monkeypatch):
     records, exited, read = {1: record(ppid=0, pgid=1), 2: record()}, [False], []
     monkeypatch.setattr(reading, "_info", lambda pid: read.append(pid) or records.get(pid))
     monkeypatch.setattr(reading, "_exited", lambda pid: exited[0])
-    monkeypatch.setattr(reading, "EXIT_SECONDS", 0.2)
     assert not reading._lost(1, 2)  # still stopped beside it
     records[2] = record(status=2)  # continued
     read.clear()
@@ -770,6 +777,12 @@ def test_a_sentinel_is_lost_only_while_its_child_goes_on(monkeypatch):
     records[1] = record(ppid=0, pgid=1, flags=reading._INEXIT)
     assert not reading._lost(1, 2)  # the child in its exit
     del records[1]
+    started = time.monotonic()
+    threading.Timer(1.5, exited.__setitem__, (0, True)).start()  # an exit as slow as a starved one
+    assert not reading._lost(1, 2)  # no record: in its exit, waited for
+    assert time.monotonic() - started >= 1.5
+    exited[0] = False
+    monkeypatch.setattr(reading, "EXIT_SECONDS", 0.2)
     started = time.monotonic()
     assert reading._lost(1, 2)  # no record, and no end to wait for: lost (fails closed)
     assert 0.2 <= time.monotonic() - started < 2
