@@ -12,6 +12,7 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     spike-fail MIB    touch MIB MiB and free them; then fail as an unreadable file would
     spike-frame MIB   touch MIB MiB and free them; then send a frame past MAX_FRAME
     exit CODE         exit with CODE at once (os._exit)
+    quiet-exit S      say nothing for S seconds, then exit with 1 (os._exit): an end at any point of a tick
     signal NAME       kill itself with signal NAME (SIGSEGV: a crash in native code)
     stall             sleep without a word, for ever
     sentinel-dies DIR its sentinel ends (exit 7) where it would stop, before the child's wait for its stop;
@@ -21,6 +22,8 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     frame NAME        send a frame that is not one (FRAMES), then read for real
     after-done NAME   read for real, then after `done`: send a frame (beat) or exit non-zero (exit)
     done NAME         read for real, its `done` changed as NAME says (see Out.send)
+    done-then-stall DIR  read for real, then once `done` is sent say so by a file DIR/held-<pid> and stall
+                      60 s in native code holding the GIL
     png NAME          a page image whose PNG header says NAME: huge (past the page bounds), a pixel past
                       or two pixels past (MAX_PAGE_SIDE)
     version           name another extractor version in `ready`
@@ -112,6 +115,11 @@ class Out(reading._Out):
                      "ocr-needed-without-scans": [pages, 0, "ocr_needed"], "pages-in-a-text": [3, 0, status],
                      "scanned-in-a-text": [None, 1, status]}[ARGS[0]]
         super().send(key, value, flush)
+        if key == "done" and MODE == "done-then-stall":
+            import ctypes
+
+            Path(ARGS[0], f"held-{os.getpid()}").write_text("done")
+            ctypes.PyDLL(None).sleep(60)
         if key == "done" and MODE == "after-done":
             if ARGS[0] == "exit":
                 self.stream.flush()
@@ -158,6 +166,9 @@ def before(what, stop, progress, data=b""):
             out.raw(b"x" * (reading.MAX_FRAME + 1))
     elif MODE == "exit":
         os._exit(int(ARGS[0]))
+    elif MODE == "quiet-exit":
+        time.sleep(float(ARGS[0]))
+        os._exit(1)
     elif MODE == "signal":
         os.kill(os.getpid(), getattr(signal, ARGS[0]))
     elif MODE == "stall":

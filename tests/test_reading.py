@@ -638,34 +638,52 @@ async def test_a_value_outside_what_the_extraction_promises_is_a_wrong_frame(tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ended", ["read to its end", "stopped"])
+@pytest.mark.parametrize("ended", ["read to its end", "stopped", "an unreadable file", "a crash"])
 async def test_a_childs_sentinel_goes_with_it(tmp_path, reading_stub, ended):
-    """Its process group (the child and its stopped sentinel) is empty once the child has ended."""
-    reached, go = hold_extraction(reading_stub, tmp_path)
-    if ended == "read to its end":
-        go.set()
-    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    """Its process group (the child and its stopped sentinel) is empty once the child has ended, however
+    it ended: the child leaves its sentinel to the kernel, which ends it once the child's group is orphaned."""
+    data = b"%PDF-1.7\n not a whole PDF" if ended == "an unreadable file" else MARKDOWN[1]
+    reached = None
+    if ended == "a crash":
+        reading_stub("signal", "SIGSEGV")
+    elif ended != "an unreadable file":
+        reached, go = hold_extraction(reading_stub, tmp_path)
+        if ended == "read to its end":
+            go.set()
+    path, sha256 = stored(tmp_path, data)
+    stats = {}
 
     def stop():
         if ended == "stopped" and reached.is_set():
             raise RuntimeError("stopped")
 
+    kind = extraction.PDF if ended == "an unreadable file" else extraction.MARKDOWN
     try:
-        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN, stop)
-    except RuntimeError:
-        assert ended == "stopped"
-    [child] = reached.held()
-    deadline = time.monotonic() + 2
-    while True:
-        try:
-            os.killpg(child, 0)
-        except ProcessLookupError:
-            break
-        except PermissionError:
-            pass  # ended, not yet reaped: a group of zombies only
-        assert time.monotonic() < deadline, "the child's process group outlived it"
-        await asyncio.sleep(0.01)
-    assert gone(child)
+        await asyncio.to_thread(reading.read, path, sha256, kind, stop, stats=stats)
+    except (RuntimeError, extraction.Unreadable):
+        assert ended != "read to its end"
+    await ended_with_its_group(stats["pid"])
+    assert gone(stats["pid"])
+
+
+@pytest.mark.asyncio
+async def test_the_watch_holds_after_the_result_until_the_child_has_ended(tmp_path, reading_stub):
+    """A child that has sent its result and then stalls holding the GIL, its sentinel lost: ended."""
+    reading_stub("done-then-stall", tmp_path)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
+    try:
+        assert await asyncio.to_thread(Held(tmp_path).wait, 10)
+        [child] = Held(tmp_path).held()
+        [sentinel] = reading._children(child)
+        await asyncio.sleep(0.2)
+        os.kill(sentinel, signal.SIGKILL)
+        with pytest.raises(reading.ChildError, match="sentinel"):
+            await asyncio.wait_for(pending, 5)
+        await ended_with_its_group(child, 0.5)
+    finally:
+        if not pending.done():
+            pending.cancel()
 
 
 @pytest.mark.asyncio
@@ -683,12 +701,13 @@ async def test_a_page_image_past_its_bounds_is_a_wrong_frame(tmp_path, reading_s
 
 
 @pytest.mark.asyncio
-async def test_a_child_whose_sigchld_is_ignored_before_its_main_still_reaps_its_sentinel_and_reads(tmp_path,
+async def test_a_child_whose_sigchld_is_ignored_before_its_main_starts_with_its_sentinel_and_reads(tmp_path,
                                                                                                    monkeypatch):
-    """A child in which SIGCHLD is ignored before main() runs (as a library imported first might), which
-    on macOS makes the kernel reap its children unasked, resets it: its wait for its sentinel at its end
-    works, and the reading is taken. (An ignored SIGCHLD inherited through exec does not make the kernel
-    reap on macOS, so the child is started here in the process that ignored it.)"""
+    """A child in which SIGCHLD is ignored before main() runs (as a library imported first might, which on
+    macOS makes the kernel reap its children unasked; an ignored SIGCHLD inherited through exec does not, so
+    the child starts here in the process that ignored it) starts with its sentinel stopped and reads. The
+    child resets SIGCHLD, so a sentinel lost while it works stays its zombie, its pid not free for another
+    process to take, until the child ends (the app's watch also checks the sentinel's parent)."""
     command = [sys.executable, "-c", "import runpy, signal, sys; signal.signal(signal.SIGCHLD, signal.SIG_IGN); "
                "sys.argv = ['backend.reading']; runpy.run_module('backend.reading', run_name='__main__')"]
     monkeypatch.setattr(reading, "command", lambda: command)

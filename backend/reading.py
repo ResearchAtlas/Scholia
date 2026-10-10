@@ -182,23 +182,30 @@ def _peak(pid):
 
 
 def _children(pid):
-    """The pids of a process's children (proc_listchildpids), at most 64."""
-    kids = (ctypes.c_int * 64)()
-    count = _lib().proc_listchildpids(pid, kids, ctypes.sizeof(kids))
-    return list(kids[:max(0, min(count, 64))])
+    """The pids of a process's children (proc_listchildpids), all of them."""
+    size = 64
+    while True:
+        kids = (ctypes.c_int * size)()
+        count = _lib().proc_listchildpids(pid, kids, ctypes.sizeof(kids))
+        if count < size:
+            return list(kids[:max(count, 0)])
+        size *= 4  # it may have had more: read again with room for them
 
 
-def _sentinel_held(pid):
-    """Whether the child's process group holds a stopped member besides the child (its sentinel,
-    _sentinel), which the app's death needs to bring the kernel's SIGHUP. A sentinel killed or
-    continued (it then ends) is no longer one."""
+def _stopped_member(pid, kid):
+    """Whether kid is a stopped child of the child pid, in its process group: its sentinel (_sentinel),
+    which the app's death needs to bring the kernel's SIGHUP. One killed or continued (it then ends) is
+    not: a zombie's proc_pidinfo fails. Its pid stays the child's while it is a zombie (the child never
+    reaps it), and a pid taken by another process has another parent."""
     info = _BsdInfo()
-    for kid in _children(pid):
-        size = ctypes.sizeof(info)
-        if _lib().proc_pidinfo(kid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) == size \
-                and info.status == _SSTOP and info.pgid == pid:
-            return True
-    return False
+    size = ctypes.sizeof(info)
+    return _lib().proc_pidinfo(kid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) == size \
+        and info.status == _SSTOP and info.ppid == pid and info.pgid == pid
+
+
+def _find_sentinel(pid):
+    """The pid of the child's stopped sentinel, or None."""
+    return next((kid for kid in _children(pid) if _stopped_member(pid, kid)), None)
 
 
 def _exited(pid):
@@ -228,7 +235,7 @@ class _Bad(Exception):
 def _run(request, ceiling, limit, stop, received, stats):
     """Start the child, send it request, and watch it to its end (see the module's docstring), giving
     each frame to received.take. Returns its exit status; the child is always reaped."""
-    started, peak, longest = time.monotonic(), 0, 0.0
+    started, peak, longest, sentinel = time.monotonic(), 0, 0.0, None
     stop()  # a run stopped while it waited for its turn starts no child
     selector = None
     try:
@@ -292,14 +299,17 @@ def _run(request, ceiling, limit, stop, received, stats):
                         raise  # what a frame may say, a wrong frame found as one, or this process out of memory
                     # Any other failure on a value the child sent: a wrong frame, its type logged (never content).
                     raise _Bad(f"a frame its checks could not take ({type(error).__name__})") from None
-            elif received.ready and not received.settled() and not _sentinel_held(child.pid) \
-                    and not _exited(child.pid):
-                # A quiet tick (nothing to read): its sentinel lost (killed, or continued and so ended) while
-                # it works. The app's death would no longer end a child stalled with the GIL held, so it ends
-                # now, while the app is here to end it. (A child that has sent its result, or ends, lets its
-                # sentinel go: its output is read first, as its ending is.)
-                log.error("a reading's child lost its sentinel; it was stopped")
-                raise ChildError("sentinel")
+            elif received.ready:  # a quiet tick (nothing to read), from ready until the child has ended
+                sentinel = sentinel or _find_sentinel(child.pid)
+                if sentinel is None or not _stopped_member(child.pid, sentinel):
+                    # Its sentinel lost (killed, or continued and so ended): the app's death would no longer end
+                    # a child stalled with the GIL held, so it ends now, while the app is here to end it. A child
+                    # that is itself ending lets its sentinel go some 150 us before its end can be seen, so its
+                    # end is looked for once more first: its output's end, or its exit.
+                    time.sleep(0.002)
+                    if not selector.select(0) and not _exited(child.pid):
+                        log.error("a reading's child lost its sentinel; it was stopped")
+                        raise ChildError("sentinel")
             if time.monotonic() - last > STEP_SECONDS:
                 log.warning("a reading's child sent nothing for %d s; it was stopped", STEP_SECONDS)
                 raise extraction.Unreadable("step_limit")
@@ -332,7 +342,7 @@ def _run(request, ceiling, limit, stop, received, stats):
             LIVE.discard(child.pid)
         if stats is not None:
             stats.update(seconds=time.monotonic() - started, peak_mib=round(peak / 2**20, 1) if peak else None,
-                         longest_step_seconds=longest)
+                         longest_step_seconds=longest, pid=child.pid)
 
 
 class _Ceiling(Exception):
@@ -409,10 +419,6 @@ class _Received:
             log.error("a reading's child names another extractor version")
             raise ChildError("version")
         self.ready = True
-
-    def settled(self):
-        """Whether its result has come whole (after which the child ends its sentinel and itself)."""
-        return False
 
     errors = _ERRORS - {"no_page"}  # what a reading's child may report
 
@@ -534,9 +540,6 @@ class _Reading(_Received):
             raise _Bad("boxes that are not boxes")
         return len(rects)
 
-    def settled(self):
-        return self.done is not None
-
     def result(self):
         if self.done is None or self.exit != 0:
             self.ended()
@@ -550,9 +553,6 @@ class _Render(_Received):
     def __init__(self):
         super().__init__(extraction.PDF)
         self.image = None
-
-    def settled(self):
-        return self.image is not None
 
     def take(self, body):
         if self.ready and self.image is None and body.startswith(_PNG):
