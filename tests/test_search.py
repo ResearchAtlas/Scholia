@@ -1349,7 +1349,7 @@ async def test_a_run_cancelled_before_its_work_began_ends_its_pending_rerun_too(
         assert (await run_finished(client, run))["status"] == "cancelled"
         await cancel
         dropped = await run_finished(client, pending)
-        assert (dropped["status"], dropped["cancel_reason"]) == ("cancelled", "researcher")
+        assert (dropped["status"], dropped["cancel_reason"], dropped["rebuild"]) == ("cancelled", "researcher", True)
 
 
 async def test_retry_after_a_failed_terminal_write_records_the_pending_rebuild_under_its_id(tmp_path, monkeypatch):
@@ -1442,10 +1442,11 @@ async def test_an_index_run_a_lookup_records_starts_at_once_and_never_outlives_a
     that run starts once the change commits (not at the lookup's end), so papers added while the lookup
     goes on are indexed, and a Cancel of the lookup leaves no run held that never starts."""
     from backend import lookup
-    blocked = asyncio.Event()
+    blocked, go = asyncio.Event(), asyncio.Event()
 
     async def resolve(client, scheme, identifier, pace):
         if identifier.endswith(".1"):
+            await go.wait()  # once the readings' index run has ended: the title change records the project's run
             return lookup.Found("openalex", {"title": "Wage Floors, as Published", "DOI": identifier}, None,
                                 "openalex:W1")
         await blocked.wait()  # the second identifier: the lookup goes on
@@ -1456,6 +1457,8 @@ async def test_an_index_run_a_lookup_records_starts_at_once_and_never_outlives_a
         one = ("one.md", b"# Wage Floors\n\ndoi:10.5555/s117.1\n\n## Findings\n\nMinimum wages raise earnings.\n")
         two = ("two.md", b"# Price Notes\n\ndoi:10.5555/s117.2\n\n## Findings\n\nRegional prices adjust slowly.\n")
         result = await added(client, project, one, two)
+        await idle(client, project)
+        go.set()
         deadline = asyncio.get_running_loop().time() + 15
         while not await rows(client, "SELECT 1 FROM materials WHERE title = 'Wage Floors, as Published'"):
             assert asyncio.get_running_loop().time() < deadline  # the first identifier's title applied
@@ -1473,6 +1476,48 @@ async def test_an_index_run_a_lookup_records_starts_at_once_and_never_outlives_a
         [fourth] = (await added(client, project, paper("Fourth Paper", "A paragraph after the Cancel.")))["materials"]
         status = await idle(client, project)
         assert status["materials"][fourth["id"]]["embedded"] == status["materials"][fourth["id"]]["embeddable"] > 0
+
+
+async def test_an_index_run_a_lookup_records_starts_though_the_lookup_is_cancelled_as_that_write_commits(
+        tmp_path, monkeypatch):
+    """The internal review of b682b9b, P2-3: a Cancel reaching the lookup at the await of a write that has
+    committed (and recorded its project's index run) never reaches the lookup's own start of that run; the
+    run's end starts it all the same, so it never stays held with no task and later papers are indexed."""
+    from backend import lookup, materials
+    blocked, go = asyncio.Event(), asyncio.Event()
+
+    async def resolve(client, scheme, identifier, pace):
+        if identifier.endswith(".1"):
+            await go.wait()  # once the readings' index run has ended: the title change records the project's run
+            return lookup.Found("openalex", {"title": "Wage Floors, as Published", "DOI": identifier}, None,
+                                "openalex:W1")
+        await blocked.wait()
+        raise lookup.Failed("unavailable")
+    monkeypatch.setattr(lookup, "resolve", resolve)
+    real, fired = materials._write_if_running, []
+
+    async def cancelled_as_it_commits(write, run_id, fn):
+        made = await real(write, run_id, fn)
+        if made and not fired:
+            fired.append(True)
+            raise asyncio.CancelledError()  # as a Cancel arriving at this await once the write has committed
+        return made
+    monkeypatch.setattr(materials, "_write_if_running", cancelled_as_it_commits)
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        one = ("one.md", b"# Wage Floors\n\ndoi:10.5555/s117.1\n\n## Findings\n\nMinimum wages raise earnings.\n")
+        two = ("two.md", b"# Price Notes\n\ndoi:10.5555/s117.2\n\n## Findings\n\nRegional prices adjust slowly.\n")
+        result = await added(client, project, one, two)
+        await idle(client, project)
+        go.set()
+        await run_finished(client, result["lookup_run_id"])
+        assert fired and await rows(client, "SELECT 1 FROM materials WHERE title = 'Wage Floors, as Published'")
+        await idle(client, project)
+        registry = client.state["harness"].registry
+        assert [r for r in registry.runs.values() if r.kind == "background" and r.task is None] == []
+        [later] = (await added(client, project, paper("Later Paper", "A paragraph after the Cancel.")))["materials"]
+        status = await idle(client, project)
+        assert status["materials"][later["id"]]["embedded"] == status["materials"][later["id"]]["embeddable"] > 0
 
 
 # From the internal review of 68c4cdd
@@ -1506,3 +1551,110 @@ async def test_the_index_status_shows_the_latest_run_over_an_older_one_left_runn
         status = await idle(client, project)
         [latest] = [r["run_id"] for r in await runs_of(client, "index", project) if r["run_id"] != stale]
         assert (status["run"]["run_id"], status["run"]["status"]) == (latest, "succeeded")
+
+
+# From the internal review of b682b9b
+
+
+async def _interrupted_with_a_rebuild_pending(client, monkeypatch):
+    """A project's run whose terminal write failed (it reads interrupted) with a Rebuild pending, its id given
+    out (the app with batch=1): (project, run, pending)."""
+    from backend.runs import Harness
+    real = Harness._finish_local
+    project = await project_of(client)
+    client.remote.hold, client.remote.free = asyncio.Event(), 1
+    await added(client, project, WAGES)
+    await asyncio.wait_for(client.remote.reached.wait(), 10)
+    [run] = await _running_index_runs(client, project)
+    pending = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+
+    def failing(self, conn, active, status, cancel_reason, summary, effect=None):
+        if active.run_id == run:
+            raise OSError("the disk is full")
+        return real(self, conn, active, status, cancel_reason, summary, effect)
+    monkeypatch.setattr(Harness, "_finish_local", failing)
+    client.remote.hold.set()
+    assert (await run_finished(client, run))["status"] == "interrupted"
+    monkeypatch.setattr(Harness, "_finish_local", real)
+    return project, run, pending
+
+
+async def _a_later_run_waiting(client, project, run, rebuild=False):
+    """A later run of the project (a reading's, or a Rebuild), held in its embedding: its id."""
+    client.remote.hold, client.remote.free = asyncio.Event(), len(client.remote.indexing)
+    client.remote.reached.clear()
+    if rebuild:
+        await client.post(f"/api/projects/{project}/index/rebuild")
+    else:
+        await added(client, project, paper("Later", "A later paragraph."))
+    await asyncio.wait_for(client.remote.reached.wait(), 10)
+    [later] = [r for r in await _running_index_runs(client, project) if r != run]
+    return later
+
+
+async def test_a_retry_whose_pending_id_marks_the_running_run_starts_nothing_until_that_run_ends(tmp_path,
+                                                                                                   monkeypatch):
+    """P2: Retry of a run whose terminal write failed with a Rebuild pending, while a later run of the
+    project runs: the pending id marks that run (no row yet), so nothing starts for it now (a run started for
+    an id with no row would hold it while that run's end recorded it, unheld: interrupted); it is recorded,
+    a rebuild, and started when that run ends."""
+    from backend.runs import Harness
+    real, started_for = Harness._background, []
+
+    async def background(self, active):
+        started_for.append(active.run_id)
+        return await real(self, active)
+    monkeypatch.setattr(Harness, "_background", background)
+    async with app(tmp_path, batch=1) as client:
+        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        later = await _a_later_run_waiting(client, project, run)
+        again = await client.post(f"/api/runs/{run}/retry")
+        assert again.status_code == 201 and again.json()["run_id"] == pending
+        assert await _pending(client, later) == {"run_id": pending, "rebuild": True}
+        assert pending not in started_for and await rows(client, "SELECT 1 FROM runs WHERE id = ?", pending) == []
+        client.remote.hold.set()
+        ended = await run_finished(client, pending)
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True) and started_for.count(pending) == 1
+
+
+@pytest.mark.parametrize("over", ["rerun", "rebuild"])
+async def test_a_retrys_pending_id_that_loses_to_another_ends_superseded_as_a_rebuild(tmp_path, monkeypatch, over):
+    """P3: Retry of a run with a Rebuild pending (its id given out) while the project's running run already
+    has a rerun pending, or is itself a rebuild: that one does the work, and the pending id ends, superseded,
+    a rebuild, so whoever follows it sees it end."""
+    async with app(tmp_path, batch=1) as client:
+        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        later = await _a_later_run_waiting(client, project, run, rebuild=over == "rebuild")
+        winner = later if over == "rebuild" else \
+            (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        again = await client.post(f"/api/runs/{run}/retry")
+        assert again.status_code == 201 and again.json()["run_id"] == winner
+        lost = await run_finished(client, pending)
+        assert (lost["status"], lost["result"]["reason"], lost["rebuild"]) == ("cancelled", "superseded", True)
+        client.remote.hold.set()
+        assert (await run_finished(client, winner))["status"] == "succeeded"
+
+
+async def test_two_retries_at_once_of_a_run_with_a_rebuild_pending_both_get_that_rebuild(tmp_path, monkeypatch):
+    """P3: a second Retry pressed while the first holds the pending run's id (its write under way) is answered
+    with that run, not refused as if the app were closing."""
+    import threading
+    import backend.search as search
+    async with app(tmp_path, batch=1) as client:
+        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        real, entered, go = search.request_run, threading.Event(), threading.Event()
+
+        def held(*args, **kwargs):  # the first Retry's write waits in the writer, the pending id held
+            if not entered.is_set():
+                entered.set()
+                go.wait(10)
+            return real(*args, **kwargs)
+        monkeypatch.setattr(search, "request_run", held)
+        first = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
+        assert await asyncio.to_thread(entered.wait, 10)
+        second = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
+        await asyncio.sleep(0.3)
+        go.set()
+        answers = [await first, await second]
+        assert [(a.status_code, a.json()["run_id"]) for a in answers] == [(201, pending)] * 2
+        assert (await run_finished(client, pending))["status"] == "succeeded"

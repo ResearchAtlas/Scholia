@@ -819,7 +819,7 @@ async def test_a_rebuild_already_submitted_when_the_index_closes_makes_and_unlin
 async def test_a_rebuild_that_succeeds_disarms_a_retry_still_to_come(tmp_path, monkeypatch):
     """A failed whole rebuild arms a retry; one that then succeeds by another path disarms it, so no
     rebuild of a healthy file follows."""
-    monkeypatch.setattr(search_index, "RETRY_SECONDS", (1.0, 1.0))
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))  # the retry never comes due in the test
     async with app(tmp_path) as client:
         project = await project_of(client)
         await added(client, project, WAGES)
@@ -841,12 +841,12 @@ async def test_a_rebuild_that_succeeds_disarms_a_retry_still_to_come(tmp_path, m
     async with app(tmp_path) as client:
         index = client.state["index"]
         await _until(lambda: len(attempts) == 1 and index.unusable and index._rebuild_retry is not None)
+        armed = index._rebuild_retry
         failing["on"] = False
         index._damaged()  # another path asks for a rebuild, which succeeds
         await _until(lambda: not index.unusable and not index.building)
-        assert index._rebuild_retry is None
-        await asyncio.sleep(1.5)  # past the retry's delay
-        assert len(attempts) == 2  # the failed one and the success: none after
+        assert index._rebuild_retry is None and armed.finished.is_set()  # the armed retry cancelled
+        assert len(attempts) == 2  # the failed one and the success
         await until_embedded(client, project)
 
 
@@ -955,3 +955,36 @@ async def test_a_whole_rebuild_takes_the_queue_rows_it_read_so_no_later_launch_a
     async with app(tmp_path) as client:
         await idle(client, project)
         assert await runs_of(client, "index", project) == before
+
+
+@pytest.mark.asyncio
+async def test_a_close_discarding_an_unfinished_rebuilds_file_goes_on_whatever_closing_its_readers_meets(tmp_path,
+                                                                                                          monkeypatch):
+    """The internal review of b682b9b, P3: the close's discard of a file a whole rebuild has not finished is
+    guarded as a failed rebuild's is (_discard): a failure closing its readers leaves it removed all the same."""
+    import threading
+    from backend.db import Database
+    db = await asyncio.to_thread(Database, tmp_path / "data")
+    index = SearchIndex(tmp_path / "data", db, {"model": "m"})
+    real, failed = SearchIndex._close_readers, []
+
+    def failing(self):
+        if self.closed and not failed:
+            failed.append(True)
+            raise search_index.apsw.IOError("disk I/O error")
+        return real(self)
+    try:
+        await asyncio.to_thread(index.open)
+        await asyncio.to_thread(index.apply)
+        go = threading.Event()
+        index._writer.submit(go.wait, 20)  # the writer busy
+        index._rebuild_soon()  # asked for: the file is unfinished from now on
+        monkeypatch.setattr(SearchIndex, "_close_readers", failing)
+        closing = asyncio.ensure_future(asyncio.to_thread(index.close))
+        await asyncio.sleep(0.2)
+        go.set()
+        await asyncio.wait_for(closing, 10)
+    finally:
+        monkeypatch.setattr(SearchIndex, "_close_readers", real)
+        await asyncio.to_thread(db.close)
+    assert failed and not index.path.exists() and not Path(f"{index.path}-wal").exists()

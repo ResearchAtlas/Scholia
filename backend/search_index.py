@@ -458,24 +458,25 @@ class SearchIndex:
         return future
 
     def _discard(self):
-        """A failed whole rebuild's partial file goes (it may hold text a deletion since has removed from
-        the main database): the index stays unusable, building, until a rebuild succeeds."""
+        """A file that may hold text a deletion since has removed from the main database goes: a failed
+        whole rebuild's partial file (the index stays unusable, building, until a rebuild succeeds), or, as
+        the index closes, an unfinished rebuild's or one whose last removals failed."""
         self.unusable = True
         conn, self._conn = self._conn, None
         try:
             if conn is not None:
                 conn.close()
         except Exception as error:  # the file goes all the same
-            log.warning("closing a failed rebuild's partial index file failed (%s)", type(error).__name__)
+            log.warning("closing an index file to discard it failed (%s)", type(error).__name__)
         try:
             self._close_readers()
         except Exception as error:
-            log.warning("closing the partial index file's readers failed (%s)", type(error).__name__)
+            log.warning("closing a discarded index file's readers failed (%s)", type(error).__name__)
         for suffix in ("", "-wal", "-shm"):
             try:
                 Path(f"{self.path}{suffix}").unlink(missing_ok=True)
             except OSError as error:
-                log.warning("a failed rebuild's partial index file could not be removed (%s)", type(error).__name__)
+                log.warning("a discarded index file could not be removed (%s)", type(error).__name__)
 
     def _rebuild_later(self):
         """Another whole rebuild after a delay that doubles with each failure in a row (RETRY_SECONDS), one at
@@ -873,20 +874,18 @@ class SearchIndex:
         def end():
             discard = self.building
             if self._conn is not None and not discard:
-                self._close_readers()
                 try:
+                    self._close_readers()
                     self._remove_queued()
                 except Exception as error:
                     log.warning("the index's last removals could not be applied (%s); its file is discarded",
                                 type(error).__name__)
                     discard = True
-            if self._conn is not None:
+            if discard:
+                self._discard()  # each step guarded: the file goes whatever closing it meets
+            elif self._conn is not None:
                 self._conn.close()
                 self._conn = None
-            if discard:
-                self._close_readers()
-                for suffix in ("", "-wal", "-shm"):
-                    Path(f"{self.path}{suffix}").unlink(missing_ok=True)
         try:
             self._writer.submit(end).result()
         finally:

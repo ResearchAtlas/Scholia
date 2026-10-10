@@ -192,11 +192,11 @@ def request_run(conn, registry, project_id, record, rebuild=False, startup=False
         inputs = json.loads(inputs or "{}")
         if rebuild and inputs.get("rebuild"):
             if run_id is not None:
-                _close_pending(conn, project_id, run_id, "superseded")
+                _close_pending(conn, project_id, run_id, "superseded", rebuild)
             return live
         again = inputs.get("again") or {"run_id": run_id or new_id()}
         if run_id is not None and again["run_id"] != run_id:
-            _close_pending(conn, project_id, run_id, "superseded")
+            _close_pending(conn, project_id, run_id, "superseded", rebuild)
         again["rebuild"] = bool(again.get("rebuild") or rebuild)
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.again', json(?)) WHERE id = ?",
                      (json.dumps(again), live))
@@ -204,15 +204,16 @@ def request_run(conn, registry, project_id, record, rebuild=False, startup=False
     return record(conn, project_id, {"rebuild": True} if rebuild else {})
 
 
-def _close_pending(conn, project_id, run_id, reason=None):
+def _close_pending(conn, project_id, run_id, reason=None, rebuild=False):
     """A pending run's id that will not run (its run's Cancel dropped it, or another pending run does its
-    work), recorded as a cancelled index run, so the interface following it (a Rebuild) sees it end."""
+    work), recorded as a cancelled index run (a rebuild, if it was one), so the interface following it (a
+    Rebuild) sees it end."""
     if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None:
         return
     conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status, cancel_reason, finished_at, summary)"
-                 " VALUES (?, ?, 'background', 'index', '{}', 'cancelled', ?, ?, ?)",
-                 (run_id, project_id, None if reason else "researcher", utc_now(),
-                  json.dumps({"reason": reason}) if reason else None))
+                 " VALUES (?, ?, 'background', 'index', ?, 'cancelled', ?, ?, ?)",
+                 (run_id, project_id, json.dumps({"rebuild": True} if rebuild else {}), None if reason else "researcher",
+                  utc_now(), json.dumps({"reason": reason}) if reason else None))
     _event(conn, run_id, "run_finished", {"status": "cancelled", **({"reason": reason} if reason else {})})
 
 
@@ -340,7 +341,8 @@ def register(harness, state):
         if not again or not conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone():
             return
         if row[0] == "cancelled":  # Cancel stops indexing for now (reading R29): nothing starts at once; a later
-            _close_pending(conn, project_id, again["run_id"])  # trigger or the next launch requests again
+            # trigger or the next launch requests again
+            _close_pending(conn, project_id, again["run_id"], rebuild=again.get("rebuild"))
             return
         harness.record_in(conn, active, project_id, "index", {"rebuild": True} if again.get("rebuild") else {},
                           run_id=again["run_id"])
