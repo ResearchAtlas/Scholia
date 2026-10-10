@@ -184,6 +184,11 @@ class Registry:
             self.retired.add(run_id)
             return True
 
+    def unretire(self, run_id: str) -> None:
+        """Undo a retire whose retry failed: a kick or a resume may hold the run again."""
+        with self.lock:
+            self.retired.discard(run_id)
+
     def release(self, active: ActiveRun) -> None:
         with self.lock:  # from a write transaction's thread too (record_background)
             if self.runs.get(active.run_id) is active:

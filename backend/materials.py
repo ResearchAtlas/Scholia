@@ -1292,6 +1292,8 @@ async def retry_run(run_id: str, request: Request):
             raise _refused(*refusal)
         left_running = _running(conn, run_id)  # it reads interrupted: running in the record, held by no process
         if left_running and not registry.retire(run_id):  # held again meanwhile (a kick started it): running
+            if registry.closed:  # or the app is closing: its resume starts the run again
+                raise _refused(503, "shutting_down", "The app is closing")
             raise _refused(409, "not_retryable", "This run is running")
         project_id, workflow, inputs = retry
 
@@ -1332,8 +1334,15 @@ async def retry_run(run_id: str, request: Request):
     # One Retry at a time: a second press reads what the first wrote (its run), never the pending id the first
     # holds (S1-17), whichever write would reach the database first.
     async with state.setdefault("retry_lock", asyncio.Lock()):
+        registry = state["harness"].registry
         pending = await asyncio.to_thread(state["db"].read, left_pending)
-        if pending:  # S1-17: the run it was pending after must never end (recording it) while this holds its id
-            registry = state["harness"].registry  # retired, it is never held again; held, it runs: refused
-            pending = await asyncio.to_thread(state["db"].read, left_pending) if registry.retire(run_id) else []
-        return {"run_id": await state["harness"].record_background(1, again, ids=pending)}
+        try:
+            if pending:  # S1-17: the run it was pending after must never end (recording it) while this holds its id
+                # retired, it is never held again; held, it runs: refused
+                pending = await asyncio.to_thread(state["db"].read, left_pending) if registry.retire(run_id) else []
+            return {"run_id": await state["harness"].record_background(1, again, ids=pending)}
+        except BaseException:
+            # A Retry refused or failed leaves the run as it was, for a kick or a resume to start again. One whose
+            # retry committed is never started again whatever this undoes (retried_by, its record interrupted).
+            registry.unretire(run_id)
+            raise

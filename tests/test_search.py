@@ -1817,3 +1817,41 @@ async def test_a_retry_whose_run_ends_unrecorded_after_it_looked_ends_the_pendin
         assert (lost["status"], lost["result"]["reason"], lost["rebuild"]) == ("cancelled", "superseded", True)
         retried = await run_finished(client, again.json()["run_id"])
         assert (retried["status"], retried["rebuild"]) == ("succeeded", True)
+
+
+
+# From recheck 4 (d5f9902)
+
+
+@pytest.mark.parametrize("when", ["after_its_retire", "during_its_write"])
+async def test_a_retry_the_app_starts_closing_under_is_refused_and_leaves_the_run_to_the_resume(tmp_path,
+                                                                                                  monkeypatch, when):
+    """P2: the harness closing while a Retry is under way (a restore starting, that then does not go ahead),
+    after the Retry retired the run it retries or while its write waits: the Retry is refused as the app
+    closing, and the run is left as it was, so the resume starts it again and it records its pending run."""
+    from backend.runs import Registry
+    async with app(tmp_path, batch=1) as client:
+        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        harness = client.state["harness"]
+        if when == "after_its_retire":
+            real = Registry.retire
+
+            def retire_then_close(self, run_id):
+                retired = real(self, run_id)
+                self.closed = True
+                return retired
+            monkeypatch.setattr(Registry, "retire", retire_then_close)
+            assert (await client.post(f"/api/runs/{run}/retry")).status_code == 503
+            monkeypatch.setattr(Registry, "retire", real)
+        else:
+            entered, go = _held_retry_write(monkeypatch)
+            retry = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
+            assert await asyncio.to_thread(entered.wait, 10)
+            harness.registry.closed = True
+            go.set()
+            assert (await retry).status_code == 503
+        harness.registry.closed = False
+        await harness.kick_background()
+        assert (await run_finished(client, run))["status"] == "succeeded"
+        ended = await run_finished(client, pending)
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
