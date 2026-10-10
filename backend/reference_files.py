@@ -60,6 +60,10 @@ _ARXIV_IN = re.compile(r"(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5}
 _LATEX = re.compile(r"[\\{}$~]")
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # Unicode's control characters (Cc)
 _SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair, which only JSON's escapes can give: no text holds one
+# bibtexparser's block start (splitter._BLOCK_START, `@[\w]*( |\t)*(?=[{(])`, a test holds them equal), its
+# run of spaces a plain repeat here: the parser's group keeps state for each space it passes.
+_BLOCK_START = re.compile(r"@(\w*)[ \t]*(?=[{(])")
+_BLOCK_SPACES = re.compile(r"(@\w*)[ \t]{2,}")
 _BREAKS = re.compile("\r\n?|[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")  # every line end str.splitlines() takes, but \n
 
 # The parsers log what they read (bibtexparser's splitter quotes a block it could not read). Their
@@ -222,15 +226,20 @@ def _bibtex(text, beat):
     import bibtexparser
     from bibtexparser.middlewares.names import parse_single_name_into_parts, split_multiple_persons_names
     from bibtexparser.model import Entry
-    from bibtexparser.splitter import _BLOCK_START  # its block start, so the bound counts what it will make
 
-    # bibtexparser opens a block at every mark of its own pattern wherever it comes between blocks: each is
-    # counted by that same pattern, so the count is what the parser would make, entries (any type but
+    # Spaces after an @ and its type are one space: the parser's pattern holds state for each space it passes
+    # there (a few MiB of them would take the child past its ceiling), and they mean nothing in BibTeX.
+    text = _BLOCK_SPACES.sub(r"\1 ", text)
+    # bibtexparser opens a block at every mark of its block start wherever it comes between blocks: each is
+    # counted as it comes, so the count is at least what the parser would make, entries (any type but
     # @string, @comment and @preamble, by prefix, as it routes them) and blocks of any kind.
-    starts = [m.group(0)[1:].strip().lower() for m in re.finditer(_BLOCK_START, text)]
-    _counted(sum(1 for kind in starts if not kind.startswith(("string", "comment", "preamble"))))
-    if len(starts) > MAX_BLOCKS:
-        raise Unreadable("too_many_records")
+    blocks = entries = 0
+    for start in _BLOCK_START.finditer(text):
+        blocks += 1
+        entries += not start.group(1).lower().startswith(("string", "comment", "preamble"))
+        if blocks > MAX_BLOCKS:
+            raise Unreadable("too_many_records")
+    _counted(entries)
     try:
         # No middleware: @string macros are resolved here, once each, never by concatenation (#),
         # so a value is never longer than the file.

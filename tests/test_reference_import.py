@@ -826,3 +826,27 @@ async def test_a_doi_change_drops_what_the_lookup_that_gave_the_doi_filled(tmp_p
         assert filled["DOI"] == "10.5555/from.arxiv" and filled["publisher"] == "arXiv"  # both the arXiv lookup's
         moved = (await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/the.right.doi"})).json()["csl"]
         assert "publisher" not in moved and moved["volume"] == "2" and moved["number"] == "arXiv:2401.05555"
+
+
+async def test_a_doi_changed_twice_keeps_a_field_a_merge_gave_after_the_first(tmp_path, monkeypatch):
+    import scholia_app
+
+    def with_a_doi(identifier, title):
+        return scholia_app_feed(identifier, title).replace(b"</entry>", b"<arxiv:doi>10.5555/from.arxiv</arxiv:doi></entry>")
+
+    scholia_app_feed = scholia_app.arxiv_feed
+    monkeypatch.setattr(scholia_app, "arxiv_feed", with_a_doi)
+    async with started(tmp_path / "data", MockProvider(scholarly=MockScholarly(arxiv={"2401.05555": "A Preprint"}))) as client:
+        project = await project_of(client)
+        result = await imported(client, project, b"@misc{k, title={A Preprint}, eprint={2401.05555}, archivePrefix={arXiv}}",
+                                "export.bib")
+        await run_finished(client, result["lookup_run_id"])
+        [paper] = result["imported"]
+        first = (await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/second"})).json()["csl"]
+        assert "publisher" not in first  # the arXiv lookup's, gone with the DOI it gave
+        await imported(client, project, ris(("A Preprint", "DO  - 10.5555/second\nPB  - Merged Press\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        second = (await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/third"})).json()["csl"]
+        assert second["publisher"] == "Merged Press"  # the merged record's own

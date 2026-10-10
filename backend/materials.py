@@ -795,16 +795,17 @@ def _fill_imported(conn, material, found):
     return sorted(added)
 
 
-def _lookup_filled(conn, material, doi):
+def _lookup_filled(conn, material, doi, resolved):
     """The fields the lookups of a DOI filled in a reference file's paper (each lookup step records them),
-    and those of the lookup that gave the paper that DOI (arXiv's record, say): not its record's, so a DOI
-    the researcher changes takes them with it (S1-14). doi: the old DOI, or "" for none."""
+    and, while the paper still has what a lookup resolved (resolved: an earlier change of DOI clears it),
+    those of the lookup that gave it its DOI (arXiv's record, say): not its record's, so a DOI the
+    researcher changes takes them with it (S1-14). doi: the old DOI, or "" for none."""
     return {key for (keys,) in conn.execute(
         "SELECT json_extract(e.data, '$.filled') FROM runs r, json_each(r.inputs, '$.material_ids') j"
         " JOIN run_events e ON e.run_id = r.id WHERE r.workflow = 'lookup' AND j.value = ?1"
         " AND e.type = 'step_finished' AND json_extract(e.data, '$.material_id') = ?1"
         " AND json_extract(e.data, '$.filled') IS NOT NULL AND (json_extract(e.data, '$.identifier') = 'doi:' || ?2"
-        " OR EXISTS (SELECT 1 FROM json_each(e.data, '$.filled') WHERE value = 'DOI'))", (material, doi))
+        " OR ?3 AND EXISTS (SELECT 1 FROM json_each(e.data, '$.filled') WHERE value = 'DOI'))", (material, doi, resolved))
         for key in json.loads(keys)}
 
 
@@ -812,8 +813,8 @@ def _kept_on_move(conn, material, csl):
     """What a paper's details keep when the researcher changes or clears its DOI: the fields the details
     form shows; a reference file's paper also keeps its record's own fields, all but those a lookup
     filled for the old DOI (S1-14)."""
-    source = conn.execute("SELECT source FROM materials WHERE id = ?", (material,)).fetchone()
-    filled = _lookup_filled(conn, material, csl.get("DOI") or "") \
+    source = conn.execute("SELECT source, resolved_at FROM materials WHERE id = ?", (material,)).fetchone()
+    filled = _lookup_filled(conn, material, csl.get("DOI") or "", bool(source[1])) \
         if source is not None and source[0] == "reference_file" else None
     return {key: value for key, value in csl.items() if key in _FORM_FIELDS or (filled is not None and key not in filled)}
 

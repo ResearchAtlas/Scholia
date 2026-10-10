@@ -339,5 +339,26 @@ def test_json_whose_strings_hold_other_line_ends_is_still_json():
 
 
 def test_the_bibtex_bound_counts_with_the_parsers_own_block_start():
+    import re
+
     from bibtexparser import splitter
-    assert splitter._BLOCK_START == r"@[\w]*( |\t)*(?=[{(])"  # bibtexparser 2's, read by reference_files
+    assert splitter._BLOCK_START == r"@[\w]*( |\t)*(?=[{(])"  # bibtexparser 2's, which reference_files' equals
+    for text in ("@misc{", "@ {", "@\t(", "@1x_é {", "a@b{", "@{", "@x y{", "@@x{", "@ \n{", "@string1{a=1}"):
+        assert [m.group(0) for m in re.finditer(splitter._BLOCK_START, text)] == \
+            [m.group(0) for m in rf._BLOCK_START.finditer(text)], text
+
+
+@pytest.mark.parametrize("block", ["@{\n", "@string1{a=1}\n", "@1{}", "@é{}"])
+def test_too_many_bibtex_blocks_are_refused_before_the_parser_runs(block, monkeypatch):
+    import bibtexparser
+
+    def never(*args, **kwargs):
+        raise AssertionError("the parser ran")
+
+    monkeypatch.setattr(bibtexparser, "parse_string", never)
+    assert unreadable("@misc{k, title={T}}\n" + block * (rf.MAX_BLOCKS + 1)) == "too_many_records"
+
+
+def test_a_run_of_spaces_after_an_at_sign_is_read_as_one():
+    [record], _, _ = parse("@misc{k, title={T}}\n@" + " " * (4 * 1024 * 1024) + "x")
+    assert record["title"] == "T"
