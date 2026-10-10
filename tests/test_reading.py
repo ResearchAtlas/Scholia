@@ -772,6 +772,9 @@ def test_a_failed_checks_cleanup_ends_only_the_processes_it_saw(monkeypatch):
     records[6].start[0] = 101  # the sentinel left behind, its child gone
     end_reader(reader)
     assert ended == [6]
+    records[5].start[0] = 100  # the child itself still there
+    end_reader(reader)
+    assert ended == [6, 5, 6]
 
 
 def test_a_sentinel_is_its_childs_stopped_child_in_its_group(monkeypatch):
