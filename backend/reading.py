@@ -3,6 +3,9 @@ sections 1.5, 7.1 and 13; ticket 60 B1, Harold's decisions of 2026-10-09).
 
 Each reading (an extract run) and each page image parses its file in a child process of its own,
 started for it and ended with it: `read` and `render` are the parent's side, `main` the child's.
+A reference file (S1-14) is read so too, by `references`: its bytes, never stored, follow the request
+on the child's stdin, and the child sends its records (`record` frames, each one
+backend/reference_files.py makes) and then `done`.
 The child reads the stored file itself, checks it against its hash, parses it with
 backend/extraction.py, whose per-parser bounds stay as defence in depth, and sends back what it
 found in frames. The parent keeps everything that touches the database, so a child that is killed
@@ -86,9 +89,11 @@ log = logging.getLogger(__name__)
 READING_CEILING = 1024 * 1024 * 1024  # bytes of physical footprint, a reading's child at its peak
 RENDER_CEILING = 768 * 1024 * 1024  # a page image's child
 # A reference file's child (S1-14), by the same rule: the largest peak measured among the files
-# backend/reference_files.py accepts is 125 MiB (10 MiB of RIS in 10,000 records); BibTeX's 10,000
-# entries 116 MiB, one 10 MiB field 101 MiB; the longest silence 1.1 s (LaTeX in a 10 MiB value).
-REFERENCES_CEILING = 512 * 1024 * 1024
+# backend/reference_files.py accepts is 399 MiB (one BibTeX entry of 1.2 million short fields, which
+# bibtexparser holds whole); a RIS, EndNote or NoteExpress record of a million lines 93 MiB, 10,000
+# records 145 MiB; the longest silence 2.6 s. It takes one of the readings' turns (materials.READINGS),
+# under a reading's own ceiling, so the children's worst case above holds.
+REFERENCES_CEILING = 768 * 1024 * 1024
 # The time ceiling: the longest silence measured in an accepted reading is 4.9 s (pylatexenc parsing
 # LaTeX of 480,000 marks, in one step); an ordinary document's is under 1.1 s (a page read by Vision).
 # pylatexenc on a run of plain text with no mark takes 21 s at 1 MiB and 82 s at 2 MiB.

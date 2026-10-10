@@ -257,3 +257,42 @@ def test_a_wrong_record_from_the_child_is_a_wrong_frame():
         received.take(json.dumps({"done": {"format": "ris", "skipped": {}}}).encode())  # nothing read, nothing skipped
     with pytest.raises(reading._Bad):
         received.take(json.dumps({"done": {"format": "docx", "skipped": {"no_title": 1}}}).encode())
+
+
+# From the writer's first review (2026-10-10)
+
+
+def test_half_a_surrogate_pair_from_json_never_reaches_a_record():
+    text = ('[{"title": "Emoji \\ud83d cut", "abstract": "\\udc00 abstract", "container-title": "Venue \\ud800",'
+            ' "author": [{"family": "Fam\\ud800", "given": "Giv"}, {"literal": "\\udfff Lit"}]}]')
+    [record], _, _ = parse(text)
+    assert record["title"] == "Emoji � cut" and record["abstract"] == "� abstract"
+    assert record["container-title"] == "Venue �" and record["author"][0] == {"family": "Fam�", "given": "Giv"}
+    assert rf.valid(record) and json.dumps(record, ensure_ascii=False).encode()  # the database and JSON answers take it
+    assert not rf.valid({"type": "article", "title": "Half \ud800 a pair"})
+    assert not rf.valid({"type": "article", "title": "T", "author": [{"literal": "\udfff"}]})
+
+
+@pytest.mark.parametrize("end", ["\r", " ", "\x0c", "\r\n"])
+def test_every_line_end_counts_and_reads_records_alike(end):
+    ris = f"TY  - JOUR{end}TI  - T{end}ER  - {end}"
+    assert unreadable(ris * (rf.MAX_RECORDS + 1)) == "too_many_records"
+    assert len(parse(ris * 3)[0]) == 3
+    endnote = f"%0 Book{end}%T T{end}{end}"
+    assert unreadable(endnote * (rf.MAX_RECORDS + 1)) == "too_many_records"
+    assert [r["title"] for r in parse(f"{{Reference Type}}: Book{end}{{Title}}: One{end}" * 2)[0]] == ["One", "One"]
+
+
+def test_a_record_of_very_many_lines_keeps_its_bounds():
+    [ris], _, _ = parse("TY  - JOUR\nTI  - T\n" + "AU  - Family, Given\n" * 50_000 + "ER  - \n")
+    [endnote], _, _ = parse("%0 Book\n%T T\n" + "%A Family, Given\n" * 50_000)
+    [noteexpress], _, _ = parse("{Reference Type}: Book\n{Title}: T\n" + "{Author}: 甲;乙\n" * 50_000)
+    assert [len(r["author"]) for r in (ris, endnote, noteexpress)] == [rf.AUTHORS] * 3
+    [csl], _, _ = parse(json.dumps([{"title": "T", "author": [{"literal": "x"}] * 50_000}]))
+    assert len(csl["author"]) == rf.AUTHORS
+
+
+def test_a_name_cut_to_its_bound_is_still_a_visible_name_or_none():
+    for name in ("​" * 300 + "Visible", "​" * 199 + "AB", "Fam" + "​" * 300 + ", Given"):
+        [record], _, _ = parse(f"TY  - JOUR\nTI  - T\nAU  - {name}\nAU  - Kept, Name\nER  - \n")
+        assert rf.valid(record) and {"family": "Kept", "given": "Name"} in record["author"]

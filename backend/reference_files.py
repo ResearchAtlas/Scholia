@@ -21,10 +21,10 @@ a Han-script one included, is kept whole (literal). Nothing here logs content, a
 kept from logging it.
 """
 
+import io
 import json
 import logging
 import re
-import unicodedata
 from urllib.parse import urlsplit
 
 from backend.extraction import ARXIV, Unreadable, clean_doi
@@ -43,6 +43,7 @@ KEYWORDS = 50
 KEYWORD_CHARS = 200
 CONTINUATION_LINES = 200  # a field's lines after its first; later ones are left out
 CONTINUATION_CHARS = 2 * ABSTRACT_CHARS  # and their characters
+RECORD_LINES = 1000  # a record's tagged lines (its fields, one an author); later ones are left out
 BEAT_EVERY = 500  # records or lines between two beats
 PARSER = ("references", "1")  # what the child names when it is ready (backend/reading.py)
 FORMATS = ("ris", "bibtex", "csl_json", "noteexpress", "endnote")
@@ -55,8 +56,10 @@ _YEAR = re.compile(r"(?<!\d)(1\d{3}|2[01]\d{2}|2200)(?!\d)")  # the details form
 _DOI_PREFIX = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
 _ARXIV_IN = re.compile(r"(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})"
                        r"(?:v\d+)?", re.IGNORECASE)
-_HAN = re.compile(r"[㐀-鿿豈-﫿]")
 _LATEX = re.compile(r"[\\{}$~]")
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # Unicode's control characters (Cc)
+_SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair, which only JSON's escapes can give: no text holds one
+_BREAKS = re.compile("\r\n?|[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")  # every line end str.splitlines() takes, but \n
 
 # The parsers log what they read (bibtexparser's splitter quotes a block it could not read). Their
 # loggers never write, at any level; the child's own output goes nowhere (backend/reading.py).
@@ -72,15 +75,18 @@ def parse(data, beat=lambda: None):
     if len(data) > MAX_BYTES:
         raise Unreadable("reference_file_too_large")
     text = _decode(data)
+    del data
     if not text.strip():
         raise Unreadable("no_records")
-    kind = detect(text)
+    lined = _BREAKS.sub("\n", text)  # one line end, so a record counted is a record read
+    kind = detect(lined)
     if kind is None:
         raise Unreadable("unsupported_reference_file")
     reader = {"ris": _ris, "bibtex": _bibtex, "csl_json": _csl_json, "noteexpress": _noteexpress,
               "endnote": _endnote}[kind]
     records, skipped, chars = [], {}, 0
-    for done, record in enumerate(reader(text, beat), start=1):  # each record kept within its bounds as it comes
+    # Each record kept within its bounds as it comes. JSON keeps its own text: a line end in its strings is text.
+    for done, record in enumerate(reader(text if kind == "csl_json" else lined, beat), start=1):
         if done % BEAT_EVERY == 0:
             beat()
         csl = None if record is None else _finish(record)
@@ -139,28 +145,57 @@ def _counted(count):
 # _finish cleans and bounds it.
 
 
+def _lines(text, beat):
+    """The text's lines, one at a time (never all of them held), a beat every so many."""
+    for number, line in enumerate(io.StringIO(text)):
+        if number % (BEAT_EVERY * 20) == 0:
+            beat()
+        yield line.rstrip("\n")
+
+
+def _records(lines, starts, tagged, ends=lambda line: False):
+    """Each record's lines, one record at a time: from a line starts() says begins one to the next such
+    line, or to a line ends() says closes it. A record keeps at most RECORD_LINES of the lines tagged()
+    takes (its fields), and each field at most CONTINUATION_LINES lines after its first, of
+    CONTINUATION_CHARS characters together; a field left out takes its lines with it. Lines outside
+    a record are left out."""
+    record, after, chars = None, 0, 0
+    for line in lines:
+        if starts(line):
+            if record:
+                yield record
+            record, after, chars = [line], 0, 0
+        elif record is None:
+            continue
+        elif ends(line):
+            yield record
+            record = None
+        elif tagged(line):
+            kept = len(record) < RECORD_LINES
+            if kept:
+                record.append(line)
+            after, chars = (0, 0) if kept else (CONTINUATION_LINES, CONTINUATION_CHARS)
+        elif (after := after + 1) <= CONTINUATION_LINES and (chars := chars + len(line)) <= CONTINUATION_CHARS:
+            record.append(line)
+    if record:
+        yield record
+
+
 def _ris(text, beat):
     import rispy
 
     _counted(len(re.findall(r"^TY  -", text, re.MULTILINE)))
-
-    def lines():  # each field's continuation lines and characters bounded, and the last record closed
-        after = chars = 0
-        for number, line in enumerate(text.splitlines()):
-            if number % (BEAT_EVERY * 20) == 0:
-                beat()
-            if line[2:5] == "  -" and line[:2].isupper() and line[:1].isalpha():
-                after = chars = 0
-                yield line
-            elif (after := after + 1) <= CONTINUATION_LINES and (chars := chars + len(line)) <= CONTINUATION_CHARS:
-                yield line
-        yield "ER  - "
-
-    try:
-        found = rispy.RisParser(skip_unknown_tags=True).parse_lines(lines())
-    except Exception:  # a file it could not take apart: its type alone, never its text, is known here
-        raise Unreadable("unreadable_file") from None
-    for entry in found:
+    parser = rispy.RisParser(skip_unknown_tags=True)
+    tag = re.compile(r"[A-Z][A-Z0-9]  -")
+    for lines in _records(_lines(text, beat), lambda line: line.startswith("TY  -"), tag.match,
+                          lambda line: line.startswith("ER  -")):
+        try:  # one record at a time, closed here whether or not the file closed it
+            entry = next(iter(parser.parse_lines(iter([*lines, "ER  - "]))), None)
+        except Exception:  # a record it could not take apart: its type alone, never its text, is known here
+            entry = None
+        if entry is None:
+            yield None
+            continue
         kind = _first(entry.get("type_of_reference")) or ""
         start, end = _first(entry.get("start_page")), _first(entry.get("end_page"))
         yield {
@@ -300,7 +335,7 @@ def _csl_json(text, beat):
         year = (parts[0][0] if isinstance(parts, list) and parts and isinstance(parts[0], list) and parts[0]
                 else issued.get("raw") if isinstance(issued, dict) else issued)
         authors = []
-        for author in item.get("author") if isinstance(item.get("author"), list) else []:
+        for author in item.get("author")[:AUTHORS * 4] if isinstance(item.get("author"), list) else []:
             if isinstance(author, dict):
                 family, given = author.get("family"), author.get("given")
                 authors.append({"family": family, "given": given} if isinstance(family, str) and isinstance(given, str)
@@ -317,25 +352,19 @@ def _csl_json(text, beat):
 
 
 def _tagged(text, start, line, beat):
-    """The records of a tagged format whose record starts with the tag start, each a list of (tag,
-    value) as line(text) reads them; a line no tag starts continues the one before."""
-    _counted(sum(1 for found in re.finditer(line, text, re.MULTILINE) if found.group(1) == start))
-    records, after, chars = [], 0, 0
-    for number, row in enumerate(text.splitlines()):
-        if number % (BEAT_EVERY * 20) == 0:
-            beat()
-        found = re.match(line, row)
-        if found is not None:
-            tag, value = found.group(1), found.group(2)
-            if tag == start:
-                records.append([])
-            if records:
-                records[-1].append((tag, [value]))
-            after = chars = 0
-        elif records and records[-1] and row.strip() and (after := after + 1) <= CONTINUATION_LINES \
-                and (chars := chars + len(row)) <= CONTINUATION_CHARS:
-            records[-1][-1][1].append(row.strip())
-    return [[(tag, " ".join(parts)) for tag, parts in record] for record in records]
+    """The records of a tagged format whose record starts with the tag start, one at a time, each a
+    list of (tag, value) as the pattern line reads them; a line no tag starts continues the one before."""
+    pattern = re.compile(line, re.MULTILINE)
+    _counted(sum(1 for found in pattern.finditer(text) if found.group(1) == start))
+    for lines in _records(_lines(text, beat), lambda row: (found := pattern.match(row)) is not None
+                          and found.group(1) == start, pattern.match):
+        fields = []
+        for row in lines:
+            if (found := pattern.match(row)) is not None:
+                fields.append((found.group(1), [found.group(2)]))
+            elif row.strip():
+                fields[-1][1].append(row.strip())
+        yield [(tag, " ".join(parts)) for tag, parts in fields]
 
 
 def _endnote(text, beat):
@@ -390,13 +419,14 @@ def _list(value):
 
 
 def _text(value, limit):
-    """A field's text: cut before it is worked on, its whitespace collapsed and its control
-    characters dropped, at most limit characters, or None when nothing visible is left."""
+    """A field's text: cut before it is worked on, its control characters made spaces and half a
+    surrogate pair (JSON's escapes can give one) the replacement character, its whitespace collapsed,
+    cut to limit characters; None when nothing visible is left."""
     if isinstance(value, int) and not isinstance(value, bool):  # a volume or page CSL JSON gives as a number
         value = str(value)
     if not isinstance(value, str):
         return None
-    value = " ".join("".join(c if unicodedata.category(c) != "Cc" else " " for c in value[:limit * 4]).split())
+    value = " ".join(_SURROGATE.sub("\ufffd", _CONTROL.sub(" ", value[:limit * 4])).split())
     return visible(value[:limit])
 
 
@@ -408,9 +438,11 @@ def _name(value):
     if name is None:
         return None
     family, comma, given = name.partition(",")
-    if comma and visible(family) and visible(given):
-        return {"family": visible(family)[:NAME_CHARS], "given": visible(given)[:NAME_CHARS]}
-    return {"literal": name[:NAME_CHARS]}
+    family, given = _text(family, NAME_CHARS), _text(given, NAME_CHARS)  # each cut, then seen to be visible still
+    if comma and family and given:
+        return {"family": family, "given": given}
+    literal = _text(name, NAME_CHARS)
+    return {"literal": literal} if literal else None
 
 
 def _url(values):
@@ -439,7 +471,7 @@ def _finish(record):
         return None
     csl = {"type": record["type"] if isinstance(record.get("type"), str) and _TYPE.fullmatch(record["type"])
            else "article", "title": title}
-    authors = [name for name in map(_name, record.get("author") or []) if name][:AUTHORS]
+    authors = [name for name in map(_name, (record.get("author") or [])[:AUTHORS * 4]) if name][:AUTHORS]
     if authors:
         csl["author"] = authors
     if isinstance(record.get("issued"), str) and (year := _YEAR.search(record["issued"][:100])):
@@ -480,7 +512,8 @@ def valid(csl):
     KEYS only, each of its type and within its bound, with a visible title. Anything else is a
     wrong frame."""
     def text(value, limit):
-        return type(value) is str and 0 < len(value) <= limit and visible(value) is not None
+        return type(value) is str and 0 < len(value) <= limit and visible(value) is not None \
+            and not _SURROGATE.search(value)  # none the database or a JSON answer could not encode
 
     def name(author):
         return type(author) is dict and (list(author) == ["literal"] and text(author["literal"], NAME_CHARS)
