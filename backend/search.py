@@ -135,7 +135,9 @@ async def open_index(state, db):
             except RuntimeError:  # the app stopped meanwhile: the next launch requests the runs
                 pass
     index.rebuilt = rebuilt
-    deletion.CLEANUP[db] = index.apply  # a deletion's removals, applied after its commit
+    # A deletion's removals, applied after its commit; while a whole rebuild runs (or failed, its file
+    # discarded), the pass after it applies them, and the deletion does not wait for the rebuild.
+    deletion.CLEANUP[db] = lambda: index.apply_soon() if index.building else index.apply()
     if rebuilding is None:
         index.apply_soon()
     installed = _installed(state)

@@ -622,8 +622,7 @@ async def test_a_whole_rebuild_that_keeps_failing_leaves_search_unavailable_neve
     attempts = _failing_rebuilds(monkeypatch, max(first, second), failures=10_000)  # after the other's rows
     async with app(tmp_path) as client:
         index = client.state["index"]
-        await _until(lambda: len(attempts) >= 3)  # tried again, and again
-        assert not path.exists()  # each attempt's partial file discarded
+        await _until(lambda: len(attempts) >= 3)  # tried again, and again (each partial file discarded: see above)
         with pytest.raises(search_index.Unavailable):  # nothing is written to it meanwhile
             await asyncio.to_thread(index.store, first, [])
         for project in (first, second):
@@ -642,6 +641,7 @@ async def test_a_whole_rebuild_that_keeps_failing_leaves_search_unavailable_neve
 async def test_a_deletion_while_a_rebuild_keeps_failing_leaves_no_deleted_text_at_rest(tmp_path, monkeypatch):
     """Finding 19: the failed rebuild's partial file is discarded, so a paper deleted meanwhile rests in no
     index file or WAL, before the rebuild succeeds or after."""
+    import threading
     monkeypatch.setattr(search_index, "RETRY_SECONDS", (0.05, 0.1))
     english = "Pangolins audit cerulean xylophones"
     async with app(tmp_path) as client:
@@ -653,27 +653,24 @@ async def test_a_deletion_while_a_rebuild_keeps_failing_leaves_no_deleted_text_a
         path = client.state["index"].path
     await _unfinished(path)
     files = [path, Path(f"{path}-wal")]
-    failing = {"on": True}
-    attempts, real_add = [], SearchIndex._add
-
-    def failing_add(self, project, pid, reading):
-        if self.building and project == late and failing["on"]:
-            attempts.append(True)
-            raise search_index.apsw.IOError("disk I/O error")
-        return real_add(self, project, pid, reading)
-    monkeypatch.setattr(SearchIndex, "_add", failing_add)
-    async with app(tmp_path) as client:
-        index = client.state["index"]
-        await _until(lambda: len(attempts) >= 2 and index.unusable)
-        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
-        left = b"".join(f.read_bytes() for f in files if f.exists())
-        assert english.encode() not in left and b"pangolins" not in left  # no partial file holds it
-        failing["on"] = False
-        await _until(lambda: not index.unusable and not index.building)
-        status = await until_embedded(client, late)
-        assert status["state"] == "ready" and (await idle(client, early))["passages"]["indexed"] == 0
-        left = b"".join(f.read_bytes() for f in files if f.exists())
-        assert english.encode() not in left and b"pangolins" not in left and b"cerulean" not in left
+    held = threading.Event()
+    attempts = _failing_rebuilds(monkeypatch, late, failures=2, held=held)  # the third waits, then succeeds
+    try:
+        async with app(tmp_path) as client:
+            index = client.state["index"]
+            await _until(lambda: len(attempts) == 3)  # two failed, each after the early project's rows
+            assert index.unusable
+            assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+            left = b"".join(f.read_bytes() for f in files if f.exists())
+            assert english.encode() not in left and b"pangolins" not in left  # no partial file holds it
+            held.set()
+            await _until(lambda: not index.unusable and not index.building)
+            status = await until_embedded(client, late)
+            assert status["state"] == "ready" and (await idle(client, early))["passages"]["indexed"] == 0
+            left = b"".join(f.read_bytes() for f in files if f.exists())
+            assert english.encode() not in left and b"pangolins" not in left and b"cerulean" not in left
+    finally:
+        held.set()
 
 
 @pytest.mark.asyncio
