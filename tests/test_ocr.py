@@ -24,7 +24,7 @@ from backend.db import new_id
 from backend.self_test import scanned_pdf
 import synthetic_materials as synthetic
 from scholia_app import MockProvider, MockScholarly, background_idle, openalex_work, run_finished, started
-from test_materials import added, listing, project_of, rows, settled
+from test_materials import added, kept_queue, listing, project_of, rows, settled  # noqa: F401
 
 DOI = "10.5555/scholia.scanned.001"
 LINE = ocr.Line("Recognized text of a scanned page, read by the engine.", (0.1, 0.1, 0.9, 0.12), 0.9)
@@ -110,7 +110,7 @@ async def test_a_reading_cancelled_while_a_page_is_recognized_stops_there_writes
 
 
 @pytest.mark.asyncio
-async def test_a_failed_recognition_writes_nothing_says_so_and_retry_reads_the_paper(tmp_path, monkeypatch):
+async def test_a_failed_recognition_writes_nothing_says_so_and_retry_reads_the_paper(tmp_path, monkeypatch, kept_queue):
     engine = use(monkeypatch, Engine(fail={2}))  # the second page fails, the first was read
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
@@ -154,7 +154,8 @@ async def test_deleting_while_a_page_is_recognized_sends_no_later_page_and_write
 
 
 @pytest.mark.asyncio
-async def test_one_projects_deletion_during_recognition_leaves_another_projects_reading_of_the_file(tmp_path, monkeypatch):
+async def test_one_projects_deletion_during_recognition_leaves_another_projects_reading_of_the_file(tmp_path, monkeypatch,
+                                                                                                   kept_queue):
     engine = use(monkeypatch, Engine(hold=True))
     async with started(tmp_path / "data") as client:
         mine, theirs, same = await project_of(client, "Mine"), await project_of(client, "Theirs"), ("scan.pdf", scan(2))
@@ -662,7 +663,7 @@ async def earlier_library(data, monkeypatch, scholarly=None):
 
 @pytest.mark.asyncio
 async def test_papers_read_before_ocr_are_read_again_once_at_launch_and_their_old_readings_go(tmp_path, monkeypatch,
-                                                                                              quick):
+                                                                                              quick, kept_queue):
     data = tmp_path / "data"
     papers = await earlier_library(data, monkeypatch)
     async with started(data, setup=False) as client:

@@ -69,52 +69,17 @@ def check_sqlite() -> dict:
 
 
 def check_index() -> dict:
-    """The search index's SQLite: APSW, with FTS5 secure-delete and sqlite-vec."""
-    import apsw
-    import sqlite_vec
+    """The search index's SQLite: APSW's, with FTS5 secure-delete, the app's tokenizer and sqlite-vec,
+    through the app's own index module (backend/search_index.py), so the build proves its real code path."""
+    from backend import search_index
 
-    version = apsw.sqlite_lib_version()
-    if not _at_least(version):
-        raise RuntimeError(f"APSW has SQLite {version}, older than 3.42")
     with tempfile.TemporaryDirectory() as folder:
-        con = apsw.Connection(str(Path(folder, "search.sqlite3")))
-        try:
-            con.execute(
-                "CREATE VIRTUAL TABLE fts USING fts5(text, project_id UNINDEXED, passage_id UNINDEXED);"
-                "INSERT INTO fts(fts, rank) VALUES ('secure-delete', 1);"
-                "INSERT INTO fts VALUES ('alpha beta', 'p1', 1), ('beta gamma', 'p1', 2);"
-                "DELETE FROM fts WHERE passage_id = 1;"
-            )
-            setting = con.execute("SELECT v FROM fts_config WHERE k = 'secure-delete'").get
-            hits = con.execute("SELECT passage_id FROM fts WHERE fts MATCH 'beta'").get
-            if setting != 1 or hits != 2:
-                raise RuntimeError(f"FTS5 secure-delete: setting {setting!r}, match {hits!r}")
-
-            con.enable_load_extension(True)
-            con.load_extension(sqlite_vec.loadable_path())
-            con.enable_load_extension(False)
-            vec_version = con.execute("SELECT vec_version()").get
-            if vec_version != SQLITE_VEC_VERSION:
-                raise RuntimeError(f"sqlite-vec {vec_version}, expected {SQLITE_VEC_VERSION}")
-            con.execute(
-                "CREATE VIRTUAL TABLE vec USING vec0("
-                f"project_id TEXT PARTITION KEY, passage_id INTEGER, embedding float[{DIMENSIONS}])"
-            )
-            rows = [("p1", 1, 0.0), ("p1", 2, 1.0), ("p2", 3, 0.1)]
-            for project, passage, value in rows:
-                con.execute(
-                    "INSERT INTO vec(project_id, passage_id, embedding) VALUES (?, ?, ?)",
-                    (project, passage, sqlite_vec.serialize_float32([value] * DIMENSIONS)),
-                )
-            nearest = con.execute(
-                "SELECT passage_id FROM vec WHERE embedding MATCH ? AND k = 1 AND project_id = 'p1'",
-                (sqlite_vec.serialize_float32([0.05] * DIMENSIONS),),
-            ).get
-            if nearest != 1:
-                raise RuntimeError(f"vec0 nearest neighbour in project p1 is {nearest!r}, not 1")
-        finally:
-            con.close()
-    return {"sqlite": version, "apsw": apsw.apsw_version(), "sqlite_vec": vec_version}
+        found = search_index.self_check(folder)
+    if not _at_least(found["sqlite"]):
+        raise RuntimeError(f"APSW has SQLite {found['sqlite']}, older than 3.42")
+    if found["sqlite_vec"] != SQLITE_VEC_VERSION:
+        raise RuntimeError(f"sqlite-vec {found['sqlite_vec']}, expected {SQLITE_VEC_VERSION}")
+    return found
 
 
 def verify_model(path: Path) -> None:

@@ -25,7 +25,7 @@ from backend.runs import _event
 from backend.settings import visible
 
 # The kinds that rule the text box out, and how many options an ask may offer.
-NO_TEXT = {"identifier_lookup"}
+NO_TEXT = {"identifier_lookup", "model_download"}
 MAX_OPTIONS = 3
 
 router = APIRouter()
@@ -72,6 +72,13 @@ def asked(conn, run_id):
         elif ask is not None and record.get("ask_id") == ask["ask_id"]:
             answer = record
     return ask, answer
+
+
+def researcher_answered(conn, run_id):
+    """Whether the researcher answered one of the run's asks (not a withdrawal), whatever became of the
+    run after (S1-17: the search model's offer is made once per project)."""
+    return conn.execute("SELECT 1 FROM run_events WHERE run_id = ? AND type = 'ask_answered'"
+                        " AND json_extract(data, '$.by') = 'researcher' LIMIT 1", (run_id,)).fetchone() is not None
 
 
 def _current_policy(conn, project_id):

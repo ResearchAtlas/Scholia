@@ -20,7 +20,7 @@ import backend.materials as materials_module
 import synthetic_materials as synthetic
 from scholia_app import (Chunks, MockProvider, MockScholarly, arxiv_feed, background_idle, crossref_work, openalex_work,
                          run_finished, started, streamed)
-from test_materials import added, hold_extraction, listing, project_of, rows, settled
+from test_materials import added, hold_extraction, kept_queue, listing, project_of, rows, settled  # noqa: F401
 
 pytestmark = pytest.mark.asyncio
 
@@ -349,7 +349,7 @@ async def test_the_lookup_a_late_reading_brings_asks_in_the_conversation_its_fil
 
 @pytest.mark.parametrize("level", ["normal", "local_only"])
 async def test_another_projects_reading_of_the_file_brings_the_lookup_a_stopped_reading_never_gave(
-        tmp_path, monkeypatch, level):
+        tmp_path, kept_queue, monkeypatch, level):
     reached, go = hold_extraction(monkeypatch)
     pdf = synthetic.paper_pdf()
     async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
@@ -372,11 +372,12 @@ async def test_another_projects_reading_of_the_file_brings_the_lookup_a_stopped_
         assert (shared["state"], shared["title"], shared["lookup"]["outcome"]) == ("ready", TITLE, "resolved")
         assert shared["lookup"]["run_id"] not in (result["lookup_run_id"], theirs["lookup_run_id"])
         assert [p["title"] for p in await settled(client, second)] == [TITLE]
-        # Its passages reach both projects' search index, each once.
+        # Its passages reach both projects' search index (each queued again once a lookup's title changes
+        # their index text, S1-17).
         (passages,) = (await rows(client, "SELECT count(*) FROM passages"))[0]
-        queued = await rows(client, "SELECT project_id, count(*), count(DISTINCT target_id) FROM index_queue"
+        queued = await rows(client, "SELECT project_id, count(DISTINCT target_id) FROM index_queue"
                                     " WHERE op = 'add' GROUP BY project_id ORDER BY project_id")
-        assert passages and queued == sorted([(first, passages, passages), (second, passages, passages)])
+        assert passages and queued == sorted([(first, passages), (second, passages)])
 
 
 async def test_a_reading_tried_again_while_its_batchs_lookup_still_waits_is_looked_up_once(tmp_path, monkeypatch):
@@ -635,8 +636,8 @@ async def test_a_kick_and_a_retry_of_a_run_left_running_never_both_run_it(tmp_pa
         else:  # the kick holds it and starts it while the retry's transaction is open
             real_retry = materials_module._retry
 
-            def retry(conn, run_id, registry):
-                found = real_retry(conn, run_id, registry)
+            def retry(conn, run_id, registry, derived=None):
+                found = real_retry(conn, run_id, registry, derived)
                 active = registry.add_background(run_id)
                 loop.call_soon_threadsafe(lambda: setattr(active, "task", loop.create_task(harness._background(active))))
                 return found

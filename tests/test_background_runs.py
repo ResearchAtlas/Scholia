@@ -105,6 +105,47 @@ async def test_a_reading_whose_terminal_write_fails_reads_interrupted_needs_atte
         assert ready["state"] == "ready" and ready["extraction"]["passages"] > 0
 
 
+async def test_the_list_reads_a_runs_status_and_its_retry_at_one_moment(tmp_path, monkeypatch):
+    """A reading whose terminal write fails is released just after the list's read has looked at it (held,
+    so not to be tried again) and before the list answers: the row says running without Retry, as its read
+    found it, never interrupted without Retry (which a later read would correct)."""
+    from backend import materials
+    from backend import runs as runs_module
+    real_finish, real_details = runs_module.Harness._finish_local, materials.run_details
+    writing, looked, target = threading.Event(), threading.Event(), []
+
+    def failing_once(self, conn, active, status, cancel_reason, summary, effect=None):
+        if effect is not None and not target:  # the reading's terminal write: fails once the list has looked
+            target.append(active.run_id)
+            writing.set()
+            looked.wait(10)
+            raise RuntimeError("the terminal write failed")
+        return real_finish(self, conn, active, status, cancel_reason, summary, effect)
+
+    async with started(tmp_path / "data") as client:
+        registry = client.state["harness"].registry
+
+        def looking(conn, run_id, *args):  # the list's read, the run still held; then held up until it is released
+            found = real_details(conn, run_id, *args)
+            if target and run_id == target[0] and not looked.is_set():
+                looked.set()
+                for _ in range(500):
+                    if not registry.is_active(run_id):
+                        break
+                    threading.Event().wait(0.01)
+            return found
+        monkeypatch.setattr(runs_module.Harness, "_finish_local", failing_once)
+        monkeypatch.setattr(materials, "run_details", looking)
+        project = await project_of(client)
+        [paper] = (await added(client, project, PDF))["materials"]
+        assert await asyncio.to_thread(writing.wait, 10)
+        [row] = (await client.get("/api/activity", params={"run_id": paper["run_id"]})).json()["runs"]
+        assert looked.is_set() and not registry.is_active(paper["run_id"])  # released before the list answered
+        assert (row["status"], row["retryable"]) == ("running", False)  # as its read found it
+        later = await run_finished(client, paper["run_id"])
+        assert (later["status"], later["retryable"]) == ("interrupted", True)
+
+
 async def test_retry_is_only_for_a_stopped_or_failed_reading_or_lookup(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)

@@ -33,6 +33,7 @@ from backend import APP_VERSION, credentials, openrouter, openrouter_client, pro
 from backend import backups
 from backend import asks, materials
 from backend import local_helper
+from backend import search  # S1-17: the search index, index runs and the search model's offer
 from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
@@ -298,12 +299,16 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         # Local background work: reading materials and looking their identifiers up; full backups and exports.
         materials.register(harness, content)
         backups.register(harness, state)
+        search.register(harness, state)  # S1-17: indexing and the search model's offer
         loop = asyncio.get_running_loop()
 
         def damaged():  # a backup's full check found it damaged: the app is limited, so its work stops too
             loop.call_soon_threadsafe(lambda: asyncio.ensure_future(harness.shutdown()))
 
         db.on_damage = damaged
+        # S1-17: the index, checked against this database (the one before closed), before the background
+        # runs start, so the index runs it records start with them.
+        await search.open_index(state, db)
         try:
             await (harness.recover() if kick else harness.recover(kick=False))
         except BaseException:
@@ -345,6 +350,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
             if state.get("harness") is not None:
                 await state["harness"].shutdown()
+            if state.get("index") is not None:  # S1-17: its writer stops before the database closes
+                await asyncio.to_thread(state.pop("index").close)
             await asyncio.to_thread(db.close)
             state.clear()
 
@@ -354,6 +361,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app.include_router(materials.router)  # materials, passages, page images and retries (S1-13)
     app.include_router(asks.router)  # the shared confirmation (S1-13)
     app.include_router(local_helper.router)  # the local model helper and its models, under Advanced
+    app.include_router(search.router)  # S1-17: search, and the index's status and rebuild
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)
@@ -1198,18 +1206,21 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 " AND (r.status = 'running' OR ?2 IS NOT NULL OR r.id IN (SELECT id FROM runs"
                 " WHERE kind = 'background' AND status != 'running' ORDER BY started_at DESC LIMIT ?1))"
                 " ORDER BY r.status = 'running' DESC, r.started_at DESC", (max(1, min(limit, 200)), run_id)).fetchall()
-            return [(row, materials.run_details(conn, row[0], row[2], row[3], row[12], registry)) for row in rows]
+            # Each run's status is worked out once, in this read, and its Retry from that same status: a run
+            # released meanwhile (its terminal write failed) never reads interrupted without its Retry.
+            return [(row, status, materials.run_details(conn, row[0], row[2], row[3], row[12], registry, status))
+                    for row in rows for status in [derived_status(row[3], row[0], registry)]]
 
         registry = harness().registry
         listed = await read(listing)
         return JSONResponse({"runs": [{
             "run_id": run, "project_id": project_id, "project_name": name, "project_kind": kind,
-            "workflow": workflow, "status": derived_status(status, run, registry), "cancel_reason": cancel,
+            "workflow": workflow, "status": status, "cancel_reason": cancel,
             "cost_usd": cost, "attempts": attempts, "started_at": started, "finished_at": finished,
             "result": json.loads(summary) if summary else None,
             "progress": registry.runs[run].progress if run in registry.runs else None, **details,
-        } for (run, project_id, workflow, status, cancel, cost, attempts, started, finished, name, kind, summary, _),
-            details in listed]}, headers={"Cache-Control": "no-store"})  # it names papers: never kept by the browser
+        } for (run, project_id, workflow, _, cancel, cost, attempts, started, finished, name, kind, summary, _),
+            status, details in listed]}, headers={"Cache-Control": "no-store"})  # it names papers: never kept by the browser
 
     # The interface: built files only, from inside their folder
 

@@ -4,16 +4,18 @@ page images), its passages leave its project's index after they were added, and 
 another project stays there. Deletion while a material is read or looked up is in test_materials.py
 and test_identifier_lookup.py; memory and the index's own checks come with S1-17 and S1-21."""
 
+import asyncio
+
 import pytest
 
 import synthetic_materials as synthetic
 from scholia_app import started
-from test_materials import added, project_of, rows, settled
+from test_materials import added, kept_queue, project_of, rows, settled  # noqa: F401
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_a_deleted_material_is_read_back_nowhere_and_leaves_its_projects_index(tmp_path):
+async def test_a_deleted_material_is_read_back_nowhere_and_leaves_its_projects_index(tmp_path, kept_queue):
     async with started(tmp_path / "data") as client:
         mine, theirs = await project_of(client, "Mine"), await project_of(client, "Theirs")
         file = ("paper.pdf", synthetic.paper_pdf())  # one file: each PDF made is a new document
@@ -39,7 +41,7 @@ async def test_a_deleted_material_is_read_back_nowhere_and_leaves_its_projects_i
 
 
 @pytest.mark.parametrize("deleted", ["markdown", "latex"])
-async def test_deleting_one_reading_of_a_file_read_two_ways_removes_its_passages_only(tmp_path, deleted):
+async def test_deleting_one_reading_of_a_file_read_two_ways_removes_its_passages_only(tmp_path, deleted, kept_queue):
     source = b"\\section{Method}\n\nText with \\emph{emphasis} here.\n"  # Markdown and LaTeX alike
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
@@ -69,7 +71,29 @@ async def test_deleting_one_reading_of_a_file_read_two_ways_removes_its_passages
         assert current["id"] == survivor["id"] and {p["id"] for p in texts} == passages[kept_reading]
 
 
-async def test_a_deleted_scanned_papers_recognized_passages_are_read_back_nowhere_and_leave_its_index(tmp_path, monkeypatch):
+async def test_a_stale_index_never_surfaces_a_deleted_or_replaced_paper(tmp_path, monkeypatch):
+    """S1-17: every search checks access again in the main database (slice-1 spec 4.3): passages the index
+    still holds, its removals not applied yet, are never returned."""
+    from backend.search_index import SearchIndex
+    from test_search import app, find, idle, index_rows, paper
+
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        [deleted] = (await added(client, project, paper("Deleted", "The aubergine finding.")))["materials"]
+        [replaced] = (await added(client, project, paper("Replaced", "The obsolete quince finding.")))["materials"]
+        await idle(client, project)
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)  # the index applies nothing from here
+        assert (await client.delete(f"/api/materials/{deleted['id']}")).status_code == 200
+        await added(client, project, paper("Replaced", "The current finding."), material_id=replaced["id"])
+        await idle(client, project)
+        texts = {r[0] for r in await index_rows(client, project)}
+        assert len(texts) == 4  # stale: still the old rows
+        for query in ("aubergine", "quince", "deleted", "obsolete"):
+            assert (await find(client, project, query))["results"] == [], query
+
+
+async def test_a_deleted_scanned_papers_recognized_passages_are_read_back_nowhere_and_leave_its_index(tmp_path, monkeypatch,
+                                                                                                         kept_queue):
     from backend import ocr
     from test_ocr import Engine, scan
 
@@ -81,6 +105,8 @@ async def test_a_deleted_scanned_papers_recognized_passages_are_read_back_nowher
         version = ready["version"]["id"]
         [passage] = (await client.get(f"/api/material-versions/{version}/passages")).json()["passages"]
         assert passage["boxes"]["ocr"]
+        await asyncio.to_thread(client.state["index"].apply)
+        assert await searched(client, project, "Recognized text of a scanned page") == {passage["id"]}  # found before
         assert (await client.delete(f"/api/materials/{paper['id']}")).status_code == 200
         for path in (f"/api/material-versions/{version}/passages", f"/api/material-versions/{version}/pages/1",
                      f"/api/passages/{passage['id']}"):
@@ -88,9 +114,21 @@ async def test_a_deleted_scanned_papers_recognized_passages_are_read_back_nowher
         assert await rows(client, "SELECT op FROM index_queue WHERE target_id = ? ORDER BY seq", passage["id"]) == [
             ("add",), ("remove",)]
         assert await rows(client, "SELECT count(*) FROM passages") == [(0,)]
+        # S1-17: search reads it back nowhere either, once the index has applied its queue (keyword search:
+        # this test has no helper)
+        await asyncio.to_thread(client.state["index"].apply)
+        assert await searched(client, project, "Recognized text of a scanned page") == set()
 
 
-async def test_a_superseded_reading_is_removed_through_the_deletion_service_and_read_back_nowhere(tmp_path, monkeypatch):
+async def searched(client, project, query):
+    """The passage ids the project's search returns for query (S1-17's API)."""
+    response = await client.post(f"/api/projects/{project}/search", json={"query": query, "limit": 50})
+    assert response.status_code == 200, response.text
+    return {r["passage_id"] for r in response.json()["results"]}
+
+
+async def test_a_superseded_reading_is_removed_through_the_deletion_service_and_read_back_nowhere(tmp_path, monkeypatch,
+                                                                                                    kept_queue):
     """S1-20: a reading another reading of its file replaced leaves each index it was in, its passages
     are read back nowhere, and its removal leaves a tombstone (section 4.2) and no dangling reference."""
     import backend.extraction as extraction
@@ -120,4 +158,11 @@ async def test_a_superseded_reading_is_removed_through_the_deletion_service_and_
         assert await rows(client, "SELECT count(*) FROM audit_log WHERE event = 'deletion'") == [(0,)]
         assert await rows(client, "SELECT count(*) FROM citations c LEFT JOIN passages p ON p.id = c.passage_id"
                                   " WHERE c.passage_id IS NOT NULL AND p.id IS NULL") == [(0,)]
+        # S1-17: search reads the superseded passages back nowhere, once the index has applied its queue
+        # (keyword search: this test has no helper); each project finds the newer reading's instead.
+        await asyncio.to_thread(client.state["index"].apply)
+        newer = {p for (p,) in await rows(client, "SELECT id FROM passages")}
+        for project in (mine, theirs):
+            found = await searched(client, project, "A paragraph of synthetic text")
+            assert found and not found & set(earlier) and found <= newer
 

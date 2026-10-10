@@ -403,10 +403,13 @@ def test_a_file_shared_with_another_material_keeps_its_extraction(db, store):
     assert ids_in(db, "passages", [x["s1"]]) == {x["s1"]}
     assert one(db, "SELECT material_id, passage_id, existence FROM citations WHERE id = ?", x["ct1"]) == (
         None, None, "source_removed")  # no way back to the passage through another project's material
-    assert queued(db) == set()  # another material in the project still uses the file
+    # Another material in the project still uses the file: no removal; its passages are queued again, so
+    # the index takes them as that material's (S1-17).
+    assert queued(db) == {("passage", x["s1"], x["project"], "add")}
 
     delete(db, store, "material", same_project)
-    assert queued(db) == {("passage", x["s1"], x["project"], "remove")}  # only this project's index rows
+    assert queued(db) == {("passage", x["s1"], x["project"], "add"),
+                          ("passage", x["s1"], x["project"], "remove")}  # only this project's index rows
     assert ids_in(db, "passages", [x["s1"]]) == {x["s1"]}  # the other project still uses it
     assert one(db, "SELECT existence FROM citations WHERE id = ?", other["ct1"]) == ("ok",)
 

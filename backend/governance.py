@@ -307,8 +307,9 @@ def policy(conn, project_id):
 
 # Local work that sends nothing off this Mac, so a stricter level or the review lock takes nothing
 # from it: reading a material, and full backups and exports (an unencrypted one stops through
-# backups.Archives). Identifier lookups and model calls are revoked.
-UNSENT_WORKFLOWS = ("extract", "full_backup", "project_export")
+# backups.Archives); indexing, whose embeddings go only to the app's own helper (S1-17).
+# Identifier lookups, model calls and the search model's offer are revoked.
+UNSENT_WORKFLOWS = ("extract", "full_backup", "project_export", "index")
 
 
 def revoke_running(conn, project_id):

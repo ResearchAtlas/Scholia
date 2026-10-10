@@ -19,6 +19,8 @@ import { Ask } from './Ask.jsx';
 import { fraction, retryRun, runOutcome } from '../runs.js';
 import { libraryChanged } from '../library.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
+import { IndexSection } from './SearchIndex.jsx'; // S1-17
+import { offerOutcome, runReason } from '../search.js'; // S1-17
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
@@ -26,7 +28,8 @@ import { cn } from '@/lib/utils';
 
 const PAGES = ['general', 'providers', 'subagents', 'project', 'advanced'];
 const WORKFLOWS = { title: 'settings.workflowTitle', extract: 'settings.workflowExtract', lookup: 'settings.workflowLookup',
-  full_backup: 'settings.workflowFullBackup', project_export: 'settings.workflowExport' };
+  full_backup: 'settings.workflowFullBackup', project_export: 'settings.workflowExport',
+  index: 'settings.workflowIndex', model_offer: 'settings.workflowModelOffer' }; // the last two: S1-17
 const POLL_MS = 2000; // ponytail: polled while open; a pushed event stream if the list grows
 const EFFORT_SUGGESTIONS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const LIMITS = ['agent_steps', 'tool_calls', 'turn_minutes'];
@@ -323,6 +326,9 @@ function ThisProject({ project, onProjectChanged, onOpenAdvanced }) {
       <Section title={t('settings.projectLimits')} hint={t('settings.projectLimitsHint')}>
         <LimitFields file={own} inherited={personal.values.limits} onProblem={setProblem} prefix="project-limit" />
       </Section>
+      <Section title={t('search.indexTitle')} hint={t('search.indexHint')}>
+        <IndexSection project={project} />
+      </Section>
       <Section title={t('export.title')} hint={t('export.hint')}>
         <ProjectExportSection project={project} />
       </Section>
@@ -498,6 +504,12 @@ function RunRow({ run, dates, onCancel, onRetry, onChanged }) {
       )}
       {outcome && !outcome.ok && (
         <p className="text-xs text-muted-foreground">{outcome.code ? errorText(t, outcome.code) : t(outcome.key)}</p>
+      )}
+      {run.workflow === 'model_offer' && run.status === 'succeeded' && offerOutcome(t, run.result) && (
+        <p className="text-xs text-muted-foreground">{offerOutcome(t, run.result)}</p>
+      )}
+      {run.workflow === 'index' && run.status === 'succeeded' && run.result?.mode === 'keyword_only' && (
+        <p className="text-xs text-muted-foreground">{t('helper.keywordOnly', { reason: t(runReason(run)) })}</p>
       )}
       {run.ask && <Ask ask={run.ask} onAnswered={onChanged} />}
     </li>
