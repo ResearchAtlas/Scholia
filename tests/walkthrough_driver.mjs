@@ -1304,6 +1304,7 @@ async function references(ctx) {
     check('Merge filled the paper here from the record, keeping its own details', merged?.csl.abstract?.includes('reference file')
       && merged.source === 'upload' && merged.evidence_type === 'full_text' && merged.checked_by === 'lookup');
     const kept = listed.materials.filter((m) => m.title === duplicates.keep);  // the notes, the PDF they replaced, and now the record
+    await panel().getByRole('button', { name: duplicates.keep, exact: true }).nth(2).waitFor(); // the Library shows it too
     check('Keep both made the record a paper of its own, not looked up', kept.length === 3
       && kept.filter((m) => m.source === 'reference_file' && m.lookup === null && m.csl.abstract).length === 1);
     const runs = (await get('/api/activity')).body.runs.filter((r) => asked.some((a) => a.run_id === r.run_id));

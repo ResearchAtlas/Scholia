@@ -77,4 +77,4 @@ async def test_identifiers_reach_a_lookup_only_from_a_materials_own_text():
     assert {name: n for name, n in callers.items() if n} == {"materials.py": 1}
     source = (backend / "materials.py").read_text(encoding="utf-8")
     assert "found = _identifiers(conn, project_id, materials, versions)" in source
-    assert "reference_files.identifier(json.loads(row[4]" in source  # the record: the second source (S1-14)
+    assert "reference_files.identifier(record)" in source  # the record: the second source (S1-14)

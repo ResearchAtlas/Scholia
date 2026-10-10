@@ -646,3 +646,121 @@ async def test_a_file_attached_later_is_looked_up_by_the_records_doi_never_by_on
             assert paths == [] and found["lookup"]["outcome"] == "no_identifier"
         else:  # the record's DOI comes first, whatever the attached file holds
             assert paths == [f"/works/doi:{DOI}"] and found["lookup"]["identifier"] == f"doi:{DOI}"
+
+
+# From the writer's first review (2026-10-10)
+
+
+async def test_half_a_surrogate_pair_in_a_csl_json_record_never_breaks_the_librarys_answers(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await imported(client, project, ris(("Paper Here", f"DO  - {DOI}\n")))
+        text = json.dumps([{"title": "New \ud83d Paper", "abstract": "Cut \udc00"},
+                           {"title": "Paper Here", "DOI": DOI, "abstract": "Half \ud800 pair"}])
+        result = await imported(client, project, text.encode(), "export.json")
+        assert len(result["imported"]) == 1 and len(result["waiting"]) == 1
+        [ask] = await merge_asks(client, project)
+        assert ask["params"]["record"]["title"] == "Paper Here"
+        assert (await client.get("/api/activity")).status_code == 200 and (await client.get("/api/asks")).status_code == 200
+        assert (await answer(client, ask, "keep_both")).status_code == 200
+        assert (await run_finished(client, ask["run_id"]))["status"] == "succeeded"
+        found = {m["csl"].get("abstract"): m for m in (await listing(client, project))["materials"]}
+        assert {"Cut �", "Half � pair"} <= set(found)
+
+
+async def test_a_doi_corrected_on_a_reference_files_paper_keeps_its_records_fields_and_drops_the_lookups(tmp_path):
+    record = openalex_work(DOI, "Wrong Work")  # the lookup adds a venue, a volume and a page the record lacks
+    async with started(tmp_path / "data", scholarly(openalex={DOI: record})) as client:
+        project = await project_of(client)
+        result = await imported(client, project, ris(("Corrected", f"DO  - {DOI}\nAB  - Its abstract.\nKW  - wages\n"
+                                                                   "LA  - en\nIS  - 7\n")))
+        await run_finished(client, result["lookup_run_id"])
+        [paper] = result["imported"]
+        before = (await client.get(f"/api/materials/{paper}")).json()["csl"]
+        assert before["volume"] == "3" and before["container-title"] == "Journal of Synthetic Studies"
+        moved = await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/the.right.doi"})
+        assert moved.status_code == 200
+        after = moved.json()
+        assert after["csl"] == {"type": "article-journal", "title": "Corrected", "DOI": "10.5555/the.right.doi",
+                                "abstract": "Its abstract.", "keyword": "wages", "language": "en", "issue": "7",
+                                # the form's fields stay as saved, whoever gave them
+                                "container-title": "Journal of Synthetic Studies", "author": [{"literal": "A. Researcher"}],
+                                "issued": {"date-parts": [[2024]]}}
+        assert "volume" not in after["csl"] and "page" not in after["csl"]  # the old DOI's lookup's, gone with it
+        assert (after["evidence_type"], after["source_key"], after["resolved_at"]) == ("abstract", None, None)
+
+
+async def test_a_doi_a_lookup_gave_an_arxiv_record_is_never_sent_as_the_records_own(tmp_path, monkeypatch):
+    import scholia_app
+
+    def with_a_doi(identifier, title):  # arXiv's answer, naming the work's DOI
+        return scholia_app_feed(identifier, title).replace(b"</entry>", b"<arxiv:doi>10.5555/from.arxiv</arxiv:doi></entry>")
+
+    scholia_app_feed = scholia_app.arxiv_feed
+    monkeypatch.setattr(scholia_app, "arxiv_feed", with_a_doi)
+    feed = MockScholarly(arxiv={"2401.05555": "A Preprint"})
+    async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
+        project = await project_of(client)
+        result = await imported(client, project, b"@misc{k, title={A Preprint}, eprint={2401.05555}, archivePrefix={arXiv}}",
+                                "export.bib")
+        await run_finished(client, result["lookup_run_id"])
+        [paper] = result["imported"]
+        assert (await client.get(f"/api/materials/{paper}")).json()["csl"]["DOI"] == "10.5555/from.arxiv"  # filled
+        sent = len(feed.requests)
+        attached = await added(client, project, ("p.md", b"# A Preprint\n\nText.\n"), material_id=paper)
+        await run_finished(client, attached["lookup_run_id"])
+        assert [(host, path) for host, path, _ in feed.requests[sent:]] == [
+            ("export.arxiv.org", "/api/query?id_list=2401.05555&max_results=1")]  # the record's arXiv ID, not that DOI
+
+
+async def test_a_lookup_fills_nothing_in_a_reference_files_paper_the_researcher_edited(tmp_path):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "Resolved", retracted=True)})) as client:
+        project = await project_of(client, level="local_only")  # its lookup waits on the question
+        result = await imported(client, project, ris(("Edited First", f"DO  - {DOI}\n")))
+        [ask] = await asks_of(client, project)
+        [paper] = result["imported"]
+        assert (await client.patch(f"/api/materials/{paper}", json={"title": "Edited First, by me"})).status_code == 200
+        assert (await answer(client, ask, "lookup")).status_code == 200
+        await run_finished(client, result["lookup_run_id"])
+        found = (await client.get(f"/api/materials/{paper}")).json()
+        assert found["csl"] == {"type": "article-journal", "title": "Edited First, by me", "DOI": DOI}
+        assert (found["source_key"], found["resolved_at"], found["retraction"]) == (None, None, "retracted")
+
+
+async def test_the_same_record_imported_again_while_its_merge_waits_asks_once(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        _, ask = await with_duplicate(client, project)
+        again = await imported(client, project, ris(("A Paper Already Here", f"DO  - {DOI}\nPY  - 2020\n"
+                                                                             "AB  - The record's abstract.\n")))
+        assert again["waiting"] == [{"run_id": ask["run_id"], "material_id": again["waiting"][0]["material_id"]}]
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'merge'") == [(1,)]
+
+
+async def test_the_library_looks_again_while_a_merge_applies_its_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "POLICY_SECONDS", 60)
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        _, ask = await with_duplicate(client, project)
+        assert (await listing(client, project))["merging"] == 0  # it waits on its question, which is listed
+        registry = client.state["harness"].registry
+        await asyncio.to_thread(client.state["db"].write, lambda conn: asks.answer(
+            conn, ask["run_id"], ask["ask_id"], "keep_both", registry=registry))
+        assert (await listing(client, project))["merging"] == 1  # answered, its effect still to come
+        registry.runs[ask["run_id"]].answered.set()
+        await run_finished(client, ask["run_id"])
+        assert (await listing(client, project))["merging"] == 0
+
+
+async def test_a_reference_file_is_read_in_one_of_the_readings_turns(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        turns = client.state["harness"].readings
+        held = [await turns.acquire() for _ in range(materials_module.READINGS)]
+        importing = asyncio.create_task(post(client, project, synthetic.references_ris()))
+        await asyncio.sleep(0.5)
+        assert not importing.done()  # waits for a turn
+        turns.release()
+        assert (await importing).status_code == 201
+        for _ in held[1:]:
+            turns.release()

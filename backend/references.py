@@ -98,13 +98,16 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
         if harness.registry.closed:
             raise _Stop()
 
-    def parse():
-        return reading.references(data, stop)
+    async def parse():
+        # One of the readings' turns (materials.READINGS), so the children's memory stays within the
+        # budget backend/reading.py sets out.
+        async with harness.readings:
+            return await asyncio.to_thread(reading.references, data, stop)
 
     try:
         # Held by the harness as its detached work, so a shutdown waits for its child to end and be
         # reaped; followed to its end when the request goes away (nothing is written then).
-        records, skipped, kind = await _to_end(harness._detach(asyncio.to_thread(parse)))
+        records, skipped, kind = await _to_end(harness._detach(parse()))
     except _Stop:
         raise _refused(503, "shutting_down", "The app is closing") from None
     except extraction.Unreadable as unreadable:
@@ -120,6 +123,12 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
         ids, used = iter(ids), []
         locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
         papers = Duplicates(conn, project_id)
+        asking = {}  # the merges waiting already, by their paper and record: the same record is asked about once
+        for run, inputs in conn.execute("SELECT id, inputs FROM runs WHERE project_id = ? AND workflow = 'merge'"
+                                        " AND status = 'running'", (project_id,)).fetchall():
+            inputs = json.loads(inputs or "{}")
+            if (held := (inputs.get("held") or {}).get("record")) is not None:
+                asking[inputs["material_ids"][0], json.dumps(held, sort_keys=True)] = run
         imported, waiting, already, looked_up = [], [], [], {}
         for csl in records:
             if (found := papers.find(csl)) is not None:
@@ -127,7 +136,10 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
                 if not fills(*papers.details(material), csl):
                     already.append(material)
                     continue
-                run = next(ids)
+                if (run := asking.get((material, json.dumps(csl, sort_keys=True)))) is not None:
+                    waiting.append({"run_id": run, "material_id": material})
+                    continue
+                run = asking[material, json.dumps(csl, sort_keys=True)] = next(ids)
                 used.append(run)
                 conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
                              " 'merge', ?)", (run, project_id, json.dumps({

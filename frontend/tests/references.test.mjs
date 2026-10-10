@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { importReferences, MAX_REFERENCE_BYTES, paperLine, REFERENCE_ACCEPT, reportParts } from '../src/references.js';
-import { detailsSource, latestLookup } from '../src/library.js';
+import { detailsSource, latestLookup, unsettled } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zh from '../src/i18n/zh-CN.json' with { type: 'json' };
@@ -97,4 +97,11 @@ test('a Local only lookup of a reference file\'s papers says its answer covers t
   assert.match(en['ask.identifier_lookup.bodyReferenceFile'], /the papers this reference file added/);
   assert.match(zh['ask.identifier_lookup.bodyReferenceFile'], /这个参考文献文件添加的文献/);
   assert.doesNotMatch(en['ask.identifier_lookup.bodyReferenceFile'], /files you just added/);
+});
+
+test('the Library looks again while a merge has still to ask or to apply its answer, and not once none has', () => {
+  const settled = { materials: [{ state: 'ready', lookup: null }], asks: [], merging: 0 };
+  assert.equal(unsettled(settled), false);
+  assert.equal(unsettled({ ...settled, merging: 1 }), true); // Keep both answered: its paper is still to come
+  assert.equal(unsettled({ ...settled, asks: [{ kind: 'merge' }] }), true);
 });

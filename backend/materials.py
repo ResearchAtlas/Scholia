@@ -319,6 +319,7 @@ def register(harness, content):
     """The extract and lookup workflows, as the harness's local background work, on its content store."""
     pace = lookup.Pace()  # shared by this harness's lookups, so each source's spacing holds across runs
     readings = asyncio.Semaphore(READINGS)  # a turn is taken before a file is read, and its limit starts then
+    harness.readings = readings  # S1-14: a reference file's child takes one too (backend/references.py)
 
     async def extract_run(harness, active, project_id, inputs):
         version_id = inputs["version_id"]
@@ -647,7 +648,8 @@ def _identifiers(conn, project_id, materials, versions):
     that version, and is sent and applied only while it is still the material's current file."""
     found = {}
     for material in materials:
-        row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE}, m.source, m.csl, m.checked_by FROM materials m"
+        row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE}, m.source, m.csl, m.checked_by, m.resolved_at"
+                           " FROM materials m"
                            " JOIN material_versions v ON v.material_id = m.id AND (v.id = ?3 OR (?3 IS NULL AND v.is_current = 1))"
                            " LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE m.id = ?1 AND m.project_id = ?2",
                            (material, project_id, versions.get(material))).fetchone()
@@ -656,8 +658,10 @@ def _identifiers(conn, project_id, materials, versions):
         # A reference file's paper is identified by its record (S1-14), whatever file it has since, unless
         # the researcher edited its details: an identifier they typed is not the record's, so then only a
         # file's text gives one. A version with no file has nothing to read: it is read, giving none.
-        if row[3] == "reference_file" and row[5] != "researcher" \
-                and (given := reference_files.identifier(json.loads(row[4] or "{}"))):
+        record = json.loads(row[4] or "{}") if row[3] == "reference_file" and row[5] != "researcher" else None
+        if record and row[6] and "DOI" in record and "DOI" in _lookup_filled(conn, material):
+            del record["DOI"]  # a DOI a lookup gave (arXiv's, say) is not the record's
+        if record and (given := reference_files.identifier(record)):
             found[material] = (row[0], given, True)
             continue
         extracted = _extraction(conn, *row[1:3])
@@ -743,9 +747,9 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
         if row is None:
             continue
         mine, result = (found, outcome) if row[1] else (None, "replaced")
-        imported = mine is not None and _fill_imported(conn, material, mine)  # S1-14: its record stays
+        filled = _fill_imported(conn, material, mine) if mine is not None else None  # S1-14: its record stays
         if mine is not None:
-            if row[0] != "researcher" and not imported:  # what the researcher edited stays
+            if row[0] != "researcher" and filled is None:  # what the researcher edited stays
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
                              (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
@@ -758,27 +762,51 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
                 conn.execute("UPDATE materials SET retraction = ?, retraction_checked_at = ? WHERE id = ?",
                              ("retracted" if mine.retracted else "none", now, material))
         _event(conn, run_id, "step_finished", {"material_id": material, "identifier": f"{scheme}:{value}",
-                                               "source": mine.source if mine else None, "outcome": result})
+                                               "source": mine.source if mine else None, "outcome": result,
+                                               **({"filled": filled} if filled else {})})
 
 
 def _fill_imported(conn, material, found):
     """A lookup's record for a reference file's paper (S1-14): the paper keeps its record's fields and
-    takes the lookup's only where it lacks them (references.fills, so an edited paper's form fields
-    stay as saved), and records where it resolved (source_key, resolved_at); checked_by stays unset,
-    as nobody checked its record. The retraction check is _apply's. False, writing nothing, for
-    another paper."""
+    takes the lookup's only where it lacks them (references.fills), and records where it resolved
+    (source_key, resolved_at); checked_by stays unset, as nobody checked its record. A paper whose
+    details the researcher edited takes nothing, as an upload's does not. The retraction check is
+    _apply's. Returns the fields it filled, which the lookup's step records (_lookup_filled), or
+    None, writing nothing, for another paper."""
     from backend import references  # it builds on this module
 
     row = conn.execute("SELECT source, csl, checked_by, title FROM materials WHERE id = ?", (material,)).fetchone()
     if row is None or row[0] != "reference_file":
-        return False
+        return None
+    if row[2] == "researcher":
+        return []
     csl = json.loads(row[1] or "{}")
-    added = references.fills(csl, row[2] == "researcher", found.csl)
+    added = references.fills(csl, False, found.csl)
     csl.update(added)
     now = utc_now()
     conn.execute("UPDATE materials SET csl = ?, title = ?, source_key = ?, resolved_at = ?, updated_at = ? WHERE id = ?",
                  (json.dumps(csl), added.get("title", row[3]), found.source_key, now, now, material))
-    return True
+    return sorted(added)
+
+
+def _lookup_filled(conn, material):
+    """The fields lookups filled in a reference file's paper (each lookup step records them): not its
+    record's, so a DOI among them is never sent as the paper's own identifier, and a DOI the
+    researcher changes takes them with it (S1-14)."""
+    return {key for (keys,) in conn.execute(
+        "SELECT json_extract(e.data, '$.filled') FROM runs r, json_each(r.inputs, '$.material_ids') j"
+        " JOIN run_events e ON e.run_id = r.id WHERE r.workflow = 'lookup' AND j.value = ?1"
+        " AND e.type = 'step_finished' AND json_extract(e.data, '$.material_id') = ?1"
+        " AND json_extract(e.data, '$.filled') IS NOT NULL", (material,)) for key in json.loads(keys)}
+
+
+def _kept_on_move(conn, material, csl):
+    """What a paper's details keep when the researcher changes or clears its DOI: the fields the details
+    form shows; a reference file's paper also keeps its record's own fields, all but those a lookup
+    filled for the old DOI (S1-14)."""
+    source = conn.execute("SELECT source FROM materials WHERE id = ?", (material,)).fetchone()
+    filled = _lookup_filled(conn, material) if source is not None and source[0] == "reference_file" else None
+    return {key: value for key, value in csl.items() if key in _FORM_FIELDS or (filled is not None and key not in filled)}
 
 
 # The Library
@@ -878,7 +906,11 @@ async def list_materials(project_id: str, request: Request):
             " AND v.is_current = 1 LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE m.project_id = ?"
             " ORDER BY m.created_at DESC, m.id", (project_id,)).fetchall()
         return {"materials": [_describe(conn, row, registry) for row in rows],
-                "asks": asks.open_asks(conn, project_id=project_id)}
+                "asks": asks.open_asks(conn, project_id=project_id),
+                # S1-14: merges not yet waiting on their question, or applying its answer: the Library looks again
+                "merging": sum(_live(run, registry) for (run,) in conn.execute(
+                    "SELECT id FROM runs WHERE project_id = ? AND workflow = 'merge' AND status = 'running'"
+                    " AND waiting IS NULL", (project_id,)))}
 
     return await asyncio.to_thread(state["db"].read, listing)
 
@@ -927,7 +959,7 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
         csl = json.loads(row[1]) if row[1] else {}
         moved = "doi" in changes and doi != (csl.get("DOI") or None)  # changed or cleared
         if moved:
-            csl = {key: value for key, value in csl.items() if key in _FORM_FIELDS}
+            csl = _kept_on_move(conn, material_id, csl)
         title = visible(changes["title"]) if "title" in changes else row[0]
         csl["title"] = title
         if "authors" in changes:
