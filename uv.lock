@@ -90,6 +90,18 @@ wheels = [
 ]
 
 [[package]]
+name = "bibtexparser"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pylatexenc" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/40/bb/38f8b2ee3e3da9161fb4a845fb04b4ccb0b8d5a5f5e25aaea39154073532/bibtexparser-2.1.0.tar.gz", hash = "sha256:9f48851eef4693cb7ef6897f7628966c5d0ef49b6403b13a862679a4c313d176", size = 88630, upload-time = "2026-10-02T16:11:35.234Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/86/df/b0898588ad7c1a1c1cb50dcf1afbac1b656ad1ce5373c895b49138b00894/bibtexparser-2.1.0-py3-none-any.whl", hash = "sha256:3b4b1de50ce45ee9091ccca72e1efc8732ab3ef615b70bcecc537c17cd84753e", size = 50128, upload-time = "2026-10-02T16:11:34.111Z" },
+]
+
+[[package]]
 name = "bottle"
 version = "0.13.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1006,6 +1018,15 @@ wheels = [
 ]
 
 [[package]]
+name = "rispy"
+version = "0.10.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/21/80/79150d1fabf30a863e2ec5e8d289731863efe2a7762ff5072d9e97b8bfbc/rispy-0.10.0.tar.gz", hash = "sha256:0b815b668fcc993e4f540670fd37090576ecfbc58a57e2daae67774241e91c84", size = 16703, upload-time = "2025-05-23T17:00:39.479Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/14/25/efdcd3dadf3f2aabbdb64d028db1dca1b1467a08d84b5117bffc3b1a599b/rispy-0.10.0-py3-none-any.whl", hash = "sha256:acc8b941ab5e7b65b5365e468af2e00f0cb031a9e5c5a6b06538d856151e61be", size = 15260, upload-time = "2025-05-23T17:00:37.796Z" },
+]
+
+[[package]]
 name = "rpds-py"
 version = "2026.6.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1036,6 +1057,7 @@ default-groups = ["dev", "packaging"]
 dependencies = [
     { name = "apsw" },
     { name = "beautifulsoup4" },
+    { name = "bibtexparser" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "keyring" },
@@ -1048,6 +1070,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "pywebview" },
     { name = "pyzipper" },
+    { name = "rispy" },
     { name = "sqlite-vec" },
     { name = "tomlkit" },
     { name = "uvicorn", extra = ["standard"] },
@@ -1074,6 +1097,7 @@ packaging = [
 requires-dist = [
     { name = "apsw", specifier = ">=3.53.4.0,<3.54" },
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
+    { name = "bibtexparser", specifier = ">=2.0.1,<3" },
     { name = "fastapi", specifier = ">=0.115.0,<0.122" },
     { name = "httpx", specifier = ">=0.27.0,<0.29" },
     { name = "keyring", specifier = ">=25.7.0" },
@@ -1087,6 +1111,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "pywebview", specifier = ">=6.1,<7" },
     { name = "pyzipper", specifier = ">=0.4.0,<0.5" },
+    { name = "rispy", specifier = ">=0.10,<0.11" },
     { name = "sqlite-vec", specifier = "==0.1.9" },
     { name = "tomlkit", specifier = ">=0.15.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0,<0.39" },

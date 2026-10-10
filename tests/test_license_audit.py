@@ -516,3 +516,11 @@ def test_pdfium_is_reviewed_with_the_libraries_built_into_it_and_their_notices_s
 def test_pylatexenc_is_mit_and_ships_its_license():
     assert la.component("pylatexenc")[0] == "MIT"
     assert {dest for _, dest in la.component("pylatexenc")[1]} == {"LICENSE.txt"}
+
+
+@pytest.mark.parametrize("name", ["rispy", "bibtexparser"])
+def test_the_reference_file_parsers_are_mit_ship_their_license_and_are_bundled(name):
+    # S1-14: read in the reading child (backend/reference_files.py); each ships its own license file.
+    assert la.component(name)[0] == "MIT" and la.allowed("MIT")
+    assert {dest for _, dest in la.component(name)[1]} == {"LICENSE"}
+    assert f'"{name}"' in (la.ROOT / "tools/scholia.spec").read_text()

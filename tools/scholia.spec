@@ -26,6 +26,8 @@ DISTRIBUTIONS = [
     "pyzipper", "pycryptodomex",
     # Reading materials: PDF text, boxes and page images; text from LaTeX source
     "pypdfium2", "pylatexenc",
+    # Reference files (S1-14): RIS and BibTeX
+    "rispy", "bibtexparser",
     # The window
     "pywebview", "bottle", "proxy_tools", "pyobjc-framework-WebKit", "pyobjc-framework-UniformTypeIdentifiers",
 ]
