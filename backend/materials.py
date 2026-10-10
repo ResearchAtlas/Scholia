@@ -1049,12 +1049,18 @@ async def get_passage(passage_id: str, request: Request):
     return await asyncio.to_thread(_state(request)["db"].read, fetch)
 
 
+_RENDER_CEILINGS = {"memory_limit": "Rendering the page needed more memory than allowed",
+                    "step_limit": "Rendering the page made no progress for a minute"}
+
+
 @router.get("/api/material-versions/{version_id}/pages/{number}")
 async def page_image(version_id: str, number: int, request: Request, scale: float = 2.0):
     """A PDF page rendered as a PNG by pypdfium2, in memory, in a child process under its own memory
     ceiling (backend/reading.py); never written to disk. The version is looked for again once the
     page is rendered, so a page whose paper was deleted meanwhile is not given. The app closing ends
-    the child (503), and its shutdown returns only once the child is reaped."""
+    the child (503), and its shutdown returns only once the child is reaped. A render stopped at its
+    memory ceiling or after a minute without a word is answered 409 memory_limit or step_limit; one
+    that fails otherwise, 409 file_missing."""
     state = _state(request)
     harness = state["harness"]
 
@@ -1075,6 +1081,7 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
     def render():
         return reading.render(state["content"]._path(row[0]), row[0], number, max(0.5, min(scale, 3.0)), stop)
 
+    ceiling = None
     try:
         # A turn is held to its render's end, even when the request goes away meanwhile (_to_end);
         # one whose page was let go while it waited for its turn (its request gone) is not rendered.
@@ -1087,10 +1094,13 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
         raise _refused(404, "not_found", "No such page") from None
     except _Stop:
         raise _refused(503, "shutting_down", "The app is closing") from None
-    except (extraction.Unreadable, FileNotFoundError, ContentCorruptError, reading.ChildError):
+    except (extraction.Unreadable, FileNotFoundError, ContentCorruptError, reading.ChildError) as error:
         image = None  # a child that did not start or failed as it did is logged there
+        ceiling = error.code if isinstance(error, extraction.Unreadable) else None
     if await asyncio.to_thread(state["db"].read, version) != row:  # deleted while it rendered, its file with it
         raise _refused(404, "not_found", "No such version")
+    if ceiling in _RENDER_CEILINGS:  # stopped at a ceiling: said as such, not as a file unread
+        raise _refused(409, ceiling, _RENDER_CEILINGS[ceiling])
     if image is None:
         raise _refused(409, "file_missing", "The file cannot be read")
     return Response(image, media_type="image/png", headers={"Cache-Control": "no-store"})  # see _no_store

@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
   typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, MAX_LIST_HEIGHT, withFocus,
-  detailsSource, latestLookup, pageImage, ocrPages } from '../src/library.js';
+  detailsSource, latestLookup, pageImage, pageFailedKey, ocrPages } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
@@ -125,6 +125,20 @@ test('a page image let go while it loads is abandoned: its request is aborted, n
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test('a page image stopped at a ceiling says which, with its code as the page image answer gives it', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ code: 'step_limit', message: '' }), { status: 409 });
+  try {
+    await assert.rejects(pageImage('v', 1), (error) => error.code === 'step_limit');
+  } finally {
+    globalThis.fetch = original;
+  }
+  const t = makeT('en');
+  assert.match(t(pageFailedKey('memory_limit')), /more memory than Scholia allows/);
+  assert.match(t(pageFailedKey('step_limit')), /no progress for a minute/);
+  for (const other of ['file_missing', 'unreachable', true]) assert.equal(pageFailedKey(other), 'paper.pageFailed');
 });
 
 test('a paper shows its pages only while its version is a PDF', () => {

@@ -359,6 +359,8 @@
   "paper.loadFailed": "无法加载段落。",
   "paper.page": "第 {number} 页",
   "paper.pageFailed": "无法显示这一页。",
+  "paper.pageMemoryLimit": "显示这一页所需的内存超过了 Scholia 设定的上限，已停止。这一页的内容可能异常复杂。",
+  "paper.pageStepLimit": "显示这一页时连续 1 分钟没有进展，已停止。这一页的内容可能异常复杂。",
   "paper.earlierPassages": "本页前面的段落",
   "paper.laterPassages": "本页后面的段落",
   "paper.pagesCut": "第 {number} 页之后的页面不在此显示，其文字见“段落”。",

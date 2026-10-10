@@ -424,17 +424,19 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path, 
     stub = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), mode, str(held),
             *(["60"] if mode == "gil-stall" else [])]
     app = await app_reading(path, sha256, stub, app_code)
-    child = None
+    reader = None
     try:
         assert await asyncio.to_thread(Held(held).wait, 10)
         [child] = Held(held).held()
+        reader = seen(child)
         assert os.getpgid(child) == child  # it leads its own process group, beside its sentinel
         await asyncio.sleep(0.2)  # in its stall
         app.kill()  # SIGKILL: no cleanup of its own runs
         app.wait()
         await ended_with_its_group(child)
+        reader = None  # gone: its numbers may be another process's from now on
     finally:
-        end_group(app, child)
+        end_group(app, reader)
 
 
 @pytest.mark.asyncio
@@ -448,10 +450,11 @@ async def test_a_child_whose_sentinel_is_lost_while_it_holds_the_gil_is_ended_wh
     reading_stub(mode, tmp_path, *(["60"] if mode.startswith("gil-stall") else []))
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
-    child = None
+    reader = None
     try:
         assert await asyncio.to_thread(Held(tmp_path).wait, 10)
         [child] = Held(tmp_path).held()
+        reader = seen(child)
         [sentinel] = reading._children(child)
         await asyncio.sleep(0.2)  # in its stall
         os.kill(sentinel, loss)
@@ -460,10 +463,9 @@ async def test_a_child_whose_sentinel_is_lost_while_it_holds_the_gil_is_ended_wh
             await asyncio.wait_for(pending, 5)
         assert time.monotonic() - lost < 0.5
         await ended_with_its_group(child, 0.5)
+        reader = None  # gone: its numbers may be another process's from now on
     finally:
-        if child is not None:  # a failed run leaves no child for the step limit to end
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(child, signal.SIGKILL)
+        end_reader(reader)  # a failed run leaves no child for the step limit to end
 
 
 @pytest.mark.asyncio
@@ -474,10 +476,11 @@ async def test_after_its_sentinel_is_lost_nothing_survives_the_apps_death(tmp_pa
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     stub = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), "gil-stall", str(tmp_path), "60"]
     app = await app_reading(path, sha256, stub)
-    child = None
+    reader = None
     try:
         assert await asyncio.to_thread(Held(tmp_path).wait, 10)
         [child] = Held(tmp_path).held()
+        reader = seen(child)
         [sentinel] = reading._children(child)
         await asyncio.sleep(0.2)
         os.kill(sentinel, loss)
@@ -485,8 +488,9 @@ async def test_after_its_sentinel_is_lost_nothing_survives_the_apps_death(tmp_pa
         app.kill()
         app.wait()
         await ended_with_its_group(child)
+        reader = None  # gone: its numbers may be another process's from now on
     finally:
-        end_group(app, child)
+        end_group(app, reader)
 
 
 @pytest.mark.asyncio
@@ -512,15 +516,17 @@ async def test_a_child_whose_app_dies_while_it_starts_ends_too(tmp_path, delay):
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     stub = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), "gil-stall", str(tmp_path), "60"]
     app = await app_reading(path, sha256, stub, then_kill_after=delay)
-    child = None
+    reader = None
     try:
         line = await asyncio.wait_for(asyncio.to_thread(app.stdout.readline), 15)  # its child's pid, as it started
         assert line.strip(), "the stand-in app's child never started"
         child = int(line)
+        reader = seen(child)
         app.wait()  # it killed itself
         await ended_with_its_group(child)
+        reader = None  # gone: its numbers may be another process's from now on
     finally:
-        end_group(app, child)
+        end_group(app, reader)
 
 
 async def app_reading(path, sha256, stub, app_code="", then_kill_after=None):
@@ -563,12 +569,29 @@ async def ended_with_its_group(child, seconds=2.0):
         os.kill(child, 0)  # the child itself, by its own pid
 
 
-def end_group(app, child):
-    """Whatever a failed check left: the stand-in app, and the child's group."""
+def end_group(app, reader):
+    """Whatever a failed check left: the stand-in app, and the child's group (end_reader)."""
     if app.poll() is None:
         app.kill()
         app.wait()
-    if child is not None:
+    end_reader(reader)
+
+
+def seen(child):
+    """The reading child as the test saw it: its pid and start time, or None if it is gone already."""
+    info = reading._info(child)
+    return None if info is None else (child, tuple(info.start))
+
+
+def end_reader(reader):
+    """A failed check's cleanup: end the group the child leads, only while its leader is still the process
+    the test saw (a group of its own, the same start time); a pid taken by another process since is left
+    alone. A leader gone takes its sentinel with it (its group orphaned with a stopped member)."""
+    if reader is None:
+        return
+    child, start = reader
+    info = reading._info(child)
+    if info is not None and info.pgid == child and tuple(info.start) == start:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(child, signal.SIGKILL)
 
@@ -683,20 +706,20 @@ async def test_the_watch_holds_after_the_result_until_the_child_has_ended(tmp_pa
     reading_stub(mode, tmp_path)
     path, sha256 = stored(tmp_path, MARKDOWN[1])
     pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
-    child = None
+    reader = None
     try:
         assert await asyncio.to_thread(Held(tmp_path).wait, 10)
         [child] = Held(tmp_path).held()
+        reader = seen(child)
         [sentinel] = reading._children(child)
         await asyncio.sleep(0.2)
         os.kill(sentinel, signal.SIGKILL)
         with pytest.raises(reading.ChildError, match="sentinel"):
             await asyncio.wait_for(pending, 5)
         await ended_with_its_group(child, 0.5)
+        reader = None  # gone: its numbers may be another process's from now on
     finally:
-        if child is not None:  # a failed run leaves no stalled child for the step limit to end
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(child, signal.SIGKILL)
+        end_reader(reader)  # a failed run leaves no stalled child for the step limit to end
 
 
 @pytest.mark.asyncio
@@ -715,23 +738,42 @@ async def test_a_sentinel_lost_before_the_watch_has_seen_it_stopped_ends_the_chi
             Held(tmp_path).wait(10)
 
     pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN, stop))
-    child = None
+    reader = None
     try:
         assert await asyncio.to_thread(Held(tmp_path).wait, 10)
         [child] = Held(tmp_path).held()
+        reader = seen(child)
         with pytest.raises(reading.ChildError, match="sentinel"):
             await asyncio.wait_for(pending, 5)
         await ended_with_its_group(child, 0.5)
+        reader = None  # gone: its numbers may be another process's from now on
     finally:
-        if child is not None:  # a failed run leaves no child for the step limit to end
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(child, signal.SIGKILL)
+        end_reader(reader)  # a failed run leaves no child for the step limit to end
 
 
 def record(status=reading._SSTOP, ppid=1, pgid=1, flags=0):
     info = reading._BsdInfo()
     info.status, info.ppid, info.pgid, info.flags = status, ppid, pgid, flags
     return info
+
+
+def test_a_failed_checks_cleanup_ends_only_the_group_it_saw(monkeypatch):
+    """end_reader: the group of the child the test saw, never one whose leader is another process by now
+    (a later start, or another group), nor one gone."""
+    ended, leader = [], record(pgid=5)
+    leader.start[0] = 100
+    monkeypatch.setattr(reading, "_info", lambda pid: leader)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: ended.append(pid))
+    reader = seen(5)
+    leader.start[0] = 200  # its pid taken by a process started since
+    end_reader(reader)
+    leader.start[0], leader.pgid = 100, 6  # in another group
+    end_reader(reader)
+    end_reader(None)
+    assert ended == []
+    leader.pgid = 5
+    end_reader(reader)
+    assert ended == [5]
 
 
 def test_a_sentinel_is_its_childs_stopped_child_in_its_group(monkeypatch):
@@ -873,16 +915,26 @@ async def test_a_missing_or_changed_file_and_a_child_that_cannot_start(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_a_page_images_child_past_its_ceiling_or_crashing_is_a_file_that_cannot_be_read(
+async def test_a_page_image_stopped_at_a_ceiling_says_which_and_one_whose_child_fails_cannot_be_read(
         tmp_path, monkeypatch, reading_stub):
+    """Past its memory ceiling, 409 memory_limit; silent past the step limit, 409 step_limit (not a file
+    that cannot be read: it was stopped); a child that crashes, does not start or sends a wrong frame,
+    409 file_missing."""
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, PDF)
         [paper] = await settled(client, project)
         url = f"/api/material-versions/{paper['version']['id']}/pages"
         monkeypatch.setattr(reading, "RENDER_CEILING", 1024 * 1024)
-        assert (await client.get(f"{url}/1")).json()["code"] == "file_missing"
+        answer = await client.get(f"{url}/1")
+        assert (answer.status_code, answer.json()["code"]) == (409, "memory_limit")
         monkeypatch.setattr(reading, "RENDER_CEILING", 512 * 2**20)
+        step = reading.STEP_SECONDS
+        monkeypatch.setattr(reading, "STEP_SECONDS", 0.5)
+        reading_stub("stall")
+        answer = await client.get(f"{url}/1")
+        assert (answer.status_code, answer.json()["code"]) == (409, "step_limit")
+        monkeypatch.setattr(reading, "STEP_SECONDS", step)
         for mode in (("signal", "SIGSEGV"), ("no-start",), ("version",), ("frame", "list-error")):
             reading_stub(*mode)
             assert (await client.get(f"{url}/1")).json()["code"] == "file_missing", mode
