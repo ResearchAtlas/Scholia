@@ -437,6 +437,67 @@ async def test_a_child_ends_within_two_seconds_when_the_app_is_killed(tmp_path, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("loss", [signal.SIGKILL, signal.SIGCONT])
+async def test_a_child_whose_sentinel_is_lost_while_it_holds_the_gil_is_ended_while_the_app_lives(
+        tmp_path, reading_stub, loss):
+    """Its sentinel killed, or continued (it then ends), while the child stalls holding the GIL: the app's
+    watch ends the child's group at its next quiet tick, as the app's death no longer would."""
+    reading_stub("gil-stall", tmp_path, 60)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    pending = asyncio.ensure_future(asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN))
+    try:
+        assert await asyncio.to_thread(Held(tmp_path).wait, 10)
+        [child] = Held(tmp_path).held()
+        [sentinel] = reading._children(child)
+        await asyncio.sleep(0.2)  # in its stall
+        os.kill(sentinel, loss)
+        lost = time.monotonic()
+        with pytest.raises(reading.ChildError, match="sentinel"):
+            await asyncio.wait_for(pending, 5)
+        assert time.monotonic() - lost < 0.5
+        await ended_with_its_group(child, 0.5)
+    finally:
+        if not pending.done():
+            pending.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", [signal.SIGKILL, signal.SIGCONT])
+async def test_after_its_sentinel_is_lost_nothing_survives_the_apps_death(tmp_path, loss):
+    """In a stand-in app: the sentinel lost while the child stalls holding the GIL; the app ends the group
+    while it lives, and once the app is killed nothing of the reading is left."""
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    stub = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), "gil-stall", str(tmp_path), "60"]
+    app = await app_reading(path, sha256, stub)
+    child = None
+    try:
+        assert await asyncio.to_thread(Held(tmp_path).wait, 10)
+        [child] = Held(tmp_path).held()
+        [sentinel] = reading._children(child)
+        await asyncio.sleep(0.2)
+        os.kill(sentinel, loss)
+        await ended_with_its_group(child, 0.5)  # by the app, whose watch saw its sentinel go
+        app.kill()
+        app.wait()
+        await ended_with_its_group(child)
+    finally:
+        end_group(app, child)
+
+
+@pytest.mark.asyncio
+async def test_a_sentinel_that_ends_before_it_stops_fails_the_start_and_its_pid_is_never_signalled(
+        tmp_path, reading_stub):
+    reading_stub("sentinel-dies", tmp_path)
+    path, sha256 = stored(tmp_path, MARKDOWN[1])
+    with pytest.raises(reading.ChildError, match="ended"):  # no start without a stopped sentinel: before ready
+        await asyncio.to_thread(reading.read, path, sha256, extraction.MARKDOWN)
+    sentinel = (tmp_path / "sentinel").read_text()
+    kills = (tmp_path / "kills").read_text() if (tmp_path / "kills").exists() else ""
+    assert not any(line.split()[0] == sentinel for line in kills.splitlines())  # its pid, reaped, never signalled
+    assert gone()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delay", [0.0, 0.01, 0.02])
 async def test_a_child_whose_app_dies_while_it_starts_ends_too(tmp_path, delay):
     """The app killed delay seconds after the child started, before it could have made its sentinel:

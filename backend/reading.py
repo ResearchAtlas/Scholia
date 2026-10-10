@@ -41,8 +41,11 @@ process start; it writes its frames to a copy of its stdout and points stdout an
 dies and whatever the child is doing: it runs in a process group of its own beside a stopped
 sentinel (_sentinel), so the parent's death leaves the group orphaned and the kernel sends it
 SIGHUP, whose default action ends the child even in native code holding the GIL; and its stdin's
-end ends it too. Its environment is HOME and TMPDIR only. It never imports the database, the
-server or the window. Logs carry codes, counts and MiB, never a path, a name, a hash or text.
+end ends it too. The child starts only with its sentinel stopped, and the app's watch ends the child
+at its next quiet tick if the sentinel is lost while the child works (killed, or continued and so
+ended), as the app's death would then no longer end it. Its environment is HOME and TMPDIR only.
+It never imports the database, the server or the window. Logs carry codes, counts and MiB, never a
+path, a name, a hash or text.
 """
 
 import contextlib
@@ -145,19 +148,57 @@ class _Usage(ctypes.Structure):  # struct rusage_info_v4, <sys/resource.h>: a UU
 
 _RUSAGE_INFO_V4 = 4
 _LIFETIME_MAX_PHYS_FOOTPRINT = 28  # ri_lifetime_max_phys_footprint
+class _BsdInfo(ctypes.Structure):  # struct proc_bsdinfo, <sys/proc_info.h>
+    _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32), ("xstatus", ctypes.c_uint32),
+                ("pid", ctypes.c_uint32), ("ppid", ctypes.c_uint32), ("ids", ctypes.c_uint32 * 6),
+                ("reserved", ctypes.c_uint32), ("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
+                ("nfiles", ctypes.c_uint32), ("pgid", ctypes.c_uint32), ("pjobc", ctypes.c_uint32),
+                ("tdev", ctypes.c_uint32), ("tpgid", ctypes.c_uint32), ("nice", ctypes.c_int32),
+                ("start", ctypes.c_uint64 * 2)]
+
+
+_PROC_PIDTBSDINFO, _SSTOP = 3, 4  # <sys/proc_info.h>, <sys/proc.h>
 _libproc = None
+
+
+def _lib():
+    global _libproc
+    if _libproc is None:
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        lib.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+        lib.proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        _libproc = lib
+    return _libproc
 
 
 def _peak(pid):
     """The child's largest physical footprint so far, in bytes, as the kernel records it (readable
     until the child is reaped), or None when it cannot be read."""
-    global _libproc
-    if _libproc is None:
-        _libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     usage = _Usage()
-    if _libproc.proc_pid_rusage(pid, _RUSAGE_INFO_V4, ctypes.byref(usage)) != 0:
+    if _lib().proc_pid_rusage(pid, _RUSAGE_INFO_V4, ctypes.byref(usage)) != 0:
         return None
     return usage.counters[_LIFETIME_MAX_PHYS_FOOTPRINT]
+
+
+def _children(pid):
+    """The pids of a process's children (proc_listchildpids), at most 64."""
+    kids = (ctypes.c_int * 64)()
+    count = _lib().proc_listchildpids(pid, kids, ctypes.sizeof(kids))
+    return list(kids[:max(0, min(count, 64))])
+
+
+def _sentinel_held(pid):
+    """Whether the child's process group holds a stopped member besides the child (its sentinel,
+    _sentinel), which the app's death needs to bring the kernel's SIGHUP. A sentinel killed or
+    continued (it then ends) is no longer one."""
+    info = _BsdInfo()
+    for kid in _children(pid):
+        size = ctypes.sizeof(info)
+        if _lib().proc_pidinfo(kid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), size) == size \
+                and info.status == _SSTOP and info.pgid == pid:
+            return True
+    return False
 
 
 def _exited(pid):
@@ -251,6 +292,14 @@ def _run(request, ceiling, limit, stop, received, stats):
                         raise  # what a frame may say, a wrong frame found as one, or this process out of memory
                     # Any other failure on a value the child sent: a wrong frame, its type logged (never content).
                     raise _Bad(f"a frame its checks could not take ({type(error).__name__})") from None
+            elif received.ready and not received.settled() and not _sentinel_held(child.pid) \
+                    and not _exited(child.pid):
+                # A quiet tick (nothing to read): its sentinel lost (killed, or continued and so ended) while
+                # it works. The app's death would no longer end a child stalled with the GIL held, so it ends
+                # now, while the app is here to end it. (A child that has sent its result, or ends, lets its
+                # sentinel go: its output is read first, as its ending is.)
+                log.error("a reading's child lost its sentinel; it was stopped")
+                raise ChildError("sentinel")
             if time.monotonic() - last > STEP_SECONDS:
                 log.warning("a reading's child sent nothing for %d s; it was stopped", STEP_SECONDS)
                 raise extraction.Unreadable("step_limit")
@@ -360,6 +409,10 @@ class _Received:
             log.error("a reading's child names another extractor version")
             raise ChildError("version")
         self.ready = True
+
+    def settled(self):
+        """Whether its result has come whole (after which the child ends its sentinel and itself)."""
+        return False
 
     errors = _ERRORS - {"no_page"}  # what a reading's child may report
 
@@ -481,6 +534,9 @@ class _Reading(_Received):
             raise _Bad("boxes that are not boxes")
         return len(rects)
 
+    def settled(self):
+        return self.done is not None
+
     def result(self):
         if self.done is None or self.exit != 0:
             self.ended()
@@ -494,6 +550,9 @@ class _Render(_Received):
     def __init__(self):
         super().__init__(extraction.PDF)
         self.image = None
+
+    def settled(self):
+        return self.image is not None
 
     def take(self, body):
         if self.ready and self.image is None and body.startswith(_PNG):
@@ -555,7 +614,10 @@ def _sentinel():
         os.closerange(0, 1024)
         os.kill(os.getpid(), signal.SIGSTOP)
         os._exit(0)
-    os.waitpid(pid, os.WUNTRACED)  # stopped: from now on the app's death brings the SIGHUP
+    _, status = os.waitpid(pid, os.WUNTRACED)
+    if not os.WIFSTOPPED(status):  # it ended before it stopped, and this wait reaped it: no sentinel, and its
+        os._exit(1)  # pid is no longer the child's to signal; no start (the parent reads it as a failed start)
+    # Stopped: from now on the app's death brings the SIGHUP (and the app watches that it stays so).
     if os.getppid() != parent or parent == 1:  # the app died before: no SIGHUP will come
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)
@@ -622,13 +684,12 @@ def _file(path, sha256):
 
 
 def main():
-    """The child: one request, one reading or page image, its frames on stdout."""
-    sentinel = _sentinel()  # before the audit hook, which refuses a fork, and before any thread
-    try:
-        return _child()
-    finally:
-        os.kill(sentinel, signal.SIGKILL)
-        os.waitpid(sentinel, 0)
+    """The child: one request, one reading or page image, its frames on stdout. Its sentinel ends with
+    it: the child's own end leaves its group orphaned with the stopped sentinel, which the kernel's
+    SIGHUP ends (and launchd reaps). It is not ended here first: the app takes a sentinel gone while
+    the child still runs for one lost (_run)."""
+    _sentinel()  # before the audit hook, which refuses a fork, and before any thread
+    return _child()
 
 
 def _child():

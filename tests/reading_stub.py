@@ -14,6 +14,8 @@ arguments say (the conftest fixture reading_stub starts it in place of the real 
     exit CODE         exit with CODE at once (os._exit)
     signal NAME       kill itself with signal NAME (SIGSEGV: a crash in native code)
     stall             sleep without a word, for ever
+    sentinel-dies DIR its sentinel ends (exit 7) where it would stop, before the child's wait for its stop;
+                      it says so by a file DIR/sentinel, and every signal the child sends is listed in DIR/kills
     gil-stall DIR S   say it holds by a file DIR/held-<pid>, then stall S seconds in native code holding
                       the GIL (libc's sleep through ctypes.PyDLL), as a parser stuck in C would
     frame NAME        send a frame that is not one (FRAMES), then read for real
@@ -241,6 +243,19 @@ class FailsOnce:
             raise ocr.Failed()
         return self.engine.recognize(bitmap)
 
+
+if MODE == "sentinel-dies":
+    real_kill = os.kill
+
+    def kill(pid, sig):
+        if pid == os.getpid() and sig == signal.SIGSTOP:  # in the sentinel, as it would stop: it ends instead
+            Path(ARGS[0], "sentinel").write_text(str(pid))
+            os._exit(7)
+        with open(Path(ARGS[0], "kills"), "a") as kills:
+            kills.write(f"{pid} {sig}\n")
+        return real_kill(pid, sig)
+
+    os.kill = kill
 
 if MODE == "beat":  # the real child, its reports while it works closer together; nothing else changed
     reading.BEAT_SECONDS = float(ARGS[0])
