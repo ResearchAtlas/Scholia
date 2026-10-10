@@ -423,8 +423,8 @@ async def test_a_restore_done_whose_bookkeeping_fails_twice_lists_both_and_logs_
             after_audit.append(True)
         return result
 
-    def read(self, fn):
-        if after_audit:
+    def read(self, fn):  # the restore's own read: the search index reads the restored database meanwhile
+        if after_audit and fn.__qualname__.startswith("_replace"):
             after_audit.clear()
             raise OSError(f"I/O error reading {data}")
         return real_read(self, fn)
