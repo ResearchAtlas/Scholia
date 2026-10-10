@@ -287,6 +287,9 @@ class Harness:
         # Local background work by workflow: async handler(harness, active, project_id, inputs) ->
         # (summary, effect), where effect(conn), if any, is applied in the run's terminal transaction.
         self.workflows = {}
+        # By workflow: ending(conn, active, project_id), called in a local run's terminal transaction
+        # whatever its outcome (S1-17: a project's index run, asked for again while it ran, runs once more).
+        self.endings = {}
         self._tasks = set()  # detached tasks, kept referenced until they finish
         # Orders settings saves with the budget reads of call admission: a lowered budget either
         # lands before a call reads it or after that call was admitted.
@@ -1072,17 +1075,17 @@ class Harness:
             raise
         return result
 
-    def record_in(self, conn, active, project_id, workflow, inputs):
+    def record_in(self, conn, active, project_id, workflow, inputs, run_id=None):
         """Record a background run of the project in local work's terminal transaction (from its
         effect, on the writer thread): held here from before that transaction commits, as
         record_background holds its runs, and started by _local once it has (released if it did
         not), so no read finds it running in the record and not held. While the app is closing it is
         recorded unheld, and starts at the next launch."""
-        held = self.registry.add_background(new_id())
+        held = self.registry.add_background(run_id or new_id())
         if held is not None:
             active.follows.append(held)
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
-                     (held.run_id if held is not None else new_id(), project_id, workflow, json.dumps(inputs)))
+                     (held.run_id if held is not None else run_id or new_id(), project_id, workflow, json.dumps(inputs)))
 
     async def _local(self, active, project_id, workflow, inputs):
         try:
@@ -1132,6 +1135,9 @@ class Harness:
                      " settled_cost_usd = ? WHERE id = ?",
                      (status, cancel_reason, utc_now(), json.dumps(summary) if summary else None,
                       spending.run_cost(conn, run_id), run_id))
+        workflow, project_id = conn.execute("SELECT workflow, project_id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if (ending := self.endings.get(workflow)) is not None:
+            ending(conn, active, project_id)
 
     def _finish_background(self, conn, active, status, output, inputs, cancel_reason=None):
         """The run's effect, terminal status and settled cost, in one transaction. A cancel

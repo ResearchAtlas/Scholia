@@ -95,6 +95,7 @@ class Database:
         self.backups_dir = self.data_dir / "backups"
         self._damaged = None  # why writing stopped, once an integrity check fails
         self.on_damage = None  # called once, from the thread whose check found the database damaged
+        self.closing = []  # called as close() starts: what reads this database closes first (S1-17: the search index)
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
@@ -287,10 +288,16 @@ class Database:
         (DatabaseClosedError); reads in progress finish first, and a write already
         submitted runs before the writer connection closes. So work still running when
         the app stops gets an error, never a connection closed under it. A backup in
-        progress is stopped, and waited for up to STOP_SECONDS."""
+        progress is stopped, and waited for up to STOP_SECONDS. What reads this database
+        (closing: the search index) is closed first, its work drained."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")
+        for close in list(self.closing):  # each closes once, its work drained while this database still reads
+            try:
+                close()
+            except Exception as error:
+                log.warning("closing what reads the database failed (%s)", type(error).__name__)
         with self._readers_lock:
             if self._closed:  # closed already, or closing in another thread
                 return
