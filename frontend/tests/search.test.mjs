@@ -88,7 +88,7 @@ test('an index run or a paper says why search is keyword-only, in words for each
   assert.equal(indexReason('model_missing'), 'helper.reason.model_missing');
   assert.equal(indexReason('model_missing', false), 'helper.reasonImport.model_missing'); // Local only: import
   assert.equal(indexReason('never_seen'), 'helper.reason.other');
-  for (const reason of ['request_failed', 'start_failed', 'start_timeout', 'helper_failed', 'index_unavailable', 'model_changed',
+  for (const reason of ['request_failed', 'start_failed', 'start_timeout', 'helper_failed', 'index_unavailable', 'superseded', 'model_changed',
     'binary_missing', 'binary_changed', 'crashed', 'unhealthy', 'helper_unavailable']) {
     for (const catalog of [en, zhCN]) assert.ok(`errors.${reason}` in catalog, reason); // a failed index run's reason
   }

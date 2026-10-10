@@ -51,7 +51,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from backend import asks, local_helper
-from backend.db import deletion, new_id
+from backend.db import deletion, new_id, utc_now
 from backend.local_helper import EMBEDDING, HelperUnavailable, Refused
 from backend.runs import AdmissionError, RunOutcome, _event, _revoked, _running, derived_status
 from backend.search_index import DAMAGE, DIMENSIONS, SearchIndex, Unavailable, digest, index_text, readings
@@ -135,11 +135,10 @@ async def open_index(state, db):
             except RuntimeError:  # the app stopped meanwhile: the next launch requests the runs
                 pass
     index.rebuilt = rebuilt
-    # A deletion's removals, applied after its commit; while a whole rebuild runs (or failed, its file
-    # discarded), the pass after it applies them, and the deletion does not wait for the rebuild.
-    deletion.CLEANUP[db] = lambda: index.apply_soon() if index.building else index.apply()
-    if rebuilding is None:
-        index.apply_soon()
+    # A deletion's removals, applied after its commit and before it is reported done: during a whole
+    # rebuild, once the rebuild (whose last pass applies them) has run; a rebuild that fails, or that the
+    # index's close stops, discards its file, so nothing deleted rests in it either way.
+    deletion.CLEANUP[db] = index.apply
     installed = _installed(state)
     try:
         pending = None if wanted else await asyncio.to_thread(index.unembedded) if installed else set()
@@ -156,8 +155,12 @@ async def open_index(state, db):
         for project in sorted(projects):
             if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project,)).fetchone():
                 request_run(conn, None, project, lambda conn, project, inputs: _insert_run(conn, None, project, inputs),
-                        startup=True)
+                            startup=True)
+    # What waits is read once (the index's unembedded rows, then the queue) before any pass applies the
+    # queue and prunes it, so no project's work is missed between the two reads.
     await asyncio.to_thread(db.write, requested)
+    if rebuilding is None:
+        index.apply_soon()
 
 
 def _insert_run(conn, run_id, project_id, inputs):
@@ -167,28 +170,46 @@ def _insert_run(conn, run_id, project_id, inputs):
     return run_id
 
 
-def request_run(conn, registry, project_id, record, rebuild=False, startup=False):
+def request_run(conn, registry, project_id, record, rebuild=False, startup=False, run_id=None):
     """Ask for the project's index run, in the caller's transaction (see the module's docstring). While
-    one runs (unrevoked, its Cancel not asked for, held by registry; at a launch or a restore, startup:
-    one the launch starts again), it is marked to run once more when it ends: one rerun pending, its id
-    chosen now, a rebuild if any request asked for one (a Rebuild while a rebuild runs is that one).
-    Else record(conn, project id, inputs) records one. Returns the id of the run that will do it."""
-    for run_id, inputs in conn.execute(
+    one runs (unrevoked and held by registry, a Cancel draining included: a run is the project's until its
+    terminal transaction; at a launch or a restore, startup: one the launch starts again), it is marked
+    to run once more when it ends: one rerun pending, its id chosen now (run_id, if given), a rebuild if
+    any request asked for one (a Rebuild while a rebuild runs is that one). Else record(conn, project id,
+    inputs) records one (under run_id, if given). Returns the id of the run that will do it. A run_id
+    that loses to an id already pending gets a terminal record (_close_pending), so whoever follows it
+    sees it end."""
+    for live, inputs in conn.execute(
             "SELECT id, inputs FROM runs WHERE project_id = ? AND workflow = 'index' AND status = 'running'"
             " AND cancel_reason IS NULL AND json_extract(inputs, '$.retried_by') IS NULL ORDER BY rowid DESC",
             (project_id,)).fetchall():
-        active = registry.runs.get(run_id) if registry is not None else None
-        if not (startup or (active is not None and not active.cancel_requested.is_set())):
+        if not (startup or (registry is not None and live in registry.runs)):
             continue  # it will not end in this process (its terminal write failed): not the one
         inputs = json.loads(inputs or "{}")
         if rebuild and inputs.get("rebuild"):
-            return run_id
-        again = inputs.get("again") or {"run_id": new_id()}
+            if run_id is not None:
+                _close_pending(conn, project_id, run_id, "superseded")
+            return live
+        again = inputs.get("again") or {"run_id": run_id or new_id()}
+        if run_id is not None and again["run_id"] != run_id:
+            _close_pending(conn, project_id, run_id, "superseded")
         again["rebuild"] = bool(again.get("rebuild") or rebuild)
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.again', json(?)) WHERE id = ?",
-                     (json.dumps(again), run_id))
+                     (json.dumps(again), live))
         return again["run_id"]
     return record(conn, project_id, {"rebuild": True} if rebuild else {})
+
+
+def _close_pending(conn, project_id, run_id, reason=None):
+    """A pending run's id that will not run (its run's Cancel dropped it, or another pending run does its
+    work), recorded as a cancelled index run, so the interface following it (a Rebuild) sees it end."""
+    if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None:
+        return
+    conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status, cancel_reason, finished_at, summary)"
+                 " VALUES (?, ?, 'background', 'index', '{}', 'cancelled', ?, ?, ?)",
+                 (run_id, project_id, None if reason else "researcher", utc_now(),
+                  json.dumps({"reason": reason}) if reason else None))
+    _event(conn, run_id, "run_finished", {"status": "cancelled", **({"reason": reason} if reason else {})})
 
 
 async def _request(harness, project_id, rebuild=False):
@@ -309,11 +330,16 @@ def register(harness, state):
             raise RunOutcome("cancelled", None, "revoked" if active.cancel_reason == "revoked" else "researcher") from None
 
     def ending(conn, active, project_id):  # in an index run's terminal transaction, whatever its outcome
-        row = conn.execute("SELECT json_extract(inputs, '$.again') FROM runs WHERE id = ?", (active.run_id,)).fetchone()
-        again = json.loads(row[0]) if row and row[0] else None
-        if again and conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone():
-            harness.record_in(conn, active, project_id, "index", {"rebuild": True} if again.get("rebuild") else {},
-                              run_id=again["run_id"])
+        row = conn.execute("SELECT status, json_extract(inputs, '$.again') FROM runs WHERE id = ?",
+                           (active.run_id,)).fetchone()
+        again = json.loads(row[1]) if row and row[1] else None
+        if not again or not conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone():
+            return
+        if row[0] == "cancelled":  # Cancel stops indexing for now (reading R29): nothing starts at once; a later
+            _close_pending(conn, project_id, again["run_id"])  # trigger or the next launch requests again
+            return
+        harness.record_in(conn, active, project_id, "index", {"rebuild": True} if again.get("rebuild") else {},
+                          run_id=again["run_id"])
 
     async def offer_run(harness, active, project_id, inputs):
         return await _offer_run(state, harness, active, project_id, inputs)

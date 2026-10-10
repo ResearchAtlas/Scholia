@@ -640,10 +640,12 @@ async def _look_up(harness, active, project_id, inputs, pace):
                         raise RunOutcome("cancelled", "project_changed", "revoked") from None
                     else:
                         found, outcome = None, "refused"
-            if not await _write_if_running(write, run_id, lambda conn: _apply(
-                    conn, run_id, project_id, mine, scheme, value, found, outcome,
-                    lambda conn, project, workflow, inputs: harness.record_in(conn, active, project, workflow, inputs),
-                    harness)):
+            written = await _write_if_running(write, run_id, lambda conn: _apply(
+                conn, run_id, project_id, mine, scheme, value, found, outcome,
+                lambda conn, project, workflow, inputs: harness.record_in(conn, active, project, workflow, inputs),
+                harness))
+            harness.start_follows(active)  # an index run a title change recorded starts now, not at the lookup's end
+            if not written:
                 break
             resolved += found is not None
             missed += [outcome] if outcome in ("unavailable", "refused") else []
@@ -1204,8 +1206,10 @@ def _retry(conn, run_id, registry, derived=None):
     if workflow not in _WORKFLOWS or workflow == "model_offer" or (status not in ("failed", "cancelled", "interrupted")
                                       and (workflow, status) != ("extract", "succeeded")):  # read by an earlier version
         return None, (409, "not_retryable", "This run cannot be tried again")
-    if workflow == "index":  # S1-17: its project's run requested again (search.request_run), a rebuild again if it was one
-        return (project_id, workflow, {"rebuild": True} if inputs.get("rebuild") else {}), None
+    if workflow == "index":  # S1-17: its project's run requested again (search.request_run), a rebuild again if it
+        # was one or one was pending after it
+        rebuild = inputs.get("rebuild") or (inputs.get("again") or {}).get("rebuild")
+        return (project_id, workflow, {"rebuild": True} if rebuild else {}), None
     kept = [m for m in inputs.get("material_ids", []) if conn.execute(
         "SELECT 1 FROM materials WHERE id = ? AND project_id = ?", (m, project_id)).fetchone()]
     if not kept:
@@ -1271,8 +1275,10 @@ async def retry_run(run_id: str, request: Request):
             conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
                          (ids[0], project, workflow, json.dumps(inputs)))
             return ids[0]
-        # An index run's retry is a request for its project's run (S1-17): the one running, if one does, runs again.
-        retried = search.request_run(conn, registry, project_id, insert, bool(inputs.get("rebuild"))) if workflow == "index" \
+        # An index run's retry is a request for its project's run (S1-17): the one running, if one does, runs
+        # again. The run left pending after it (an interface follows its id) is the one this records (pending).
+        retried = search.request_run(conn, registry, project_id, insert, bool(inputs.get("rebuild")),
+                                     run_id=ids[0] if pending else None) if workflow == "index" \
             else insert(conn, project_id, inputs)
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
                      (retried, run_id))
@@ -1282,4 +1288,10 @@ async def retry_run(run_id: str, request: Request):
                          (utc_now(), run_id))
         return retried, [ids[0]] if retried == ids[0] else []
 
-    return {"run_id": await state["harness"].record_background(1, again)}
+    def left_pending(conn):  # S1-17: the id of the run an index run left pending, when none has it yet
+        row = conn.execute("SELECT json_extract(inputs, '$.again.run_id') FROM runs WHERE id = ? AND workflow = 'index'"
+                           " AND json_extract(inputs, '$.retried_by') IS NULL", (run_id,)).fetchone()
+        unused = row and row[0] and conn.execute("SELECT 1 FROM runs WHERE id = ?", (row[0],)).fetchone() is None
+        return [row[0]] if unused else []
+    pending = await asyncio.to_thread(state["db"].read, left_pending)
+    return {"run_id": await state["harness"].record_background(1, again, ids=pending)}

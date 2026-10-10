@@ -787,7 +787,7 @@ async def test_queued_additions_whose_passages_a_newer_reading_removed_are_passe
         project = await project_of(client)
         real, reconcile = SearchIndex._apply, SearchIndex._reconcile
         monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)  # the first reading's additions wait in the queue
-        monkeypatch.setattr(SearchIndex, "_reconcile", lambda self, project_id: (0, 0))  # and nothing makes them good
+        monkeypatch.setattr(SearchIndex, "_reconcile", lambda self, project_id, stop=None: (0, 0))  # and nothing makes them good
         await added(client, project, WAGES)
         await idle(client, project)
         older = {p for (p,) in await rows(client, "SELECT id FROM passages")}
@@ -1275,3 +1275,198 @@ async def test_a_run_that_ends_without_its_work_leaves_it_to_the_next_request(tm
         status = await idle(client, project)
         for material in (first, second):
             assert status["materials"][material["id"]]["embedded"] == status["materials"][material["id"]]["embeddable"]
+
+
+# Fix batch 4
+
+
+async def _running_index_runs(client, project):
+    return [r for (r,) in await rows(client, "SELECT id FROM runs WHERE project_id = ? AND workflow = 'index'"
+                                             " AND status = 'running'", project)]
+
+
+async def test_a_trigger_while_a_cancel_drains_is_that_runs_and_the_cancel_drops_it(tmp_path, monkeypatch):
+    """Review 4, items 2 and 6: a run is its project's until its terminal transaction, a Cancel draining
+    included, so a reading then marks it (never a second run); and Cancel stops indexing for now (reading
+    R29): the pending rerun is dropped, its id ended, and nothing starts until a later trigger."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        reached, go = await _held_in_the_writer(client, monkeypatch, "_store")
+        await added(client, project, WAGES)
+        assert await asyncio.to_thread(reached.wait, 10)
+        [run] = await _running_index_runs(client, project)
+        cancel = await _cancelling(client, run)
+        [(newer,)] = [(m["id"],) for m in (await added(client, project, paper("Newer", "Text added meanwhile.")))["materials"]]
+        deadline = asyncio.get_running_loop().time() + 10
+        while not await _pending(client, run):  # the reading's commit marked the draining run
+            assert asyncio.get_running_loop().time() < deadline
+            assert await _running_index_runs(client, project) == [run]  # never a second run
+            await asyncio.sleep(0.02)
+        pending = (await _pending(client, run))["run_id"]
+        go.set()
+        assert (await run_finished(client, run))["status"] == "cancelled"
+        await cancel
+        dropped = await run_finished(client, pending)  # its id ended, so whoever follows it sees the end
+        assert (dropped["status"], dropped["cancel_reason"]) == ("cancelled", "researcher")
+        await asyncio.sleep(0.3)
+        assert await _running_index_runs(client, project) == []  # nothing started at once
+        [later] = (await added(client, project, paper("Later", "A later paragraph.")))["materials"]
+        status = await idle(client, project)  # a later trigger's run reconciles all of it
+        for material in (newer, later["id"]):
+            assert status["materials"][material]["embedded"] == status["materials"][material]["embeddable"] > 0
+
+
+async def test_a_run_cancelled_before_its_work_began_ends_its_pending_rerun_too(tmp_path, monkeypatch):
+    """Review 4, item 3: a run left running by a shutdown with a rerun pending (a Rebuild's id given out),
+    cancelled at the next launch before its work begins, ends through _finish_background: the pending id
+    is ended there too."""
+    from backend.runs import Harness
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        pending = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        assert (await _pending(client, run)) == {"run_id": pending, "rebuild": True}
+    real, go = Harness._background, asyncio.Event()
+
+    async def held(self, active):
+        if active.run_id == run:
+            await go.wait()
+        return await real(self, active)
+    monkeypatch.setattr(Harness, "_background", held)
+    async with app(tmp_path, batch=1) as client:
+        cancel = asyncio.ensure_future(client.post(f"/api/runs/{run}/cancel"))
+        deadline = asyncio.get_running_loop().time() + 10
+        while not client.state["harness"].registry.runs[run].cancel_requested.is_set():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        go.set()
+        assert (await run_finished(client, run))["status"] == "cancelled"
+        await cancel
+        dropped = await run_finished(client, pending)
+        assert (dropped["status"], dropped["cancel_reason"]) == ("cancelled", "researcher")
+
+
+async def test_retry_after_a_failed_terminal_write_records_the_pending_rebuild_under_its_id(tmp_path, monkeypatch):
+    """Review 4, item 3: a run whose terminal write failed (interrupted) had a Rebuild pending, its id
+    given out; Retry records that pending run, a rebuild, under that id, so the interface following it
+    sees it run and end."""
+    from backend.runs import Harness
+    real = Harness._finish_local
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        pending = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+
+        def failing(self, conn, active, status, cancel_reason, summary, effect=None):
+            if active.run_id == run:
+                raise OSError("the disk is full")
+            return real(self, conn, active, status, cancel_reason, summary, effect)
+        monkeypatch.setattr(Harness, "_finish_local", failing)
+        client.remote.hold.set()
+        interrupted = await run_finished(client, run)
+        assert (interrupted["status"], interrupted["retryable"]) == ("interrupted", True)
+        monkeypatch.setattr(Harness, "_finish_local", real)
+        again = await client.post(f"/api/runs/{run}/retry")
+        assert again.status_code == 201 and again.json()["run_id"] == pending
+        ended = await run_finished(client, pending)
+        assert (ended["status"], ended["rebuild"], ended["result"]["rebuilt"]) == ("succeeded", True, True)
+
+
+async def test_startup_reads_what_waits_once_before_any_pass_applies_the_queue(tmp_path, monkeypatch):
+    """Review 4, item 4: additions left queued (a run cancelled before applying them) are seen at the next
+    launch whichever way its reads and the queue's pass interleave: its requests come from reads made
+    before the pass starts."""
+    real_apply, real_reconcile = SearchIndex._apply, SearchIndex._reconcile
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)  # the additions stay queued
+        monkeypatch.setattr(SearchIndex, "_reconcile", lambda self, project_id, stop=None: (0, 0))
+        await added(client, project, WAGES)
+        await idle(client, project)
+        assert await index_rows(client, project) == []
+    monkeypatch.setattr(SearchIndex, "_apply", real_apply)
+    monkeypatch.setattr(SearchIndex, "_reconcile", real_reconcile)
+    real_unembedded = SearchIndex.unembedded
+
+    def late_reader(self):  # reads, then lets a pass apply and prune the queue (if one runs) before answering
+        found = real_unembedded(self)
+        import sqlite3
+        import time
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with sqlite3.connect(self.db.path) as conn:
+                if conn.execute("SELECT count(*) FROM index_queue").fetchone()[0] == 0:
+                    break
+            time.sleep(0.02)
+        return found
+    monkeypatch.setattr(SearchIndex, "unembedded", late_reader)
+    async with app(tmp_path) as client:
+        deadline = asyncio.get_running_loop().time() + 15
+        while (await idle(client, project))["passages"]["embedded"] < 4:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.05)
+
+
+async def test_retry_of_a_rebuild_while_another_rebuild_runs_is_that_rebuild(tmp_path):
+    """Finding 23: one rebuild at a time per project, Retry included."""
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        old = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        await client.post(f"/api/runs/{old}/cancel")
+        assert (await run_finished(client, old))["status"] == "cancelled"
+        client.remote.hold, client.remote.free = asyncio.Event(), len(client.remote.indexing)
+        running = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        retried = (await client.post(f"/api/runs/{old}/retry")).json()["run_id"]
+        assert retried == running and await _running_index_runs(client, project) == [running]
+        assert await _pending(client, running) is None
+        client.remote.hold.set()
+        assert (await run_finished(client, running))["status"] == "succeeded"
+        await idle(client, project)
+        assert await _running_index_runs(client, project) == []
+
+
+async def test_an_index_run_a_lookup_records_starts_at_once_and_never_outlives_a_cancel(tmp_path, monkeypatch):
+    """The internal review of 68c4cdd, P2: a lookup's title change asks for its project's index run mid-run;
+    that run starts once the change commits (not at the lookup's end), so papers added while the lookup
+    goes on are indexed, and a Cancel of the lookup leaves no run held that never starts."""
+    from backend import lookup
+    blocked = asyncio.Event()
+
+    async def resolve(client, scheme, identifier, pace):
+        if identifier.endswith(".1"):
+            return lookup.Found("openalex", {"title": "Wage Floors, as Published", "DOI": identifier}, None,
+                                "openalex:W1")
+        await blocked.wait()  # the second identifier: the lookup goes on
+        raise lookup.Failed("unavailable")
+    monkeypatch.setattr(lookup, "resolve", resolve)
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        one = ("one.md", b"# Wage Floors\n\ndoi:10.5555/s117.1\n\n## Findings\n\nMinimum wages raise earnings.\n")
+        two = ("two.md", b"# Price Notes\n\ndoi:10.5555/s117.2\n\n## Findings\n\nRegional prices adjust slowly.\n")
+        result = await added(client, project, one, two)
+        deadline = asyncio.get_running_loop().time() + 15
+        while not await rows(client, "SELECT 1 FROM materials WHERE title = 'Wage Floors, as Published'"):
+            assert asyncio.get_running_loop().time() < deadline  # the first identifier's title applied
+            await asyncio.sleep(0.05)
+        [third] = (await added(client, project, paper("Third Paper", "A paragraph added during the lookup.")))["materials"]
+        deadline = asyncio.get_running_loop().time() + 10
+        while not [r for r in await index_rows(client, project) if r[1] == third["id"]]:
+            assert asyncio.get_running_loop().time() < deadline  # indexed while the lookup goes on
+            await asyncio.sleep(0.05)
+        await client.post(f"/api/runs/{result['lookup_run_id']}/cancel")
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "cancelled"
+        await idle(client, project)
+        registry = client.state["harness"].registry
+        assert [r for r in registry.runs.values() if r.kind == "background" and r.task is None] == []
+        [fourth] = (await added(client, project, paper("Fourth Paper", "A paragraph after the Cancel.")))["materials"]
+        status = await idle(client, project)
+        assert status["materials"][fourth["id"]]["embedded"] == status["materials"][fourth["id"]]["embeddable"] > 0

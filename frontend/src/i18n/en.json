@@ -570,6 +570,7 @@
   "errors.start_timeout": "The helper did not start in time. Try again.",
   "errors.helper_failed": "The helper failed several times in a row. Start it again under Settings, Advanced.",
   "errors.index_unavailable": "The search index is not available right now.",
+  "errors.superseded": "Another indexing run of this project does this work.",
   "errors.model_changed": "The search model's file is not the expected one. Download or import it again under Settings, Advanced.",
   "errors.binary_missing": "The helper program is missing from this copy of Scholia. Reinstall Scholia.",
   "errors.binary_changed": "The helper program changed since Scholia was built, so it is not started. Reinstall Scholia.",

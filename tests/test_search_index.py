@@ -639,10 +639,10 @@ async def test_a_whole_rebuild_that_keeps_failing_leaves_search_unavailable_neve
 
 @pytest.mark.asyncio
 async def test_a_deletion_while_a_rebuild_keeps_failing_leaves_no_deleted_text_at_rest(tmp_path, monkeypatch):
-    """Finding 19: the failed rebuild's partial file is discarded, so a paper deleted meanwhile rests in no
-    index file or WAL, before the rebuild succeeds or after."""
-    import threading
-    monkeypatch.setattr(search_index, "RETRY_SECONDS", (0.05, 0.1))
+    """Finding 19: the failed rebuild's partial file (the early project's rows committed, the deleted
+    paper's among them) is discarded, so the paper deleted while the retry waits rests in no index file or
+    WAL, before the rebuild succeeds or after."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))  # the retry waits: nothing else rebuilds meanwhile
     english = "Pangolins audit cerulean xylophones"
     async with app(tmp_path) as client:
         first, second = await project_of(client, "First"), await project_of(client, "Second")
@@ -653,24 +653,19 @@ async def test_a_deletion_while_a_rebuild_keeps_failing_leaves_no_deleted_text_a
         path = client.state["index"].path
     await _unfinished(path)
     files = [path, Path(f"{path}-wal")]
-    held = threading.Event()
-    attempts = _failing_rebuilds(monkeypatch, late, failures=2, held=held)  # the third waits, then succeeds
-    try:
-        async with app(tmp_path) as client:
-            index = client.state["index"]
-            await _until(lambda: len(attempts) == 3)  # two failed, each after the early project's rows
-            assert index.unusable
-            assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
-            left = b"".join(f.read_bytes() for f in files if f.exists())
-            assert english.encode() not in left and b"pangolins" not in left  # no partial file holds it
-            held.set()
-            await _until(lambda: not index.unusable and not index.building)
-            status = await until_embedded(client, late)
-            assert status["state"] == "ready" and (await idle(client, early))["passages"]["indexed"] == 0
-            left = b"".join(f.read_bytes() for f in files if f.exists())
-            assert english.encode() not in left and b"pangolins" not in left and b"cerulean" not in left
-    finally:
-        held.set()
+    attempts = _failing_rebuilds(monkeypatch, late, failures=1)  # the first fails after the early project's rows
+    async with app(tmp_path) as client:
+        index = client.state["index"]
+        await _until(lambda: len(attempts) == 1 and index.unusable and index._rebuild_retry is not None)
+        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        left = b"".join(f.read_bytes() for f in files if f.exists())
+        assert english.encode() not in left and b"pangolins" not in left  # no partial file holds it
+        index._damaged()  # the rebuild asked for again, now: it succeeds
+        await _until(lambda: not index.unusable and not index.building)
+        status = await until_embedded(client, late)
+        assert status["state"] == "ready" and (await idle(client, early))["passages"]["indexed"] == 0
+        left = b"".join(f.read_bytes() for f in files if f.exists())
+        assert english.encode() not in left and b"pangolins" not in left and b"cerulean" not in left
 
 
 @pytest.mark.asyncio
@@ -737,3 +732,196 @@ async def test_a_rebuild_is_said_building_from_the_moment_it_is_asked_for(tmp_pa
             await until_embedded(client, project)
     finally:
         go.set()
+
+
+# Fix batch 4
+
+
+@pytest.mark.asyncio
+async def test_a_deletion_while_a_partial_file_exists_then_a_close_leaves_no_deleted_text(tmp_path):
+    """Review 4, P1: the rebuild has committed a project's rows (the paper's among them) when the paper is
+    deleted, and the app closes before the rebuild ends: the deletion waits for the rebuild's writer, and
+    the close discards the unfinished file, so neither the file nor its WAL keeps the paper's text."""
+    import threading
+    from backend.db import ContentStore, Database, delete
+    import backend.search as search
+    english = "Okapis tabulate amber zeppelins"
+    async with app(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        early, late = sorted((first, second))
+        [doomed] = (await added(client, early, paper("Okapi Ledger", english)))["materials"]
+        await added(client, late, CHINESE)
+        await until_embedded(client, late)
+    data = tmp_path / "data"
+    path = data / search_index.FILE
+    files = [path, Path(f"{path}-wal")]
+    await _unfinished(path)
+    reached, go, real_add = threading.Event(), threading.Event(), SearchIndex._add
+
+    def held(self, project, pid, reading):  # the late project's first row: the early project's rows committed
+        if self.building and project == late and not go.is_set():
+            reached.set()
+            go.wait(20)
+        return real_add(self, project, pid, reading)
+    db = await asyncio.to_thread(Database, data)
+    state = {"data_dir": data}
+    try:
+        SearchIndex._add = held
+        await search.open_index(state, db)
+        assert await asyncio.to_thread(reached.wait, 10)
+        assert english.encode() in b"".join(f.read_bytes() for f in files if f.exists())  # the partial file has it
+        deleting = asyncio.ensure_future(asyncio.to_thread(delete, db, ContentStore(db), "material", doomed["id"]))
+        await asyncio.sleep(0.2)
+        assert not deleting.done()  # its cleanup waits for the rebuild's writer
+        closing = asyncio.ensure_future(asyncio.to_thread(db.close))
+        await asyncio.sleep(0.2)
+        go.set()
+        await asyncio.wait_for(asyncio.gather(deleting, closing), 20)
+    finally:
+        SearchIndex._add = real_add
+        go.set()
+        await asyncio.to_thread(db.close)
+    left = b"".join(f.read_bytes() for f in files if f.exists())
+    assert english.encode() not in left and b"okapis" not in left and b"zeppelins" not in left
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_already_submitted_when_the_index_closes_makes_and_unlinks_nothing(tmp_path, monkeypatch):
+    """Finding 22: a whole rebuild waiting its turn in the writer as close() runs neither unlinks the file nor
+    makes a new one; the close discards the unfinished file."""
+    import threading
+    from backend.db import Database
+    db = await asyncio.to_thread(Database, tmp_path / "data")
+    index = SearchIndex(tmp_path / "data", db, {"model": "m"})
+    made, real_create = [], SearchIndex._create
+
+    def create(self):
+        if self.closed:
+            made.append(True)
+        return real_create(self)
+    monkeypatch.setattr(SearchIndex, "_create", create)
+    try:
+        await asyncio.to_thread(index.open)
+        await asyncio.to_thread(index.apply)
+        go = threading.Event()
+        index._writer.submit(go.wait, 20)  # the writer busy
+        index._rebuild_soon()  # waits its turn behind it
+        closing = asyncio.ensure_future(asyncio.to_thread(index.close))
+        await asyncio.sleep(0.2)
+        go.set()
+        await asyncio.wait_for(closing, 10)
+    finally:
+        await asyncio.to_thread(db.close)
+    assert made == [] and not index.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_that_succeeds_disarms_a_retry_still_to_come(tmp_path, monkeypatch):
+    """A failed whole rebuild arms a retry; one that then succeeds by another path disarms it, so no
+    rebuild of a healthy file follows."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (1.0, 1.0))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await until_embedded(client, project)
+        path = client.state["index"].path
+    await _unfinished(path)
+    attempts, failing, real_all, real_add = [], {"on": True}, SearchIndex._rebuild_all, SearchIndex._add
+
+    def counted(self):
+        attempts.append(True)
+        return real_all(self)
+
+    def failing_add(self, project_id, pid, reading):
+        if self.building and failing["on"]:
+            raise search_index.apsw.IOError("disk I/O error")
+        return real_add(self, project_id, pid, reading)
+    monkeypatch.setattr(SearchIndex, "_rebuild_all", counted)
+    monkeypatch.setattr(SearchIndex, "_add", failing_add)
+    async with app(tmp_path) as client:
+        index = client.state["index"]
+        await _until(lambda: len(attempts) == 1 and index.unusable and index._rebuild_retry is not None)
+        failing["on"] = False
+        index._damaged()  # another path asks for a rebuild, which succeeds
+        await _until(lambda: not index.unusable and not index.building)
+        assert index._rebuild_retry is None
+        await asyncio.sleep(1.5)  # past the retry's delay
+        assert len(attempts) == 2  # the failed one and the success: none after
+        await until_embedded(client, project)
+
+
+@pytest.mark.asyncio
+async def test_removals_a_deletion_queued_but_no_pass_applied_reach_the_file_as_it_closes(tmp_path, monkeypatch):
+    """A deletion whose cleanup did not reach the index (the index closing as it came) leaves its removals
+    queued; the index's close applies them before the file closes, so its bytes and its WAL hold none of
+    the paper."""
+    english = "Quokkas annotate vermilion abacuses"
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [doomed] = (await added(client, project, paper("Quokka Ledger", english)))["materials"]
+        await added(client, project, WAGES)
+        await until_embedded(client, project)
+        index = client.state["index"]
+        files = [index.path, Path(f"{index.path}-wal")]
+        from backend.db import deletion
+        monkeypatch.setitem(deletion.CLEANUP, client.state["db"], lambda: None)  # its cleanup does not reach the index
+        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        assert english.encode() in b"".join(f.read_bytes() for f in files if f.exists())  # still there
+    left = b"".join(f.read_bytes() for f in files if f.exists())
+    assert english.encode() not in left and b"quokkas" not in left and b"vermilion" not in left
+    assert files[0].exists()  # applied, not discarded: its embeddings stay for the next launch
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rebuilds_discard_goes_on_whatever_closing_its_connections_meets(tmp_path, monkeypatch):
+    """The internal review of 68c4cdd, P2: closing the partial file's connections may fail after an I/O
+    error; the file is unlinked and the retry armed all the same."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        await added(client, first, WAGES)
+        await added(client, second, CHINESE)
+        await until_embedded(client, second)
+        path = client.state["index"].path
+    await _unfinished(path)
+    attempts = _failing_rebuilds(monkeypatch, max(first, second), failures=1)
+    real = SearchIndex._close_readers
+
+    def failing(self):
+        if self.unusable:
+            raise search_index.apsw.IOError("disk I/O error")
+        return real(self)
+    monkeypatch.setattr(SearchIndex, "_close_readers", failing)
+    async with app(tmp_path) as client:
+        index = client.state["index"]
+        await _until(lambda: len(attempts) == 1 and index.unusable)
+        await _until(lambda: index._rebuild_retry is not None)  # armed, the discard's failure notwithstanding
+        assert not path.exists() and not Path(f"{path}-wal").exists()
+        monkeypatch.setattr(SearchIndex, "_close_readers", real)
+
+
+@pytest.mark.asyncio
+async def test_reconciling_a_project_stops_and_rolls_back_when_its_run_is_cancelled(tmp_path, monkeypatch):
+    """The internal review of 68c4cdd, P3: the check against the main database asks stop() every
+    STOP_EVERY rows; a true answer rolls it back, the drift left to the next run."""
+    from backend.db import deletion
+    monkeypatch.setattr(search_index, "STOP_EVERY", 1)
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [gone] = (await added(client, project, WAGES))["materials"]
+        await added(client, project, paper("Kept Paper", "A paragraph that stays."))
+        await until_embedded(client, project)
+        index = client.state["index"]
+        monkeypatch.setitem(deletion.CLEANUP, client.state["db"], lambda: None)  # its rows left behind: drift
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)
+        assert (await client.delete(f"/api/materials/{gone['id']}")).status_code == 200
+        before = len(await index_rows(client, project))
+        import threading
+        writer = threading.current_thread
+
+        def stopped():  # asked in the index's writer only: by then the Cancel has come
+            return writer().name.startswith("scholia-index-writer")
+        assert await asyncio.to_thread(index.reconcile, project, stopped) == (0, 0)
+        assert len(await index_rows(client, project)) == before  # rolled back
+        assert await asyncio.to_thread(index.reconcile, project, lambda: False) == (0, 4)
+        assert {r[1] for r in await index_rows(client, project)} == {m for m in (await idle(client, project))["materials"]}

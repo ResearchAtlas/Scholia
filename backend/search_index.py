@@ -435,9 +435,11 @@ class SearchIndex:
                 if not self._rebuild_all():
                     return
             except Exception as error:
-                self._discard()
                 log.error("rebuilding the search index failed (%s); it is tried again", type(error).__name__)
-                self._rebuild_later()
+                try:
+                    self._discard()
+                finally:  # whatever the discard meets, a retry is armed
+                    self._rebuild_later()
                 return
             with self._lock:
                 self._rebuild_failures = 0
@@ -459,10 +461,16 @@ class SearchIndex:
         """A failed whole rebuild's partial file goes (it may hold text a deletion since has removed from
         the main database): the index stays unusable, building, until a rebuild succeeds."""
         self.unusable = True
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
-        self._close_readers()
+        conn, self._conn = self._conn, None
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception as error:  # the file goes all the same
+            log.warning("closing a failed rebuild's partial index file failed (%s)", type(error).__name__)
+        try:
+            self._close_readers()
+        except Exception as error:
+            log.warning("closing the partial index file's readers failed (%s)", type(error).__name__)
         for suffix in ("", "-wal", "-shm"):
             try:
                 Path(f"{self.path}{suffix}").unlink(missing_ok=True)
@@ -622,6 +630,21 @@ class SearchIndex:
             applied += len(rows)
             self._prune(rows[-1][0])
         return applied
+
+    def _remove_queued(self):
+        """As the index closes: the queue's removals after the last sequence applied, each passage's rows
+        removed and checked gone, then the WAL checkpointed and truncated. The sequence applied is left as it
+        is, so the next launch's pass applies the queue in order (these again: nothing to remove)."""
+        last = int(self._conn.execute("SELECT value FROM index_meta WHERE key = 'last_seq'").fetchone()[0])
+        rows = self.db.read(lambda conn: conn.execute(
+            "SELECT target_id, project_id FROM index_queue WHERE seq > ? AND op = 'remove' AND target = 'passage'"
+            " ORDER BY seq", (last,)).fetchall())
+        if not rows:
+            return
+        with self._conn:
+            removed = [rowid for pid, project in rows for rowid in self._remove(project, pid)]
+        if removed:
+            self._checkpoint()
 
     def _prune(self, seq):
         """The applied rows leave the queue (migration 0001's note); the next pass deletes them if this fails."""
@@ -798,10 +821,11 @@ class SearchIndex:
         """The project's rows checked against the main database, the access check's own source: a row
         of a passage no current version in the project reads now goes, and a passage one reads that has
         no row gets one (the queue keeps both in step; this makes any drift good). Returns (added,
-        removed). stop() withdraws it while it waits its turn."""
-        return self._write(self._reconcile, project_id, withdraw=stop)
+        removed). stop() withdraws it while it waits its turn, and is asked every STOP_EVERY rows: a
+        true answer rolls it back (the next run makes the drift good)."""
+        return self._write(self._reconcile, project_id, stop, withdraw=stop)
 
-    def _reconcile(self, project_id):
+    def _reconcile(self, project_id, stop=None):
         if self.building or self._conn is None or self.closed:
             return 0, 0
         reads = self.db.read(lambda conn: granted(conn, project_id))
@@ -811,10 +835,19 @@ class SearchIndex:
         if not gone and not new:
             return 0, 0
         found = self.db.read(lambda conn: readings(conn, project_id, new)) if new else {}
-        with self._conn:
-            removed = [rowid for pid in gone for rowid in self._remove(project_id, pid)]
-            for pid, reading in found.items():
-                self._add(project_id, pid, reading)
+        try:
+            with self._conn:
+                removed = []
+                for count, pid in enumerate(gone, start=1):
+                    removed += self._remove(project_id, pid)
+                    if stop is not None and count % STOP_EVERY == 0 and stop():
+                        raise _Stopped()
+                for count, (pid, reading) in enumerate(found.items(), start=1):
+                    self._add(project_id, pid, reading)
+                    if stop is not None and count % STOP_EVERY == 0 and stop():
+                        raise _Stopped()
+        except _Stopped:
+            return 0, 0
         if removed:
             self._checkpoint()
         return len(found), len(removed)
@@ -823,7 +856,10 @@ class SearchIndex:
 
     def close(self):
         """Stop the writer once the job it runs ends (a whole rebuild stops between projects), and close
-        every connection."""
+        every connection. The queue's removals not applied yet (a deletion during the last pass, or one
+        that pass did not reach as the index closed) are applied first (_remove_queued). A file a whole
+        rebuild has not finished (asked for, under way, or failed), or one whose removals cannot be
+        applied, is discarded: nothing deleted stays in it, and the next launch rebuilds it."""
         with self._lock:
             if self._shut:  # closed already (the database's close closes it too)
                 return
@@ -833,9 +869,22 @@ class SearchIndex:
                     timer.cancel()
 
         def end():
+            discard = self.building
+            if self._conn is not None and not discard:
+                self._close_readers()
+                try:
+                    self._remove_queued()
+                except Exception as error:
+                    log.warning("the index's last removals could not be applied (%s); its file is discarded",
+                                type(error).__name__)
+                    discard = True
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+            if discard:
+                self._close_readers()
+                for suffix in ("", "-wal", "-shm"):
+                    Path(f"{self.path}{suffix}").unlink(missing_ok=True)
         try:
             self._writer.submit(end).result()
         finally:
