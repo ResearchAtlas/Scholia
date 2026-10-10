@@ -32,8 +32,9 @@ sequence the main database cannot have (a restored or replaced database: its que
 is lower) is replaced and rebuilt from the main database's current readings, in the writer, while
 the app runs; another tokenizer version re-tokenizes the keyword rows; another model, revision,
 quantization, runtime or dimension drops every vector, so that search never uses one from another
-model. A whole rebuild that fails leaves the index unavailable (its partial file is never read, nor
-taken for ready) and is tried again in the writer, sooner and then less often, until one succeeds.
+model. A whole rebuild that fails discards its partial file and leaves the index unavailable until
+one succeeds; it is tried again in the writer, sooner and then less often. The index closes with
+its database (Database.closing), its timers cancelled and its writer drained.
 Nothing here logs text, a title, a query or a path.
 """
 
@@ -64,7 +65,9 @@ TOKENIZER, TOKENIZER_VERSION = "scholia", "1"
 SCHEMA_VERSION = "1"  # a file of another schema is replaced and rebuilt
 QUEUE_PAGE = 1000  # queue rows applied in one index transaction
 MAX_TERMS = 64  # a query's distinct tokens, at most
-RETRY_SECONDS = (1, 60)  # a failed pass or WAL truncation is tried again after 1 s, doubling to at most 60 s
+# A failed pass, WAL truncation or whole rebuild is tried again after 1 s, doubling with each failure in a
+# row to at most 60 s (each kind counted apart); a success sets it back to 1 s.
+RETRY_SECONDS = (1, 60)
 STOP_EVERY = 1000  # rows between a project rebuild's looks at whether its run was stopped
 # Han characters: CJK unified ideographs, extension A, the compatibility ideographs and extensions B on.
 _HAN = "㐀-䶿一-鿿豈-﫿\U00020000-\U0003134f"
@@ -184,6 +187,14 @@ def readings(conn, project_id, passage_ids=None, references=True):
     return found
 
 
+def granted(conn, project_id):
+    """The ids of the passages a current version of a material in the project reads now (as readings)."""
+    return {pid for (pid,) in conn.execute(
+        f"SELECT p.id FROM materials m JOIN material_versions w ON w.material_id = m.id AND w.is_current = 1"
+        f" JOIN extractions e ON {_reads_now('w', 'e')} JOIN passages p ON p.extraction_id = e.id"
+        f" WHERE m.project_id = ?", (project_id,))}
+
+
 def connect(path, create=False):
     """An APSW connection to the index file at path, with the tokenizer registered, secure delete on (freed
     pages are zeroed) and sqlite-vec loaded if it can be: (connection, whether it loaded). Only with create
@@ -256,6 +267,7 @@ class SearchIndex:
         self.vectors = False  # sqlite-vec loaded: dense search is possible
         self.building = False  # the whole file is being rebuilt
         self.closed = False
+        self._shut = False  # close() has run (it runs once)
         self.damaged = False  # a read found the file damaged: it is being replaced
         self._conn = None
         self._truncate = False  # a WAL truncation not done yet: tried again at each pass, and soon (_retry_later)
@@ -349,6 +361,8 @@ class SearchIndex:
             pass
 
     def _open(self):
+        if self.closed:
+            return False, False
         self._create()
         try:
             self._conn, self.vectors = self._connect()
@@ -407,35 +421,57 @@ class SearchIndex:
 
     def _rebuild_soon(self, then=None):
         """_rebuild_all in the writer, without waiting for it, then then() there once it has succeeded. One
-        that fails leaves its partial file unusable (never read as ready) and is tried again soon, its
-        papers' embeddings asked for once one succeeds (self.rebuilt)."""
+        that fails discards its partial file and leaves the index unusable (never read as ready), and is
+        tried again soon, its papers' embeddings asked for once one succeeds (self.rebuilt). A success,
+        by any path, disarms a retry still to come."""
         def done(future):
             if not future.cancelled() and future.exception() is not None:
                 log.error("rebuilding the search index failed (%s)", type(future.exception()).__name__)
 
         def rebuild():
+            if self.closed:  # closed while this waited its turn: nothing is unlinked or made
+                return
             try:
                 if not self._rebuild_all():
                     return
             except Exception as error:
-                self.unusable = True
+                self._discard()
                 log.error("rebuilding the search index failed (%s); it is tried again", type(error).__name__)
                 self._rebuild_later()
                 return
-            self._rebuild_failures = 0
+            with self._lock:
+                self._rebuild_failures = 0
+                if self._rebuild_retry is not None:
+                    self._rebuild_retry.cancel()
+                    self._rebuild_retry = None
             if then is not None and not self.closed:  # once the file is ready, whatever the pass after it meets
                 then()
             try:
                 self._apply()  # what the queue brought meanwhile
             except Exception as error:  # the file is rebuilt; the pass is tried again soon (_apply)
                 log.warning("applying the index queue after its rebuild failed (%s)", type(error).__name__)
+        self.building = True  # from the moment it is asked for: no file is taken for ready meanwhile
         future = self._writer.submit(rebuild)
         future.add_done_callback(done)
         return future
 
+    def _discard(self):
+        """A failed whole rebuild's partial file goes (it may hold text a deletion since has removed from
+        the main database): the index stays unusable, building, until a rebuild succeeds."""
+        self.unusable = True
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+        self._close_readers()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+            except OSError as error:
+                log.warning("a failed rebuild's partial index file could not be removed (%s)", type(error).__name__)
+
     def _rebuild_later(self):
         """Another whole rebuild after a delay that doubles with each failure in a row (RETRY_SECONDS), one at
-        a time, none once the index is closed."""
+        a time, none once the index is closed (close cancels it)."""
         def again():
             with self._lock:
                 self._rebuild_retry = None
@@ -450,18 +486,22 @@ class SearchIndex:
                 return
             delay = min(RETRY_SECONDS[0] * 2 ** self._rebuild_failures, RETRY_SECONDS[1])
             self._rebuild_failures += 1
-            self._rebuild_retry = threading.Timer(delay, again)
-            self._rebuild_retry.daemon = True
-            self._rebuild_retry.start()
+            timer = threading.Timer(delay, again)
+            timer.daemon = True
+            self._rebuild_retry = timer  # held before it starts, so close() always finds it to cancel
+            timer.start()
 
     def _rebuild_all(self):
-        """Replace the file with a new one built from the main database's current readings: marked
-        building until every project's rows are in, so a launch that finds it unfinished starts
-        again. The last sequence applied is the queue's high-water mark read first; the queue then
-        brings in what changed meanwhile (the caller's next pass). Readers never make the file
-        (connect), so the new one is this writer's, owner-only. Returns whether it finished (else the
-        index closed meanwhile). One that fails leaves building set: no pass applies to its file."""
+        """Replace the file with a new one built from the main database's current readings, project by
+        project in the order of their ids: marked building until every project's rows are in, so a
+        launch that finds it unfinished starts again. The last sequence applied is the queue's
+        high-water mark read first; the queue then brings in what changed meanwhile (the caller's next
+        pass). Readers never make the file (connect), so the new one is this writer's, owner-only.
+        Returns whether it finished (else the index closed meanwhile). One that raises leaves building
+        set: the caller discards its file."""
         self.building = True
+        if self.closed:
+            return False
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -477,7 +517,7 @@ class SearchIndex:
                        tokenizer=TOKENIZER, tokenizer_version=TOKENIZER_VERSION, **self.identity)
         self._vector_tables()
         last = self.db.read(high_water)
-        for (project,) in self.db.read(lambda conn: conn.execute("SELECT id FROM projects").fetchall()):
+        for (project,) in self.db.read(lambda conn: conn.execute("SELECT id FROM projects ORDER BY id").fetchall()):
             if self.closed:
                 return False
             found = self.db.read(lambda conn: readings(conn, project))
@@ -690,13 +730,13 @@ class SearchIndex:
 
     # Embeddings
 
-    def missing(self, project_id, material_ids, limit, skip=()):
-        """Up to limit of the materials' passages in the project that have no embedding yet, as
-        (rowid, passage id, digest), leaving out skip (rowids); never a reference passage."""
+    def missing(self, project_id, limit, skip=()):
+        """Up to limit of the project's passages that have no embedding yet, as (rowid, passage id,
+        digest), leaving out skip (rowids); never a reference passage."""
         return self._read(lambda conn: conn.execute(
             "SELECT id, passage_id, digest FROM index_rows WHERE project_id = ? AND embedded = 0 AND kind != 'reference'"
-            " AND material_id IN (SELECT value FROM json_each(?)) AND id NOT IN (SELECT value FROM json_each(?))"
-            " ORDER BY id LIMIT ?", (project_id, json.dumps(list(material_ids)), json.dumps(list(skip)), limit)).fetchall())
+            " AND id NOT IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT ?",
+            (project_id, json.dumps(list(skip)), limit)).fetchall())
 
     def store(self, project_id, embedded, stop=None):
         """Write [(rowid, passage id, digest, vector)] in one transaction: each only while its row is
@@ -750,13 +790,34 @@ class SearchIndex:
                     " WHERE project_id = ? GROUP BY material_id", (project_id,)).fetchall())}
 
     def unembedded(self):
-        """{project id: [material ids]} whose passages lack embeddings."""
-        found = {}
-        for project, material in self._read(lambda conn: conn.execute(
-                "SELECT DISTINCT project_id, material_id FROM index_rows WHERE embedded = 0 AND kind != 'reference'"
-                " ORDER BY project_id, material_id").fetchall()):
-            found.setdefault(project, []).append(material)
-        return found
+        """The ids of the projects some of whose passages lack embeddings."""
+        return {project for (project,) in self._read(lambda conn: conn.execute(
+            "SELECT DISTINCT project_id FROM index_rows WHERE embedded = 0 AND kind != 'reference'").fetchall())}
+
+    def reconcile(self, project_id, stop=None):
+        """The project's rows checked against the main database, the access check's own source: a row
+        of a passage no current version in the project reads now goes, and a passage one reads that has
+        no row gets one (the queue keeps both in step; this makes any drift good). Returns (added,
+        removed). stop() withdraws it while it waits its turn."""
+        return self._write(self._reconcile, project_id, withdraw=stop)
+
+    def _reconcile(self, project_id):
+        if self.building or self._conn is None or self.closed:
+            return 0, 0
+        reads = self.db.read(lambda conn: granted(conn, project_id))
+        have = {pid for (pid,) in self._conn.execute("SELECT passage_id FROM index_rows WHERE project_id = ?",
+                                                     (project_id,))}
+        gone, new = sorted(have - reads), reads - have
+        if not gone and not new:
+            return 0, 0
+        found = self.db.read(lambda conn: readings(conn, project_id, new)) if new else {}
+        with self._conn:
+            removed = [rowid for pid in gone for rowid in self._remove(project_id, pid)]
+            for pid, reading in found.items():
+                self._add(project_id, pid, reading)
+        if removed:
+            self._checkpoint()
+        return len(found), len(removed)
 
     # Closing
 
@@ -764,7 +825,9 @@ class SearchIndex:
         """Stop the writer once the job it runs ends (a whole rebuild stops between projects), and close
         every connection."""
         with self._lock:
-            self.closed = True
+            if self._shut:  # closed already (the database's close closes it too)
+                return
+            self._shut = self.closed = True
             for timer in (self._retry, self._rebuild_retry):
                 if timer is not None:
                     timer.cancel()

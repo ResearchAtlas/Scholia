@@ -170,7 +170,7 @@ async def test_cancelling_an_index_run_keeps_its_committed_batches_and_retry_emb
         [material] = (await added(client, project, WAGES))["materials"]
         await asyncio.wait_for(client.remote.reached.wait(), 10)
         [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
-        assert run["materials"]["titles"] == ["Wage Floors"]
+        assert run["materials"] == {"titles": [], "count": 0}  # a project's run: it names no papers
         assert (await client.post(f"/api/runs/{run['run_id']}/cancel")).json()["status"] == "cancelled"
         assert (await client.post(f"/api/runs/{run['run_id']}/cancel")).json()["status"] == "cancelled"  # again: safe
         stored = [r for r in await index_rows(client, project) if r[3]]
@@ -209,7 +209,9 @@ async def test_a_helper_that_fails_ends_the_run_with_its_reason_and_the_paper_st
 
 
 @pytest.mark.parametrize("deleted", ["material", "project"])
-async def test_deleting_mid_embedding_revokes_the_run_and_nothing_of_it_is_sent_again_or_kept(tmp_path, deleted):
+async def test_deleting_mid_embedding_sends_nothing_more_of_it_and_keeps_nothing(tmp_path, deleted):
+    """A paper's deletion leaves its project's run running: its passages are refused at their requests
+    and its rows go with the deletion's cleanup. A project's deletion takes its run with it."""
     async with app(tmp_path, batch=1) as client:
         client.remote.hold = asyncio.Event()
         project = await project_of(client)
@@ -225,30 +227,31 @@ async def test_deleting_mid_embedding_revokes_the_run_and_nothing_of_it_is_sent_
         assert await index_rows(client) == []  # its rows and vectors went with the deletion's cleanup
         if deleted == "material":
             ended = await run_finished(client, run["run_id"])
-            assert (ended["status"], ended["cancel_reason"]) == ("cancelled", "revoked")
+            assert ended["status"] == "succeeded" and ended["result"]["passages"] == {"indexed": 0, "embedded": 0,
+                                                                                    "embeddable": 0}
             assert (await find(client, project, "earnings"))["results"] == []
 
 
-async def test_a_deleted_papers_index_run_leaves_its_other_papers_to_a_new_run(tmp_path):
+async def test_a_paper_deleted_while_its_project_rebuilds_leaves_the_rebuild_to_embed_the_rest(tmp_path):
     async with app(tmp_path, batch=1) as client:
         project = await project_of(client)
         first = (await added(client, project, WAGES))["materials"][0]
         second = (await added(client, project, paper("Second Paper", "A paragraph about synthetic cities.")))["materials"][0]
         await idle(client, project)
-        client.remote.hold = asyncio.Event()
-        response = await client.post(f"/api/projects/{project}/index/rebuild")  # names both papers
+        client.remote.hold, client.remote.free = asyncio.Event(), len(client.remote.indexing)
+        response = await client.post(f"/api/projects/{project}/index/rebuild")
         assert response.status_code == 202
         rebuild = response.json()["run_id"]
         await asyncio.wait_for(client.remote.reached.wait(), 10)
         assert (await client.delete(f"/api/materials/{first['id']}")).status_code == 200
-        ended = await run_finished(client, rebuild)
-        assert (ended["status"], ended["cancel_reason"]) == ("cancelled", "revoked")
-        follow = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
-        assert [r["materials"]["titles"] for r in follow] == [["Second Paper"]]
         client.remote.hold.set()
+        ended = await run_finished(client, rebuild)
+        assert (ended["status"], ended["result"]["rebuilt"]) == ("succeeded", True)
         status = await idle(client, project)
         assert list(status["materials"]) == [second["id"]]
         assert status["passages"]["embedded"] == status["passages"]["embeddable"] > 0
+        after = [r for r in await runs_of(client, "index", project) if r["started_at"] >= ended["started_at"]]
+        assert len(after) <= 2 and all(r["status"] == "succeeded" for r in after)  # the deletion's request: one rerun at most
 
 
 async def test_a_passage_deleted_between_retrieval_and_fetch_is_dropped(tmp_path, monkeypatch):
@@ -440,7 +443,8 @@ async def test_a_local_only_project_gets_no_offer_and_searches_by_keyword(tmp_pa
         found = await find(client, project, "earnings")
         assert (found["mode"], found["reason"]) == ("keyword_only", "model_missing") and found["results"]
         [run] = await runs_of(client, "index", project)
-        assert (run["status"], run["result"]) == ("succeeded", {"mode": "keyword_only", "reason": "model_missing"})
+        assert (run["status"], run["result"]["mode"], run["result"]["reason"]) == ("succeeded", "keyword_only", "model_missing")
+        assert run["result"]["passages"] == {"indexed": 4, "embedded": 0, "embeddable": 4}
 
 
 async def test_later_sends_nothing_and_is_not_asked_again_in_that_project(tmp_path):
@@ -651,7 +655,7 @@ async def test_the_index_status_and_a_rebuild_read_back(tmp_path):
         assert (await run_finished(client, response.json()["run_id"]))["status"] == "succeeded"
         status = await idle(client, project)
         assert status["run"] == {"run_id": response.json()["run_id"], "status": "succeeded", "rebuild": True,
-                                 "progress": None}
+                                 "rebuild_pending": False, "progress": None}
         assert status["passages"]["embedded"] == 4 and len(client.remote.indexing) - before == 4
         assert (await find(client, project, "earnings"))["results"]
         assert (await client.post("/api/projects/00000000-0000-4000-8000-000000000000/index/rebuild")).status_code == 404
@@ -781,8 +785,9 @@ async def test_queued_additions_whose_passages_a_newer_reading_removed_are_passe
     monkeypatch.setitem(extraction.EXTRACTORS, extraction.MARKDOWN, ("markdown", "markdown-0"))
     async with app(tmp_path) as client:
         project = await project_of(client)
-        real = SearchIndex._apply
+        real, reconcile = SearchIndex._apply, SearchIndex._reconcile
         monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)  # the first reading's additions wait in the queue
+        monkeypatch.setattr(SearchIndex, "_reconcile", lambda self, project_id: (0, 0))  # and nothing makes them good
         await added(client, project, WAGES)
         await idle(client, project)
         older = {p for (p,) in await rows(client, "SELECT id FROM passages")}
@@ -796,6 +801,7 @@ async def test_queued_additions_whose_passages_a_newer_reading_removed_are_passe
         assert await rows(client, "SELECT count(*) FROM passages WHERE id IN (SELECT value FROM json_each(?))",
                           json.dumps(sorted(older))) == [(0,)]  # but the newer reading removed their passages
         monkeypatch.setattr(SearchIndex, "_apply", real)
+        monkeypatch.setattr(SearchIndex, "_reconcile", reconcile)
         await asyncio.to_thread(client.state["index"].apply)
         newer = {p for (p,) in await rows(client, "SELECT id FROM passages")}
         assert {r[0] for r in await index_rows(client, project)} == newer and not newer & older
@@ -958,12 +964,12 @@ async def test_a_model_installed_as_a_run_finds_it_missing_gets_that_runs_papers
             assert asyncio.get_running_loop().time() < deadline, status
             await asyncio.sleep(0.05)
         first, *_ = sorted(await runs_of(client, "index", project), key=lambda r: r["started_at"])
-        assert first["result"] == {"mode": "keyword_only", "reason": "model_missing"}
+        assert (first["result"]["mode"], first["result"]["reason"]) == ("keyword_only", "model_missing")
 
 
-async def test_the_installs_runs_take_the_papers_of_a_running_run_too(tmp_path):
-    """No window in which an ending run's papers are left to no one: the install's runs name them too (a
-    second run for papers the first embeds finds nothing missing)."""
+async def test_the_installs_request_while_a_run_runs_is_one_rerun_after_it(tmp_path):
+    """No window in which an ending run's work is left to no one: the install's request, while the
+    project's run runs, marks it to run once more when it ends (that rerun finds nothing missing)."""
     import backend.search as search
     async with app(tmp_path, batch=1) as client:
         client.remote.hold, client.remote.free = asyncio.Event(), 1  # the run embeds one passage, then waits
@@ -972,13 +978,16 @@ async def test_the_installs_runs_take_the_papers_of_a_running_run_too(tmp_path):
         await asyncio.wait_for(client.remote.reached.wait(), 10)
         [running] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
         await search._embed_all(client.state)  # as the model's install calls it
-        runs = await runs_of(client, "index", project)
-        assert len(runs) == 2 and {r["materials"]["titles"][0] for r in runs} == {"Wage Floors"}
+        await search._embed_all(client.state)  # twice: still one rerun
+        assert [r["run_id"] for r in await runs_of(client, "index", project)] == [running["run_id"]]
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", running["run_id"])
+        rerun = json.loads(inputs)["again"]["run_id"]
         client.remote.hold.set()
         assert (await run_finished(client, running["run_id"]))["status"] == "succeeded"
+        assert (await run_finished(client, rerun))["status"] == "succeeded"
         status = await idle(client, project)
         assert status["passages"]["embedded"] == 4 and status["materials"][material["id"]]["embedded"] == 4
-        assert all(r["status"] == "succeeded" for r in await runs_of(client, "index", project))
+        assert len(await runs_of(client, "index", project)) == 2
 
 
 async def test_a_helper_still_saying_the_model_is_missing_records_no_chain_of_runs(tmp_path):
@@ -993,10 +1002,10 @@ async def test_a_helper_still_saying_the_model_is_missing_records_no_chain_of_ru
         await asyncio.sleep(0.5)
         await idle(client, project)
         [run] = await runs_of(client, "index", project)
-        assert run["result"] == {"mode": "keyword_only", "reason": "model_missing"}
+        assert (run["result"]["mode"], run["result"]["reason"]) == ("keyword_only", "model_missing")
 
 
-async def test_a_rebuild_under_way_shows_in_the_status_though_a_newer_run_follows(tmp_path):
+async def test_a_reading_during_a_rebuild_runs_once_more_after_it_and_the_status_shows_the_rebuild(tmp_path):
     async with app(tmp_path, batch=1) as client:
         project = await project_of(client)
         await added(client, project, WAGES)
@@ -1005,16 +1014,20 @@ async def test_a_rebuild_under_way_shows_in_the_status_though_a_newer_run_follow
         client.remote.free = len(client.remote.indexing)
         rebuild = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
         await asyncio.wait_for(client.remote.reached.wait(), 10)
-        await added(client, project, paper("Newer Paper", "Text after the rebuild began."))
+        [newer] = (await added(client, project, paper("Newer Paper", "Text after the rebuild began.")))["materials"]
         deadline = asyncio.get_running_loop().time() + 10
-        while len([r for r in await runs_of(client, "index", project) if r["status"] == "running"]) < 2:
-            assert asyncio.get_running_loop().time() < deadline
+        while not (await rows(client, "SELECT json_extract(inputs, '$.again.run_id') FROM runs WHERE id = ?", rebuild))[0][0]:
+            assert asyncio.get_running_loop().time() < deadline  # the reading's commit asked for the project's run
             await asyncio.sleep(0.02)
+        assert [r["run_id"] for r in await runs_of(client, "index", project) if r["status"] == "running"] == [rebuild]
         status = (await client.get(f"/api/projects/{project}/index")).json()
         assert (status["run"]["run_id"], status["run"]["rebuild"], status["run"]["status"]) == (rebuild, True, "running")
+        again = await client.post(f"/api/projects/{project}/index/rebuild")  # Rebuild while a rebuild runs: that one
+        assert again.json()["run_id"] == rebuild
         client.remote.hold.set()
         assert (await run_finished(client, rebuild))["status"] == "succeeded"
-        await idle(client, project)
+        status = await idle(client, project)
+        assert status["materials"][newer["id"]]["embedded"] == status["materials"][newer["id"]]["embeddable"] > 0
 
 
 async def test_each_index_run_in_the_activity_says_whether_its_own_project_offers_the_model(tmp_path):
@@ -1143,3 +1156,122 @@ async def test_retrying_a_stopped_rebuild_rebuilds_again(tmp_path):
         assert len(client.remote.indexing) - before == 4  # and every passage embedded again
         status = await idle(client, project)
         assert status["run"]["rebuild"] is True and status["passages"]["embedded"] == 4
+
+
+# The structural fix (fix batch 3): a project's index run, reconciling from the main database, at most
+# one running and one rerun pending per project; every trigger only a request.
+
+
+async def _pending(client, run_id):
+    [(again,)] = await rows(client, "SELECT json_extract(inputs, '$.again') FROM runs WHERE id = ?", run_id)
+    return json.loads(again) if again else None
+
+
+async def test_every_trigger_while_the_projects_run_runs_is_one_rerun_after_it(tmp_path):
+    """A burst of readings, a title change, a deletion, the model's install, Retry and Rebuild while the
+    project's run runs: still one running run, and one rerun pending (a rebuild, since one asked for it)."""
+    import backend.search as search
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        [old] = (await added(client, project, paper("Old Paper", "An earlier paragraph about prices.")))["materials"]
+        await idle(client, project)
+        cancelled = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        await client.post(f"/api/runs/{cancelled}/cancel")
+        await run_finished(client, cancelled)
+        client.remote.hold, client.remote.free = asyncio.Event(), len(client.remote.indexing)
+        [first] = (await added(client, project, WAGES))["materials"]
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [running] = [r["run_id"] for r in await runs_of(client, "index", project) if r["status"] == "running"]
+        for i in range(4):  # a burst of readings
+            await added(client, project, paper(f"Burst {i}", f"Paragraph {i} of a burst."))
+        deadline = asyncio.get_running_loop().time() + 10
+        while [r for r in await runs_of(client, "extract", project) if r["status"] == "running"]:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        patched = await client.patch(f"/api/materials/{first['id']}", json={"title": "Wage Floors, Retitled"})
+        assert patched.status_code == 200, patched.text
+        assert (await client.delete(f"/api/materials/{old['id']}")).status_code == 200
+        await search._embed_all(client.state)
+        retried = (await client.post(f"/api/runs/{cancelled}/retry")).json()["run_id"]
+        rebuilt = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        again = await _pending(client, running)
+        assert again == {"run_id": retried, "rebuild": True} and rebuilt == retried
+        assert [r["run_id"] for r in await runs_of(client, "index", project) if r["status"] == "running"] == [running]
+        client.remote.hold.set()
+        assert (await run_finished(client, running))["status"] == "succeeded"
+        ended = await run_finished(client, retried)
+        assert (ended["status"], ended["rebuild"], ended["result"]["rebuilt"]) == ("succeeded", True, True)
+        status = await idle(client, project)
+        assert status["passages"]["embedded"] == status["passages"]["embeddable"] == status["passages"]["indexed"] > 4
+        assert old["id"] not in status["materials"]
+        runs = {r["run_id"] for r in await runs_of(client, "index", project)}
+        assert {cancelled, running, retried} <= runs and len(runs) == 4  # and the first paper's: no other run
+
+
+async def test_retrying_an_old_rebuild_embeds_the_papers_added_since(tmp_path):
+    """Finding 16: Retry of a rebuild stopped before papers were added rebuilds the project's rows and
+    embeds every one of its passages, theirs too, not only the papers the old run knew."""
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        client.remote.hold, client.remote.free = asyncio.Event(), len(client.remote.indexing)
+        old = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        await client.post(f"/api/runs/{old}/cancel")
+        client.remote.hold.set()
+        assert (await run_finished(client, old))["status"] == "cancelled"
+        [later] = (await added(client, project, paper("Later Paper", "A paragraph added after the rebuild.")))["materials"]
+        await idle(client, project)
+        again = (await client.post(f"/api/runs/{old}/retry")).json()["run_id"]
+        ended = await run_finished(client, again)
+        assert (ended["status"], ended["result"]["rebuilt"]) == ("succeeded", True)
+        status = await idle(client, project)
+        assert status["materials"][later["id"]]["embedded"] == status["materials"][later["id"]]["embeddable"] > 0
+        assert status["passages"]["embedded"] == status["passages"]["embeddable"]
+
+
+async def test_a_revoked_run_left_running_by_a_crash_never_stands_for_the_projects_run(tmp_path):
+    """Finding 18: a revoked index run still running in the record at a launch is not the project's run:
+    the launch's request records one that embeds what waits; the revoked one ends cancelled."""
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        [material] = (await added(client, project, WAGES))["materials"]
+        assert (await idle(client, project))["passages"]["embedded"] == 0
+
+        def left(conn):  # as a crash after the revocation's commit leaves it (an older run named its papers)
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, cancel_reason) VALUES"
+                         " ('00000000-0000-4000-8000-0000000000aa', ?, 'background', 'index', ?, 'revoked')",
+                         (project, json.dumps({"material_ids": [material["id"]]})))
+        await asyncio.to_thread(client.state["db"].write, left)
+    async with app(tmp_path) as client:
+        deadline = asyncio.get_running_loop().time() + 10
+        while (await idle(client, project))["passages"]["embedded"] < 4:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.05)
+        revoked = await run_finished(client, "00000000-0000-4000-8000-0000000000aa")
+        assert (revoked["status"], revoked["cancel_reason"]) == ("cancelled", "revoked")
+
+
+@pytest.mark.parametrize("ended", ["cancelled", "failed"])
+async def test_a_run_that_ends_without_its_work_leaves_it_to_the_next_request(tmp_path, ended):
+    """Whatever ends the project's run (Cancel, a helper that fails), the next request's run does what it
+    left: every passage of the project embedded."""
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        if ended == "failed":
+            client.remote.failing = True
+        [first] = (await added(client, project, WAGES))["materials"]
+        if ended == "cancelled":
+            await asyncio.wait_for(client.remote.reached.wait(), 10)
+            [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
+            await client.post(f"/api/runs/{run['run_id']}/cancel")
+        client.remote.hold.set()
+        assert (await idle(client, project))["passages"]["embedded"] < 4
+        assert [r["status"] for r in await runs_of(client, "index", project)] == [ended]
+        client.remote.failing, client.remote.hold = False, None
+        [second] = (await added(client, project, paper("Second Paper", "Another paragraph.")))["materials"]
+        status = await idle(client, project)
+        for material in (first, second):
+            assert status["materials"][material["id"]]["embedded"] == status["materials"][material["id"]]["embeddable"]

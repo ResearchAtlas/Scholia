@@ -300,9 +300,8 @@ async def measure(args, state, client, data, processes):
         build["passages_per_second"] = round(build["embeddable"] / max(build["embedding_seconds"], 0.001), 2)
     else:  # seeded random unit vectors, written to the index directly (see the module's docstring)
         rng = random.Random(SEED)
-        materials = list(counts)
         written_at = time.perf_counter()
-        while rows := await asyncio.to_thread(index.missing, project, materials, 2000):
+        while rows := await asyncio.to_thread(index.missing, project, 2000):
             batch = []
             for rowid, pid, mark in rows:
                 vector = [rng.gauss(0, 1) for _ in range(DIMENSIONS)]

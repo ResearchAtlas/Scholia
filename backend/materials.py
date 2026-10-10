@@ -219,7 +219,7 @@ async def add_files(project_id: str, body: Upload, request: Request):
             run, indexed = None, False
             if shared is not None:  # read already, for another project or version: shared, not read again
                 if indexed := _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
-                    search.queued(conn, harness, project_id, [material], origin, recorded)
+                    search.queued(conn, harness, project_id, origin, recorded)
             else:
                 run = next(ids)
                 used.append(run)
@@ -228,7 +228,7 @@ async def add_files(project_id: str, body: Upload, request: Request):
                                                                              "version_id": version, "origin": origin})))
             if replaced is not None and replaced[1] in extraction.EXTRACTORS:  # its old file's readings, unless read still
                 if _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0]) and not indexed:
-                    recorded(conn, project_id, "index", {"material_ids": [material]})  # takes those removals now
+                    search.removed(conn, harness, project_id, recorded)  # its index run takes those removals now
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
             looked_up[material] = version
         lookup_run = None  # a review-locked project never looks identifiers up
@@ -454,9 +454,9 @@ def _serve(conn, sha256, extractor, extraction_id, record, gives=False, harness=
         for earlier in older:
             removing = _queue_removes(conn, earlier, project) or removing
         if _queue_adds(conn, extraction_id, project):  # a reading with passages: indexed, offered for
-            search.queued(conn, harness, project, [material], (origins or {}).get(version), record)
-        elif removing:  # a reading without passages: an index run still takes the earlier reading's removals
-            record(conn, project, "index", {"material_ids": [material]})
+            search.queued(conn, harness, project, (origins or {}).get(version), record)
+        elif removing:  # a reading without passages: its project's index run still takes the earlier reading's removals
+            search.removed(conn, harness, project, record)
         if locked:
             continue
         latest = conn.execute("SELECT r.id, json_extract(r.inputs, '$.origin') FROM runs r, json_each(r.inputs, '$.versions') j"
@@ -642,7 +642,8 @@ async def _look_up(harness, active, project_id, inputs, pace):
                         found, outcome = None, "refused"
             if not await _write_if_running(write, run_id, lambda conn: _apply(
                     conn, run_id, project_id, mine, scheme, value, found, outcome,
-                    lambda conn, project, workflow, inputs: harness.record_in(conn, active, project, workflow, inputs))):
+                    lambda conn, project, workflow, inputs: harness.record_in(conn, active, project, workflow, inputs),
+                    harness)):
                 break
             resolved += found is not None
             missed += [outcome] if outcome in ("unavailable", "refused") else []
@@ -742,13 +743,13 @@ async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
         await asyncio.sleep(WAIT_SECONDS)
 
 
-def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, record=None):
+def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, record=None, harness=None):
     """An identifier's outcome for the papers it was found in, [(material id, version id)]: their
     metadata is written only while that version is still the material's current file; a paper whose
     file was replaced meanwhile keeps what its newer file gives (outcome replaced). A retraction
     check is about one DOI: a record of another DOI, or of none, that says nothing on retraction
     leaves the paper unchecked rather than keeping the old DOI's check. A changed title is indexed anew
-    (search.retitled), its index run recorded with record."""
+    (search.retitled), its project's index run requested with record (harness: its runs, for the request)."""
     now = utc_now()
     for material, version in pairs:
         row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title FROM materials m"
@@ -764,7 +765,7 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
                              (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
                 if record is not None and mine.csl["title"] != row[3]:
-                    search.retitled(conn, project_id, material, record)
+                    search.retitled(conn, harness, project_id, material, record)
                 if mine.retracted is None and row[2] != mine.csl.get("DOI"):  # another work, of which no check is known
                     conn.execute("UPDATE materials SET retraction = 'unknown', retraction_checked_at = NULL WHERE id = ?",
                                  (material,))
@@ -950,7 +951,7 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
                          (ids[0], project, workflow, json.dumps(inputs)))
 
         if title != row[0]:  # the index text carries the title (S1-17)
-            search.retitled(conn, row[2], material_id, recorded)
+            search.retitled(conn, harness, row[2], material_id, recorded)
         return _describe(conn, _material_row(conn, material_id), harness.registry), used
 
     return await harness.record_background(1, update)
@@ -978,16 +979,12 @@ async def delete_material(material_id: str, request: Request, purge_backups: boo
         "SELECT project_id FROM materials WHERE id = ?", (material_id,)).fetchone())
     if project is None:
         raise _refused(404, "not_found", "No such material")
-    files = await asyncio.to_thread(state["db"].read, lambda conn: [f for (f,) in conn.execute(  # S1-17, below
-        "SELECT DISTINCT file_sha256 FROM material_versions WHERE material_id = ? AND file_sha256 IS NOT NULL",
-        (material_id,))])
-
     async def deleting():
         revoked = await asyncio.to_thread(
             delete, state["db"], state["content"], "material", material_id, remove_all_trace=remove_all_trace,
             on_committed=lambda ids: loop.call_soon_threadsafe(harness.revoke, ids))
         harness.revoke(revoked)
-        await search.after_deletion(state, revoked, project[0], files)  # what lacks embeddings now gets a run
+        await search.after_deletion(state, project[0])  # what lacks embeddings now: its project's run is requested
         if not purge_backups:
             return {"ok": True}
         try:
@@ -1133,7 +1130,8 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
 def run_details(conn, run_id, workflow, status, inputs, registry, derived=None):
     """What the background-run list shows of a material's run beside its status: the titles of the
     papers it works on (up to three, with their count), its open ask, whether Retry applies, and for
-    an index run whether its project offers the search model's download (S1-17). derived: the status the
+    an index run whether its project offers the search model's download and whether it rebuilds the
+    project's rows (S1-17). derived: the status the
     list shows (derived_status), worked out in the same read, which Retry is decided by."""
     if workflow not in _WORKFLOWS:
         return {}
@@ -1146,10 +1144,11 @@ def run_details(conn, run_id, workflow, status, inputs, registry, derived=None):
     ask = asks.open_asks(conn, run_id=run_id) if status == "running" else []
     details = {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
                "retryable": _retry(conn, run_id, registry, derived)[1] is None}
-    if workflow == "index":  # S1-17: why it was keyword-only is worded as its own project offers the model
+    if workflow == "index":  # S1-17: a project's run (no papers named); its reason worded as its project offers the model
         level = conn.execute("SELECT p.sensitivity FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?",
                              (run_id,)).fetchone()
         details["download_offered"] = level is not None and level[0] != "local_only"
+        details["rebuild"] = bool(json.loads(inputs or "{}").get("rebuild"))
     return details
 
 
@@ -1205,6 +1204,8 @@ def _retry(conn, run_id, registry, derived=None):
     if workflow not in _WORKFLOWS or workflow == "model_offer" or (status not in ("failed", "cancelled", "interrupted")
                                       and (workflow, status) != ("extract", "succeeded")):  # read by an earlier version
         return None, (409, "not_retryable", "This run cannot be tried again")
+    if workflow == "index":  # S1-17: its project's run requested again (search.request_run), a rebuild again if it was one
+        return (project_id, workflow, {"rebuild": True} if inputs.get("rebuild") else {}), None
     kept = [m for m in inputs.get("material_ids", []) if conn.execute(
         "SELECT 1 FROM materials WHERE id = ? AND project_id = ?", (m, project_id)).fetchone()]
     if not kept:
@@ -1213,8 +1214,6 @@ def _retry(conn, run_id, registry, derived=None):
         if (refusal := _unreadable(conn, inputs.get("version_id"), registry)) is not None:
             return None, refusal
         return (project_id, workflow, {"material_ids": kept, "version_id": inputs["version_id"]}), None
-    if workflow == "index":  # embeds what its papers still lack (S1-17); a project's rebuild rebuilds again
-        return (project_id, workflow, {"material_ids": kept, **({"rebuild": True} if inputs.get("rebuild") else {})}), None
     if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
         return None, (403, "lookup_locked", "A review-locked project never looks identifiers up")
     return (project_id, workflow, {"material_ids": kept, "origin": None, "versions": dict(conn.execute(
@@ -1267,14 +1266,20 @@ async def retry_run(run_id: str, request: Request):
         if left_running and not registry.retire(run_id):  # held again meanwhile (a kick started it): running
             raise _refused(409, "not_retryable", "This run is running")
         project_id, workflow, inputs = retry
-        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
-                     (ids[0], project_id, workflow, json.dumps(inputs)))
+
+        def insert(conn, project, inputs):
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
+                         (ids[0], project, workflow, json.dumps(inputs)))
+            return ids[0]
+        # An index run's retry is a request for its project's run (S1-17): the one running, if one does, runs again.
+        retried = search.request_run(conn, registry, project_id, insert, bool(inputs.get("rebuild"))) if workflow == "index" \
+            else insert(conn, project_id, inputs)
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
-                     (ids[0], run_id))
+                     (retried, run_id))
         if left_running:  # retired: no kick holds it here from now on, and the record says it ended
             _event(conn, run_id, "run_finished", {"status": "interrupted"})
             conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
                          (utc_now(), run_id))
-        return ids[0], ids
+        return retried, [ids[0]] if retried == ids[0] else []
 
     return {"run_id": await state["harness"].record_background(1, again)}

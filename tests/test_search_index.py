@@ -223,7 +223,7 @@ async def test_without_sqlite_vec_search_is_keyword_only_and_says_so(tmp_path, m
         assert (found["mode"], found["reason"]) == ("keyword_only", "vectors_unavailable") and found["results"]
         assert client.remote.indexing == []
         [run] = [r for r in (await client.get("/api/activity")).json()["runs"] if r["workflow"] == "index"]
-        assert run["result"] == {"mode": "keyword_only", "reason": "vectors_unavailable"}
+        assert (run["result"]["mode"], run["result"]["reason"]) == ("keyword_only", "vectors_unavailable")
 
 
 @pytest.mark.asyncio
@@ -588,15 +588,16 @@ async def test_a_whole_rebuild_that_fails_once_is_tried_again_and_its_partial_fi
         path = client.state["index"].path
     await _unfinished(path)
     held = threading.Event()
-    attempts = _failing_rebuilds(monkeypatch, second, failures=1, held=held)
+    early, late = sorted((first, second))  # rebuilt in the order of their ids: the early one's rows commit first
+    attempts = _failing_rebuilds(monkeypatch, late, failures=1, held=held)
     try:
         async with app(tmp_path) as client:
             index = client.state["index"]
-            await _until(lambda: len(attempts) == 2)  # the first failed, after First's rows; the retry waits
-            assert index.unusable
-            status = (await client.get(f"/api/projects/{first}/index")).json()
+            await _until(lambda: len(attempts) == 2)  # the first failed, after the early project's rows; the retry waits
+            assert index.unusable and not path.exists()  # its partial file discarded
+            status = (await client.get(f"/api/projects/{early}/index")).json()
             assert (status["state"], status["mode"], status["reason"]) == ("unavailable", "keyword_only", "index_unavailable")
-            found = await find(client, first, "earnings")  # First's rows are in the partial file: never read
+            found = await find(client, early, "earnings" if early == first else "最低工资")
             assert (found["results"], found["index"], found["reason"]) == ([], "unavailable", "index_unavailable")
             held.set()
             await _until(lambda: not index.unusable and not index.building)
@@ -618,10 +619,13 @@ async def test_a_whole_rebuild_that_keeps_failing_leaves_search_unavailable_neve
         await until_embedded(client, second)
         path = client.state["index"].path
     await _unfinished(path)
-    attempts = _failing_rebuilds(monkeypatch, second, failures=10_000)
+    attempts = _failing_rebuilds(monkeypatch, max(first, second), failures=10_000)  # after the other's rows
     async with app(tmp_path) as client:
         index = client.state["index"]
         await _until(lambda: len(attempts) >= 3)  # tried again, and again
+        assert not path.exists()  # each attempt's partial file discarded
+        with pytest.raises(search_index.Unavailable):  # nothing is written to it meanwhile
+            await asyncio.to_thread(index.store, first, [])
         for project in (first, second):
             status = await idle(client, project)  # the launch's index runs end; none loops on the file
             assert (status["state"], status["reason"], status["passages"]["indexed"]) == ("unavailable", "index_unavailable", 0)
@@ -632,3 +636,107 @@ async def test_a_whole_rebuild_that_keeps_failing_leaves_search_unavailable_neve
         assert ended and all((r["status"], (r["result"] or {}).get("reason")) == ("failed", "index_unavailable")
                              for r in ended)
         assert index.unusable and index.building
+
+
+@pytest.mark.asyncio
+async def test_a_deletion_while_a_rebuild_keeps_failing_leaves_no_deleted_text_at_rest(tmp_path, monkeypatch):
+    """Finding 19: the failed rebuild's partial file is discarded, so a paper deleted meanwhile rests in no
+    index file or WAL, before the rebuild succeeds or after."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (0.05, 0.1))
+    english = "Pangolins audit cerulean xylophones"
+    async with app(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        early, late = sorted((first, second))
+        [doomed] = (await added(client, early, paper("Pangolin Ledger", english)))["materials"]
+        await added(client, late, CHINESE)
+        await until_embedded(client, late)
+        path = client.state["index"].path
+    await _unfinished(path)
+    files = [path, Path(f"{path}-wal")]
+    failing = {"on": True}
+    attempts, real_add = [], SearchIndex._add
+
+    def failing_add(self, project, pid, reading):
+        if self.building and project == late and failing["on"]:
+            attempts.append(True)
+            raise search_index.apsw.IOError("disk I/O error")
+        return real_add(self, project, pid, reading)
+    monkeypatch.setattr(SearchIndex, "_add", failing_add)
+    async with app(tmp_path) as client:
+        index = client.state["index"]
+        await _until(lambda: len(attempts) >= 2 and index.unusable)
+        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        left = b"".join(f.read_bytes() for f in files if f.exists())
+        assert english.encode() not in left and b"pangolins" not in left  # no partial file holds it
+        failing["on"] = False
+        await _until(lambda: not index.unusable and not index.building)
+        status = await until_embedded(client, late)
+        assert status["state"] == "ready" and (await idle(client, early))["passages"]["indexed"] == 0
+        left = b"".join(f.read_bytes() for f in files if f.exists())
+        assert english.encode() not in left and b"pangolins" not in left and b"cerulean" not in left
+
+
+@pytest.mark.asyncio
+async def test_the_index_closes_with_its_database_and_no_rebuild_outlives_it(tmp_path, monkeypatch):
+    """Finding 17: when the main database closes (a restore under way or abandoned, shutdown), its index
+    closes first: its retry timers cancelled, its writer drained, and no rebuild runs against the closed
+    database."""
+    from backend.db import Database
+    import backend.search as search
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (0.05, 0.05))
+    attempts, real_add = [], SearchIndex._add
+
+    def failing_add(self, project, pid, reading):
+        if self.building:
+            attempts.append(True)
+            raise search_index.apsw.IOError("disk I/O error")
+        return real_add(self, project, pid, reading)
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+    data = tmp_path / "data"
+    await _unfinished(data / search_index.FILE)
+    monkeypatch.setattr(SearchIndex, "_add", failing_add)
+    db = await asyncio.to_thread(Database, data)
+    state = {"data_dir": data}
+    try:
+        await search.open_index(state, db)
+        index = state["index"]
+        await _until(lambda: len(attempts) >= 2)  # failing, and tried again
+        assert index._rebuild_retry is not None or index.unusable
+    finally:
+        await asyncio.to_thread(db.close)
+    assert index.closed and index._shut
+    assert index._rebuild_retry is None or index._rebuild_retry.finished.is_set()  # cancelled
+    tried = len(attempts)
+    await asyncio.sleep(0.3)
+    assert len(attempts) == tried  # nothing tried again against the closed database
+    await asyncio.to_thread(index.close)  # closing again changes nothing
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_is_said_building_from_the_moment_it_is_asked_for(tmp_path, monkeypatch):
+    """Finding 21: an unfinished file found at a launch reads as being rebuilt before the writer starts the
+    rebuild, never as ready."""
+    import threading
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await until_embedded(client, project)
+        path = client.state["index"].path
+    await _unfinished(path)
+    go, real = threading.Event(), SearchIndex._rebuild_all
+
+    def held(self):
+        go.wait(20)
+        return real(self)
+    monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+    try:
+        async with app(tmp_path) as client:
+            status = (await client.get(f"/api/projects/{project}/index")).json()
+            assert status["state"] == "building"
+            go.set()
+            await until_embedded(client, project)
+    finally:
+        go.set()
