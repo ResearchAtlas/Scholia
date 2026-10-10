@@ -503,8 +503,9 @@ class SearchIndex:
         """Replace the file with a new one built from the main database's current readings, project by
         project in the order of their ids: marked building until every project's rows are in, so a
         launch that finds it unfinished starts again. The last sequence applied is the queue's
-        high-water mark read first; the queue then brings in what changed meanwhile (the caller's next
-        pass). Readers never make the file (connect), so the new one is this writer's, owner-only.
+        high-water mark read first, and the queue's rows up to it are pruned once it is ready; the queue
+        then brings in what changed meanwhile (the caller's next pass). Readers never make the file
+        (connect), so the new one is this writer's, owner-only.
         Returns whether it finished (else the index closed meanwhile). One that raises leaves building
         set: the caller discards its file."""
         self.building = True
@@ -534,6 +535,7 @@ class SearchIndex:
                     self._add(project, pid, reading)
         with self._conn:
             self._meta(state="ready", last_seq=last)
+        self._prune(last)  # what it read leaves the queue (no pass applies rows at or below last)
         self.damaged = self.unusable = False
         self.building = False
         return True

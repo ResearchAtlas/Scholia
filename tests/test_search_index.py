@@ -15,7 +15,7 @@ import backend.search_index as search_index
 from backend.search_index import DIMENSIONS, SearchIndex, match, tokens
 from scholia_app import run_finished, started
 from test_materials import added, project_of, rows
-from test_search import CHINESE, WAGES, app, find, idle, index_rows, paper, vector
+from test_search import CHINESE, WAGES, app, find, idle, index_rows, paper, runs_of, vector
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -925,3 +925,33 @@ async def test_reconciling_a_project_stops_and_rolls_back_when_its_run_is_cancel
         assert len(await index_rows(client, project)) == before  # rolled back
         assert await asyncio.to_thread(index.reconcile, project, lambda: False) == (0, 4)
         assert {r[1] for r in await index_rows(client, project)} == {m for m in (await idle(client, project))["materials"]}
+
+
+@pytest.mark.asyncio
+async def test_a_whole_rebuild_takes_the_queue_rows_it_read_so_no_later_launch_asks_a_run_for_them(tmp_path,
+                                                                                                    monkeypatch):
+    """Internal review of 68c4cdd, finding 5: the queue's rows at or below a whole rebuild's last sequence
+    (what it read) leave the queue as it finishes, so later launches ask no index run for their project."""
+    real_apply, real_reconcile = SearchIndex._apply, SearchIndex._reconcile
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)  # the additions stay queued
+        monkeypatch.setattr(SearchIndex, "_reconcile", lambda self, project_id, stop=None: (0, 0))
+        await added(client, project, WAGES)
+        await idle(client, project)
+        path = client.state["index"].path
+    monkeypatch.setattr(SearchIndex, "_apply", real_apply)
+    monkeypatch.setattr(SearchIndex, "_reconcile", real_reconcile)
+    import apsw
+    conn = apsw.Connection(str(path))
+    conn.execute("UPDATE index_meta SET value = 'building' WHERE key = 'state'")  # unfinished: rebuilt at launch
+    conn.close()
+    async with app(tmp_path) as client:
+        await until_rebuilt(client.state["index"])
+        await until_embedded(client, project)
+        [(queued,)] = await rows(client, "SELECT count(*) FROM index_queue")
+        assert queued == 0
+        before = await runs_of(client, "index", project)
+    async with app(tmp_path) as client:
+        await idle(client, project)
+        assert await runs_of(client, "index", project) == before

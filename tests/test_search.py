@@ -1473,3 +1473,36 @@ async def test_an_index_run_a_lookup_records_starts_at_once_and_never_outlives_a
         [fourth] = (await added(client, project, paper("Fourth Paper", "A paragraph after the Cancel.")))["materials"]
         status = await idle(client, project)
         assert status["materials"][fourth["id"]]["embedded"] == status["materials"][fourth["id"]]["embeddable"] > 0
+
+
+# From the internal review of 68c4cdd
+
+
+async def test_a_launch_asks_no_rerun_of_the_run_it_starts_again(tmp_path):
+    """Finding 4(b): a launch's request for a project whose run it starts again is that run, unmarked (it
+    applies the queue, reconciles and embeds what is missing, all a plain run does): no second run follows."""
+    async with app(tmp_path, batch=1) as client:
+        client.remote.hold, client.remote.free = asyncio.Event(), 2
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)  # shut down with the paper half embedded
+        [run] = [r["run_id"] for r in await runs_of(client, "index", project) if r["status"] == "running"]
+        before = {r["run_id"] for r in await runs_of(client, "index", project)}
+    async with app(tmp_path, batch=1) as client:  # its unembedded passages ask for a run: the one restarted
+        assert await _pending(client, run) is None
+        assert (await idle(client, project))["passages"]["embedded"] == 4
+        assert (await run_finished(client, run))["status"] == "succeeded"
+        assert {r["run_id"] for r in await runs_of(client, "index", project)} == before
+
+
+async def test_the_index_status_shows_the_latest_run_over_an_older_one_left_running_in_its_record(tmp_path):
+    """Finding 6: a run whose terminal write failed stays running in its record (it reads interrupted);
+    the index status shows the project's latest run, a later one that finished, not that one."""
+    from backend.search import _insert_run
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        stale = await asyncio.to_thread(client.state["db"].write, lambda conn: _insert_run(conn, None, project, {}))
+        await added(client, project, WAGES)
+        status = await idle(client, project)
+        [latest] = [r["run_id"] for r in await runs_of(client, "index", project) if r["run_id"] != stale]
+        assert (status["run"]["run_id"], status["run"]["status"]) == (latest, "succeeded")

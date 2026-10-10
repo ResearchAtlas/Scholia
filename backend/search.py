@@ -10,7 +10,8 @@ embedding_batch` at a time, each committed to the index as one batch. At most on
 every trigger (a reading's commit, a title change, a deletion, the model's install, the launch, a
 restore, a whole-file rebuild, Retry, Rebuild) only requests one (`request_run`): while the project's run
 runs, it is marked to run once more when it ends (one rerun pending, a rebuild if one was asked
-for), else one is recorded, in the trigger's own transaction. Every embedding request carries the
+for; at a launch or a restore, a plain request is the run the launch starts again, left as it is),
+else one is recorded, in the trigger's own transaction. Every embedding request carries the
 run's dispatch check, read in the outbound gate's decision transaction: the run still runs,
 unrevoked, and the passage is still one a current version in the project reads (`_may_index`); so
 nothing deleted or replaced is sent, and a vector is written only while its passage's row is there
@@ -173,9 +174,10 @@ def _insert_run(conn, run_id, project_id, inputs):
 def request_run(conn, registry, project_id, record, rebuild=False, startup=False, run_id=None):
     """Ask for the project's index run, in the caller's transaction (see the module's docstring). While
     one runs (unrevoked and held by registry, a Cancel draining included: a run is the project's until its
-    terminal transaction; at a launch or a restore, startup: one the launch starts again), it is marked
-    to run once more when it ends: one rerun pending, its id chosen now (run_id, if given), a rebuild if
-    any request asked for one (a Rebuild while a rebuild runs is that one). Else record(conn, project id,
+    terminal transaction; at a launch or a restore, startup: one the launch starts again, which a plain
+    request leaves as it is, since it does all a plain run does), it is marked to run once more when it
+    ends: one rerun pending, its id chosen now (run_id, if given), a rebuild if any request asked for one
+    (a Rebuild while a rebuild runs is that one). Else record(conn, project id,
     inputs) records one (under run_id, if given). Returns the id of the run that will do it. A run_id
     that loses to an id already pending gets a terminal record (_close_pending), so whoever follows it
     sees it end."""
@@ -185,6 +187,8 @@ def request_run(conn, registry, project_id, record, rebuild=False, startup=False
             (project_id,)).fetchall():
         if not (startup or (registry is not None and live in registry.runs)):
             continue  # it will not end in this process (its terminal write failed): not the one
+        if startup and not rebuild:
+            return live
         inputs = json.loads(inputs or "{}")
         if rebuild and inputs.get("rebuild"):
             if run_id is not None:
@@ -604,13 +608,15 @@ async def index_status(project_id: str, request: Request):
     def latest(conn):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
             raise AdmissionError(404, "not_found", "No such project")
-        return conn.execute("SELECT id, status, inputs FROM runs WHERE project_id = ? AND workflow = 'index'"
-                            " ORDER BY status = 'running' DESC, rowid DESC LIMIT 20", (project_id,)).fetchall()
+        runs = "SELECT id, status, inputs FROM runs WHERE project_id = ? AND workflow = 'index'"
+        return [*conn.execute(runs + " AND status = 'running' ORDER BY rowid DESC", (project_id,)),
+                *conn.execute(runs + " ORDER BY rowid DESC LIMIT 1", (project_id,))]
 
     runs = await asyncio.to_thread(state["db"].read, latest)
-    # Each status worked out once (a run may be released between two looks at the registry).
+    # Each status worked out once (a run may be released between two looks at the registry). The latest is
+    # last: one running in its record that this process does not hold (interrupted) is not taken over it.
     found = [(run_id, derived_status(status, run_id, registry), json.loads(inputs or "{}")) for run_id, status, inputs in runs]
-    run = next((r for r in found if r[1] == "running"), found[0] if found else None)
+    run = next((r for r in found if r[1] == "running"), found[-1] if found else None)
     active = run and registry.runs.get(run[0])
     index = state.get("index")
     if index is not None and (index.closed or index.unusable):
