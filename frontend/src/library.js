@@ -522,8 +522,9 @@ export function withNear(near, page, isNear) {
 
 // What a page whose read failed says in its place (the catalog key): that its image was stopped at a
 // ceiling, by name (backend/materials.py page_image), or else that it could not be shown.
+const PAGE_CEILINGS = new Map([['memory_limit', 'paper.pageMemoryLimit'], ['step_limit', 'paper.pageStepLimit']]);
 export function pageFailedKey(code) {
-  return { memory_limit: 'paper.pageMemoryLimit', step_limit: 'paper.pageStepLimit' }[code] ?? 'paper.pageFailed';
+  return PAGE_CEILINGS.get(code) ?? 'paper.pageFailed';
 }
 
 // A PDF page as a data URL: the request carries the session, which an <img> could not, and the

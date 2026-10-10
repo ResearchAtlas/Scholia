@@ -803,19 +803,24 @@ async def test_a_docx_declaring_an_entity_is_refused_and_nothing_of_it_is_writte
         assert (refused["state"], refused["reason"]) == ("needs_attention", "unreadable_file")
 
 
-@pytest.mark.parametrize("held", ["its file's read", "its render"])
+@pytest.mark.parametrize("held", ["its file's read", "its render", "its render, then stopped silent"])
 @pytest.mark.parametrize("deleted", ["material", "project"])
-async def test_a_page_image_whose_paper_is_deleted_while_it_renders_is_not_given(tmp_path, reading_stub, deleted, held):
+async def test_a_page_image_whose_paper_is_deleted_while_it_renders_is_not_given(tmp_path, monkeypatch, reading_stub,
+                                                                                 deleted, held):
+    """Not found, even when its render was stopped at a ceiling meanwhile (the step limit here)."""
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         await added(client, project, PDF)
         [paper] = await settled(client, project)
         reached, go = hold_extraction(reading_stub, tmp_path, *(["file"] if held == "its file's read" else []))
+        if held.endswith("stopped silent"):
+            monkeypatch.setattr(reading, "STEP_SECONDS", 1.0)
         page = asyncio.ensure_future(client.get(f"/api/material-versions/{paper['version']['id']}/pages/1"))
         await asyncio.to_thread(reached.wait, 10)
         url = f"/api/materials/{paper['id']}" if deleted == "material" else f"/api/projects/{project}"
         assert (await client.delete(url)).status_code == 200
-        go.set()
+        if not held.endswith("stopped silent"):
+            go.set()
         assert (await page).status_code == 404
         assert await ended(*reached.held())
 

@@ -578,22 +578,19 @@ def end_group(app, reader):
 
 
 def seen(child):
-    """The reading child as the test saw it: its pid and start time, or None if it is gone already."""
-    info = reading._info(child)
-    return None if info is None else (child, tuple(info.start))
+    """The reading child and its sentinel (its group: the child starts no other process) as the test saw
+    them: each one's pid and start time, of those there."""
+    return [(pid, tuple(info.start)) for pid in (child, *reading._children(child)) if (info := reading._info(pid))]
 
 
 def end_reader(reader):
-    """A failed check's cleanup: end the group the child leads, only while its leader is still the process
-    the test saw (a group of its own, the same start time); a pid taken by another process since is left
-    alone. A leader gone takes its sentinel with it (its group orphaned with a stopped member)."""
-    if reader is None:
-        return
-    child, start = reader
-    info = reading._info(child)
-    if info is not None and info.pgid == child and tuple(info.start) == start:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(child, signal.SIGKILL)
+    """A failed check's cleanup: end each process the test saw, one by one, only while it is still that
+    process (the same start time); a pid taken by another process since is left alone."""
+    for pid, start in reader or ():
+        info = reading._info(pid)
+        if info is not None and tuple(info.start) == start:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
 
 
 # Child failures: each fails the reading cleanly, writes nothing, and Retry reads the file
@@ -757,23 +754,24 @@ def record(status=reading._SSTOP, ppid=1, pgid=1, flags=0):
     return info
 
 
-def test_a_failed_checks_cleanup_ends_only_the_group_it_saw(monkeypatch):
-    """end_reader: the group of the child the test saw, never one whose leader is another process by now
-    (a later start, or another group), nor one gone."""
-    ended, leader = [], record(pgid=5)
-    leader.start[0] = 100
-    monkeypatch.setattr(reading, "_info", lambda pid: leader)
-    monkeypatch.setattr(os, "killpg", lambda pid, sig: ended.append(pid))
+def test_a_failed_checks_cleanup_ends_only_the_processes_it_saw(monkeypatch):
+    """end_reader: the child and its sentinel the test saw, each while it is still that process; never a
+    pid taken by a process started since, nor one gone; the sentinel even once the child is gone."""
+    ended, records = [], {5: record(pgid=5), 6: record(ppid=5, pgid=5)}
+    records[5].start[0], records[6].start[0] = 100, 101
+    monkeypatch.setattr(reading, "_info", records.get)
+    monkeypatch.setattr(reading, "_children", lambda pid: [6])
+    monkeypatch.setattr(os, "kill", lambda pid, sig: ended.append(pid))
     reader = seen(5)
-    leader.start[0] = 200  # its pid taken by a process started since
-    end_reader(reader)
-    leader.start[0], leader.pgid = 100, 6  # in another group
+    records[5].start[0] = 200  # the child's pid taken by a process started since
+    del records[6]  # the sentinel gone
     end_reader(reader)
     end_reader(None)
     assert ended == []
-    leader.pgid = 5
+    records[6] = record(ppid=1, pgid=5)
+    records[6].start[0] = 101  # the sentinel left behind, its child gone
     end_reader(reader)
-    assert ended == [5]
+    assert ended == [6]
 
 
 def test_a_sentinel_is_its_childs_stopped_child_in_its_group(monkeypatch):

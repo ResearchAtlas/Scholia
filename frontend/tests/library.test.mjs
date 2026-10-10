@@ -138,7 +138,7 @@ test('a page image stopped at a ceiling says which, with its code as the page im
   const t = makeT('en');
   assert.match(t(pageFailedKey('memory_limit')), /more memory than Scholia allows/);
   assert.match(t(pageFailedKey('step_limit')), /no progress for a minute/);
-  for (const other of ['file_missing', 'unreachable', true]) assert.equal(pageFailedKey(other), 'paper.pageFailed');
+  for (const other of ['file_missing', 'unreachable', true, 'constructor']) assert.equal(pageFailedKey(other), 'paper.pageFailed');
 });
 
 test('a paper shows its pages only while its version is a PDF', () => {
