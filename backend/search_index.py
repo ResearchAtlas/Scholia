@@ -878,8 +878,8 @@ class SearchIndex:
                     self._close_readers()
                     self._remove_queued()
                 except Exception as error:
-                    log.warning("the index's last removals could not be applied (%s); its file is discarded",
-                                type(error).__name__)
+                    log.warning("the index's readers could not be closed or its last removals applied (%s); its file"
+                                " is discarded", type(error).__name__)
                     discard = True
             if discard:
                 self._discard()  # each step guarded: the file goes whatever closing it meets

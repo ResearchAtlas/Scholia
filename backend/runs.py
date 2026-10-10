@@ -405,7 +405,7 @@ class Harness:
 
     def provider_busy(self, name: str) -> bool:
         """Whether running work calls this provider, so its settings or key may not change now."""
-        return any(active.provider == name for active in self.registry.runs.values())
+        return any(active.provider == name for active in list(self.registry.runs.values()))  # changed on other threads
 
     async def cancel(self, run_id: str, reason: str = "researcher") -> dict | None:
         """Request cancellation and report how the run ended, or None if no such run.

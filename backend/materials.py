@@ -1325,4 +1325,7 @@ async def retry_run(run_id: str, request: Request):
     # holds (S1-17), whichever write would reach the database first.
     async with state.setdefault("retry_lock", asyncio.Lock()):
         pending = await asyncio.to_thread(state["db"].read, left_pending)
+        if pending:  # S1-17: the run it was pending after must never end (recording it) while this holds its id
+            registry = state["harness"].registry  # retired, it is never held again; held, it runs: refused
+            pending = await asyncio.to_thread(state["db"].read, left_pending) if registry.retire(run_id) else []
         return {"run_id": await state["harness"].record_background(1, again, ids=pending)}

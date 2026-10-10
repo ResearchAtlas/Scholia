@@ -1696,3 +1696,36 @@ async def test_a_run_a_retry_marked_that_ends_before_the_retry_resumes_holds_and
         assert (await retry).json()["run_id"] == pending
         ended = await run_finished(client, pending)
         assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+
+
+async def test_a_retry_of_the_run_still_running_holds_no_pending_id_its_end_records(tmp_path, monkeypatch):
+    """Recheck 2 (0612064), finding 1: Retry pressed on the project's run while it still runs with a Rebuild
+    pending (its id given out), the run ending before the Retry's write: the Retry holds no pending id, so
+    the run's end records and starts it (never unheld, read as interrupted); the Retry is refused."""
+    import threading
+    from backend.db import Database
+    real, armed, entered, go = Database.write, [], threading.Event(), threading.Event()
+
+    def write(self, fn):
+        if armed and "record_background" in fn.__qualname__:  # the Retry's write waits to begin
+            armed.clear()
+            entered.set()
+            go.wait(10)
+        return real(self, fn)
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        pending = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        monkeypatch.setattr(Database, "write", write)
+        armed.append(True)
+        retry = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
+        assert await asyncio.to_thread(entered.wait, 10)
+        client.remote.hold.set()
+        assert (await run_finished(client, run))["status"] == "succeeded"  # recording the pending run
+        go.set()
+        assert (await retry).status_code == 409
+        ended = await run_finished(client, pending)
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
