@@ -131,7 +131,7 @@ def detect(text):
         return "ris"
     if re.search(r"^%0 ", text, re.MULTILINE):
         return "endnote"
-    if re.search(r"^[ \t]*@[A-Za-z]+[ \t]*[{(]", text, re.MULTILINE):  # [ \t], never \s: no line's spaces read twice
+    if re.search(r"^[^\S\n]*@[A-Za-z]+[ \t]*[{(]", text, re.MULTILINE):  # never \s: no line's spaces read twice
         return "bibtex"
     return None
 
@@ -222,11 +222,14 @@ def _bibtex(text, beat):
     import bibtexparser
     from bibtexparser.middlewares.names import parse_single_name_into_parts, split_multiple_persons_names
     from bibtexparser.model import Entry
+    from bibtexparser.splitter import _BLOCK_START  # its block start, so the bound counts what it will make
 
-    _counted(len(re.findall(r"^[ \t]*@(?!(?:string|comment|preamble)\b)[A-Za-z]+[ \t]*[{(]", text,
-                            re.MULTILINE | re.IGNORECASE)))
-    # Every block the parser would make, wherever it starts (an @ opens one anywhere), entries or not.
-    if len(re.findall(r"@[A-Za-z]+\s*[{(]", text)) > MAX_BLOCKS:
+    # bibtexparser opens a block at every mark of its own pattern wherever it comes between blocks: each is
+    # counted by that same pattern, so the count is what the parser would make, entries (any type but
+    # @string, @comment and @preamble, by prefix, as it routes them) and blocks of any kind.
+    starts = [m.group(0)[1:].strip().lower() for m in re.finditer(_BLOCK_START, text)]
+    _counted(sum(1 for kind in starts if not kind.startswith(("string", "comment", "preamble"))))
+    if len(starts) > MAX_BLOCKS:
         raise Unreadable("too_many_records")
     try:
         # No middleware: @string macros are resolved here, once each, never by concatenation (#),

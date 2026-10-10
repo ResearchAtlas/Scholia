@@ -779,6 +779,7 @@ async def test_an_import_waits_a_bounded_time_for_a_readings_turn_and_is_refused
         for _ in range(materials_module.READINGS):
             turns.release()
         assert (await post(client, project, synthetic.references_ris())).status_code == 201
+        assert turns._value == materials_module.READINGS  # every turn back, none kept by the refusal or the import
 
 
 async def test_a_second_doi_change_keeps_a_field_a_merged_record_gave(tmp_path):
@@ -805,3 +806,23 @@ async def test_twin_records_of_a_paper_in_one_file_are_one_waiting_question(tmp_
         result = await imported(client, project, ris(twin, twin, twin))
         assert len(result["waiting"]) == 1 and result["imported"] == []
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'merge'") == [(1,)]
+
+
+async def test_a_doi_change_drops_what_the_lookup_that_gave_the_doi_filled(tmp_path, monkeypatch):
+    import scholia_app
+
+    def with_a_doi(identifier, title):
+        return scholia_app_feed(identifier, title).replace(b"</entry>", b"<arxiv:doi>10.5555/from.arxiv</arxiv:doi></entry>")
+
+    scholia_app_feed = scholia_app.arxiv_feed
+    monkeypatch.setattr(scholia_app, "arxiv_feed", with_a_doi)
+    async with started(tmp_path / "data", MockProvider(scholarly=MockScholarly(arxiv={"2401.05555": "A Preprint"}))) as client:
+        project = await project_of(client)
+        result = await imported(client, project, b"@misc{k, title={A Preprint}, eprint={2401.05555}, archivePrefix={arXiv},"
+                                                  b" note={kept}, volume={2}}", "export.bib")
+        await run_finished(client, result["lookup_run_id"])
+        [paper] = result["imported"]
+        filled = (await client.get(f"/api/materials/{paper}")).json()["csl"]
+        assert filled["DOI"] == "10.5555/from.arxiv" and filled["publisher"] == "arXiv"  # both the arXiv lookup's
+        moved = (await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/the.right.doi"})).json()["csl"]
+        assert "publisher" not in moved and moved["volume"] == "2" and moved["number"] == "arXiv:2401.05555"

@@ -138,7 +138,7 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
             inputs = json.loads(inputs or "{}")
             if (held := (inputs.get("held") or {}).get("record")) is not None:
                 asking[inputs["material_ids"][0], json.dumps(held, sort_keys=True)] = run
-        imported, waiting, already, looked_up = [], [], [], {}
+        imported, waiting, already, looked_up, reported = [], [], [], {}, set()
         for csl in records:
             if (found := papers.find(csl)) is not None:
                 material, matched = found
@@ -146,7 +146,8 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
                     already.append(material)
                     continue
                 if (run := asking.get((material, json.dumps(csl, sort_keys=True)))) is not None:
-                    if not any(w["run_id"] == run for w in waiting):  # its twin in this file is counted there already
+                    if run not in reported:  # its twin in this file is counted there already
+                        reported.add(run)
                         waiting.append({"run_id": run, "material_id": material})
                     continue
                 run = asking[material, json.dumps(csl, sort_keys=True)] = next(ids)
@@ -155,6 +156,7 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
                              " 'merge', ?)", (run, project_id, json.dumps({
                                  "material_ids": [material], "matched": matched, "origin": None,
                                  "held": {"record": csl}})))
+                reported.add(run)
                 waiting.append({"run_id": run, "material_id": material})
                 continue
             material, version = new_material(conn, project_id, csl)

@@ -309,9 +309,19 @@ def test_a_noteexpress_tag_is_on_its_own_line():  # as the reader takes it, so t
 # From the writer's second recheck (2026-10-10)
 
 
-@pytest.mark.parametrize("block", ["@string{a=1}\n", "@string{}", "@comment{x}", "@preamble{x}\n"])
-def test_bibtex_blocks_of_any_kind_count_toward_the_bound(block):
+@pytest.mark.parametrize("block", ["@string{a=1}\n", "@string{}", "@comment{x}", "@preamble{x}\n", "@{}\n", "@{", "@1{}",
+                                   "@a_b{}", "@é{}", "@ {}", "@string1{a=1}\n", "@comment1{x}"])
+def test_bibtex_blocks_of_any_kind_count_toward_the_bound(block):  # as bibtexparser opens one: an @, any word, { or (
     assert unreadable("@misc{k, title={T}}\n" + block * (rf.MAX_BLOCKS + 1)) == "too_many_records"
+
+
+@pytest.mark.parametrize("kind", ["1", "", "a_b", "é"])
+def test_bibtex_entries_of_any_type_count_toward_the_record_bound(kind):
+    assert unreadable("@misc{a, title={T}}\n" + f"@{kind}{{k, title={{T}}}}\n" * rf.MAX_RECORDS) == "too_many_records"
+
+
+def test_bibtex_indented_by_any_space_is_found():
+    assert rf.detect("\u3000@article{k, title={T}}") == "bibtex" and rf.detect("\t @misc{k}") == "bibtex"
 
 
 def test_many_blank_lines_are_read_in_linear_time():
@@ -326,3 +336,8 @@ def test_json_whose_strings_hold_other_line_ends_is_still_json():
     text = json.dumps([{"title": "A {Reference Type}: B"}], ensure_ascii=False)
     [record], _, kind = parse(text)
     assert kind == "csl_json" and record["title"] == "A {Reference Type}: B"
+
+
+def test_the_bibtex_bound_counts_with_the_parsers_own_block_start():
+    from bibtexparser import splitter
+    assert splitter._BLOCK_START == r"@[\w]*( |\t)*(?=[{(])"  # bibtexparser 2's, read by reference_files
