@@ -17,7 +17,9 @@ cleaned, and kept at most to its field's bound; a BibTeX value longer than four 
 whose macros expand past that, skips its record instead, as its LaTeX could read as far less), a field's continuation lines, and the authors and
 keywords of a record. A record keeps only what CSL names here (KEYS); what a record points to is
 never read: file attachments (RIS L1, L2 and L4, EndNote %>, BibTeX file) are not kept, and a URL is
-kept only when it is http or https, never fetched. A DOI is kept only when it fits the pattern
+kept only when it is http or https, never fetched. The values an identifier comes from (a DOI, a URL,
+a number naming arXiv, a BibTeX eprint, the last two read as written, not as LaTeX) are checked whole,
+as the file gives them, before anything is cut or cleaned. A DOI is kept only when it fits the pattern
 (extraction.clean_doi), an arXiv ID only as extraction.ARXIV reads one, and only whole: a BibTeX
 eprint that is the ID and nothing else, a number that is "arXiv:" and the ID (and its category), an
 arxiv.org URL whose whole path is the ID's page. A BibTeX field given twice is read as its first. Names are kept as the file
@@ -35,7 +37,7 @@ import logging
 import re
 from urllib.parse import urlsplit
 
-from backend.extraction import ARXIV, Unreadable, clean_doi
+from backend.extraction import ARXIV, DOI_CHARS, Unreadable, clean_doi
 from backend.settings import visible
 
 MAX_BYTES = 10 * 1024 * 1024
@@ -181,8 +183,9 @@ def _records(lines, starts, tagged, ends=lambda line: False):
     """Each record's lines, one record at a time: from a line starts() says begins one to the next such
     line, or to a line ends() says closes it. A record takes a line tagged() takes (a field) only while
     it holds fewer than RECORD_LINES lines, and each field at most CONTINUATION_LINES lines after its first, of
-    CONTINUATION_CHARS characters together; a field left out takes its lines with it. Lines outside
-    a record are left out."""
+    CONTINUATION_CHARS characters together (the line that passes them is cut, never left out whole, so a
+    field that went on still shows it did: a DOI with text after it is no DOI); a blank line adds nothing
+    and is left out; a field left out takes its lines with it. Lines outside a record are left out."""
     record, after, chars = None, 0, 0
     for line in lines:
         if starts(line):
@@ -199,8 +202,11 @@ def _records(lines, starts, tagged, ends=lambda line: False):
             if kept:
                 record.append(line)
             after, chars = (0, 0) if kept else (CONTINUATION_LINES, CONTINUATION_CHARS)
-        elif (after := after + 1) <= CONTINUATION_LINES and (chars := chars + len(line)) <= CONTINUATION_CHARS:
-            record.append(line)
+        elif not line.strip():
+            continue
+        elif (after := after + 1) <= CONTINUATION_LINES and chars < CONTINUATION_CHARS:
+            record.append(line[:CONTINUATION_CHARS - chars])
+            chars += len(line)
     if record:
         yield record
 
@@ -370,7 +376,8 @@ def _bibtex(text, beat):
             eprint = _ARXIV_VERSION.sub(r"v\1", _ARXIV_PREFIX.sub("", (_escapes(value(fields, "eprint", literal=True)) or "").strip()))
             arxiv = eprint if eprint and (value(fields, "archiveprefix", "eprinttype") or "").lower() == "arxiv" else None
             valid = bool(arxiv) and _ARXIV_WHOLE.fullmatch(arxiv) is not None
-            number = value(fields, "number")
+            number = _escapes(value(fields, "number", literal=True))  # an identifier's field: as written
+            number = number if number and _ARXIV_NAMED.search(number) else value(fields, "number")
             record = {
                 "type": _BIBTEX_TYPES.get(kind, "article"),
                 "title": value(fields, "title"),
@@ -630,11 +637,11 @@ def _url(values):
     with a backslash (LaTeX's escapes are no part of a URL)."""
     found, wrong = None, 0
     for value in values if isinstance(values, list) else [values]:
-        url = _text(value, URL_CHARS + 1)
-        if url is None:
+        if not isinstance(value, str) or visible(value) is None:
             continue
+        url = value.strip()  # checked whole, as the file gives it: never cut or cleaned first
         try:
-            parts = urlsplit(url) if " " not in url and "\\" not in url and len(url) <= URL_CHARS else None
+            parts = urlsplit(url) if len(url) <= URL_CHARS and not _NOT_IN_URL.search(url) else None
         except ValueError:
             parts = None
         if parts and parts.scheme.lower() in ("http", "https") and parts.netloc:
@@ -644,9 +651,18 @@ def _url(values):
     return found, wrong
 
 
+_NOT_IN_URL = re.compile("[\\s\\\\\x00-\x1f\x7f-\x9f\ud800-\udfff]")  # spaces, backslashes, controls, half pairs
+
+
 def _doi(value):
-    text = _text(value, 400)
-    return clean_doi(_DOI_PREFIX.sub("", text)) if text else None
+    """(The DOI a value is, whole, or None; 1 when a value was given and is not one, else 0.) Only its
+    surrounding spaces and a doi.org or doi: prefix are taken off, and only its case is changed: a DOI
+    the pattern takes followed by anything else, spaces included, is no DOI."""
+    if not isinstance(value, str) or visible(value) is None:
+        return None, 0
+    text = _DOI_PREFIX.sub("", value.strip())
+    doi = clean_doi(text) if len(text) <= DOI_CHARS else None
+    return (doi, 0) if doi and doi == text.lower() else (None, 1)
 
 
 def _finish(record):
@@ -668,12 +684,23 @@ def _finish(record):
     if venue := _text(record.get("container-title"), TITLE_CHARS):
         csl["container-title"] = venue
     for key in _SHORT:
-        if text := _text(record.get(key), FIELD_CHARS):
+        if key != "number" and (text := _text(record.get(key), FIELD_CHARS)):
             csl[key] = text
-    if doi := _doi(record.get("DOI")):
+    # The values an identifier comes from (a number naming arXiv, a DOI, a URL) are checked whole, as the
+    # file gives them, before anything is cut or cleaned; one that is not what its field takes is left out.
+    number = record.get("number")
+    if isinstance(number, str) and _ARXIV_NAMED.search(number):
+        found = _ARXIV_NUMBER.fullmatch(number.strip()) if len(number.strip()) <= 100 else None
+        if found and ARXIV.fullmatch(found.group(1)):
+            csl["number"] = " ".join(number.split())
+        else:
+            dropped += 1  # it names an arXiv ID the pattern does not take: not kept as one
+    elif text := _text(number, FIELD_CHARS):
+        csl["number"] = text
+    doi, wrong = _doi(record.get("DOI"))
+    dropped += wrong
+    if doi:
         csl["DOI"] = doi
-    elif _text(record.get("DOI"), 400):
-        dropped += 1
     url, wrong = _url(record.get("URL"))
     dropped += wrong
     if url:
@@ -683,10 +710,6 @@ def _finish(record):
     keywords = [k for k in (_text(k, KEYWORD_CHARS) for k in (record.get("keyword") or [])[:KEYWORDS * 4]) if k]
     if keywords:
         csl["keyword"] = ", ".join(dict.fromkeys(keywords[:KEYWORDS]))
-    if "number" in csl and _ARXIV_NAMED.search(csl["number"]) \
-            and not ((found := _ARXIV_NUMBER.fullmatch(csl["number"])) and ARXIV.fullmatch(found.group(1))):
-        del csl["number"]  # it names an arXiv ID the pattern does not take: not kept as one
-        dropped += 1
     return csl, dropped
 
 

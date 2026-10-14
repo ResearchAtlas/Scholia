@@ -243,6 +243,36 @@ def test_keywords_are_split_on_their_text_as_written_then_read():
     assert record["keyword"] == "über, a;b"
 
 
+_PADDED_ARXIV = "arXiv:2101.00001" + " " * 1200 + "garbage"
+_PADDED_URL = "https://arxiv.org/abs/2101.00001" + " " * 8100 + "garbage"
+_PADDED_DOI = "10.5555/example" + " " * 1600 + "garbage"
+
+
+@pytest.mark.parametrize("data", [
+    json.dumps([{"title": "T", "number": _PADDED_ARXIV}]),  # CSL JSON
+    "@misc{k, title={T}, number={" + _PADDED_ARXIV + "}}",  # BibTeX
+    "@misc{k, title={T}, number={arXiv:2101.00001\\garbage}}",  # BibTeX: a number read as written, not as LaTeX
+    "@misc{k, title={T}, number = \"arXiv:2101.00001{\\relax}\"}",
+    json.dumps([{"title": "T", "URL": _PADDED_URL}]),
+    f"TY  - JOUR\nTI  - T\nUR  - {_PADDED_URL}\nER  - \n",  # RIS
+    "@misc{k, title={T}, url={https://arxiv.org/abs/2101.00001" + " " * 1600 + "garbage}}",  # (longer: past its cap, refused)
+    json.dumps([{"title": "T", "DOI": _PADDED_DOI}]),
+    f"TY  - JOUR\nTI  - T\nDO  - {_PADDED_DOI}\nER  - \n",
+    f"%0 Journal Article\n%T T\n%R {_PADDED_DOI}\n",  # EndNote
+    "{Reference Type}: Journal Article\n{Title}: T\n{DOI}: " + _PADDED_DOI + "\n",  # NoteExpress
+    "@misc{k, title={T}, doi={" + _PADDED_DOI + "}}",
+    # the lines after an identifier's own: cut at their bound, never left out whole; blank lines add nothing
+    "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\n" + "g" * (rf.CONTINUATION_CHARS + 10) + "\nER  - \n",
+    "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\n" + "\n" * (rf.CONTINUATION_LINES + 10) + "garbage\nER  - \n",
+    "%0 Journal Article\n%T T\n%R 10.5555/example\n" + "  \n" * (rf.CONTINUATION_LINES + 10) + "garbage\n",
+    json.dumps([{"title": "T", "DOI": "10.5555/example."}]),  # nothing taken off but spaces and a prefix
+])
+def test_an_identifiers_value_is_checked_whole_as_the_file_gives_it(data):
+    [record], skipped, _ = parse(data)
+    assert rf.identifier(record) is None and skipped == {"invalid_field": 1}
+    assert not {"DOI", "URL", "number"} & set(record)
+
+
 def test_exports_escapes_in_a_url_or_doi_are_read_as_their_characters():
     [record], skipped, _ = parse(r"@misc{k, title={T}, url={http://example.com/a\_b\&c\%20d}, doi={10.1000/Ab\_c}}")
     assert (record["URL"], record["DOI"], skipped) == ("http://example.com/a_b&c%20d", "10.1000/ab_c", {})
