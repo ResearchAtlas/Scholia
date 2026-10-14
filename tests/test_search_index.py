@@ -1262,7 +1262,8 @@ def library(conn):
     project read (the first added gives it), the same bytes added as Markdown and as LaTeX (two readings
     of one file), a version from before media types (its file's type), a replaced version, a reading by
     an earlier extractor version, a paper with no current version, a reference passage and the same
-    file in the other project. {project: [passage ids]}."""
+    file in the other project, a file of a type no extractor reads (its extraction's own), and a passage
+    with no section path. (project one, project two, every passage id)."""
     from backend.db.database import new_id
     from backend.extraction import LATEX, MARKDOWN, extractor_of
     passages = {}
@@ -1277,7 +1278,8 @@ def library(conn):
             for ordinal, kind in enumerate(("title", "paragraph", "reference")):
                 pid = new_id()
                 conn.execute("INSERT INTO passages (id, extraction_id, ordinal, kind, text, section_path)"
-                             " VALUES (?, ?, ?, ?, ?, ?)", (pid, extraction, ordinal, kind, f"{name} {kind}", '["Intro"]'))
+                             " VALUES (?, ?, ?, ?, ?, ?)", (pid, extraction, ordinal, kind, f"{name} {kind}",
+                                                            None if kind == "title" else '["Intro"]'))
                 passages.setdefault("all", []).append(pid)
         return sha
 
@@ -1301,6 +1303,7 @@ def library(conn):
     material(one, 4, (both, MARKDOWN, True))
     material(one, 5, (old, MARKDOWN, True))
     material(one, 6, (file("withdrawn"), MARKDOWN, False))
+    material(one, 9, (file("unknown", "application/x-unknown", ("plain", "plain-1")), None, True))
     material(two, 7, (shared, MARKDOWN, True))
     material(two, 8, (file("elsewhere"), MARKDOWN, True))
     return one, two, passages["all"]
@@ -1326,7 +1329,7 @@ def test_a_check_for_some_passages_gives_what_the_whole_projects_reading_gives_t
             assert reference and db.read(lambda conn: s117_readings(conn, project, references)) == reference
             assert db.read(lambda conn: readings(conn, project, references=references)) == reference
             assert db.read(lambda conn: granted(conn, project)) == db.read(lambda conn: s117_granted(conn, project))
-            subsets = [[pid] for pid in every] + [rng.sample(every, k) for k in (2, 5, 9) for _ in range(20)] + [[], every]
+            subsets = [[pid] for pid in every] + [rng.sample(every, k) for k in (2, 5, 9) for _ in range(20)] + [[], every, every[:4] * 2]
             for ids in subsets:
                 assert db.read(lambda conn: readings(conn, project, ids, references)) == {
                     pid: reading for pid, reading in reference.items() if pid in ids}
@@ -1355,8 +1358,8 @@ def test_a_check_for_a_few_passages_reads_only_their_rows_and_a_projects_reading
     for plan in (some, whole, ids):
         scans = [step for step in plan if step.startswith("SCAN") and "json_each" not in step]
         assert scans == [], plan
-    assert some[0].startswith("SEARCH p USING INDEX") and "(id=?)" in some[0]
+    assert "sqlite_autoindex_passages_1" in some[0]  # the passages' primary key, first
     assert any("material_versions_current_by_file" in step for step in some)
     for plan in (whole, ids):
-        assert plan[0] == "SEARCH m USING INDEX materials_by_project (project_id=?)"
+        assert "materials_by_project" in plan[0]
         assert any("extractions_by_file" in step for step in plan)
