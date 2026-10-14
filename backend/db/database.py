@@ -99,7 +99,7 @@ class Database:
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
-        self._closed = False  # set when close() starts, under _readers_lock; later reads and writes are refused
+        self._closed = False  # set by close() once its hooks have run, under _readers_lock; later reads and writes are refused
         self._held = False  # set by hold_writes(), under _readers_lock: later writes are refused
         self._closing = False  # set as close() starts, under _readers_lock: later writes are refused (never released)
         self._closer = None  # the thread of the close() that closes it
@@ -189,7 +189,8 @@ class Database:
 
     @property
     def closed(self):
-        """Whether close() has started. A backup in progress stops at its next check."""
+        """Whether close() has closed what reads this database and is closing it. A backup in progress stops at its
+        next check."""
         return self._closed
 
     @property
@@ -296,7 +297,9 @@ class Database:
         (closing: the search index) is closed, its work drained, so it sees every write that
         will ever commit (a deletion's queued removals). Every close() returns once the database is closed,
         whichever call closes it: the first closes it, and one called while it runs, or after, waits for it to
-        finish (but one called from inside it, by a hook, returns at once)."""
+        finish (but one called from inside it, by a hook, returns at once). A close that fails part-way raises in
+        its own caller; the others return when it ends, and nothing tries the close again. Never call close()
+        from inside read(): the close waits for that read."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")

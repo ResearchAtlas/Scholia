@@ -1340,11 +1340,27 @@ async def test_a_close_called_while_another_drains_the_index_returns_only_once_t
                          english.encode() in left or b"quokkas" in left))
         later = threading.Thread(target=second)
         later.start()
-        deadline = time.monotonic() + 1  # the second close's chance to return early
-        while later.is_alive() and time.monotonic() < deadline:
-            await asyncio.sleep(0.01)
-        go.set()
+        try:
+            deadline = time.monotonic() + 1  # the second close's chance to return early
+            while later.is_alive() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+        finally:
+            go.set()
         await asyncio.to_thread(later.join, 20)
         await asyncio.to_thread(first.join, 20)
         assert not first.is_alive() and not later.is_alive()
         assert seen == [(True, True, False)]  # returned after the index closed, its removals applied, then the database
+
+
+@pytest.mark.asyncio
+async def test_the_index_closed_from_its_own_writer_closes_there_and_a_later_close_returns(tmp_path):
+    """PR 29 review 1, finding 2: a close called in the index's own writer (by a job) closes there rather than
+    waiting for its own job; a close after it, as the database's, returns."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        await asyncio.wait_for(asyncio.to_thread(index._writer.submit(index.close).result), 10)
+        assert index.closed and index._conn is None and index._done.is_set()
+        await asyncio.wait_for(asyncio.to_thread(index.close), 10)

@@ -897,7 +897,8 @@ class SearchIndex:
         A file a whole rebuild has not finished (asked for, under way, or failed), or one whose rows
         cannot be removed so or whose WAL cannot be truncated, is discarded: nothing deleted stays in it,
         and the next launch rebuilds it. A close called while another runs, or after it, returns once that one
-        has finished (but in the writer itself, whose job it would wait for)."""
+        has finished (but in the writer itself, whose job it would wait for). Called first in the writer, it closes
+        there, without waiting for itself."""
         with self._lock:
             joining = self._shut  # closing or closed already (the database's close closes it too)
             self._shut = self.closed = True
@@ -924,11 +925,12 @@ class SearchIndex:
             elif self._conn is not None:
                 self._conn.close()
                 self._conn = None
+        in_writer = threading.get_ident() == self._writer_ident
         try:
-            self._writer.submit(end).result()
+            end() if in_writer else self._writer.submit(end).result()
         finally:
             try:
-                self._writer.shutdown()
+                self._writer.shutdown(wait=not in_writer)
                 self._close_readers()
             finally:
                 self._done.set()
