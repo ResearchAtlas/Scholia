@@ -141,6 +141,12 @@ async def open_index(state, db):
     # index's close stops, discards its file, so nothing deleted rests in it either way.
     deletion.CLEANUP[db] = index.apply
     installed = _installed(state)
+    # What waits is read in this order: the queue's projects, then the index's unembedded rows. Whatever
+    # applies the queue in between (a retry timer armed by the opening's checkpoint, a deletion's cleanup,
+    # a rebuild) commits what it took from the queue to the index before it prunes the queue, so the second
+    # read finds what the first missed and no project's work is lost to a pass.
+    queued = await asyncio.to_thread(db.read, lambda conn: {p for (p,) in conn.execute(
+        "SELECT DISTINCT project_id FROM index_queue WHERE project_id IS NOT NULL")})
     try:
         pending = None if wanted else await asyncio.to_thread(index.unembedded) if installed else set()
     except Exception as error:  # unreadable now (being replaced): every project is taken as pending
@@ -148,7 +154,7 @@ async def open_index(state, db):
         pending = None
 
     def requested(conn):
-        projects = {p for (p,) in conn.execute("SELECT DISTINCT project_id FROM index_queue WHERE project_id IS NOT NULL")}
+        projects = set(queued)
         if installed:
             projects |= pending if pending is not None else {p for (p,) in conn.execute(
                 "SELECT DISTINCT m.project_id FROM materials m JOIN material_versions v ON v.material_id = m.id"
@@ -157,8 +163,6 @@ async def open_index(state, db):
             if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project,)).fetchone():
                 request_run(conn, None, project, lambda conn, project, inputs: _insert_run(conn, None, project, inputs),
                             startup=True)
-    # What waits is read once (the index's unembedded rows, then the queue) before any pass applies the
-    # queue and prunes it, so no project's work is missed between the two reads.
     await asyncio.to_thread(db.write, requested)
     if rebuilding is None:
         index.apply_soon()

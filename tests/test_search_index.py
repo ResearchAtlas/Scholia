@@ -1106,3 +1106,43 @@ async def test_a_shared_readings_deletion_no_pass_applied_leaves_no_deleted_titl
         status = await until_embedded(client, project)
         assert list(status["materials"]) == [kept["id"]]
 
+
+@pytest.mark.asyncio
+async def test_a_retry_the_opening_checkpoint_arms_cannot_take_a_launchs_queued_work(tmp_path, monkeypatch):
+    """Recheck 5, finding 32: the opening's WAL truncation fails and arms a retry, whose pass applies the
+    queued additions and prunes the queue; run between the launch's two reads of what waits, it still leaves
+    the additions their index run."""
+    real_apply, real_reconcile = SearchIndex._apply, SearchIndex._reconcile
+    async with app(tmp_path, install=False) as client:
+        project = await project_of(client)
+        monkeypatch.setattr(SearchIndex, "_apply", lambda self, stop=None: 0)  # the additions stay queued
+        monkeypatch.setattr(SearchIndex, "_reconcile", lambda self, project_id, stop=None: (0, 0))
+        await added(client, project, WAGES)
+        await idle(client, project)
+        assert await index_rows(client, project) == []
+    monkeypatch.setattr(SearchIndex, "_apply", real_apply)
+    monkeypatch.setattr(SearchIndex, "_reconcile", real_reconcile)
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))  # the armed retry runs when the test says
+    real_connect, real_unembedded, failing, fired = SearchIndex._connect, SearchIndex.unembedded, [], []
+
+    def connect(self):
+        conn, loaded = real_connect(self)
+        if failing:
+            return conn, loaded
+        failing.append(FailingCheckpoints(conn, "BusyError", failures=1))  # the writer's, opened first
+        return failing[0], loaded
+
+    def then_the_retry(self):  # the armed retry's pass, run to its end right after this read
+        found = real_unembedded(self)
+        if not fired:
+            fired.append(self._retry)
+            self._retry.cancel()
+            self._retry.function()
+            self._writer.submit(lambda: None).result()
+        return found
+    monkeypatch.setattr(SearchIndex, "_connect", connect)
+    monkeypatch.setattr(SearchIndex, "unembedded", then_the_retry)
+    async with app(tmp_path) as client:
+        assert fired and fired[0] is not None and len(failing[0].calls) >= 2  # armed by the failure; its pass truncated
+        await until_embedded(client, project)
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
