@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import backend.search_index as search_index
+from backend.db import DatabaseClosedError
 from backend.search_index import DIMENSIONS, SearchIndex, match, tokens
 from scholia_app import background_idle, run_finished, started
 from test_materials import added, project_of, rows
@@ -1353,14 +1354,55 @@ async def test_a_close_called_while_another_drains_the_index_returns_only_once_t
 
 
 @pytest.mark.asyncio
-async def test_the_index_closed_from_its_own_writer_closes_there_and_a_later_close_returns(tmp_path):
-    """PR 29 review 1, finding 2: a close called in the index's own writer (by a job) closes there rather than
-    waiting for its own job; a close after it, as the database's, returns."""
+async def test_the_index_refuses_a_close_from_its_own_writer_and_closes_from_elsewhere(tmp_path):
+    """PR 29 recheck 2, finding 4: a close called in the index's own writer (by a job) would wait for that job, so it
+    is refused; the index stays open and closes from any other thread."""
     async with app(tmp_path) as client:
         project = await project_of(client)
         await added(client, project, WAGES)
         await idle(client, project)
         index = client.state["index"]
-        await asyncio.wait_for(asyncio.to_thread(index._writer.submit(index.close).result), 10)
-        assert index.closed and index._conn is None and index._done.is_set()
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(asyncio.to_thread(index._writer.submit(index.close).result), 10)
+        assert not index.closed and not index._done.is_set()
         await asyncio.wait_for(asyncio.to_thread(index.close), 10)
+        assert index.closed and index._conn is None and index._done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_close_waits_for_a_read_in_progress_and_keeps_no_connection_open(tmp_path):
+    """PR 29 recheck 2, finding 3: a close while a search reads refuses later reads, waits for that read to end, and
+    returns with no read connection left open, the one that read included."""
+    import threading
+    import time
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        reading, go, used = threading.Event(), threading.Event(), []
+
+        def slow(conn):
+            used.append(conn)
+            reading.set()
+            go.wait(20)
+            return conn.execute("SELECT count(*) FROM index_rows").fetchone()
+        reader = threading.Thread(target=index._read, args=(slow,))
+        reader.start()
+        assert await asyncio.to_thread(reading.wait, 10)
+        closer = threading.Thread(target=index.close)
+        closer.start()
+        try:
+            deadline = time.monotonic() + 1  # the close's chance to return early
+            while closer.is_alive() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            returned_early = not closer.is_alive()
+            with pytest.raises(DatabaseClosedError):
+                index._read(lambda conn: None)
+        finally:
+            go.set()
+        await asyncio.to_thread(closer.join, 20)
+        await asyncio.to_thread(reader.join, 20)
+        assert not returned_early and not closer.is_alive() and index._readers.empty()
+        with pytest.raises(search_index.apsw.ConnectionClosedError):
+            used[0].execute("SELECT 1")

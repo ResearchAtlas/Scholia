@@ -818,6 +818,39 @@ def test_a_close_while_another_runs_returns_only_once_that_one_has_finished(tmp_
         db.read(lambda conn: None)
 
 
+
+@pytest.mark.parametrize("failing", ["drain", "writer"])
+def test_a_close_that_fails_stops_the_writer_and_every_close_says_it_failed(tmp_path, monkeypatch, failing):
+    """PR 29 recheck 2, findings 1 and 2: a close that fails, as it queues its drain of the writes or as it closes
+    the writer connection, still stops the writer thread and signals its end: another close then raises too
+    (never reads as done) rather than waiting for ever or returning as if the database were closed."""
+    db = Database(tmp_path / "data")
+    real_submit = db._writer.submit
+    if failing == "drain":
+        def submit(fn, *args):
+            if fn is not db._close_writer and not args:  # the drain's empty job
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+            return real_submit(fn, *args)
+        monkeypatch.setattr(db._writer, "submit", submit)
+    else:
+        def close_writer():
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(db, "_close_writer", close_writer)
+    with pytest.raises((RuntimeError, sqlite3.OperationalError)):
+        db.close()
+    outcome = []
+
+    def again():
+        try:
+            db.close()
+            outcome.append("returned")
+        except RuntimeError:
+            outcome.append("raised")
+    later = threading.Thread(target=again, daemon=True)
+    later.start()
+    later.join(5)
+    assert outcome == ["raised"] and db.closed and db._writer._shutdown
+
 # Backups while the app is open
 
 

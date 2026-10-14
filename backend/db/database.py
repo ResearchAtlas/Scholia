@@ -104,6 +104,7 @@ class Database:
         self._closing = False  # set as close() starts, under _readers_lock: later writes are refused (never released)
         self._closer = None  # the thread of the close() that closes it
         self._shut = threading.Event()  # set once that close() has finished: any other close() waits for it
+        self._close_error = None  # what made that close() fail, if it did: raised to every other close() too
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
@@ -295,11 +296,11 @@ class Database:
         progress is stopped, and waited for up to STOP_SECONDS. First, writes are refused and
         those already admitted commit (as hold_writes does); then what reads this database
         (closing: the search index) is closed, its work drained, so it sees every write that
-        will ever commit (a deletion's queued removals). Every close() returns once the database is closed,
-        whichever call closes it: the first closes it, and one called while it runs, or after, waits for it to
-        finish (but one called from inside it, by a hook, returns at once). A close that fails part-way raises in
-        its own caller; the others return when it ends, and nothing tries the close again. Never call close()
-        from inside read(): the close waits for that read."""
+        will ever commit (a deletion's queued removals). The first close() closes it, and one called while it
+        runs, or after, waits for it to finish (but one called from inside it, by a hook, returns at once). Whatever
+        fails, the writer connection's close is tried and the writer thread stopped; a close that failed raises in
+        every close() (RuntimeError from the failure, in the others), so a failed close never reads as done.
+        Never call close() from inside read(): the close waits for that read."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")
@@ -308,35 +309,52 @@ class Database:
             self._closing = True
             if owner:
                 self._closer = threading.get_ident()
-                drained = None if self._closed else self._writer.submit(lambda: None)  # behind every write admitted
         if not owner:
             if threading.get_ident() != self._closer:  # but one from inside that close (a hook) returns at once
                 self._shut.wait()
+                if self._close_error is not None:
+                    raise RuntimeError("closing the database failed") from self._close_error
             return
-        try:
-            if drained is not None:
-                drained.result()
-            for close in list(self.closing):  # each closes once, its work drained while this database still reads
-                try:
-                    close()
-                except Exception as error:
-                    log.warning("closing what reads the database failed (%s)", type(error).__name__)
+        error = None
+        try:  # everything from here signals its end (_shut), and a failure reaches every close()
+            try:
+                with self._readers_lock:
+                    drained = None if self._closed else self._writer.submit(lambda: None)  # behind every write admitted
+                if drained is not None:
+                    drained.result()
+                for close in list(self.closing):  # each closes once, its work drained while this database still reads
+                    try:
+                        close()
+                    except Exception as failure:
+                        log.warning("closing what reads the database failed (%s)", type(failure).__name__)
+                with self._readers_lock:
+                    self._closed = True  # a backup's progress handler and step checks see this and stop
+                    while self._reads:
+                        self._reads_done.wait()
+                    readers, self._readers = self._readers, []
+                for conn in readers:
+                    conn.close()
+                if self._backup_lock.acquire(timeout=STOP_SECONDS):
+                    self._backup_lock.release()
+                else:
+                    log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
+            except BaseException as failure:
+                error = failure
             with self._readers_lock:
-                self._closed = True  # a backup's progress handler and step checks see this and stop
-                while self._reads:
-                    self._reads_done.wait()
-                readers, self._readers = self._readers, []
-            for conn in readers:
-                conn.close()
-            if self._backup_lock.acquire(timeout=STOP_SECONDS):
-                self._backup_lock.release()
-            else:
-                log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
-            self._writer.submit(self._close_writer).result()
-            self._writer.shutdown()
-            self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
+                self._closed = True
+            try:
+                self._writer.submit(self._close_writer).result()
+            except BaseException as failure:
+                error = error or failure
         finally:
-            self._shut.set()
+            try:
+                self._writer.shutdown()
+            finally:
+                self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
+                self._close_error = error
+                self._shut.set()
+        if error is not None:
+            raise error
 
     # Writer thread
 

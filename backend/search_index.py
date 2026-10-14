@@ -284,6 +284,9 @@ class SearchIndex:
         self._readers = queue.SimpleQueue()  # idle read connections
         self._generation = 0  # a replaced file's readers are closed, not used again
         self._lock = threading.Lock()
+        self._reading = 0  # reads in progress, admitted under _lock; close() waits for none
+        self._reads_done = threading.Condition(self._lock)
+        self._close_error = None  # what made close() fail, if it did: raised to every later close() too
         self._writer_ident = None
         self._writer = concurrent.futures.ThreadPoolExecutor(
             1, thread_name_prefix="scholia-index-writer",
@@ -320,27 +323,37 @@ class SearchIndex:
             raise
 
     def _read(self, fn):
-        """fn(conn) on an idle read connection, in one read transaction."""
-        if self.closed:
-            raise DatabaseClosedError("the search index is closed")
-        if self.unusable:
-            raise Unavailable()
+        """fn(conn) on an idle read connection, in one read transaction. Admitted, and its connection given back
+        to the idle ones, under _lock, so close() refuses later reads, waits for these, and none is left idle."""
         with self._lock:
+            if self.closed:
+                raise DatabaseClosedError("the search index is closed")
+            if self.unusable:
+                raise Unavailable()
             generation = self._generation
+            self._reading += 1
         try:
-            conn = self._readers.get_nowait()
-        except queue.Empty:
-            conn, _ = self._connect()
-        try:
-            with conn:
-                return fn(conn)
-        except DAMAGE:
-            self._damaged()
-            raise
+            try:
+                conn = self._readers.get_nowait()
+            except queue.Empty:
+                conn, _ = self._connect()
+            try:
+                with conn:
+                    return fn(conn)
+            except DAMAGE:
+                self._damaged()
+                raise
+            finally:
+                with self._lock:
+                    keep = not self.closed and generation == self._generation
+                    if keep:
+                        self._readers.put(conn)
+                if not keep:
+                    conn.close()
         finally:
             with self._lock:
-                keep = not self.closed and generation == self._generation
-            self._readers.put(conn) if keep else conn.close()
+                self._reading -= 1
+                self._reads_done.notify_all()
 
     def _close_readers(self):
         with self._lock:
@@ -896,9 +909,11 @@ class SearchIndex:
         and its additions that retitle a reading another paper keeps) are removed first (_remove_queued).
         A file a whole rebuild has not finished (asked for, under way, or failed), or one whose rows
         cannot be removed so or whose WAL cannot be truncated, is discarded: nothing deleted stays in it,
-        and the next launch rebuilds it. A close called while another runs, or after it, returns once that one
-        has finished (but in the writer itself, whose job it would wait for). Called first in the writer, it closes
-        there, without waiting for itself."""
+        and the next launch rebuilds it. Reads still running are waited for. A close called while another runs, or
+        after it, returns once that one has finished, and raises if it failed (RuntimeError from the failure). Never
+        called in the writer (RuntimeError: it would wait for its own job), nor inside a read."""
+        if threading.get_ident() == self._writer_ident:
+            raise RuntimeError("the search index cannot be closed from its own writer")
         with self._lock:
             joining = self._shut  # closing or closed already (the database's close closes it too)
             self._shut = self.closed = True
@@ -906,8 +921,9 @@ class SearchIndex:
                 if timer is not None:
                     timer.cancel()
         if joining:
-            if threading.get_ident() != self._writer_ident:
-                self._done.wait()
+            self._done.wait()
+            if self._close_error is not None:
+                raise RuntimeError("closing the search index failed") from self._close_error
             return
 
         def end():
@@ -925,12 +941,17 @@ class SearchIndex:
             elif self._conn is not None:
                 self._conn.close()
                 self._conn = None
-        in_writer = threading.get_ident() == self._writer_ident
         try:
-            end() if in_writer else self._writer.submit(end).result()
+            self._writer.submit(end).result()
+        except BaseException as error:
+            self._close_error = error
+            raise
         finally:
             try:
-                self._writer.shutdown(wait=not in_writer)
+                self._writer.shutdown()
+                with self._lock:  # reads still running end, their connections closed, not kept
+                    while self._reading:
+                        self._reads_done.wait()
                 self._close_readers()
             finally:
                 self._done.set()
