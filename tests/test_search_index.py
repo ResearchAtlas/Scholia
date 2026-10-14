@@ -997,12 +997,14 @@ async def test_a_close_discarding_an_unfinished_rebuilds_file_goes_on_whatever_c
 QUIXOTIC = ("Quixotic Ledger.md", b"# Plain Heading\n\n## Part\n\nPlain text with nothing special.\n")
 
 
-async def _last_project(client):
-    """A project whose id sorts after every other's: the last a whole rebuild fills."""
-    while True:
+async def _last_project(client, monkeypatch):
+    """A project whose id sorts after every other's (General's is random): the last a whole rebuild fills."""
+    import backend.app
+    with monkeypatch.context() as patch:
+        patch.setattr(backend.app, "new_id", lambda: "ffffffff-ffff-4fff-bfff-ffffffffffff")
         project = await project_of(client)
-        if await rows(client, "SELECT max(id) FROM projects") == [(project,)]:
-            return project
+    assert await rows(client, "SELECT max(id) FROM projects") == [(project,)]
+    return project
 
 
 async def _sharing(client, project):
@@ -1022,7 +1024,7 @@ def _deleted_title_in(files):
 
 
 @pytest.mark.asyncio
-async def test_a_shared_readings_deletion_during_a_rebuilds_last_project_leaves_no_deleted_title_at_close(tmp_path):
+async def test_a_shared_readings_deletion_during_a_rebuilds_last_project_leaves_no_deleted_title_at_close(tmp_path, monkeypatch):
     """Recheck 5, finding 31: one of two papers reading one file is deleted while a whole rebuild fills the
     last project (its rows read with the deleted paper's title), and the app closes before that project is
     done. The rebuild ends ready, the queue's additions that retitle the passages unapplied; the close
@@ -1032,7 +1034,7 @@ async def test_a_shared_readings_deletion_during_a_rebuilds_last_project_leaves_
     from backend.db import ContentStore, Database, delete
     import backend.search as search
     async with app(tmp_path, install=False) as client:
-        project = await _last_project(client)
+        project = await _last_project(client, monkeypatch)
         doomed, kept = await _sharing(client, project)
     data = tmp_path / "data"
     path = data / search_index.FILE
