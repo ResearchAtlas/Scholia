@@ -54,7 +54,7 @@
         "scope": "evidence selection within each question's own paper: each paper is one project of its own, so the product's per-project search applies unchanged",
         "paper": "tools/search_timings.markdown: one Markdown file (title, abstract, sections with their paragraphs, figure and table captions), named by the paper's title, read by the app into passages by section 7.1",
         "mapping": "an evidence paragraph maps to the paper's passages whose text equals it or contains it; a paragraph longer than the passage limit, which section 7.1 splits at sentences, maps to the consecutive passages whose texts together make it up, and any one of them counts; texts are compared by their letters and digits only, case-folded (whitespace and Markdown punctuation ignored)",
-        "annotators": "each annotator's evidence is scored on its own and the question takes the best annotator, for each metric, as QASPER's own evaluator does for evidence F1; an annotator who marks the question unanswerable, lists no evidence, or lists only figure or table evidence is not used; evidence items matching no passage are left out of that annotator's set and counted",
+        "annotators": "each annotator's evidence is scored on its own and the question takes the best annotator, for each metric, as QASPER's own evaluator does for evidence F1; an annotator who marks the question unanswerable, lists no evidence, or lists only figure or table evidence (FLOAT SELECTED) is not used; evidence items matching no passage, and the figure or table items of an annotator who also lists text evidence, are left out of that annotator's set and counted",
         "scoring": "recall@8: the share of the annotator's evidence paragraphs with at least one of their passages in the top 8; nDCG@10 and MRR@10: binary relevance over the passages the evidence maps to",
         "exclusions": "a question is excluded and counted when every annotator marks it unanswerable (all_unanswerable), when no usable annotator remains because the text evidence matches no passage (evidence_matching_no_passage), because the evidence is only figures or tables (figure_or_table_only), or because no evidence is listed (no_evidence), checked in that order; and when its paper's reading failed (paper_not_read)"
       }
@@ -385,7 +385,7 @@
     }
   },
   "arms": {
-    "hybrid": "backend.search.search as the app runs it: BM25 50 and dense 50 concurrently, RRF k 60, within [retrieval] hybrid_ms; a query that falls back to keyword-only is counted by its reason",
+    "hybrid": "backend.search.search as the app runs it: BM25 50 and dense 50 concurrently, RRF k 60, within [retrieval] hybrid_ms; a query that falls back to keyword-only at the deadline is scored as the app returned it, counted and marked, and the hybrid metrics are also given without such queries; a fallback for any other reason, an index not ready or partial meaning-search coverage leaves the arm unscored, its queries marked",
     "keyword_only": "the same function with dense search unavailable (the runner's stand-in for the helper's status, reason reference_arm): the reference point of tickets 17 and 70"
   },
   "search_limit": 50,

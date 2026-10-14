@@ -16,11 +16,14 @@ through it. Every project is review-locked, so nothing is looked up and nothing 
 under the loopback-only sandbox; the helper's sockets are listed with lsof.
 
 The arms (ARMS) are plain named async functions of (state, project id, query) returning search's
-answer, so S1-19 adds a rerank arm without changing the runner. The results file is written once,
-atomically, when the run ends: `status: finished` only after every benchmark finished, `status:
-incomplete` with the reason otherwise (an interrupted run, a refusal, a failure), never a file that looks
-complete. A hybrid arm that fell back to keyword-only for any reason but the deadline gives no score:
-its queries are marked with the reason, never scored as hybrid. Benchmark text never enters the
+answer, so S1-19 adds a rerank arm without changing the runner. The results file is written whole,
+when the run ends (an `incomplete` marker stands in its place meanwhile): `status: finished` only when
+every benchmark ran to its end with every arm run as named, every reading succeeded and no socket off
+loopback, `status: incomplete` with the reason or the gaps otherwise (an interrupted run, a refusal, a
+failure), never a file that looks complete. A hybrid arm that fell back to keyword-only for any reason
+but the deadline gives no score: its queries are marked with the reason, never scored as hybrid. Deadline
+fallbacks are the product's own: scored as the app returned them, counted, marked, and the hybrid
+metrics are also given without them. Benchmark text never enters the
 results: scores, counts and hashes, and query ids only for sets whose terms allow them
 (`ids_committable`).
 """
@@ -181,8 +184,9 @@ def evidence_passages(evidence, passages, limit=2000):
 
 def qasper_question(qa, passages, headings, limit=2000):
     """(annotators, exclusion, unmatched): each usable annotator as a list of evidence items, each the
-    passage ids it maps to; the exclusion reason when none is usable; the text evidence that matched no
-    passage, as (kind, text)."""
+    passage ids it maps to; the exclusion reason when none is usable; the evidence left out of a usable
+    or unusable annotator's set, as (kind, text): text that matched no passage (heading, other), and an
+    annotator's figure or table items beside text evidence (figure_or_table)."""
     kinds, annotators, unmatched = Counter(), [], []
     for answer in qa.get("answers") or []:
         given = answer.get("answer") or {}
@@ -197,6 +201,7 @@ def qasper_question(qa, passages, headings, limit=2000):
             kinds["figure_or_table"] += 1
         else:
             items = []
+            unmatched += [("figure_or_table", item) for item in evidence if item not in text]
             for item in text:
                 if hits := evidence_passages(item, passages, limit):
                     items.append(hits)
@@ -353,7 +358,13 @@ async def run_arms(state, arms, queries, rank):
             answer = await arm(state, query["project"], query["text"])
             seconds.append(time.perf_counter() - began)
             rankings.append(rank(answer, query))
-            outcomes.append((answer["mode"], answer["reason"]))
+            reason = answer["reason"]
+            if answer.get("index") != "ready":  # being rebuilt or unavailable: not the built index
+                reason = "index_not_ready"
+            elif answer["mode"] == "hybrid" and (answer.get("coverage") or {}).get("embedded") != \
+                    (answer.get("coverage") or {}).get("total"):  # meaning search over part of the passages
+                reason = "coverage_partial"
+            outcomes.append((answer["mode"], reason))
         out[name] = {"rankings": rankings, "outcomes": outcomes, "seconds": summary(seconds)}
     return out
 
@@ -375,7 +386,7 @@ async def build_qasper(client, state, papers, limit):
         project, material = projects[pid]
         found = await asyncio.to_thread(state["db"].read, lambda c, p=project: readings(c, p, references=False))
         passages = [(passage, r[4]) for passage, r in found.items() if r[0] == material]
-        stable.update({passage: f"{group}:{r[6]}" for passage, r in found.items()})  # comparable between runs
+        stable.update({passage: f"{pid}:{r[6]}" for passage, r in found.items()})  # comparable between any two runs
         headings = {clean(s.get("section_name")) for s in paper.get("full_text") or []}
         for qa in paper.get("qas") or []:
             if not passages:
@@ -383,14 +394,16 @@ async def build_qasper(client, state, papers, limit):
                 continue
             annotators, reason, missed = qasper_question(qa, passages, headings, limit)
             unmatched.update(kind for kind, _ in missed)
-            sample += [(kind, pid, text[:160]) for kind, text in missed][:max(0, 40 - len(sample))]
+            sample += [(kind, pid, text[:160]) for kind, text in missed if kind != "figure_or_table"][:max(0, 40 - len(sample))]
             if reason:
                 exclusions[reason] += 1
                 continue
             items += sum(len(a) for a in annotators)
             queries.append({"key": str(qa.get("question_id")), "text": clean(qa.get("question")), "group": group,
                             "project": project, "annotators": annotators})
-    record.update(exclusions=dict(exclusions), evidence_items_mapped=items, evidence_items_unmatched=dict(unmatched))
+    dropped = unmatched.pop("figure_or_table", 0)
+    record.update(exclusions=dict(exclusions), evidence_items_mapped=items, evidence_items_unmatched=dict(unmatched),
+                  figure_or_table_items_dropped=dropped)
     # For the person running it, never in the results (benchmark text): a sample of what matched nothing.
     print(json.dumps({"unmatched_evidence_sample": sample}, ensure_ascii=False), file=sys.stderr)
     return queries, record, stable
@@ -453,20 +466,42 @@ def summarize(bench, boot, queries, arms_out, scores):
         if complete:
             entry["scores"] = {s["name"]: [None if row[s["name"]] is None else round(row[s["name"]], 6)
                                            for row in scores[arm]] for s in bench["metrics"]}
-            entry["metrics"] = {}
-            for spec in bench["metrics"]:
-                chosen = [i for i in _selected(spec, specific) if entry["scores"][spec["name"]][i] is not None]
-                values = [entry["scores"][spec["name"]][i] for i in chosen]
-                interval = metrics.bootstrap(values, [groups[i] for i in chosen], boot["resamples"], boot["seed"],
-                                             boot["level"])
-                entry["metrics"][spec["name"]] = {"mean": _round(metrics.mean(values)), "n": len(values),
-                                                  "interval": [_round(v) for v in interval] if interval else None}
+            entry["metrics"] = metric_summary(bench, boot, entry["scores"], groups, specific)
+            if marked:  # the deadline's keyword-only answers, counted above, also left out
+                entry["metrics_without_fallbacks"] = metric_summary(bench, boot, entry["scores"], groups, specific,
+                                                                    set(marked))
         record["arms"][arm] = entry
     base = record["arms"].get("hybrid", {}).get("scores")
     for arm, entry in record["arms"].items():
         if arm != "hybrid" and base and entry.get("scores"):
             entry["minus_hybrid"] = paired(bench, boot, entry["scores"], base, groups, specific)
     return record
+
+
+def metric_summary(bench, boot, scores, groups, specific, skip=frozenset()):
+    """Each metric's mean, n and interval over the queries it covers, less those in skip."""
+    out = {}
+    for spec in bench["metrics"]:
+        chosen = [i for i in _selected(spec, specific) if i not in skip and scores[spec["name"]][i] is not None]
+        values = [scores[spec["name"]][i] for i in chosen]
+        interval = metrics.bootstrap(values, [groups[i] for i in chosen], boot["resamples"], boot["seed"], boot["level"])
+        out[spec["name"]] = {"mean": _round(metrics.mean(values)), "n": len(values),
+                             "interval": [_round(v) for v in interval] if interval else None}
+    return out
+
+
+def gaps(results):
+    """What keeps a run that ran to its end from being finished: an arm that did not run as named, a
+    reading that failed (a document missing from its corpus), a socket off loopback."""
+    found = []
+    for name, bench in results["benchmarks"].items():
+        found += [f"{name} {arm}: did not run as named ({entry['fallbacks']})"
+                  for arm, entry in bench["arms"].items() if not entry["complete"]]
+        if bench["build"]["readings_not_succeeded"]:
+            found.append(f"{name}: {bench['build']['readings_not_succeeded']} readings did not succeed")
+        if bench.get("not_loopback_sockets"):
+            found.append(f"{name}: sockets off loopback {bench['not_loopback_sockets']}")
+    return found
 
 
 def paired(bench, boot, mine, other, groups, specific, chosen_pairs=None):
@@ -615,6 +650,9 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "load_average_start": os.getloadavg(),
                "arms": list(arms), "bootstrap": manifest["bootstrap"], "benchmarks": {}}
     began = time.perf_counter()
+    # Whatever was at out before (a run killed outright leaves this marker, never an older finished file)
+    write_atomic(out, {**{k: results[k] for k in ("level", "benchmarks_asked", "commit", "started_at")},
+                       "status": "incomplete", "reason": "running"})
     try:
         with tempfile.TemporaryDirectory(prefix="scholia-tier1-") as folder:
             for name in names:
@@ -640,7 +678,8 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
                            "status": "incomplete", "reason": f"{type(error).__name__}: {str(error)[:300]}",
                            "benchmarks_finished": list(results["benchmarks"])})
         raise
-    results.update(status="finished", seconds=round(time.perf_counter() - began, 1),
+    found = gaps(results)
+    results.update(status="incomplete" if found else "finished", gaps=found, seconds=round(time.perf_counter() - began, 1),
                    load_average_end=os.getloadavg(), finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     write_atomic(out, results)
     return results
@@ -659,6 +698,10 @@ def compare(manifest, baseline, current):
     lines = []
     if not current.get("like_for_like") or current.get("model_settings") != baseline.get("model_settings"):
         lines.append("NOT LIKE FOR LIKE: the model settings differ from the baseline's or the manifest's")
+    if current.get("manifest_sha256") != baseline.get("manifest_sha256"):
+        lines.append("NOT LIKE FOR LIKE: the manifest (pins, rules, subset) differs from the baseline's")
+    if current.get("bootstrap") != baseline.get("bootstrap"):
+        lines.append("the bootstrap settings differ from the baseline's; the intervals below use the manifest's")
     if current.get("machine") != baseline.get("machine"):
         lines.append(f"NOT LIKE FOR LIKE: machine {current.get('machine')} differs from the baseline's")
     for name, run_bench in current["benchmarks"].items():
@@ -698,18 +741,21 @@ def report(results):
     """A short Markdown summary of a results file: per benchmark and arm, each metric with its interval."""
     def interval(found):
         return f"[{found[0]:.3f}, {found[1]:.3f}]" if found else "none"
-    lines = [f"# Tier 1 results ({results['level']}, {results['status']})", "",
-             f"Commit `{results['commit']['sha']}`{' (modified)' if results['commit']['modified'] else ''}; "
-             f"{results['started_at']} to {results.get('finished_at')}; {results.get('seconds')} s; machine "
-             f"{results['machine']}; load average {results['load_average_start']} at the start and "
+    commit_ = results.get("commit") or {}
+    lines = [f"# Tier 1 results ({results.get('level')}, {results.get('status')})", ""]
+    if results.get("status") != "finished":
+        lines += [f"Not finished: {results.get('reason') or ''} {results.get('gaps') or ''}".rstrip(), ""]
+    lines += [f"Commit `{commit_.get('sha')}`{' (modified)' if commit_.get('modified') else ''}; "
+             f"{results.get('started_at')} to {results.get('finished_at')}; {results.get('seconds')} s; machine "
+             f"{results.get('machine')}; load average {results.get('load_average_start')} at the start and "
              f"{results.get('load_average_end')} at the end; model settings like the manifest's: "
              f"{results.get('like_for_like')}. Queries and documents are English (query language en, document "
              "language en). Each benchmark is reported on its own; there is no combined score.", ""]
-    for name, bench in results["benchmarks"].items():
+    for name, bench in (results.get("benchmarks") or {}).items():
         build = bench["build"]
         chars = build["passage_chars"] or {}
         lines += [f"## {name}", "",
-                  f"{bench['queries']} queries scored; excluded {bench.get('exclusions') or 'none'}. Build "
+                  f"{bench['queries']} queries run; excluded {bench.get('exclusions') or 'none'}. Build "
                   f"{build['seconds']} s, {build['passages']} passages (characters median {chars.get('median')}, p95 "
                   f"{chars.get('p95')}, max {chars.get('max')}; {build['passages_over_2000_chars']} over 2,000), index "
                   f"{build['index_bytes'] / 2**20:.1f} MiB, readings not succeeded {build['readings_not_succeeded']}.", "",
@@ -720,13 +766,22 @@ def report(results):
                 continue
             for metric, found in entry["metrics"].items():
                 diff = (entry.get("minus_hybrid") or {}).get(metric)
-                lines.append(f"| {arm} | {metric} | {found['mean']:.3f} | {interval(found['interval'])} | {found['n']} | "
-                             + (f"{diff['difference']:+.3f} {interval(diff['interval'])}" if diff else "") + " |")
+                mean = "none" if found["mean"] is None else f"{found['mean']:.3f}"
+                lines.append(f"| {arm} | {metric} | {mean} | {interval(found['interval'])} | {found['n']} | "
+                             + (f"{diff['difference']:+.3f} {interval(diff['interval'])}"
+                                if diff and diff["difference"] is not None else "") + " |")
+        for arm, entry in bench["arms"].items():
+            if entry.get("metrics_without_fallbacks"):
+                lines.append("")
+                lines.append(f"{arm} without its {len(entry['fallback_queries'])} fallback queries: " + "; ".join(
+                    f"{m} {'none' if f['mean'] is None else format(f['mean'], '.3f')} {interval(f['interval'])} n={f['n']}"
+                    for m, f in entry["metrics_without_fallbacks"].items()))
         lines += ["", "Keyword-only fallbacks of the hybrid arm: "
                   f"{bench['arms'].get('hybrid', {}).get('fallbacks') or 'none'}; search seconds (median, p95): "
                   + "; ".join(f"{arm} {e['search_seconds']['median']}, {e['search_seconds']['p95']}"
                               for arm, e in bench["arms"].items() if e.get("search_seconds")), ""]
-        for key in ("evidence_items_mapped", "evidence_items_unmatched", "documents", "documents_empty",
+        for key in ("evidence_items_mapped", "evidence_items_unmatched", "figure_or_table_items_dropped", "documents",
+                    "documents_empty",
                     "documents_sharing_a_file", "queries_with_fewer_documents_than_largest_cutoff"):
             if key in bench:
                 lines.append(f"- {key.replace('_', ' ')}: {bench[key]}")

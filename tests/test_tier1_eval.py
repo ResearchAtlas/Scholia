@@ -45,6 +45,9 @@ def _write(folder, path, text):
 
 LONG = " ".join(f"Sentence {i} of the long paragraph about tidal wetlands and their carbon burial." for i in range(40))
 QASPER = {
+    "0000.00001": {"title": "An Earlier Paper", "abstract": "Nothing is asked about it.", "full_text": [
+        {"section_name": "Intro", "paragraphs": ["Mangroves store carbon in their roots."]}], "figures_and_tables": [],
+        "qas": []},
     "0001.00001": {
         "title": "Tidal Wetlands", "abstract": "We measure carbon burial in tidal wetlands.",
         "full_text": [{"section_name": "Methods", "paragraphs": [
@@ -166,13 +169,35 @@ async def test_an_interrupted_run_leaves_an_incomplete_file_and_no_data_folder(t
 
 
 @pytest.mark.asyncio
-async def test_the_results_file_is_written_once_and_only_when_the_run_has_finished(tmp_path, monkeypatch):
+async def test_the_results_file_says_incomplete_until_the_run_has_finished_and_is_written_whole(tmp_path, monkeypatch):
     writes = []
     real = tier1.write_atomic
-    monkeypatch.setattr(tier1, "write_atomic", lambda path, results: writes.append(results["status"]) or real(path, results))
+    monkeypatch.setattr(tier1, "write_atomic", lambda path, results: writes.append(
+        (results["status"], results.get("reason"))) or real(path, results))
+    (tmp_path / "results.json").write_text(json.dumps({"status": "finished"}))  # an earlier run's file at --out
     _, out, running = await _run(tmp_path, ["scifact"])
-    await running
-    assert writes == ["finished"] and json.loads(out.read_text())["status"] == "finished"
+    task = asyncio.ensure_future(running)
+    while not writes:
+        await asyncio.sleep(0.01)
+    assert json.loads(out.read_text())["status"] == "incomplete"  # the earlier finished file is gone at once
+    results = await task
+    assert writes == [("incomplete", "running"), ("finished", None)] and json.loads(out.read_text())["status"] == "finished"
+    assert results["gaps"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_failure_during_the_build_leaves_an_incomplete_file_and_no_data_folder(tmp_path, monkeypatch):
+    seen = []
+
+    async def failed(state):
+        raise RuntimeError("the index runs ended with passages unembedded (request_failed)")
+    monkeypatch.setattr(tier1, "until_built", failed)
+    _, out, running = await _run(tmp_path, ["scifact"], open_app=opener(seen))
+    with pytest.raises(RuntimeError):
+        await running
+    written = json.loads(out.read_text())
+    assert written["status"] == "incomplete" and written["reason"].startswith("RuntimeError: the index runs ended")
+    assert not seen[0].parent.exists()
 
 
 @pytest.mark.asyncio
@@ -193,7 +218,12 @@ async def test_a_failing_helper_marks_its_queries_and_its_keyword_results_are_ne
     assert hybrid["complete"] is False and "scores" not in hybrid and "metrics" not in hybrid
     assert hybrid["fallback_queries"] == [0, 1, 2] and set(hybrid["fallbacks"]) - {"deadline"}
     assert arms["keyword_only"]["complete"] is True and "minus_hybrid" not in arms["keyword_only"]
-    assert results["status"] == "finished"  # the run ran to its end; the hybrid arm says it did not run as named
+    # the run ran to its end, but an arm that did not run as named keeps it from being finished
+    assert results["status"] == "incomplete" and results["gaps"] == [
+        f"scifact hybrid: did not run as named ({hybrid['fallbacks']})"]
+    with pytest.raises(tier1.Refused, match="not a finished run"):
+        tier1.compare(tier1.load_manifest(), results, results)
+    assert "Not finished:" in "\n".join(tier1.report(results))
 
 
 @pytest.mark.asyncio
@@ -208,6 +238,7 @@ async def test_a_deadline_fallback_is_counted_and_marked_but_scored_as_the_app_r
     hybrid = results["benchmarks"]["scifact"]["arms"]["hybrid"]
     assert hybrid["complete"] is True and hybrid["fallbacks"] == {"deadline": 3} and hybrid["fallback_queries"] == [0, 1, 2]
     assert hybrid["metrics"]["ndcg@10"]["n"] == 3 and results["model_settings"]["retrieval"]["hybrid_ms"] == 50
+    assert hybrid["metrics_without_fallbacks"]["ndcg@10"]["n"] == 0 and results["status"] == "finished"
 
 
 # Success paths
@@ -236,7 +267,8 @@ async def test_a_full_run_builds_through_the_app_scores_each_benchmark_apart_and
     assert qasper["exclusions"] == {"all_unanswerable": 1, "figure_or_table_only": 1, "no_evidence": 1,
                                     "evidence_matching_no_passage": 1}
     assert qasper["evidence_items_unmatched"] == {"heading": 1, "other": 2}
-    assert qasper["keys"] == ["q-cores", "q-burial", "q-long"] and qasper["groups"] == [0, 0, 0]
+    assert qasper["keys"] == ["q-cores", "q-burial", "q-long"] and qasper["groups"] == [1, 1, 1]
+    assert qasper["papers"] == 2 and qasper["figure_or_table_items_dropped"] == 0
     assert qasper["arms"]["hybrid"]["metrics"]["recall@8"]["mean"] == 1.0
 
     lit = results["benchmarks"]["litsearch"]
@@ -252,10 +284,13 @@ async def test_a_full_run_builds_through_the_app_scores_each_benchmark_apart_and
 
 @pytest.mark.asyncio
 async def test_the_subset_runs_its_listed_papers_and_compare_pairs_it_with_the_baseline(tmp_path):
-    manifest, out, running = await _run(tmp_path, ["qasper"], level="subset")
+    manifest, out, running = await _run(tmp_path / "full", ["qasper"])
+    baseline = await running
+    manifest, out, running = await _run(tmp_path / "subset", ["qasper"], level="subset")
     run = await running
-    assert run["benchmarks"]["qasper"]["papers"] == 1
-    lines = tier1.compare(manifest, run, run)
+    assert run["benchmarks"]["qasper"]["papers"] == 1 and baseline["benchmarks"]["qasper"]["papers"] == 2
+    assert run["benchmarks"]["qasper"]["groups"] == [0, 0, 0]  # the paper's place differs; its questions pair by id
+    lines = tier1.compare(manifest, baseline, run)
     assert "qasper hybrid: 3 queries paired, rankings identical for 3; fallbacks none" in lines
     assert any(line.startswith("  recall@8: difference +0.0000 [+0.0000, +0.0000] n=3") for line in lines)
 
@@ -308,9 +343,10 @@ def test_each_exclusion_is_its_own_and_the_best_annotator_scores_the_question():
     assert tier1.qasper_question(ask(yes()), passages, set())[1] == "no_evidence"
     annotators, reason, unmatched = tier1.qasper_question(ask(yes("Heading"), yes("Zeta.")), passages, {"Heading"})
     assert (annotators, reason, unmatched) == ([], "evidence_matching_no_passage", [("heading", "Heading"), ("other", "Zeta.")])
-    annotators, reason, _ = tier1.qasper_question(ask(yes("Alpha beta.", "Gamma delta."), yes("Gamma delta.")),
-                                                  passages, set())
+    annotators, reason, left = tier1.qasper_question(
+        ask(yes("Alpha beta.", "Gamma delta."), yes("Gamma delta.", "FLOAT SELECTED: Table 2")), passages, set())
     assert reason is None and annotators == [[["p1"], ["p2"]], [["p2"]]]
+    assert left == [("figure_or_table", "FLOAT SELECTED: Table 2")]  # left out of the set, and counted
     specs = tier1.load_manifest()["benchmarks"]["qasper"]["metrics"]
     scored = tier1.score_qasper(["p2", "x"], annotators, specs)
     assert scored["recall@8"] == 1.0 and scored["mrr@10"] == 1.0  # the second annotator, fully found
@@ -367,4 +403,20 @@ def test_the_manifest_records_rule_e_word_for_word_with_each_benchmarks_own_metr
         assert rule["own_metric"][name].startswith(bench["primary"])
     assert "no reranker can qualify in M2" in rule["chinese"]
     assert manifest["model_settings"]["reranker"] is None and list(tier1.ARMS) == ["hybrid", "keyword_only"]
+    from backend.search import MAX_LIMIT, QUERY_INSTRUCTION
+    assert manifest["search_limit"] == MAX_LIMIT and manifest["model_settings"]["query_instruction"] == QUERY_INSTRUCTION
     assert len(manifest["levels"]["subset"]["benchmarks"]["qasper"]["papers"]) == 50
+
+
+def test_the_models_and_the_conversion_refuse_files_that_differ_from_their_pins(tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"not the model")
+    with pytest.raises(tier1.Refused, match="the embedding model: model.gguf: 13 bytes"):
+        tier1.check_models(tier1.load_manifest(), tmp_path / "llama-server", model)
+    from evals import litsearch_to_jsonl
+    for name in litsearch_to_jsonl.INPUTS:
+        (tmp_path / "in" / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "in" / name).write_bytes(b"x")
+    with pytest.raises(SystemExit, match="nothing converted"):  # before pyarrow is imported or anything written
+        litsearch_to_jsonl.main(tmp_path / "in", tmp_path / "out")
+    assert not (tmp_path / "out").exists()
