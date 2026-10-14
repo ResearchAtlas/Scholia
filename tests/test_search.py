@@ -1593,12 +1593,13 @@ async def _a_later_run_waiting(client, project, run, rebuild=False):
     return later
 
 
-async def test_a_retry_whose_pending_id_marks_the_running_run_starts_nothing_until_that_run_ends(tmp_path,
-                                                                                                   monkeypatch):
-    """P2: Retry of a run whose terminal write failed with a Rebuild pending, while a later run of the
-    project runs: the pending id marks that run (no row yet), so nothing starts for it now (a run started for
-    an id with no row would hold it while that run's end recorded it, unheld: interrupted); it is recorded,
-    a rebuild, and started when that run ends."""
+async def test_a_request_after_a_failed_terminal_write_supersedes_that_run_so_a_kick_starts_no_second(tmp_path,
+                                                                                                        monkeypatch):
+    """Recheck 5, finding 33: a run whose terminal write failed (left running, held by no process) with a
+    Rebuild pending, its id given out. A later request (a reading) supersedes it as a Retry does, in the write
+    that records the project's run: it is recorded interrupted and retired, so a kick (a turn's end) never
+    starts it beside the new run, and its pending id ends superseded, a rebuild, recorded once and never
+    started; the new run does that rebuild. A Retry of the old run is then the new run."""
     from backend.runs import Harness
     real, started_for = Harness._background, []
 
@@ -1609,13 +1610,43 @@ async def test_a_retry_whose_pending_id_marks_the_running_run_starts_nothing_unt
     async with app(tmp_path, batch=1) as client:
         project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
         later = await _a_later_run_waiting(client, project, run)
+        harness = client.state["harness"]
+        await harness.kick_background()
+        assert await _running_index_runs(client, project) == [later]
+        assert run not in harness.registry.runs and started_for.count(run) == 1
+        assert await rows(client, "SELECT status FROM runs WHERE id = ?", run) == [("interrupted",)]
+        lost = await run_finished(client, pending)
+        assert (lost["status"], lost["result"]["reason"], lost["rebuild"]) == ("cancelled", "superseded", True)
         again = await client.post(f"/api/runs/{run}/retry")
-        assert again.status_code == 201 and again.json()["run_id"] == pending
-        assert await _pending(client, later) == {"run_id": pending, "rebuild": True}
-        assert pending not in started_for and await rows(client, "SELECT 1 FROM runs WHERE id = ?", pending) == []
+        assert again.status_code == 201 and again.json()["run_id"] == later
         client.remote.hold.set()
+        ended = await run_finished(client, later)
+        assert (ended["status"], ended["rebuild"], ended["result"]["rebuilt"]) == ("succeeded", True, True)
+        await idle(client, project)
+        await harness.kick_background()
+        assert {r["run_id"] for r in await runs_of(client, "index", project)} == {run, pending, later}
+        assert started_for.count(run) == 1 and pending not in started_for
+
+
+async def test_a_request_while_the_app_closes_leaves_a_run_left_running_the_projects_run(tmp_path, monkeypatch):
+    """Finding 33, while the app closes (a restore starting, or shutdown): a run left running by a failed terminal
+    write cannot be told from one a shutdown stopped, which a resume or the next launch starts again, so a request
+    then records no second run: it is that run's rerun (the pending one). The resume starts the run, whose end
+    records the pending rebuild: one run at a time, one pending."""
+    import backend.search as search
+    async with app(tmp_path, batch=1) as client:
+        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        harness = client.state["harness"]
+        harness.registry.closed = True
+        asked = await asyncio.to_thread(client.state["db"].write, lambda conn: search.request_run(
+            conn, harness.registry, project, lambda conn, project, inputs: search._insert_run(conn, None, project, inputs)))
+        assert asked == pending and await _running_index_runs(client, project) == [run]
+        harness.registry.closed = False
+        await harness.kick_background()
+        assert (await run_finished(client, run))["status"] == "succeeded"
         ended = await run_finished(client, pending)
-        assert (ended["status"], ended["rebuild"]) == ("succeeded", True) and started_for.count(pending) == 1
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+        assert {r["run_id"] for r in await runs_of(client, "index", project)} == {run, pending}
 
 
 @pytest.mark.parametrize("over", ["rerun", "rebuild"])
@@ -1666,9 +1697,11 @@ async def test_two_retries_at_once_of_a_run_with_a_rebuild_pending_both_get_that
 
 async def test_a_run_a_retry_marked_that_ends_before_the_retry_resumes_holds_and_starts_the_pending_run(
         tmp_path, monkeypatch):
-    """Recheck of b89a308, finding 1: the project's running run the Retry marked may end between the
-    Retry's commit and its coroutine's resuming; the pending id is released inside the Retry's write, so
-    that run's end holds, records and starts it, never recording it unheld (read as interrupted)."""
+    """Recheck of b89a308, finding 1: the project's running run a Retry marked to run once more may end
+    between the Retry's commit and its coroutine's resuming; the id the Retry held is released inside its
+    write, so that run's end holds, records and starts the pending run, never recording it unheld (read as
+    interrupted). (Since finding 33, a run left running by a failed terminal write never runs beside a later
+    one: the Retry here is of a run Cancel stopped.)"""
     import threading
     from backend.db import Database
     real, armed, committed, go = Database.write, [], threading.Event(), threading.Event()
@@ -1681,12 +1714,20 @@ async def test_a_run_a_retry_marked_that_ends_before_the_retry_resumes_holds_and
             go.wait(10)
         return result
     async with app(tmp_path, batch=1) as client:
-        project, run, pending = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        await client.post(f"/api/runs/{run}/cancel")
+        client.remote.hold.set()
+        assert (await run_finished(client, run))["status"] == "cancelled"
         later = await _a_later_run_waiting(client, project, run)
         monkeypatch.setattr(Database, "write", write)
         armed.append(True)
         retry = asyncio.ensure_future(client.post(f"/api/runs/{run}/retry"))
         assert await asyncio.to_thread(committed.wait, 10)
+        pending = (await _pending(client, later))["run_id"]
         client.remote.hold.set()
         deadline = asyncio.get_running_loop().time() + 10
         while await _status_of(client, later) == "running":  # it ends, recording the pending run
@@ -1694,8 +1735,7 @@ async def test_a_run_a_retry_marked_that_ends_before_the_retry_resumes_holds_and
             await asyncio.sleep(0.02)
         go.set()
         assert (await retry).json()["run_id"] == pending
-        ended = await run_finished(client, pending)
-        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+        assert (await run_finished(client, pending))["status"] == "succeeded"
 
 
 async def test_a_retry_of_the_run_still_running_holds_no_pending_id_its_end_records(tmp_path, monkeypatch):

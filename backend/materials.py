@@ -1314,7 +1314,8 @@ async def retry_run(run_id: str, request: Request):
                 search._close_pending(conn, project_id, left["run_id"], "superseded", left.get("rebuild"))
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
                      (retried, run_id))
-        if left_running:  # retired: no kick holds it here from now on, and the record says it ended
+        if left_running and _running(conn, run_id):  # retired: no kick holds it here from now on, and the record
+            # says it ended (an index run's request_run, superseding it, has said so already)
             _event(conn, run_id, "run_finished", {"status": "interrupted"})
             conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
                          (utc_now(), run_id))

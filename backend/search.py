@@ -185,16 +185,29 @@ def request_run(conn, registry, project_id, record, rebuild=False, startup=False
     (a Rebuild while a rebuild runs is that one). Else record(conn, project id,
     inputs) records one (under run_id, if given). Returns the id of the run that will do it. A run_id
     that loses to an id already pending gets a terminal record (_close_pending), so whoever follows it
-    sees it end."""
+    sees it end. A run left running in its record that no process holds (its terminal write failed) is
+    superseded, as a Retry supersedes it: retired (Registry.retire), so no kick starts it beside the
+    run this asks for, and recorded interrupted, so no launch does; its pending rerun ends superseded
+    (unless it is run_id), and a rebuild it or that rerun was to do is asked for here. One that cannot
+    be retired (a kick holds it as this looks, or the app is closing: a resume or the next launch starts
+    it again) is the project's run."""
     for live, inputs in conn.execute(
             "SELECT id, inputs FROM runs WHERE project_id = ? AND workflow = 'index' AND status = 'running'"
             " AND cancel_reason IS NULL AND json_extract(inputs, '$.retried_by') IS NULL ORDER BY rowid DESC",
             (project_id,)).fetchall():
-        if not (startup or (registry is not None and live in registry.runs)):
-            continue  # it will not end in this process (its terminal write failed): not the one
+        inputs = json.loads(inputs or "{}")
+        if not startup and (registry is None or registry.retire(live)):
+            if registry is not None:
+                left = inputs.get("again")
+                if left and left["run_id"] != run_id:
+                    _close_pending(conn, project_id, left["run_id"], "superseded", left.get("rebuild"))
+                rebuild = bool(rebuild or inputs.get("rebuild") or (left or {}).get("rebuild"))
+                _event(conn, live, "run_finished", {"status": "interrupted"})
+                conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
+                             (utc_now(), live))
+            continue
         if startup and not rebuild:
             return live
-        inputs = json.loads(inputs or "{}")
         if rebuild and inputs.get("rebuild"):
             if run_id is not None:
                 _close_pending(conn, project_id, run_id, "superseded", rebuild)
