@@ -69,9 +69,9 @@ _DOI_PREFIX = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNOREC
 # A number that names an arXiv ID is that ID and nothing else: "arXiv:" and the ID, its version, and the
 # category arXiv's own exports add ("arXiv:2101.00001v2 [cs.CL]"); extraction.ARXIV then checks the ID.
 _ARXIV_NUMBER = re.compile(r"\s*arxiv\s*:\s*(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?(?:\s*\[[a-z.-]{1,20}\])?\s*",
-                           re.IGNORECASE)
-_ARXIV_NAMED = re.compile(r"arxiv\s*:|arxiv\.org", re.IGNORECASE)  # a value that says it names one
-_ARXIV_WHOLE = re.compile(rf"(?:{ARXIV.pattern})(?:v\d+)?", re.IGNORECASE)  # an eprint: the ID and nothing else
+                           re.IGNORECASE | re.ASCII)  # ASCII: a digit is 0 to 9, as in every arXiv ID
+_ARXIV_NAMED = re.compile(r"arxiv\s*:|arxiv\.org/", re.IGNORECASE)  # a value that says it names one
+_ARXIV_WHOLE = re.compile(rf"(?:{ARXIV.pattern})(?:v\d+)?", re.IGNORECASE | re.ASCII)  # an eprint: the ID and nothing else
 _ARXIV_PREFIX = re.compile(r"^arxiv\s*:\s*", re.IGNORECASE)
 _ARXIV_VERSION = re.compile(r"V(\d+)$")  # arXiv writes a version with a lower-case v
 _LATEX = re.compile(r"[\\{}$~]")
@@ -387,7 +387,7 @@ def _bibtex(text, beat):
                 "language": value(fields, "language", "langid"),
                 "abstract": value(fields, "abstract", limit=ABSTRACT_CHARS),
                 "keyword": [_latex(k) for k in _split_top(value(fields, "keywords", limit=KEYWORDS * KEYWORD_CHARS,
-                                                                literal=True) or "")],
+                                                                literal=True) or "")[:KEYWORDS * 4]],  # as _finish keeps
                 # an arXiv eprint the whole of which is no arXiv ID is left out, and counted
                 "number": f"arXiv:{arxiv}" if valid else (number if kind != "article" else None),
                 "dropped": 1 if arxiv and not valid else 0,
@@ -706,7 +706,7 @@ def identifier(csl):
 
 
 _ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
-_ARXIV_PATH = re.compile(r"/(?:abs|pdf)/(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?(?:\.pdf)?/?", re.IGNORECASE)
+_ARXIV_PATH = re.compile(r"/(?:abs|pdf)/(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?(?:\.pdf)?/?", re.IGNORECASE | re.ASCII)
 
 
 def valid(csl):

@@ -158,12 +158,25 @@ def test_an_arxiv_eprint_as_exports_write_it(eprint, number):
     assert record.get("URL") == (f"https://arxiv.org/abs/{number[6:]}" if number else None)
 
 
-def test_a_number_that_only_mentions_arxiv_is_kept():
-    [record], skipped, _ = parse(json.dumps([{"title": "T", "number": "arXiv preprint 5"}]))
-    assert record["number"] == "arXiv preprint 5" and skipped == {}
+@pytest.mark.parametrize("number", ["arXiv preprint 5", "Preprint at arxiv.org"])
+def test_a_number_that_only_mentions_arxiv_is_kept(number):
+    [record], skipped, _ = parse(json.dumps([{"title": "T", "number": number}]))
+    assert record["number"] == number and skipped == {}
 
 
-@pytest.mark.parametrize("eprint", ["2101.123456", "2101.00001garbage", "2101.00001 2101.00002", "x2101.00001"])
+def test_only_the_keywords_a_record_keeps_are_read():
+    calls = []
+    real = rf._latex
+    rf._latex = lambda text: calls.append(text) or real(text)
+    try:
+        [record], _, _ = parse("@misc{k, title={T}, keywords={" + ",".join(["\\a"] * 5000) + "}}")
+    finally:
+        rf._latex = real
+    assert len(calls) <= rf.KEYWORDS * 4 + 1
+
+
+@pytest.mark.parametrize("eprint", ["2101.123456", "2101.00001garbage", "2101.00001 2101.00002", "x2101.00001",
+                                    "hep-th/９９０１００１"])
 def test_an_eprint_the_whole_of_which_is_no_arxiv_id_is_left_out_and_never_looked_up(eprint):
     [record], skipped, _ = parse(f"@misc{{k, title={{T}}, eprint={{{eprint}}}, archiveprefix={{arXiv}}}}")
     assert "number" not in record and "URL" not in record and rf.identifier(record) is None
@@ -179,6 +192,7 @@ def test_an_eprint_written_with_its_arxiv_prefix_is_that_id():
     ("arXiv:2101.123456", None), ("arXiv:2101.00001garbage", None), ("arXiv:2101.00001v2x", None),
     ("xarxiv:2101.00001", None), ("evilarxiv.org/abs/2101.00001", None), ("arXiv:2101.123456 arXiv:2101.00001", None),
     ("arXiv:2101.00001-2", None), ("arXiv:2101.00001.garbage", None), ("https://arxiv.org/abs/2101.00001", None),
+    ("arXiv:hep-th/９９０１００１", None),  # digits other than 0 to 9 are no arXiv ID's
     ("arXiv:2101.00001 [cs.CL]", "2101.00001"), ("arXiv:2101.00001v2", "2101.00001"), ("arXiv:math.GT/0309136", "math.GT/0309136"),
 ])
 def test_a_number_naming_arxiv_gives_a_whole_id_or_is_left_out(number, found):
@@ -190,7 +204,7 @@ def test_a_number_naming_arxiv_gives_a_whole_id_or_is_left_out(number, found):
 @pytest.mark.parametrize("url, found", [
     ("https://arxiv.org/abs/2101.00001v2", "2101.00001"), ("https://arxiv.org/pdf/2101.00001.pdf", "2101.00001"),
     ("https://arxiv.org/abs/2101.123456", None), ("https://arxiv.org/abs/2101.00001/extra", None),
-    ("https://proxy.example.org/arxiv.org/abs/2101.00001", None), ("https://example.org/?u=arxiv.org/abs/2101.00001", None),
+    ("https://proxy.example.org/arxiv.org/abs/2101.00001", None), ("https://arxiv.org/abs/hep-th/９９０１００１", None), ("https://example.org/?u=arxiv.org/abs/2101.00001", None),
 ])
 def test_an_arxiv_id_comes_only_from_the_whole_path_of_an_arxiv_org_url(url, found):
     [record], _, _ = parse(f"TY  - JOUR\nTI  - T\nUR  - {url}\nER  - \n")
