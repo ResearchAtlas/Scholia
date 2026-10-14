@@ -369,9 +369,9 @@ def _bibtex(text, beat):
         fields = {key.lower(): field for key, field in entry.fields_dict.items()}
         kind = entry.entry_type.lower()
         try:
-            eprint = _escapes(value(fields, "eprint", literal=True))
+            eprint = (_escapes(value(fields, "eprint", literal=True)) or "").strip()
             arxiv = eprint if eprint and (value(fields, "archiveprefix", "eprinttype") or "").lower() == "arxiv" else None
-            url = [f"https://arxiv.org/abs/{arxiv}"] if arxiv and ARXIV.fullmatch(arxiv.strip()) else []
+            url = [f"https://arxiv.org/abs/{arxiv}"] if arxiv and ARXIV.fullmatch(re.sub(r"v\d+$", "", arxiv)) else []
             number = value(fields, "number")
             record = {
                 "type": _BIBTEX_TYPES.get(kind, "article"),
@@ -665,7 +665,7 @@ def _finish(record):
     if keywords:
         csl["keyword"] = ", ".join(dict.fromkeys(keywords[:KEYWORDS]))
     arxiv = _ARXIV_IN.search(csl["number"]) if "number" in csl else None
-    if arxiv and not ARXIV.fullmatch(arxiv.group(1)) or not arxiv and csl.get("number", "").lower().startswith("arxiv"):
+    if arxiv and not ARXIV.fullmatch(arxiv.group(1)) or not arxiv and csl.get("number", "").startswith("arXiv:"):
         del csl["number"]  # it names an arXiv ID the pattern does not take: not kept as one
         dropped += 1
     return csl, dropped

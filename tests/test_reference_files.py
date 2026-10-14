@@ -150,6 +150,28 @@ def test_values_left_out_as_invalid_are_counted_not_lost():
     assert "number" not in record and "URL" not in record and skipped == {"invalid_field": 1}  # an eprint no arXiv ID
 
 
+@pytest.mark.parametrize("eprint, number", [("2101.00001v2", "arXiv:2101.00001v2"), (" 2101.00001 ", "arXiv:2101.00001"),
+                                            ("math\\_ph/0301001", None)])
+def test_an_arxiv_eprint_as_exports_write_it(eprint, number):
+    [record], skipped, _ = parse(f"@misc{{k, title={{T}}, eprint={{{eprint}}}, archiveprefix={{arXiv}}}}")
+    assert (record.get("number"), skipped) == (number, {} if number else {"invalid_field": 1})
+    assert record.get("URL") == (f"https://arxiv.org/abs/{number[6:]}" if number else None)
+
+
+def test_a_number_that_only_mentions_arxiv_is_kept():
+    [record], skipped, _ = parse(json.dumps([{"title": "T", "number": "arXiv preprint 5"}]))
+    assert record["number"] == "arXiv preprint 5" and skipped == {}
+
+
+@pytest.mark.parametrize("strings, title", [
+    ('@string{jan = "a"}\n@string{jan = "b"}\n', "jan"),  # a month name defined twice differently
+    ('@string{a = "x"}\n@string{b = a # "y"}\n@string{a = "z"}\n', "b"),  # built on a macro defined twice differently
+])
+def test_a_macro_defined_twice_differently_refuses_what_uses_it(strings, title):
+    records, skipped, _ = parse(f"{strings}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
+    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
+
+
 def test_exports_escapes_in_a_url_or_doi_are_read_as_their_characters():
     [record], skipped, _ = parse(r"@misc{k, title={T}, url={http://example.com/a\_b\&c\%20d}, doi={10.1000/Ab\_c}}")
     assert (record["URL"], record["DOI"], skipped) == ("http://example.com/a_b&c%20d", "10.1000/ab_c", {})
