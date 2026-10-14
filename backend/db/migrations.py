@@ -580,4 +580,14 @@ _0004 = r"""
 ALTER TABLE material_versions ADD COLUMN media_type TEXT;
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004)
+# The passages a project's current versions read now (backend/search_index.py's readings and
+# granted): checked for a few passage ids by their keys up to the current version that reads the
+# passage's reading's file, and read for a whole project from its materials down, so neither costs
+# the rest of the project or other projects' rows.
+_0005 = r"""
+CREATE INDEX materials_by_project ON materials (project_id);
+CREATE INDEX material_versions_current_by_file ON material_versions (file_sha256) WHERE is_current = 1;
+CREATE INDEX extractions_by_file ON extractions (file_sha256);
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005)
