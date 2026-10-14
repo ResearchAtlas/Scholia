@@ -360,9 +360,13 @@ class SearchIndex:
             self._generation += 1
         while True:
             try:
-                self._readers.get_nowait().close()
+                conn = self._readers.get_nowait()
             except queue.Empty:
                 return
+            try:
+                conn.close()
+            except Exception as error:  # the others are closed all the same
+                log.warning("an index read connection could not be closed (%s)", type(error).__name__)
 
     # Opening and staleness
 
@@ -941,17 +945,24 @@ class SearchIndex:
             elif self._conn is not None:
                 self._conn.close()
                 self._conn = None
+        failures = []  # every step is tried whatever failed before; the first failure is the close's
         try:
-            self._writer.submit(end).result()
-        except BaseException as error:
-            self._close_error = error
-            raise
+            for step in (lambda: self._writer.submit(end).result(), self._writer.shutdown, self._drain_reads):
+                try:
+                    step()
+                except BaseException as error:
+                    failures.append(error)
         finally:
-            try:
-                self._writer.shutdown()
-                with self._lock:  # reads still running end, their connections closed, not kept
-                    while self._reading:
-                        self._reads_done.wait()
-                self._close_readers()
-            finally:
-                self._done.set()
+            self._writer_ident = None  # a later thread may get its id: it is not this index's writer
+            self._close_error = failures[0] if failures else None
+            self._done.set()
+        if failures:
+            raise failures[0]
+
+    def _drain_reads(self):
+        """As the index closes: the reads still running end (their connections closed, not kept), then the idle
+        connections are closed."""
+        with self._lock:
+            while self._reading:
+                self._reads_done.wait()
+        self._close_readers()

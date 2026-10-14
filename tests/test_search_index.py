@@ -1406,3 +1406,28 @@ async def test_a_close_waits_for_a_read_in_progress_and_keeps_no_connection_open
         assert not returned_early and not closer.is_alive() and index._readers.empty()
         with pytest.raises(search_index.apsw.ConnectionClosedError):
             used[0].execute("SELECT 1")
+
+
+@pytest.mark.asyncio
+async def test_an_index_close_that_fails_after_its_drain_is_reported_to_every_later_close(tmp_path, monkeypatch):
+    """Internal review of 98116c4: a close that fails after its drain (stopping the writer, say) still closes the
+    read connections and signals its end, and every later close, on any thread, raises rather than reading as
+    done; the dead writer's thread id is forgotten, so no later thread is taken for it."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        await asyncio.to_thread(index._read, lambda conn: None)  # an idle read connection, to be closed
+        real = index._writer.shutdown
+
+        def shutdown(*args, **kwargs):
+            real(*args, **kwargs)
+            raise OSError("the writer could not be stopped")
+        monkeypatch.setattr(index._writer, "shutdown", shutdown)
+        with pytest.raises(OSError):
+            await asyncio.to_thread(index.close)
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                await asyncio.to_thread(index.close)
+        assert index._done.is_set() and index._writer_ident is None and index._readers.empty()

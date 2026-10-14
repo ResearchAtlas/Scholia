@@ -822,13 +822,17 @@ def test_a_close_while_another_runs_returns_only_once_that_one_has_finished(tmp_
 @pytest.mark.parametrize("failing", ["drain", "writer"])
 def test_a_close_that_fails_stops_the_writer_and_every_close_says_it_failed(tmp_path, monkeypatch, failing):
     """PR 29 recheck 2, findings 1 and 2: a close that fails, as it queues its drain of the writes or as it closes
-    the writer connection, still stops the writer thread and signals its end: another close then raises too
-    (never reads as done) rather than waiting for ever or returning as if the database were closed."""
+    the writer connection, still tries every other step (the hooks run, the writer connection is closed after a
+    failed drain) and stops the writer thread, and signals its end: another close then raises too, from another
+    thread or the same one (never reads as done), rather than waiting for ever or returning as if the database
+    were closed."""
     db = Database(tmp_path / "data")
     real_submit = db._writer.submit
+    hooked = []
+    db.closing.append(lambda: hooked.append(True))
     if failing == "drain":
         def submit(fn, *args):
-            if fn is not db._close_writer and not args:  # the drain's empty job
+            if getattr(fn, "__func__", None) is not Database._close_writer:  # the drain's empty job
                 raise RuntimeError("cannot schedule new futures after interpreter shutdown")
             return real_submit(fn, *args)
         monkeypatch.setattr(db._writer, "submit", submit)
@@ -849,7 +853,11 @@ def test_a_close_that_fails_stops_the_writer_and_every_close_says_it_failed(tmp_
     later = threading.Thread(target=again, daemon=True)
     later.start()
     later.join(5)
-    assert outcome == ["raised"] and db.closed and db._writer._shutdown
+    again()  # on the thread whose close failed
+    assert outcome == ["raised", "raised"] and hooked == [True] and db.closed and db._writer._shutdown
+    if failing == "drain":  # the writer connection was closed all the same
+        with pytest.raises(sqlite3.ProgrammingError):
+            db._conn.execute("SELECT 1")
 
 # Backups while the app is open
 

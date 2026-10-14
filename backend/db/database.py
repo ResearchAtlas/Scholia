@@ -315,46 +315,52 @@ class Database:
                 if self._close_error is not None:
                     raise RuntimeError("closing the database failed") from self._close_error
             return
-        error = None
-        try:  # everything from here signals its end (_shut), and a failure reaches every close()
+        failures = []  # every step is tried whatever failed before; the first failure is the close's
+
+        def attempt(step):
             try:
+                step()
+            except BaseException as failure:
+                failures.append(failure)
+        try:  # everything from here signals its end (_shut), and a failure reaches every close()
+            def drain():
                 with self._readers_lock:
                     drained = None if self._closed else self._writer.submit(lambda: None)  # behind every write admitted
                 if drained is not None:
                     drained.result()
-                for close in list(self.closing):  # each closes once, its work drained while this database still reads
-                    try:
-                        close()
-                    except Exception as failure:
-                        log.warning("closing what reads the database failed (%s)", type(failure).__name__)
+            attempt(drain)
+            for close in list(self.closing):  # each closes once, its work drained while this database still reads
+                try:
+                    close()
+                except Exception as failure:
+                    log.warning("closing what reads the database failed (%s)", type(failure).__name__)
+
+            def readers():
                 with self._readers_lock:
                     self._closed = True  # a backup's progress handler and step checks see this and stop
                     while self._reads:
                         self._reads_done.wait()
                     readers, self._readers = self._readers, []
                 for conn in readers:
-                    conn.close()
-                if self._backup_lock.acquire(timeout=STOP_SECONDS):
-                    self._backup_lock.release()
-                else:
-                    log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
-            except BaseException as failure:
-                error = failure
+                    attempt(conn.close)
+            attempt(readers)
             with self._readers_lock:
                 self._closed = True
-            try:
-                self._writer.submit(self._close_writer).result()
-            except BaseException as failure:
-                error = error or failure
+            if self._backup_lock.acquire(timeout=STOP_SECONDS):
+                self._backup_lock.release()
+            else:
+                log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
+            attempt(lambda: self._writer.submit(self._close_writer).result())
         finally:
             try:
-                self._writer.shutdown()
+                attempt(self._writer.shutdown)
             finally:
                 self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
-                self._close_error = error
+                self._close_error = failures[0] if failures else None
+                self._closer = None  # from here a close() on that thread too waits, and is told of a failure
                 self._shut.set()
-        if error is not None:
-            raise error
+        if failures:
+            raise failures[0]
 
     # Writer thread
 
