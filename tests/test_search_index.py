@@ -4,6 +4,7 @@ tokenizer, a restored database, a damaged or unfinished file), secure delete che
 own bytes, and sqlite-vec failing to load. Synthetic text only."""
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -1230,3 +1231,132 @@ async def test_a_close_whose_wal_truncation_stays_owed_discards_the_file(tmp_pat
         status = await until_embedded(client, project)
         assert status["passages"]["indexed"] == 4  # the kept paper's
         assert await asyncio.to_thread(client.state["index"].keyword, project, "wombats", 50) == []
+
+
+# The main database's side: the passages a project's current versions read now (M2 follow-up)
+
+# readings and granted as S1-17 wrote them, driven from every current version of every project: the
+# reference the cheaper queries must agree with, row for row.
+S117_READS = ("FROM materials m JOIN material_versions w ON w.material_id = m.id AND w.is_current = 1"
+              " JOIN extractions e ON {} JOIN passages p ON p.extraction_id = e.id WHERE m.project_id = ?")
+
+
+def s117_readings(conn, project_id, references=True):
+    from backend.db.deletion import _reads_now
+    found = {}
+    for pid, material, title, path, kind, text, page, ordinal, version in conn.execute(
+            "SELECT p.id, m.id, m.title, p.section_path, p.kind, p.text, p.page, p.ordinal, w.id "
+            + S117_READS.format(_reads_now("w", "e")) + ("" if references else " AND p.kind != 'reference'")
+            + " ORDER BY m.created_at, m.id, p.ordinal", (project_id,)):
+        found.setdefault(pid, (material, title, json.loads(path) if path else [], kind, text, page, ordinal, version))
+    return found
+
+
+def s117_granted(conn, project_id):
+    from backend.db.deletion import _reads_now
+    return {pid for (pid,) in conn.execute("SELECT p.id " + S117_READS.format(_reads_now("w", "e")), (project_id,))}
+
+
+def library(conn):
+    """Two projects of synthetic papers, with every way a passage is read or not: a file two papers of a
+    project read (the first added gives it), the same bytes added as Markdown and as LaTeX (two readings
+    of one file), a version from before media types (its file's type), a replaced version, a reading by
+    an earlier extractor version, a paper with no current version, a reference passage and the same
+    file in the other project. {project: [passage ids]}."""
+    from backend.db.database import new_id
+    from backend.extraction import LATEX, MARKDOWN, extractor_of
+    passages = {}
+
+    def file(name, media_type=MARKDOWN, *readers):
+        sha = hashlib.sha256(name.encode()).hexdigest()
+        conn.execute("INSERT OR IGNORE INTO content_files (sha256, size, media_type) VALUES (?, 1, ?)", (sha, media_type))
+        for kind, version in readers or [extractor_of(media_type)]:
+            extraction = new_id()
+            conn.execute("INSERT INTO extractions (id, file_sha256, extractor, extractor_version, status)"
+                         " VALUES (?, ?, ?, ?, 'done')", (extraction, sha, kind, version))
+            for ordinal, kind in enumerate(("title", "paragraph", "reference")):
+                pid = new_id()
+                conn.execute("INSERT INTO passages (id, extraction_id, ordinal, kind, text, section_path)"
+                             " VALUES (?, ?, ?, ?, ?, ?)", (pid, extraction, ordinal, kind, f"{name} {kind}", '["Intro"]'))
+                passages.setdefault("all", []).append(pid)
+        return sha
+
+    def material(project, when, *versions):  # versions: (sha, media type or None, current)
+        mid = new_id()
+        conn.execute("INSERT INTO materials (id, project_id, title, source, created_at) VALUES (?, ?, ?, 'upload', ?)",
+                     (mid, project, f"Paper {when}", f"2026-10-15T00:00:{when:02d}.000Z"))
+        for seq, (sha, media_type, current) in enumerate(versions):
+            conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
+                         " VALUES (?, ?, ?, ?, ?, ?)", (new_id(), mid, seq, sha, int(current), media_type))
+
+    one, two = new_id(), new_id()
+    for project in (one, two):
+        conn.execute("INSERT INTO projects (id, name, kind) VALUES (?, 'P', 'research')", (project,))
+    shared = file("shared")
+    both = file("both", MARKDOWN, extractor_of(MARKDOWN), extractor_of(LATEX))
+    old = file("old", MARKDOWN, ("markdown", "markdown-1"), extractor_of(MARKDOWN))
+    material(one, 1, (file("replaced"), MARKDOWN, False), (shared, MARKDOWN, True))
+    material(one, 2, (shared, None, True))  # the shared file, added later: the first gives its passages
+    material(one, 3, (both, LATEX, True))
+    material(one, 4, (both, MARKDOWN, True))
+    material(one, 5, (old, MARKDOWN, True))
+    material(one, 6, (file("withdrawn"), MARKDOWN, False))
+    material(two, 7, (shared, MARKDOWN, True))
+    material(two, 8, (file("elsewhere"), MARKDOWN, True))
+    return one, two, passages["all"]
+
+
+def test_a_check_for_some_passages_gives_what_the_whole_projects_reading_gives_them(tmp_path):
+    """The access check driven from the passage ids returns, for every subset, exactly what S1-17's
+    whole-project query did: the same passages, the first added paper for one two papers read, and no
+    reference passage without references; a database from before the indexes reads the same after them."""
+    import random
+    from backend.db.database import Database
+    from backend.db.migrations import MIGRATIONS
+    from backend.search_index import granted, readings
+    data = tmp_path / "data"
+    with Database(data, migrations=MIGRATIONS[:4]) as db:
+        one, two, every = db.write(library)
+        before = db.read(lambda conn: {(p, r): s117_readings(conn, p, r) for p in (one, two) for r in (True, False)})
+    with Database(data) as db:
+        names = {name for (name,) in db.read(lambda conn: conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'"))}
+        assert {"materials_by_project", "material_versions_current_by_file", "extractions_by_file"} <= names
+        rng = random.Random(5)
+        for (project, references), reference in before.items():
+            assert reference and db.read(lambda conn: s117_readings(conn, project, references)) == reference
+            assert db.read(lambda conn: readings(conn, project, references=references)) == reference
+            assert db.read(lambda conn: granted(conn, project)) == db.read(lambda conn: s117_granted(conn, project))
+            subsets = [[pid] for pid in every] + [rng.sample(every, k) for k in (2, 5, 9) for _ in range(20)] + [[], every]
+            for ids in subsets:
+                assert db.read(lambda conn: readings(conn, project, ids, references)) == {
+                    pid: reading for pid, reading in reference.items() if pid in ids}
+
+
+def test_a_check_for_a_few_passages_reads_only_their_rows_and_a_projects_reading_only_its_own(tmp_path):
+    """The plans: a check for given passage ids searches each table by key from the passages up (no scan
+    of passages, extractions, versions or materials, whatever the project's size); a whole project's
+    reading and its granted ids search from its materials down, so neither reads other projects' rows."""
+    from backend.db.database import Database
+    from backend.search_index import granted, readings
+    with Database(tmp_path / "data") as db:
+        one, _, every = db.write(library)
+
+        def plans(conn):
+            statements = []
+            conn.set_trace_callback(statements.append)
+            try:
+                readings(conn, one, every[:3], references=False)
+                readings(conn, one)
+                granted(conn, one)
+            finally:
+                conn.set_trace_callback(None)
+            return [[row[3] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}")] for sql in statements]
+        some, whole, ids = db.read(plans)
+    for plan in (some, whole, ids):
+        scans = [step for step in plan if step.startswith("SCAN") and "json_each" not in step]
+        assert scans == [], plan
+    assert some[0].startswith("SEARCH p USING INDEX") and "(id=?)" in some[0]
+    assert any("material_versions_current_by_file" in step for step in some)
+    for plan in (whole, ids):
+        assert plan[0] == "SEARCH m USING INDEX materials_by_project (project_id=?)"
+        assert any("extractions_by_file" in step for step in plan)
