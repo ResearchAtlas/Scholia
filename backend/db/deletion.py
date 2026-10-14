@@ -30,6 +30,13 @@ log = logging.getLogger(__name__)
 # commits, to another project than one read beforehand (a conversation moved meanwhile, say).
 REVOKING = weakref.WeakKeyDictionary()
 
+# The search index open over a database, if any, by database: delete() calls its cleanup after the
+# deletion commits (and after the WAL truncation), so the index's removals are applied, with secure
+# delete, and checked gone without waiting for an index run (backend/search_index.py). A failure is
+# logged; the removals stay queued for the index's next pass, and search checks access in this
+# database meanwhile.
+CLEANUP = weakref.WeakKeyDictionary()
+
 # What can be deleted: kind -> (table, column holding the tombstone's title).
 KINDS = {
     "project": ("projects", "name"),
@@ -198,6 +205,11 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
             log.warning("the WAL could not be truncated after a deletion; a reader still needed it")
     except Exception as error:
         log.warning("WAL truncation after a deletion failed (%s)", type(error).__name__)
+    if (cleanup := CLEANUP.get(db)) is not None:
+        try:
+            cleanup()
+        except Exception as error:
+            log.warning("the search index's cleanup after a deletion failed (%s)", type(error).__name__)
     return revoked
 
 
@@ -378,6 +390,21 @@ def _queue_index_removals(conn):
         JOIN passages p ON p.extraction_id = e.id
         WHERE v.rowid IN {_doomed('material_versions')}
         AND NOT EXISTS (
+            SELECT 1 FROM material_versions w JOIN materials n ON n.id = w.material_id
+            WHERE {_reads_now('w', 'e')} AND n.project_id = m.project_id
+            AND w.rowid NOT IN {_doomed('material_versions')})
+        ORDER BY p.id""")
+    # A reading another current version in the project still reads stays; its passages are queued
+    # again, so the index takes them as that paper's, with its title (S1-17), and keeps nothing of the
+    # deleted one's.
+    conn.execute(f"""INSERT INTO index_queue (target, target_id, project_id, op)
+        SELECT DISTINCT 'passage', p.id, m.project_id, 'add'
+        FROM material_versions v
+        JOIN materials m ON m.id = v.material_id
+        JOIN extractions e ON {_reads('v', 'e')}
+        JOIN passages p ON p.extraction_id = e.id
+        WHERE v.rowid IN {_doomed('material_versions')}
+        AND EXISTS (
             SELECT 1 FROM material_versions w JOIN materials n ON n.id = w.material_id
             WHERE {_reads_now('w', 'e')} AND n.project_id = m.project_id
             AND w.rowid NOT IN {_doomed('material_versions')})

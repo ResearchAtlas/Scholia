@@ -142,3 +142,35 @@ async def test_the_log_never_writes_through_a_link(tmp_path):
     (tmp_path / "outside-logs").mkdir()
     with pytest.raises(NotADirectoryError):
         logs.configure(linked)
+
+
+async def test_no_search_canary_reaches_the_log(tmp_path, caplog, monkeypatch):
+    """S1-17: indexing, search and a failed index cleanup log no passage text, title or query."""
+    from backend.search_index import SearchIndex
+    from test_materials import added, project_of
+    from test_search import app, find, idle, paper
+
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    caplog.set_level(logging.DEBUG, logger="backend")
+    canaries = ["CANARY-PASSAGE", "CANARY-TITLE-SEARCH", "CANARY-QUERY", "CANARY-CLEANUP", "金丝雀段落"]
+    try:
+        async with app(tmp_path, data=data) as client:
+            project = await project_of(client)
+            [material] = (await added(client, project, paper("CANARY-TITLE-SEARCH", "CANARY-PASSAGE 金丝雀段落")))[
+                "materials"]
+            await idle(client, project)
+            client.remote.failing = True
+            assert (await find(client, project, "CANARY-QUERY"))["reason"] == "request_failed"
+            monkeypatch.setattr(SearchIndex, "_verify", lambda self, rowid: (_ for _ in ()).throw(
+                RuntimeError("CANARY-CLEANUP CANARY-PASSAGE")))
+            assert (await client.delete(f"/api/materials/{material['id']}")).status_code == 200
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    assert "the search index's cleanup after a deletion failed (RuntimeError)" in text
+    for canary in canaries:
+        assert canary not in text, canary
+        assert not any(canary in record.getMessage() for record in caplog.records), canary

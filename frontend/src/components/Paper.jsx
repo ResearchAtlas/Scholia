@@ -15,13 +15,16 @@ import { ACCEPT, changes, detailsOf, headings, heldPages, hovering, isPdf, isPoi
   rectStyle, reasonKey, selectedParts, takeSaved, unionRect, validYear, viewOf, waitsOn, withFocus, withNear } from '../library.js';
 import { addTo, Byline, Facts, Progress, ReadAgain, Retracted, StateChip } from './Library.jsx';
 import { DeleteDialog } from './DeleteDialog.jsx';
+import { revealPassage } from '../search.js'; // S1-17: opened at a search result's passage
 import { Segmented } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/utils';
 
-export function Paper({ material, project, onBack, onChanged }) {
+// index: the project's search index status, for Details (S1-17); target: a search result's passage
+// ({ id, ordinal }), which the text view opens at.
+export function Paper({ material, project, index, target, onBack, onChanged }) {
   const t = useT();
   const [deleting, setDeleting] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -66,9 +69,9 @@ export function Paper({ material, project, onBack, onChanged }) {
         <Details material={material} onSaved={onChanged} />
         <section className="grid gap-2 text-sm">
           <h4 className="font-semibold">{t('paper.about')}</h4>
-          <Facts material={material} project={project} />
+          <Facts material={material} project={project} index={index} />
         </section>
-        {material.extraction && material.version && <Contents key={material.version.id} material={material} />}
+        {material.extraction && material.version && <Contents key={material.version.id} material={material} target={target} />}
       </div>
       <DeleteDialog target={deleting ? { kind: 'material', id: material.id, title: t('paper.deleteTitle', { title: material.title }),
         body: t('paper.deleteBody') } : null}
@@ -141,18 +144,20 @@ function Details({ material, onSaved }) {
 // has its own (keyed by it), and the view follows the version's kind: only a PDF has pages. Neither
 // holds the whole text: each part (a page, a stretch of passages) reads what it shows as it comes near
 // the view and lets it go as it leaves, and a part far from the view is an empty box of its size.
-function Contents({ material }) {
+function Contents({ material, target }) {
   const t = useT();
   const pdf = isPdf(material);
-  const [chosen, setChosen] = useState('pages');
+  const [chosen, setChosen] = useState(target ? 'text' : 'pages'); // a search result opens the text at its passage
   const views = useRef(null); // the view's switch, whose Passages focus goes to when a note opens that view
+  const section = useRef(null);
+  useEffect(() => (target ? revealPassage(section.current, target) : undefined), [target]);
   const view = viewOf(material, chosen);
   const [pointed, setPointed] = useState(NOT_POINTED); // the passages with focus and under the pointer
   const version = material.version.id;
   const count = material.extraction.passages ?? 0;
   useEffect(() => setPointed(NOT_POINTED), [count]); // read again: its passages go, with no blur or leave for them
   return (
-    <section className="grid gap-3">
+    <section ref={section} className="grid gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h4 className="text-sm font-semibold">{t('paper.text')}</h4>
         {pdf && <div ref={views}><Segmented label={t('paper.view')} value={view} onChange={setChosen}

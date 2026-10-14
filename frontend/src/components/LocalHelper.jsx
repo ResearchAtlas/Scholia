@@ -332,3 +332,33 @@ function LocalOnlyNote({ onOpenAdvanced }) {
     </div>
   );
 }
+
+// S1-17: the search model's consent details (S13) under the first material's offer (Ask.jsx), where
+// the offer's answer is the consent: what is downloaded, its size, each source's address, its SHA-256,
+// its license and where it is kept, read from the helper's status.
+export function ModelDetails() {
+  const t = useT();
+  const language = useContext(LanguageContext);
+  const { status, problem, load } = useHelperStatus();
+  const model = status?.models?.[0];
+  if (!model) return <LoadState problem={problem} onRetry={load} />;
+  return (
+    <dl className="mt-2 grid gap-2.5 rounded-md bg-background/60 px-3 py-2.5 text-xs">
+      <Detail label={t('helper.consentModel')}>{model.name}</Detail>
+      <Detail label={t('helper.consentSize')}>
+        {t('helper.consentSizeValue', { size: fileSize(model.size, language), bytes: new Intl.NumberFormat(language).format(model.size) })}
+      </Detail>
+      {SOURCES.filter((name) => model.sources[name]).map((name) => (
+        <Detail key={name} label={status.recommended_source === name
+          ? t('helper.sourceRecommended', { source: t(`helper.source.${name}`) }) : t(`helper.source.${name}`)}>
+          <span className="break-all font-mono text-[11px]">{model.sources[name]}</span>
+        </Detail>
+      ))}
+      {status.recommended_source === 'modelscope' && <p className="text-muted-foreground">{t('helper.recommendModelScope')}</p>}
+      <Detail label={t('helper.consentHash')}><span className="break-all font-mono text-[11px]">{model.sha256}</span></Detail>
+      <Detail label={t('helper.consentLicense')}>{model.license}</Detail>
+      <Detail label={t('helper.consentStored')}><span className="break-all font-mono text-[11px]">{model.folder}</span></Detail>
+      <p className="leading-relaxed text-muted-foreground">{t('helper.consentNote')}</p>
+    </dl>
+  );
+}

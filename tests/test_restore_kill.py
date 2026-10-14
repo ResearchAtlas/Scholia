@@ -340,8 +340,8 @@ async def test_a_restore_done_whose_audit_row_cannot_be_written_is_reported_done
         full.append(True)  # the next write is the restore's audit row
         return result
 
-    def write(self, fn):
-        if full:
+    def write(self, fn):  # the restore's own write: the search index writes the restored database meanwhile
+        if full and fn.__qualname__.startswith("_replace"):
             full.clear()
             raise OSError(errno.ENOSPC, "No space left on device")
         return real_write(self, fn)
@@ -423,8 +423,8 @@ async def test_a_restore_done_whose_bookkeeping_fails_twice_lists_both_and_logs_
             after_audit.append(True)
         return result
 
-    def read(self, fn):
-        if after_audit:
+    def read(self, fn):  # the restore's own read: the search index reads the restored database meanwhile
+        if after_audit and fn.__qualname__.startswith("_replace"):
             after_audit.clear()
             raise OSError(f"I/O error reading {data}")
         return real_read(self, fn)
