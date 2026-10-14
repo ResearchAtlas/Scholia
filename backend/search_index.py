@@ -627,6 +627,8 @@ class SearchIndex:
             self._checkpoint()
         while self._conn is not None and not self.closed and not self.building and not (stop and stop()):
             last = int(self._conn.execute("SELECT value FROM index_meta WHERE key = 'last_seq'").fetchone()[0])
+            if self.db.read(lambda conn: conn.execute("SELECT 1 FROM index_queue WHERE seq <= ? LIMIT 1", (last,)).fetchone()):
+                self._prune(last)  # applied rows a prune that failed left (in this session or an earlier one)
             rows = self.db.read(lambda conn: conn.execute(
                 "SELECT seq, target, target_id, project_id, op FROM index_queue WHERE seq > ? ORDER BY seq LIMIT ?",
                 (last, QUEUE_PAGE)).fetchall())
@@ -672,7 +674,8 @@ class SearchIndex:
             self._checkpoint()
 
     def _prune(self, seq):
-        """The applied rows leave the queue (migration 0001's note); the next pass deletes them if this fails."""
+        """The applied rows leave the queue (migration 0001's note); the next pass deletes them if this fails
+        (_apply_queue: the rows at or below the last sequence applied)."""
         try:
             self.db.write(lambda conn: conn.execute("DELETE FROM index_queue WHERE seq <= ?", (seq,)))
         except Exception as error:

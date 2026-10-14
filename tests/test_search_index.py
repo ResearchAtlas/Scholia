@@ -1175,3 +1175,32 @@ async def test_a_deletions_cleanup_that_fails_once_asks_for_the_runs_once_its_re
         status = await until_embedded(client, project)
         assert list(status["materials"]) == [kept["id"]]
         assert len(await runs_of(client, "index", project)) == len(before) + 1
+
+
+@pytest.mark.asyncio
+async def test_queue_rows_a_failed_prune_left_leave_at_the_next_pass(tmp_path, monkeypatch):
+    """Connector thread 4274410602: the queue's applied rows could not be deleted (a transient failure in the
+    main database after the index recorded them applied); the next pass deletes them, though it has nothing
+    of its own to apply, so no launch asks an index run for them again."""
+    import threading
+    from backend.db import Database
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await until_embedded(client, project)
+        index, real, failed, failing = client.state["index"], Database.write, [], {"on": True}
+
+        def failing_prunes(self, fn, *args, **kwargs):  # the index writer's writes to the main database: its prunes
+            if failing["on"] and threading.current_thread().name.startswith("scholia-index-writer"):
+                failed.append(True)
+                raise OSError("disk I/O error")
+            return real(self, fn, *args, **kwargs)
+        db = client.state["db"]
+        await asyncio.to_thread(db.write, lambda conn: conn.execute(
+            "INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('passage', 'gone', ?, 'remove')", (project,)))
+        monkeypatch.setattr(Database, "write", failing_prunes)
+        assert await asyncio.to_thread(index.apply) == 1
+        assert failed and await rows(client, "SELECT count(*) FROM index_queue") == [(1,)]  # applied, left queued
+        failing["on"] = False
+        assert await asyncio.to_thread(index.apply) == 0  # nothing of its own to apply
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
