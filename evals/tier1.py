@@ -499,6 +499,8 @@ def gaps(results):
                   for arm, entry in bench["arms"].items() if not entry["complete"]]
         if bench["build"]["readings_not_succeeded"]:
             found.append(f"{name}: {bench['build']['readings_not_succeeded']} readings did not succeed")
+        if bench.get("helper_sockets") is None:
+            found.append(f"{name}: the helper's sockets were not sampled (it was not running)")
         if bench.get("not_loopback_sockets"):
             found.append(f"{name}: sockets off loopback {bench['not_loopback_sockets']}")
     return found
@@ -640,7 +642,8 @@ def write_atomic(path, results):
 
 async def run(manifest, level_name, names, files, out, open_app, arms=None):
     """Every named benchmark, each in an app of its own on a new temporary data folder; the results file
-    written once at the end (finished), or with the reason the run stopped (incomplete)."""
+    first an incomplete marker, then once more at the end: finished, or incomplete with the reason the run
+    stopped or the gaps that keep it from being finished."""
     from helper_timings import not_loopback, sockets
     arms = arms or ARMS
     level = manifest["levels"][level_name]
@@ -744,7 +747,8 @@ def report(results):
     commit_ = results.get("commit") or {}
     lines = [f"# Tier 1 results ({results.get('level')}, {results.get('status')})", ""]
     if results.get("status") != "finished":
-        lines += [f"Not finished: {results.get('reason') or ''} {results.get('gaps') or ''}".rstrip(), ""]
+        lines += ["Not finished: " + "; ".join([*([results["reason"]] if results.get("reason") else []),
+                                                *(results.get("gaps") or [])]), ""]
     lines += [f"Commit `{commit_.get('sha')}`{' (modified)' if commit_.get('modified') else ''}; "
              f"{results.get('started_at')} to {results.get('finished_at')}; {results.get('seconds')} s; machine "
              f"{results.get('machine')}; load average {results.get('load_average_start')} at the start and "
@@ -834,6 +838,8 @@ def main(argv=None):
     results = asyncio.run(main_task())
     print(json.dumps({name: {arm: entry.get("metrics") for arm, entry in bench["arms"].items()}
                       for name, bench in results["benchmarks"].items()}, indent=1))
+    if results["status"] != "finished":
+        sys.exit(f"{results['status']}: " + "; ".join(results["gaps"]))
 
 
 if __name__ == "__main__":

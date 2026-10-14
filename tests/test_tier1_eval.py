@@ -420,3 +420,44 @@ def test_the_models_and_the_conversion_refuse_files_that_differ_from_their_pins(
     with pytest.raises(SystemExit, match="nothing converted"):  # before pyarrow is imported or anything written
         litsearch_to_jsonl.main(tmp_path / "in", tmp_path / "out")
     assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.asyncio
+async def test_answers_over_a_partial_or_unready_index_are_marked_and_the_others_are_not():
+    answers = iter([
+        {"mode": "hybrid", "reason": None, "index": "ready", "coverage": {"embedded": 5, "total": 5}, "results": []},
+        {"mode": "hybrid", "reason": None, "index": "ready", "coverage": {"embedded": 3, "total": 5}, "results": []},
+        {"mode": "hybrid", "reason": None, "index": "building", "coverage": {"embedded": 5, "total": 5}, "results": []},
+        {"mode": "keyword_only", "reason": "deadline", "index": "ready", "coverage": {"embedded": 5, "total": 5},
+         "results": []},
+        {"mode": "keyword_only", "reason": "reference_arm", "index": "ready", "coverage": {"embedded": 0, "total": 5},
+         "results": []}])
+
+    async def arm(state, project, text):
+        return next(answers)
+    out = await tier1.run_arms({}, {"hybrid": arm}, [{"project": "p", "text": "t"}] * 5, lambda answer, query: [])
+    assert out["hybrid"]["outcomes"] == [("hybrid", None), ("hybrid", "coverage_partial"), ("hybrid", "index_not_ready"),
+                                         ("keyword_only", "deadline"), ("keyword_only", "reference_arm")]
+
+
+def test_gaps_keep_a_run_from_finishing_and_metrics_without_fallbacks_leave_out_only_those():
+    bench = {"build": {"readings_not_succeeded": 2}, "helper_sockets": None, "not_loopback_sockets": ["1 10.0.0.1:443"],
+             "arms": {"hybrid": {"complete": True}, "keyword_only": {"complete": False, "fallbacks": {"x": 1}}}}
+    assert tier1.gaps({"benchmarks": {"b": bench}}) == [
+        "b keyword_only: did not run as named ({'x': 1})", "b: 2 readings did not succeed",
+        "b: the helper's sockets were not sampled (it was not running)", "b: sockets off loopback ['1 10.0.0.1:443']"]
+    spec = {"metrics": [{"name": "ndcg@10", "kind": "ndcg", "k": 10}], "ids_committable": False, "resample": "query"}
+    queries = [{"key": str(i)} for i in range(4)]
+    scores = {"hybrid": [{"ndcg@10": v} for v in (1.0, 0.0, 0.5, 0.25)]}
+    out = {"hybrid": {"outcomes": [("hybrid", None), ("keyword_only", "deadline"), ("hybrid", None), ("hybrid", None)],
+                      "seconds": None, "digests": ["a"] * 4}}
+    record = tier1.summarize(spec, {"resamples": 50, "seed": 1, "level": 0.95}, queries, out, scores)
+    hybrid = record["arms"]["hybrid"]
+    assert hybrid["complete"] and hybrid["fallback_queries"] == [1]
+    assert hybrid["metrics"]["ndcg@10"]["n"] == 4 and hybrid["metrics_without_fallbacks"]["ndcg@10"] == {
+        "mean": 0.5833, "n": 3, "interval": hybrid["metrics_without_fallbacks"]["ndcg@10"]["interval"]}
+    finished = {"status": "finished", "like_for_like": True, "model_settings": {}, "machine": {}, "benchmarks": {},
+                "manifest_sha256": "a", "bootstrap": {}}
+    lines = tier1.compare({}, finished, {**finished, "manifest_sha256": "b"})
+    assert lines == ["NOT LIKE FOR LIKE: the manifest (pins, rules, subset) differs from the baseline's"]
+    assert "Not finished: running" in "\n".join(tier1.report({"status": "incomplete", "reason": "running"}))
