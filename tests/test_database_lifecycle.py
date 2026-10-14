@@ -748,6 +748,43 @@ def test_a_write_admitted_before_close_runs_before_the_writer_closes(tmp_path, m
         assert audit_events(reopened) == [("kept",)]
 
 
+def test_close_lets_admitted_writes_commit_and_refuses_the_rest_before_closing_what_reads_it(tmp_path):
+    """S1-17 recheck 6, finding 35: close() first refuses later writes and waits for those admitted to commit
+    (as hold_writes does), then closes what reads this database (closing: the search index), which so sees
+    every write that will ever commit (a deletion's queued removals), on every path that closes it: shutdown,
+    a restore going ahead or abandoned, a damaged database. It can still read then; it cannot write."""
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    entered, go, hooked, seen = threading.Event(), threading.Event(), threading.Event(), []
+
+    def held(conn):  # admitted, its commit waiting
+        add_audit_row(conn)
+        entered.set()
+        go.wait(10)
+
+    def hook():
+        events = audit_events(db)
+        hooked.set()
+        try:
+            db.write(add_audit_row)
+            seen.append((events, "written"))
+        except DatabaseClosedError:
+            seen.append((events, "refused"))
+    db.closing.append(hook)
+    writer = threading.Thread(target=db.write, args=(held,))
+    writer.start()
+    assert entered.wait(5)
+    closer = threading.Thread(target=db.close)
+    closer.start()
+    deadline = time.monotonic() + 10  # until close refuses writes, or (were they not refused first) runs its hook
+    while not (getattr(db, "_closing", False) or hooked.is_set()) and time.monotonic() < deadline:
+        time.sleep(0.002)
+    go.set()
+    writer.join(5)
+    closer.join(5)
+    assert not closer.is_alive() and seen == [([("kept",)], "refused")]
+
+
 # Backups while the app is open
 
 

@@ -350,8 +350,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
             if state.get("harness") is not None:
                 await state["harness"].shutdown()
-            if state.get("index") is not None:  # S1-17: its writer stops before the database closes
-                await asyncio.to_thread(state.pop("index").close)
+            if state.get("index") is not None:  # S1-17: closed by its database's close, once no write can commit
+                await asyncio.to_thread(state.pop("index").db.close)
             await asyncio.to_thread(db.close)
             state.clear()
 

@@ -95,12 +95,13 @@ class Database:
         self.backups_dir = self.data_dir / "backups"
         self._damaged = None  # why writing stopped, once an integrity check fails
         self.on_damage = None  # called once, from the thread whose check found the database damaged
-        self.closing = []  # called as close() starts: what reads this database closes first (S1-17: the search index)
+        self.closing = []  # called by close() once its writes are refused and drained, before it reads no more (S1-17: the search index)
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
         self._closed = False  # set when close() starts, under _readers_lock; later reads and writes are refused
         self._held = False  # set by hold_writes(), under _readers_lock: later writes are refused
+        self._closing = False  # set as close() starts, under _readers_lock: later writes are refused (never released)
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
@@ -137,7 +138,7 @@ class Database:
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("write() cannot be called from inside a write")
         with self._readers_lock:  # admitted and queued in one step, so never queued behind close() or a hold
-            if self._closed or self._held:
+            if self._closed or self._held or self._closing:
                 raise DatabaseClosedError("the database is closed")
             future = self._writer.submit(self._transaction, fn)
         return future.result()
@@ -288,11 +289,18 @@ class Database:
         (DatabaseClosedError); reads in progress finish first, and a write already
         submitted runs before the writer connection closes. So work still running when
         the app stops gets an error, never a connection closed under it. A backup in
-        progress is stopped, and waited for up to STOP_SECONDS. What reads this database
-        (closing: the search index) is closed first, its work drained."""
+        progress is stopped, and waited for up to STOP_SECONDS. First, writes are refused and
+        those already admitted commit (as hold_writes does); then what reads this database
+        (closing: the search index) is closed, its work drained, so it sees every write that
+        will ever commit (a deletion's queued removals)."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")
+        with self._readers_lock:
+            self._closing = True
+            drained = None if self._closed else self._writer.submit(lambda: None)  # behind every write admitted
+        if drained is not None:
+            drained.result()
         for close in list(self.closing):  # each closes once, its work drained while this database still reads
             try:
                 close()

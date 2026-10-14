@@ -14,7 +14,7 @@ import pytest
 
 import backend.search_index as search_index
 from backend.search_index import DIMENSIONS, SearchIndex, match, tokens
-from scholia_app import run_finished, started
+from scholia_app import background_idle, run_finished, started
 from test_materials import added, project_of, rows
 from test_search import CHINESE, WAGES, app, find, idle, index_rows, paper, runs_of, vector
 
@@ -1230,3 +1230,69 @@ async def test_a_close_whose_wal_truncation_stays_owed_discards_the_file(tmp_pat
         status = await until_embedded(client, project)
         assert status["passages"]["indexed"] == 4  # the kept paper's
         assert await asyncio.to_thread(client.state["index"].keyword, project, "wombats", 50) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("papers", ["own", "shared"])
+async def test_a_deletion_admitted_as_the_app_shuts_down_leaves_nothing_of_it_in_the_closed_index(tmp_path, monkeypatch,
+                                                                                                   papers):
+    """Recheck 6, finding 35: a deletion admitted by the main database, its transaction still to commit, as the
+    app shuts down. Shutdown refuses later writes and lets those admitted commit before the index closes, so
+    the close finds the deletion's queue rows and removes their rows: neither the file nor its WAL keeps the
+    deleted paper's title (own: nor its text and vector; shared: a file another paper reads, retitled), and
+    the next launch shows the kept paper's rows."""
+    import threading
+    import time
+    from backend.db import delete
+    english = "Quokkas annotate vermilion abacuses"
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        if papers == "shared":
+            doomed, kept = await _sharing(client, project)
+        else:
+            [doomed] = (await added(client, project, paper("Quixotic Ledger", english)))["materials"]
+            [kept] = (await added(client, project, WAGES))["materials"]
+        await until_embedded(client, project)
+        await background_idle(client)  # the lookups too: no run's write waits behind the deletion's
+        db, index = client.state["db"], client.state["index"]
+        files = [index.path, Path(f"{index.path}-wal")]
+        embedding = vector(f"Quixotic Ledger\nFindings\n{english}")
+        first = next(i for i, value in enumerate(embedding) if value)
+        secrets = [b"Quixotic", b"quixotic"] + ([english.encode(), b"quokkas", b"vermilion",
+                   search_index.sqlite_vec.serialize_float32(embedding)[4 * first:4 * first + 64]]
+                   if papers == "own" else [])
+        held = b"".join(f.read_bytes() for f in files if f.exists())
+        assert all(s in held for s in secrets[:1] + secrets[2:3] + secrets[-1:])  # it was there
+        entered, go, real_write = threading.Event(), threading.Event(), db.write
+
+        def write(fn):  # the deletion's transaction waits, admitted, before its commit
+            if "delete" in fn.__qualname__ and not entered.is_set():
+                def waiting(conn):
+                    result = fn(conn)
+                    entered.set()
+                    go.wait(20)
+                    return result
+                return real_write(waiting)
+            return real_write(fn)
+        monkeypatch.setattr(db, "write", write)
+        deleting = asyncio.ensure_future(asyncio.to_thread(delete, db, client.state["content"], "material", doomed["id"]))
+        assert await asyncio.to_thread(entered.wait, 10)
+
+        def release():  # once the close refuses writes, or (were they not refused first) has closed the index
+            deadline = time.monotonic() + 20
+            while not (getattr(db, "_closing", False) or (index._shut and index._conn is None)) \
+                    and time.monotonic() < deadline:
+                time.sleep(0.002)
+            go.set()
+        threading.Thread(target=release, daemon=True).start()
+    await asyncio.wait_for(deleting, 20)  # committed, as the app closed
+    left = b"".join(f.read_bytes() for f in files if f.exists())
+    assert [s for s in secrets if s in left] == []
+    async with app(tmp_path) as client:
+        status = await until_embedded(client, project)
+        assert list(status["materials"]) == [kept["id"]]
+        assert {material for _, material, _, _ in await index_rows(client, project)} == {kept["id"]}
+        if papers == "shared":
+            texts = await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+                "SELECT text FROM fts_passages WHERE project_id = ?", (project,)).fetchall())
+            assert texts and all(text.startswith("Zephyr Accounts") for (text,) in texts)
