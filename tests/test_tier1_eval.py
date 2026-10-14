@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 from evals import metrics, tier1
+from backend.local_helper import EMBEDDING
+from test_local_helper import WEIGHTS
 from test_search import app as search_app
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,16 +114,27 @@ def manifest_for(folder):
 
 
 def opener(seen=None, before_yield=None):
-    """The runner's app: the test app with the stand-in helper and the model's file in place."""
+    """The runner's app: the test app with the stand-in helper, the model imported through the API when
+    the runner installs it (as the runner does with the real model)."""
     @contextlib.asynccontextmanager
     async def open_app(data):
         if seen is not None:
             seen.append(data)
-        async with search_app(data.parent, data=data) as client:
+        async with search_app(data.parent, data=data, install=False) as client:
             if before_yield:
                 await before_yield(client)
-            yield client, client.state
+
+            async def install():
+                weights = data.parent / "Qwen3-Embedding-0.6B-Q8_0.gguf"
+                weights.write_bytes(WEIGHTS)
+                response = await client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(weights)})
+                assert response.status_code == 200, response.text
+                installs.append(data.name)
+            yield client, client.state, install
     return open_app
+
+
+installs = []
 
 
 async def _run(tmp_path, names, level="full", **options):
@@ -249,6 +262,8 @@ async def test_a_full_run_builds_through_the_app_scores_each_benchmark_apart_and
     manifest, out, running = await _run(tmp_path, ["qasper", "scifact", "litsearch"])
     results = await running
     assert results["status"] == "finished" and json.loads(out.read_text()) == json.loads(json.dumps(results))
+    assert installs[-3:] == ["qasper", "scifact", "litsearch"]  # each benchmark's model imported once its files were read
+    assert results["benchmarks"]["scifact"]["build"]["embedding_seconds"] >= 0
     assert results["model_settings"]["retrieval"] == manifest["model_settings"]["retrieval"]
     assert results["model_settings"]["helper_flags"] == manifest["model_settings"]["helper_flags"]
     assert results["like_for_like"] is False  # the stand-in helper's runtime is not the pinned bundle's

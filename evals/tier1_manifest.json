@@ -4,6 +4,7 @@
   "use": "local evaluation only: no benchmark text is committed, shipped or redistributed; results carry scores, counts and hashes, and ids only where a set's terms clearly allow them (QASPER and SciFact)",
   "query_language": "en",
   "document_language": "en",
+  "build": "each benchmark in an app of its own on a new temporary data folder, its projects review-locked: the files are added through the API (20 a request) and read by the app into passages (section 7.1) and the keyword index; then the search model is imported through the API and the app's index runs embed every passage, as when a researcher installs the model after adding papers; searches start once every passage has its vector",
   "benchmarks": {
     "qasper": {
       "folder": "qasper-v0.3",

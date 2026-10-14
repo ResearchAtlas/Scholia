@@ -320,6 +320,35 @@ async def until_built(state):
             raise RuntimeError(f"the index runs ended with passages unembedded ({failed[0] if failed else 'none failed'})")
 
 
+async def until_read(state):
+    """Wait until every reading has ended and its passages are in the keyword index (no extract or index
+    run running and the queue empty, twice in a row)."""
+    db = state["db"]
+
+    def busy(conn):
+        return bool(conn.execute("SELECT 1 FROM runs WHERE workflow IN ('extract', 'index') AND status = 'running'"
+                                 " LIMIT 1").fetchone() or conn.execute("SELECT 1 FROM index_queue LIMIT 1").fetchone())
+    quiet = 0
+    while quiet < 2:
+        await asyncio.sleep(POLL_SECONDS)
+        quiet = 0 if await asyncio.to_thread(db.read, busy) else quiet + 1
+
+
+async def built(state, install, began):
+    """The build's second half and its record: once the files are read and keyword-indexed, the search
+    model is installed (imported through the API), and one index run per project embeds its passages, as
+    when a researcher installs the model after adding papers; then the build's figures."""
+    await until_read(state)
+    read = time.perf_counter()
+    await install()
+    await until_built(state)
+    stats = await build_stats(state, began)
+    stats["read_and_keyword_seconds"] = round(read - began, 1)
+    stats["embedding_seconds"] = round(time.perf_counter() - read, 1)
+    stats["embedded_per_second"] = round(stats["passages"] / max(stats["embedding_seconds"], 0.001), 1)
+    return stats
+
+
 async def build_stats(state, began):
     from helper_timings import summary
     db = state["db"]
@@ -369,7 +398,7 @@ async def run_arms(state, arms, queries, rank):
     return out
 
 
-async def build_qasper(client, state, papers, limit):
+async def build_qasper(client, state, install, papers, limit):
     """One project per paper (retrieval within the question's own paper), its questions mapped."""
     from search_timings import markdown
     from backend.search_index import readings
@@ -379,8 +408,7 @@ async def build_qasper(client, state, papers, limit):
         project = await new_project(client, f"QASPER {pid}")
         [material] = await add_files(client, project, [(file_name(paper.get("title")), markdown(paper))])
         projects[pid] = (project, material)
-    await until_built(state)
-    record = {"build": await build_stats(state, began), "papers": len(papers)}
+    record = {"build": await built(state, install, began), "papers": len(papers)}
     queries, exclusions, unmatched, items, stable, sample = [], Counter(), Counter(), 0, {}, []
     for group, (pid, paper) in enumerate(papers.items()):
         project, material = projects[pid]
@@ -409,7 +437,7 @@ async def build_qasper(client, state, papers, limit):
     return queries, record, stable
 
 
-async def build_documents(client, state, docs, name):
+async def build_documents(client, state, install, docs, name):
     """One project of one material per document; {material id: [document ids]} (documents with the
     same file share a material)."""
     began = time.perf_counter()
@@ -422,8 +450,7 @@ async def build_documents(client, state, docs, name):
     documents_of = defaultdict(list)
     for doc_id, material in zip(kept, await add_files(client, project, files), strict=True):
         documents_of[material].append(doc_id)
-    await until_built(state)
-    return project, documents_of, {"build": await build_stats(state, began), "documents": len(docs),
+    return project, documents_of, {"build": await built(state, install, began), "documents": len(docs),
                                    "documents_empty": len(docs) - len(kept),
                                    "documents_sharing_a_file": sum(len(d) - 1 for d in documents_of.values())}
 
@@ -522,13 +549,13 @@ def paired(bench, boot, mine, other, groups, specific, chosen_pairs=None):
     return out
 
 
-async def evaluate(name, bench, boot, files, chosen, client, state, arms):
+async def evaluate(name, bench, boot, files, chosen, client, state, install, arms):
     """Build one benchmark in the app given, run the arms over its queries and score them."""
     from backend.search import QUERY_CHARS
     limit = (await client.get("/api/settings")).json()["values"]["retrieval"]["passage_chars"]
     if name == "qasper":
         papers = read_qasper(files, chosen.get("papers") if isinstance(chosen, dict) else None)
-        queries, record, stable = await build_qasper(client, state, papers, limit)
+        queries, record, stable = await build_qasper(client, state, install, papers, limit)
 
         def rank(answer, query):
             return [r["passage_id"] for r in answer["results"]]
@@ -537,7 +564,7 @@ async def evaluate(name, bench, boot, files, chosen, client, state, arms):
             return [stable.get(p, p) for p in ranking]
     else:
         docs, raw = read_litsearch(files) if name == "litsearch" else read_beir(files)
-        project, documents_of, record = await build_documents(client, state, docs, name)
+        project, documents_of, record = await build_documents(client, state, install, docs, name)
         queries, skipped = [], 0
         for qid, text, relevant, *specific in raw:
             if not text or len(text) > QUERY_CHARS:  # the search API's own limit
@@ -615,8 +642,8 @@ def model_settings(state, values):
 
 @contextlib.asynccontextmanager
 async def desktop_app(data_dir, helper, model):
-    """The app on a new data folder as the desktop runs it, the embedding model imported through the API;
-    yields (client, state)."""
+    """The app on a new data folder as the desktop runs it; yields (client, state, install), install
+    importing the embedding model through the API."""
     import httpx
     from backend import local_helper
     from backend.app import create_app
@@ -625,9 +652,10 @@ async def desktop_app(data_dir, helper, model):
     async with app.app.router.lifespan_context(app.app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN,
                                      headers={"X-Scholia-Client": "local"}, timeout=3600) as client:
-            await _post(client, "/api/helper/models/import",
-                        {"model": local_helper.EMBEDDING, "path": str(Path(model).resolve())}, 200)
-            yield client, app.app.state.scholia
+            async def install():
+                await _post(client, "/api/helper/models/import",
+                            {"model": local_helper.EMBEDDING, "path": str(Path(model).resolve())}, 200)
+            yield client, app.app.state.scholia, install
 
 
 def write_atomic(path, results):
@@ -660,7 +688,7 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
         with tempfile.TemporaryDirectory(prefix="scholia-tier1-") as folder:
             for name in names:
                 data = Path(folder) / name
-                async with open_app(data) as (client, state):
+                async with open_app(data) as (client, state, install):
                     values = (await client.get("/api/settings")).json()["values"]["retrieval"]
                     settings = model_settings(state, values)
                     if "model_settings" not in results:
@@ -669,7 +697,7 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
                     elif settings != results["model_settings"]:
                         raise Refused(f"{name}: the model settings changed during the run")
                     record = await evaluate(name, manifest["benchmarks"][name], manifest["bootstrap"], files[name],
-                                            level["benchmarks"][name], client, state, arms)
+                                            level["benchmarks"][name], client, state, install, arms)
                     local = state.get("local_helper")
                     helper = next(iter(local.helpers.values()), None) if local is not None else None
                     pid = getattr(getattr(helper, "_process", None), "pid", None)
