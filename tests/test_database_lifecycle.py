@@ -785,6 +785,39 @@ def test_close_lets_admitted_writes_commit_and_refuses_the_rest_before_closing_w
     assert not closer.is_alive() and seen == [([("kept",)], "refused")]
 
 
+def test_a_close_while_another_runs_returns_only_once_that_one_has_finished(tmp_path):
+    """PR 29 review 1, finding 2: a close() called while another is held inside a hook (the search index draining)
+    returns only once that close has finished: the hook done, then the database closed. A close() a hook calls,
+    from inside that close, returns at once rather than waiting for itself."""
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    entered, go, order = threading.Event(), threading.Event(), []
+
+    def hook():
+        entered.set()
+        db.close()  # from inside the close: returns at once
+        go.wait(10)
+        order.append("hook done")
+    db.closing.append(hook)
+    first = threading.Thread(target=db.close)
+    first.start()
+    assert entered.wait(5)
+
+    def second():
+        db.close()
+        order.append(("second returned", db._writer_ident is None))
+    later = threading.Thread(target=second)
+    later.start()
+    later.join(0.5)  # its chance to return early
+    go.set()
+    first.join(5)
+    later.join(5)
+    assert not first.is_alive() and not later.is_alive()
+    assert order == ["hook done", ("second returned", True)]
+    with pytest.raises(DatabaseClosedError):
+        db.read(lambda conn: None)
+
+
 # Backups while the app is open
 
 

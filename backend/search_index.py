@@ -267,7 +267,8 @@ class SearchIndex:
         self.vectors = False  # sqlite-vec loaded: dense search is possible
         self.building = False  # the whole file is being rebuilt
         self.closed = False
-        self._shut = False  # close() has run (it runs once)
+        self._shut = False  # close() has started (it runs once)
+        self._done = threading.Event()  # that close has finished: a later or concurrent close() waits for it
         self.damaged = False  # a read found the file damaged: it is being replaced
         self._conn = None
         self._truncate = False  # a WAL truncation not done yet: tried again at each pass, and soon (_retry_later)
@@ -283,7 +284,10 @@ class SearchIndex:
         self._readers = queue.SimpleQueue()  # idle read connections
         self._generation = 0  # a replaced file's readers are closed, not used again
         self._lock = threading.Lock()
-        self._writer = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="scholia-index-writer")
+        self._writer_ident = None
+        self._writer = concurrent.futures.ThreadPoolExecutor(
+            1, thread_name_prefix="scholia-index-writer",
+            initializer=lambda: setattr(self, "_writer_ident", threading.get_ident()))
 
     # Connections
 
@@ -892,14 +896,18 @@ class SearchIndex:
         and its additions that retitle a reading another paper keeps) are removed first (_remove_queued).
         A file a whole rebuild has not finished (asked for, under way, or failed), or one whose rows
         cannot be removed so or whose WAL cannot be truncated, is discarded: nothing deleted stays in it,
-        and the next launch rebuilds it."""
+        and the next launch rebuilds it. A close called while another runs, or after it, returns once that one
+        has finished (but in the writer itself, whose job it would wait for)."""
         with self._lock:
-            if self._shut:  # closed already (the database's close closes it too)
-                return
+            joining = self._shut  # closing or closed already (the database's close closes it too)
             self._shut = self.closed = True
             for timer in (self._retry, self._rebuild_retry):
                 if timer is not None:
                     timer.cancel()
+        if joining:
+            if threading.get_ident() != self._writer_ident:
+                self._done.wait()
+            return
 
         def end():
             discard = self.building
@@ -919,5 +927,8 @@ class SearchIndex:
         try:
             self._writer.submit(end).result()
         finally:
-            self._writer.shutdown()
-            self._close_readers()
+            try:
+                self._writer.shutdown()
+                self._close_readers()
+            finally:
+                self._done.set()

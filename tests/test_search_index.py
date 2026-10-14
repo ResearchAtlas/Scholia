@@ -1296,3 +1296,55 @@ async def test_a_deletion_admitted_as_the_app_shuts_down_leaves_nothing_of_it_in
             texts = await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
                 "SELECT text FROM fts_passages WHERE project_id = ?", (project,)).fetchall())
             assert texts and all(text.startswith("Zephyr Accounts") for (text,) in texts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closing", ["database", "index"])
+async def test_a_close_called_while_another_drains_the_index_returns_only_once_that_close_has_finished(tmp_path,
+                                                                                                         monkeypatch,
+                                                                                                         closing):
+    """PR 29 review 1, finding 2: a second close, of the main database or of the index itself, called while the
+    database's first close is held inside the index's drain (its queued removals still to apply), returns only
+    once that has finished: the index's removals applied and the file closed (and, for the database's, then the
+    main database closed). Neither the file nor its WAL keeps the deleted paper's text when it returns."""
+    import threading
+    import time
+    from backend.db import deletion
+    english = "Quokkas annotate vermilion abacuses"
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [doomed] = (await added(client, project, paper("Quokka Ledger", english)))["materials"]
+        await added(client, project, WAGES)
+        await until_embedded(client, project)
+        await background_idle(client)
+        db, index = client.state["db"], client.state["index"]
+        files = [index.path, Path(f"{index.path}-wal")]
+        monkeypatch.setitem(deletion.CLEANUP, db, lambda: None)  # its removals stay queued for the close
+        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        reached, go, real = threading.Event(), threading.Event(), SearchIndex._remove_queued
+
+        def held(self):  # the first close, inside the index's drain
+            reached.set()
+            go.wait(20)
+            return real(self)
+        monkeypatch.setattr(SearchIndex, "_remove_queued", held)
+        first = threading.Thread(target=db.close)
+        first.start()
+        assert await asyncio.to_thread(reached.wait, 10)
+        seen = []
+
+        def second():
+            (db.close if closing == "database" else index.close)()
+            left = b"".join(f.read_bytes() for f in files if f.exists())
+            seen.append((index._conn is None, closing == "index" or db._writer_ident is None,
+                         english.encode() in left or b"quokkas" in left))
+        later = threading.Thread(target=second)
+        later.start()
+        deadline = time.monotonic() + 1  # the second close's chance to return early
+        while later.is_alive() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        go.set()
+        await asyncio.to_thread(later.join, 20)
+        await asyncio.to_thread(first.join, 20)
+        assert not first.is_alive() and not later.is_alive()
+        assert seen == [(True, True, False)]  # returned after the index closed, its removals applied, then the database
