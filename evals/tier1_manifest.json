@@ -1,0 +1,465 @@
+{
+  "name": "Scholia retrieval evaluation, tier 1 (S1-18)",
+  "governed_by": "slice-1 spec sections 7.1, 7.4, 13 and 14 and tickets 17, 22, 70 and 72 (E) at docs commit 0d911523fbb6af53e06113d3f5034346e33123e1",
+  "use": "local evaluation only: no benchmark text is committed, shipped or redistributed; results carry scores, counts and hashes, and ids only where a set's terms clearly allow them (QASPER and SciFact)",
+  "query_language": "en",
+  "document_language": "en",
+  "benchmarks": {
+    "qasper": {
+      "folder": "qasper-v0.3",
+      "source": "QASPER v0.3 (Dasigi et al., 2021), AllenAI",
+      "archives": [
+        {
+          "url": "https://qasper-dataset.s3.us-west-2.amazonaws.com/qasper-train-dev-v0.3.tgz",
+          "size": 10835856,
+          "sha256": "a28fdf966db827bcee3d873107d6b6669864fb7ca8fbf73a192f5e39191bdb5a"
+        },
+        {
+          "url": "https://qasper-dataset.s3.us-west-2.amazonaws.com/qasper-test-and-evaluator-v0.3.tgz",
+          "size": 3865061,
+          "sha256": "72a52a41193e2838b8074f80ac074b94f956b84886c36a61c58a7df4171bdd72"
+        }
+      ],
+      "license": "CC BY 4.0 (AllenAI's dataset script and card)",
+      "ids_committable": true,
+      "split": "test",
+      "files": {
+        "test": {
+          "path": "extracted/qasper-test-v0.3.json",
+          "size": 18078957,
+          "sha256": "6e29ad410e6e39aa1936017fb965b30a20eb2e7751997f55b97c9d281aa884e5"
+        }
+      },
+      "unit": "passage",
+      "metrics": [
+        {
+          "name": "recall@8",
+          "kind": "recall",
+          "k": 8
+        },
+        {
+          "name": "ndcg@10",
+          "kind": "ndcg",
+          "k": 10
+        },
+        {
+          "name": "mrr@10",
+          "kind": "mrr",
+          "k": 10
+        }
+      ],
+      "primary": "recall@8",
+      "resample": "paper",
+      "rules": {
+        "scope": "evidence selection within each question's own paper: each paper is one project of its own, so the product's per-project search applies unchanged",
+        "paper": "tools/search_timings.markdown: one Markdown file (title, abstract, sections with their paragraphs, figure and table captions), named by the paper's title, read by the app into passages by section 7.1",
+        "mapping": "an evidence paragraph maps to the paper's passages whose text equals it or contains it; a paragraph longer than the passage limit, which section 7.1 splits at sentences, maps to the consecutive passages whose texts together make it up, and any one of them counts; texts are compared by their letters and digits only, case-folded (whitespace and Markdown punctuation ignored)",
+        "annotators": "each annotator's evidence is scored on its own and the question takes the best annotator, for each metric, as QASPER's own evaluator does for evidence F1; an annotator who marks the question unanswerable, lists no evidence, or lists only figure or table evidence is not used; evidence items matching no passage are left out of that annotator's set and counted",
+        "scoring": "recall@8: the share of the annotator's evidence paragraphs with at least one of their passages in the top 8; nDCG@10 and MRR@10: binary relevance over the passages the evidence maps to",
+        "exclusions": "a question is excluded and counted when every annotator marks it unanswerable (all_unanswerable), when no usable annotator remains because the text evidence matches no passage (evidence_matching_no_passage), because the evidence is only figures or tables (figure_or_table_only), or because no evidence is listed (no_evidence), checked in that order; and when its paper's reading failed (paper_not_read)"
+      }
+    },
+    "scifact": {
+      "folder": "beir-scifact",
+      "source": "SciFact (Wadden et al., 2020) in BEIR's form (Thakur et al., 2021)",
+      "archives": [
+        {
+          "url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip",
+          "size": 2816079,
+          "sha256": "536e14446a0ba56ed1398ab1055f39fe852686ecad24a6306c80c490fa8e0165",
+          "md5": "5f7d1de60b170fc8027bb7898e2efca1"
+        }
+      ],
+      "license": "claims and annotations CC BY 4.0, abstracts ODC-By 1.0 (allenai/scifact LICENSE.md); the BEIR card's CC BY-SA 4.0 tag is not relied on",
+      "ids_committable": true,
+      "split": "test",
+      "files": {
+        "corpus": {
+          "path": "extracted/scifact/corpus.jsonl",
+          "size": 8106566,
+          "sha256": "dec31c8182f3d744c7d2c09423756fd1d17cbef75808db13ba01cc0aab4d1ac6"
+        },
+        "queries": {
+          "path": "extracted/scifact/queries.jsonl",
+          "size": 209731,
+          "sha256": "8ff84a7c903f722981cd8d595c022660140c51867b27608a6d4910db86080313"
+        },
+        "qrels": {
+          "path": "extracted/scifact/qrels/test.tsv",
+          "size": 5389,
+          "sha256": "0864bb985e0ca2367ba217977e72004d549054b2b06666ed9d4825ac7c21284c"
+        }
+      },
+      "unit": "document",
+      "metrics": [
+        {
+          "name": "ndcg@10",
+          "kind": "ndcg",
+          "k": 10
+        },
+        {
+          "name": "recall@10",
+          "kind": "recall",
+          "k": 10
+        },
+        {
+          "name": "mrr@10",
+          "kind": "mrr",
+          "k": 10
+        }
+      ],
+      "primary": "ndcg@10",
+      "resample": "query",
+      "rules": {
+        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material: its file named by the title (so the material's title, which prefixes the index text, is the document's title), its text the document's text (its title when the text is empty); the app reads it into passages by section 7.1. A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); documents with identical files share their passages and are ranked together; a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do"
+      }
+    },
+    "nfcorpus": {
+      "folder": "beir-nfcorpus",
+      "source": "NFCorpus (Boteva et al., 2016) in BEIR's form (Thakur et al., 2021)",
+      "archives": [
+        {
+          "url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nfcorpus.zip",
+          "size": 2448432,
+          "sha256": "efe5be03f8c5b86a5870102d0599d227c8c6e2484328e68c6522560385671b0b",
+          "md5": "a89dba18a62ef92f7d323ec890a0d38d"
+        }
+      ],
+      "license": "free to use for academic purposes (the NFCorpus page's terms of use); other uses of the NutritionFacts.org data need its author's permission; the BEIR card's CC BY-SA 4.0 tag is not relied on",
+      "ids_committable": false,
+      "split": "test",
+      "files": {
+        "corpus": {
+          "path": "extracted/nfcorpus/corpus.jsonl",
+          "size": 6219364,
+          "sha256": "10cc83ef1826b1425e6a87090b5140b39b27755d5a27e48215a88611c899991f"
+        },
+        "queries": {
+          "path": "extracted/nfcorpus/queries.jsonl",
+          "size": 441466,
+          "sha256": "d024e6621b84925d485ae473d316a0c3af31c62c8068a59fb29d22f7613aef2a"
+        },
+        "qrels": {
+          "path": "extracted/nfcorpus/qrels/test.tsv",
+          "size": 279572,
+          "sha256": "f8fba6ef3d4dd9c3a242a8ba4ae38276fc3622fce7dcbae764766d564542fd2a"
+        }
+      },
+      "unit": "document",
+      "metrics": [
+        {
+          "name": "ndcg@10",
+          "kind": "ndcg",
+          "k": 10
+        },
+        {
+          "name": "recall@10",
+          "kind": "recall",
+          "k": 10
+        },
+        {
+          "name": "mrr@10",
+          "kind": "mrr",
+          "k": 10
+        }
+      ],
+      "primary": "ndcg@10",
+      "resample": "query",
+      "rules": {
+        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material: its file named by the title (so the material's title, which prefixes the index text, is the document's title), its text the document's text (its title when the text is empty); the app reads it into passages by section 7.1. A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); documents with identical files share their passages and are ranked together; a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do"
+      }
+    },
+    "scidocs": {
+      "folder": "beir-scidocs",
+      "source": "SCIDOCS (Cohan et al., 2020) in BEIR's form (Thakur et al., 2021)",
+      "archives": [
+        {
+          "url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scidocs.zip",
+          "size": 142471588,
+          "sha256": "96640201687767c9b1fcc5af7a80b90fb325b37fa25329c2586c25edcfa17ef1",
+          "md5": "38121350fc3a4d2f48850f6aff52e4a9"
+        }
+      ],
+      "license": "no statement for the data; allenai/scidocs carries a repository-wide CC BY 4.0 file; the BEIR card's CC BY-SA 4.0 tag is not relied on",
+      "ids_committable": false,
+      "split": "test",
+      "files": {
+        "corpus": {
+          "path": "extracted/scidocs/corpus.jsonl",
+          "size": 257334350,
+          "sha256": "328bb38854179c83ee40d4f49fae2ef7209ede7163785193cbdcd5906b28eecc"
+        },
+        "queries": {
+          "path": "extracted/scidocs/queries.jsonl",
+          "size": 3166530,
+          "sha256": "3c85b68419bd579ff52edb58f9e7b32eb3d18bc83435edb71dbb68aaf79531d6"
+        },
+        "qrels": {
+          "path": "extracted/scidocs/qrels/test.tsv",
+          "size": 2543906,
+          "sha256": "dcd3d7f77417294bb6f338537f3c28d8a5ea72b30fe6633f407fa85528767e35"
+        }
+      },
+      "unit": "document",
+      "metrics": [
+        {
+          "name": "ndcg@10",
+          "kind": "ndcg",
+          "k": 10
+        },
+        {
+          "name": "recall@10",
+          "kind": "recall",
+          "k": 10
+        },
+        {
+          "name": "mrr@10",
+          "kind": "mrr",
+          "k": 10
+        }
+      ],
+      "primary": "ndcg@10",
+      "resample": "query",
+      "rules": {
+        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material: its file named by the title (so the material's title, which prefixes the index text, is the document's title), its text the document's text (its title when the text is empty); the app reads it into passages by section 7.1. A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); documents with identical files share their passages and are ranked together; a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do"
+      }
+    },
+    "litsearch": {
+      "folder": "litsearch",
+      "source": "LitSearch (Ajith et al., 2024), Princeton NLP: Hugging Face princeton-nlp/LitSearch at commit 9573fb284a1026c998df47024b888a163f0f0e25",
+      "archives": [
+        {
+          "url": "https://huggingface.co/datasets/princeton-nlp/LitSearch/resolve/9573fb284a1026c998df47024b888a163f0f0e25/query/full-00000-of-00001.parquet",
+          "sha256": "38cdbe4a6b7a7f5776d08055bfbf6e4511000aa2a523866592b4bb273388b914"
+        },
+        {
+          "url": "https://huggingface.co/datasets/princeton-nlp/LitSearch/resolve/9573fb284a1026c998df47024b888a163f0f0e25/corpus_clean/full-00000-of-00006.parquet",
+          "sha256": "f0477a38be6f83a87ac76e76c5c6fa9dd590c7e388bd0c9cf3a602b909e52d86"
+        },
+        {
+          "url": "https://huggingface.co/datasets/princeton-nlp/LitSearch/resolve/9573fb284a1026c998df47024b888a163f0f0e25/corpus_clean/full-00001-of-00006.parquet",
+          "sha256": "a82e002f8423e4c150b2e07bc983bc25425baa90af4dd2b9877e54617ace5beb"
+        },
+        {
+          "url": "https://huggingface.co/datasets/princeton-nlp/LitSearch/resolve/9573fb284a1026c998df47024b888a163f0f0e25/corpus_clean/full-00002-of-00006.parquet",
+          "sha256": "30ee83c73f547e9dc841e74f9f88e3f132018599bd3c04c2e06ad69750a54cd0"
+        },
+        {
+          "url": "https://huggingface.co/datasets/princeton-nlp/LitSearch/resolve/9573fb284a1026c998df47024b888a163f0f0e25/corpus_clean/full-00003-of-00006.parquet",
+          "sha256": "bbc5b74d533e6d978a7621724864c24aa8a2e9c1ec7d1ace51f6c4ad7e62d9f6"
+        },
+        {
+          "url": "https://huggingface.co/datasets/princeton-nlp/LitSearch/resolve/9573fb284a1026c998df47024b888a163f0f0e25/corpus_clean/full-00004-of-00006.parquet",
+          "sha256": "c9c110a457efe2553f90ff1a4419c1f4a6a50a8b49bce47bf89ff01b7871d6ad"
+        },
+        {
+          "url": "https://huggingface.co/datasets/princeton-nlp/LitSearch/resolve/9573fb284a1026c998df47024b888a163f0f0e25/corpus_clean/full-00005-of-00006.parquet",
+          "sha256": "38d333622bd085d623c306c31a871b9d19c80230b28eeb9f0aaa555acc6e674a"
+        }
+      ],
+      "conversion": "evals/litsearch_to_jsonl.py with pyarrow 25.0.1 (uv run --no-project --with pyarrow==25.0.1 python -I), a preparation step outside any run; it checks the parquet files' SHA-256 above before converting; its outputs are the files below",
+      "license": "none stated for the data (the authors' MIT license covers their code)",
+      "ids_committable": false,
+      "split": "all 597 queries (LitSearch has no splits)",
+      "files": {
+        "corpus": {
+          "path": "converted/corpus.jsonl",
+          "size": 61936346,
+          "sha256": "338d397873e94665169e9d5b6aad0ee2760c5903a234afe563f0228663d0ffcb"
+        },
+        "queries": {
+          "path": "converted/queries.jsonl",
+          "size": 144649,
+          "sha256": "cf96e2662f3ee16bd6ff6720c37fd29176aac9dd36ca0f955a1a084316ec6eea"
+        }
+      },
+      "unit": "document",
+      "metrics": [
+        {
+          "name": "recall@5 (specific)",
+          "kind": "recall",
+          "k": 5,
+          "queries": "specific"
+        },
+        {
+          "name": "recall@20 (broad)",
+          "kind": "recall",
+          "k": 20,
+          "queries": "broad"
+        },
+        {
+          "name": "recall@20 (specific)",
+          "kind": "recall",
+          "k": 20,
+          "queries": "specific"
+        },
+        {
+          "name": "recall@5",
+          "kind": "recall",
+          "k": 5
+        },
+        {
+          "name": "recall@20",
+          "kind": "recall",
+          "k": 20
+        }
+      ],
+      "primary": "recall@5 (specific)",
+      "resample": "query",
+      "rules": {
+        "documents": "each corpus_clean document becomes one Markdown material, its file named by the title and its text the abstract (titles and abstracts only, as LitSearch's main results use), ranked by its best passage as for the BEIR sets; specific questions are those with specificity 1, broad those with 0",
+        "metric": "LitSearch's paper (Ajith et al., 2024, section 3.1 and table 3) reports recall@20 for broad questions and recall@5 and recall@20 for specific ones, and headlines recall@5 on specific questions; recall@k is the share of a question's gold papers in the top k"
+      }
+    }
+  },
+  "levels": {
+    "subset": {
+      "benchmarks": {
+        "qasper": {
+          "papers": [
+            "1601.03313",
+            "1603.00957",
+            "1603.01547",
+            "1604.02038",
+            "1605.04278",
+            "1606.02892",
+            "1607.00167",
+            "1610.00479",
+            "1610.03955",
+            "1610.09722",
+            "1611.00440",
+            "1704.04451",
+            "1708.07252",
+            "1709.05295",
+            "1709.05700",
+            "1710.06923",
+            "1710.07695",
+            "1710.11027",
+            "1712.00733",
+            "1803.02155",
+            "1803.04579",
+            "1805.04579",
+            "1811.04791",
+            "1904.02306",
+            "1904.02954",
+            "1904.03670",
+            "1906.01076",
+            "1906.01502",
+            "1906.08584",
+            "1907.00168",
+            "1908.07491",
+            "1908.09892",
+            "1909.00871",
+            "1909.04242",
+            "1909.07158",
+            "1909.12079",
+            "1910.09942",
+            "1910.12203",
+            "1911.01248",
+            "1911.03642",
+            "1911.04474",
+            "1911.06815",
+            "1911.06919",
+            "1911.11025",
+            "1911.12722",
+            "1911.12848",
+            "2001.05540",
+            "2004.01970",
+            "2004.02143",
+            "2004.02401"
+          ]
+        },
+        "scifact": "all test queries",
+        "nfcorpus": "all test queries"
+      },
+      "drawn": "QASPER: 50 test papers drawn with random.Random(20261015).sample(sorted test paper ids, 50), all their questions; SciFact and NFCorpus: all test queries over their full corpora; SCIDOCS and LitSearch run only in full tier 1, as their corpora dominate its build time"
+    },
+    "full": {
+      "benchmarks": {
+        "qasper": "all test papers",
+        "scifact": "all test queries",
+        "nfcorpus": "all test queries",
+        "scidocs": "all test queries",
+        "litsearch": "all queries"
+      }
+    }
+  },
+  "arms": {
+    "hybrid": "backend.search.search as the app runs it: BM25 50 and dense 50 concurrently, RRF k 60, within [retrieval] hybrid_ms; a query that falls back to keyword-only is counted by its reason",
+    "keyword_only": "the same function with dense search unavailable (the runner's stand-in for the helper's status, reason reference_arm): the reference point of tickets 17 and 70"
+  },
+  "search_limit": 50,
+  "bootstrap": {
+    "method": "paired percentile bootstrap",
+    "resamples": 10000,
+    "seed": 20261015,
+    "level": 0.95,
+    "resample": "QASPER by paper (questions share papers), the others by query"
+  },
+  "model_settings": {
+    "embedding_model": {
+      "id": "qwen3-embedding-0.6b",
+      "file": "Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "size": 639150592,
+      "sha256": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"
+    },
+    "llama_cpp": {
+      "file": "llama-b11146-bin-macos-arm64.tar.gz",
+      "size": 11189714,
+      "sha256": "1ad3f9eff80edb9dbef4259ad564d1720612ef7eea48fa4afed0e54f5f3d5711"
+    },
+    "helper_runtime_sha256": "1795a95f6ed27e433d21b072230580063713c04216bba485c78e9a0a934a7969",
+    "helper_flags": [
+      "--embedding",
+      "--pooling",
+      "last",
+      "-c",
+      "4096",
+      "-ub",
+      "2048",
+      "-np",
+      "2",
+      "--cache-ram",
+      "0"
+    ],
+    "query_instruction": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:",
+    "retrieval": {
+      "passage_chars": 2000,
+      "bm25_candidates": 50,
+      "dense_candidates": 50,
+      "rrf_k": 60,
+      "keep": 8,
+      "embedding_batch": 32,
+      "hybrid_ms": 500
+    },
+    "reranker": null
+  },
+  "reference_machine": "Apple M5, 24 GB, macOS 27.0.1 (ticket 70)",
+  "rule_e": {
+    "source": "ticket 72 (planning/issues/72-pre-m2-research-evaluation.md), lines 44 to 55, at docs commit 0d911523fbb6af53e06113d3f5034346e33123e1, word for word; recorded by S1-18 with tier 1's baseline, before any reranker result exists",
+    "text": [
+      "**E. The reranker comparison on tier 1 (decided).** Ticket 70 requires a reranker to \"improve quality measurably\" and to be validated in English, Chinese and across languages. Ticket 17's adoption rule asks for a paired 95% confidence interval above zero, but not on which of tier 1's five benchmarks (SciFact, NFCorpus, SCIDOCS, LitSearch and QASPER), which ticket 70 reports separately. The proposed \"above zero on at least one, below zero on none\" was replaced: it gave five chances at a false gain, and let through a large loss whose interval only crossed zero. S1-18 records this rule before any reranker result exists:",
+      "1. **The primary measure** is QASPER evidence, scored as recall@8 over Scholia's passages, matching \"keep 8\" and the preview gate. S1-18 records how QASPER's evidence paragraphs map to passages, how several annotators' evidence is scored, and how many questions are excluded (evidence only in a figure or table). nDCG@10 and MRR are reported too.",
+      "2. **A reranker improves quality only when all of these hold:**",
+      "   - on QASPER, the paired 95% interval of the gain lies above zero, resampling papers since questions share papers, and the gain is at least 2 points;",
+      "   - on each other tier 1 benchmark, in its own metric, the interval's lower end is above −3 points;",
+      "   - citation support does not fall;",
+      "   - the budgets hold.",
+      "",
+      "   Anything else, an inconclusive result included, is not an improvement.",
+      "3. **Chinese-document evidence** comes from synthetic development cases only. They are recorded as not establishing the Chinese result, so no reranker qualifies until field 1 or an approved corpus provides it. No public benchmark covers Chinese scholarly retrieval ([ticket 13](13-embedding-models.md#answer)).",
+      "",
+      "Citation support needs the paid judge and the Chinese result waits for field 1, so no reranker can qualify in M2. The M2 comparison records the tier 1 result, and the offer is decided at the preview."
+    ],
+    "own_metric": {
+      "qasper": "recall@8 (the primary measure)",
+      "scifact": "ndcg@10",
+      "nfcorpus": "ndcg@10",
+      "scidocs": "ndcg@10",
+      "litsearch": "recall@5 (specific)"
+    },
+    "points": "a point is 0.01 of the metric (scores run from 0 to 1)",
+    "interval": "the paired percentile bootstrap above (10,000 resamples, seed 20261015, 95%), of the reranked arm minus the same retrieval without reranking (the hybrid arm), QASPER resampling papers",
+    "chinese": "Synthetic Chinese development cases do not establish the Chinese result, so no reranker can qualify in M2; the M2 comparison records the tier 1 result."
+  }
+}
