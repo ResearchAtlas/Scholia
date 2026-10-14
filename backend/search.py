@@ -129,7 +129,8 @@ async def open_index(state, db):
     state["model_installed"] = lambda: asyncio.ensure_future(_embed_all(state))
     loop = asyncio.get_running_loop()
 
-    def rebuilt():  # a file rebuilt while the app runs (in the writer): its projects are embedded again
+    def rebuilt():  # rows made outside an index run (in the writer): a file rebuilt while the app runs, or the
+        # queue applied after a failed pass; the projects whose passages lack embeddings get their runs
         if _installed(state):
             try:
                 loop.call_soon_threadsafe(state["model_installed"])
@@ -250,7 +251,7 @@ def _downloading(state):
 
 
 async def _embed_all(state):
-    """The model was just installed, or the file was rebuilt while the app runs: a run is requested for
+    """The model was just installed, or rows were made outside an index run (index.rebuilt): a run is requested for
     every project whose index has passages without embeddings."""
     index, harness = state.get("index"), state.get("harness")
     if index is None or harness is None:
@@ -265,7 +266,8 @@ async def _embed_all(state):
 async def after_deletion(state, project_id):
     """After a material's deletion (its removals applied, deletion.CLEANUP), a run is requested for its
     project when the project's index has passages without embeddings (a file another of its papers
-    reads, queued again with that paper's title)."""
+    reads, queued again with that paper's title). A cleanup that failed is applied by the index's retry, which
+    asks for those runs then (SearchIndex._retried)."""
     index, harness = state.get("index"), state.get("harness")
     if index is None or harness is None:
         return

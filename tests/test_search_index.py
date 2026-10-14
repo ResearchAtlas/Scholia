@@ -1146,3 +1146,32 @@ async def test_a_retry_the_opening_checkpoint_arms_cannot_take_a_launchs_queued_
         assert fired and fired[0] is not None and len(failing[0].calls) >= 2  # armed by the failure; its pass truncated
         await until_embedded(client, project)
         assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_a_deletions_cleanup_that_fails_once_asks_for_the_runs_once_its_retry_applies_it(tmp_path, monkeypatch):
+    """Connector thread 4237098115: one of two papers reading one file is deleted and its cleanup's pass fails,
+    so the check after the deletion finds every row embedded and asks for no run. The retry's pass retitles the
+    shared passages (their embeddings dropped) and asks for the project's run, which embeds them again."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))  # the retry runs when the test says
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        doomed, kept = await _sharing(client, project)
+        await until_embedded(client, project)
+        index, real, failed = client.state["index"], SearchIndex._apply_queue, []
+
+        def failing_once(self, stop=None):
+            if not failed:
+                failed.append(True)
+                raise search_index.apsw.IOError("disk I/O error")
+            return real(self, stop)
+        monkeypatch.setattr(SearchIndex, "_apply_queue", failing_once)
+        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        assert failed and index._retry is not None
+        before = await runs_of(client, "index", project)
+        index._retry.cancel()
+        index._retry.function()
+        await asyncio.to_thread(lambda: index._writer.submit(lambda: None).result())  # its pass done
+        status = await until_embedded(client, project)
+        assert list(status["materials"]) == [kept["id"]]
+        assert len(await runs_of(client, "index", project)) == len(before) + 1

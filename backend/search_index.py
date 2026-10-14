@@ -272,9 +272,14 @@ class SearchIndex:
         self._conn = None
         self._truncate = False  # a WAL truncation not done yet: tried again at each pass, and soon (_retry_later)
         self._retry, self._retries = None, 0  # the timer of the next try after a failure, and how many failed
+        # A pass failed: what it was to apply (a deletion's cleanup, say) comes in by a later pass, whose caller may
+        # ask no index run for it, so the retried pass that follows asks for the runs (self.rebuilt) (_retried).
+        self._owed = False
         self.unusable = False  # a whole rebuild failed: its partial file is neither read nor written (Unavailable)
         self._rebuild_retry, self._rebuild_failures = None, 0  # the same, for a whole rebuild
-        self.rebuilt = None  # called (in the writer) once a damaged file found while the app runs is rebuilt
+        # Called (in the writer) once rows were made outside an index run: a damaged file found while the app runs
+        # rebuilt, or the queue applied after a failed pass (_retried).
+        self.rebuilt = None
         self._readers = queue.SimpleQueue()  # idle read connections
         self._generation = 0  # a replaced file's readers are closed, not used again
         self._lock = threading.Lock()
@@ -559,13 +564,18 @@ class SearchIndex:
         true answer leaves the rest to the next pass (and withdraws a pass still waiting its turn)."""
         return self._write(self._apply, stop, withdraw=stop)
 
-    def apply_soon(self):
-        """apply, in the writer, without waiting for it; a failure is logged."""
+    def apply_soon(self, then=None):
+        """apply, in the writer, without waiting for it, then then() there if it succeeded; a failure is logged."""
         def done(future):
             if not future.cancelled() and future.exception() is not None:
                 log.warning("applying the index queue failed (%s)", type(future.exception()).__name__)
+
+        def apply():
+            self._apply()
+            if then is not None and not self.closed:
+                then()
         if not self.closed:
-            self._writer.submit(self._apply).add_done_callback(done)
+            self._writer.submit(apply).add_done_callback(done)
 
     def _apply(self, stop=None):
         """A pass over the queue. One that fails is tried again soon (_retry_later), so a removal it
@@ -576,6 +586,7 @@ class SearchIndex:
             self._damaged()
             raise
         except Exception:
+            self._owed = True
             self._retry_later()
             raise
         if not self._truncate:
@@ -595,10 +606,18 @@ class SearchIndex:
             self._retry.start()
 
     def _retried(self):
+        """The retry's pass; after a failed pass, once one succeeds, the runs of what lacks embeddings are asked
+        for (self.rebuilt), whichever pass applied what the failed one was to (this one, or an index run's)."""
         with self._lock:
             self._retry = None
+
+        def owed():
+            if self._owed:
+                self._owed = False
+                if self.rebuilt is not None:
+                    self.rebuilt()
         try:
-            self.apply_soon()
+            self.apply_soon(owed)
         except RuntimeError:  # the writer stopped meanwhile (closing)
             pass
 
