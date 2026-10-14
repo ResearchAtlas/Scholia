@@ -266,6 +266,15 @@ _PADDED_DOI = "10.5555/example" + " " * 1600 + "garbage"
     "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\n" + "\n" * (rf.CONTINUATION_LINES + 10) + "garbage\nER  - \n",
     "%0 Journal Article\n%T T\n%R 10.5555/example\n" + "  \n" * (rf.CONTINUATION_LINES + 10) + "garbage\n",
     json.dumps([{"title": "T", "DOI": "10.5555/example."}]),  # nothing taken off but spaces and a prefix
+    # a number whose kept text would name arXiv though the file's does not (LaTeX read, a control character)
+    "@misc{k, title={T}, number={arX{}iv:2101.00001\\garbage}}",
+    "@misc{k, title={T}, number={{arXiv}:2101.00001\\garbage}}",
+    "@misc{k, title={T}, number={\\textbf{arXiv}:2101.00001 \\garbage}}",
+    json.dumps([{"title": "T", "number": "arXiv\u0000:2101.00001"}]),
+    json.dumps([{"title": "T", "number": "arXiv\u001c:2101.00001"}]),
+    "TY  - JOUR\nTI  - T\nUR  - https://arxiv.org/abs/2101.00001\ngarbage\nER  - \n",  # RIS: a URL's next line
+    json.dumps([{"title": "T", "DOI": "10.\u0661\u0662\u0663\u0664/abc"}]),  # a DOI of other than ASCII
+    json.dumps([{"title": "T", "DOI": "10.1000/\u212a"}]),  # the Kelvin sign lower-cases to k
 ])
 def test_an_identifiers_value_is_checked_whole_as_the_file_gives_it(data):
     [record], skipped, _ = parse(data)

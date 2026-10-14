@@ -219,6 +219,7 @@ def _ris(text, beat):
     tag = re.compile(r"[A-Z][A-Z0-9]  -")
     for lines in _records(_lines(text, beat), lambda line: line.startswith("TY  -"), tag.match,
                           lambda line: line.startswith("ER  -")):
+        lines = _joined(lines, tag, "UR  -")
         try:  # one record at a time, closed here whether or not the file closed it
             entry = next(iter(parser.parse_lines(iter([*lines, "ER  - "]))), None)
         except Exception:  # a record it could not take apart: its type alone, never its text, is known here
@@ -245,6 +246,20 @@ def _ris(text, beat):
             "abstract": _first(entry.get("abstract")) or _first(entry.get("notes_abstract")),
             "keyword": _list(entry.get("keywords")),
         }
+
+
+def _joined(lines, tag, field):
+    """A record's lines with each continuation of a field (rispy makes a list tag's continuation an item of
+    its own: a URL followed by text would still read as that URL) joined to that field's line."""
+    out, joining = [], False
+    for line in lines:
+        if tag.match(line):
+            joining = line.startswith(field)
+        elif joining:
+            out[-1] = f"{out[-1]} {line.strip()}"
+            continue
+        out.append(line)
+    return out
 
 
 def _bibtex(text, beat):
@@ -376,8 +391,8 @@ def _bibtex(text, beat):
             eprint = _ARXIV_VERSION.sub(r"v\1", _ARXIV_PREFIX.sub("", (_escapes(value(fields, "eprint", literal=True)) or "").strip()))
             arxiv = eprint if eprint and (value(fields, "archiveprefix", "eprinttype") or "").lower() == "arxiv" else None
             valid = bool(arxiv) and _ARXIV_WHOLE.fullmatch(arxiv) is not None
-            number = _escapes(value(fields, "number", literal=True))  # an identifier's field: as written
-            number = number if number and _ARXIV_NAMED.search(number) else value(fields, "number")
+            written = _escapes(value(fields, "number", literal=True))  # an identifier's field: as written
+            number = written if written and _ARXIV_NAMED.search(written) else value(fields, "number")
             record = {
                 "type": _BIBTEX_TYPES.get(kind, "article"),
                 "title": value(fields, "title"),
@@ -397,6 +412,7 @@ def _bibtex(text, beat):
                                                                 literal=True) or "")[:KEYWORDS * 4]],  # as _finish keeps
                 # an arXiv eprint the whole of which is no arXiv ID is left out, and counted
                 "number": f"arXiv:{arxiv}" if valid else (number if kind != "article" else None),
+                "number_written": None if valid or kind == "article" else written,  # what _finish checks
                 "dropped": 1 if arxiv and not valid else 0,
             }
         except _Refused:  # a value it cannot read as written: the record is skipped, never read wrong
@@ -657,12 +673,13 @@ _NOT_IN_URL = re.compile("[\\s\\\\\x00-\x1f\x7f-\x9f\ud800-\udfff]")  # spaces, 
 def _doi(value):
     """(The DOI a value is, whole, or None; 1 when a value was given and is not one, else 0.) Only its
     surrounding spaces and a doi.org or doi: prefix are taken off, and only its case is changed: a DOI
-    the pattern takes followed by anything else, spaces included, is no DOI."""
+    the pattern takes followed by anything else, spaces included, is no DOI, nor one of other than ASCII
+    characters (a digit of another script, a letter that lower-cases to an ASCII one)."""
     if not isinstance(value, str) or visible(value) is None:
         return None, 0
     text = _DOI_PREFIX.sub("", value.strip())
     doi = clean_doi(text) if len(text) <= DOI_CHARS else None
-    return (doi, 0) if doi and doi == text.lower() else (None, 1)
+    return (doi, 0) if doi and text.isascii() and doi == text.lower() else (None, 1)
 
 
 def _finish(record):
@@ -688,14 +705,18 @@ def _finish(record):
             csl[key] = text
     # The values an identifier comes from (a number naming arXiv, a DOI, a URL) are checked whole, as the
     # file gives them, before anything is cut or cleaned; one that is not what its field takes is left out.
-    number = record.get("number")
-    if isinstance(number, str) and _ARXIV_NAMED.search(number):
-        found = _ARXIV_NUMBER.fullmatch(number.strip()) if len(number.strip()) <= 100 else None
+    # A number names arXiv when the file's text does or the text kept would (after LaTeX is read, control
+    # characters made spaces); then the file's own text, whole, must be "arXiv:" and an ID, or it is left out.
+    number, text = record.get("number"), _text(record.get("number"), FIELD_CHARS)
+    written = record.get("number_written") if isinstance(record.get("number_written"), str) else number
+    if isinstance(written, str) and _ARXIV_NAMED.search(written) or text and _ARXIV_NAMED.search(text):
+        whole = written.strip() if isinstance(written, str) else ""
+        found = _ARXIV_NUMBER.fullmatch(whole) if len(whole) <= 100 and not _CONTROL.search(whole) else None
         if found and ARXIV.fullmatch(found.group(1)):
-            csl["number"] = " ".join(number.split())
+            csl["number"] = " ".join(whole.split())
         else:
             dropped += 1  # it names an arXiv ID the pattern does not take: not kept as one
-    elif text := _text(number, FIELD_CHARS):
+    elif text:
         csl["number"] = text
     doi, wrong = _doi(record.get("DOI"))
     dropped += wrong
