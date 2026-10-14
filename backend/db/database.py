@@ -329,11 +329,14 @@ class Database:
                 if drained is not None:
                     drained.result()
             attempt(drain)
-            for close in list(self.closing):  # each closes once, its work drained while this database still reads
-                try:
-                    close()
-                except Exception as failure:
-                    log.warning("closing what reads the database failed (%s)", type(failure).__name__)
+
+            def hooks():
+                for close in list(self.closing):  # each closes once, its work drained while this database still reads
+                    try:
+                        close()
+                    except Exception as failure:
+                        log.warning("closing what reads the database failed (%s)", type(failure).__name__)
+            attempt(hooks)
 
             def readers():
                 with self._readers_lock:
@@ -344,12 +347,15 @@ class Database:
                 for conn in readers:
                     attempt(conn.close)
             attempt(readers)
-            with self._readers_lock:
-                self._closed = True
-            if self._backup_lock.acquire(timeout=STOP_SECONDS):
-                self._backup_lock.release()
-            else:
-                log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
+
+            def stopped():
+                with self._readers_lock:
+                    self._closed = True
+                if self._backup_lock.acquire(timeout=STOP_SECONDS):
+                    self._backup_lock.release()
+                else:
+                    log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
+            attempt(stopped)
             attempt(lambda: self._writer.submit(self._close_writer).result())
         finally:
             try:

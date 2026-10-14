@@ -828,11 +828,15 @@ def test_a_close_that_fails_stops_the_writer_and_every_close_says_it_failed(tmp_
     were closed."""
     db = Database(tmp_path / "data")
     real_submit = db._writer.submit
-    hooked = []
+    hooked, writer_closes, real_close_writer = [], [], db._close_writer
     db.closing.append(lambda: hooked.append(True))
     if failing == "drain":
+        def close_writer():
+            writer_closes.append(True)
+            real_close_writer()
+        monkeypatch.setattr(db, "_close_writer", close_writer)
         def submit(fn, *args):
-            if getattr(fn, "__func__", None) is not Database._close_writer:  # the drain's empty job
+            if fn is not close_writer:  # the drain's empty job
                 raise RuntimeError("cannot schedule new futures after interpreter shutdown")
             return real_submit(fn, *args)
         monkeypatch.setattr(db._writer, "submit", submit)
@@ -856,8 +860,24 @@ def test_a_close_that_fails_stops_the_writer_and_every_close_says_it_failed(tmp_
     again()  # on the thread whose close failed
     assert outcome == ["raised", "raised"] and hooked == [True] and db.closed and db._writer._shutdown
     if failing == "drain":  # the writer connection was closed all the same
-        with pytest.raises(sqlite3.ProgrammingError):
-            db._conn.execute("SELECT 1")
+        assert writer_closes == [True]
+
+
+def test_a_hook_that_raises_beyond_exception_still_closes_the_writer_and_fails_every_close(tmp_path):
+    """Recheck of 3fb92ba, N3: a closing hook that raises a BaseException (not an Exception, so not only logged) is
+    the close's failure: the writer connection is still closed and the thread stopped, and a later close raises."""
+    class Stop(BaseException):
+        pass
+
+    def hook():
+        raise Stop()
+    db = Database(tmp_path / "data")
+    db.closing.append(hook)
+    with pytest.raises(Stop):
+        db.close()
+    with pytest.raises(RuntimeError):
+        db.close()
+    assert db.closed and db._writer._shutdown and db._writer_ident is None
 
 # Backups while the app is open
 

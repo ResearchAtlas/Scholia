@@ -356,17 +356,21 @@ class SearchIndex:
                 self._reads_done.notify_all()
 
     def _close_readers(self):
+        """Close the idle read connections, every one of them though one fails; the first failure is raised after."""
         with self._lock:
             self._generation += 1
+        failed = None
         while True:
             try:
                 conn = self._readers.get_nowait()
             except queue.Empty:
-                return
+                break
             try:
                 conn.close()
-            except Exception as error:  # the others are closed all the same
-                log.warning("an index read connection could not be closed (%s)", type(error).__name__)
+            except Exception as error:
+                failed = failed or error
+        if failed is not None:
+            raise failed
 
     # Opening and staleness
 

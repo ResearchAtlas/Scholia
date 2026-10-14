@@ -1431,3 +1431,48 @@ async def test_an_index_close_that_fails_after_its_drain_is_reported_to_every_la
             with pytest.raises(RuntimeError):
                 await asyncio.to_thread(index.close)
         assert index._done.is_set() and index._writer_ident is None and index._readers.empty()
+
+
+@pytest.mark.asyncio
+async def test_a_read_connection_that_fails_to_close_closes_the_rest_and_fails_the_close(tmp_path, monkeypatch):
+    """Recheck of 3fb92ba, N1: an idle read connection whose close fails as the index closes: the other idle ones are
+    closed all the same, and the failure is the close's, never only a log line: the file is discarded, as for any
+    close that cannot close what reads it."""
+    import threading
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        first, second, go = threading.Event(), threading.Event(), threading.Event()
+
+        def holding(event):
+            def fn(conn):
+                event.set()
+                go.wait(10)
+            return fn
+        readers = [threading.Thread(target=index._read, args=(holding(e),)) for e in (first, second)]
+        for reader in readers:
+            reader.start()
+        assert await asyncio.to_thread(first.wait, 10) and await asyncio.to_thread(second.wait, 10)
+        go.set()
+        for reader in readers:
+            await asyncio.to_thread(reader.join, 10)
+        pooled = []
+        while not index._readers.empty():
+            pooled.append(index._readers.get_nowait())
+        assert len(pooled) == 2
+
+        class Failing:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def close(self):
+                self.conn.close()
+                raise search_index.apsw.IOError("disk I/O error")
+        index._readers.put(Failing(pooled[0]))
+        index._readers.put(pooled[1])
+        await asyncio.to_thread(index.close)  # end discards the file: it could not close what reads it
+        assert not index.path.exists() and index._readers.empty()
+        with pytest.raises(search_index.apsw.ConnectionClosedError):
+            pooled[1].execute("SELECT 1")
