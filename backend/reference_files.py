@@ -51,6 +51,7 @@ CONTINUATION_CHARS = 2 * ABSTRACT_CHARS  # and their characters
 RECORD_LINES = 1000  # a record's lines, a field (one an author) and its continuations; later fields are left out
 MACRO_DEPTH = 10  # a BibTeX macro's macros, and theirs, this deep at most (files use one or two)
 MACRO_CHARS = 4 * max(ABSTRACT_CHARS, AUTHORS * NAME_CHARS)  # a macro's text is cut here, past what any field keeps
+EXPANDED_CHARS = MAX_BYTES  # what a file's macros expand to, all of it together: no more than the file may hold
 BEAT_EVERY = 500  # records or lines between two beats
 PARSER = ("references", "1")  # what the child names when it is ready (backend/reading.py)
 FORMATS = ("ris", "bibtex", "csl_json", "noteexpress", "endnote")
@@ -262,36 +263,58 @@ def _bibtex(text, beat):
     yield from [None] * unread
 
     def spend(chars):
-        """What expanding macros makes, all of it together, holds MAX_CHARS at most: a doubling chain
-        of macros, cut at each step, could otherwise make far more than the file."""
+        """What expanding macros makes, all of it together, holds EXPANDED_CHARS at most: a doubling
+        chain of macros, cut at each step, could otherwise make far more than the file."""
         spent[0] += chars
-        if spent[0] > MAX_CHARS:
+        if spent[0] > EXPANDED_CHARS:
             raise Unreadable("reference_file_too_large")
 
-    def macro(name, depth):
-        """A macro's text, expanded once (cut at MACRO_CHARS) however many values use it; _Refused when
-        it is not defined (the month names are), refers to itself, or nests past MACRO_DEPTH."""
-        if name not in macros:
-            if name not in definitions:
-                if name in _MONTHS:
-                    return _MONTHS[name]
-                macros[name] = None
-            elif depth >= MACRO_DEPTH:
-                raise _Refused
+    def macro(name):
+        """A macro's text, expanded once (cut at MACRO_CHARS) however many values use it. _Refused when
+        it is not defined (the month names are), refers to itself, or its macros nest more than
+        MACRO_DEPTH deep (its own depth, whatever uses it). Worked out with a stack of its own, never
+        Python's: a macro's macros first, then the macro."""
+        stack, opened, parsed = [name], set(), {}
+        while stack:
+            at = stack[-1]
+            if at in macros:
+                stack.pop()
+                continue
+            if at not in definitions:
+                macros[at] = (_MONTHS[at], 0) if at in _MONTHS else None
+                continue
+            if at not in parsed:
+                try:
+                    parsed[at] = _parts(definitions[at])
+                except _Refused:
+                    macros[at] = None
+                    continue
+                opened.add(at)
+            uses = {part.lower() for literal, part in parsed[at] if not literal}
+            if waiting := [use for use in uses if use not in macros]:
+                if opened.intersection(waiting):  # it refers to itself, through others or not
+                    macros[at] = None
+                else:
+                    stack.extend(waiting)
+                    continue
+            elif any(macros[use] is None for use in uses) \
+                    or (depth := 1 + max((macros[use][1] for use in uses), default=0)) > MACRO_DEPTH:
+                macros[at] = None
             else:
-                macros[name] = None  # refused unless it expands: one that refers to itself meets this
-                text = expand(_parts(definitions[name]), MACRO_CHARS, depth + 1)
+                text = expand(parsed[at], MACRO_CHARS)
                 spend(len(text))
-                macros[name] = text
+                macros[at] = (text, depth)
+            opened.discard(at)
+            del parsed[at]
         if macros[name] is None:
             raise _Refused
-        return macros[name]
+        return macros[name][0]
 
-    def expand(parts, cap, depth=0):
+    def expand(parts, cap):
         """A value's parts joined (#), each macro by its text, cut at cap characters."""
         out, length = [], 0
         for literal, part in parts:
-            part = (part if literal else macro(part.lower(), depth))[:cap - length]
+            part = (part if literal else macro(part.lower()))[:cap - length]
             out.append(part)
             length += len(part)
             if length >= cap:
