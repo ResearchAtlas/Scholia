@@ -661,17 +661,20 @@ class SearchIndex:
         may replace text a deletion took from the main database (a reading another paper keeps, retitled
         with that paper's title: deletion._queue_index_removals), so its old rows go too. The sequence
         applied is left as it is, so the next launch's pass applies the queue in order (the additions
-        again, from the main database as it is then)."""
+        again, from the main database as it is then). A truncation still owed (one that failed before, or
+        this one) raises CleanupFailed: old WAL frames may hold what was removed, so the close discards the file."""
         last = int(self._conn.execute("SELECT value FROM index_meta WHERE key = 'last_seq'").fetchone()[0])
         rows = self.db.read(lambda conn: conn.execute(
             "SELECT target_id, project_id FROM index_queue WHERE seq > ? AND target = 'passage'"
             " ORDER BY seq", (last,)).fetchall())
-        if not rows:
-            return
-        with self._conn:
-            removed = [rowid for pid, project in rows for rowid in self._remove(project, pid)]
-        if removed:
+        removed = []
+        if rows:
+            with self._conn:
+                removed = [rowid for pid, project in rows for rowid in self._remove(project, pid)]
+        if removed or self._truncate:
             self._checkpoint()
+        if self._truncate:
+            raise CleanupFailed()
 
     def _prune(self, seq):
         """The applied rows leave the queue (migration 0001's note); the next pass deletes them if this fails
@@ -888,7 +891,8 @@ class SearchIndex:
         deletion during the last pass, or one that pass did not reach as the index closed: its removals,
         and its additions that retitle a reading another paper keeps) are removed first (_remove_queued).
         A file a whole rebuild has not finished (asked for, under way, or failed), or one whose rows
-        cannot be removed so, is discarded: nothing deleted stays in it, and the next launch rebuilds it."""
+        cannot be removed so or whose WAL cannot be truncated, is discarded: nothing deleted stays in it,
+        and the next launch rebuilds it."""
         with self._lock:
             if self._shut:  # closed already (the database's close closes it too)
                 return
@@ -904,8 +908,8 @@ class SearchIndex:
                     self._close_readers()
                     self._remove_queued()
                 except Exception as error:
-                    log.warning("the index's readers could not be closed or its last removals applied (%s); its file"
-                                " is discarded", type(error).__name__)
+                    log.warning("the index's readers could not be closed, its last removals applied or its WAL"
+                                " truncated (%s); its file is discarded", type(error).__name__)
                     discard = True
             if discard:
                 self._discard()  # each step guarded: the file goes whatever closing it meets

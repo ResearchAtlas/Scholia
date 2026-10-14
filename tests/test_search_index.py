@@ -1204,3 +1204,27 @@ async def test_queue_rows_a_failed_prune_left_leave_at_the_next_pass(tmp_path, m
         failing["on"] = False
         assert await asyncio.to_thread(index.apply) == 0  # nothing of its own to apply
         assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_a_close_whose_wal_truncation_stays_owed_discards_the_file(tmp_path, monkeypatch):
+    """The internal review of fix batch 5, P3: a deletion's removals applied but the WAL's truncation failing,
+    at the pass and again as the index closes: old WAL frames may hold the paper's text, so the close
+    discards the file (the next launch rebuilds it) rather than leave them to SQLite's own close."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    english = "Wombats catalogue saffron theodolites"
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [doomed] = (await added(client, project, paper("Wombat Ledger", english)))["materials"]
+        await added(client, project, WAGES)
+        await until_embedded(client, project)
+        index = client.state["index"]
+        files = [index.path, Path(f"{index.path}-wal")]
+        index._conn = failing = FailingCheckpoints(index._conn, "IOError", failures=100)
+        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        assert index._truncate and failing.calls  # applied, its truncation owed
+    assert len(failing.calls) >= 2 and not any(f.exists() for f in files)  # tried again at the close, then discarded
+    async with app(tmp_path) as client:
+        status = await until_embedded(client, project)
+        assert status["passages"]["indexed"] == 4  # the kept paper's
+        assert await asyncio.to_thread(client.state["index"].keyword, project, "wombats", 50) == []
