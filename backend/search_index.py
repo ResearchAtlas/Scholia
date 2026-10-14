@@ -635,12 +635,15 @@ class SearchIndex:
         return applied
 
     def _remove_queued(self):
-        """As the index closes: the queue's removals after the last sequence applied, each passage's rows
-        removed and checked gone, then the WAL checkpointed and truncated. The sequence applied is left as it
-        is, so the next launch's pass applies the queue in order (these again: nothing to remove)."""
+        """As the index closes: every passage the queue names after the last sequence applied, removed or
+        added, has its rows removed and checked gone, then the WAL checkpointed and truncated. An addition
+        may replace text a deletion took from the main database (a reading another paper keeps, retitled
+        with that paper's title: deletion._queue_index_removals), so its old rows go too. The sequence
+        applied is left as it is, so the next launch's pass applies the queue in order (the additions
+        again, from the main database as it is then)."""
         last = int(self._conn.execute("SELECT value FROM index_meta WHERE key = 'last_seq'").fetchone()[0])
         rows = self.db.read(lambda conn: conn.execute(
-            "SELECT target_id, project_id FROM index_queue WHERE seq > ? AND op = 'remove' AND target = 'passage'"
+            "SELECT target_id, project_id FROM index_queue WHERE seq > ? AND target = 'passage'"
             " ORDER BY seq", (last,)).fetchall())
         if not rows:
             return
@@ -859,10 +862,11 @@ class SearchIndex:
 
     def close(self):
         """Stop the writer once the job it runs ends (a whole rebuild stops between projects), and close
-        every connection. The queue's removals not applied yet (a deletion during the last pass, or one
-        that pass did not reach as the index closed) are applied first (_remove_queued). A file a whole
-        rebuild has not finished (asked for, under way, or failed), or one whose removals cannot be
-        applied, is discarded: nothing deleted stays in it, and the next launch rebuilds it."""
+        every connection. The rows of the passages the queue names that no pass has applied yet (a
+        deletion during the last pass, or one that pass did not reach as the index closed: its removals,
+        and its additions that retitle a reading another paper keeps) are removed first (_remove_queued).
+        A file a whole rebuild has not finished (asked for, under way, or failed), or one whose rows
+        cannot be removed so, is discarded: nothing deleted stays in it, and the next launch rebuilds it."""
         with self._lock:
             if self._shut:  # closed already (the database's close closes it too)
                 return

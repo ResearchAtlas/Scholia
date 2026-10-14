@@ -4,6 +4,7 @@ tokenizer, a restored database, a damaged or unfinished file), secure delete che
 own bytes, and sqlite-vec failing to load. Synthetic text only."""
 
 import asyncio
+import json
 import os
 import re
 import stat
@@ -988,3 +989,120 @@ async def test_a_close_discarding_an_unfinished_rebuilds_file_goes_on_whatever_c
         monkeypatch.setattr(SearchIndex, "_close_readers", real)
         await asyncio.to_thread(db.close)
     assert failed and not index.path.exists() and not Path(f"{index.path}-wal").exists()
+
+
+# Fix batch 5
+
+
+QUIXOTIC = ("Quixotic Ledger.md", b"# Plain Heading\n\n## Part\n\nPlain text with nothing special.\n")
+
+
+async def _last_project(client):
+    """A project whose id sorts after every other's: the last a whole rebuild fills."""
+    while True:
+        project = await project_of(client)
+        if await rows(client, "SELECT max(id) FROM projects") == [(project,)]:
+            return project
+
+
+async def _sharing(client, project):
+    """Two papers reading one file: the first added, whose title the shared passages carry in the index, and
+    the other, kept."""
+    [first] = (await added(client, project, QUIXOTIC))["materials"]
+    [second] = (await added(client, project, paper("Zephyr Accounts", "Other text.")))["materials"]
+    await idle(client, project)
+    await added(client, project, ("zephyr.md", QUIXOTIC[1]), material_id=second["id"])  # the same bytes
+    await idle(client, project)
+    return first, second
+
+
+def _deleted_title_in(files):
+    left = b"".join(f.read_bytes() for f in files if f.exists())
+    return b"Quixotic" in left or b"quixotic" in left
+
+
+@pytest.mark.asyncio
+async def test_a_shared_readings_deletion_during_a_rebuilds_last_project_leaves_no_deleted_title_at_close(tmp_path):
+    """Recheck 5, finding 31: one of two papers reading one file is deleted while a whole rebuild fills the
+    last project (its rows read with the deleted paper's title), and the app closes before that project is
+    done. The rebuild ends ready, the queue's additions that retitle the passages unapplied; the close
+    removes their rows, so neither the file nor its WAL keeps the deleted title, and the next launch adds
+    them back with the kept paper's."""
+    import threading
+    from backend.db import ContentStore, Database, delete
+    import backend.search as search
+    async with app(tmp_path, install=False) as client:
+        project = await _last_project(client)
+        doomed, kept = await _sharing(client, project)
+    data = tmp_path / "data"
+    path = data / search_index.FILE
+    files = [path, Path(f"{path}-wal")]
+    await _unfinished(path)
+    reached, go, real_add = threading.Event(), threading.Event(), SearchIndex._add
+
+    def held(self, project_id, pid, reading):  # the last project's first row: its readings read already
+        if self.building and project_id == project and not go.is_set():
+            reached.set()
+            go.wait(20)
+        return real_add(self, project_id, pid, reading)
+    db = await asyncio.to_thread(Database, data)
+    state = {"data_dir": data}
+    try:
+        SearchIndex._add = held
+        await search.open_index(state, db)
+        index = state["index"]
+        assert await asyncio.to_thread(reached.wait, 10)
+        deleting = asyncio.ensure_future(asyncio.to_thread(delete, db, ContentStore(db), "material", doomed["id"]))
+        deadline = asyncio.get_running_loop().time() + 10
+        while not await asyncio.to_thread(db.read, lambda conn: conn.execute(
+                "SELECT count(*) FROM index_queue WHERE op = 'add'").fetchone()[0]):  # until the deletion commits
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.02)
+        closing = asyncio.ensure_future(asyncio.to_thread(db.close))
+        await _until(lambda: index.closed)
+        go.set()
+        await asyncio.wait_for(asyncio.gather(deleting, closing), 20)
+    finally:
+        SearchIndex._add = real_add
+        go.set()
+        await asyncio.to_thread(db.close)
+    assert path.exists()  # the rebuild ended ready: kept, not discarded
+    assert not _deleted_title_in(files)
+    async with app(tmp_path, install=False) as client:
+        status = await idle(client, project)
+        assert list(status["materials"]) == [kept["id"]] and status["passages"]["indexed"]
+        texts = await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+            "SELECT text FROM fts_passages").fetchall())
+        assert texts and all(text.startswith("Zephyr Accounts") for (text,) in texts)
+
+
+@pytest.mark.asyncio
+async def test_a_shared_readings_deletion_no_pass_applied_leaves_no_deleted_title_or_vector_at_close(tmp_path,
+                                                                                                    monkeypatch):
+    """Recheck 5, finding 31, by the cleanup path: the deletion's cleanup does not reach the index, so the
+    additions that retitle the shared passages stay queued; the close removes those passages' rows, their
+    vectors made from the deleted title's text with them, and the next launch embeds them again."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        doomed, kept = await _sharing(client, project)
+        await until_embedded(client, project)
+        index = client.state["index"]
+        files = [index.path, Path(f"{index.path}-wal")]
+        shared = await asyncio.to_thread(index._read, lambda conn: [rowid for (rowid,) in conn.execute(
+            "SELECT id FROM index_rows WHERE project_id = ? AND material_id = ? AND embedded = 1", (project, doomed["id"]))])
+        assert shared
+        from backend.db import deletion
+        monkeypatch.setitem(deletion.CLEANUP, client.state["db"], lambda: None)  # its cleanup does not reach the index
+        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        assert _deleted_title_in(files)  # still there
+    assert files[0].exists() and not _deleted_title_in(files)
+    conn, loaded = search_index.connect(files[0])
+    try:
+        assert loaded and conn.execute("SELECT count(*) FROM vec_passages WHERE rowid IN (SELECT value FROM json_each(?))",
+                                       (json.dumps(shared),)).fetchone()[0] == 0
+    finally:
+        conn.close()
+    async with app(tmp_path) as client:
+        status = await until_embedded(client, project)
+        assert list(status["materials"]) == [kept["id"]]
+
