@@ -275,11 +275,22 @@ _PADDED_DOI = "10.5555/example" + " " * 1600 + "garbage"
     "TY  - JOUR\nTI  - T\nUR  - https://arxiv.org/abs/2101.00001\ngarbage\nER  - \n",  # RIS: a URL's next line
     json.dumps([{"title": "T", "DOI": "10.\u0661\u0662\u0663\u0664/abc"}]),  # a DOI of other than ASCII
     json.dumps([{"title": "T", "DOI": "10.1000/\u212a"}]),  # the Kelvin sign lower-cases to k
+    "TY  - JOUR\nTI  - T\nUR  - https://arxiv.org/abs/2101.00001\nUR  -Xgarbage\nER  - \n",
+    json.dumps([{"title": "T", "number": "arXiv:2101.00001\u001f"}]),  # a control character around it
+    json.dumps([{"title": "T", "DOI": "10.5555/example\u001f"}]),
+    json.dumps([{"title": "T", "URL": "https://arxiv.org/abs/2101.00001\u001f"}]),
 ])
 def test_an_identifiers_value_is_checked_whole_as_the_file_gives_it(data):
     [record], skipped, _ = parse(data)
     assert rf.identifier(record) is None and skipped == {"invalid_field": 1}
     assert not {"DOI", "URL", "number"} & set(record)
+
+
+def test_a_ris_ur_line_is_one_value_and_a_tag_needs_its_space():
+    [record], skipped, _ = parse("TY  - JOUR\nTI  - T\nUR  - https://arxiv.org/abs/2101.00001;garbage\nER  - \n")
+    assert record["URL"] == "https://arxiv.org/abs/2101.00001;garbage" and rf.identifier(record) is None  # no ID's page
+    [record], skipped, _ = parse("TY  - JOUR\nTI  - T\nDO  -X10.5555/example\nER  - \n")
+    assert "DOI" not in record and rf.identifier(record) is None and record["title"] == "T DO -X10.5555/example"
 
 
 def test_exports_escapes_in_a_url_or_doi_are_read_as_their_characters():

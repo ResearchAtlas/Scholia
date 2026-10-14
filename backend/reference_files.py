@@ -215,11 +215,15 @@ def _ris(text, beat):
     import rispy
 
     _counted(len(re.findall(r"^TY  -", text, re.MULTILINE)))
-    parser = rispy.RisParser(skip_unknown_tags=True)
-    tag = re.compile(r"[A-Z][A-Z0-9]  -")
+    # A UR line is one value, checked whole (rispy would split it at ";": a URL followed by text would still
+    # read as that URL). A tag is two characters, two spaces, a hyphen and a space (or the line's end): a
+    # line otherwise like one is text, as rispy, which takes a value from the seventh character on, is shown.
+    parser = rispy.RisParser(skip_unknown_tags=True, delimiter_tags_mapping={})
+    tag = re.compile(r"[A-Z][A-Z0-9]  -(?: |$)")
+    loose = re.compile(r"[A-Z][A-Z0-9]  -")
     for lines in _records(_lines(text, beat), lambda line: line.startswith("TY  -"), tag.match,
                           lambda line: line.startswith("ER  -")):
-        lines = _joined(lines, tag, "UR  -")
+        lines = _joined([f" {line}" if loose.match(line) and not tag.match(line) else line for line in lines], tag, "UR  -")
         try:  # one record at a time, closed here whether or not the file closed it
             entry = next(iter(parser.parse_lines(iter([*lines, "ER  - "]))), None)
         except Exception:  # a record it could not take apart: its type alone, never its text, is known here
@@ -388,7 +392,7 @@ def _bibtex(text, beat):
             fields.setdefault(field.key.lower(), field)
         kind = entry.entry_type.lower()
         try:
-            eprint = _ARXIV_VERSION.sub(r"v\1", _ARXIV_PREFIX.sub("", (_escapes(value(fields, "eprint", literal=True)) or "").strip()))
+            eprint = _ARXIV_VERSION.sub(r"v\1", _ARXIV_PREFIX.sub("", (_escapes(value(fields, "eprint", literal=True)) or "").strip(_SPACES_AROUND)))
             arxiv = eprint if eprint and (value(fields, "archiveprefix", "eprinttype") or "").lower() == "arxiv" else None
             valid = bool(arxiv) and _ARXIV_WHOLE.fullmatch(arxiv) is not None
             written = _escapes(value(fields, "number", literal=True))  # an identifier's field: as written
@@ -655,7 +659,7 @@ def _url(values):
     for value in values if isinstance(values, list) else [values]:
         if not isinstance(value, str) or visible(value) is None:
             continue
-        url = value.strip()  # checked whole, as the file gives it: never cut or cleaned first
+        url = value.strip(_SPACES_AROUND)  # checked whole, as the file gives it: never cut or cleaned first
         try:
             parts = urlsplit(url) if len(url) <= URL_CHARS and not _NOT_IN_URL.search(url) else None
         except ValueError:
@@ -667,6 +671,7 @@ def _url(values):
     return found, wrong
 
 
+_SPACES_AROUND = " \t\r\n"  # all an identifier's value may have around it: str.strip() would take control characters too
 _NOT_IN_URL = re.compile("[\\s\\\\\x00-\x1f\x7f-\x9f\ud800-\udfff]")  # spaces, backslashes, controls, half pairs
 
 
@@ -677,7 +682,7 @@ def _doi(value):
     characters (a digit of another script, a letter that lower-cases to an ASCII one)."""
     if not isinstance(value, str) or visible(value) is None:
         return None, 0
-    text = _DOI_PREFIX.sub("", value.strip())
+    text = _DOI_PREFIX.sub("", value.strip(_SPACES_AROUND))
     doi = clean_doi(text) if len(text) <= DOI_CHARS else None
     return (doi, 0) if doi and text.isascii() and doi == text.lower() else (None, 1)
 
@@ -710,7 +715,7 @@ def _finish(record):
     number, text = record.get("number"), _text(record.get("number"), FIELD_CHARS)
     written = record.get("number_written") if isinstance(record.get("number_written"), str) else number
     if isinstance(written, str) and _ARXIV_NAMED.search(written) or text and _ARXIV_NAMED.search(text):
-        whole = written.strip() if isinstance(written, str) else ""
+        whole = written.strip(_SPACES_AROUND) if isinstance(written, str) else ""
         found = _ARXIV_NUMBER.fullmatch(whole) if len(whole) <= 100 and not _CONTROL.search(whole) else None
         if found and ARXIV.fullmatch(found.group(1)):
             csl["number"] = " ".join(whole.split())
