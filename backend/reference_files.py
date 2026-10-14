@@ -21,8 +21,9 @@ kept only when it is http or https, never fetched. A DOI is kept only when it fi
 gives them: "Family, Given" splits at its comma (BibTeX's by its name parts, split on the text as
 written so a braced group is one name), and any other name, a Han-script one included, is kept whole
 (literal), as is CSL JSON's literal. BibTeX's macros (aliases, # and the month names) are expanded
-within MACRO_DEPTH and MACRO_CHARS, or the record is skipped; its literal fields (url, doi, eprint)
-keep their characters. Nothing here logs content, and the parsers are kept from logging it.
+within MACRO_DEPTH and MACRO_CHARS, or the record is skipped (a macro defined twice differently is
+refused); its literal fields (url, doi, eprint) keep their characters, TeX's escapes of _ & % # $
+read as those characters. Nothing here logs content, and the parsers are kept from logging it.
 """
 
 import io
@@ -234,7 +235,7 @@ def _ris(text, beat):
 def _bibtex(text, beat):
     import bibtexparser
     from bibtexparser.middlewares.names import parse_single_name_into_parts, split_multiple_persons_names
-    from bibtexparser.model import Entry
+    from bibtexparser.model import Entry, String
 
     # Spaces after an @ and its type are one space: the parser's pattern holds state for each space it passes
     # there (a few MiB of them would take the child past its ceiling), and they mean nothing in BibTeX.
@@ -251,14 +252,22 @@ def _bibtex(text, beat):
     except Exception:
         raise Unreadable("unreadable_file") from None
     beat()
-    # BibTeX's macros are case-insensitive, a later definition replacing an earlier one.
-    definitions = {block.key.lower(): block.value for block in library.strings if isinstance(block.value, str)}
     entries, unread, macros, values, people, spent = list(library.entries), 0, {}, {}, {}, [0]
+    strings = list(library.strings)
     for block in library.failed_blocks:  # an entry under a key or field name used twice is still read
         if isinstance(block.ignore_error_block, Entry):
             entries.append(block.ignore_error_block)
+        elif isinstance(block.ignore_error_block, String):  # a macro defined again: no record
+            strings.append(block.ignore_error_block)
         else:
             unread += 1
+    # BibTeX's macros are case-insensitive. One defined twice alike is that definition; one defined
+    # twice differently (None) is refused wherever it is used: which one a value means is not certain.
+    definitions = {}
+    for block in strings:
+        key = block.key.lower()
+        value = block.value if isinstance(block.value, str) else None
+        definitions[key] = value if definitions.get(key, value) == value else None
     _counted(len(entries))
     yield from [None] * unread
 
@@ -280,8 +289,8 @@ def _bibtex(text, beat):
             if at in macros:
                 stack.pop()
                 continue
-            if at not in definitions:
-                macros[at] = (_MONTHS[at], 0) if at in _MONTHS else None
+            if definitions.get(at) is None:
+                macros[at] = (_MONTHS[at], 0) if at in _MONTHS and at not in definitions else None
                 continue
             if at not in parsed:
                 try:
@@ -360,8 +369,9 @@ def _bibtex(text, beat):
         fields = {key.lower(): field for key, field in entry.fields_dict.items()}
         kind = entry.entry_type.lower()
         try:
-            eprint = value(fields, "eprint", literal=True)
+            eprint = _escapes(value(fields, "eprint", literal=True))
             arxiv = eprint if eprint and (value(fields, "archiveprefix", "eprinttype") or "").lower() == "arxiv" else None
+            url = [f"https://arxiv.org/abs/{arxiv}"] if arxiv and ARXIV.fullmatch(arxiv.strip()) else []
             number = value(fields, "number")
             record = {
                 "type": _BIBTEX_TYPES.get(kind, "article"),
@@ -373,8 +383,8 @@ def _bibtex(text, beat):
                 "issue": value(fields, "issue") or (number if kind == "article" else None),
                 "page": (value(fields, "pages") or "").replace("--", "-") or None,
                 "publisher": value(fields, "publisher", "institution", "school", "organization"),
-                "DOI": value(fields, "doi", literal=True),
-                "URL": [value(fields, "url", literal=True)] + ([f"https://arxiv.org/abs/{arxiv}"] if arxiv else []),
+                "DOI": _escapes(value(fields, "doi", literal=True)),
+                "URL": [_escapes(value(fields, "url", literal=True))] + url,  # an eprint not an arXiv ID: its number is left out
                 "ISBN": value(fields, "isbn"), "ISSN": value(fields, "issn"),
                 "language": value(fields, "language", "langid"),
                 "abstract": value(fields, "abstract", limit=ABSTRACT_CHARS),
@@ -438,6 +448,13 @@ def _parts(raw):
         at += 1
 
 
+def _escapes(value):
+    """A literal field's text with TeX's escapes of _ & % # $ read as those characters, as exports write
+    them in a URL or DOI (where a backslash cannot stand); anything else is kept as written."""
+    return _ESCAPED.sub(r"\1", value) if value and "\\" in value else value
+
+
+_ESCAPED = re.compile(r"\\([_&%#$])")
 _WORD = re.compile(r"[^\s#{}\"]*")
 _SPACES = re.compile(r"\s*")
 _MONTHS = {name[:3].lower(): name for name in ("January", "February", "March", "April", "May", "June", "July",
@@ -647,7 +664,8 @@ def _finish(record):
     keywords = [k for k in (_text(k, KEYWORD_CHARS) for k in (record.get("keyword") or [])[:KEYWORDS * 4]) if k]
     if keywords:
         csl["keyword"] = ", ".join(dict.fromkeys(keywords[:KEYWORDS]))
-    if "number" in csl and (arxiv := _ARXIV_IN.search(csl["number"])) and not ARXIV.fullmatch(arxiv.group(1)):
+    arxiv = _ARXIV_IN.search(csl["number"]) if "number" in csl else None
+    if arxiv and not ARXIV.fullmatch(arxiv.group(1)) or not arxiv and csl.get("number", "").lower().startswith("arxiv"):
         del csl["number"]  # it names an arXiv ID the pattern does not take: not kept as one
         dropped += 1
     return csl, dropped

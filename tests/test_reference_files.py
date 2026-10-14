@@ -144,8 +144,31 @@ def test_values_left_out_as_invalid_are_counted_not_lost():
     ris_text = "TY  - JOUR\nTI  - T\nDO  - not a doi\nUR  - file:///etc/hosts\nUR  - https://e.org/k\nPY  - n.d.\nER  - \n"
     [record], skipped, _ = parse(ris_text)
     assert record["URL"] == "https://e.org/k" and skipped == {"invalid_field": 3}
-    [record], skipped, _ = parse(r"@misc{k, title={T}, url={https://e.org/a\_b}, doi={10.5555/a\_b}, year={2020}}")
-    assert "URL" not in record and "DOI" not in record and skipped == {"invalid_field": 2}  # LaTeX's escapes are no URL's
+    [record], skipped, _ = parse(r"@misc{k, title={T}, url={\url{https://e.org/a}}, doi={10.5555/a\textunderscore b}, year={2020}}")
+    assert "URL" not in record and "DOI" not in record and skipped == {"invalid_field": 2}  # LaTeX no URL or DOI holds
+    [record], skipped, _ = parse(r"@misc{k, title={T}, eprint={foo bar}, archiveprefix={arXiv}}")
+    assert "number" not in record and "URL" not in record and skipped == {"invalid_field": 1}  # an eprint no arXiv ID
+
+
+def test_exports_escapes_in_a_url_or_doi_are_read_as_their_characters():
+    [record], skipped, _ = parse(r"@misc{k, title={T}, url={http://example.com/a\_b\&c\%20d}, doi={10.1000/Ab\_c}}")
+    assert (record["URL"], record["DOI"], skipped) == ("http://example.com/a_b&c%20d", "10.1000/ab_c", {})
+
+
+@pytest.mark.parametrize("strings, kept", [
+    ('@string{a = "x"}\n@string{a = "x"}\n', ["x", "Kept"]),  # defined twice alike: that definition, nothing skipped
+    ('@string{a = "x"}\n@string{a = "y"}\n', ["Kept"]),  # defined twice differently: refused, never one of them
+    ('@string{a = "x"}\n@string{A = "y"}\n', ["Kept"]),  # names are case-insensitive
+    ('@string{a = "x"}\n@string{a = a # "y"}\n', ["Kept"]),
+])
+def test_a_macro_defined_twice(strings, kept):
+    records, skipped, _ = parse(f"{strings}@misc{{bad, title = A}}\n@misc{{good, title = {{Kept}}}}\n")
+    assert [r["title"] for r in records] == kept and skipped == ({} if len(kept) == 2 else {"unreadable": 1})
+
+
+def test_a_month_name_an_at_string_defines_is_its_definition():
+    [record], _, _ = parse('@string{jan = {Janvier}}\n@misc{k, title = {T}, abstract = JAN # " and " # feb}\n')
+    assert record["abstract"] == "Janvier and February"
 
 
 def test_a_csl_json_name_given_whole_keeps_its_commas():
