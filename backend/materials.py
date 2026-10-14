@@ -915,12 +915,15 @@ async def list_materials(project_id: str, request: Request):
             f"SELECT {_MATERIAL_COLUMNS} FROM materials m LEFT JOIN material_versions v ON v.material_id = m.id"
             " AND v.is_current = 1 LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE m.project_id = ?"
             " ORDER BY m.created_at DESC, m.id", (project_id,)).fetchall()
-        return {"materials": [_describe(conn, row, registry) for row in rows],
-                "asks": asks.open_asks(conn, project_id=project_id),
-                # S1-14: merges not yet waiting on their question, or applying its answer: the Library looks again
-                "merging": sum(_live(run, registry) for (run,) in conn.execute(
-                    "SELECT id FROM runs WHERE project_id = ? AND workflow = 'merge' AND status = 'running'"
-                    " AND waiting IS NULL", (project_id,)))}
+        open_asks = asks.open_asks(conn, project_id=project_id)
+        listed = {ask["run_id"] for ask in open_asks}
+        return {"materials": [_describe(conn, row, registry) for row in rows], "asks": open_asks,
+                # S1-14: merges still running whose question is not listed (not asked yet, asked under a
+                # policy the project no longer has and not yet asked again, or answered and applying it):
+                # the Library looks again
+                "merging": sum(run not in listed and _live(run, registry) for (run,) in conn.execute(
+                    "SELECT id FROM runs WHERE project_id = ? AND workflow = 'merge' AND status = 'running'",
+                    (project_id,)))}
 
     return await asyncio.to_thread(state["db"].read, listing)
 

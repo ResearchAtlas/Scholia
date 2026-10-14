@@ -18,14 +18,17 @@ export async function importReferences(projectId, file) {
 }
 
 // What an import's report says, as [catalog key, params] pairs: the papers imported, the duplicates
-// waiting for an answer, those already in the project with nothing to add, and the records skipped.
+// waiting for an answer, those already in the project with nothing to add, the records skipped, and
+// the values left out of the records kept (invalid_field: a year, DOI, URL or arXiv ID that is not one).
 export function reportParts(report) {
-  const skipped = Object.values(report.skipped ?? {}).reduce((sum, n) => sum + n, 0);
+  const { invalid_field: leftOut = 0, ...records } = report.skipped ?? {};
+  const skipped = Object.values(records).reduce((sum, n) => sum + n, 0);
   return [
     ['references.imported', { count: report.imported.length }],
     report.waiting.length && ['references.waiting', { count: report.waiting.length }],
     report.already.length && ['references.already', { count: report.already.length }],
     skipped && ['references.skipped', { count: skipped }],
+    leftOut && ['references.leftOut', { count: leftOut }],
   ].filter(Boolean);
 }
 

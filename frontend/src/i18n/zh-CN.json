@@ -414,6 +414,9 @@
   "references.skipped": {
     "other": "跳过了 {count} 条记录：没有标题或无法读取。"
   },
+  "references.leftOut": {
+    "other": "有 {count} 项信息未导入：不是有效的年份、DOI、网址或 arXiv 编号。"
+  },
   "references.doi": "DOI {doi}",
   "ask.merge.question": "这两篇文献看起来是重复的",
   "ask.merge.body": "合并会保留本项目中的文献，只用参考文献文件中的记录补充它缺少的信息。都保留会把这条记录另存为一篇文献。",

@@ -78,11 +78,71 @@ def test_bibtex_blocks_it_cannot_read_are_counted_and_the_rest_imported():
     assert sorted(r["title"] for r in records) == ["Fine one", "Fine two", "Same key, read too"]
 
 
-def test_a_doubling_chain_of_string_macros_is_never_expanded():
-    text = "@string{a0 = {xx}}\n" + "".join(f"@string{{a{i} = a{i - 1} # a{i - 1}}}\n" for i in range(1, 60)) \
-        + "@misc{k, title = a59}\n"
+def test_bibtex_macros_expand_through_aliases_concatenation_and_the_month_names():
+    text = ('@string{macroA = {Journal of A}}\n@string{macroB = macroA}\n@string{prefix = "A " # {Synthetic}}\n'
+            '@string{Deep = prefix}\n'
+            '@article{k, title = deep # { study of } # "{W}ages " # 12, journal = macroB, year = 2020,\n'
+            '  abstract = {Seen in } # MAR # ", twice"}\n')
+    [record], skipped, _ = parse(text)
+    assert (record["title"], record["container-title"], record["abstract"], skipped) == (
+        "A Synthetic study of Wages 12", "Journal of A", "Seen in March, twice", {})
+
+
+def test_a_macro_chain_as_deep_as_its_bound_expands():
+    chain = "@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, rf.MACRO_DEPTH))
+    [record], skipped, _ = parse(chain + f"@misc{{k, title = m{rf.MACRO_DEPTH - 1} # {{ end}}}}\n")
+    assert record["title"] == "deep end" and skipped == {}
+
+
+@pytest.mark.parametrize("strings, title", [
+    ("", "nowhere # {x}"),  # a macro no @string defines
+    ("@string{a = b}\n@string{b = {x} # a}\n", "b"),  # one that refers to itself
+    ("@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, rf.MACRO_DEPTH + 1)),
+     f"m{rf.MACRO_DEPTH}"),  # nested past the bound
+    ("@string{a0 = {xx}}\n" + "".join(f"@string{{a{i} = a{i - 1} # a{i - 1}}}\n" for i in range(1, 60)), "a59"),
+])
+def test_a_bibtex_value_that_cannot_be_expanded_skips_its_record_never_read_wrong(strings, title):
+    records, skipped, _ = parse(f"{strings}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
+    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
+
+
+def test_macros_expanding_past_their_bound_together_refuse_the_file():
+    # 7 doublings of 1,000 characters: each entry's own expression of it is up to 80,000 characters
+    text = "@string{a0 = {" + "w" * 1000 + "}}\n" + "".join(f"@string{{a{i} = a{i - 1} # a{i - 1}}}\n" for i in range(1, 8)) \
+        + "".join(f"@misc{{k{i}, title = {{T{i}}}, abstract = a7 # {{{i}}}}}\n" for i in range(400))
+    assert len(text) < 30_000 and unreadable(text) == "reference_file_too_large"
+
+
+def test_bibtex_names_are_split_on_their_text_as_written_then_read():
+    text = (r'@misc{k, title={T}, author={{Research and Development Council} and {van der} Berg and '
+            r'M{\"u}ller, J{\"o}rg and {Barnes and Noble, Inc.} and Ludwig van Beethoven and {\v{S}}koda, Ji{\v{r}}{\'\i}'
+            r' and 王五}}')
     [record], _, _ = parse(text)
-    assert len(record["title"]) < 20  # the raw reference to the chain, never 2**60 characters
+    assert record["author"] == [
+        {"literal": "Research and Development Council"}, {"family": "Berg", "given": "van der"},  # as BibTeX splits it
+        {"family": "Müller", "given": "Jörg"}, {"literal": "Barnes and Noble, Inc."},
+        {"family": "van Beethoven", "given": "Ludwig"}, {"family": "Škoda", "given": "Jiří"}, {"literal": "王五"}]
+
+
+def test_bibtex_literal_fields_keep_their_characters():
+    text = (r'@misc{k, title={T}, url={https://example.org/~researcher/a_b%20c}, doi = "10.5555/a_b--c",'
+            r' eprint={2101.00001}, archiveprefix={arXiv}}')
+    [record], skipped, _ = parse(text)
+    assert (record["URL"], record["DOI"], record["number"], skipped) == (
+        "https://example.org/~researcher/a_b%20c", "10.5555/a_b--c", "arXiv:2101.00001", {})
+
+
+def test_values_left_out_as_invalid_are_counted_not_lost():
+    ris_text = "TY  - JOUR\nTI  - T\nDO  - not a doi\nUR  - file:///etc/hosts\nUR  - https://e.org/k\nPY  - n.d.\nER  - \n"
+    [record], skipped, _ = parse(ris_text)
+    assert record["URL"] == "https://e.org/k" and skipped == {"invalid_field": 3}
+    [record], skipped, _ = parse(r"@misc{k, title={T}, url={https://e.org/a\_b}, doi={10.5555/a\_b}, year={2020}}")
+    assert "URL" not in record and "DOI" not in record and skipped == {"invalid_field": 2}  # LaTeX's escapes are no URL's
+
+
+def test_a_csl_json_name_given_whole_keeps_its_commas():
+    [record], _, _ = parse(json.dumps([{"title": "T", "author": [{"literal": "Barnes and Noble, Inc."}, {"family": "Doe, Ltd"}]}]))
+    assert record["author"] == [{"literal": "Barnes and Noble, Inc."}, {"literal": "Doe, Ltd"}]
 
 
 def test_a_macro_every_entry_shares_cannot_make_the_records_larger_than_their_bound():
@@ -145,7 +205,7 @@ def test_nothing_a_record_points_to_is_read_or_kept(monkeypatch):
 
 def test_ris_records_in_english_and_chinese():
     records, skipped, kind = rf.parse(synthetic.references_ris())
-    assert (kind, skipped, len(records)) == ("ris", {}, 3)
+    assert (kind, skipped, len(records)) == ("ris", {"invalid_field": 1}, 3)  # its file: URL, left out and counted
     english, chinese, chapter = records
     assert english == {
         "type": "article-journal", "title": "Synthetic Evidence from Reference Files",
@@ -209,7 +269,7 @@ def test_valid_takes_only_what_parse_makes():
 
 def test_a_reference_file_is_read_in_the_child_and_its_records_checked():
     records, skipped, kind = reading.references(synthetic.references_ris())
-    assert (kind, skipped, len(records)) == ("ris", {}, 3) and records == rf.parse(synthetic.references_ris())[0]
+    assert (kind, skipped, len(records)) == ("ris", {"invalid_field": 1}, 3) and records == rf.parse(synthetic.references_ris())[0]
     assert not reading.LIVE
 
 

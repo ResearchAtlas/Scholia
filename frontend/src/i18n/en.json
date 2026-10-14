@@ -426,6 +426,10 @@
     "one": "{count} record was skipped: it had no title or could not be read.",
     "other": "{count} records were skipped: they had no title or could not be read."
   },
+  "references.leftOut": {
+    "one": "{count} value was left out: it was not a valid year, DOI, URL or arXiv ID.",
+    "other": "{count} values were left out: they were not valid years, DOIs, URLs or arXiv IDs."
+  },
   "references.doi": "DOI {doi}",
   "ask.merge.question": "These two papers look like duplicates",
   "ask.merge.body": "Merge keeps the paper in this project and fills in only what it lacks from the reference file's record. Keep both adds the record as a paper of its own.",

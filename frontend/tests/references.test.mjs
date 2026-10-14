@@ -45,6 +45,12 @@ test('the report says what the import did, counted, in each supported interface 
     ['Imported 0 papers.']);
   const zh_ = makeT('zh-CN');
   assert.equal(zh_(...reportParts(report)[0]), '已导入 2 篇文献。');
+  // values left out of the records kept are counted apart from the records skipped
+  const leftOut = { imported: ['a'], waiting: [], already: [], skipped: { unreadable: 1, invalid_field: 2 } };
+  assert.deepEqual(reportParts(leftOut).slice(1).map(([key, params]) => en_(key, params)), [
+    '1 record was skipped: it had no title or could not be read.',
+    '2 values were left out: they were not valid years, DOIs, URLs or arXiv IDs.']);
+  assert.equal(zh_(...reportParts(leftOut)[2]), '有 2 项信息未导入：不是有效的年份、DOI、网址或 arXiv 编号。');
 });
 
 test('a reference file\'s paper says where its details come from: its record, completed by a lookup, or the lookup\'s outcome', () => {

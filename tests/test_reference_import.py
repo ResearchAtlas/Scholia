@@ -359,7 +359,7 @@ async def test_each_record_becomes_a_metadata_only_paper_with_no_file_reading_or
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         result = await imported(client, project, synthetic.references_ris())
-        assert (result["format"], result["skipped"], len(result["imported"])) == ("ris", {}, 3)
+        assert (result["format"], result["skipped"], len(result["imported"])) == ("ris", {"invalid_field": 1}, 3)  # its file: URL
         await background_idle(client)
         found = await papers(client, project)
         english = found["Synthetic Evidence from Reference Files"]
@@ -750,6 +750,19 @@ async def test_the_library_looks_again_while_a_merge_applies_its_answer(tmp_path
         registry.runs[ask["run_id"]].answered.set()
         await run_finished(client, ask["run_id"])
         assert (await listing(client, project))["merging"] == 0
+
+
+async def test_the_library_looks_again_while_a_merge_waits_to_ask_again_under_a_changed_policy(tmp_path, monkeypatch):
+    monkeypatch.setattr(references, "POLICY_SECONDS", 60)  # it asks again only once it next looks, not during the check
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        _, ask = await with_duplicate(client, project)
+        assert (await client.post(f"/api/projects/{project}/review-lock", json={"locked": True})).status_code == 200
+        found = await listing(client, project)
+        assert found["asks"] == [] and found["merging"] == 1  # its question no longer stands, the next not asked yet
+        client.state["harness"].registry.runs[ask["run_id"]].answered.set()  # it looks again
+        [again] = await merge_asks(client, project)
+        assert again["ask_id"] != ask["ask_id"] and (await listing(client, project))["merging"] == 0
 
 
 async def test_a_reference_file_is_read_in_one_of_the_readings_turns(tmp_path):
