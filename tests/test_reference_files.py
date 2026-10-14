@@ -106,6 +106,14 @@ def test_a_bibtex_value_that_cannot_be_expanded_skips_its_record_never_read_wron
     assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
 
 
+@pytest.mark.parametrize("deep_first", [True, False])
+def test_a_macros_depth_is_its_own_whatever_was_read_before(deep_first):
+    chain = "@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, rf.MACRO_DEPTH + 1))
+    deep, shallow = f"@misc{{a, title = m{rf.MACRO_DEPTH}}}\n", "@misc{b, title = m1}\n"
+    records, skipped, _ = parse(chain + (deep + shallow if deep_first else shallow + deep))
+    assert [r["title"] for r in records] == ["deep"] and skipped == {"unreadable": 1}
+
+
 def test_macros_expanding_past_their_bound_together_refuse_the_file():
     # 7 doublings of 1,000 characters: each entry's own expression of it is up to 80,000 characters
     text = "@string{a0 = {" + "w" * 1000 + "}}\n" + "".join(f"@string{{a{i} = a{i - 1} # a{i - 1}}}\n" for i in range(1, 8)) \
