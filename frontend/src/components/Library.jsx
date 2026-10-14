@@ -327,7 +327,7 @@ function useSearch(projectId) {
 function SearchField({ search }) {
   const t = useT();
   const id = useId();
-  const composing = useRef(false); // an Enter confirming composed characters is down: no search
+  const composing = useRef(false); // an Enter confirming composed characters is down (until its keyup, or focus leaves): no search
   return (
     <form role="search" className="flex shrink-0 items-center gap-1.5 border-b px-4 py-2"
       onSubmit={(event) => { event.preventDefault(); if (!composing.current) search.search(); }}>
@@ -337,7 +337,7 @@ function SearchField({ search }) {
         <Input id={id} value={search.text} placeholder={t('search.placeholder')} autoComplete="off" spellCheck={false}
           className="h-8 pl-8" onChange={(event) => search.setText(event.target.value)}
           onKeyDown={(event) => { composing.current = onFieldKey(event, search.clear); }}
-          onKeyUp={() => { composing.current = false; }} />
+          onKeyUp={() => { composing.current = false; }} onBlur={() => { composing.current = false; }} />
       </div>
       {(search.shown || search.text) && (
         <Button type="button" size="icon" variant="ghost" className="size-8" title={t('search.clear')} aria-label={t('search.clear')}
