@@ -177,6 +177,8 @@ def test_an_eprint_written_with_its_arxiv_prefix_is_that_id():
 
 @pytest.mark.parametrize("number, found", [
     ("arXiv:2101.123456", None), ("arXiv:2101.00001garbage", None), ("arXiv:2101.00001v2x", None),
+    ("xarxiv:2101.00001", None), ("evilarxiv.org/abs/2101.00001", None), ("arXiv:2101.123456 arXiv:2101.00001", None),
+    ("arXiv:2101.00001-2", None), ("arXiv:2101.00001.garbage", None), ("https://arxiv.org/abs/2101.00001", None),
     ("arXiv:2101.00001 [cs.CL]", "2101.00001"), ("arXiv:2101.00001v2", "2101.00001"), ("arXiv:math.GT/0309136", "math.GT/0309136"),
 ])
 def test_a_number_naming_arxiv_gives_a_whole_id_or_is_left_out(number, found):
@@ -205,6 +207,26 @@ def test_a_value_past_its_cap_is_refused_never_cut_and_read(title):
     chain = "@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, 12))
     records, skipped, _ = parse(f"{chain}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
     assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
+
+
+def test_an_eprints_version_is_written_as_arxiv_writes_it():
+    [record], _, _ = parse("@misc{k, title={T}, eprint={2101.00001V2}, archiveprefix={arXiv}}")
+    assert (record["number"], record["URL"]) == ("arXiv:2101.00001v2", "https://arxiv.org/abs/2101.00001v2")
+
+
+def test_a_field_given_twice_is_read_as_bibtex_reads_it_the_first():
+    [record], _, _ = parse("@misc{k, title={First}, TITLE={Second}, doi={10.5555/first}, doi={10.5555/second}}")
+    assert (record["title"], record["DOI"]) == ("First", "10.5555/first")
+
+
+def test_an_empty_field_gives_way_to_the_next_one_named():
+    [record], skipped, _ = parse("@misc{k, title={T}, year={}, date={2020-01-01}, journal={}, booktitle={B}}")
+    assert (record["issued"], record["container-title"], skipped) == ({"date-parts": [[2020]]}, "B", {})
+
+
+def test_keywords_are_split_on_their_text_as_written_then_read():
+    [record], _, _ = parse('@misc{k, title={T}, keywords={{\\"u}ber; {a;b}}}')
+    assert record["keyword"] == "über, a;b"
 
 
 def test_exports_escapes_in_a_url_or_doi_are_read_as_their_characters():

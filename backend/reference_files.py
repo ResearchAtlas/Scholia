@@ -19,8 +19,8 @@ keywords of a record. A record keeps only what CSL names here (KEYS); what a rec
 never read: file attachments (RIS L1, L2 and L4, EndNote %>, BibTeX file) are not kept, and a URL is
 kept only when it is http or https, never fetched. A DOI is kept only when it fits the pattern
 (extraction.clean_doi), an arXiv ID only as extraction.ARXIV reads one, and only whole: a BibTeX
-eprint that is the ID and nothing else, a number's ID token entire, an arxiv.org URL whose whole path
-is the ID's page. Names are kept as the file
+eprint that is the ID and nothing else, a number that is "arXiv:" and the ID (and its category), an
+arxiv.org URL whose whole path is the ID's page. A BibTeX field given twice is read as its first. Names are kept as the file
 gives them: "Family, Given" splits at its comma (BibTeX's by its name parts, split on the text as
 written so a braced group is one name), and any other name, a Han-script one included, is kept whole
 (literal), as is CSL JSON's literal. BibTeX's macros (aliases, # and the month names) are expanded
@@ -66,13 +66,14 @@ _SHORT = ("volume", "issue", "page", "publisher", "ISBN", "ISSN", "language", "n
 _TYPE = re.compile(r"[a-z]{1,30}(?:-[a-z]{1,30}){0,3}")  # a CSL type name, as backend/lookup.py reads one
 _YEAR = re.compile(r"(?<!\d)(1\d{3}|2[01]\d{2}|2200)(?!\d)")  # the details form's years, 1000 to 2200
 _DOI_PREFIX = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
-# An arXiv ID a number or a URL names: the whole ID, its version and a .pdf after it, and nothing of a
-# longer token (2101.123456, 2101.00001garbage name none); extraction.ARXIV then checks the ID itself.
-_ARXIV_IN = re.compile(r"(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})"
-                       r"(?:v\d+)?(?:\.pdf)?(?![\w/]|\.\d)", re.IGNORECASE)
-_ARXIV_NAMED = re.compile(r"arxiv\s*:|arxiv\.org/", re.IGNORECASE)  # a value that says it names one
+# A number that names an arXiv ID is that ID and nothing else: "arXiv:" and the ID, its version, and the
+# category arXiv's own exports add ("arXiv:2101.00001v2 [cs.CL]"); extraction.ARXIV then checks the ID.
+_ARXIV_NUMBER = re.compile(r"\s*arxiv\s*:\s*(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?(?:\s*\[[a-z.-]{1,20}\])?\s*",
+                           re.IGNORECASE)
+_ARXIV_NAMED = re.compile(r"arxiv\s*:|arxiv\.org", re.IGNORECASE)  # a value that says it names one
 _ARXIV_WHOLE = re.compile(rf"(?:{ARXIV.pattern})(?:v\d+)?", re.IGNORECASE)  # an eprint: the ID and nothing else
 _ARXIV_PREFIX = re.compile(r"^arxiv\s*:\s*", re.IGNORECASE)
+_ARXIV_VERSION = re.compile(r"V(\d+)$")  # arXiv writes a version with a lower-case v
 _LATEX = re.compile(r"[\\{}$~]")
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # Unicode's control characters (Cc)
 _SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair, which only JSON's escapes can give: no text holds one
@@ -320,12 +321,15 @@ def _bibtex(text, beat):
                 parts, cap = _parts(raw), limit * 4
                 if len(parts) == 1 and parts[0][0]:  # braced, quoted or a number: the file's own text
                     text, _ = expand(parts, cap)
-                    return text if literal else _latex(text)
-                if (raw, cap, literal) not in values:  # a macro every entry uses is expanded and read once
-                    text, _ = expand(parts, cap)
-                    spend(len(text))
-                    values[raw, cap, literal] = text if literal else _latex(text)
-                return values[raw, cap, literal]
+                    text = text if literal else _latex(text)
+                else:
+                    if (raw, cap, literal) not in values:  # a macro every entry uses is expanded and read once
+                        text, _ = expand(parts, cap)
+                        spend(len(text))
+                        values[raw, cap, literal] = text if literal else _latex(text)
+                    text = values[raw, cap, literal]
+                if text.strip():  # an empty one ({}) gives way to the next field named
+                    return text
         return None
 
     def names(text):
@@ -358,10 +362,12 @@ def _bibtex(text, beat):
             continue
         entry = found
         beat()  # each entry: a long value's LaTeX takes a moment
-        fields = {key.lower(): field for key, field in entry.fields_dict.items()}
+        fields = {}
+        for field in entry.fields:  # a field given twice (in any case): BibTeX reads the first, and so here
+            fields.setdefault(field.key.lower(), field)
         kind = entry.entry_type.lower()
         try:
-            eprint = _ARXIV_PREFIX.sub("", (_escapes(value(fields, "eprint", literal=True)) or "").strip())
+            eprint = _ARXIV_VERSION.sub(r"v\1", _ARXIV_PREFIX.sub("", (_escapes(value(fields, "eprint", literal=True)) or "").strip()))
             arxiv = eprint if eprint and (value(fields, "archiveprefix", "eprinttype") or "").lower() == "arxiv" else None
             valid = bool(arxiv) and _ARXIV_WHOLE.fullmatch(arxiv) is not None
             number = value(fields, "number")
@@ -380,7 +386,8 @@ def _bibtex(text, beat):
                 "ISBN": value(fields, "isbn"), "ISSN": value(fields, "issn"),
                 "language": value(fields, "language", "langid"),
                 "abstract": value(fields, "abstract", limit=ABSTRACT_CHARS),
-                "keyword": re.split(r"[,;]", value(fields, "keywords", limit=KEYWORDS * KEYWORD_CHARS) or ""),
+                "keyword": [_latex(k) for k in _split_top(value(fields, "keywords", limit=KEYWORDS * KEYWORD_CHARS,
+                                                                literal=True) or "")],
                 # an arXiv eprint the whole of which is no arXiv ID is left out, and counted
                 "number": f"arXiv:{arxiv}" if valid else (number if kind != "article" else None),
                 "dropped": 1 if arxiv and not valid else 0,
@@ -440,6 +447,24 @@ def _parts(raw):
         if raw[at] != "#":
             raise _Refused
         at += 1
+
+
+def _split_top(value):
+    """A BibTeX keywords field's keywords: split at its commas and semicolons outside braces, on the text
+    as written (a braced group is one keyword), before its LaTeX is read."""
+    found, start, depth = [], 0, 0
+    for mark in _KEYWORD_MARKS.finditer(value):
+        if mark.group() == "{":
+            depth += 1
+        elif mark.group() == "}":
+            depth = max(depth - 1, 0)
+        elif depth == 0:
+            found.append(value[start:mark.start()])
+            start = mark.end()
+    return found + [value[start:]]
+
+
+_KEYWORD_MARKS = re.compile(r"[{},;]")
 
 
 def _escapes(value):
@@ -659,7 +684,7 @@ def _finish(record):
     if keywords:
         csl["keyword"] = ", ".join(dict.fromkeys(keywords[:KEYWORDS]))
     if "number" in csl and _ARXIV_NAMED.search(csl["number"]) \
-            and not ((found := _ARXIV_IN.search(csl["number"])) and ARXIV.fullmatch(found.group(1))):
+            and not ((found := _ARXIV_NUMBER.fullmatch(csl["number"])) and ARXIV.fullmatch(found.group(1))):
         del csl["number"]  # it names an arXiv ID the pattern does not take: not kept as one
         dropped += 1
     return csl, dropped
@@ -670,7 +695,7 @@ def identifier(csl):
     by its pattern): ("doi", DOI), else ("arxiv", ID) from its number or its arxiv.org URL, or None."""
     if isinstance(csl.get("DOI"), str) and (doi := clean_doi(csl["DOI"])):
         return "doi", doi
-    found = _ARXIV_IN.search(csl["number"]) if isinstance(csl.get("number"), str) else None
+    found = _ARXIV_NUMBER.fullmatch(csl["number"]) if isinstance(csl.get("number"), str) else None
     if found is None and isinstance(csl.get("URL"), str):  # an arxiv.org URL whose whole path is an ID's page
         try:
             url = urlsplit(csl["URL"])
