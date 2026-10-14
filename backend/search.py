@@ -190,7 +190,8 @@ def request_run(conn, registry, project_id, record, rebuild=False, startup=False
     run this asks for, and recorded interrupted, so no launch does; its pending rerun ends superseded
     (unless it is run_id), and a rebuild it or that rerun was to do is asked for here. One that cannot
     be retired (a kick holds it as this looks, or the app is closing: a resume or the next launch starts
-    it again) is the project's run."""
+    it again) is the project's run. A retire outlives a transaction that rolls back: that run then waits,
+    read as interrupted, for the next request (which supersedes it) or the next launch."""
     for live, inputs in conn.execute(
             "SELECT id, inputs FROM runs WHERE project_id = ? AND workflow = 'index' AND status = 'running'"
             " AND cancel_reason IS NULL AND json_extract(inputs, '$.retried_by') IS NULL ORDER BY rowid DESC",

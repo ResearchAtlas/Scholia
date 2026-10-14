@@ -1698,10 +1698,11 @@ async def test_two_retries_at_once_of_a_run_with_a_rebuild_pending_both_get_that
 async def test_a_run_a_retry_marked_that_ends_before_the_retry_resumes_holds_and_starts_the_pending_run(
         tmp_path, monkeypatch):
     """Recheck of b89a308, finding 1: the project's running run a Retry marked to run once more may end
-    between the Retry's commit and its coroutine's resuming; the id the Retry held is released inside its
-    write, so that run's end holds, records and starts the pending run, never recording it unheld (read as
-    interrupted). (Since finding 33, a run left running by a failed terminal write never runs beside a later
-    one: the Retry here is of a run Cancel stopped.)"""
+    between the Retry's commit and its coroutine's resuming; that run's end holds, records and starts the
+    pending run the Retry marked, never recording it unheld (read as interrupted). Since finding 33, a run left
+    running by a failed terminal write never runs beside a later one, so a Retry holding a pending id while
+    another run of the project runs (this test's earlier form) no longer arises: the Retry here is of a run
+    Cancel stopped, and the id it marks is not one it holds."""
     import threading
     from backend.db import Database
     real, armed, committed, go = Database.write, [], threading.Event(), threading.Event()

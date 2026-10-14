@@ -143,7 +143,8 @@ class Registry:
         # released it reads interrupted, as its record still says running (Harness._ended).
         # ponytail: one id per background run finished in this launch; a bounded log if that grows large
         self.finished: set[str] = set()
-        # Background runs a retry takes over (materials.retry_run): never held from then on. The lock
+        # Background runs a retry takes over (materials.retry_run), or an index run's request supersedes
+        # (search.request_run, S1-17): never held from then on. The lock
         # makes holding a run (add_background) and retiring it (retire, from a write transaction's
         # thread, or the event loop) one decision: whichever comes first, the other is refused.
         self.retired: set[str] = set()
