@@ -115,9 +115,9 @@ def test_a_macros_depth_is_its_own_whatever_was_read_before(deep_first):
 
 
 def test_macros_expanding_past_their_bound_together_refuse_the_file():
-    # 7 doublings of 1,000 characters: each entry's own expression of it is up to 80,000 characters
-    text = "@string{a0 = {" + "w" * 1000 + "}}\n" + "".join(f"@string{{a{i} = a{i - 1} # a{i - 1}}}\n" for i in range(1, 8)) \
-        + "".join(f"@misc{{k{i}, title = {{T{i}}}, abstract = a7 # {{{i}}}}}\n" for i in range(400))
+    # 6 doublings of 1,000 characters: each entry's own expression of it holds 64,000 characters, within its cap
+    text = "@string{a0 = {" + "w" * 1000 + "}}\n" + "".join(f"@string{{a{i} = a{i - 1} # a{i - 1}}}\n" for i in range(1, 7)) \
+        + "".join(f"@misc{{k{i}, title = {{T{i}}}, abstract = a6 # {{{i}}}}}\n" for i in range(400))
     assert len(text) < 30_000 and unreadable(text) == "reference_file_too_large"
 
 
@@ -163,12 +163,47 @@ def test_a_number_that_only_mentions_arxiv_is_kept():
     assert record["number"] == "arXiv preprint 5" and skipped == {}
 
 
-@pytest.mark.parametrize("strings, title", [
-    ('@string{jan = "a"}\n@string{jan = "b"}\n', "jan"),  # a month name defined twice differently
-    ('@string{a = "x"}\n@string{b = a # "y"}\n@string{a = "z"}\n', "b"),  # built on a macro defined twice differently
+@pytest.mark.parametrize("eprint", ["2101.123456", "2101.00001garbage", "2101.00001 2101.00002", "x2101.00001"])
+def test_an_eprint_the_whole_of_which_is_no_arxiv_id_is_left_out_and_never_looked_up(eprint):
+    [record], skipped, _ = parse(f"@misc{{k, title={{T}}, eprint={{{eprint}}}, archiveprefix={{arXiv}}}}")
+    assert "number" not in record and "URL" not in record and rf.identifier(record) is None
+    assert skipped == {"invalid_field": 1}
+
+
+def test_an_eprint_written_with_its_arxiv_prefix_is_that_id():
+    [record], skipped, _ = parse("@misc{k, title={T}, eprint={arXiv:2101.00001v3}, eprinttype={arxiv}}")
+    assert (record["number"], rf.identifier(record), skipped) == ("arXiv:2101.00001v3", ("arxiv", "2101.00001"), {})
+
+
+@pytest.mark.parametrize("number, found", [
+    ("arXiv:2101.123456", None), ("arXiv:2101.00001garbage", None), ("arXiv:2101.00001v2x", None),
+    ("arXiv:2101.00001 [cs.CL]", "2101.00001"), ("arXiv:2101.00001v2", "2101.00001"), ("arXiv:math.GT/0309136", "math.GT/0309136"),
 ])
-def test_a_macro_defined_twice_differently_refuses_what_uses_it(strings, title):
-    records, skipped, _ = parse(f"{strings}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
+def test_a_number_naming_arxiv_gives_a_whole_id_or_is_left_out(number, found):
+    [record], skipped, _ = parse(json.dumps([{"title": "T", "number": number}]))
+    assert rf.identifier(record) == (found and ("arxiv", found))
+    assert (record.get("number"), skipped) == ((number, {}) if found else (None, {"invalid_field": 1}))
+
+
+@pytest.mark.parametrize("url, found", [
+    ("https://arxiv.org/abs/2101.00001v2", "2101.00001"), ("https://arxiv.org/pdf/2101.00001.pdf", "2101.00001"),
+    ("https://arxiv.org/abs/2101.123456", None), ("https://arxiv.org/abs/2101.00001/extra", None),
+    ("https://proxy.example.org/arxiv.org/abs/2101.00001", None), ("https://example.org/?u=arxiv.org/abs/2101.00001", None),
+])
+def test_an_arxiv_id_comes_only_from_the_whole_path_of_an_arxiv_org_url(url, found):
+    [record], _, _ = parse(f"TY  - JOUR\nTI  - T\nUR  - {url}\nER  - \n")
+    assert record["URL"] == url and rf.identifier(record) == (found and ("arxiv", found))
+
+
+@pytest.mark.parametrize("title", [
+    "{Known " + "\\relax " * 600 + "} # missing",  # an undefined macro after the cap is reached
+    "{Known " + "\\relax " * 600 + "} # m11",  # a macro nested too deep after it
+    "{Known " + "\\relax " * 600 + "} # {tail}",  # past the cap, every part readable
+    "{Known " + "\\relax " * 700 + "tail}",  # one braced value past the cap
+])
+def test_a_value_past_its_cap_is_refused_never_cut_and_read(title):
+    chain = "@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, 12))
+    records, skipped, _ = parse(f"{chain}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
     assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
 
 
@@ -177,15 +212,32 @@ def test_exports_escapes_in_a_url_or_doi_are_read_as_their_characters():
     assert (record["URL"], record["DOI"], skipped) == ("http://example.com/a_b&c%20d", "10.1000/ab_c", {})
 
 
-@pytest.mark.parametrize("strings, kept", [
-    ('@string{a = "x"}\n@string{a = "x"}\n', ["x", "Kept"]),  # defined twice alike: that definition, nothing skipped
-    ('@string{a = "x"}\n@string{a = "y"}\n', ["Kept"]),  # defined twice differently: refused, never one of them
-    ('@string{a = "x"}\n@string{A = "y"}\n', ["Kept"]),  # names are case-insensitive
-    ('@string{a = "x"}\n@string{a = a # "y"}\n', ["Kept"]),
+@pytest.mark.parametrize("strings, use, title", [
+    ('@string{a = "x"}\n@string{a = "x"}\n', "a", "x"),  # defined again alike
+    ('@string{a = "x"}\n@string{a = "y"}\n', "a", "y"),  # a later definition replaces the earlier one
+    ('@string{a = "x"}\n@string{A = "y"}\n', "a", "y"),  # names are case-insensitive
+    ('@string{a = "x"}\n@string{a = a # "y"}\n', "a", "xy"),  # its own value reads the earlier one
+    ('@string{a = "x"}\n@string{b = a # "y"}\n@string{a = "z"}\n', "b", "xy"),  # b was read when it was defined
 ])
-def test_a_macro_defined_twice(strings, kept):
-    records, skipped, _ = parse(f"{strings}@misc{{bad, title = A}}\n@misc{{good, title = {{Kept}}}}\n")
-    assert [r["title"] for r in records] == kept and skipped == ({} if len(kept) == 2 else {"unreadable": 1})
+def test_a_macro_defined_again_applies_from_there_on(strings, use, title):
+    records, skipped, _ = parse(f"{strings}@misc{{k, title = {use}}}\n")
+    assert [r["title"] for r in records] == [title] and skipped == {}
+
+
+def test_each_entry_reads_the_macros_defined_before_it():
+    records, skipped, _ = parse("@misc{before, title = jan}\n@string{jan = {Janvier}}\n@misc{after, title = jan}\n")
+    assert [r["title"] for r in records] == ["January", "Janvier"] and skipped == {}
+
+
+@pytest.mark.parametrize("strings", [
+    "@string{b = a}\n@string{a = {x}}\n",  # an alias of a macro defined only later
+    "@string{b = {x} # nowhere}\n@string{nowhere = {y}}\n",
+    "@string{jan = nowhere}\n",  # a month name defined again as something unreadable
+])
+def test_a_macro_whose_definition_cannot_be_read_where_it_stands_refuses_what_uses_it(strings):
+    title = "jan" if "jan" in strings else "b"
+    records, skipped, _ = parse(f"{strings}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
+    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
 
 
 def test_a_month_name_an_at_string_defines_is_its_definition():
@@ -198,9 +250,17 @@ def test_a_csl_json_name_given_whole_keeps_its_commas():
     assert record["author"] == [{"literal": "Barnes and Noble, Inc."}, {"literal": "Doe, Ltd"}]
 
 
-def test_a_macro_every_entry_shares_cannot_make_the_records_larger_than_their_bound():
+def test_a_macro_longer_than_any_field_takes_is_refused_never_cut():
     shared = "@string{m = {\\'e " + "w" * (rf.MAX_BYTES // 2) + "}}\n"
     entries = "".join(f"@misc{{k{i}, title={{T{i}}}, author=m, abstract=m}}\n" for i in range(5000))
+    records, skipped, _ = parse(shared + entries)
+    assert records == [] and skipped == {"unreadable": 5000}
+
+
+def test_one_long_macro_read_again_after_each_definition_refuses_the_file():
+    # each @string between entries makes the next entry read the macro again: together past the bound
+    shared = "@string{m = {" + "w" * (rf.ABSTRACT_CHARS * 3) + "}}\n"
+    entries = "".join(f"@string{{x{i} = {{x}}}}\n@misc{{k{i}, title={{T{i}}}, abstract=m}}\n" for i in range(400))
     assert unreadable(shared + entries) == "reference_file_too_large"
 
 

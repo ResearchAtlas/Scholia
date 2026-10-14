@@ -13,16 +13,19 @@ gets. It never imports the database, the server or the window.
 
 Every bound holds before a value is worked on: the file's size (MAX_BYTES), its records
 (MAX_RECORDS; more refuse the whole file), each field's characters (a value is cut before it is
-cleaned, and kept at most to its field's bound), a field's continuation lines, and the authors and
+cleaned, and kept at most to its field's bound; a BibTeX value longer than four times its bound, or
+whose macros expand past that, skips its record instead, as its LaTeX could read as far less), a field's continuation lines, and the authors and
 keywords of a record. A record keeps only what CSL names here (KEYS); what a record points to is
 never read: file attachments (RIS L1, L2 and L4, EndNote %>, BibTeX file) are not kept, and a URL is
 kept only when it is http or https, never fetched. A DOI is kept only when it fits the pattern
-(extraction.clean_doi), an arXiv ID only as extraction.ARXIV reads one. Names are kept as the file
+(extraction.clean_doi), an arXiv ID only as extraction.ARXIV reads one, and only whole: a BibTeX
+eprint that is the ID and nothing else, a number's ID token entire, an arxiv.org URL whose whole path
+is the ID's page. Names are kept as the file
 gives them: "Family, Given" splits at its comma (BibTeX's by its name parts, split on the text as
 written so a braced group is one name), and any other name, a Han-script one included, is kept whole
 (literal), as is CSL JSON's literal. BibTeX's macros (aliases, # and the month names) are expanded
-within MACRO_DEPTH and MACRO_CHARS, or the record is skipped (a macro defined twice differently is
-refused); its literal fields (url, doi, eprint) keep their characters, TeX's escapes of _ & % # $
+as BibTeX reads them, in file order (a value sees the definitions before it, a later one replacing an
+earlier), within MACRO_DEPTH and MACRO_CHARS, or the record is skipped; its literal fields (url, doi, eprint) keep their characters, TeX's escapes of _ & % # $
 read as those characters. Nothing here logs content, and the parsers are kept from logging it.
 """
 
@@ -51,7 +54,7 @@ CONTINUATION_LINES = 200  # a field's lines after its first; later ones are left
 CONTINUATION_CHARS = 2 * ABSTRACT_CHARS  # and their characters
 RECORD_LINES = 1000  # a record's lines, a field (one an author) and its continuations; later fields are left out
 MACRO_DEPTH = 10  # a BibTeX macro's macros, and theirs, this deep at most (files use one or two)
-MACRO_CHARS = 4 * max(ABSTRACT_CHARS, AUTHORS * NAME_CHARS)  # a macro's text is cut here, past what any field keeps
+MACRO_CHARS = 4 * max(ABSTRACT_CHARS, AUTHORS * NAME_CHARS)  # a longer macro is refused: past what any field takes
 EXPANDED_CHARS = MAX_BYTES  # what a file's macros expand to, all of it together: no more than the file may hold
 BEAT_EVERY = 500  # records or lines between two beats
 PARSER = ("references", "1")  # what the child names when it is ready (backend/reading.py)
@@ -63,8 +66,13 @@ _SHORT = ("volume", "issue", "page", "publisher", "ISBN", "ISSN", "language", "n
 _TYPE = re.compile(r"[a-z]{1,30}(?:-[a-z]{1,30}){0,3}")  # a CSL type name, as backend/lookup.py reads one
 _YEAR = re.compile(r"(?<!\d)(1\d{3}|2[01]\d{2}|2200)(?!\d)")  # the details form's years, 1000 to 2200
 _DOI_PREFIX = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
+# An arXiv ID a number or a URL names: the whole ID, its version and a .pdf after it, and nothing of a
+# longer token (2101.123456, 2101.00001garbage name none); extraction.ARXIV then checks the ID itself.
 _ARXIV_IN = re.compile(r"(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})"
-                       r"(?:v\d+)?", re.IGNORECASE)
+                       r"(?:v\d+)?(?:\.pdf)?(?![\w/]|\.\d)", re.IGNORECASE)
+_ARXIV_NAMED = re.compile(r"arxiv\s*:|arxiv\.org/", re.IGNORECASE)  # a value that says it names one
+_ARXIV_WHOLE = re.compile(rf"(?:{ARXIV.pattern})(?:v\d+)?", re.IGNORECASE)  # an eprint: the ID and nothing else
+_ARXIV_PREFIX = re.compile(r"^arxiv\s*:\s*", re.IGNORECASE)
 _LATEX = re.compile(r"[\\{}$~]")
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # Unicode's control characters (Cc)
 _SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair, which only JSON's escapes can give: no text holds one
@@ -235,7 +243,7 @@ def _ris(text, beat):
 def _bibtex(text, beat):
     import bibtexparser
     from bibtexparser.middlewares.names import parse_single_name_into_parts, split_multiple_persons_names
-    from bibtexparser.model import Entry, String
+    from bibtexparser.model import Entry, ParsingFailedBlock, String
 
     # Spaces after an @ and its type are one space: the parser's pattern holds state for each space it passes
     # there (a few MiB of them would take the child past its ceiling), and they mean nothing in BibTeX.
@@ -252,95 +260,69 @@ def _bibtex(text, beat):
     except Exception:
         raise Unreadable("unreadable_file") from None
     beat()
-    entries, unread, macros, values, people, spent = list(library.entries), 0, {}, {}, {}, [0]
-    strings = list(library.strings)
-    for block in library.failed_blocks:  # an entry under a key or field name used twice is still read
-        if isinstance(block.ignore_error_block, Entry):
-            entries.append(block.ignore_error_block)
-        elif isinstance(block.ignore_error_block, String):  # a macro defined again: no record
-            strings.append(block.ignore_error_block)
-        else:
-            unread += 1
-    # BibTeX's macros are case-insensitive. One defined twice alike is that definition; one defined
-    # twice differently (None) is refused wherever it is used: which one a value means is not certain.
-    definitions = {}
-    for block in strings:
-        key = block.key.lower()
-        value = block.value if isinstance(block.value, str) else None
-        definitions[key] = value if definitions.get(key, value) == value else None
-    _counted(len(entries))
-    yield from [None] * unread
+    # BibTeX reads a file in order: an entry, and an @string's own value, see the macros defined before it
+    # (the month names from the start), a later @string of the same name (in any case) replacing it from
+    # there on. env: name -> (text, depth), or None for a definition that cannot be read as written.
+    env, values, people, spent = {}, {}, {}, [0]
+    _counted(sum(isinstance(block, Entry) or isinstance(getattr(block, "ignore_error_block", None), Entry)
+                 for block in library.blocks))
 
     def spend(chars):
-        """What expanding macros makes, all of it together, holds EXPANDED_CHARS at most: a doubling
-        chain of macros, cut at each step, could otherwise make far more than the file."""
+        """What expanding macros makes, all of it together, holds EXPANDED_CHARS at most: macros
+        concatenated, or one long macro read again by many entries, could otherwise make far more than
+        the file."""
         spent[0] += chars
         if spent[0] > EXPANDED_CHARS:
             raise Unreadable("reference_file_too_large")
 
-    def macro(name):
-        """A macro's text, expanded once (cut at MACRO_CHARS) however many values use it. _Refused when
-        it is not defined (the month names are), refers to itself, or its macros nest more than
-        MACRO_DEPTH deep (its own depth, whatever uses it). Worked out with a stack of its own, never
-        Python's: a macro's macros first, then the macro."""
-        stack, opened, parsed = [name], set(), {}
-        while stack:
-            at = stack[-1]
-            if at in macros:
-                stack.pop()
-                continue
-            if definitions.get(at) is None:
-                macros[at] = (_MONTHS[at], 0) if at in _MONTHS and at not in definitions else None
-                continue
-            if at not in parsed:
-                try:
-                    parsed[at] = _parts(definitions[at])
-                except _Refused:
-                    macros[at] = None
-                    continue
-                opened.add(at)
-            uses = {part.lower() for literal, part in parsed[at] if not literal}
-            if waiting := [use for use in uses if use not in macros]:
-                if opened.intersection(waiting):  # it refers to itself, through others or not
-                    macros[at] = None
-                else:
-                    stack.extend(waiting)
-                    continue
-            elif any(macros[use] is None for use in uses) \
-                    or (depth := 1 + max((macros[use][1] for use in uses), default=0)) > MACRO_DEPTH:
-                macros[at] = None
-            else:
-                text = expand(parsed[at], MACRO_CHARS)
-                spend(len(text))
-                macros[at] = (text, depth)
-            opened.discard(at)
-            del parsed[at]
-        if macros[name] is None:
-            raise _Refused
-        return macros[name][0]
-
     def expand(parts, cap):
-        """A value's parts joined (#), each macro by its text, cut at cap characters."""
-        out, length = [], 0
+        """(A value's parts joined by #, each macro by its definition at this point of the file, its
+        depth). _Refused when a macro is not defined here or its definition could not be read, when they
+        nest more than MACRO_DEPTH deep, or when the whole is longer than cap: every part is checked,
+        whatever the length so far, and a value past its cap is never cut short and read."""
+        texts, length, depth = [], 0, 0
         for literal, part in parts:
-            part = (part if literal else macro(part.lower()))[:cap - length]
-            out.append(part)
+            if not literal:
+                name = part.lower()
+                found = env[name] if name in env else (_MONTHS[name], 0) if name in _MONTHS else None
+                if found is None:
+                    raise _Refused
+                part, depth = found[0], max(depth, found[1] + 1)
             length += len(part)
-            if length >= cap:
-                break
-        return "".join(out)
+            if length <= cap:
+                texts.append(part)
+        if length > cap or depth > MACRO_DEPTH:
+            raise _Refused
+        return (texts[0] if len(texts) == 1 else "".join(texts)), depth
+
+    def define(block):
+        """An @string, read now, against the macros defined before it."""
+        name = block.key.lower()
+        try:
+            if not isinstance(block.value, str):
+                raise _Refused
+            parts = _parts(block.value.strip())
+            text, depth = expand(parts, MACRO_CHARS)
+            if len(parts) > 1:
+                spend(len(text))
+            env[name] = (text, depth)
+        except _Refused:
+            env[name] = None
+        values.clear()  # a value read before may mean something else from here on
 
     def value(fields, *names, limit=TITLE_CHARS, literal=False):
-        """The first of the fields named, as the file means it: its macros and # expanded, cut to what
-        its bound may keep, its LaTeX read unless it is a literal field (a URL, DOI or eprint keeps the
-        characters it has). _Refused when it cannot be read as written."""
+        """The first of the fields named, as the file means it here: its macros and # expanded, its LaTeX
+        read unless it is a literal field (a URL, DOI or eprint keeps the characters it has). _Refused
+        when it cannot be read as written, or is longer than four times its field's bound (never cut
+        before it is read: the bound itself is applied to the text read)."""
         for name in names:
             if name in fields and isinstance(fields[name].value, str) and (raw := fields[name].value.strip()):
                 parts, cap = _parts(raw), limit * 4
                 if len(parts) == 1 and parts[0][0]:  # braced, quoted or a number: the file's own text
-                    return parts[0][1][:cap] if literal else _latex(parts[0][1][:cap])
+                    text, _ = expand(parts, cap)
+                    return text if literal else _latex(text)
                 if (raw, cap, literal) not in values:  # a macro every entry uses is expanded and read once
-                    text = expand(parts, cap)
+                    text, _ = expand(parts, cap)
                     spend(len(text))
                     values[raw, cap, literal] = text if literal else _latex(text)
                 return values[raw, cap, literal]
@@ -364,14 +346,24 @@ def _bibtex(text, beat):
                          else {"literal": family if family.strip() else _latex(name)})
         return found
 
-    for entry in entries:
+    for block in library.blocks:
+        found = getattr(block, "ignore_error_block", None) if isinstance(block, ParsingFailedBlock) else block
+        if isinstance(found, String):  # a macro defined again is read as BibTeX reads it, in its place
+            define(found)
+            continue
+        if isinstance(block, ParsingFailedBlock) and not isinstance(found, Entry):
+            yield None  # a block the parser could not read
+            continue
+        if not isinstance(found, Entry):  # a comment or a preamble
+            continue
+        entry = found
         beat()  # each entry: a long value's LaTeX takes a moment
         fields = {key.lower(): field for key, field in entry.fields_dict.items()}
         kind = entry.entry_type.lower()
         try:
-            eprint = (_escapes(value(fields, "eprint", literal=True)) or "").strip()
+            eprint = _ARXIV_PREFIX.sub("", (_escapes(value(fields, "eprint", literal=True)) or "").strip())
             arxiv = eprint if eprint and (value(fields, "archiveprefix", "eprinttype") or "").lower() == "arxiv" else None
-            url = [f"https://arxiv.org/abs/{arxiv}"] if arxiv and ARXIV.fullmatch(re.sub(r"v\d+$", "", arxiv)) else []
+            valid = bool(arxiv) and _ARXIV_WHOLE.fullmatch(arxiv) is not None
             number = value(fields, "number")
             record = {
                 "type": _BIBTEX_TYPES.get(kind, "article"),
@@ -384,12 +376,14 @@ def _bibtex(text, beat):
                 "page": (value(fields, "pages") or "").replace("--", "-") or None,
                 "publisher": value(fields, "publisher", "institution", "school", "organization"),
                 "DOI": _escapes(value(fields, "doi", literal=True)),
-                "URL": [_escapes(value(fields, "url", literal=True))] + url,  # an eprint not an arXiv ID: its number is left out
+                "URL": [_escapes(value(fields, "url", literal=True))] + ([f"https://arxiv.org/abs/{arxiv}"] if valid else []),
                 "ISBN": value(fields, "isbn"), "ISSN": value(fields, "issn"),
                 "language": value(fields, "language", "langid"),
                 "abstract": value(fields, "abstract", limit=ABSTRACT_CHARS),
                 "keyword": re.split(r"[,;]", value(fields, "keywords", limit=KEYWORDS * KEYWORD_CHARS) or ""),
-                "number": f"arXiv:{arxiv}" if arxiv else (number if kind != "article" else None),
+                # an arXiv eprint the whole of which is no arXiv ID is left out, and counted
+                "number": f"arXiv:{arxiv}" if valid else (number if kind != "article" else None),
+                "dropped": 1 if arxiv and not valid else 0,
             }
         except _Refused:  # a value it cannot read as written: the record is skipped, never read wrong
             record = None
@@ -397,8 +391,8 @@ def _bibtex(text, beat):
 
 
 class _Refused(Exception):
-    """A BibTeX value that cannot be read as written: malformed, or a macro undefined, circular or
-    nested past MACRO_DEPTH."""
+    """A BibTeX value that cannot be read as written: malformed, longer than its cap, or a macro not
+    defined before it (or whose own definition could not be read), or nested past MACRO_DEPTH."""
 
 
 _DELIMITERS = re.compile(r'[{}"]')
@@ -636,12 +630,12 @@ def _finish(record):
     title = _text(record.get("title"), TITLE_CHARS)
     if title is None:
         return None, 0
+    dropped = record.get("dropped", 0)  # what a reader left out itself (BibTeX: an eprint no arXiv ID)
     csl = {"type": record["type"] if isinstance(record.get("type"), str) and _TYPE.fullmatch(record["type"])
            else "article", "title": title}
     authors = [name for name in map(_name, (record.get("author") or [])[:AUTHORS * 4]) if name][:AUTHORS]
     if authors:
         csl["author"] = authors
-    dropped = 0
     if isinstance(record.get("issued"), str) and (year := _YEAR.search(record["issued"][:100])):
         csl["issued"] = {"date-parts": [[int(year.group(1))]]}
     elif _text(record.get("issued"), 100):
@@ -664,8 +658,8 @@ def _finish(record):
     keywords = [k for k in (_text(k, KEYWORD_CHARS) for k in (record.get("keyword") or [])[:KEYWORDS * 4]) if k]
     if keywords:
         csl["keyword"] = ", ".join(dict.fromkeys(keywords[:KEYWORDS]))
-    arxiv = _ARXIV_IN.search(csl["number"]) if "number" in csl else None
-    if arxiv and not ARXIV.fullmatch(arxiv.group(1)) or not arxiv and csl.get("number", "").startswith("arXiv:"):
+    if "number" in csl and _ARXIV_NAMED.search(csl["number"]) \
+            and not ((found := _ARXIV_IN.search(csl["number"])) and ARXIV.fullmatch(found.group(1))):
         del csl["number"]  # it names an arXiv ID the pattern does not take: not kept as one
         dropped += 1
     return csl, dropped
@@ -676,11 +670,18 @@ def identifier(csl):
     by its pattern): ("doi", DOI), else ("arxiv", ID) from its number or its arxiv.org URL, or None."""
     if isinstance(csl.get("DOI"), str) and (doi := clean_doi(csl["DOI"])):
         return "doi", doi
-    for key in ("number", "URL"):
-        if isinstance(csl.get(key), str) and (found := _ARXIV_IN.search(csl[key][:URL_CHARS])) \
-                and ARXIV.fullmatch(found.group(1)):
-            return "arxiv", found.group(1)
-    return None
+    found = _ARXIV_IN.search(csl["number"]) if isinstance(csl.get("number"), str) else None
+    if found is None and isinstance(csl.get("URL"), str):  # an arxiv.org URL whose whole path is an ID's page
+        try:
+            url = urlsplit(csl["URL"])
+            found = _ARXIV_PATH.fullmatch(url.path) if (url.hostname or "") in _ARXIV_HOSTS else None
+        except ValueError:
+            found = None
+    return ("arxiv", found.group(1)) if found and ARXIV.fullmatch(found.group(1)) else None
+
+
+_ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
+_ARXIV_PATH = re.compile(r"/(?:abs|pdf)/(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?(?:\.pdf)?/?", re.IGNORECASE)
 
 
 def valid(csl):
