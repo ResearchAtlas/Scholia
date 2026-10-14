@@ -8,16 +8,30 @@ import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
-import { fieldKey, indexReason, offerOutcome, paperIndexed, queryOf, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
+import { fieldKey, indexReason, offerOutcome, onFieldKey, paperIndexed, queryOf, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
 
 const t = makeT('en');
 
 test('Enter searches, Escape clears, and Enter while an input method composes does neither', () => {
   assert.equal(fieldKey({ key: 'Enter', isComposing: false, keyCode: 13 }), 'search');
-  assert.equal(fieldKey({ key: 'Enter', isComposing: true, keyCode: 13 }), null); // choosing 最低工资 in pinyin
-  assert.equal(fieldKey({ key: 'Enter', isComposing: false, keyCode: 229 }), null); // WebKit's composing Enter
+  assert.equal(fieldKey({ key: 'Enter', isComposing: true, keyCode: 13 }), 'compose'); // choosing 最低工资 in pinyin
+  assert.equal(fieldKey({ key: 'Enter', isComposing: false, keyCode: 229 }), 'compose'); // WebKit's composing Enter
   assert.equal(fieldKey({ key: 'Escape', isComposing: false, keyCode: 27 }), 'clear');
   assert.equal(fieldKey({ key: 'a', isComposing: false, keyCode: 65 }), null);
+});
+
+test('an Enter confirming composed characters keeps its default, so the input method commits them, and holds off the search', () => {
+  const pressed = (key, isComposing, keyCode) => {
+    const event = { key, keyCode, nativeEvent: { isComposing }, prevented: 0, preventDefault() { this.prevented += 1; } };
+    const cleared = [];
+    const hold = onFieldKey(event, () => cleared.push(true));
+    return { hold, prevented: event.prevented, cleared: cleared.length };
+  };
+  assert.deepEqual(pressed('Enter', true, 13), { hold: true, prevented: 0, cleared: 0 }); // connector thread 4237098120
+  assert.deepEqual(pressed('Enter', false, 229), { hold: true, prevented: 0, cleared: 0 });
+  assert.deepEqual(pressed('Enter', false, 13), { hold: false, prevented: 0, cleared: 0 }); // the form's submission searches
+  assert.deepEqual(pressed('Escape', false, 27), { hold: false, prevented: 1, cleared: 1 });
+  assert.deepEqual(pressed('a', false, 65), { hold: false, prevented: 0, cleared: 0 });
 });
 
 test('blank or invisible-only input searches nothing', () => {

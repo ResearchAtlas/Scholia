@@ -20,7 +20,7 @@ import { cn } from '@/lib/utils';
 // S1-17: search and the search index
 import { Input } from '@/components/ui/input';
 import { downloadOffered } from '../helper.js';
-import { fieldKey, indexPoll, indexReason, indexStatus, paperIndexed, queryOf, searchNote, searchProject, whereIs } from '../search.js';
+import { indexPoll, indexReason, indexStatus, onFieldKey, paperIndexed, queryOf, searchNote, searchProject, whereIs } from '../search.js';
 import { LocalOnlySearchNote } from './LocalHelper.jsx';
 
 const POLL_MS = 1500; // while a paper is read, a lookup runs or a question waits
@@ -323,27 +323,21 @@ function useSearch(projectId) {
   return { text, setText, shown, busy, problem, search, clear };
 }
 
-// The search field: Enter searches (not while an input method composes), Escape clears.
+// The search field: Enter searches (not while an input method composes: onFieldKey), Escape clears.
 function SearchField({ search }) {
   const t = useT();
   const id = useId();
-  function onKeyDown(event) {
-    const action = fieldKey({ key: event.key, isComposing: event.nativeEvent.isComposing, keyCode: event.keyCode });
-    if (action === 'clear') {
-      event.preventDefault();
-      search.clear();
-    } else if (event.key === 'Enter' && action === null) {
-      event.preventDefault(); // confirming composed characters, not searching
-    }
-  }
+  const composing = useRef(false); // an Enter confirming composed characters is down: no search
   return (
     <form role="search" className="flex shrink-0 items-center gap-1.5 border-b px-4 py-2"
-      onSubmit={(event) => { event.preventDefault(); search.search(); }}>
+      onSubmit={(event) => { event.preventDefault(); if (!composing.current) search.search(); }}>
       <label htmlFor={id} className="sr-only">{t('search.label')}</label>
       <div className="relative min-w-0 flex-1">
         <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
         <Input id={id} value={search.text} placeholder={t('search.placeholder')} autoComplete="off" spellCheck={false}
-          className="h-8 pl-8" onChange={(event) => search.setText(event.target.value)} onKeyDown={onKeyDown} />
+          className="h-8 pl-8" onChange={(event) => search.setText(event.target.value)}
+          onKeyDown={(event) => { composing.current = onFieldKey(event, search.clear); }}
+          onKeyUp={() => { composing.current = false; }} />
       </div>
       {(search.shown || search.text) && (
         <Button type="button" size="icon" variant="ghost" className="size-8" title={t('search.clear')} aria-label={t('search.clear')}

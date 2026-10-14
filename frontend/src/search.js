@@ -16,11 +16,23 @@ export const indexStatus = (projectId) => get(`/api/projects/${encodeURIComponen
 export const rebuildIndex = (projectId) => post(`/api/projects/${encodeURIComponent(projectId)}/index/rebuild`);
 
 // What a key pressed in the search field does: 'search' on Enter, except while an input method
-// composes (Enter then confirms the Chinese characters chosen), 'clear' on Escape, else null.
+// composes (Enter then confirms the Chinese characters chosen: 'compose'), 'clear' on Escape, else null.
 export function fieldKey(event) {
   if (event.key === 'Escape') return 'clear';
-  if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) return 'search';
+  if (event.key === 'Enter') return event.isComposing || event.keyCode === 229 ? 'compose' : 'search';
   return null;
+}
+
+// The search field's keydown (a React event): Escape clears, its default prevented. An Enter that confirms
+// composed characters keeps its default, so the input method commits them, and the form's submission it may
+// bring is held off: returns whether to hold it off until the key comes up.
+export function onFieldKey(event, clear) {
+  const action = fieldKey({ key: event.key, isComposing: event.nativeEvent?.isComposing, keyCode: event.keyCode });
+  if (action === 'clear') {
+    event.preventDefault();
+    clear();
+  }
+  return action === 'compose';
 }
 
 // The query the field sends, or null when it holds nothing visible (nothing is searched then).
