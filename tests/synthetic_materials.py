@@ -218,17 +218,19 @@ GLYPH_NOTES = ("# Unmapped Glyphs (synthetic)\n\n## Findings\n\n"
                + "最低工资提高了低收入工人的收入" * 130 + "\n\n" + "\ue000" * 120 + "\n").encode()
 
 
-def helper_tokenizer(path, body, slot, *, extra=0, refuse=None):
+def helper_tokenizer(path, body, slot, *, extra=0, refuse=None, per_byte=False):
     """The stand-in helper's tokenizer and slot, as llama-server answers them, as (status, JSON), or None
     for a path it leaves to its caller: one token per UTF-8 byte (byte-level BPE at its most spread out;
     `extra` tokens more, counted after them, as a text whose own count runs over its cut's), tokens
-    read back as their bytes (a split character as U+FFFD), and an embedding input over the slot (its
+    read back as their bytes (a split character as one U+FFFD, or with per_byte one for each of its
+    bytes), and an embedding input over the slot (its
     tokens and the one special token the server adds) refused with HTTP 400, as is one containing
     `refuse`."""
     if path == "/tokenize":
         return 200, {"tokens": list(body["content"].encode()) + [32] * extra}
     if path == "/detokenize":
-        return 200, {"content": bytes(body["tokens"]).decode(errors="replace")}
+        content = bytes(body["tokens"]).decode(errors="surrogateescape" if per_byte else "replace")
+        return 200, {"content": "".join("\ufffd" if "\udc80" <= c <= "\udcff" else c for c in content)}
     if path == "/v1/embeddings":
         for text in body["input"]:
             if refuse is not None and refuse in text:

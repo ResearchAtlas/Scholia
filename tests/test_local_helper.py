@@ -114,9 +114,9 @@ class Fake:
 SLOT = local_helper.CONTEXT // local_helper.SLOTS  # what the stand-in holds per input, as llama-server's slot
 
 
-def tokenizer(path, body, extra=0, refuse=None):
+def tokenizer(path, body, extra=0, refuse=None, per_byte=False):
     """The stand-in's tokenizer and slot (synthetic_materials.helper_tokenizer), as a response."""
-    answer = synthetic_materials.helper_tokenizer(path, body, SLOT, extra=extra, refuse=refuse)
+    answer = synthetic_materials.helper_tokenizer(path, body, SLOT, extra=extra, refuse=refuse, per_byte=per_byte)
     return None if answer is None else httpx.Response(answer[0], json=answer[1])
 
 
@@ -135,7 +135,7 @@ class Remote:
         self.files = {}  # URL -> (status, headers, body or async iterator)
         self.scores = None  # reranking scores to answer with, instead of 1 / (rank + 1)
         self.rows = None  # embedding reply rows to answer with, instead of one per input
-        self.extra, self.refuse, self.status = 0, None, None
+        self.extra, self.refuse, self.status, self.per_byte = 0, None, None, False
 
     def key(self, port):
         """The key of the server that announced port (50000 + its launch's number)."""
@@ -164,7 +164,7 @@ class Remote:
             await self.hold[request.url.path].wait()
         if self.status is not None and request.url.path in ("/tokenize", "/detokenize", "/v1/embeddings"):
             return httpx.Response(self.status, json={"error": "as the test says"})
-        if (answer := tokenizer(request.url.path, body, self.extra, self.refuse)) is not None:
+        if (answer := tokenizer(request.url.path, body, self.extra, self.refuse, self.per_byte)) is not None:
             return answer
         if request.url.path == "/v1/embeddings":
             return httpx.Response(200, json={"data": self.rows or [{"index": i, "embedding": [0.5, 0.5, 0.5, 0.5]}
@@ -843,6 +843,17 @@ async def test_an_input_over_the_slot_is_embedded_on_its_longest_prefix_within_i
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("per_byte", [False, True], ids=["one U+FFFD", "one per byte"])
+async def test_a_split_character_read_back_as_u_fffd_goes_and_the_texts_own_stay(tmp_path, fake, timings, per_byte):
+    async with app(tmp_path, fake) as client:
+        client.remote.per_byte = per_byte  # llama.cpp's reading back of a cut character, either way
+        text = "w" * 2008 + "\ufffd" * 2 + "最" * 500  # the cut falls inside the first 最, after two of its own
+        await local_helper.embed(client.state, [text])
+        [[sent]] = [body["input"] for body in _sent(client, "/v1/embeddings")]
+        assert sent == "w" * 2008 + "\ufffd" * 2
+
+
+@pytest.mark.asyncio
 async def test_a_text_within_the_margin_in_bytes_is_sent_as_it_is_uncounted(tmp_path, fake, timings):
     async with app(tmp_path, fake) as client:
         text = "é" * (local_helper.INPUT_TOKENS // 2)  # two bytes each: at most as many tokens
@@ -884,6 +895,8 @@ async def test_an_input_no_cut_brings_within_the_slot_is_refused_and_never_sent(
             await local_helper.embed(client.state, [text])
         assert _sent(client, "/v1/embeddings") == []
         assert 1 <= len(_sent(client, "/tokenize")) <= local_helper.BOUND_TRIES + 1
+        if text.startswith("最"):  # cut to one token, read back as a split character's U+FFFD: nothing left, refused
+            assert (len(_sent(client, "/tokenize")), len(_sent(client, "/detokenize"))) == (2, 2)
 
 
 @pytest.mark.asyncio
