@@ -881,19 +881,13 @@ def test_a_hook_that_raises_beyond_exception_still_closes_the_writer_and_fails_e
 
 
 @pytest.mark.parametrize("failing", [None, "drain", "hook", "reader", "backup", "writer"])
-def test_a_close_writes_its_marker_first_and_removes_it_only_when_every_step_succeeded(tmp_path, monkeypatch, failing):
-    """PR 29 recheck 3, findings 43, 45 and 48, failing closed (Harold, 2026-10-15): the marker (the search index's,
-    which makes the next launch discard it) is written before anything else, the drain and the hooks included, and
-    removed only by a close whose every step succeeded. Whatever fails (the drain, a hook's ordinary error, a read
-    connection, a backup still running after STOP_SECONDS, the writer), the marker stays and every close raises
-    DatabaseCloseError."""
-    from backend.db import DatabaseCloseError
+def test_a_close_that_fails_anywhere_holds_file_replacement_off_for_the_process(tmp_path, monkeypatch, failing):
+    """PR 29 rechecks 3 and 4, findings 43, 45, 48 and 51, failing closed (Harold, 2026-10-15): whatever step of a
+    close fails (the drain, a hook's ordinary error, a read connection, a backup still running after STOP_SECONDS,
+    the writer), every close raises DatabaseCloseError and close_failed() holds for the rest of the process (no
+    file is replaced: backend/backups.py); a close whose every step succeeds leaves it unset."""
+    from backend.db import DatabaseCloseError, close_failed
     db = Database(tmp_path / "data")
-    marker = tmp_path / "data" / "discard"
-    db.marker = marker
-    seen = []
-    db.closing.append(lambda: seen.append(marker.exists()))
-    holding = threading.Event()
     if failing == "drain":
         real_submit = db._writer.submit
 
@@ -929,8 +923,10 @@ def test_a_close_writes_its_marker_first_and_removes_it_only_when_every_step_suc
     finally:
         if failing == "backup":
             db._backup_lock.release()
-    assert seen == [True]  # written before the hooks ran
-    assert marker.exists() == (failing is not None) and db.closed and db._writer._shutdown
+    assert close_failed() == (failing is not None) and db.closed and db._writer._shutdown
+    with Database(tmp_path / "data") as again:  # a new database in the same process: the flag holds all the same
+        pass
+    assert close_failed() == (failing is not None)
 
 # Backups while the app is open
 

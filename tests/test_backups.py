@@ -1485,13 +1485,13 @@ async def test_a_file_that_appears_at_a_backups_name_meanwhile_is_never_replaced
     assert sorted(p.name for p in destination.iterdir()) == sorted([audited[0].name, path.name])  # no temporary left
 
 
-# Failing closed (Harold, 2026-10-15; PR 29 recheck 3, finding 47): files are replaced only after a close that succeeded
+# Failing closed (Harold, 2026-10-15, as simplified): one failed close holds file replacement off for the rest of the
+# process (PR 29 findings 47 and 49)
 
 
 async def test_a_restore_whose_running_database_fails_to_close_puts_nothing_in_place(tmp_path, monkeypatch):
     """The running database's close fails as a restore is about to put the backup in place: nothing is moved, the
-    restore says it did not happen, and the app is limited (it runs on no database); a second restore is refused
-    the same way, the close's failure being said again."""
+    restore says to restart the app, and the app is limited; a second restore is refused the same way."""
     data = tmp_path / "data"
     async with started(data) as client:
         backup = (await client.post("/api/backups")).json()["id"]
@@ -1501,19 +1501,25 @@ async def test_a_restore_whose_running_database_fails_to_close_puts_nothing_in_p
         def failing():
             raise sqlite3.OperationalError("disk I/O error")
         monkeypatch.setattr(db, "_close_writer", failing)
-        put = []
-        monkeypatch.setattr(backups_module, "_put_in_place", lambda *args: put.append(args))
+        real_put, put = backups_module._put_in_place, []
+
+        def put_in_place(*args):
+            put.append(args)
+            return real_put(*args)
+        monkeypatch.setattr(backups_module, "_put_in_place", put_in_place)
         for _ in range(2):
             response = await client.post("/api/backups/restore", json={"generation": backup})
-            assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+            assert (response.status_code, response.json()["code"]) == (409, "restart_required")
         assert put == [] and (data / "projects" / project / "config.toml").is_file()
         assert not (data / "backups" / backups_module.JOURNAL).exists()
-        assert (await client.get("/api/health")).json().get("database_damaged")
+        assert (await client.get("/api/projects")).json()["code"] == "restart_required"  # limited: restart
 
 
-async def test_a_failed_restore_whose_restored_database_fails_to_close_is_not_put_back(tmp_path, monkeypatch):
-    """The restored database cannot start, and its close fails: the previous files are not put back over it (its
-    journal stays, for the next launch to finish), and the restore says it could be neither finished nor undone."""
+async def test_a_failed_restore_whose_restored_database_fails_to_close_puts_nothing_back_nor_in_place(tmp_path,
+                                                                                                        monkeypatch):
+    """Findings 47 and 49: the restored database cannot start, and its close fails. The previous files are not put
+    back over it (the journal stays, for the next launch to finish), and a second Restore, though the failed
+    database was forgotten (_stop, _forget), is refused before anything moves: the app says to restart."""
     from backend.runs import Harness
     data = tmp_path / "data"
     async with started(data) as client:
@@ -1533,10 +1539,14 @@ async def test_a_failed_restore_whose_restored_database_fails_to_close_is_not_pu
             if self is not original:  # the restored database's
                 raise sqlite3.OperationalError("disk I/O error")
             return real_close_writer(self)
-        put_back = []
+        moved = []
+        real_back, real_put = backups_module._back, backups_module._put_in_place
         monkeypatch.setattr(Harness, "recover", failing_once)
         monkeypatch.setattr(Database, "_close_writer", close_writer)
-        monkeypatch.setattr(backups_module, "_back_from_journal", lambda *args, **kwargs: put_back.append(args))
+        monkeypatch.setattr(backups_module, "_back", lambda *args, **kwargs: moved.append("back") or real_back(*args, **kwargs))
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
-        assert put_back == [] and (data / "backups" / backups_module.JOURNAL).exists()
+        assert moved == [] and (data / "backups" / backups_module.JOURNAL).exists()
+        monkeypatch.setattr(backups_module, "_put_in_place", lambda *args: moved.append("put") or real_put(*args))
+        again = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (again.status_code, again.json()["code"]) == (409, "restart_required") and moved == []

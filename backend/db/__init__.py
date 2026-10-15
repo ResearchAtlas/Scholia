@@ -10,6 +10,7 @@ from backend.db.database import (
     DatabaseDamagedError,
     ForeignDatabaseError,
     NewerDatabaseError,
+    close_failed,
     new_id,
     utc_now,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "DatabaseDamagedError",
     "ForeignDatabaseError",
     "NewerDatabaseError",
+    "close_failed",
     "delete",
     "new_id",
     "utc_now",

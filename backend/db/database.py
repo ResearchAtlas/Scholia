@@ -64,8 +64,24 @@ class DatabaseClosedError(RuntimeError):
 
 
 class DatabaseCloseError(RuntimeError):
-    """Closing the database failed: what it closes may still be open (its marker, if any, stays). Nothing may
-    replace its files (a restore, its undoing) after such a close."""
+    """Closing the database failed: what it closes may still be open. From then on nothing in this process
+    replaces the data folder's files (close_failed)."""
+
+
+# Set by the first close (of a database or of what reads it, the search index) that fails, and never cleared:
+# what that close left open may still be open, so for the rest of this process no restore, its undoing or a
+# launch's undoing replaces files (backend/backups.py), and the app says to restart it.
+_close_failed = threading.Event()
+
+
+def close_failed():
+    """Whether any close in this process has failed (see _close_failed)."""
+    return _close_failed.is_set()
+
+
+def note_close_failed():
+    """Record that a close failed (see _close_failed); for what closes with a database (the search index)."""
+    _close_failed.set()
 
 
 class DatabaseDamagedError(RuntimeError):
@@ -101,9 +117,6 @@ class Database:
         self._damaged = None  # why writing stopped, once an integrity check fails
         self.on_damage = None  # called once, from the thread whose check found the database damaged
         self.closing = []  # called by close() once its writes are refused and drained, before it reads no more (S1-17: the search index)
-        # A file close() writes before anything else and removes only once every step of it succeeded (S1-17: the
-        # search index's discard marker, which makes the next launch discard and rebuild the index)
-        self.marker = None
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
@@ -301,15 +314,15 @@ class Database:
         (DatabaseClosedError); reads in progress finish first, and a write already
         submitted runs before the writer connection closes. So work still running when
         the app stops gets an error, never a connection closed under it. A backup in
-        progress is stopped, and waited for up to STOP_SECONDS. First writes are refused, then the marker is
-        written (if one is set), then those already admitted commit (as hold_writes does); then what reads this
-        database (closing: the search index) is closed, its work drained, so it sees every write that will ever
-        commit (a deletion's queued removals). The marker is removed only once every step succeeded. The first
-        close() closes it, and one called while it runs, or after, waits for it to finish (but one called from
-        inside it, by a hook, returns at once). Fail closed: whatever fails (the marker, the drain, a hook, a
-        read connection, a backup still running after STOP_SECONDS, the writer), every other step is still tried
-        and the writer thread stopped, the marker stays, and every close() raises DatabaseCloseError, so a
-        failed close never reads as done. Never call close() from inside read(): the close waits for that read."""
+        progress is stopped, and waited for up to STOP_SECONDS. First writes are refused and those already
+        admitted commit (as hold_writes does); then what reads this database (closing: the search index) is
+        closed, its work drained, so it sees every write that will ever commit (a deletion's queued removals).
+        The first close() closes it, and one called while it runs, or after, waits for it to finish (but one
+        called from inside it, by a hook, returns at once). Fail closed: whatever fails (the drain, a hook, a read
+        connection, a backup still running after STOP_SECONDS, the writer), every other step is still tried and
+        the writer thread stopped, close_failed() holds for the rest of the process, and every close() raises
+        DatabaseCloseError, so a failed close never reads as done (the index's next open purges what it left).
+        Never call close() from inside read(): the close waits for that read."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")
@@ -332,8 +345,6 @@ class Database:
             except BaseException as failure:
                 failures.append(failure)
         try:  # everything from here signals its end (_shut), and a failure reaches every close()
-            if self.marker is not None:
-                attempt(lambda: _write_marker(self.marker))
 
             def drain():
                 with self._readers_lock:
@@ -365,9 +376,9 @@ class Database:
         finally:
             try:
                 attempt(self._writer.shutdown)
-                if not failures and self.marker is not None:
-                    attempt(lambda: _remove_marker(self.marker))
             finally:
+                if failures:
+                    _close_failed.set()
                 self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
                 self._close_error = failures[0] if failures else None
                 self._closer = None  # from here a close() on that thread too waits, and is told of a failure
@@ -822,22 +833,6 @@ def _stamp_of(path):
         return datetime.strptime(path.name, _STAMP).replace(tzinfo=UTC)
     except ValueError:
         return None
-
-
-def _write_marker(path):
-    """Create the file at path (owner-only, empty) and make it durable, with its folder's entry."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    _fsync(Path(path).parent)
-
-
-def _remove_marker(path):
-    """Remove the file at path, if there, durably."""
-    Path(path).unlink(missing_ok=True)
-    _fsync(Path(path).parent)
 
 
 def _create_private(path, content=b""):

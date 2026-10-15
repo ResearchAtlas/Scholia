@@ -119,7 +119,7 @@ async def open_index(state, db):
     if previous is not None:
         try:
             await asyncio.to_thread(previous.close)
-        except Exception as error:  # its database's close kept the marker: this open discards the file
+        except Exception as error:  # close_failed() holds; this open purges the file before any read
             log.warning("the previous search index's close had failed (%s)", type(error).__name__)
     index = SearchIndex(state["data_dir"], db, identity(state.get("helper_config") or local_helper.Config()))
     try:
@@ -128,11 +128,10 @@ async def open_index(state, db):
         log.error("the search index could not be opened (%s); search is unavailable", type(error).__name__)
         try:
             await asyncio.to_thread(index.close)
-        except Exception as failure:  # its marker, if any, stays for the next open
+        except Exception as failure:  # close_failed() holds; the next open purges the file
             log.warning("closing the search index that could not be opened failed (%s)", type(failure).__name__)
         return
     db.closing.append(index.close)  # a restore under way or abandoned, or shutdown: nothing outlives db
-    db.marker = index.marker  # kept by a close that fails: the next open discards the file (fail closed)
     state["index"] = index
     state["model_installed"] = lambda: asyncio.ensure_future(_embed_all(state))
     loop = asyncio.get_running_loop()

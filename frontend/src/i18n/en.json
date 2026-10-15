@@ -175,6 +175,7 @@
   "errors.newer_schema": "That backup comes from a newer version of Scholia. Update Scholia to restore it.",
   "errors.restore_failed": "The backup could not be put in place. Nothing was changed.",
   "errors.restore_interrupted": "The restore was interrupted. Close Scholia and open it again to finish it.",
+  "errors.restart_required": "Scholia could not close its database cleanly. Close Scholia and open it again before restoring a backup.",
   "errors.restoring": "Scholia is restoring a backup. Try again when it has finished.",
   "errors.work_running": "Some running work did not stop in time, so nothing was restored. Try again in a moment.",
   "errors.safety_copy_failed": "Scholia could not first save its current state, so nothing was restored.",

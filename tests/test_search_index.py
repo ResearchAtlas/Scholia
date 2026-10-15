@@ -1213,12 +1213,11 @@ async def test_queue_rows_a_failed_prune_left_leave_at_the_next_pass(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_a_close_whose_wal_truncation_stays_owed_leaves_the_marker_and_the_launch_discards_the_file(tmp_path,
-                                                                                                         monkeypatch):
+async def test_a_close_whose_wal_truncation_stays_owed_fails_and_the_next_open_truncates_it_before_any_read(
+        tmp_path, monkeypatch):
     """The internal review of fix batch 5, P3, failing closed (Harold, 2026-10-15): a deletion's removals applied
     but the WAL's truncation failing, at the pass and again as the index closes: old WAL frames may hold the
-    paper's text, so the close fails and keeps the marker, and the next launch discards the file before anything
-    reads it, then rebuilds it."""
+    paper's text, so the close fails (close_failed), and the next open truncates the WAL before anything reads."""
     monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
     english = "Wombats catalogue saffron theodolites"
     async with app(tmp_path) as client:
@@ -1231,10 +1230,10 @@ async def test_a_close_whose_wal_truncation_stays_owed_leaves_the_marker_and_the
         index._conn = failing = FailingCheckpoints(index._conn, "IOError", failures=100)
         assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
         assert index._truncate and failing.calls  # applied, its truncation owed
-    assert len(failing.calls) >= 2 and index.marker.exists()  # tried again at the close, which failed
+    from backend.db import close_failed
+    assert len(failing.calls) >= 2 and close_failed()  # tried again at the close, which failed
     async with app(tmp_path) as client:
-        assert not index.marker.exists()
-        assert not any(b"wombat" in f.read_bytes().lower() for f in files if f.exists())  # discarded, then rebuilt
+        assert not any(b"wombat" in f.read_bytes().lower() for f in files if f.exists())  # truncated at open
         status = await until_embedded(client, project)
         assert status["passages"]["indexed"] == 4  # the kept paper's
         assert await asyncio.to_thread(client.state["index"].keyword, project, "wombats", 50) == []
@@ -1443,8 +1442,8 @@ async def test_an_index_close_that_fails_after_its_drain_is_reported_to_every_la
 @pytest.mark.asyncio
 async def test_a_read_connection_that_fails_to_close_closes_the_rest_and_fails_the_close(tmp_path, monkeypatch):
     """Recheck of 3fb92ba, N1, failing closed: an idle read connection whose close fails as the index closes: the
-    other idle ones are closed all the same, and the failure is the close's, never only a log line; the database's
-    close then fails too and keeps the marker, so the next launch discards the file."""
+    other idle ones are closed all the same, and the failure is the close's, never only a log line: close_failed()
+    then holds."""
     import threading
     async with app(tmp_path) as client:
         project = await project_of(client)
@@ -1484,20 +1483,24 @@ async def test_a_read_connection_that_fails_to_close_closes_the_rest_and_fails_t
         assert index._readers.empty()
         with pytest.raises(search_index.apsw.ConnectionClosedError):
             pooled[1].execute("SELECT 1")
-    assert index.marker.exists()
+        from backend.db import close_failed
+        assert close_failed()
 
 
 
-# Failing closed (Harold, 2026-10-15; PR 29 recheck 3, findings 43 to 46)
+# Failing closed (Harold, 2026-10-15, as simplified: every open purges before any read; one failed close holds file
+# replacement off for the rest of the process. PR 29 findings 43 to 46 and 49 to 51, 54)
 
 
+@pytest.mark.parametrize("left", ["queued", "ungranted"])
 @pytest.mark.asyncio
-async def test_a_close_that_fails_keeps_the_marker_and_the_next_launch_discards_the_file_before_any_read(tmp_path,
-                                                                                                         monkeypatch):
-    """A deletion whose removals the index's close cannot apply (a failure as it closes): the close fails, so the
-    database's close keeps the index's marker; the next launch discards the file, the deleted paper's text with
-    it, before anything reads it, and rebuilds the kept paper's rows from the main database."""
-    from backend.db import deletion
+async def test_what_a_failed_close_leaves_of_a_deletion_is_purged_at_the_next_open_before_any_read(tmp_path,
+                                                                                                    monkeypatch, left):
+    """A deletion whose removals the index's close could not apply: the close fails (close_failed), and the deleted
+    paper's text stays in the file. The next open, before anything reads it, applies the queue (queued) or, the
+    queue lost as after a crash, removes every row of a passage the main database no longer grants (ungranted), and
+    truncates the WAL: the first read finds none of it, and the kept paper's rows are as they were."""
+    from backend.db import close_failed, deletion
     english = "Quokkas annotate vermilion abacuses"
     async with app(tmp_path) as client:
         project = await project_of(client)
@@ -1509,12 +1512,14 @@ async def test_a_close_that_fails_keeps_the_marker_and_the_next_launch_discards_
         files = [index.path, Path(f"{index.path}-wal")]
         monkeypatch.setitem(deletion.CLEANUP, client.state["db"], lambda: None)  # its removals left to the close
         assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        if left == "ungranted":  # the queue rows gone too, as a crash between the commit and the pass may leave none
+            await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute("DELETE FROM index_queue"))
 
         def failing(self):
             raise search_index.apsw.IOError("disk I/O error")
         monkeypatch.setattr(SearchIndex, "_remove_queued", failing)
     monkeypatch.undo()
-    assert index.marker.exists() and english.encode() in b"".join(f.read_bytes() for f in files if f.exists())
+    assert close_failed() and english.encode() in b"".join(f.read_bytes() for f in files if f.exists())
     reads = []
     real_read = SearchIndex._read
 
@@ -1525,20 +1530,20 @@ async def test_a_close_that_fails_keeps_the_marker_and_the_next_launch_discards_
     async with app(tmp_path) as client:
         status = await until_embedded(client, project)
         assert reads and not any(english.encode() in b or b"quokkas" in b for b in reads[0])  # gone before the first read
-        assert not index.marker.exists() and list(status["materials"]) == [kept["id"]]
+        assert list(status["materials"]) == [kept["id"]] and status["passages"]["embedded"] == 4
+        assert client.remote.indexing == []  # nothing embedded again: the purge only removes
 
 
 @pytest.mark.asyncio
-async def test_a_discard_that_fails_as_the_index_closes_fails_the_close_and_keeps_the_marker(tmp_path, monkeypatch):
+async def test_a_discard_that_fails_as_the_index_closes_fails_the_close(tmp_path, monkeypatch):
     """Finding 44: the close's discard of a file a whole rebuild has not finished, its unlink failing, is the
-    close's failure, never a logged success: the database's close raises and keeps the marker, and the next open
-    discards the file."""
+    close's failure, never a logged success: the database's close raises and close_failed() holds; the next open
+    purges (or rebuilds) the file left before anything reads it."""
     import threading
-    from backend.db import Database, DatabaseCloseError
+    from backend.db import Database, DatabaseCloseError, close_failed
     db = await asyncio.to_thread(Database, tmp_path / "data")
     index = SearchIndex(tmp_path / "data", db, {"model": "m"})
     db.closing.append(index.close)
-    db.marker = index.marker
     real_unlink, failed = Path.unlink, []
 
     def unlink(self, missing_ok=False):
@@ -1558,48 +1563,59 @@ async def test_a_discard_that_fails_as_the_index_closes_fails_the_close_and_keep
     with pytest.raises(DatabaseCloseError):
         await asyncio.wait_for(closing, 10)
     monkeypatch.setattr(Path, "unlink", real_unlink)
-    assert failed and index.path.exists() and index.marker.exists()
+    assert failed and index.path.exists() and close_failed()
     db = await asyncio.to_thread(Database, tmp_path / "data")
     again = SearchIndex(tmp_path / "data", db, {"model": "m"})
     try:
         await asyncio.to_thread(again.open)
-        assert not again.marker.exists()
     finally:
         await asyncio.to_thread(again.close)
         await asyncio.to_thread(db.close)
 
 
+class _FailingClose:
+    """A read connection whose close fails (after closing it)."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self.conn.__enter__()
+
+    def __exit__(self, *exc):
+        return self.conn.__exit__(*exc)
+
+    def close(self):
+        self.conn.close()
+        raise search_index.apsw.IOError("disk I/O error")
+
+
+@pytest.mark.parametrize("generation", ["same", "replaced"])
 @pytest.mark.asyncio
-async def test_a_read_that_returns_after_the_close_began_has_its_connection_closed_by_the_close(tmp_path):
-    """Finding 46: a read still running as the index closes gives its connection back to the close, which closes it:
-    a failure closing it is the close's (never lost on the reader's thread)."""
+async def test_a_read_that_ends_as_the_index_closes_has_its_failed_close_fail_the_close(tmp_path, generation):
+    """Findings 46 and 50: a read still running as the index closes, its connection's close failing: whether it
+    gives the connection to the close (same file) or closes it itself (a file a rebuild replaced meanwhile), the
+    failure is the close's, and close_failed() holds."""
     import threading
+    from backend.db import close_failed
     async with app(tmp_path) as client:
         project = await project_of(client)
         await added(client, project, WAGES)
         await idle(client, project)
         index = client.state["index"]
         conn, _ = search_index.connect(index.path)
-
-        class Failing:  # the read connection the read is given, whose close fails
-            def __enter__(self):
-                return conn.__enter__()
-
-            def __exit__(self, *exc):
-                return conn.__exit__(*exc)
-
-            def close(self):
-                conn.close()
-                raise search_index.apsw.IOError("disk I/O error")
         while not index._readers.empty():
             index._readers.get_nowait().close()
-        index._readers.put(Failing())
+        index._readers.put(_FailingClose(conn))
         reading, go = threading.Event(), threading.Event()
 
         def slow(conn):
             reading.set()
             go.wait(20)
-        reader = threading.Thread(target=index._read, args=(slow,))
+            if generation == "replaced":
+                with index._lock:
+                    index._generation += 1  # as a rebuild that replaced the file
+        reader = threading.Thread(target=_ignoring(index._read), args=(slow,))
         reader.start()
         assert await asyncio.to_thread(reading.wait, 10)
         closing = asyncio.ensure_future(asyncio.to_thread(index.close))
@@ -1610,7 +1626,16 @@ async def test_a_read_that_returns_after_the_close_began_has_its_connection_clos
         await asyncio.to_thread(reader.join, 10)
         with pytest.raises(search_index.apsw.ConnectionClosedError):
             conn.execute("SELECT 1")
-    assert index.marker.exists()  # the database's close, finding the index's close failed, kept it
+        assert close_failed()
+
+
+def _ignoring(fn):
+    def call(*args):
+        try:
+            fn(*args)
+        except Exception:
+            pass
+    return call
 
 # The main database's side: the passages a project's current versions read now (M2 follow-up)
 

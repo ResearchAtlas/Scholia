@@ -34,9 +34,11 @@ the app runs; another tokenizer version re-tokenizes the keyword rows; another m
 quantization, runtime or dimension drops every vector, so that search never uses one from another
 model. A whole rebuild that fails discards its partial file and leaves the index unavailable until
 one succeeds; it is tried again in the writer, sooner and then less often. The index closes with
-its database (Database.closing), its timers cancelled and its writer drained. A close that fails in any
-step leaves a marker beside the file (Database.marker), and the next open discards the file before
-anything reads it, then rebuilds it (fail closed).
+its database (Database.closing), its timers cancelled and its writer drained. Every open, before anything
+reads the file, applies the queue and removes every row of a passage the main database no longer grants,
+then truncates the WAL (_purge): what a close that failed, or a crash, left of a deletion is gone before
+the first read (fail closed). A close that fails holds file replacement off for the rest of the process
+(backend.db.close_failed).
 Nothing here logs text, a title, a query or a path.
 """
 
@@ -56,7 +58,7 @@ import apsw.fts5
 import sqlite_vec
 
 from backend.db import DatabaseClosedError
-from backend.db.database import _fsync
+from backend.db.database import note_close_failed
 from backend.db.deletion import _reads_now
 from backend.settings import _make_private_dirs
 
@@ -274,7 +276,6 @@ class SearchIndex:
 
     def __init__(self, data_dir, db, identity):
         self.path = Path(data_dir) / FILE
-        self.marker = Path(f"{self.path}.discard")  # see open() and Database.marker
         self.db, self.identity = db, {key: str(value) for key, value in identity.items()}
         self.vectors = False  # sqlite-vec loaded: dense search is possible
         self.building = False  # the whole file is being rebuilt
@@ -297,6 +298,7 @@ class SearchIndex:
         self._generation = 0  # a replaced file's readers are closed, not used again
         self._lock = threading.Lock()
         self._reading = 0  # reads in progress, admitted under _lock; close() waits for none
+        self._read_failures = []  # read connections a read could not close, under _lock: the close's failure
         self._reads_done = threading.Condition(self._lock)
         self._close_error = None  # what made close() fail, if it did: raised to every later close() too
         self._writer_ident = None
@@ -362,7 +364,12 @@ class SearchIndex:
                     if keep:
                         self._readers.put(conn)
                 if not keep:  # a replaced file's
-                    conn.close()
+                    try:
+                        conn.close()
+                    except Exception as error:  # the index's close fails with it (_drain_reads)
+                        with self._lock:
+                            self._read_failures.append(error)
+                        raise
         finally:
             with self._lock:
                 self._reading -= 1
@@ -406,13 +413,6 @@ class SearchIndex:
     def _open(self):
         if self.closed:
             return False, False
-        if self.marker.exists():  # a close that failed (or a crash as it closed): the file may hold what was deleted
-            log.warning("the search index was not closed cleanly; it is discarded and rebuilt")
-            for suffix in ("", "-wal", "-shm"):
-                Path(f"{self.path}{suffix}").unlink(missing_ok=True)
-            _fsync(self.path.parent)  # the file gone for good before its marker goes
-            self.marker.unlink()
-            _fsync(self.path.parent)
         self._create()
         try:
             self._conn, self.vectors = self._connect()
@@ -439,10 +439,34 @@ class SearchIndex:
             if any(meta.get(key) != value for key, value in self.identity.items()):
                 self._drop_vectors()
                 wanted = True
+            self._purge()
             return wanted, False
         except apsw.Error as error:  # a file SQLite cannot use (damaged, not a database): replaced
             log.warning("the search index could not be used (%s); it is rebuilt", type(error).__name__)
             return False, True
+
+    def _purge(self):
+        """At every open, before anything reads the file (fail closed): the queue applied (its removals, and its
+        additions, whose text may replace a deleted paper's title), then every row of a passage the main database
+        no longer grants removed and checked gone, and the WAL checkpointed and truncated. What a close that failed,
+        or a crash, left of a deletion is gone before the first read. Returns how many rows it removed."""
+        self._apply_queue()
+        projects = [p for (p,) in self._conn.execute("SELECT DISTINCT project_id FROM index_rows")]
+        grants = self.db.read(lambda conn: {project: granted(conn, project) for project in projects})
+        removed = []
+        with self._conn:
+            for project in projects:
+                for (pid,) in self._conn.execute("SELECT passage_id FROM index_rows WHERE project_id = ?",
+                                                 (project,)).fetchall():
+                    if pid not in grants[project]:
+                        removed += self._remove(project, pid)
+        if removed or self._truncate:
+            self._checkpoint()
+        if self._truncate:  # old WAL frames may hold what was removed: not read until the truncation is done
+            raise CleanupFailed()
+        if removed:
+            log.warning("the search index held %d rows the main database no longer grants; removed", len(removed))
+        return len(removed)
 
     def _database(self):
         """Which main database file the index was built from: its inode. A restore puts another
@@ -511,7 +535,7 @@ class SearchIndex:
         """A file that may hold text a deletion since has removed from the main database goes: a failed
         whole rebuild's partial file (the index stays unusable, building, until a rebuild succeeds), or, as
         the index closes, an unfinished rebuild's. Every step is tried whatever the others meet; the first
-        failure is raised after (as the index closes, its marker then stays, and the next launch discards it)."""
+        failure is raised after (as the index closes, the close then fails, and the next open purges the file)."""
         self.unusable = True
 
         def close_conn():  # kept if its close fails, so the close of the index tries it again
@@ -708,8 +732,8 @@ class SearchIndex:
         with that paper's title: deletion._queue_index_removals), so its old rows go too. The sequence
         applied is left as it is, so the next launch's pass applies the queue in order (the additions
         again, from the main database as it is then). A truncation still owed (one that failed before, or
-        this one) raises CleanupFailed: old WAL frames may hold what was removed, so the close fails and the next
-        launch discards the file (Database.marker)."""
+        this one) raises CleanupFailed: old WAL frames may hold what was removed, so the close fails (and the next
+        open purges the file and truncates its WAL before anything reads it)."""
         last = int(self._conn.execute("SELECT value FROM index_meta WHERE key = 'last_seq'").fetchone()[0])
         rows = self.db.read(lambda conn: conn.execute(
             "SELECT target_id, project_id FROM index_queue WHERE seq > ? AND target = 'passage'"
@@ -939,9 +963,9 @@ class SearchIndex:
         and its additions that retitle a reading another paper keeps) are removed first (_remove_queued).
         A file a whole rebuild has not finished (asked for, under way, or failed) is discarded. Reads still running
         are waited for, and every connection is closed. Fail closed: a step that fails (the removals, the WAL's
-        truncation, a connection's close, the discard) does not stop the others, and the close raises; the
-        database's close then keeps the index's marker, and the next launch discards the file before anything
-        reads it (open). A close called while another runs, or after it, returns once that one has finished, and
+        truncation, a connection's close, a read's, the discard) does not stop the others, and the close raises;
+        close_failed() then holds for the rest of the process, and the next open purges the file before anything
+        reads it (_purge). A close called while another runs, or after it, returns once that one has finished, and
         raises if it failed (RuntimeError from the failure). Never called in the writer (RuntimeError: it would
         wait for its own job), nor inside a read."""
         if threading.get_ident() == self._writer_ident:
@@ -980,6 +1004,8 @@ class SearchIndex:
                 except BaseException as error:
                     failures.append(error)
         finally:
+            if failures:
+                note_close_failed()
             self._writer_ident = None  # a later thread may get its id: it is not this index's writer
             self._close_error = failures[0] if failures else None
             self._done.set()
@@ -987,9 +1013,12 @@ class SearchIndex:
             raise failures[0]
 
     def _drain_reads(self):
-        """As the index closes: the reads still running end (their connections closed, not kept), then the idle
-        connections are closed."""
+        """As the index closes: the reads still running end (their connections given back to it), then the idle
+        connections are closed; a read connection that could not be closed, by a read or here, fails the close."""
         with self._lock:
             while self._reading:
                 self._reads_done.wait()
         self._close_readers()
+        with self._lock:
+            if self._read_failures:
+                raise self._read_failures[0]
