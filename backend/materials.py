@@ -588,7 +588,7 @@ async def _look_up(harness, active, project_id, inputs, pace):
         later sees it (_serve) and this run can be tried again."""
         if not _running(conn, run_id) or _revoked(conn, run_id):
             return None
-        found = _identifiers(conn, project_id, materials, versions, inputs.get("given"))
+        found = _identifiers(conn, project_id, materials, versions)
         for material, (_, identifier, read) in found.items():
             if identifier is None:
                 _event(conn, run_id, "step_finished", {"material_id": material, "identifier": None,
@@ -672,15 +672,13 @@ async def _write_if_running(write, run_id, fn):
     return await write(guarded)
 
 
-def _identifiers(conn, project_id, materials, versions, given=None):
+def _identifiers(conn, project_id, materials, versions):
     """{material id: (version id, (scheme, identifier) or None, whether the version has a committed
     reading)}: the first DOI the version's own text gives, else the first arXiv ID; a reference file's
     paper's from its record (reference_files.identifier), read or not. The version is the one the lookup was made for (versions), or the
     current one for a lookup that names none; materials gone since are left out. A result is about
-    that version, and is sent and applied only while it is still the material's current file. given:
-    {material id: [scheme, identifier]} a merge gave a paper (S1-14, references._merged_lookup), looked up
-    whatever its file gives, unless the researcher has edited its details since."""
-    found, merges = {}, given or {}
+    that version, and is sent and applied only while it is still the material's current file."""
+    found = {}
     for material in materials:
         row = conn.execute(f"SELECT v.id, v.file_sha256, {_VERSION_TYPE}, m.source, m.csl, m.checked_by, m.lookup_filled"
                            " FROM materials m"
@@ -688,10 +686,6 @@ def _identifiers(conn, project_id, materials, versions, given=None):
                            " LEFT JOIN content_files c ON c.sha256 = v.file_sha256 WHERE m.id = ?1 AND m.project_id = ?2",
                            (material, project_id, versions.get(material))).fetchone()
         if row is None:
-            continue
-        if row[5] != "researcher" and isinstance(merged := merges.get(material), list) and len(merged) == 2 \
-                and merged[0] in ("doi", "arxiv"):
-            found[material] = (row[0], tuple(merged), True)
             continue
         # A reference file's paper is identified by its record (S1-14), whatever file it has since, unless
         # the researcher edited its details: an identifier they typed is not the record's, so then only a
@@ -1321,7 +1315,7 @@ def _retry(conn, run_id, registry, derived=None):
     if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
         return None, (403, "lookup_locked", "A review-locked project never looks identifiers up")
     return (project_id, workflow, {"material_ids": kept, "origin": None, **({"batch": inputs["batch"]} if inputs.get(
-        "batch") else {}), **({"given": inputs["given"]} if inputs.get("given") else {}), "versions": dict(conn.execute(
+        "batch") else {}), "versions": dict(conn.execute(
         "SELECT material_id, id FROM material_versions WHERE is_current = 1 AND material_id IN"
         " (SELECT value FROM json_each(?))", (json.dumps(kept),)).fetchall())}), None
 

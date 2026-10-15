@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { importReferences, MAX_REFERENCE_BYTES, paperLine, REFERENCE_ACCEPT, reportParts } from '../src/references.js';
+import { importReferences, MAX_REFERENCE_BYTES, paperLine, RECORD_LINES, REFERENCE_ACCEPT, reportParts } from '../src/references.js';
 import { detailsSource, latestLookup, unsettled } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
@@ -120,4 +120,9 @@ test('the Library looks again while a merge has still to ask or to apply its ans
   assert.equal(unsettled(settled), false);
   assert.equal(unsettled({ ...settled, merging: 1 }), true); // Keep both answered: its paper is still to come
   assert.equal(unsettled({ ...settled, asks: [{ kind: 'merge' }] }), true);
+});
+
+test('the lines read of one record are the backend\'s', () => {
+  const backend = readFileSync(fileURLToPath(new URL('../../backend/reference_files.py', import.meta.url)), 'utf8');
+  assert.equal(Number(backend.match(/^RECORD_LINES = (\d+)/m)[1]), RECORD_LINES);
 });

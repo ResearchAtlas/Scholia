@@ -14,8 +14,10 @@ gets. It never imports the database, the server or the window.
 Every bound holds before a value is worked on: the file's size (MAX_BYTES), its records
 (MAX_RECORDS; more refuse the whole file), each field's characters (a value is cut before it is
 cleaned, and kept at most to its field's bound; a BibTeX value longer than four times its bound skips
-its record instead, as its LaTeX could read as far less), a field's continuation lines, and the authors
-and keywords of a record. A record keeps only what CSL names here (KEYS); what a record points to is
+its record instead, as its LaTeX could read as far less), a field's continuation lines, a record's
+lines (RECORD_LINES: the fields after them are left out and counted, past_record_bound), and the authors
+and keywords of a record; every BibTeX block it yields, read or not, counts toward MAX_RECORDS. A
+delimiter after an odd run of backslashes (\\", \\{, \\}) is text in a BibTeX value. A record keeps only what CSL names here (KEYS); what a record points to is
 never read: file attachments (RIS L1, L2 and L4, EndNote %>, BibTeX file) are not kept, and a URL is
 display only, never fetched. A BibTeX field given twice is read as its first.
 
@@ -454,6 +456,14 @@ _STRING_ANYWHERE = re.compile(r"@\s*string", re.IGNORECASE)
 _DELIMITERS = re.compile(r'[{}"]')
 
 
+def _escaped(value, at, start=-1):
+    """Whether the character at `at` follows an odd run of backslashes (after start): TeX's escape."""
+    run, before = 0, at - 1
+    while before > start and value[before] == "\\":
+        run, before = run + 1, before - 1
+    return run % 2 == 1
+
+
 def _closing(value, start):
     """Where the brace or quote opening value at start closes (braces inside it balanced), or None. A
     delimiter after an odd run of backslashes is escaped (TeX's \\{, \\} and \\"), so it neither opens,
@@ -461,10 +471,7 @@ def _closing(value, start):
     depth, at = 0, start + 1
     while found := _DELIMITERS.search(value, at):
         at = found.end()
-        run, before = 0, found.start() - 1
-        while before > start and value[before] == "\\":
-            run, before = run + 1, before - 1
-        if run % 2:
+        if _escaped(value, found.start(), start):
             continue
         if found.group() == "{":
             depth += 1
@@ -510,6 +517,8 @@ def _split_top(value):
     as written (a braced group is one keyword), before its LaTeX is read."""
     found, start, depth = [], 0, 0
     for mark in _KEYWORD_MARKS.finditer(value):
+        if mark.group() in "{}" and _escaped(value, mark.start()):  # \{ and \} are text
+            continue
         if mark.group() == "{":
             depth += 1
         elif mark.group() == "}":

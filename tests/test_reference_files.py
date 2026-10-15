@@ -642,11 +642,17 @@ def test_a_record_refused_by_its_cap_keeps_its_macros_counted():
     ('"Schr\\"odinger"', "Schrödinger"),  # an escaped quote ends nothing
     ("{Set \\{ notation}", "Set { notation"),  # an escaped brace opens nothing
     ("{Set \\} notation}", "Set } notation"),  # nor closes
-    ("{Tab \\\\{x}}", None),  # an escaped backslash, then a brace that counts
+    ("{Tab \\\\{x}}", None),  # an escaped backslash, then a brace that counts: the value runs on past its close
 ])
 def test_escaped_delimiters_in_a_bibtex_value(value, title):
     records, skipped = parse(f"@misc{{k, title = {value}, year = {{2020}}}}\n")[:2]
     assert [r["title"] for r in records] == ([title] if title else [])
+    assert skipped == ({} if title else {"no_title": 1, "unsupported_macro": 1})  # never read as a title
+
+
+def test_escaped_braces_in_keywords_are_text():
+    [record], _ = parse("@misc{k, title={T}, keywords={Set \\{ a, b, c}}")[:2]
+    assert record["keyword"] == "Set { a, b, c"
 
 
 def test_an_escaped_delimiter_in_an_identifiers_value_is_inside_its_outer_delimiters():

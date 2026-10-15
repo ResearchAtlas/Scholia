@@ -998,3 +998,57 @@ async def test_a_merge_whose_paper_changed_meanwhile_applies_nothing(tmp_path):
         run = await run_finished(client, ask["run_id"])
         assert (run["status"], run["result"]) == ("failed", {"reason": "no_longer_duplicate"})
         assert "abstract" not in (await client.get(f"/api/materials/{paper}")).json()["csl"]
+
+
+def test_the_merges_recheck_is_the_duplicate_checks_own_rule():
+    def paper(title, year=None, doi=None):
+        return {"title": title, **({"issued": {"date-parts": [[year]]}} if year else {}), **({"DOI": doi} if doi else {})}
+
+    records = [paper("Wages"), paper("Wages", 2020), paper("WAGES!", 2020), paper("Wages", 2021),
+               paper("Other", 2020, DOI), paper("Wages", 2020, DOI), paper("Wages", 2020, "10.5555/other")]
+    for existing in records:
+        for record in records:
+            found = references.Duplicates.__new__(references.Duplicates)
+            found.dois, found.titles, found.papers = {}, {}, {}
+            found.add("m", existing)
+            assert references._matches(existing, record) == (found.find(record) is not None), (existing, record)
+
+
+async def test_a_merge_that_gives_a_paper_its_arxiv_id_looks_it_up(tmp_path):
+    feed = MockScholarly(arxiv={"2401.05555": "A Preprint"})
+    async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
+        project = await project_of(client)
+        await imported(client, project, b"@misc{k, title={A Preprint}, year={2024}}", "a.bib")
+        await imported(client, project, b"@misc{k, title={A Preprint}, year={2024}, eprint={2401.05555},"
+                                        b" archivePrefix={arXiv}}", "b.bib")
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        [(run,)] = await rows(client, "SELECT id FROM runs WHERE workflow = 'lookup' AND project_id = ?", project)
+        assert (await run_finished(client, run))["status"] == "succeeded"
+        assert [(host, path) for host, path, _ in feed.requests] == [
+            ("export.arxiv.org", "/api/query?id_list=2401.05555&max_results=1")]
+
+
+@pytest.mark.parametrize("case", ["had_one", "edited"])
+async def test_a_merge_looks_nothing_up_for_a_paper_with_an_identifier_or_the_researchers_details(tmp_path, case):
+    feed = MockScholarly(arxiv={"2401.05555": "A Preprint"}, openalex={DOI: openalex_work(DOI, "A Preprint")})
+    async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
+        project = await project_of(client)
+        first = await imported(client, project, f"@misc{{k, title={{A Preprint}}, year={{2024}}"
+                                                f"{', doi={' + DOI + '}' if case == 'had_one' else ''}}}".encode(), "a.bib")
+        [paper] = first["imported"]
+        if first["lookup_run_id"]:
+            await run_finished(client, first["lookup_run_id"])
+        if case == "edited":
+            assert (await client.patch(f"/api/materials/{paper}", json={"title": "A Preprint"})).status_code == 200
+        before = await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup' AND project_id = ?", project)
+        await imported(client, project, f"@misc{{k, title={{A Preprint}}, year={{2024}}, eprint={{2401.05555}},"
+                                        f" archivePrefix={{arXiv}}{', doi={' + DOI + '}' if case == 'had_one' else ''}}}".encode(),
+                       "b.bib")
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        assert (await run_finished(client, ask["run_id"]))["status"] == "succeeded"
+        assert "arxiv" in (await client.get(f"/api/materials/{paper}")).json()["csl"]  # merged
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup' AND project_id = ?",
+                          project) == before  # but nothing looked up
