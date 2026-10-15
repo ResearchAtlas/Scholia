@@ -228,12 +228,11 @@ class _Cancelled(Exception):
 
 class RunOutcome(Exception):
     """Ends local work otherwise than succeeded: status failed (reason, a stable code), cancelled
-    (cancel_reason limit, or researcher for an answer that declined it) or interrupted. details, if
-    given, joins the reason in the run's result (what the work did before it ended)."""
+    (cancel_reason limit, or researcher for an answer that declined it) or interrupted."""
 
-    def __init__(self, status, reason=None, cancel_reason=None, details=None):
+    def __init__(self, status, reason=None, cancel_reason=None):
         super().__init__(reason or status)
-        self.status, self.reason, self.cancel_reason, self.details = status, reason, cancel_reason, details
+        self.status, self.reason, self.cancel_reason = status, reason, cancel_reason
 
 
 def _running(conn, run_id) -> bool:
@@ -1114,8 +1113,8 @@ class Harness:
             summary, effect = await self.workflows[workflow](self, active, project_id, inputs)
             outcome = ("succeeded", None)
         except RunOutcome as ended:
-            summary = {**({"reason": ended.reason} if ended.reason else {}), **(ended.details or {})} or None
-            effect, outcome = None, (ended.status, ended.cancel_reason)
+            summary, effect, outcome = {"reason": ended.reason} if ended.reason else None, None, \
+                (ended.status, ended.cancel_reason)
         except Exception as error:  # a defect: the run ends failed rather than starting again at each launch
             log.error("local background work failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
             summary, effect, outcome = {"reason": "internal"}, None, ("failed", None)
@@ -1132,8 +1131,7 @@ class Harness:
                 raise
             # Its effect found it could not be applied.
             await _through(self._write(lambda conn: self._finish_local(
-                conn, active, error.status, error.cancel_reason,
-                {**({"reason": error.reason} if error.reason else {}), **(error.details or {})} or None)))
+                conn, active, error.status, error.cancel_reason, {"reason": error.reason} if error.reason else None)))
         self.start_follows(active)  # recorded with its terminal record, which has committed
 
     def start_follows(self, active):

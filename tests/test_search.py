@@ -753,7 +753,7 @@ async def test_an_over_long_passage_among_others_is_embedded_on_its_bounded_pref
         await added(client, project, LONG)
         status = await idle(client, project)
         [run] = await runs_of(client, "index", project)
-        assert (run["status"], run["result"]["refused"]) == ("succeeded", {})
+        assert (run["status"], run["result"]["passages"]["refused"]) == ("succeeded", 0)
         assert status["passages"]["embedded"] == status["passages"]["embeddable"] > 2
         assert status["passages"]["refused"] == 0 and client.remote.refused == [] and client.remote.counted
         sent = [text for texts in client.remote.indexing for text in texts]
@@ -790,7 +790,7 @@ async def test_a_passage_the_helper_refuses_is_counted_and_passed_over_until_its
         [material] = (await added(client, project, WAGES))["materials"]
         status = await idle(client, project)
         [run] = await runs_of(client, "index", project)
-        assert run["status"] == "succeeded" and run["result"]["refused"] == {"input_refused": 1}
+        assert run["status"] == "succeeded"  # the project's refused passages, from the index, in its result
         assert run["result"]["passages"] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
         assert status["passages"] == run["result"]["passages"]
         assert status["materials"][material["id"]] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
@@ -802,7 +802,7 @@ async def test_a_passage_the_helper_refuses_is_counted_and_passed_over_until_its
         await idle(client, project)
         assert len(client.remote.refused) == 1
         ran = await runs_of(client, "index", project)
-        assert ran[0]["result"]["refused"] == {}
+        assert ran[0]["result"]["passages"]["refused"] == 1  # still the one: not asked for again
     async with app(tmp_path, batch=1) as client:  # nor at the next launch, which asks for no run for it
         client.remote.refuse = "Employment effects"
         await asyncio.sleep(0.3)
@@ -833,7 +833,7 @@ async def test_a_refusal_is_kept_when_a_later_passage_of_its_batch_fails_and_ret
         await added(client, project, WAGES)
         status = await idle(client, project)
         [run] = await runs_of(client, "index", project)
-        assert (run["status"], run["result"]) == ("failed", {"reason": "request_failed", "refused": {"input_refused": 1}})
+        assert (run["status"], run["result"]) == ("failed", {"reason": "request_failed"})  # its reason only
         assert status["passages"]["refused"] == 1 and len(client.remote.refused) == 1  # kept, though the batch failed
         client.remote.fail_on = None
         again = await client.post(f"/api/runs/{run['run_id']}/retry")
@@ -866,37 +866,6 @@ async def test_a_rebuild_and_its_retry_keep_a_refusal_while_its_text_is_unchange
         response = await client.post(f"/api/projects/{project}/index/rebuild")
         assert (await run_finished(client, response.json()["run_id"]))["status"] == "succeeded"
         assert len(client.remote.refused) == 2  # asked for again, and refused again
-
-
-@pytest.mark.parametrize("when", ["after its store", "during its store"])
-async def test_a_cancelled_run_keeps_the_refusals_it_met_in_its_result(tmp_path, monkeypatch, when):
-    import threading
-    reached, go, real = threading.Event(), threading.Event(), SearchIndex._store
-    if when == "during its store":  # the refusal's own store held in the writer while the cancel arrives
-        def held(self, project_id, embedded):
-            if any(vector is None for *_, vector in embedded):
-                reached.set()
-                go.wait(20)
-            return real(self, project_id, embedded)
-        monkeypatch.setattr(SearchIndex, "_store", held)
-    async with app(tmp_path, batch=10) as client:
-        client.remote.refuse = "Minimum wages"
-        client.remote.hold, client.remote.free = asyncio.Event(), 2  # the passage after the refused one waits
-        project = await project_of(client)
-        await added(client, project, WAGES)
-        if when == "during its store":
-            await asyncio.to_thread(reached.wait, 10)
-        else:
-            await asyncio.wait_for(client.remote.reached.wait(), 10)
-        [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
-        cancel = asyncio.ensure_future(client.post(f"/api/runs/{run['run_id']}/cancel"))
-        active = client.state["harness"].registry.runs[run["run_id"]]
-        await asyncio.wait_for(asyncio.to_thread(active.cancel_requested.wait), 10)  # asked while the store is held
-        go.set()
-        client.remote.hold.set()
-        await cancel
-        ended = await run_finished(client, run["run_id"])
-        assert (ended["status"], ended["result"]) == ("cancelled", {"refused": {"input_refused": 1}})
 
 
 @pytest.mark.parametrize("status", [503, 500, 429])

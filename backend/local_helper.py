@@ -396,9 +396,10 @@ class Helper:
     async def _bounded(self, text, project_id, admit):
         """text, or its longest prefix that the helper's own tokenizer counts within INPUT_TOKENS: its
         tokens are cut there and read back (/detokenize), the cut is kept only as an exact prefix of text
-        (a character the cut splits is dropped), and counted again; a cut that still counts over is cut
-        deeper by as much. Each request carries admit, as the embedding's does, so nothing goes out
-        that the embedding itself could not send. A text of at most INPUT_TOKENS UTF-8 bytes is sent as
+        (a character the cut splits, read back as up to three U+FFFD, is dropped; a U+FFFD the text
+        itself holds is kept), and counted again; a cut that still counts over is cut deeper by as
+        much. Each request carries admit, as the embedding's does, so nothing goes out that the
+        embedding itself could not send. A text of at most INPUT_TOKENS UTF-8 bytes is sent as
         it is, uncounted: the model's byte-level BPE gives each token at least one byte. Raises
         InputRefused when the helper refuses to count it, reads back nothing or something else, or
         BOUND_TRIES cuts leave it over."""
@@ -419,7 +420,11 @@ class Helper:
             content = cut.get("content") if isinstance(cut, dict) else None
             if not isinstance(content, str):
                 raise HelperUnavailable("request_failed")
-            content = content.rstrip("\ufffd")  # a character the cut split
+            if not text.startswith(content):  # a character the cut split: its bytes read back as U+FFFD
+                for drop in range(1, 4):  # at most three bytes of it, and no more U+FFFD than that removed
+                    if content.endswith("\ufffd" * drop) and text.startswith(content[:-drop]):
+                        content = content[:-drop]
+                        break
             if not content or not text.startswith(content):  # nothing left to send, or not the text's own
                 break
             text = content

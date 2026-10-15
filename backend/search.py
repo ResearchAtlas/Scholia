@@ -336,22 +336,14 @@ def register(harness, state):
     _STATES[harness] = state
 
     async def index_run(harness, active, project_id, inputs):
-        refused = {}  # the passages the helper refused in this run, by reason: in its result however it ends
-
-        def details():
-            return {"refused": dict(refused)} if refused else None
         try:
-            return await _index_run(state, harness, active, project_id, inputs, refused)
-        except RunOutcome as ended:
-            ended.details = details()
-            raise
+            return await _index_run(state, harness, active, project_id, inputs)
         except (Unavailable, *DAMAGE):  # the file is being replaced or rebuilt again; its rebuild's runs embed
-            raise RunOutcome("failed", "index_unavailable", details=details()) from None
+            raise RunOutcome("failed", "index_unavailable") from None
         except asyncio.CancelledError:  # Cancel or a revocation ends it through its terminal record (ending)
             if active.cancel_reason == "shutdown":  # it stays running, and the next launch starts it again
                 raise
-            raise RunOutcome("cancelled", None, "revoked" if active.cancel_reason == "revoked" else "researcher",
-                             details=details()) from None
+            raise RunOutcome("cancelled", None, "revoked" if active.cancel_reason == "revoked" else "researcher") from None
 
     def ending(conn, active, project_id):  # in an index run's terminal transaction, whatever its outcome
         row = conn.execute("SELECT status, json_extract(inputs, '$.again') FROM runs WHERE id = ?",
@@ -402,12 +394,12 @@ def _text(reading):
     return index_text(title, path, text)
 
 
-async def _index_run(state, harness, active, project_id, inputs, refused):
+async def _index_run(state, harness, active, project_id, inputs):
     """The project's index brought in step with the main database, then its missing embeddings made (see
     the module's docstring). Its result says what it did: queue rows applied, rows the check against the
-    main database added and removed, whether it rebuilt the project's rows, the embeddings it stored, the
-    passages the helper refused by reason (`refused`, which it fills, so a run that fails or is cancelled
-    keeps them in its result too), and the project's passages indexed, embedded and refused as it ended."""
+    main database added and removed, whether it rebuilt the project's rows, the embeddings it stored, and
+    the project's passages indexed, embedded and refused (read from the index, which keeps each refusal)
+    as it ended. A run that fails or is cancelled says its reason only."""
     index, db, run_id = state.get("index"), harness.db, active.run_id
     if index is None:
         raise RunOutcome("failed", "index_unavailable")
@@ -456,10 +448,9 @@ async def _index_run(state, harness, active, project_id, inputs, refused):
                 try:
                     [vector] = await local_helper.embed(state, [_text(reading)], project_id=project_id,
                                                         admit=lambda conn, pid=pid: _may_index(conn, run_id, project_id, pid))
-                except InputRefused as refusal:  # its text, refused as such: recorded at once (a later failure in
-                    # this batch must not lose it, or Retry would send it again), and the run goes on
-                    refused[refusal.reason] = refused.get(refusal.reason, 0) + 1  # counted first: a cancel may end
-                    await drained(index.store, project_id, [(rowid, pid, mark, None)], stop)  # the run at the store
+                except InputRefused:  # its text, refused as such: recorded at once (a later failure in this
+                    # batch must not lose it, or Retry would send it again), and the run goes on
+                    await drained(index.store, project_id, [(rowid, pid, mark, None)], stop)
                     continue
                 except HelperUnavailable as unavailable:
                     def now(conn, pid=pid):
@@ -477,7 +468,7 @@ async def _index_run(state, harness, active, project_id, inputs, refused):
                 vectors.append((rowid, pid, mark, vector))
             embedded += await drained(index.store, project_id, vectors, stop) or 0
             await counted({})
-        return await counted({"mode": "hybrid", "embedded": embedded, "refused": refused}), None
+        return await counted({"mode": "hybrid", "embedded": embedded}), None
 
 
 async def _offer_run(state, harness, active, project_id, inputs):

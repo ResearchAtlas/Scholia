@@ -1276,7 +1276,7 @@ async function s117(ctx) {
       && status.passages.refused === 1);
     const [latest] = await runs(offerId, 'index');
     check('its index run succeeded, and counts the refusal', latest?.status === 'succeeded'
-      && latest.result.refused?.input_refused === 1 && latest.result.passages.refused === 1);
+      && latest.result.passages.refused === 1);
     const said = L('search.paperRefused');
     const line = (said.one ?? said.other).replace('{count}', '1');
     const row = panel().getByRole('listitem').filter({ hasText: glyphs });

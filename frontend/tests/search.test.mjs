@@ -86,7 +86,7 @@ test('passages the search model could not take are counted, not taken for embedd
   assert.equal(t(...indexCounts({ indexed: 12, embedded: 9, embeddable: 11, refused: 2 })),
     '12 indexed; embeddings 9 of 11; 2 could not be embedded');
   assert.equal(t(...indexCounts({ indexed: 12, embedded: 11, embeddable: 11, refused: 0 })), '12 indexed; embeddings 11 of 11');
-  assert.equal(t(...runCounts({ status: 'succeeded', result: { mode: 'hybrid', embedded: 6, refused: { input_refused: 1 },
+  assert.equal(t(...runCounts({ status: 'succeeded', result: { mode: 'hybrid', embedded: 6,
     passages: { indexed: 12, embedded: 10, embeddable: 11, refused: 1 } } })),
   '6 embedded by this run; embeddings 10 of 11 in this project; 1 could not be embedded');
   const zh = makeT('zh-CN');

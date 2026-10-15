@@ -824,7 +824,9 @@ def _sent(client, path):
     "\ue000\ue123\uf8ff" * 500 + "\nA title of unmapped glyphs",  # private-use characters, as PDF extraction leaves them
     "最低工资" * 542 + "最",  # Han text of 2,169 characters
     "w" * 4000,  # one byte each
-], ids=["private use", "han", "ascii"])
+    "w" + "最" * 1000,  # the cut splits a character: its first two bytes read back as U+FFFD
+    "\ufffd" * 1000,  # replacement characters the text itself holds, kept
+], ids=["private use", "han", "ascii", "split character", "replacement characters"])
 @pytest.mark.parametrize("query", [False, True], ids=["passage", "question"])
 async def test_an_input_over_the_slot_is_embedded_on_its_longest_prefix_within_it(tmp_path, fake, timings, text, query):
     """Counted by the helper's own tokenizer, cut where its tokens end, kept as an exact prefix of the
@@ -862,7 +864,7 @@ async def test_a_cut_that_counts_over_again_is_cut_deeper_by_as_much(tmp_path, f
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra,text", [(3000, "w" * 3000), (-1, "w" * 3000), (0, "\ufffd" * 1000)],
+@pytest.mark.parametrize("extra,text", [(3000, "w" * 3000), (-1, "w" * 3000), (3000, "最" * 1000)],
                          ids=["never within", "read back as other text", "nothing left once a split character goes"])
 async def test_an_input_no_cut_brings_within_the_slot_is_refused_and_never_sent(tmp_path, fake, timings, extra, text):
     async with app(tmp_path, fake) as client:
