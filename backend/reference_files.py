@@ -37,8 +37,8 @@ BibTeX macros (Harold's reading, 2026-10-15, the second): no @string is read. A 
 braced or quoted literal, a number, or (only in a file whose text names no @string anywhere, in any case
 or spacing) one of the twelve month names; any other value (a bare name, parts joined with #, words or a literal
 and a word side by side) is left out of its record and counted (unsupported_macro), on every field of
-every record kept, whether the field is read or not. A record is never refused for a macro; one whose
-title is a macro has no title (no_title). Nothing here logs content, and the parsers are kept from logging it.
+every record, whether the field is read or not, and whether the record is then kept or skipped. A record
+is never refused for a macro; one whose title is a macro has no title (no_title). Nothing here logs content, and the parsers are kept from logging it.
 """
 
 import io
@@ -122,14 +122,14 @@ def parse(data, beat=lambda: None):
         if done % BEAT_EVERY == 0:
             beat()
         csl, dropped = (None, 0) if record is None else _finish(record)
+        if record is not None and record.get("macros"):  # BibTeX: values given as macros or by #, left out,
+            skipped["unsupported_macro"] = skipped.get("unsupported_macro", 0) + record["macros"]  # kept or not
         if csl is None:
             reason = "unreadable" if record is None else "no_title"
             skipped[reason] = skipped.get(reason, 0) + 1
             continue
         if dropped:
             skipped["invalid_field"] = skipped.get("invalid_field", 0) + dropped
-        if record.get("macros"):  # BibTeX: values given as macros or by #, left out
-            skipped["unsupported_macro"] = skipped.get("unsupported_macro", 0) + record["macros"]
         chars += size(csl)
         if chars > MAX_CHARS:  # LaTeX and the month names read can make the records a little larger than the file
             raise Unreadable("reference_file_too_large")

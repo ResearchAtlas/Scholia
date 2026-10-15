@@ -145,9 +145,11 @@ def test_an_at_string_after_the_last_entry_still_turns_month_names_off():
     assert "abstract" not in record and skipped == {"unsupported_macro": 1}
 
 
-def test_a_title_given_by_a_macro_leaves_the_record_without_a_title():
+def test_a_title_given_by_a_macro_leaves_the_record_without_a_title_its_macros_counted():
     records, skipped = parsed("@misc{k, title = t}\n@misc{l, title = {Kept}}\n")
-    assert [r["title"] for r in records] == ["Kept"] and skipped == {"no_title": 1}  # a record with no title: skipped
+    assert [r["title"] for r in records] == ["Kept"] and skipped == {"no_title": 1, "unsupported_macro": 1}
+    records, skipped = parsed("@misc{k,title=t,journal=j}\n")  # recheck 6: each value counted, the record skipped
+    assert records == [] and skipped == {"no_title": 1, "unsupported_macro": 2}
 
 
 def test_a_value_past_its_cap_is_refused_never_cut_and_read():
