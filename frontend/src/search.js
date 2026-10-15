@@ -15,6 +15,15 @@ export const indexStatus = (projectId) => get(`/api/projects/${encodeURIComponen
 
 export const rebuildIndex = (projectId) => post(`/api/projects/${encodeURIComponent(projectId)}/index/rebuild`);
 
+// A Rebuild asked while another index run ran (its answer's rebuild_pending) is the run that one's end records:
+// once it has ended, the project's index run then (status, the index status), when it is a rebuild other than
+// that run, else null (a Cancel of that run dropped the rebuild, reading R29).
+export function rebuildAfter(started, ended, status) {
+  if (!started.rebuild_pending || ended.status === 'cancelled') return null;
+  const next = status?.run;
+  return next && next.run_id !== started.run_id && next.rebuild ? next.run_id : null;
+}
+
 // What a key pressed in the search field does: 'search' on Enter, except while an input method
 // composes (Enter then confirms the Chinese characters chosen: 'compose'), 'clear' on Escape, else null.
 export function fieldKey(event) {

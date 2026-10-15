@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
-import { fieldKey, indexReason, offerOutcome, onFieldKey, paperIndexed, queryOf, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
+import { fieldKey, indexReason, offerOutcome, onFieldKey, paperIndexed, queryOf, rebuildAfter, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
 
 const t = makeT('en');
 
@@ -153,4 +153,18 @@ test("an index run is its project's: the list says what it did in counts, and wh
   const settings = readFileSync(fileURLToPath(new URL('../src/components/Settings.jsx', import.meta.url)), 'utf8');
   assert.match(settings, /run\.workflow === 'index' && run\.rebuild \? t\('settings\.workflowIndexRebuild'\)/);
   assert.match(settings, /t\(\.\.\.runCounts\(run\)\)/);
+});
+
+test('a Rebuild asked while another index run ran follows that run, then the rebuild its end records', () => {
+  const during = { run_id: 'r1', rebuild_pending: true };
+  const next = { run: { run_id: 'r2', status: 'running', rebuild: true } };
+  assert.equal(rebuildAfter(during, { status: 'succeeded' }, next), 'r2');
+  assert.equal(rebuildAfter(during, { status: 'failed' }, next), 'r2'); // a run that fails still runs its rerun
+  assert.equal(rebuildAfter(during, { status: 'cancelled' }, next), null); // Cancel drops the rerun (R29)
+  assert.equal(rebuildAfter(during, { status: 'succeeded' }, { run: { run_id: 'r1', rebuild: false } }), null);
+  assert.equal(rebuildAfter({ run_id: 'r2', rebuild_pending: false }, { status: 'succeeded' }, next), null);
+  for (const catalog of [en, zhCN]) assert.ok('search.rebuildAfterRun' in catalog);
+  const component = readFileSync(fileURLToPath(new URL('../src/components/SearchIndex.jsx', import.meta.url)), 'utf8');
+  assert.match(component, /rebuildAfter\(started, ended, await indexStatus\(project\.id\)/);
+  assert.match(component, /index\.run\?\.rebuild_pending && \(/);
 });

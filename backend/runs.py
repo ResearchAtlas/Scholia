@@ -143,8 +143,7 @@ class Registry:
         # released it reads interrupted, as its record still says running (Harness._ended).
         # ponytail: one id per background run finished in this launch; a bounded log if that grows large
         self.finished: set[str] = set()
-        # Background runs a retry takes over (materials.retry_run), or an index run's request supersedes
-        # (search.request_run, S1-17): never held from then on. The lock
+        # Background runs a retry takes over (materials.retry_run): never held from then on. The lock
         # makes holding a run (add_background) and retiring it (retire, from a write transaction's
         # thread, or the event loop) one decision: whichever comes first, the other is refused.
         self.retired: set[str] = set()
@@ -1049,17 +1048,15 @@ class Harness:
         active.task = asyncio.create_task(self._background(active))
         return run_id
 
-    async def record_background(self, count, write, ids=()):
+    async def record_background(self, count, write):
         """Record new background runs in one transaction and start them. write(conn, ids) gets count
-        run ids (ids, chosen before, then fresh ones), records the runs it needs under some of them, and
-        returns (result, the ids it
+        fresh run ids, records the runs it needs under some of them, and returns (result, the ids it
         used). Each id is held in the registry before the transaction commits, and the runs recorded
         start as soon as it has, so no read ever finds one running in the record and not held here
-        (which reads as interrupted). The ids it did not use are released inside the transaction, so no
-        later one finds them held (record_in, recording a run under an id chosen before). Returns the
-        result; a cancellation of the caller waits for the transaction (see _through), starts the runs,
-        and is raised after."""
-        actives = [self.registry.add_background(run_id) for run_id in [*ids, *(new_id() for _ in range(count - len(ids)))]]
+        (which reads as interrupted). The ids it did not use are released inside the transaction.
+        Returns the result; a cancellation of the caller waits for the transaction (see _through),
+        starts the runs, and is raised after."""
+        actives = [self.registry.add_background(new_id()) for _ in range(count)]
         if None in actives:
             for active in actives:
                 if active is not None:
@@ -1097,17 +1094,17 @@ class Harness:
             raise
         return result
 
-    def record_in(self, conn, active, project_id, workflow, inputs, run_id=None):
+    def record_in(self, conn, active, project_id, workflow, inputs):
         """Record a background run of the project in local work's terminal transaction (from its
         effect, on the writer thread): held here from before that transaction commits, as
         record_background holds its runs, and started by _local once it has (released if it did
         not), so no read finds it running in the record and not held. While the app is closing it is
         recorded unheld, and starts at the next launch."""
-        held = self.registry.add_background(run_id or new_id())
+        held = self.registry.add_background(new_id())
         if held is not None:
             active.follows.append(held)
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
-                     (held.run_id if held is not None else run_id or new_id(), project_id, workflow, json.dumps(inputs)))
+                     (held.run_id if held is not None else new_id(), project_id, workflow, json.dumps(inputs)))
 
     async def _local(self, active, project_id, workflow, inputs):
         try:

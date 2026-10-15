@@ -9,7 +9,7 @@ import { useT } from '../i18n/index.js';
 import { useAction } from '../action.js';
 import { downloadOffered } from '../helper.js';
 import { fraction, followRun } from '../runs.js';
-import { indexPoll, indexReason, indexStatus, rebuildIndex } from '../search.js';
+import { indexPoll, indexReason, indexStatus, rebuildAfter, rebuildIndex } from '../search.js';
 import { LoadState } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 
@@ -33,7 +33,11 @@ export function IndexSection({ project }) {
     const started = await run(() => rebuildIndex(project.id));
     if (!started) return;
     load();
-    const ended = await followRun(started.run_id, () => load());
+    let ended = await followRun(started.run_id, () => load());
+    if (started.rebuild_pending) { // asked while another run ran: the rebuild is the run that one's end records
+      const next = rebuildAfter(started, ended, await indexStatus(project.id).catch(() => null));
+      ended = next ? await followRun(next, () => load()) : { status: 'cancelled' };
+    }
     setOutcome(ended.status === 'succeeded' ? 'rebuilt' : 'stopped');
     load();
   }
@@ -63,6 +67,9 @@ export function IndexSection({ project }) {
         <Button variant="outline" size="sm" disabled={rebuilding} onClick={rebuild}>
           <RotateCcw aria-hidden="true" />{rebuilding ? t('search.rebuilding') : t('search.rebuild')}
         </Button>
+        {rebuilding && index.run?.rebuild_pending && (
+          <span className="text-xs text-muted-foreground" role="status">{t('search.rebuildAfterRun')}</span>
+        )}
         {rebuilding && share !== null && (
           <span className="text-xs tabular-nums text-muted-foreground" role="status">
             {t('runs.progress', { done: index.run.progress.done, total: index.run.progress.total })}

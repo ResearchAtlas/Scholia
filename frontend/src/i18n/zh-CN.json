@@ -542,6 +542,7 @@
   "search.rebuilding": "正在重建…",
   "search.rebuilt": "已重建。",
   "search.rebuildStopped": "重建未完成。再次重建即可完成。",
+  "search.rebuildAfterRun": "当前的索引运行结束后即开始重建。",
   "search.offer.started": "已开始下载搜索模型。",
   "search.offer.download_running": "未开始下载：已有模型下载在进行中。",
   "search.offer.already_installed": "未开始下载：搜索模型已安装。",

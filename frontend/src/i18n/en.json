@@ -551,6 +551,7 @@
   "search.rebuilding": "Rebuilding…",
   "search.rebuilt": "Rebuilt.",
   "search.rebuildStopped": "The rebuild did not finish. Rebuild again to finish it.",
+  "search.rebuildAfterRun": "The rebuild starts once the indexing run in progress ends.",
   "search.offer.started": "The search model's download started.",
   "search.offer.download_running": "Nothing was started: a model download was already under way.",
   "search.offer.already_installed": "Nothing was started: the search model was already installed.",
