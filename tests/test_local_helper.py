@@ -853,6 +853,45 @@ async def test_a_split_character_read_back_as_u_fffd_goes_and_the_texts_own_stay
         assert sent == "w" * 2008 + "\ufffd" * 2
 
 
+def _longest_within(text):
+    """The longest prefix of text, in whole characters, that the stand-in counts within the bound."""
+    while len(text.encode()) > local_helper.INPUT_TOKENS:
+        text = text[:-1]
+    return text
+
+
+@pytest.mark.asyncio
+async def test_a_cut_that_reads_back_as_the_same_prefix_is_cut_shorter_until_it_fits(tmp_path, fake, timings):
+    """gpt-6-astra recheck 4: cuts at 2,016 and 2,015 tokens split the same U+FFFD of the text's own and
+    read back as the same exact prefix (2,017 bytes); the cut goes on shrinking to the 2,014-token prefix."""
+    async with app(tmp_path, fake) as client:
+        text = "Prefix\nFindings\n" + "w" * 1998 + "\ufffd" * 2
+        await local_helper.embed(client.state, [text])
+        [[sent]] = [body["input"] for body in _sent(client, "/v1/embeddings")]
+        assert sent == "Prefix\nFindings\n" + "w" * 1998 and len(sent.encode()) == 2014
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("per_byte", [False, True], ids=["one U+FFFD", "one per byte"])
+async def test_the_longest_prefix_within_the_bound_is_sent_whatever_u_fffd_the_cut_meets(tmp_path, fake, timings,
+                                                                                         per_byte):
+    """The text's own trailing U+FFFD (0 to 4) before a character the cut falls inside (a U+FFFD or a
+    Han character or a 4-byte character, cut inside it or at its start), split characters read back as one
+    U+FFFD or one per byte: the longest prefix within the bound is sent each time, nothing refused."""
+    async with app(tmp_path, fake) as client:
+        client.remote.per_byte = per_byte
+        cases = [("w" * (local_helper.INPUT_TOKENS - 3 * own - into) + "\ufffd" * own + tail * 400)
+                 for own in range(5) for tail in ("\ufffd", "最", "\U0001d400") for into in range(len(tail.encode()))]
+        wrong = []
+        for text in cases:
+            before = len(_sent(client, "/v1/embeddings"))
+            await local_helper.embed(client.state, [text])
+            [sent] = _sent(client, "/v1/embeddings")[before]["input"]
+            if sent != _longest_within(text):
+                wrong.append((cases.index(text), len(sent.encode()), len(_longest_within(text).encode())))
+        assert wrong == []
+
+
 @pytest.mark.asyncio
 async def test_a_text_within_the_margin_in_bytes_is_sent_as_it_is_uncounted(tmp_path, fake, timings):
     async with app(tmp_path, fake) as client:
@@ -870,14 +909,16 @@ async def test_a_cut_that_counts_over_again_is_cut_deeper_by_as_much(tmp_path, f
         await local_helper.embed(client.state, [text])
         [[sent]] = [body["input"] for body in _sent(client, "/v1/embeddings")]
         assert sent == "w" * (local_helper.INPUT_TOKENS - 5)
-        assert [len(body["content"]) for body in _sent(client, "/tokenize")] == [3000, local_helper.INPUT_TOKENS,
-                                                                                 local_helper.INPUT_TOKENS - 5]
+        assert [len(body["content"]) for body in _sent(client, "/tokenize")] == [  # within the slack: one at a time
+            3000, *range(local_helper.INPUT_TOKENS, local_helper.INPUT_TOKENS - 6, -1)]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra,text", [(3000, "w" * 3000), (-1, "w" * 3000), (3000, "最" * 1000)],
+@pytest.mark.parametrize("extra,text,requests", [(3000, "w" * 3000, (2, 1)), (-1, "w" * 3000, (1, 1)),
+                                                 (2022, "\U0001d400" * 1000, (2, 2))],
                          ids=["never within", "read back as other text", "nothing left once a split character goes"])
-async def test_an_input_no_cut_brings_within_the_slot_is_refused_and_never_sent(tmp_path, fake, timings, extra, text):
+async def test_an_input_no_cut_brings_within_the_slot_is_refused_and_never_sent(tmp_path, fake, timings, extra, text,
+                                                                                requests):
     async with app(tmp_path, fake) as client:
         if extra < 0:  # the tokens read back as something that is not the text's prefix
             client.remote.hold = {}
@@ -894,9 +935,9 @@ async def test_an_input_no_cut_brings_within_the_slot_is_refused_and_never_sent(
         with pytest.raises(local_helper.InputRefused, match="input_refused"):
             await local_helper.embed(client.state, [text])
         assert _sent(client, "/v1/embeddings") == []
-        assert 1 <= len(_sent(client, "/tokenize")) <= local_helper.BOUND_TRIES + 1
-        if text.startswith("最"):  # cut to one token, read back as a split character's U+FFFD: nothing left, refused
-            assert (len(_sent(client, "/tokenize")), len(_sent(client, "/detokenize"))) == (2, 2)
+        # counted, then read back and counted until refused: over by more than any cut can take, a cut read back
+        # as other text, or (the last) a cut of 3 tokens read back as a split character's U+FFFD, leaving nothing
+        assert (len(_sent(client, "/tokenize")), len(_sent(client, "/detokenize"))) == requests
 
 
 @pytest.mark.asyncio

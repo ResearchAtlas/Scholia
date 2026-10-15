@@ -120,7 +120,11 @@ LIMITS = ["-c", str(CONTEXT), "-ub", str(UBATCH), "-np", str(SLOTS), "--cache-ra
 # has no truncation of embedding inputs of its own.
 TOKEN_MARGIN = 32
 INPUT_TOKENS = min(CONTEXT // SLOTS, UBATCH) - TOKEN_MARGIN
-BOUND_TRIES = 3  # cuts tried before an input is refused (input_refused)
+# How far a cut's read-back can count from the cut itself: up to 3 tokens fewer (a split character
+# dropped) or 6 more (its bytes read back as U+FFFD that the text itself holds there). A prefix that
+# counts over by more is cut shorter by the excess at once; within it, one token at a time, so the
+# longest prefix within INPUT_TOKENS is never stepped over (Helper._bounded).
+CUT_SLACK = 9
 # Statuses that say the helper cannot serve now rather than that it refuses this input: its key
 # (a restarted helper's), a path this build lacks, a timeout, or too many requests.
 _UNAVAILABLE = (401, 403, 404, 408, 429)
@@ -394,28 +398,24 @@ class Helper:
         return vectors
 
     async def _bounded(self, text, project_id, admit):
-        """text, or its longest prefix that the helper's own tokenizer counts within INPUT_TOKENS: its
-        tokens are cut there and read back (/detokenize), the cut is kept only as an exact prefix of text
-        (a character the cut splits, read back as up to three U+FFFD, is dropped; a U+FFFD the text
-        itself holds is kept), and counted again; a cut that still counts over is cut deeper by as
-        much. Each request carries admit, as the embedding's does, so nothing goes out that the
-        embedding itself could not send. A text of at most INPUT_TOKENS UTF-8 bytes is sent as
-        it is, uncounted: the model's byte-level BPE gives each token at least one byte. Raises
-        InputRefused when the helper refuses to count it, reads back nothing or something else, or
-        BOUND_TRIES cuts leave it over."""
+        """text, or its longest prefix that the helper's own tokenizer counts within INPUT_TOKENS. The
+        text's tokens are counted once; the first k are read back (/detokenize), kept only as an exact
+        prefix of text (a character the cut splits, read back as up to three U+FFFD, is dropped; a
+        U+FFFD the text itself holds is kept) and that prefix counted. One still over is cut again
+        with k less its overshoot beyond CUT_SLACK, at least one token fewer each time, so the
+        longest prefix within the bound is found and the loop ends: with a prefix within the bound,
+        or refused (InputRefused) once k reaches zero, a cut leaves nothing, a cut reads back as other
+        text, or the helper refuses to count. Each request carries admit, as the embedding's does, so
+        nothing goes out that the embedding itself could not send. A text of at most INPUT_TOKENS
+        UTF-8 bytes is sent as it is, uncounted: the model's byte-level BPE gives each token at least
+        one byte."""
         if len(text.encode()) <= INPUT_TOKENS:
             return text
-        for attempt in range(BOUND_TRIES + 1):
-            counted = await self._post("/tokenize", {"content": text, "add_special": False}, project_id, admit)
-            tokens = counted.get("tokens") if isinstance(counted, dict) else None
-            if not isinstance(tokens, list):
-                raise HelperUnavailable("request_failed")
-            over = len(tokens) - INPUT_TOKENS
-            if over <= 0:
-                return text
-            if attempt == BOUND_TRIES:
-                break
-            keep = max(INPUT_TOKENS - (over if attempt else 0), 1)
+        tokens = await self._tokens(text, project_id, admit)
+        if len(tokens) <= INPUT_TOKENS:
+            return text
+        keep = INPUT_TOKENS
+        while keep > 0:
             cut = await self._post("/detokenize", {"tokens": tokens[:keep]}, project_id, admit)
             content = cut.get("content") if isinstance(cut, dict) else None
             if not isinstance(content, str):
@@ -427,8 +427,19 @@ class Helper:
                         break
             if not content or not text.startswith(content):  # nothing left to send, or not the text's own
                 break
-            text = content
+            over = len(await self._tokens(content, project_id, admit)) - INPUT_TOKENS
+            if over <= 0:
+                return content
+            keep -= max(over - CUT_SLACK, 1)  # at least one token fewer, never past a shorter prefix within
         raise InputRefused()
+
+    async def _tokens(self, text, project_id, admit):
+        """text's tokens as the helper counts them (/tokenize, without the special tokens)."""
+        counted = await self._post("/tokenize", {"content": text, "add_special": False}, project_id, admit)
+        tokens = counted.get("tokens") if isinstance(counted, dict) else None
+        if not isinstance(tokens, list):
+            raise HelperUnavailable("request_failed")
+        return tokens
 
     async def rerank(self, query, documents, *, deadline, project_id=None) -> list[float] | None:
         """Each document's relevance score, in order, or None when they are not back within deadline
