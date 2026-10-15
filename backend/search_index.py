@@ -11,7 +11,9 @@ thread makes every change, in order; searches read on connections of their own.
 - `vec_passages`: vec0, partitioned by project, each passage's embedding (1024 float32, cosine).
 - `vec_memory`: memory embeddings, partitioned by scope, written from S1-21.
 - `index_rows`: the rowid the two share for one project's passage, its material and kind, a digest
-  of its index text and whether it is embedded; no text.
+  of its index text and whether it is embedded (1), not yet (0), or refused by the helper (-1: not
+  asked for again while its text and the model are unchanged; a changed text or dropped vectors set it
+  back to 0, and a project's rebuild keeps it on an unchanged text); no text.
 - `index_meta`: the model, its revision, quantization, runtime and dimensions, the tokenizer and its
   version, the file's schema version, the main database file it was built from, the last index_queue
   sequence applied, and whether a whole rebuild is under way.
@@ -777,7 +779,7 @@ class SearchIndex:
         if before == mark:
             return False
         self._conn.execute("UPDATE fts_passages SET text = ? WHERE rowid = ?", (indexed, rowid))
-        if embedded and self.vectors:
+        if embedded == 1 and self.vectors:
             self._conn.execute("DELETE FROM vec_passages WHERE rowid = ?", (rowid,))
         self._conn.execute("UPDATE index_rows SET digest = ?, embedded = 0 WHERE id = ?", (mark, rowid))
         return True
@@ -788,7 +790,7 @@ class SearchIndex:
         if row is None:
             return []
         self._conn.execute("DELETE FROM fts_passages WHERE rowid = ?", (row[0],))
-        if row[1] and self.vectors:
+        if row[1] == 1 and self.vectors:
             self._conn.execute("DELETE FROM vec_passages WHERE rowid = ?", (row[0],))
         self._conn.execute("DELETE FROM index_rows WHERE id = ?", (row[0],))
         self._verify(row[0])
@@ -824,10 +826,11 @@ class SearchIndex:
 
     def rebuild_project(self, project_id, run_id, stop=None):
         """Replace the project's rows from the main database (keyword rows; its vectors go, to be
-        embedded again), in one transaction, so search keeps its keyword rows throughout. Done once
-        per run: a run started again after a restart goes on to its embeddings. stop(), if given, is
-        asked every STOP_EVERY rows: a true answer rolls the rebuild back, leaving the rows as they were (or
-        withdraws it while it waits its turn)."""
+        embedded again, but a refusal stays with a passage whose index text is unchanged, as it does
+        everywhere but in a whole-file rebuild while the model is the same), in one transaction, so
+        search keeps its keyword rows throughout. Done once per run: a run started again after a restart goes on to its embeddings.
+        stop(), if given, is asked every STOP_EVERY rows: a true answer rolls the rebuild back, leaving
+        the rows as they were (or withdraws it while it waits its turn)."""
         return self._write(self._rebuild_project, project_id, run_id, stop, withdraw=stop)
 
     def _rebuild_project(self, project_id, run_id, stop=None):
@@ -842,13 +845,17 @@ class SearchIndex:
             check(0)
             found = self.db.read(lambda conn: readings(conn, project_id))
             with self._conn:
-                old = self._conn.execute("SELECT passage_id FROM index_rows WHERE project_id = ?", (project_id,)).fetchall()
-                for count, (pid,) in enumerate(old, start=1):
+                old = self._conn.execute("SELECT passage_id, digest, embedded FROM index_rows WHERE project_id = ?",
+                                         (project_id,)).fetchall()
+                refused = {(pid, mark) for pid, mark, embedded in old if embedded == -1}
+                for count, (pid, _, _) in enumerate(old, start=1):
                     self._remove(project_id, pid)
                     check(count)
                 for count, (pid, reading) in enumerate(found.items(), start=len(old) + 1):
                     self._add(project_id, pid, reading)
                     check(count)
+                self._conn.executemany("UPDATE index_rows SET embedded = -1 WHERE project_id = ? AND passage_id = ?"
+                                       " AND digest = ?", [(project_id, pid, mark) for pid, mark in refused])
                 self._conn.execute("DELETE FROM index_meta WHERE key LIKE 'rebuilt:%'")
                 self._meta(**{f"rebuilt:{run_id}": 1})
         except _Stopped:
@@ -869,7 +876,8 @@ class SearchIndex:
     def store(self, project_id, embedded, stop=None):
         """Write [(rowid, passage id, digest, vector)] in one transaction: each only while its row is
         there with that digest and no embedding (else it was removed, or its text changed, meanwhile).
-        Returns how many were written. stop(), if given, withdraws it while it waits its turn."""
+        A vector of None marks the row refused (the helper refused its text). Returns how many vectors
+        were written. stop(), if given, withdraws it while it waits its turn."""
         return self._write(self._store, project_id, embedded, withdraw=stop)
 
     def _store(self, project_id, embedded):
@@ -880,9 +888,12 @@ class SearchIndex:
         written = 0
         with self._conn:
             for rowid, pid, mark, vector in embedded:
-                if len(vector) != DIMENSIONS or not self._conn.execute(
+                if (vector is not None and len(vector) != DIMENSIONS) or not self._conn.execute(
                         "SELECT 1 FROM index_rows WHERE id = ? AND project_id = ? AND passage_id = ? AND digest = ?"
                         " AND embedded = 0", (rowid, project_id, pid, mark)).fetchone():
+                    continue
+                if vector is None:
+                    self._conn.execute("UPDATE index_rows SET embedded = -1 WHERE id = ?", (rowid,))
                     continue
                 self._conn.execute("INSERT INTO vec_passages (rowid, project_id, passage_id, embedding) VALUES (?, ?, ?, ?)",
                                    (rowid, project_id, pid, sqlite_vec.serialize_float32(vector)))
@@ -911,10 +922,11 @@ class SearchIndex:
             (sqlite_vec.serialize_float32(vector), limit, project_id)).fetchall())]
 
     def counts(self, project_id):
-        """{material id: (indexed, embedded, embeddable)} for the project's rows."""
-        return {material: (indexed, embedded or 0, embeddable or 0) for material, indexed, embedded, embeddable
-                in self._read(lambda conn: conn.execute(
-                    "SELECT material_id, count(*), sum(embedded), sum(kind != 'reference') FROM index_rows"
+        """{material id: (indexed, embedded, embeddable, refused)} for the project's rows."""
+        return {material: (indexed, embedded or 0, embeddable or 0, refused or 0)
+                for material, indexed, embedded, embeddable, refused in self._read(lambda conn: conn.execute(
+                    "SELECT material_id, count(*), sum(embedded = 1), sum(kind != 'reference'), sum(embedded = -1)"
+                    " FROM index_rows"
                     " WHERE project_id = ? GROUP BY material_id", (project_id,)).fetchall())}
 
     def unembedded(self):

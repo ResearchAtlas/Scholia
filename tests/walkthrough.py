@@ -23,10 +23,12 @@ child is by its whole command (the network block refuses every other child proce
 socket and only prints the line a llama-server prints once it listens; its HTTP side is answered
 here, behind the outbound gate's transport, with synthetic vectors (synthetic_materials.embedding).
 While the file named by "helper control" exists, it answers embedding requests 503, as a helper that
-stopped answering. --dev serves no interface and admits the Vite server on
-127.0.0.1:5173 instead (`npm run dev` in frontend/), with no session, on port 8765, where
-that server sends API requests. Without --port, a free port is used. --request-log appends
-each request the test-owned provider receives to FILE, one JSON line each.
+stopped answering. It counts tokens as llama-server's tokenizer at its most spread out (one per byte),
+refuses an input over its slot as llama-server does, and refuses one passage of "Unmapped glyphs".
+--dev serves no interface and admits the Vite server on 127.0.0.1:5173 instead (`npm run dev` in
+frontend/), with no session, on port 8765, where that server sends API requests. Without --port, a
+free port is used. --request-log appends each request the test-owned provider receives to FILE, one
+JSON line each.
 
 tests/walkthrough_driver.mjs drives the rendered walkthrough against this server.
 """
@@ -132,6 +134,7 @@ def write_materials():
         # S1-17's search flows: an English and a Chinese paper with no identifier.
         "Wage floors and employment.md": synthetic_materials.SEARCH_NOTES,
         "最低工资与就业笔记.md": synthetic_materials.CHINESE_NOTES,
+        "Unmapped glyphs.md": synthetic_materials.GLYPH_NOTES,  # past the helper's slot, and refused (S1-18's finding)
         "scanned-letter.pdf": synthetic_materials.scanned_letter(DOIS["scan"]),  # S1-20: an image, no text layer
         # The reading's ceilings (backend/reading.py): marked for the walkthrough's reading child.
         "large-figures.pdf": synthetic_materials.paper_pdf(title="Large Figures").replace(
@@ -178,12 +181,18 @@ while True:
 
 
 def helper_answer(request, control):
-    """The stand-in helper's HTTP side: health, and synthetic embeddings (503 while control exists)."""
+    """The stand-in helper's HTTP side: health, its tokenizer and slot, and synthetic embeddings (503
+    while control exists), refusing an input with synthetic_materials.GLYPHS_REFUSED in it."""
     if request.url.path == "/health":
         return httpx.Response(200, json={"status": "ok"})
-    if request.url.path != "/v1/embeddings" or control.exists():
+    if request.url.path not in ("/v1/embeddings", "/tokenize") or control.exists():
         return httpx.Response(503, json={"error": "unavailable"})
-    texts = json.loads(request.content)["input"]
+    body = json.loads(request.content)
+    slot = local_helper.CONTEXT // local_helper.SLOTS
+    if (answer := synthetic_materials.helper_tokenizer(request.url.path, body, slot,
+                                                       refuse=synthetic_materials.GLYPHS_REFUSED)) is not None:
+        return httpx.Response(answer[0], json=answer[1])
+    texts = body["input"]
     return httpx.Response(200, json={"data": [{"index": i, "embedding": synthetic_materials.embedding(text)}
                                               for i, text in enumerate(texts)]})
 

@@ -522,13 +522,24 @@
   "search.reason.vectors_unavailable": "此份 Scholia 无法进行语义搜索。请重新安装 Scholia。",
   "search.reason.index_unavailable": "搜索索引暂时不可用。",
   "search.reason.request_failed": "这次辅助程序没有响应。请稍后再搜索。",
+  "search.reason.input_refused": "搜索模型无法处理这个问题。请换个说法。",
   "search.reason.closing": "Scholia 正在关闭。",
   "search.building": "正在根据你的论文重建搜索索引，部分结果可能缺失。",
   "search.partial": "语义搜索目前覆盖 {total} 个段落中的 {embedded} 个；其余段落按关键词查找。",
+  "search.partialRefused": {
+    "other": "语义搜索覆盖 {total} 个段落中的 {embedded} 个；{count} 个段落搜索模型无法处理，按关键词查找。"
+  },
   "search.paperNotIndexed": "尚未加入搜索索引",
   "search.paperKeywordOnly": "已建立关键词索引。",
   "search.paperEmbedding": "已建立关键词索引；向量 {done}/{total}",
+  "search.paperEmbeddingRefused": "已建立关键词索引；向量 {done}/{total}；{refused} 个无法生成向量",
   "search.paperIndexed": "已建立关键词与语义索引",
+  "search.paperRefused": {
+    "other": "已建立关键词与语义索引，但有 {count} 个段落搜索模型无法处理；仍可按关键词找到。"
+  },
+  "search.paperRefusedAll": {
+    "other": "仅建立关键词索引：搜索模型无法处理它的 {count} 个段落。"
+  },
   "search.indexTitle": "搜索索引",
   "search.indexHint": "搜索按关键词查找段落；安装搜索模型后，也按语义查找。“重建”会把每篇论文的段落重新读入索引。",
   "search.indexState": "状态",
@@ -537,7 +548,9 @@
   "search.indexState.unavailable": "不可用",
   "search.indexPassages": "段落",
   "search.indexCounts": "已索引 {indexed} 个；向量 {embedded}/{embeddable}",
+  "search.indexCountsRefused": "已索引 {indexed} 个；向量 {embedded}/{embeddable}；{refused} 个无法生成向量",
   "search.runHybrid": "本次生成 {embedded} 个向量；本项目向量 {done}/{total}",
+  "search.runHybridRefused": "本次生成 {embedded} 个向量；本项目向量 {done}/{total}；{refused} 个无法生成向量",
   "search.runKeyword": "本项目已为关键词搜索索引 {indexed} 个段落",
   "search.indexMode": "搜索方式",
   "search.indexHybrid": "关键词与语义",

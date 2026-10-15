@@ -12,8 +12,10 @@ from `urls`. One not ready within `[helper] start_seconds` is stopped. A running
 every `[helper] health_seconds`. A start that fails, a helper that exits or fails a check, is
 started again after each of `[helper] restart_backoff_seconds` in turn; after the last, a notice
 says it stopped, and it stays stopped until Start again. A question's embeddings go ahead of
-indexing batches, which hold at most one of the server's two slots. When the helper cannot serve,
-`embed` raises HelperUnavailable, and the status says search is keyword-only, and why.
+indexing batches, which hold at most one of the server's two slots. Each text is first bounded to
+what a slot holds, in the model's own tokens (INPUT_TOKENS: a longer one is embedded on a prefix
+within it). When the helper cannot serve, `embed` raises HelperUnavailable, and the status
+says search is keyword-only, and why; when it refuses an input itself, InputRefused.
 
 Models live in `<data folder>/models/<model>/`, owner-only. A download is an explicit, app-wide
 action (ticket 71): one at a time, from Hugging Face or ModelScope as the researcher chose (kept in
@@ -109,8 +111,18 @@ SOURCES = ("huggingface", "modelscope")
 # Per process: context, physical batch and slots (section 13), about 0.46 GB of cache each; and no
 # prompt cache, which llama-server keeps by default (up to 8 GiB of host memory per process) and an
 # embedding or reranking server never reuses: measured in S1-16, a helper grew to 12 GB with it.
-LIMITS = ["-c", "4096", "-ub", "2048", "-np", "2", "--cache-ram", "0"]
-SLOTS = 2
+CONTEXT, UBATCH, SLOTS = 4096, 2048, 2
+LIMITS = ["-c", str(CONTEXT), "-ub", str(UBATCH), "-np", str(SLOTS), "--cache-ram", "0"]
+# The tokens one embedding input may take: a slot's share of the context, which the physical batch
+# must also hold whole, less a margin for the special tokens the server adds. A longer input is
+# embedded on a prefix within this, counted by the helper's own tokenizer (Helper._bounded); the
+# server refuses one over its slot (HTTP 400), and the pinned build (b11146) has no truncation of
+# embedding inputs of its own.
+TOKEN_MARGIN = 32
+INPUT_TOKENS = min(CONTEXT // SLOTS, UBATCH) - TOKEN_MARGIN
+# Statuses that say the helper cannot serve now rather than that it refuses this input: its key
+# (a restarted helper's), a path this build lacks, a timeout, or too many requests.
+_UNAVAILABLE = (401, 403, 404, 408, 429)
 # Texts per indexing request. The server queues each text of a request as a task of its own, so a
 # question sent during indexing waits behind the texts already queued. Measured in S1-16 (120 s of
 # indexing per size, with a question 0.25 s after each answer): 32 texts per request, question p95
@@ -165,6 +177,15 @@ class HelperUnavailable(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class InputRefused(HelperUnavailable):
+    """The helper refuses this input itself (a 4xx other than _UNAVAILABLE's), so asking again with
+    the same text gets the same answer: an index run records the passage as not embedded (S1-17), and
+    a question is searched by keywords (input_refused)."""
+
+    def __init__(self):
+        super().__init__("input_refused")
 
 
 class Refused(Exception):
@@ -348,9 +369,10 @@ class Helper:
     async def embed(self, texts, *, project_id=None, query=False, admit=None) -> list[list[float]]:
         """One embedding per text, in order. A question's (query) go ahead of indexing batches: a
         batch holds at most one of the server's slots, INDEXING_INPUTS texts at a time, and the
-        other stays free for questions. admit(conn), if given, is each request's dispatch check in
-        the outbound gate's decision transaction (an index run's, S1-17). Raises HelperUnavailable
-        when the helper cannot serve, or the check refuses."""
+        other stays free for questions. Each text is bounded to INPUT_TOKENS first (_bounded).
+        admit(conn), if given, is each request's dispatch check in the outbound gate's decision
+        transaction (an index run's, S1-17). Raises HelperUnavailable when the helper cannot serve, or
+        the check refuses; InputRefused when the helper refuses a text itself."""
         texts = list(texts)
         size = len(texts) if query else INDEXING_INPUTS
         vectors = []
@@ -362,13 +384,45 @@ class Helper:
                 for start in range(0, len(texts), max(size, 1)):
                     async with self._slots:
                         await self._ready()
-                        part = texts[start:start + size]
+                        part = [await self._bounded(text, project_id, admit) for text in texts[start:start + size]]
                         vectors += _vectors(await self._post("/v1/embeddings", {"input": part}, project_id, admit),
                                             len(part))
         finally:
             self._in_use -= 1
             self.last_used = time.monotonic()
         return vectors
+
+    async def _bounded(self, text, project_id, admit):
+        """text, or a prefix of it that the helper's own tokenizer counts within INPUT_TOKENS: a binary
+        search over the prefix's length in characters (code points), each candidate counted with
+        /tokenize, keeping the longest one found within the bound (the shorter end always counted
+        within it, or empty; the longer end always counted over). The prefix sent is within the bound,
+        and the longest within it when the count grows with the prefix, as it usually does;
+        the text is refused (InputRefused) only when its first character alone counts over the bound,
+        or the helper refuses to count. About log2(characters) + 1 counts per input. Each request
+        carries admit, as the embedding's does, so nothing goes out that the embedding itself could
+        not send. A text of at most INPUT_TOKENS UTF-8 bytes is sent as it is, uncounted: the model's
+        byte-level BPE gives each token at least one byte."""
+        if len(text.encode()) <= INPUT_TOKENS or await self._count(text, project_id, admit) <= INPUT_TOKENS:
+            return text
+        within, over = 0, len(text)
+        while over - within > 1:
+            middle = (within + over) // 2
+            if await self._count(text[:middle], project_id, admit) <= INPUT_TOKENS:
+                within = middle
+            else:
+                over = middle
+        if within == 0:  # its first character alone is over
+            raise InputRefused()
+        return text[:within]
+
+    async def _count(self, text, project_id, admit):
+        """How many tokens the helper counts in text (/tokenize, without the special tokens)."""
+        counted = await self._post("/tokenize", {"content": text, "add_special": False}, project_id, admit)
+        tokens = counted.get("tokens") if isinstance(counted, dict) else None
+        if not isinstance(tokens, list):
+            raise HelperUnavailable("request_failed")
+        return len(tokens)
 
     async def rerank(self, query, documents, *, deadline, project_id=None) -> list[float] | None:
         """Each document's relevance score, in order, or None when they are not back within deadline
@@ -407,7 +461,8 @@ class Helper:
                                                **({"admit": admit} if admit is not None else {})) as http:
                 response = await http.post(url + path, json=body, headers={"Authorization": f"Bearer {key}"})
             if response.status_code != 200:
-                raise HelperUnavailable("request_failed")
+                raise InputRefused() if 400 <= response.status_code < 500 and response.status_code not in _UNAVAILABLE \
+                    else HelperUnavailable("request_failed")
             return response.json()
         except (httpx.HTTPError, OutboundDenied, ValueError):
             raise HelperUnavailable("request_failed") from None

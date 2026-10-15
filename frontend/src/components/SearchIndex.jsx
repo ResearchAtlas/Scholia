@@ -9,7 +9,7 @@ import { useT } from '../i18n/index.js';
 import { useAction } from '../action.js';
 import { downloadOffered } from '../helper.js';
 import { fraction, followRun } from '../runs.js';
-import { indexPoll, indexReason, indexStatus, rebuildAfter, rebuildIndex } from '../search.js';
+import { indexCounts, indexPoll, indexReason, indexStatus, rebuildAfter, rebuildIndex } from '../search.js';
 import { LoadState } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 
@@ -51,7 +51,7 @@ export function IndexSection({ project }) {
   const rows = [
     [t('search.indexState'), t(`search.indexState.${index.state}`)],
     [t('search.indexMode'), reason],
-    [t('search.indexPassages'), t('search.indexCounts', index.passages)],
+    [t('search.indexPassages'), t(...indexCounts(index.passages))],
   ];
   return (
     <div className="grid gap-3">

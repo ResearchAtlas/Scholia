@@ -256,7 +256,7 @@ async def test_a_restore_reopens_the_index_against_the_restored_database_and_reb
         assert (await client.post("/api/backups/restore", json={"generation": backup})).status_code == 200
         assert client.state["index"] is not before and before.closed
         status = await until_embedded(client, project)
-        assert status["passages"] == {"indexed": 4, "embedded": 4, "embeddable": 4}  # what the backup holds
+        assert status["passages"] == {"indexed": 4, "embedded": 4, "embeddable": 4, "refused": 0}  # what the backup holds
         keyword = client.state["index"].keyword
         assert await asyncio.to_thread(keyword, project, "最低工资", 50) == []
         assert (await find(client, project, "earnings"))["results"]
@@ -372,7 +372,7 @@ async def test_a_search_that_finds_the_file_unreadable_answers_without_an_error(
             raise search_index.apsw.CorruptError("damaged")
         monkeypatch.setattr(SearchIndex, "counts", unreadable)
         response = await client.post(f"/api/projects/{project}/search", json={"query": "earnings"})
-        assert response.status_code == 200 and response.json()["coverage"] == {"embedded": 0, "total": 0}
+        assert response.status_code == 200 and response.json()["coverage"] == {"embedded": 0, "total": 0, "refused": 0}
         assert (await client.get(f"/api/projects/{project}/index")).status_code == 200
 
 

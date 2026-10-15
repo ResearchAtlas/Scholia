@@ -16,13 +16,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from backend import local_helper
+from backend import local_helper, search, search_index
 from backend.local_helper import EMBEDDING, Config
 from backend.search_index import SearchIndex
 import synthetic_materials as synthetic
 from network_guard import allow_subprocess
 from scholia_app import read_in_process, run_finished, started
-from test_local_helper import PIN, TIMINGS, WEIGHTS, Fake
+from test_local_helper import PIN, SLOT, TIMINGS, WEIGHTS, Fake, tokenizer
 from test_materials import added, project_of, rows
 
 pytestmark = pytest.mark.asyncio
@@ -36,7 +36,9 @@ class Remote:
     of the server launched last), the model download source (`files`), and 404 for anything else (the
     scholarly sources). `embedded` keeps each embedding request's texts in order; while `hold` is set,
     indexing requests after the first `free` wait for it (`reached` set as one arrives); `failing`
-    answers them 500; `slow_queries` delays a query's answer by that many seconds."""
+    answers them 500; `slow_queries` delays a query's answer by that many seconds. Its tokenizer and
+    slot are test_local_helper.tokenizer's: an input over the slot, or one containing `refuse`, is
+    refused with HTTP 400 (`refused` keeps those texts); `tokenizing` answers the tokenizer 503."""
 
     def __init__(self, fake):
         self.fake = fake
@@ -44,6 +46,7 @@ class Remote:
         self.hold, self.reached, self.free = None, asyncio.Event(), 0
         self.failing = False
         self.slow_queries = 0
+        self.refuse, self.refused, self.counted, self.tokenizing, self.fail_on = None, [], [], None, None
 
     def key(self, port):
         launches = self.fake.launches
@@ -62,7 +65,16 @@ class Remote:
             return httpx.Response(200, json={"status": "ok"})
         if request.headers.get("authorization") != f"Bearer {self.key(request.url.port)}":
             return httpx.Response(401, json={"error": "invalid api key"})
-        texts = json.loads(request.content)["input"]
+        body = json.loads(request.content)
+        if request.url.path == "/tokenize":
+            self.counted.append(body.get("content"))
+            return httpx.Response(self.tokenizing) if self.tokenizing else tokenizer(request.url.path, body)
+        if (refused := tokenizer(request.url.path, body, refuse=self.refuse)) is not None:
+            self.refused.append(body["input"])
+            return refused
+        texts = body["input"]
+        if self.fail_on is not None and any(self.fail_on in text for text in texts):
+            return httpx.Response(500, json={"error": "failed"})
         self.embedded.append(texts)
         query = any("Query:" in t for t in texts)
         if query and self.slow_queries:
@@ -198,7 +210,7 @@ async def test_a_helper_that_fails_ends_the_run_with_its_reason_and_the_paper_st
         assert (run["status"], run["result"]["reason"], run["retryable"]) == ("failed", "request_failed", True)
         found = await find(client, project, "earnings")
         assert [r["title"] for r in found["results"]] == ["Wage Floors"]
-        assert found["coverage"] == {"embedded": 0, "total": 4}
+        assert found["coverage"] == {"embedded": 0, "total": 4, "refused": 0}
         client.remote.failing = False
         again = await client.post(f"/api/runs/{run['run_id']}/retry")
         assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
@@ -228,7 +240,7 @@ async def test_deleting_mid_embedding_sends_nothing_more_of_it_and_keeps_nothing
         if deleted == "material":
             ended = await run_finished(client, run["run_id"])
             assert ended["status"] == "succeeded" and ended["result"]["passages"] == {"indexed": 0, "embedded": 0,
-                                                                                    "embeddable": 0}
+                                                                                    "embeddable": 0, "refused": 0}
             assert (await find(client, project, "earnings"))["results"] == []
 
 
@@ -443,7 +455,7 @@ async def test_a_local_only_project_gets_no_offer_and_searches_by_keyword(tmp_pa
         assert (found["mode"], found["reason"]) == ("keyword_only", "model_missing") and found["results"]
         [run] = await runs_of(client, "index", project)
         assert (run["status"], run["result"]["mode"], run["result"]["reason"]) == ("succeeded", "keyword_only", "model_missing")
-        assert run["result"]["passages"] == {"indexed": 4, "embedded": 0, "embeddable": 4}
+        assert run["result"]["passages"] == {"indexed": 4, "embedded": 0, "embeddable": 4, "refused": 0}
 
 
 async def test_later_sends_nothing_and_is_not_asked_again_in_that_project(tmp_path):
@@ -646,8 +658,8 @@ async def test_the_index_status_and_a_rebuild_read_back(tmp_path):
         [material] = (await added(client, project, WAGES))["materials"]
         status = await idle(client, project)
         assert (status["state"], status["mode"], status["reason"]) == ("ready", "hybrid", None)
-        assert status["passages"] == {"indexed": 4, "embedded": 4, "embeddable": 4}
-        assert status["materials"] == {material["id"]: {"indexed": 4, "embedded": 4, "embeddable": 4}}
+        assert status["passages"] == {"indexed": 4, "embedded": 4, "embeddable": 4, "refused": 0}
+        assert status["materials"] == {material["id"]: {"indexed": 4, "embedded": 4, "embeddable": 4, "refused": 0}}
         before = len(client.remote.indexing)
         response = await client.post(f"/api/projects/{project}/index/rebuild")
         assert response.status_code == 202
@@ -724,6 +736,152 @@ async def test_papers_left_unembedded_get_index_runs_at_the_next_launch_with_the
         while (await idle(client, project))["passages"]["embedded"] < 4:
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.05)
+
+
+# Embedding inputs over the helper's slot (found by S1-18): bounded before they are sent; one the helper
+# still refuses is recorded, counted and passed over until its text or the model changes
+
+
+GLYPHS = "\ue000\ue0a1\uf8ff" * 150  # private-use characters, as PDF extraction leaves unmapped glyphs
+LONG = ("long-passages.md", paper("Long Passages " + GLYPHS, "Minimum wages raise the earnings of low-paid workers.",
+                                  "最低工资" * 497 + "最", "Regional prices adjust slowly after a wage floor is raised.")[1])
+
+
+async def test_an_over_long_passage_among_others_is_embedded_on_its_bounded_prefix_and_the_rest_with_it(tmp_path):
+    async with app(tmp_path, batch=2) as client:
+        project = await project_of(client)
+        await added(client, project, LONG)
+        status = await idle(client, project)
+        [run] = await runs_of(client, "index", project)
+        assert (run["status"], run["result"]["passages"]["refused"]) == ("succeeded", 0)
+        assert status["passages"]["embedded"] == status["passages"]["embeddable"] > 2
+        assert status["passages"]["refused"] == 0 and client.remote.refused == [] and client.remote.counted
+        sent = [text for texts in client.remote.indexing for text in texts]
+        assert all(len(text.encode()) + 1 <= SLOT for text in sent)  # every input within the slot
+        readings = await asyncio.to_thread(client.state["db"].read, lambda conn: search_index.readings(conn, project))
+        [whole] = [search._text(r) for r in readings.values() if r[4].startswith("最低工资")]
+        [bounded] = [t for t in sent if "最低工资" in t]
+        assert whole.startswith(bounded) and len(bounded) < len(whole)  # its longest prefix within the slot
+        assert len(bounded.encode()) > local_helper.INPUT_TOKENS - 3 and len(client.remote.counted) <= 14
+        found = (await find(client, project, "最低工资"))["results"][0]
+        assert found["text"].startswith("最低工资") and found["text"] == readings[found["passage_id"]][4]  # shown whole
+
+
+async def test_a_question_over_the_slot_is_embedded_on_its_bounded_prefix_and_a_refused_one_searches_by_keyword(tmp_path):
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        question = "earnings " + GLYPHS[:990]
+        found = await find(client, project, question)
+        assert (found["mode"], found["reason"]) == ("hybrid", None) and found["results"]
+        [query] = [t for texts in client.remote.embedded for t in texts if "Query:" in t]
+        assert query.startswith(search.QUERY_INSTRUCTION + "earnings") and len(query.encode()) + 1 <= SLOT
+        client.remote.refuse = "earnings"
+        found = await find(client, project, "earnings")
+        assert (found["mode"], found["reason"]) == ("keyword_only", "input_refused")
+        assert [r["title"] for r in found["results"]] == ["Wage Floors"] * 1
+
+
+async def test_a_passage_the_helper_refuses_is_counted_and_passed_over_until_its_text_changes(tmp_path):
+    async with app(tmp_path, batch=1) as client:
+        client.remote.refuse = "Employment effects"
+        project = await project_of(client)
+        [material] = (await added(client, project, WAGES))["materials"]
+        status = await idle(client, project)
+        [run] = await runs_of(client, "index", project)
+        assert run["status"] == "succeeded"  # the project's refused passages, from the index, in its result
+        assert run["result"]["passages"] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
+        assert status["passages"] == run["result"]["passages"]
+        assert status["materials"][material["id"]] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
+        assert len(client.remote.refused) == 1
+        found = await find(client, project, "employment effects")
+        assert found["coverage"] == {"embedded": 3, "total": 4, "refused": 1}
+        assert found["results"][0]["text"].startswith("Employment effects")  # still found by its keywords
+        await added(client, project, CHINESE)  # the project's next run: the refused passage is not sent again
+        await idle(client, project)
+        assert len(client.remote.refused) == 1
+        ran = await runs_of(client, "index", project)
+        assert ran[0]["result"]["passages"]["refused"] == 1  # still the one: not asked for again
+    async with app(tmp_path, batch=1) as client:  # nor at the next launch, which asks for no run for it
+        client.remote.refuse = "Employment effects"
+        await asyncio.sleep(0.3)
+        status = await idle(client, project)
+        assert client.remote.refused == [] and len(await runs_of(client, "index", project)) == len(ran)
+        assert status["passages"]["refused"] == 1
+        response = await client.patch(f"/api/materials/{material['id']}", json={"title": "Wage Floors, Revised"})
+        assert response.status_code == 200
+        status = await idle(client, project)  # its text changed: asked for once more, and refused once more
+        assert len(client.remote.refused) == 1 and status["passages"]["refused"] == 1
+        other = (await added(client, project, paper("Doomed", "Employment effects of a doomed paper.")))["materials"][0]
+        assert (await idle(client, project))["materials"][other["id"]]["refused"] == 1
+        assert (await client.delete(f"/api/materials/{other['id']}")).status_code == 200  # a refused row goes too
+        assert other["id"] not in (await idle(client, project))["materials"]
+        assert [r for r in await index_rows(client, project) if r[1] == other["id"]] == []
+        client.remote.refuse = None
+        index = client.state["index"]
+        await asyncio.to_thread(index._write, index._drop_vectors)  # another model: every vector asked for again
+        await search._embed_all(client.state)
+        status = await idle(client, project)
+        assert status["passages"]["refused"] == 0 and status["passages"]["embedded"] == status["passages"]["embeddable"]
+
+
+async def test_a_refusal_is_kept_when_a_later_passage_of_its_batch_fails_and_retry_does_not_send_it_again(tmp_path):
+    async with app(tmp_path, batch=10) as client:  # one batch for the paper's passages
+        client.remote.refuse, client.remote.fail_on = "Minimum wages", "Employment effects"  # the 2nd, then the 3rd
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        status = await idle(client, project)
+        [run] = await runs_of(client, "index", project)
+        assert (run["status"], run["result"]) == ("failed", {"reason": "request_failed"})  # its reason only
+        assert status["passages"]["refused"] == 1 and len(client.remote.refused) == 1  # kept, though the batch failed
+        client.remote.fail_on = None
+        again = await client.post(f"/api/runs/{run['run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        status = await idle(client, project)
+        assert len(client.remote.refused) == 1  # not sent again
+        assert status["passages"] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
+
+
+async def test_a_rebuild_and_its_retry_keep_a_refusal_while_its_text_is_unchanged(tmp_path):
+    async with app(tmp_path, batch=10) as client:
+        client.remote.refuse, client.remote.fail_on = "Minimum wages", "Employment effects"
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)  # refused, then failed: the refusal kept (above)
+        response = await client.post(f"/api/projects/{project}/index/rebuild")
+        rebuilt = await run_finished(client, response.json()["run_id"])
+        assert (rebuilt["status"], rebuilt["result"]["reason"]) == ("failed", "request_failed")
+        assert len(client.remote.refused) == 1  # the rebuild kept the refusal: the text was not sent again
+        assert (await idle(client, project))["passages"]["refused"] == 1
+        client.remote.fail_on = None
+        again = await client.post(f"/api/runs/{rebuilt['run_id']}/retry")
+        ended = await run_finished(client, again.json()["run_id"])
+        assert (ended["status"], ended["result"]["rebuilt"]) == ("succeeded", True)  # a rebuild again
+        assert len(client.remote.refused) == 1
+        assert (await idle(client, project))["passages"] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
+        index = client.state["index"]  # a mark whose digest is not its passage's text's is not kept by a rebuild
+        await asyncio.to_thread(index._write, lambda: index._conn.execute(
+            "UPDATE index_rows SET digest = 'another text' WHERE embedded = -1"))
+        response = await client.post(f"/api/projects/{project}/index/rebuild")
+        assert (await run_finished(client, response.json()["run_id"]))["status"] == "succeeded"
+        assert len(client.remote.refused) == 2  # asked for again, and refused again
+
+
+@pytest.mark.parametrize("status", [503, 500, 429])
+async def test_a_helper_that_cannot_count_an_over_long_passage_fails_the_run_as_before(tmp_path, status):
+    async with app(tmp_path) as client:
+        client.remote.tokenizing = status
+        project = await project_of(client)
+        await added(client, project, LONG)
+        await idle(client, project)
+        [run] = await runs_of(client, "index", project)
+        assert (run["status"], run["result"]["reason"], run["retryable"]) == ("failed", "request_failed", True)
+        client.remote.tokenizing = None
+        again = await client.post(f"/api/runs/{run['run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        status = await idle(client, project)
+        assert status["passages"]["embedded"] == status["passages"]["embeddable"] and status["passages"]["refused"] == 0
 
 
 async def test_a_helper_answering_vectors_of_another_dimension_fails_the_run_after_one_request(tmp_path, monkeypatch):

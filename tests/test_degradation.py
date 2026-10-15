@@ -22,7 +22,7 @@ async def test_without_the_model_search_is_keyword_only_and_indexing_waits_for_i
         await added(client, project, WAGES)
         status = await idle(client, project)
         assert (status["mode"], status["reason"]) == ("keyword_only", "model_missing")
-        assert status["passages"] == {"indexed": 4, "embedded": 0, "embeddable": 4}
+        assert status["passages"] == {"indexed": 4, "embedded": 0, "embeddable": 4, "refused": 0}
         found = await find(client, project, "earnings")
         assert (found["mode"], found["reason"]) == ("keyword_only", "model_missing") and found["results"]
         assert client.remote.embedded == []
@@ -73,7 +73,7 @@ async def test_a_partly_embedded_library_says_how_much_meaning_search_covers(tmp
         await asyncio.to_thread(index._write, lambda: index._conn.execute(
             "UPDATE index_rows SET embedded = 0 WHERE id = (SELECT min(id) FROM index_rows)"))
         found = await find(client, project, "earnings")
-        assert found["mode"] == "hybrid" and found["coverage"] == {"embedded": 3, "total": 4}
+        assert found["mode"] == "hybrid" and found["coverage"] == {"embedded": 3, "total": 4, "refused": 0}
 
 
 async def test_the_search_model_pin_is_the_one_the_index_records():
