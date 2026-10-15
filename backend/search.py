@@ -6,7 +6,8 @@ Index runs (workflow `index`) belong to a project and name no papers: each time,
 queue (keyword search), rebuilds the project's rows if asked (`inputs.rebuild`), checks the project's
 rows against the main database (`SearchIndex.reconcile`), then embeds every passage of the project
 that lacks a vector, worked out at that moment, one index run at a time, `[retrieval]
-embedding_batch` at a time, each committed to the index as one batch. At most one runs per project:
+embedding_batch` at a time, each batch's vectors committed to the index together (a refusal, below,
+at once). At most one runs per project:
 every trigger (a reading's commit, a title change, a deletion, the model's install, the launch, a
 restore, a whole-file rebuild, Retry, Rebuild) only requests one (`request_run`): while the project's run
 runs, it is marked to run once more when it ends (one rerun pending, a rebuild if one was asked
