@@ -505,3 +505,16 @@ def test_gaps_keep_a_run_from_finishing_and_metrics_without_fallbacks_leave_out_
     assert lines == ["NOT LIKE FOR LIKE: the manifest (pins, rules, subset) differs from the baseline's"]
     assert "Not finished: running" in "\n".join(tier1.report({"status": "incomplete", "reason": "running"}))
 
+
+
+@pytest.mark.asyncio
+async def test_a_passage_the_helper_refuses_is_counted_and_the_hybrid_arm_still_scores(tmp_path):
+    async def refusing(client):
+        client.remote.refuse = "Songbirds migrate"  # the stand-in refuses a text containing this (HTTP 400)
+    _, _, running = await _run(tmp_path, ["scifact"], open_app=opener(before_yield=refusing))
+    results = await running
+    beir = results["benchmarks"]["scifact"]
+    assert beir["build"]["passages_refused"] == 1 and results["status"] == "finished"
+    hybrid = beir["arms"]["hybrid"]
+    assert hybrid["complete"] and hybrid["fallbacks"] == {} and hybrid["metrics"]["ndcg@10"]["n"] == 3
+    assert "(1 refused by the helper;" in "\n".join(tier1.report(results))

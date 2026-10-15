@@ -365,7 +365,9 @@ async def build_stats(state, began):
     failed = await asyncio.to_thread(db.read, lambda c: c.execute(
         "SELECT count(*) FROM runs WHERE workflow = 'extract' AND status != 'succeeded'").fetchone()[0])
     index_file = Path(state["data_dir"]) / "index" / "search.sqlite3"
-    return {"seconds": round(time.perf_counter() - began, 1), "passages": len(lengths),
+    refused = await asyncio.to_thread(state["index"]._read, lambda c: c.execute(  # the helper refused their text
+        "SELECT count(*) FROM index_rows WHERE embedded = -1").fetchone()[0])
+    return {"seconds": round(time.perf_counter() - began, 1), "passages": len(lengths), "passages_refused": refused,
             "passage_chars": summary(lengths), "passages_over_2000_chars": sum(1 for n in lengths if n > 2000),
             "readings_not_succeeded": failed,
             "index_bytes": sum(p.stat().st_size for p in index_file.parent.glob(index_file.name + "*") if p.is_file())}
@@ -399,9 +401,9 @@ async def run_arms(state, arms, queries, rank):
             reason = answer["reason"]
             if answer.get("index") != "ready":  # being rebuilt or unavailable: not the built index
                 reason = "index_not_ready"
-            elif answer["mode"] == "hybrid" and (answer.get("coverage") or {}).get("embedded") != \
-                    (answer.get("coverage") or {}).get("total"):  # meaning search over part of the passages
-                reason = "coverage_partial"
+            elif answer["mode"] == "hybrid" and (coverage := answer.get("coverage") or {}).get("embedded", 0) + \
+                    coverage.get("refused", 0) != coverage.get("total"):  # meaning search over part of the passages
+                reason = "coverage_partial"  # (a passage the helper refused stays out of it in the app too: counted)
             outcomes.append((answer["mode"], reason))
         out[name] = {"rankings": rankings, "outcomes": outcomes, "seconds": summary(seconds)}
     return out
@@ -803,7 +805,7 @@ def report(results):
         chars = build["passage_chars"] or {}
         lines += [f"## {name}", "",
                   f"{bench['queries']} queries run; excluded {bench.get('exclusions') or 'none'}. Build "
-                  f"{build['seconds']} s, {build['passages']} passages (characters median {chars.get('median')}, p95 "
+                  f"{build['seconds']} s, {build['passages']} passages ({build.get('passages_refused')} refused by the helper; characters median {chars.get('median')}, p95 "
                   f"{chars.get('p95')}, max {chars.get('max')}; {build['passages_over_2000_chars']} over 2,000), index "
                   f"{build['index_bytes'] / 2**20:.1f} MiB, readings not succeeded {build['readings_not_succeeded']}.", "",
                   "| Arm | Metric | Mean | 95% interval | n | Minus hybrid (95% interval) |", "|---|---|---|---|---|---|"]
