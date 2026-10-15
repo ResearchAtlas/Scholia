@@ -66,7 +66,7 @@ class Remote:
         if request.headers.get("authorization") != f"Bearer {self.key(request.url.port)}":
             return httpx.Response(401, json={"error": "invalid api key"})
         body = json.loads(request.content)
-        if request.url.path in ("/tokenize", "/detokenize"):
+        if request.url.path == "/tokenize":
             self.counted.append(body.get("content"))
             return httpx.Response(self.tokenizing) if self.tokenizing else tokenizer(request.url.path, body)
         if (refused := tokenizer(request.url.path, body, refuse=self.refuse)) is not None:
@@ -762,7 +762,7 @@ async def test_an_over_long_passage_among_others_is_embedded_on_its_bounded_pref
         [whole] = [search._text(r) for r in readings.values() if r[4].startswith("最低工资")]
         [bounded] = [t for t in sent if "最低工资" in t]
         assert whole.startswith(bounded) and len(bounded) < len(whole)  # its longest prefix within the slot
-        assert len(bounded.encode()) > local_helper.INPUT_TOKENS - 4
+        assert len(bounded.encode()) > local_helper.INPUT_TOKENS - 3 and len(client.remote.counted) <= 14
         found = (await find(client, project, "最低工资"))["results"][0]
         assert found["text"].startswith("最低工资") and found["text"] == readings[found["passage_id"]][4]  # shown whole
 

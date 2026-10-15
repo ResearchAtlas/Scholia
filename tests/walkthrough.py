@@ -25,9 +25,10 @@ here, behind the outbound gate's transport, with synthetic vectors (synthetic_ma
 While the file named by "helper control" exists, it answers embedding requests 503, as a helper that
 stopped answering. It counts tokens as llama-server's tokenizer at its most spread out (one per byte),
 refuses an input over its slot as llama-server does, and refuses one passage of "Unmapped glyphs".
---dev serves no interface and admits the Vite server on 127.0.0.1:5173 instead (`npm run dev` in frontend/), with no session, on port 8765, where
-that server sends API requests. Without --port, a free port is used. --request-log appends
-each request the test-owned provider receives to FILE, one JSON line each.
+--dev serves no interface and admits the Vite server on 127.0.0.1:5173 instead (`npm run dev` in
+frontend/), with no session, on port 8765, where that server sends API requests. Without --port, a
+free port is used. --request-log appends each request the test-owned provider receives to FILE, one
+JSON line each.
 
 tests/walkthrough_driver.mjs drives the rendered walkthrough against this server.
 """
@@ -184,7 +185,7 @@ def helper_answer(request, control):
     while control exists), refusing an input with synthetic_materials.GLYPHS_REFUSED in it."""
     if request.url.path == "/health":
         return httpx.Response(200, json={"status": "ok"})
-    if request.url.path not in ("/v1/embeddings", "/tokenize", "/detokenize") or control.exists():
+    if request.url.path not in ("/v1/embeddings", "/tokenize") or control.exists():
         return httpx.Response(503, json={"error": "unavailable"})
     body = json.loads(request.content)
     slot = local_helper.CONTEXT // local_helper.SLOTS

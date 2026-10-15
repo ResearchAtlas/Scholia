@@ -13,7 +13,7 @@ backend runs in this process on a new temporary data folder, with an in-memory c
 model is imported through the API and the helper the app starts is driven through the outbound gate.
 For each input it records the helper's own token count (/tokenize, without and with the special
 tokens), whether the helper refuses the whole input (HTTP 400, as before the fix), and the prefix
-Helper.embed sends now: its token count and that its embedding came back.
+Helper.embed sends now: its token count, the counts the search took and that its embedding came back.
 """
 
 import argparse
@@ -62,9 +62,18 @@ async def check(helper, state, text, query):
         found["whole_input"] = "embedded"
     except InputRefused:
         found["whole_input"] = "refused (HTTP 400)"
-    bounded = await helper._bounded(text, None, None)
+    counts, real = [], helper._count
+
+    async def counting(*args):
+        counts.append(1)
+        return await real(*args)
+    helper._count = counting
+    try:
+        bounded = await helper._bounded(text, None, None)
+    finally:
+        del helper._count
     [vector] = await local_helper.embed(state, [text], query=query)
-    found["sent"] = {"characters": len(bounded), "is_prefix": text.startswith(bounded),
+    found["sent"] = {"characters": len(bounded), "is_prefix": text.startswith(bounded), "counts": len(counts),
                      "tokens": await count(helper, bounded, False),
                      "tokens_with_special": await count(helper, bounded, True), "dimensions": len(vector)}
     return found
