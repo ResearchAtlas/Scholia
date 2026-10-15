@@ -120,10 +120,12 @@ LIMITS = ["-c", str(CONTEXT), "-ub", str(UBATCH), "-np", str(SLOTS), "--cache-ra
 # has no truncation of embedding inputs of its own.
 TOKEN_MARGIN = 32
 INPUT_TOKENS = min(CONTEXT // SLOTS, UBATCH) - TOKEN_MARGIN
-# How far a cut's read-back can count from the cut itself: up to 3 tokens fewer (a split character
-# dropped) or 6 more (its bytes read back as U+FFFD that the text itself holds there). A prefix that
-# counts over by more is cut shorter by the excess at once; within it, one token at a time, so the
-# longest prefix within INPUT_TOKENS is never stepped over (Helper._bounded).
+# How far a cut's read-back can count from the cut itself, bounded for a byte-level tokenizer (one
+# token per byte at worst): up to 3 fewer (a split character's bytes dropped) or 6 more (its up to 3
+# bytes each read back as a 3-byte U+FFFD that the text itself holds there). A prefix that counts over
+# by more is cut shorter by the excess at once; within it, one token at a time, so the longest prefix
+# within INPUT_TOKENS is not stepped over (Helper._bounded). A real tokenizer's read-back that drifts
+# further costs single-token passes (above) or a prefix a few tokens short (below), never a refusal.
 CUT_SLACK = 9
 # Statuses that say the helper cannot serve now rather than that it refuses this input: its key
 # (a restarted helper's), a path this build lacks, a timeout, or too many requests.
