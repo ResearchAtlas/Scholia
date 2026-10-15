@@ -68,7 +68,7 @@ export function App() {
       {state.phase === 'loading' && <Splash />}
       {state.phase === 'error' && <Failure code={state.code} onRetry={load} />}
       {state.phase === 'dataFolder' && <DataFolderScreen health={state.health} />}
-      {state.phase === 'damaged' && <DamagedDatabaseScreen onRestored={load} />}
+      {state.phase === 'damaged' && <DamagedDatabaseScreen onRestored={load} restart={state.health?.limited === 'restart_required'} />}
       {state.phase === 'setup' && <FirstRun onDone={load} />}
       {state.phase === 'ready' && <Shell health={state.health} settings={state.settings}
         onLanguage={(setting) => setLanguage(resolveLanguage(setting, navigator.language))} />}

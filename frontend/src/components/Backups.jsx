@@ -69,16 +69,20 @@ export function BackupsSection({ onRestored = () => window.location.reload(), re
   );
 }
 
-// A database damaged at startup: Scholia changed nothing and offers only a restore.
-export function DamagedDatabaseScreen({ onRestored }) {
+// A database damaged at startup: Scholia changed nothing and offers only a restore. Or, restart: a close of the
+// database failed (backend: close_failed), so nothing may replace its files until Scholia is opened again; it
+// says so and offers nothing else.
+export function DamagedDatabaseScreen({ onRestored, restart = false }) {
   const t = useT();
   return (
     <main className="grid h-full place-items-center overflow-y-auto p-6">
       <div className="w-full max-w-2xl rounded-2xl border bg-card p-8 shadow-xl">
         <TriangleAlert className="size-8 text-warning" aria-hidden="true" />
-        <h1 className="mt-4 text-xl font-semibold tracking-tight">{t('backups.damagedTitle')}</h1>
-        <p className="mb-6 mt-2 text-sm leading-relaxed text-muted-foreground">{t('backups.damagedBody')}</p>
-        <BackupsSection restoreOnly onRestored={onRestored} />
+        <h1 className="mt-4 text-xl font-semibold tracking-tight">{t(restart ? 'backups.restartTitle' : 'backups.damagedTitle')}</h1>
+        <p className="mb-6 mt-2 text-sm leading-relaxed text-muted-foreground">
+          {t(restart ? 'backups.restartBody' : 'backups.damagedBody')}
+        </p>
+        {!restart && <BackupsSection restoreOnly onRestored={onRestored} />}
       </div>
     </main>
   );

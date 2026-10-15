@@ -376,7 +376,8 @@ class SearchIndex:
                 self._reads_done.notify_all()
 
     def _close_readers(self):
-        """Close the idle read connections, every one of them though one fails; the first failure is raised after."""
+        """Close the idle read connections, every one of them though one fails; the first failure is raised after, and
+        kept for the index's close to fail with (a rebuild's or a discard's call ends, a connection is still open)."""
         with self._lock:
             self._generation += 1
         failed = None
@@ -387,7 +388,9 @@ class SearchIndex:
                 break
             try:
                 conn.close()
-            except Exception as error:
+            except Exception as error:  # the index's close fails with it, whenever this ran (_drain_reads)
+                with self._lock:
+                    self._read_failures.append(error)
                 failed = failed or error
         if failed is not None:
             raise failed

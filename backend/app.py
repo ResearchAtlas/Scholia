@@ -430,7 +430,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def health():
         why = backups.limited(state)
         return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir),
-                **({"database_damaged": why[1]} if why else {})}
+                **({"database_damaged": why[1], "limited": why[0]} if why else {})}
 
     async def provider_list():
         configured = providers.configured(data_dir, include_off=True)

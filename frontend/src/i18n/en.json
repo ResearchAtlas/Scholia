@@ -152,6 +152,8 @@
   "backups.continue": "Continue",
   "backups.damagedTitle": "Scholia's database is damaged",
   "backups.damagedBody": "Scholia has not changed it. Restore a backup to continue; the damaged file is kept with the backups.",
+  "backups.restartTitle": "Scholia needs to be opened again",
+  "backups.restartBody": "Scholia could not close its database cleanly, so it changes nothing more for now. Close Scholia and open it again; your data is as it was.",
   "export.title": "Export this project",
   "export.hint": "Its conversations as Markdown, its records as JSON, its files and its settings, never your keys, in one zip file anyone can open. Settings Scholia does not recognize, and comments in settings files, are left out.",
   "export.passphraseHint": "This project is Private or Local only, so its export is encrypted with this passphrase. Scholia cannot recover a lost passphrase.",

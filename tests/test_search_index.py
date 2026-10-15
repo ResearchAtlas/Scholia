@@ -1593,10 +1593,62 @@ class _FailingClose:
 @pytest.mark.parametrize("generation", ["same", "replaced"])
 @pytest.mark.asyncio
 async def test_a_read_that_ends_as_the_index_closes_has_its_failed_close_fail_the_close(tmp_path, generation):
-    """Findings 46 and 50: a read still running as the index closes, its connection's close failing: whether it
-    gives the connection to the close (same file) or closes it itself (a file a rebuild replaced meanwhile), the
-    failure is the close's, and close_failed() holds."""
+    """Findings 46 and 50: a read still running as the index closes, its connection's close failing. Same file: the
+    read gives its connection to the close, whose close of it fails. Replaced (a rebuild replaced the file while the
+    read ran, before the close began): the read closes its connection itself, and that close is still under way,
+    outside any lock, as the index's close begins; it fails. Either way the failure is the close's, and
+    close_failed() holds."""
     import threading
+    from backend.db import close_failed
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        conn, _ = search_index.connect(index.path)
+        closing_reached, closing_go = threading.Event(), threading.Event()
+
+        class Failing(_FailingClose):
+            def close(self):
+                if generation == "replaced":  # the read's own close, under way as the index's close begins
+                    closing_reached.set()
+                    closing_go.wait(20)
+                super().close()
+        while not index._readers.empty():
+            index._readers.get_nowait().close()
+        index._readers.put(Failing(conn))
+        reading, go = threading.Event(), threading.Event()
+
+        def slow(conn):
+            reading.set()
+            if generation == "replaced":
+                with index._lock:
+                    index._generation += 1  # as a rebuild that replaced the file meanwhile
+            else:
+                go.wait(20)
+        reader = threading.Thread(target=_ignoring(index._read), args=(slow,))
+        reader.start()
+        assert await asyncio.to_thread(reading.wait, 10)
+        if generation == "replaced":
+            assert await asyncio.to_thread(closing_reached.wait, 10)
+        closing = asyncio.ensure_future(asyncio.to_thread(index.close))
+        await asyncio.sleep(0.3)
+        assert not closing.done()  # it waits for the read
+        go.set()
+        closing_go.set()
+        with pytest.raises(search_index.apsw.IOError):
+            await asyncio.wait_for(closing, 10)
+        await asyncio.to_thread(reader.join, 10)
+        with pytest.raises(search_index.apsw.ConnectionClosedError):
+            conn.execute("SELECT 1")
+        assert close_failed()
+
+
+@pytest.mark.asyncio
+async def test_an_idle_read_connection_a_rebuild_could_not_close_fails_the_indexs_close(tmp_path):
+    """Review 6, P3-2: an idle read connection whose close fails as a rebuild replaces the file: the rebuild fails
+    and is tried again, and the index's close later fails with that connection's failure (close_failed), never
+    reporting success with it open."""
     from backend.db import close_failed
     async with app(tmp_path) as client:
         project = await project_of(client)
@@ -1607,25 +1659,10 @@ async def test_a_read_that_ends_as_the_index_closes_has_its_failed_close_fail_th
         while not index._readers.empty():
             index._readers.get_nowait().close()
         index._readers.put(_FailingClose(conn))
-        reading, go = threading.Event(), threading.Event()
-
-        def slow(conn):
-            reading.set()
-            go.wait(20)
-            if generation == "replaced":
-                with index._lock:
-                    index._generation += 1  # as a rebuild that replaced the file
-        reader = threading.Thread(target=_ignoring(index._read), args=(slow,))
-        reader.start()
-        assert await asyncio.to_thread(reading.wait, 10)
-        closing = asyncio.ensure_future(asyncio.to_thread(index.close))
-        await asyncio.sleep(0.3)
-        go.set()
         with pytest.raises(search_index.apsw.IOError):
-            await asyncio.wait_for(closing, 10)
-        await asyncio.to_thread(reader.join, 10)
-        with pytest.raises(search_index.apsw.ConnectionClosedError):
-            conn.execute("SELECT 1")
+            await asyncio.to_thread(index._close_readers)  # as a rebuild's or a discard's call meets it
+        with pytest.raises(search_index.apsw.IOError):
+            await asyncio.to_thread(index.close)
         assert close_failed()
 
 

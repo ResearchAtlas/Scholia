@@ -1159,6 +1159,7 @@ def finish_interrupted_restore(data_dir) -> dict | None:
     path = data_dir / "backups" / JOURNAL
     if not path.is_file():
         return None
+    _refuse_after_a_failed_close()  # it runs first in a new process, where none has failed: said, not assumed
     journal = json.loads(path.read_bytes())
     for key in ("staged", "aside"):
         folder = PurePosixPath(journal[key])

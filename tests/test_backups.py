@@ -1513,6 +1513,7 @@ async def test_a_restore_whose_running_database_fails_to_close_puts_nothing_in_p
         assert put == [] and (data / "projects" / project / "config.toml").is_file()
         assert not (data / "backups" / backups_module.JOURNAL).exists()
         assert (await client.get("/api/projects")).json()["code"] == "restart_required"  # limited: restart
+        assert (await client.get("/api/health")).json()["limited"] == "restart_required"  # the window's restart screen
 
 
 async def test_a_failed_restore_whose_restored_database_fails_to_close_puts_nothing_back_nor_in_place(tmp_path,
@@ -1550,3 +1551,26 @@ async def test_a_failed_restore_whose_restored_database_fails_to_close_puts_noth
         monkeypatch.setattr(backups_module, "_put_in_place", lambda *args: moved.append("put") or real_put(*args))
         again = await client.post("/api/backups/restore", json={"generation": backup})
         assert (again.status_code, again.json()["code"]) == (409, "restart_required") and moved == []
+
+
+
+async def test_after_a_failed_close_a_restore_is_refused_before_it_stops_anything_and_no_swap_can_run(tmp_path):
+    """Review 6, P3-5: once a close in this process failed, a restore is refused at once (nothing stopped, the app
+    runs on), and the swap functions themselves refuse before anything moves, whichever caller reaches them."""
+    from backend.db import database
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        project = await new_project(client)
+        database._close_failed.set()  # as a close that failed earlier in this process leaves it
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "restart_required")
+        assert not client.state["harness"].registry.closed  # nothing was stopped
+        assert (await client.get(f"/api/projects/{project}")).status_code == 200
+        staged = data / "backups" / ".staged-test"
+        staged.mkdir(parents=True)
+        with pytest.raises(backups_module.ReplacementRefused):
+            backups_module._put_in_place(data, staged, data / "backups" / ".aside-test", "id")
+        with pytest.raises(backups_module.ReplacementRefused):
+            backups_module._back_from_journal(data)
+        assert not (data / "backups" / ".aside-test").exists() and not (data / "backups" / backups_module.JOURNAL).exists()

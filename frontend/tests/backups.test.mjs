@@ -115,5 +115,12 @@ test('a request that finds the app limited tells the window, so it can offer the
   await assert.rejects(get('/api/projects'));
   answer = { status: 409, code: 'database_damaged' }; // Back up now, whose check found the damage first
   await assert.rejects(post('/api/backups'));
-  assert.deepEqual(seen, ['scholia:limited', 'scholia:limited']);
+  answer = { status: 409, code: 'restart_required' }; // a close failed: the window says to open Scholia again
+  await assert.rejects(post('/api/backups/restore', {}));
+  assert.deepEqual(seen, ['scholia:limited', 'scholia:limited', 'scholia:limited']);
+  const app = readFileSync(fileURLToPath(new URL('../src/App.jsx', import.meta.url)), 'utf8');
+  assert.match(app, /restart=\{state\.health\?\.limited === 'restart_required'\}/);
+  for (const key of ['backups.restartTitle', 'backups.restartBody']) {
+    for (const catalog of [en, zhCN]) assert.ok(key in catalog, key);
+  }
 });
