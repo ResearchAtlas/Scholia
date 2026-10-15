@@ -32,7 +32,8 @@ its own paper, as at import, not looked up. Cancel leaves the record out. Merge 
 transaction, that the paper still matches the record as a duplicate (`_matches`, Duplicates' rule): one
 whose DOI or title changed while the question waited takes nothing (the run fails no_longer_duplicate).
 A Merge that gives a reference file's paper the DOI or arXiv ID it lacked records its lookup in the
-same transaction, as the import's (`_merged_lookup`); a paper from a file is identified by its text alone. The request's base64 is refused unread past what the
+same transaction, as the import's (`_merged_lookup`); a paper not from a reference file is identified
+by its file's text alone, so none is recorded for it. The request's base64 is refused unread past what the
 largest file read encodes to (`_ENCODED`); an empty file reaches the parser, which says it holds no records.
 """
 
@@ -339,21 +340,22 @@ def _answered(conn, project_id, material, record, option, harness, active):
     if option == "keep_both":
         new_material(conn, project_id, record)
         return
-    row = conn.execute("SELECT csl, checked_by, evidence_type, title, source FROM materials WHERE id = ?"
-                       " AND project_id = ?", (material, project_id)).fetchone()
+    row = conn.execute("SELECT csl, checked_by, evidence_type, title, source, lookup_filled FROM materials"
+                       " WHERE id = ? AND project_id = ?", (material, project_id)).fetchone()
     if row is None:  # deleted meanwhile, which revokes the run first: nothing to merge into
         return
     csl = json.loads(row[0]) if row[0] else {}
     if not _matches(csl, record):
         raise RunOutcome("failed", "no_longer_duplicate")
     added = fills(csl, row[1] == "researcher", record)
-    before = reference_files.identifier(csl)
+    filled = set(json.loads(row[5] or "[]"))  # a lookup's fields are not the record's (materials._identifiers)
+    before = reference_files.identifier({key: value for key, value in csl.items() if key not in filled})
     csl.update(added)
     conn.execute("UPDATE materials SET csl = ?, title = ?, evidence_type = ?, updated_at = ? WHERE id = ?",
                  (json.dumps(csl), added.get("title", row[3]), _evidence(csl, row[2]), utc_now(), material))
     # A reference file's paper is identified by its record (materials._identifiers), which now holds it. A
-    # paper from a file is identified by its file's text alone, as every lookup's identifier is (its own
-    # text or record): what a merge gives it is its details, never looked up.
+    # paper not from a reference file is identified by its file's text alone, as every lookup's identifier
+    # is (its own text or record): what a merge gives it is its details, never looked up.
     given = reference_files.identifier({key: added[key] for key in ("DOI", "arxiv") if key in added})
     if before is None and given is not None and row[1] != "researcher" and row[4] == "reference_file":
         _merged_lookup(conn, harness, active, project_id, material)

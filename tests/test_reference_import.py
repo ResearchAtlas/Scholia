@@ -1000,18 +1000,48 @@ async def test_a_merge_whose_paper_changed_meanwhile_applies_nothing(tmp_path):
         assert "abstract" not in (await client.get(f"/api/materials/{paper}")).json()["csl"]
 
 
-def test_the_merges_recheck_is_the_duplicate_checks_own_rule():
+async def test_the_merges_recheck_is_the_duplicate_checks_own_rule(tmp_path):
     def paper(title, year=None, doi=None):
-        return {"title": title, **({"issued": {"date-parts": [[year]]}} if year else {}), **({"DOI": doi} if doi else {})}
+        return {**({"title": title} if title else {}), **({"issued": {"date-parts": [[year]]}} if year else {}),
+                **({"DOI": doi} if doi else {})}
 
-    records = [paper("Wages"), paper("Wages", 2020), paper("WAGES!", 2020), paper("Wages", 2021),
-               paper("Other", 2020, DOI), paper("Wages", 2020, DOI), paper("Wages", 2020, "10.5555/other")]
-    for existing in records:
-        for record in records:
-            found = references.Duplicates.__new__(references.Duplicates)
-            found.dois, found.titles, found.papers = {}, {}, {}
-            found.add("m", existing)
-            assert references._matches(existing, record) == (found.find(record) is not None), (existing, record)
+    records = [paper("Wages"), paper("Wages", 2020), paper("WAGES!", 2020), paper("Wages", 2021), paper(None, 2020),
+               paper("Other", 2020, DOI), paper("Wages", 2020, DOI), paper("Wages", 2020, DOI.upper()),
+               paper("Wages", 2020, "10.5555/other")]
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+
+        def check(conn):  # each paper alone in the project, as Duplicates reads it from the database
+            for existing in records:
+                conn.execute("DELETE FROM material_versions")
+                conn.execute("DELETE FROM materials")
+                references.new_material(conn, project, {"title": "x", **existing})
+                conn.execute("UPDATE materials SET csl = ?", (json.dumps(existing),))
+                for record in records:
+                    found = references.Duplicates(conn, project).find(record) is not None
+                    assert references._matches(existing, record) == found, (existing, record)
+            raise LookupError  # roll it all back
+
+        with pytest.raises(LookupError):
+            await asyncio.to_thread(client.state["db"].write, check)
+
+
+async def test_a_merge_into_a_paper_not_from_a_reference_file_looks_nothing_up(tmp_path):
+    from types import SimpleNamespace
+
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await imported(client, project, ris(("From A File", "PY  - 2020\n"))))["imported"]
+        record = {"type": "article", "title": "From A File", "issued": {"date-parts": [[2020]]}, "DOI": DOI}
+        active = SimpleNamespace(follows=[])
+
+        def merge(conn):
+            conn.execute("UPDATE materials SET source = 'upload' WHERE id = ?", (paper,))  # as an upload's paper is
+            references._answered(conn, project, paper, record, "merge", client.state["harness"], active)
+
+        await asyncio.to_thread(client.state["db"].write, merge)
+        assert active.follows == [] and await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(0,)]
+        assert (await client.get(f"/api/materials/{paper}")).json()["csl"]["DOI"] == DOI  # merged, as details
 
 
 async def test_a_merge_that_gives_a_paper_its_arxiv_id_looks_it_up(tmp_path):
