@@ -586,13 +586,27 @@
   "search.reason.vectors_unavailable": "meaning search cannot run in this copy of Scholia. Reinstall Scholia.",
   "search.reason.index_unavailable": "the search index is not available right now.",
   "search.reason.request_failed": "the helper did not answer this time. Search again in a moment.",
+  "search.reason.input_refused": "the search model could not take this question. Try other words.",
   "search.reason.closing": "Scholia is closing.",
   "search.building": "The search index is being rebuilt from your papers, so some results may be missing.",
   "search.partial": "Meaning search covers {embedded} of {total} passages so far; the others are found by keywords.",
+  "search.partialRefused": {
+    "one": "Meaning search covers {embedded} of {total} passages; {count} could not be taken by the search model and is found by keywords.",
+    "other": "Meaning search covers {embedded} of {total} passages; {count} could not be taken by the search model and are found by keywords."
+  },
   "search.paperNotIndexed": "Not in the search index yet",
   "search.paperKeywordOnly": "Indexed for keyword search.",
   "search.paperEmbedding": "Indexed for keyword search; embeddings {done} of {total}",
+  "search.paperEmbeddingRefused": "Indexed for keyword search; embeddings {done} of {total}; {refused} could not be embedded",
   "search.paperIndexed": "Indexed for keyword and meaning search",
+  "search.paperRefused": {
+    "one": "Indexed for keyword and meaning search, except {count} passage the search model could not take; keywords still find it.",
+    "other": "Indexed for keyword and meaning search, except {count} passages the search model could not take; keywords still find them."
+  },
+  "search.paperRefusedAll": {
+    "one": "Indexed for keyword search only: the search model could not take its {count} passage.",
+    "other": "Indexed for keyword search only: the search model could not take its {count} passages."
+  },
   "search.indexTitle": "Search index",
   "search.indexHint": "Search finds passages by keywords and, once the search model is installed, by meaning. Rebuild reads every paper's passages into the index again.",
   "search.indexState": "State",
@@ -601,7 +615,9 @@
   "search.indexState.unavailable": "Not available",
   "search.indexPassages": "Passages",
   "search.indexCounts": "{indexed} indexed; embeddings {embedded} of {embeddable}",
+  "search.indexCountsRefused": "{indexed} indexed; embeddings {embedded} of {embeddable}; {refused} could not be embedded",
   "search.runHybrid": "{embedded} embedded by this run; embeddings {done} of {total} in this project",
+  "search.runHybridRefused": "{embedded} embedded by this run; embeddings {done} of {total} in this project; {refused} could not be embedded",
   "search.runKeyword": "{indexed} passages in this project indexed for keyword search",
   "search.indexMode": "Search",
   "search.indexHybrid": "By keywords and meaning",

@@ -1262,6 +1262,40 @@ async function s117(ctx) {
       && status.run.status === 'succeeded' && status.passages.embedded === status.passages.embeddable && status.passages.indexed > 0);
     await dialog().getByText(L('search.rebuilt'), { exact: true }).scrollIntoViewIfNeeded();
   });
+
+  // S1-18's finding: a passage past the helper's slot is embedded on its bounded prefix, and one the
+  // helper refuses is counted, passed over and said, the run succeeding with the rest embedded.
+  const glyphs = 'Unmapped glyphs';
+  await step('39b-passage-refused', async () => {
+    await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+    await add(offerId, glyphs);
+    const material = (await get(`/api/projects/${offerId}/materials`)).body.materials.find((m) => m.title === glyphs);
+    const status = await index(offerId);
+    const mine = status.materials[material.id];
+    check('one passage is refused and every other one embedded', mine?.refused === 1 && mine.embedded === mine.embeddable - 1
+      && status.passages.refused === 1);
+    const [latest] = await runs(offerId, 'index');
+    check('its index run succeeded, and counts the refusal', latest?.status === 'succeeded'
+      && latest.result.passages.refused === 1);
+    const said = L('search.paperRefused');
+    const line = (said.one ?? said.other).replace('{count}', '1');
+    const row = panel().getByRole('listitem').filter({ hasText: glyphs });
+    await row.locator('summary', { hasText: L('library.details') }).click();
+    await row.getByText(line, { exact: true }).waitFor({ timeout: 10000 });
+    check('its Details say one passage could not be taken, and keywords still find it',
+      await row.getByText(line, { exact: true }).count() === 1);
+  });
+  await step('39c-index-refused-count', async () => {
+    await openSettings('settings.page.project');
+    await scrollTo('search.indexTitle');
+    const status = await index(offerId);
+    const counts = L('search.indexCountsRefused').replace('{indexed}', status.passages.indexed)
+      .replace('{embedded}', status.passages.embedded).replace('{embeddable}', status.passages.embeddable)
+      .replace('{refused}', status.passages.refused);
+    await dialog().getByText(counts, { exact: true }).waitFor({ timeout: 10000 });
+    check('the index says how many passages could not be embedded', await dialog().getByText(counts, { exact: true }).count() === 1);
+    await dialog().getByText(counts, { exact: true }).scrollIntoViewIfNeeded();
+  });
   await page.keyboard.press('Escape'); await page.waitForTimeout(500);
 }
 

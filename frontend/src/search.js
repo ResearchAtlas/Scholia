@@ -41,7 +41,7 @@ export const queryOf = (text) => visible(text);
 // What results say of how they were found, as [key, params], or null: keyword-only and why (the
 // search's own reasons, else the helper's, as Settings words them), the index being rebuilt, or how
 // much of the library meaning search covers so far.
-const SEARCH_REASONS = new Set(['deadline', 'vectors_unavailable', 'index_unavailable', 'request_failed', 'closing']);
+const SEARCH_REASONS = new Set(['deadline', 'vectors_unavailable', 'index_unavailable', 'request_failed', 'input_refused', 'closing']);
 
 // Why search is keyword-only, as a catalog key: the search's own reasons, else the helper's.
 export const indexReason = (reason, offered = true) => (SEARCH_REASONS.has(reason) ? `search.reason.${reason}`
@@ -52,13 +52,22 @@ export const indexReason = (reason, offered = true) => (SEARCH_REASONS.has(reaso
 export const runReason = (run) => indexReason(run.result?.reason, run.download_offered !== false);
 
 // What a finished index run did, as [key, params], or null: the embeddings it made and the project's
-// as it ended, or, keyword-only, the passages indexed for keyword search.
+// as it ended, with the passages the search model could not take, or, keyword-only, the passages
+// indexed for keyword search.
 export function runCounts(run) {
   const passages = run.result?.passages;
   if (run.status !== 'succeeded' || !passages) return null;
-  return run.result.mode === 'keyword_only' ? ['search.runKeyword', { indexed: passages.indexed }]
-    : ['search.runHybrid', { embedded: run.result.embedded ?? 0, done: passages.embedded, total: passages.embeddable }];
+  if (run.result.mode === 'keyword_only') return ['search.runKeyword', { indexed: passages.indexed }];
+  const counts = { embedded: run.result.embedded ?? 0, done: passages.embedded, total: passages.embeddable };
+  return passages.refused ? ['search.runHybridRefused', { ...counts, refused: passages.refused }] : ['search.runHybrid', counts];
 }
+
+// The index's passages under This project, as [key, params]: indexed and embedded, and how many the
+// search model could not take, if any.
+export const indexCounts = (passages) => [passages.refused ? 'search.indexCountsRefused' : 'search.indexCounts', passages];
+
+// Whether every embeddable passage has been tried: embedded, or one the search model could not take.
+const settled = (embedded, refused, total) => embedded + (refused ?? 0) >= total;
 
 export function searchNote(found, offered = true) {
   if (!found) return null;
@@ -67,8 +76,10 @@ export function searchNote(found, offered = true) {
   }
   if (found.index === 'building') return ['search.building', {}];
   const coverage = found.coverage;
-  if (coverage && coverage.embedded < coverage.total) return ['search.partial', { embedded: coverage.embedded, total: coverage.total }];
-  return null;
+  if (!coverage || coverage.embedded >= coverage.total) return null;
+  return settled(coverage.embedded, coverage.refused, coverage.total) // all tried: the rest could not be taken
+    ? ['search.partialRefused', { embedded: coverage.embedded, total: coverage.total, count: coverage.refused }]
+    : ['search.partial', { embedded: coverage.embedded, total: coverage.total }];
 }
 
 // Where a result's passage is, for its line: its page, then its section path.
@@ -81,13 +92,19 @@ export function whereIs(t, result) {
 }
 
 // A paper's line under Details for the search index, as [key, params]: not indexed yet, indexed for
-// keywords (search is keyword-only now), embeddings so far, or indexed for both.
+// keywords (search is keyword-only now), embeddings so far (with any passages refused so far), indexed
+// for both, or for both except the passages the search model could not take (or for keywords only,
+// when it could take none of them).
 export function paperIndexed(index, materialId) {
   const counts = index?.materials?.[materialId];
   if (!counts) return ['search.paperNotIndexed', {}];
   if (index.mode === 'keyword_only' || !counts.embeddable) return ['search.paperKeywordOnly', {}];
-  if (counts.embedded < counts.embeddable) return ['search.paperEmbedding', { done: counts.embedded, total: counts.embeddable }];
-  return ['search.paperIndexed', {}];
+  if (!settled(counts.embedded, counts.refused, counts.embeddable)) { // with those it could not take, if any
+    const done = { done: counts.embedded, total: counts.embeddable };
+    return counts.refused ? ['search.paperEmbeddingRefused', { ...done, refused: counts.refused }] : ['search.paperEmbedding', done];
+  }
+  if (!counts.refused) return ['search.paperIndexed', {}];
+  return counts.embedded ? ['search.paperRefused', { count: counts.refused }] : ['search.paperRefusedAll', { count: counts.refused }];
 }
 
 // Whether the index status is worth reading again soon: an index run is running, or the index is

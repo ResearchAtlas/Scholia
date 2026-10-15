@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
 import { makeT } from '../src/i18n/index.js';
-import { fieldKey, indexReason, offerOutcome, onFieldKey, paperIndexed, queryOf, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
+import { fieldKey, indexCounts, indexReason, offerOutcome, onFieldKey, paperIndexed, queryOf, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
 
 const t = makeT('en');
 
@@ -52,9 +52,11 @@ test('results say when search is keyword-only and why, the index is rebuilt, or 
   assert.match(note({ mode: 'keyword_only', reason: 'model_missing' }), /Download it, or import its file/);
   assert.doesNotMatch(note({ mode: 'keyword_only', reason: 'model_missing' }, false), /Download/); // Local only: import only
   assert.equal(note({ mode: 'keyword_only', reason: 'something new' }), t('helper.keywordOnly', { reason: t('helper.reason.other') }));
-  for (const reason of ['deadline', 'vectors_unavailable', 'index_unavailable', 'request_failed', 'closing']) {
+  for (const reason of ['deadline', 'vectors_unavailable', 'index_unavailable', 'request_failed', 'input_refused', 'closing']) {
     for (const catalog of [en, zhCN]) assert.ok(`search.reason.${reason}` in catalog, reason);
   }
+  assert.equal(note({ mode: 'keyword_only', reason: 'input_refused' }), // a question the search model refused
+    'Search is keyword-only: the search model could not take this question. Try other words.');
   assert.equal(searchNote(null), null);
 });
 
@@ -62,6 +64,41 @@ test('a result says its page and section path', () => {
   assert.equal(whereIs(t, { page: 3, section_path: ['Methods', 'Data'] }), 'p. 3 · Methods › Data');
   assert.equal(whereIs(t, { page: null, section_path: ['研究发现'] }), '研究发现');
   assert.equal(whereIs(t, { page: null, section_path: [] }), '');
+});
+
+test('passages the search model could not take are counted, not taken for embeddings still to come', () => {
+  const note = (coverage) => { const said = searchNote({ mode: 'hybrid', index: 'ready', coverage }); return said && t(...said); };
+  assert.equal(note({ embedded: 3, total: 4, refused: 1 }),
+    'Meaning search covers 3 of 4 passages; 1 could not be taken by the search model and is found by keywords.');
+  assert.equal(note({ embedded: 2, total: 4, refused: 2 }),
+    'Meaning search covers 2 of 4 passages; 2 could not be taken by the search model and are found by keywords.');
+  assert.equal(note({ embedded: 2, total: 4, refused: 1 }), // one still to come
+    'Meaning search covers 2 of 4 passages so far; the others are found by keywords.');
+  const index = { mode: 'hybrid', materials: { a: { indexed: 5, embedded: 3, embeddable: 4, refused: 1 },
+    b: { indexed: 5, embedded: 2, embeddable: 4, refused: 1 } } };
+  assert.equal(t(...paperIndexed(index, 'a')),
+    'Indexed for keyword and meaning search, except 1 passage the search model could not take; keywords still find it.');
+  assert.equal(t(...paperIndexed(index, 'b')), // still embedding: the refusal is said beside the progress
+    'Indexed for keyword search; embeddings 2 of 4; 1 could not be embedded');
+  assert.equal(makeT('zh-CN')(...paperIndexed(index, 'b')), '已建立关键词索引；向量 2/4；1 个无法生成向量');
+  const none = { mode: 'hybrid', materials: { c: { indexed: 3, embedded: 0, embeddable: 2, refused: 2 } } };
+  assert.equal(t(...paperIndexed(none, 'c')), 'Indexed for keyword search only: the search model could not take its 2 passages.');
+  assert.equal(t(...indexCounts({ indexed: 12, embedded: 9, embeddable: 11, refused: 2 })),
+    '12 indexed; embeddings 9 of 11; 2 could not be embedded');
+  assert.equal(t(...indexCounts({ indexed: 12, embedded: 11, embeddable: 11, refused: 0 })), '12 indexed; embeddings 11 of 11');
+  assert.equal(t(...runCounts({ status: 'succeeded', result: { mode: 'hybrid', embedded: 6,
+    passages: { indexed: 12, embedded: 10, embeddable: 11, refused: 1 } } })),
+  '6 embedded by this run; embeddings 10 of 11 in this project; 1 could not be embedded');
+  const zh = makeT('zh-CN');
+  assert.equal(zh(...paperIndexed(index, 'a')), '已建立关键词与语义索引，但有 1 个段落搜索模型无法处理；仍可按关键词找到。');
+  assert.equal(zh(...indexCounts({ indexed: 12, embedded: 9, embeddable: 11, refused: 2 })), '已索引 12 个；向量 9/11；2 个无法生成向量');
+  for (const key of ['search.partialRefused', 'search.paperRefused', 'search.paperRefusedAll', 'search.paperEmbeddingRefused',
+    'search.indexCountsRefused',
+    'search.runHybridRefused']) {
+    for (const catalog of [en, zhCN]) assert.ok(key in catalog, key);
+  }
+  const source = readFileSync(fileURLToPath(new URL('../src/components/SearchIndex.jsx', import.meta.url)), 'utf8');
+  assert.match(source, /t\(\.\.\.indexCounts\(index\.passages\)\)/);
 });
 
 test("a paper's index line under Details", () => {
