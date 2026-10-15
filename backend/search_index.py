@@ -34,7 +34,8 @@ sequence the main database cannot have (a restored or replaced database: its que
 is lower) is replaced and rebuilt from the main database's current readings, in the writer, while
 the app runs; another tokenizer version re-tokenizes the keyword rows; another model, revision,
 quantization, runtime or dimension drops every vector, so that search never uses one from another
-model. A whole rebuild that fails discards its partial file and leaves the index unavailable until
+model. While a whole rebuild is asked for or under way, no read is answered (search says the index is
+being built). A whole rebuild that fails discards its partial file and leaves the index unavailable until
 one succeeds; it is tried again in the writer, sooner and then less often. The index closes with
 its database (Database.closing), its timers cancelled and its writer drained. Every open, before anything
 reads the file, applies the queue and removes every row of a passage the main database no longer grants,
@@ -115,8 +116,9 @@ class _Stopped(Exception):
 
 
 class Unavailable(Exception):
-    """A whole rebuild of the file failed: nothing is read from the partial file, or written to it, until
-    one succeeds (it is tried again, SearchIndex._rebuild_later)."""
+    """Nothing is read from the file now: a whole rebuild of it is asked for or under way (the old file is never
+    read unpurged, nor a partial one), or one failed (nothing is read from or written to the partial file until
+    one succeeds; it is tried again, SearchIndex._rebuild_later)."""
 
 
 # Tokens
@@ -339,9 +341,9 @@ class SearchIndex:
             raise
 
     def _read(self, fn):
-        """fn(conn) on an idle read connection, in one read transaction. Admitted, and its connection given back
-        to the idle ones, under _lock, so close() refuses later reads, waits for these, then closes every
-        connection they gave back."""
+        """fn(conn) on an idle read connection, in one read transaction. Refused (Unavailable) while a whole rebuild
+        is asked for or under way, or after one failed. Admitted, and its connection given back to the idle ones,
+        under _lock, so close() refuses later reads, waits for these, then closes every connection they gave back."""
         with self._lock:
             if self.closed:
                 raise DatabaseClosedError("the search index is closed")

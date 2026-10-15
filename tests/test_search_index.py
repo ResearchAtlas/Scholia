@@ -1861,9 +1861,10 @@ def test_a_check_for_a_few_passages_reads_only_their_rows_and_a_projects_reading
 
 @pytest.mark.asyncio
 async def test_no_read_of_the_old_file_while_an_open_s_whole_rebuild_is_under_way(tmp_path, monkeypatch):
-    """Finding 1: an open that requires a whole rebuild (here an unfinished file) skips the purge; while that rebuild
-    runs, every read is refused (as an unavailable index), so a passage the main database no longer grants, still in
-    the old file, is never found."""
+    """Finding 1: an open that requires a whole rebuild (here an unfinished file) skips the purge; until that rebuild
+    is done every read is refused (as an unavailable index), and search says the index is being built, so a passage
+    the main database no longer grants is never found in the old file, which is still there when the rebuild waits
+    to begin (held here at its start)."""
     import threading
     from backend.db import Database
     import backend.search as search
@@ -1878,21 +1879,27 @@ async def test_no_read_of_the_old_file_while_an_open_s_whole_rebuild_is_under_wa
     db = await asyncio.to_thread(Database, data)
     await asyncio.to_thread(db.write, lambda conn: conn.execute(  # ungranted, as a deletion the index never applied
         "UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (doomed["id"],)))
-    reached, go, real_add = threading.Event(), threading.Event(), SearchIndex._add
+    reached, go, real_rebuild = threading.Event(), threading.Event(), SearchIndex._rebuild_all
 
-    def held(self, project_id, pid, reading):
-        if self.building and not go.is_set():
-            reached.set()
-            go.wait(20)
-        return real_add(self, project_id, pid, reading)
-    monkeypatch.setattr(SearchIndex, "_add", held)
-    state = {"data_dir": data}
+    def held(self):  # the rebuild about to begin: the old file, with the ungranted passage's rows, still there
+        reached.set()
+        go.wait(20)
+        return real_rebuild(self)
+    monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+    state = {"data_dir": data, "db": db}
     try:
         await search.open_index(state, db)
         index = state["index"]
-        assert await asyncio.to_thread(reached.wait, 10)  # the whole rebuild under way
+        assert await asyncio.to_thread(reached.wait, 10) and index.building
+        old, _ = search_index.connect(index.path)
+        try:  # the old file still holds it
+            assert old.execute("SELECT count(*) FROM index_rows WHERE material_id = ?", (doomed["id"],)).fetchone()[0]
+        finally:
+            old.close()
         with pytest.raises(search_index.Unavailable):
             await asyncio.to_thread(index.keyword, project, "quokkas", 50)
+        found = await search.search(state, project, "quokkas")
+        assert (found["results"], found["index"]) == ([], "building")
     finally:
         go.set()
         await asyncio.to_thread(db.close)

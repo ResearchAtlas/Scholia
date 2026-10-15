@@ -585,6 +585,8 @@ async def search(state, project_id, query, limit=None):
     mode, reason = search_mode(state)
     if index is None or index.closed or index.unusable:  # not opened, being replaced, or its rebuild failed (retried)
         return {"results": [], "mode": mode, "reason": reason, "index": "unavailable", "coverage": None}
+    if index.building:  # a whole rebuild asked for or under way: nothing is read until it is done (fail closed)
+        return {"results": [], "mode": mode, "reason": reason, "index": "building", "coverage": None}
     keyword = asyncio.ensure_future(asyncio.to_thread(index.keyword, project_id, text, values["bm25_candidates"]))
     counts = await _counts(index, project_id)
     totals = _totals(counts)
