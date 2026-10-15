@@ -590,4 +590,11 @@ CREATE INDEX material_versions_current_by_file ON material_versions (file_sha256
 CREATE INDEX extractions_by_file ON extractions (file_sha256);
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005)
+# S1-14: the fields of a reference file's paper a lookup filled (a JSON list of CSL keys, or NULL): written
+# with the lookup's fill, dropped with them and cleared when the researcher changes the paper's DOI, and
+# never the record's own identifier (backend/materials.py _fill_imported, _kept_on_move, _identifiers).
+_0006 = r"""
+ALTER TABLE materials ADD COLUMN lookup_filled TEXT;
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006)

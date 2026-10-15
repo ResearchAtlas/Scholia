@@ -85,6 +85,46 @@ async def test_no_canary_reaches_the_log(tmp_path, caplog, monkeypatch):
     assert stat.S_IMODE((data / "logs").stat().st_mode) == 0o700
 
 
+async def test_no_reference_file_canary_reaches_the_log(tmp_path, caplog):
+    # S1-14: a good reference file, a damaged one, a merge and a lookup log no file name, title, author,
+    # DOI or record text.
+    import base64
+
+    from test_reference_import import answer, merge_asks, run_finished
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    caplog.set_level(logging.DEBUG)
+    record = ("TY  - JOUR\nTI  - CANARY-REF-TITLE\nAU  - CANARY-REF-AUTHOR\nDO  - 10.5555/canary.ref\n"
+              "AB  - CANARY-REF-ABSTRACT\nER  - \n")
+    damaged = "@article{CANARY-REF-KEY, title={CANARY-REF-TITLE unbalanced\n@book{b, title={CANARY-REF-OTHER}}\n"
+
+    async def post(client, project, text, name):
+        return await client.post(f"/api/projects/{project}/materials/import-references",
+                                 json={"name": name, "data": base64.b64encode(text.encode()).decode()})
+
+    try:
+        async with started(data, MockProvider()) as client:
+            project = (await client.post("/api/projects", json={"name": "Study"})).json()["id"]
+            assert (await post(client, project, record, "CANARY-REF-NAME.ris")).status_code == 201
+            assert (await post(client, project, damaged, "CANARY-REF-NAME.bib")).status_code == 201
+            assert (await post(client, project, "CANARY-REF-NOT-A-FORMAT", "CANARY-REF-NAME.txt")).status_code == 400
+            assert (await post(client, project, record.replace("ER  -", "VL  - 4\nER  -"), "CANARY-REF-NAME.ris")).status_code == 201
+            [ask] = await merge_asks(client, project)
+            assert (await answer(client, ask, "merge")).status_code == 200
+            await run_finished(client, ask["run_id"])
+            await background_idle(client)
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    log_file = data / "logs" / "scholia.log"
+    text = log_file.read_text() if log_file.exists() else ""  # written once something is logged
+    for canary in ("CANARY-REF-TITLE", "CANARY-REF-AUTHOR", "CANARY-REF-ABSTRACT", "CANARY-REF-KEY", "CANARY-REF-OTHER",
+                   "CANARY-REF-NAME", "CANARY-REF-NOT-A-FORMAT", "canary.ref"):
+        assert canary not in text, canary
+        assert not any(canary in record.getMessage() for record in caplog.records), canary
+
+
 async def test_log_files_rotate_daily_and_are_kept_fourteen_days(tmp_path):
     handler = logs.PrivateRotatingHandler(tmp_path / "scholia.log")
     try:

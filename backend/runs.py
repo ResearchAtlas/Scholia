@@ -127,6 +127,7 @@ class ActiveRun:
     closing: asyncio.Future | None = None  # the write that records a claim stopped before it started
     progress: dict | None = None  # local work's progress, live only: {"done", "total"}
     follows: list = field(default_factory=list)  # runs its terminal transaction records (record_in), held till it commits
+    answered: asyncio.Event = field(default_factory=asyncio.Event)  # one of its asks was answered (asks.answer_ask)
 
 
 class Registry:
@@ -244,6 +245,13 @@ def _revoked(conn, run_id) -> bool:
     """Whether a running run was revoked in the record, by a deletion or a change to its project."""
     row = conn.execute("SELECT cancel_reason FROM runs WHERE id = ? AND status = 'running'", (run_id,)).fetchone()
     return row is not None and row[0] == "revoked"
+
+
+def _let_go(conn, run_id):
+    """A background run's terminal record takes out what its inputs hold only while it runs (`held`:
+    a merge's record, backend/references.py), so nothing of it outlasts the run however it ends."""
+    conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.held') WHERE id = ?"
+                 " AND json_type(inputs, '$.held') IS NOT NULL", (run_id,))
 
 
 def may_dispatch(conn, run_id) -> bool:
@@ -1155,6 +1163,7 @@ class Harness:
         if status == "succeeded" and effect is not None:
             effect(conn)  # may raise RunOutcome, which rolls this transaction back
         reason = (summary or {}).get("reason") if status != "succeeded" else None
+        _let_go(conn, run_id)
         _event(conn, run_id, "run_finished", {"status": status, **({"reason": reason} if reason else {})})
         conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, waiting = NULL, finished_at = ?, summary = ?,"
                      " settled_cost_usd = ? WHERE id = ?",
@@ -1187,6 +1196,7 @@ class Harness:
                 "UPDATE conversations SET title = ?, title_source = 'generated', title_rev = title_rev + 1,"
                 " updated_at = ? WHERE id = ? AND title_rev = ? AND coalesce(title_source, '') <> 'researcher'",
                 (output, utc_now(), inputs["conversation_id"], inputs["title_rev"]))
+        _let_go(conn, run_id)
         _event(conn, run_id, "run_finished", {"status": status})
         conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, waiting = NULL, finished_at = ?,"
                      " settled_cost_usd = ? WHERE id = ?",

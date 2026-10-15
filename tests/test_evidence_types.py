@@ -46,3 +46,34 @@ async def test_a_scanned_papers_recognized_text_is_its_full_text(tmp_path, monke
         assert (paper["evidence_type"], paper["state"]) == ("full_text", "ready")
         [passage] = (await client.get(f"/api/material-versions/{paper['version']['id']}/passages")).json()["passages"]
         assert (passage["kind"], passage["text"]) == ("paragraph", LINE.text)
+
+
+# S1-14: reference files
+
+
+async def test_a_reference_files_abstract_is_never_a_passage_or_an_index_row(tmp_path):
+    from test_reference_import import imported, ris
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        result = await imported(client, project, ris(("With an Abstract", "AB  - Abstract-Only-Canary text.\n"),
+                                                     ("Metadata Only", "PY  - 2020\n")))
+        found = {p["title"]: p for p in await settled(client, project)}
+        assert found["With an Abstract"]["evidence_type"] == "abstract"  # never full_text
+        assert found["Metadata Only"]["evidence_type"] == "metadata"
+        assert found["With an Abstract"]["csl"]["abstract"] == "Abstract-Only-Canary text."  # kept as its record's
+        assert await rows(client, "SELECT count(*) FROM passages") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM extractions") == [(0,)]
+        version = found["With an Abstract"]["version"]["id"]
+        assert (await client.get(f"/api/material-versions/{version}/passages")).json() == {"passages": [], "total": 0}
+        assert len(result["imported"]) == 2
+
+
+async def test_a_file_attached_later_makes_an_imported_paper_full_text(tmp_path):
+    from test_reference_import import imported, ris
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await imported(client, project, ris(("Attach", "AB  - An abstract.\n"))))["imported"]
+        await added(client, project, ("attach.md", b"# Attach\n\nIts full text.\n"), material_id=paper)
+        [found] = await settled(client, project)
+        assert found["evidence_type"] == "full_text" and found["extraction"]["passages"] > 0
