@@ -87,7 +87,10 @@ _SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair, which only JSON's esc
 # run of spaces a plain repeat here: the parser's group keeps state for each space it passes.
 _BLOCK_START = re.compile(r"@\w*[ \t]*(?=[{(])")
 _BLOCK_SPACES = re.compile(r"(@\w*)[ \t]{2,}")
-_BREAKS = re.compile("\r\n?|[\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")  # every line end str.splitlines() takes, but \n
+# The line ends read as one: CR, CRLF, NEL and Unicode's line and paragraph separators. The other characters
+# str.splitlines() breaks at (\x0b, \x0c, \x1c to \x1e) stay in their line as the control characters they are:
+# an identifier holding one is no identifier, and a prose field reads it as a space (_text).
+_BREAKS = re.compile("\r\n?|[\x85\u2028\u2029]")
 
 # The parsers log what they read (bibtexparser's splitter quotes a block it could not read). Their
 # loggers never write, at any level; the child's own output goes nowhere (backend/reading.py).
@@ -392,6 +395,8 @@ def _bibtex(text, beat):
             yield None  # a block the parser could not read
             continue
         if not isinstance(found, Entry):  # a comment or a preamble
+            if _STRING_IN_TEXT.search(getattr(block, "raw", None) or ""):  # "@ string{...}", which the parser
+                poisoned = True  # leaves as text but BibTeX reads as a definition: which one, not certain
             continue
         entry = found
         beat()  # each entry: a long value's LaTeX takes a moment
@@ -431,6 +436,7 @@ class _Refused(Exception):
 
 
 _STRING_BLOCK = re.compile(r"@\s*string\b", re.IGNORECASE)
+_STRING_IN_TEXT = re.compile(r"@\s*string\s*[{(]", re.IGNORECASE)
 
 
 def _one_literal(value):
@@ -571,7 +577,7 @@ def _tagged(text, start, line, beat, written=()):
         fields = []
         for row in lines:
             if (found := pattern.match(row)) is not None:
-                fields.append((found.group(1), [found.group(2)]))
+                fields.append((found.group(1), [found.group(2) or ""]))
             elif row.strip():
                 fields[-1][1].append(row.strip())
         # identifiers and URLs: the field's line as written, and one line only (_raw_fields)
@@ -580,7 +586,7 @@ def _tagged(text, start, line, beat, written=()):
 
 
 def _endnote(text, beat):
-    for fields in _tagged(text, "0", r"^%(\S) ?(.*)$", beat, written=("R", "U")):
+    for fields in _tagged(text, "0", r"^%(\S)(?: (.*))?$", beat, written=("R", "U")):  # a tag needs its space
         one, dois = {}, []
         for tag, value in fields:
             if tag in ("A", "K", "U"):
@@ -686,9 +692,20 @@ def _doi(value):
     doi = _whole(value)
     if doi is None:
         return None, 0
-    if doi is _UNREADABLE or len(doi) > DOI_CHARS or not _DOI_WHOLE.fullmatch(doi) or {".", ".."} & set(doi.split("/")):
+    if doi is _UNREADABLE or len(doi) > DOI_CHARS or not _DOI_WHOLE.fullmatch(doi) or {".", ".."} & set(doi.split("/")) \
+            or not _balanced(doi):
         return None, 1  # a dot segment: a URL holding it would name another path once resolved
     return doi.lower(), 0
+
+
+def _balanced(text):
+    """Whether text's parentheses close in order, each one opened."""
+    depth = 0
+    for mark in text:
+        depth += {"(": 1, ")": -1}.get(mark, 0)
+        if depth < 0:
+            return False
+    return depth == 0
 
 
 def _arxiv(value):

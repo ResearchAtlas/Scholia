@@ -237,10 +237,28 @@ def test_a_doi_is_its_fields_own_text_whole(data, doi):
     "@misc{k, title={T}, doi=d}\n",  # a macro is not the field's own text
     "TY  - JOUR\nTI  - T\nDO  - 10.5555/one\nDO  - 10.5555/two\nER  - \n",  # given twice differently
     json.dumps([{"title": "T", "DOI": 1234}]),  # not text (recheck 4's finding 16)
+    # a control character that splitlines() takes for a line end is no line end here (internal review, batch 4)
+    *(f"TY  - JOUR\nTI  - T\nDO  - 10.5555/abc{c}\nER  - \n" for c in "\x0b\x0c\x1c\x1d\x1e"),
+    "%0 Journal Article\n%T T\n%R 10.5555/abc\x1c\n",
+    "@misc{k, title={T}, doi={10.5555/abc\x1c}}",
+    json.dumps([{"title": "T", "DOI": "10.5555/abc)"}]),  # parentheses that do not close in order
+    json.dumps([{"title": "T", "DOI": "10.5555/a)b(c"}]),
+    "TY  - JOUR\nTI  - T\nDO  - 10.5555/abc\nER  -X\nER  - \n",  # ER without its space continues the DOI
 ])
 def test_a_doi_that_is_not_whole_its_fields_own_text_is_left_out_and_counted(data):
     [record], skipped, _ = parse(data)
     assert "DOI" not in record and rf.identifier(record) is None and skipped == {"invalid_field": 1}
+
+
+def test_an_endnote_tag_needs_its_space():
+    [record], skipped, _ = parse("%0 Journal Article\n%T T\n%R10.5555/abc\n")
+    assert "DOI" not in record and record["title"] == "T %R10.5555/abc" and skipped == {}  # text of the title
+
+
+def test_an_at_string_the_parser_leaves_as_text_is_still_a_definition_of_some_macro():
+    text = "@misc{before, title=jan}\n@ string{jan = {X}}\n@article{b, title={B}, journal=jan}\n@misc{c, title={Kept}}\n"
+    records, skipped, _ = parse(text)
+    assert [r["title"] for r in records] == ["January", "Kept"] and skipped == {"unreadable": 1}
 
 
 @pytest.mark.parametrize("eprint, arxiv", [("2101.00001", "2101.00001"), ("2101.00001v2", "2101.00001v2"),
@@ -491,7 +509,7 @@ def test_half_a_surrogate_pair_from_json_never_reaches_a_record():
     assert not rf.valid({"type": "article", "title": "T", "author": [{"literal": "\udfff"}]})
 
 
-@pytest.mark.parametrize("end", ["\r", " ", "\x0c", "\r\n"])
+@pytest.mark.parametrize("end", ["\r", "\u2028", "\x85", "\r\n"])
 def test_every_line_end_counts_and_reads_records_alike(end):
     ris = f"TY  - JOUR{end}TI  - T{end}ER  - {end}"
     assert unreadable(ris * (rf.MAX_RECORDS + 1)) == "too_many_records"

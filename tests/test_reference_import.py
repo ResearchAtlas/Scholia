@@ -914,3 +914,18 @@ async def test_a_doi_change_that_retitles_a_paper_queues_its_passages_again(tmp_
                                     " AND project_id = ?", project)
         runs = await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'index' AND project_id = ?", project)
         assert queued[0][0] > 0 or runs[0][0] > 0  # queued, or already taken by the index run it requested
+
+
+async def test_each_lookups_fill_joins_the_fields_a_lookup_filled(tmp_path):
+    from types import SimpleNamespace
+
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await imported(client, project, ris(("Filled Twice", "")), "a.ris"))["imported"]
+
+        def fill(csl):
+            return lambda conn: materials_module._fill_imported(conn, paper, SimpleNamespace(csl=csl, source_key="openalex:W1"))
+
+        assert await asyncio.to_thread(client.state["db"].write, fill({"volume": "3"})) == ["volume"]
+        assert await asyncio.to_thread(client.state["db"].write, fill({"volume": "4", "page": "5"})) == ["page"]
+        assert await lookup_filled(client, paper) == ["page", "volume"]  # the first fill's stays with the second's
