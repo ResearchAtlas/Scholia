@@ -1483,3 +1483,60 @@ async def test_a_file_that_appears_at_a_backups_name_meanwhile_is_never_replaced
     with zipfile.ZipFile(path) as archive:
         assert archive.read("a.txt") == b"x" and mode(path) == 0o600
     assert sorted(p.name for p in destination.iterdir()) == sorted([audited[0].name, path.name])  # no temporary left
+
+
+# Failing closed (Harold, 2026-10-15; PR 29 recheck 3, finding 47): files are replaced only after a close that succeeded
+
+
+async def test_a_restore_whose_running_database_fails_to_close_puts_nothing_in_place(tmp_path, monkeypatch):
+    """The running database's close fails as a restore is about to put the backup in place: nothing is moved, the
+    restore says it did not happen, and the app is limited (it runs on no database); a second restore is refused
+    the same way, the close's failure being said again."""
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        project = await new_project(client)
+        db = client.state["db"]
+
+        def failing():
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(db, "_close_writer", failing)
+        put = []
+        monkeypatch.setattr(backups_module, "_put_in_place", lambda *args: put.append(args))
+        for _ in range(2):
+            response = await client.post("/api/backups/restore", json={"generation": backup})
+            assert (response.status_code, response.json()["code"]) == (500, "restore_failed")
+        assert put == [] and (data / "projects" / project / "config.toml").is_file()
+        assert not (data / "backups" / backups_module.JOURNAL).exists()
+        assert (await client.get("/api/health")).json().get("database_damaged")
+
+
+async def test_a_failed_restore_whose_restored_database_fails_to_close_is_not_put_back(tmp_path, monkeypatch):
+    """The restored database cannot start, and its close fails: the previous files are not put back over it (its
+    journal stays, for the next launch to finish), and the restore says it could be neither finished nor undone."""
+    from backend.runs import Harness
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        await new_project(client)
+        original = client.state["db"]
+        real_recover, recovered = Harness.recover, []
+
+        async def failing_once(self, kick=True):
+            recovered.append(self)
+            if len(recovered) == 1:
+                raise RuntimeError("recovery failed")
+            await real_recover(self, kick)
+        real_close_writer = Database._close_writer
+
+        def close_writer(self):
+            if self is not original:  # the restored database's
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_close_writer(self)
+        put_back = []
+        monkeypatch.setattr(Harness, "recover", failing_once)
+        monkeypatch.setattr(Database, "_close_writer", close_writer)
+        monkeypatch.setattr(backups_module, "_back_from_journal", lambda *args, **kwargs: put_back.append(args))
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
+        assert put_back == [] and (data / "backups" / backups_module.JOURNAL).exists()

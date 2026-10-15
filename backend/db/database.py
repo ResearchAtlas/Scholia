@@ -63,6 +63,11 @@ class DatabaseClosedError(RuntimeError):
     """The database is closed or closing: nothing more is read or written through it."""
 
 
+class DatabaseCloseError(RuntimeError):
+    """Closing the database failed: what it closes may still be open (its marker, if any, stays). Nothing may
+    replace its files (a restore, its undoing) after such a close."""
+
+
 class DatabaseDamagedError(RuntimeError):
     """An integrity check failed. Writing stops and the file is left as it is."""
 
@@ -96,6 +101,9 @@ class Database:
         self._damaged = None  # why writing stopped, once an integrity check fails
         self.on_damage = None  # called once, from the thread whose check found the database damaged
         self.closing = []  # called by close() once its writes are refused and drained, before it reads no more (S1-17: the search index)
+        # A file close() writes before anything else and removes only once every step of it succeeded (S1-17: the
+        # search index's discard marker, which makes the next launch discard and rebuild the index)
+        self.marker = None
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
@@ -293,14 +301,15 @@ class Database:
         (DatabaseClosedError); reads in progress finish first, and a write already
         submitted runs before the writer connection closes. So work still running when
         the app stops gets an error, never a connection closed under it. A backup in
-        progress is stopped, and waited for up to STOP_SECONDS. First, writes are refused and
-        those already admitted commit (as hold_writes does); then what reads this database
-        (closing: the search index) is closed, its work drained, so it sees every write that
-        will ever commit (a deletion's queued removals). The first close() closes it, and one called while it
-        runs, or after, waits for it to finish (but one called from inside it, by a hook, returns at once). Whatever
-        fails, the writer connection's close is tried and the writer thread stopped; a close that failed raises in
-        every close() (RuntimeError from the failure, in the others), so a failed close never reads as done.
-        Never call close() from inside read(): the close waits for that read."""
+        progress is stopped, and waited for up to STOP_SECONDS. First the marker is written (if one is set);
+        then writes are refused and those already admitted commit (as hold_writes does); then what reads this
+        database (closing: the search index) is closed, its work drained, so it sees every write that will ever
+        commit (a deletion's queued removals). The marker is removed only once every step succeeded. The first
+        close() closes it, and one called while it runs, or after, waits for it to finish (but one called from
+        inside it, by a hook, returns at once). Fail closed: whatever fails (the marker, the drain, a hook, a
+        read connection, a backup still running after STOP_SECONDS, the writer), every other step is still tried
+        and the writer thread stopped, the marker stays, and every close() raises DatabaseCloseError, so a
+        failed close never reads as done. Never call close() from inside read(): the close waits for that read."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")
@@ -313,7 +322,7 @@ class Database:
             if threading.get_ident() != self._closer:  # but one from inside that close (a hook) returns at once
                 self._shut.wait()
                 if self._close_error is not None:
-                    raise RuntimeError("closing the database failed") from self._close_error
+                    raise DatabaseCloseError("closing the database failed") from self._close_error
             return
         failures = []  # every step is tried whatever failed before; the first failure is the close's
 
@@ -323,20 +332,17 @@ class Database:
             except BaseException as failure:
                 failures.append(failure)
         try:  # everything from here signals its end (_shut), and a failure reaches every close()
+            if self.marker is not None:
+                attempt(lambda: _write_marker(self.marker))
+
             def drain():
                 with self._readers_lock:
                     drained = None if self._closed else self._writer.submit(lambda: None)  # behind every write admitted
                 if drained is not None:
                     drained.result()
             attempt(drain)
-
-            def hooks():
-                for close in list(self.closing):  # each closes once, its work drained while this database still reads
-                    try:
-                        close()
-                    except Exception as failure:
-                        log.warning("closing what reads the database failed (%s)", type(failure).__name__)
-            attempt(hooks)
+            for close in list(self.closing):  # each closes once, its work drained while this database still reads
+                attempt(close)
 
             def readers():
                 with self._readers_lock:
@@ -351,22 +357,27 @@ class Database:
             def stopped():
                 with self._readers_lock:
                     self._closed = True
-                if self._backup_lock.acquire(timeout=STOP_SECONDS):
-                    self._backup_lock.release()
-                else:
-                    log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
+                if not self._backup_lock.acquire(timeout=STOP_SECONDS):
+                    raise TimeoutError(f"a backup did not stop within {STOP_SECONDS} s of closing")
+                self._backup_lock.release()
             attempt(stopped)
             attempt(lambda: self._writer.submit(self._close_writer).result())
         finally:
             try:
                 attempt(self._writer.shutdown)
+                if not failures and self.marker is not None:
+                    attempt(lambda: _remove_marker(self.marker))
             finally:
                 self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
                 self._close_error = failures[0] if failures else None
                 self._closer = None  # from here a close() on that thread too waits, and is told of a failure
                 self._shut.set()
         if failures:
-            raise failures[0]
+            for failure in failures:
+                log.warning("closing the database failed (%s)", type(failure).__name__)
+            if not isinstance(failures[0], Exception):  # an interruption stays one
+                raise failures[0]
+            raise DatabaseCloseError("closing the database failed") from failures[0]
 
     # Writer thread
 
@@ -811,6 +822,22 @@ def _stamp_of(path):
         return datetime.strptime(path.name, _STAMP).replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def _write_marker(path):
+    """Create the file at path (owner-only, empty) and make it durable, with its folder's entry."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync(Path(path).parent)
+
+
+def _remove_marker(path):
+    """Remove the file at path, if there, durably."""
+    Path(path).unlink(missing_ok=True)
+    _fsync(Path(path).parent)
 
 
 def _create_private(path, content=b""):

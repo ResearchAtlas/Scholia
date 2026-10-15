@@ -964,3 +964,23 @@ async def test_a_purge_that_cannot_remove_a_copy_in_staging_says_so(tmp_path, mo
         [(record,)] = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
             "SELECT data FROM audit_log WHERE event = 'backup_purge'").fetchall())
         assert json.loads(record)["staging_left"] == 1
+
+
+async def test_a_replayed_restore_whose_database_fails_to_close_is_not_put_back_at_launch(tmp_path, monkeypatch):
+    """Failing closed (PR 29 finding 47): the replayed, restored database cannot run, and its close fails: the
+    launch does not put the previous files back over it; the app is limited and the journal kept, so a later
+    launch finishes it."""
+    from backend.db import Database
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+    failing_recovery(monkeypatch, 1)
+
+    def close_writer(self):
+        raise OSError("disk I/O error")
+    put_back = []
+    monkeypatch.setattr(Database, "_close_writer", close_writer)
+    monkeypatch.setattr(backups_module, "_back_from_journal", lambda *args, **kwargs: put_back.append(args))
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"
+    assert put_back == [] and (data / "backups" / backups_module.JOURNAL).exists()

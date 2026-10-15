@@ -34,7 +34,7 @@ from backend import backups
 from backend import asks, materials
 from backend import local_helper
 from backend import search  # S1-17: the search index, index runs and the search model's offer
-from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
+from backend.db import ContentStore, Database, DatabaseCloseError, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
@@ -350,9 +350,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
             if state.get("harness") is not None:
                 await state["harness"].shutdown()
+            # A close that fails is logged by it, and its marker makes the next launch discard the index
             if state.get("index") is not None:  # S1-17: closed by its database's close, once no write can commit
-                await asyncio.to_thread(state.pop("index").db.close)
-            await asyncio.to_thread(db.close)
+                with contextlib.suppress(DatabaseCloseError):
+                    await asyncio.to_thread(state.pop("index").db.close)
+            with contextlib.suppress(DatabaseCloseError):
+                await asyncio.to_thread(db.close)
             state.clear()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)

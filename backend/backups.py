@@ -44,8 +44,8 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 from backend import APP_VERSION, i18n
-from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseClosedError, DatabaseDamagedError,
-                        ForeignDatabaseError, NewerDatabaseError, utc_now)
+from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
+                        DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, utc_now)
 from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
     list_generations
 from backend.db.migrations import MIGRATIONS
@@ -227,7 +227,10 @@ async def lifespan(app):
             if state.get("harness") is not None:
                 await state["harness"].shutdown()
             if state.get("db") is not None:
-                await asyncio.to_thread(state["db"].close)
+                try:
+                    await asyncio.to_thread(state["db"].close)
+                except DatabaseCloseError:  # logged by the close; its marker makes the next launch discard the index
+                    pass
 
 
 router = APIRouter(lifespan=lifespan, route_class=_Route)
@@ -686,8 +689,13 @@ async def _replace(state, body, staging, purges):
                 raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
                     from error
             raise
-        if db is not None and not db.closed:
-            await asyncio.to_thread(db.close)
+        if db is not None:  # closed, or its close joined (one before, failed or not, says so again)
+            try:
+                await asyncio.to_thread(db.close)
+            except DatabaseCloseError as error:  # nothing is replaced after a close that failed: the app stops here
+                _limit(state, "database_unavailable", "The database could not be closed; open Scholia again")
+                raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
+                    from error
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         aside = data_dir / "backups" / DAMAGED / stamp if damaged else staging / "replaced"
         restored = None
@@ -783,18 +791,22 @@ async def start_background(state):
 
 
 async def _stop(state, db):
-    """Stop the app started on db, before it served anything: its harness, then the database. A
-    failure is logged; what follows (putting the previous state back) goes on."""
+    """Stop the app started on db, before it served anything: its harness, then the database. Returns
+    whether the database's close succeeded: files are put back only after one that did. A failure is
+    logged."""
     try:
         if state.get("db") is db and state.get("harness") is not None:
             await state["harness"].shutdown()
     except Exception as error:
         log.warning("stopping the harness of a restore that was not committed failed (%s)", type(error).__name__)
+    closed = True
     try:
         await asyncio.to_thread(db.close)
     except Exception as error:
         log.warning("closing the database of a restore that was not committed failed (%s)", type(error).__name__)
+        closed = False
     _forget(state)
+    return closed
 
 
 def _forget(state):
@@ -816,14 +828,17 @@ async def _roll_back(state, restored, damaged, restore_id):
     """After a failed restore: close what it opened, put the previous files back as its journal
     says (however far the swap got; nothing moved if its journal, restore_id's, was never written,
     and an earlier restore's journal is left as it is), and run on the previous database again
-    unless it was damaged. Returns False when the files could not be put back: then nothing is
-    started on them, the journal says what remains, and the next launch finishes putting it back."""
+    unless it was damaged. Returns False when the files could not be put back, or the restored database's
+    close failed (nothing is put back after such a close): then nothing is started on them, the journal
+    says what remains, and the next launch finishes putting it back."""
     data_dir = state["data_dir"]
     if restored is not None:
         try:
-            await asyncio.to_thread(restored.close)
+            await asyncio.to_thread(restored.close)  # its close joined, if _stop's ran (failed or not, it says)
         except Exception as error:
-            log.warning("closing a restored database that failed to start failed (%s)", type(error).__name__)
+            log.error("closing a restored database that failed to start failed (%s); the next launch puts the"
+                      " previous state back", type(error).__name__)
+            return False
     try:
         journal = await asyncio.to_thread(_read_journal, data_dir)
         if journal == {}:  # there but unreadable: what this restore moved cannot be told
@@ -1183,8 +1198,10 @@ async def open_at_launch(state, maintenance):
         except Exception as error:
             log.warning("the restored database could not run (%s); the previous state is put back",
                         type(error).__name__)
-            if db is not None and not db.closed:
-                await _stop(state, db)
+            # Nothing is put back after a close that failed (_open's own, or this one): the next launch tries again
+            if isinstance(error, DatabaseCloseError) or (db is not None and not await _stop(state, db)):
+                _limit(state, "restore_interrupted", "A restore interrupted by a crash could not be undone; restore a backup")
+                return None
             state.pop("damaged", None)
             state.pop("damaged_code", None)
             try:

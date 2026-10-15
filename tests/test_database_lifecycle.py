@@ -879,6 +879,59 @@ def test_a_hook_that_raises_beyond_exception_still_closes_the_writer_and_fails_e
         db.close()
     assert db.closed and db._writer._shutdown and db._writer_ident is None
 
+
+@pytest.mark.parametrize("failing", [None, "drain", "hook", "reader", "backup", "writer"])
+def test_a_close_writes_its_marker_first_and_removes_it_only_when_every_step_succeeded(tmp_path, monkeypatch, failing):
+    """PR 29 recheck 3, findings 43, 45 and 48, failing closed (Harold, 2026-10-15): the marker (the search index's,
+    which makes the next launch discard it) is written before anything else, the drain and the hooks included, and
+    removed only by a close whose every step succeeded. Whatever fails (the drain, a hook's ordinary error, a read
+    connection, a backup still running after STOP_SECONDS, the writer), the marker stays and every close raises
+    DatabaseCloseError."""
+    from backend.db import DatabaseCloseError
+    db = Database(tmp_path / "data")
+    marker = tmp_path / "data" / "discard"
+    db.marker = marker
+    seen = []
+    db.closing.append(lambda: seen.append(marker.exists()))
+    holding = threading.Event()
+    if failing == "drain":
+        real_submit = db._writer.submit
+
+        def submit(fn, *args):
+            if getattr(fn, "__name__", "") == "<lambda>":  # the drain's empty job
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+            return real_submit(fn, *args)
+        monkeypatch.setattr(db._writer, "submit", submit)
+    elif failing == "hook":
+        def hook():
+            raise OSError("the index could not be closed")
+        db.closing.append(hook)
+    elif failing == "reader":
+        class Failing:
+            def close(self):
+                raise sqlite3.OperationalError("disk I/O error")
+        db._readers.append(Failing())
+    elif failing == "backup":
+        monkeypatch.setattr(database_module, "STOP_SECONDS", 0.1)
+        db._backup_lock.acquire()  # a backup that does not stop
+    elif failing == "writer":
+        def close_writer():
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(db, "_close_writer", close_writer)
+    try:
+        if failing is None:
+            db.close()
+            db.close()
+        else:
+            for _ in range(2):  # the closer, then a later close: both told
+                with pytest.raises(DatabaseCloseError):
+                    db.close()
+    finally:
+        if failing == "backup":
+            db._backup_lock.release()
+    assert seen == [True]  # written before the hooks ran
+    assert marker.exists() == (failing is not None) and db.closed and db._writer._shutdown
+
 # Backups while the app is open
 
 
