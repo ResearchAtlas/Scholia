@@ -66,9 +66,11 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
   }, [ready, library, collection]);
 
   async function more() {
+    const start = page.next;
     try {
-      const found = await zoteroItems(library, collection, page.next);
-      setPage((shown) => (shown ? { ...found, items: [...shown.items, ...found.items] } : shown)); // none: another list since
+      const found = await zoteroItems(library, collection, start);
+      // Added only to the list it continues: not to another list shown since, nor twice.
+      setPage((shown) => (shown?.next === start ? { ...found, items: [...shown.items, ...found.items] } : shown));
     } catch (error) {
       setProblem(codeOf(error));
     }

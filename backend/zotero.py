@@ -77,12 +77,13 @@ SF_DATALESS = 0x40000000  # a file whose contents are not on this Mac (a cloud p
 _LIBRARY = re.compile(r"users/0|groups/[1-9][0-9]{0,9}")
 _KEY = re.compile(r"[A-Z0-9]{8}")
 _SERVER_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_NOT_ITEMS = ("note", "attachment", "annotation")
+_NOT_ITEMS = ("note", "attachment", "annotation")  # never offered or imported as a paper
 _DATABASES = (".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm", "-journal", ".sqlite.bak")  # file names never read
-# macOS's automounted network folders: a path under one is refused before it is resolved, since resolving it
-# mounts the share. ponytail: a link elsewhere that points into one is resolved first (realpath mounts it),
-# then refused by its file system's type; a no-follow walk of each component if that ever matters.
-_AUTOMOUNTS = ("net", "home", "network")  # never offered or imported as a paper
+# macOS's automounted network folders (and their firmlinked spelling under /System/Volumes/Data): a path under
+# one is refused before it is resolved, since resolving it mounts the share. ponytail: a link elsewhere that
+# points into one, or a ".." after a link, is resolved first (realpath mounts it), then refused by its file
+# system's type; a no-follow walk of each component if that ever matters.
+_AUTOMOUNTS = ("net", "home", "network")
 _LINKS = ("imported_file", "imported_url", "linked_file")  # attachments with a file on disk, stored ones first
 # What a paper's import outcome is, counted in the run's summary.
 OUTCOMES = ("imported", "updated", "unchanged", "already", "waiting", "not_found", "no_title")
@@ -346,7 +347,10 @@ def read_attachment(text, fs_type=file_system_type):
         return None, "pdf_not_local"
     if not path.startswith("/") or "\x00" in path:
         return None, "pdf_not_local"
-    if os.path.normpath(path).split("/")[1].lower() in _AUTOMOUNTS:  # never even resolved: it would mount a share
+    names = [name.lower() for name in os.path.normpath(re.sub("/+", "/", path)).split("/") if name]
+    if names[:3] == ["system", "volumes", "data"]:
+        names = names[3:]
+    if names[:1] and names[0] in _AUTOMOUNTS:  # never even resolved: it would mount a share
         return None, "pdf_on_network"
     try:
         real = os.path.realpath(path, strict=True)
@@ -377,7 +381,9 @@ def read_attachment(text, fs_type=file_system_type):
             return None, "pdf_not_a_file"
         if getattr(info, "st_flags", 0) & SF_DATALESS:
             return None, "pdf_not_downloaded"
-        data = bytearray()
+        data = bytearray(os.read(fd, 5))
+        if data != b"%PDF-":  # nothing more of a file that is not a PDF is read
+            return None, "pdf_not_a_pdf"
         while len(data) <= extraction.MAX_FILE_BYTES:
             block = os.read(fd, min(1 << 20, extraction.MAX_FILE_BYTES + 1 - len(data)))
             if not block:

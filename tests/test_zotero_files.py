@@ -132,7 +132,9 @@ def test_a_pdf_named_like_a_database_topic_is_read_but_a_database_never(tmp_path
 
 
 @pytest.mark.parametrize("text", ["file:///net/nas.example/export/x.pdf", "file:///home/someone/x.pdf",
-                                  "file:///Network/Servers/x.pdf", "file:///tmp/../net/nas/x.pdf"])
+                                  "file:///Network/Servers/x.pdf", "file:///tmp/../net/nas/x.pdf",
+                                  "file:////net/nas/x.pdf", "file:///%2Fnet/nas/x.pdf",
+                                  "file:///System/Volumes/Data/home/x.pdf", "file:///System/Volumes/Data/net/nas/x.pdf"])
 def test_automounted_network_folders_are_refused_before_they_are_resolved(text, monkeypatch):
     def never(*args, **kwargs):
         raise AssertionError("resolved")
@@ -143,3 +145,13 @@ def test_automounted_network_folders_are_refused_before_they_are_resolved(text, 
 
 def test_a_file_url_with_a_host_it_cannot_read_is_refused():
     assert zotero.read_attachment("file://[::1/x.pdf") == (None, "pdf_not_local")
+
+
+def test_only_a_pdfs_header_is_read_from_a_file_that_is_not_one(tmp_path, monkeypatch):
+    backup = tmp_path / "zotero.sqlite.12.bak"
+    backup.write_bytes(b"SQLite format 3\x00" + b"x" * 4096)
+    reads = []
+    real_read = os.read
+    monkeypatch.setattr(zotero.os, "read", lambda fd, n: reads.append(n) or real_read(fd, n))
+    assert zotero.read_attachment(url(backup)) == (None, "pdf_not_a_pdf")
+    assert reads == [5]

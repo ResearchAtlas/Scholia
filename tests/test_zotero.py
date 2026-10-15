@@ -645,7 +645,9 @@ async def test_cancel_while_a_pdf_is_read_writes_nothing_for_it(tmp_path, monkey
         run = await start(client, project, KEYS[:1])
         await asyncio.wait_for(reading.wait(), 10)
         cancelling = asyncio.create_task(client.post(f"/api/runs/{run}/cancel"))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.3)
+        # The read is still going: the run does not end before it (nothing of it outlasts the run's record).
+        assert (await client.get("/api/activity", params={"run_id": run})).json()["runs"][0]["status"] == "running"
         release.set()
         assert (await cancelling).status_code == 200
         row = await run_finished(client, run)

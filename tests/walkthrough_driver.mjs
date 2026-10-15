@@ -1627,7 +1627,7 @@ async function references(ctx) {
 // reason), the report from the finished run; a re-import after Zotero changed one item's title and PDF.
 async function zotero(ctx) {
   const { page, L, P, C, step, check, get } = ctx;
-  const { dialog: settings, openSidebar, openSettings } = navigation(ctx);
+  const { dialog: settings, openSettings } = navigation(ctx);
   const panel = () => page.getByRole('complementary', { name: L('panel.library') });
   const browser = () => page.getByRole('dialog', { name: L('zotero.title') });
   const projectId = (await get('/api/projects')).body.projects.find((p) => p.name === C.project).id;
@@ -1653,8 +1653,7 @@ async function zotero(ctx) {
     + `|${LIB}/items/${KEY}/file/view/url)$`);
   const chosen = { 'Minimum Wages in Synthetic Towns': 'ZWAGE001', 'A Synthetic Working Paper Without a File': 'ZMETA003',
     'A Report Kept on a Network Share (synthetic)': 'ZNAS0004', '合成数据中的工资与就业': 'ZHAN0005' };
-  const openBrowser = async () => {
-    await openSidebar();
+  const openBrowser = async () => {  // from the Library panel of the project S1-14's flow left current
     if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
     const back = panel().getByRole('button', { name: L('paper.back'), exact: true });
     if (await back.count()) { await back.click(); await page.waitForTimeout(500); }
