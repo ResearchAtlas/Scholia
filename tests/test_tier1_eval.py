@@ -277,6 +277,7 @@ async def test_a_full_run_builds_through_the_app_scores_each_benchmark_apart_and
     assert hybrid["metrics"]["ndcg@10"]["n"] == 3 and hybrid["metrics"]["ndcg@10"]["mean"] > 0.9
     assert beir["arms"]["keyword_only"]["minus_hybrid"]["ndcg@10"]["n"] == 3
     assert beir["build"]["passages"] == 3 and beir["build"]["passage_chars"]["n"] == 3
+    assert beir["commit"] == {"sha": "test", "modified": False} and beir["started_at"] <= beir["finished_at"]
 
     qasper = results["benchmarks"]["qasper"]
     assert qasper["exclusions"] == {"all_unanswerable": 1, "figure_or_table_only": 1, "no_evidence": 1,
@@ -476,3 +477,4 @@ def test_gaps_keep_a_run_from_finishing_and_metrics_without_fallbacks_leave_out_
     lines = tier1.compare({}, finished, {**finished, "manifest_sha256": "b"})
     assert lines == ["NOT LIKE FOR LIKE: the manifest (pins, rules, subset) differs from the baseline's"]
     assert "Not finished: running" in "\n".join(tier1.report({"status": "incomplete", "reason": "running"}))
+

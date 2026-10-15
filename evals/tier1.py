@@ -696,8 +696,11 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
                         results["like_for_like"] = settings == manifest["model_settings"]
                     elif settings != results["model_settings"]:
                         raise Refused(f"{name}: the model settings changed during the run")
+                    began_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
                     record = await evaluate(name, manifest["benchmarks"][name], manifest["bootstrap"], files[name],
                                             level["benchmarks"][name], client, state, install, arms)
+                    record.update(commit=results["commit"], started_at=began_at,
+                                  finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
                     local = state.get("local_helper")
                     helper = next(iter(local.helpers.values()), None) if local is not None else None
                     pid = getattr(getattr(helper, "_process", None), "pid", None)
