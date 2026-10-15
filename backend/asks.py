@@ -129,6 +129,13 @@ def withdraw(conn, run_id, ask_id, reason):
     return True
 
 
+# S1-14's merge (backend/references.py): it takes one of its options, a typed answer having no defined
+# effect; and its question shows the two papers it is about, read as they are when it is listed, so
+# neither is kept in the question itself. SHOWN: kind -> fn(conn, run id) -> what its params add.
+NO_TEXT.add("merge")
+SHOWN = {}
+
+
 def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
     """The asks that can be answered now: of running runs waiting on them, under the policy they were
     asked under; for a project, a conversation they were raised from, or a run. Each names its
@@ -147,6 +154,8 @@ def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
             continue
         found.append({"run_id": run, "workflow": workflow, "project_name": project_name, "project_kind": project_kind,
                       **{key: ask[key] for key in ("ask_id", "kind", "project_id", "options", "text_box", "params")}})
+        if ask["kind"] in SHOWN:
+            found[-1]["params"] = {**ask["params"], **SHOWN[ask["kind"]](conn, run)}
     return found
 
 
@@ -169,7 +178,10 @@ async def answer_ask(run_id: str, ask_id: str, body: Answer, request: Request):
     state = request.app.state.scholia
     registry = state["harness"].registry
     try:
-        return await asyncio.to_thread(state["db"].write,
-                                       lambda conn: answer(conn, run_id, ask_id, body.option, body.text, registry))
+        answered = await asyncio.to_thread(state["db"].write,
+                                           lambda conn: answer(conn, run_id, ask_id, body.option, body.text, registry))
     except AskRefused as refused:
         return JSONResponse({"code": refused.code, "message": refused.message}, status_code=refused.status)
+    if (active := registry.runs.get(run_id)) is not None:  # a run waiting on it wakes now
+        active.answered.set()
+    return answered

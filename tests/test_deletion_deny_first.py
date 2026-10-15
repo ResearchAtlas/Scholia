@@ -167,3 +167,23 @@ async def test_a_superseded_reading_is_removed_through_the_deletion_service_and_
             found = await searched(client, project, "A paragraph of synthetic text")
             assert found and not found & set(earlier) and found <= newer
 
+
+
+async def test_a_deleted_reference_files_paper_is_read_back_nowhere_and_its_merge_writes_nothing(tmp_path):
+    # S1-14: a metadata-only paper, never indexed, deleted while a merge into it waits.
+    from test_reference_import import answer, run_finished, with_duplicate
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        paper, ask = await with_duplicate(client, project)
+        version = (await client.get(f"/api/materials/{paper}")).json()["version"]["id"]
+        assert (await client.delete(f"/api/materials/{paper}", params={"remove_all_trace": "true"})).status_code == 200
+        for path in (f"/api/materials/{paper}", f"/api/materials/{paper}/versions", f"/api/material-versions/{version}/passages"):
+            assert (await client.get(path)).status_code == 404, path
+        assert (await run_finished(client, ask["run_id"]))["cancel_reason"] == "revoked"
+        assert (await answer(client, ask, "merge")).status_code == 409
+        assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]  # it never had passages
+        # Nothing of its title or its record is kept by the run that waited on it.
+        kept = await rows(client, "SELECT inputs FROM runs UNION ALL SELECT data FROM run_events")
+        assert not any("A Paper Already Here" in (text or "") for (text,) in kept)
+        assert (await client.get(f"/api/projects/{project}/materials")).json() == {"materials": [], "asks": [], "merging": 0}

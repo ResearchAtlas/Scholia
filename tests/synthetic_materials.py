@@ -165,6 +165,116 @@ We model wage floors in a synthetic economy. DOI {doi}
 """.encode()
 
 
+# Reference files (S1-14): one of each format, English and Chinese records, made-up 10.5555 DOIs. A
+# record names a local file and a file: URL, which are never read or kept.
+REF_DOI = "10.5555/scholia.reference.001"  # its lookup's record is retracted in the walkthrough's stand-ins
+REF_DOI_ZH = "10.5555/scholia.reference.002"
+
+
+def references_ris(doi=REF_DOI, title="Synthetic Evidence from Reference Files"):
+    return f"""TY  - JOUR
+TI  - {title}
+AU  - Example, Ana
+AU  - Researcher, Bo
+PY  - 2022///
+T2  - Journal of Synthetic Studies
+VL  - 7
+IS  - 2
+SP  - 11
+EP  - 29
+DO  - {doi.upper()}
+AB  - We study synthetic wage records drawn from a made-up reference file.
+KW  - wages
+KW  - synthetic data
+L1  - file:///etc/passwd
+UR  - file:///etc/hosts
+LA  - en
+ER  -
+
+TY  - JOUR
+TI  - 合成数据中的最低工资研究
+AU  - 张三
+AU  - 李四
+PY  - 2021
+T2  - 中国合成研究
+DO  - {REF_DOI_ZH}
+AB  - 本文使用虚构的数据研究最低工资。
+LA  - zh
+ER  -
+
+TY  - CHAP
+TI  - A Chapter without an Identifier
+AU  - Writer, Cy
+PY  - 2019
+T2  - A Synthetic Handbook
+ER  -
+""".encode()
+
+
+def references_bibtex():
+    return f"""@string{{jss = {{Journal of Synthetic Studies}}}}
+@article{{example2020,
+  title = {{Caf\\'e Wages and {{S}}ynthetic Workers}},
+  author = {{Example, Ana and Bo Researcher and 王五}},
+  journal = jss,
+  year = 2020,
+  doi = {{10.5555/scholia.bibtex.001}},
+  file = {{/Users/someone/papers/example.pdf}},
+  abstract = {{An abstract with \\emph{{LaTeX}} in it.}}
+}}
+@misc{{preprint2024,
+  title = {{A Synthetic Preprint}},
+  author = {{Writer, Cy}},
+  eprint = {{{ARXIV}}},
+  archivePrefix = {{arXiv}},
+  year = {{2024}}
+}}
+""".encode()
+
+
+def references_csl_json():
+    import json
+    return json.dumps([{"type": "article-journal", "title": "Synthetic CSL Record", "author": [{"family": "Roe", "given": "Dee"}],
+                        "issued": {"date-parts": [[2018, 5]]}, "DOI": "10.5555/scholia.csl.001", "page": 12,
+                        "container-title": "Synthetic Review"}], ensure_ascii=False).encode()
+
+
+def references_noteexpress():
+    return """{Reference Type}: Journal Article
+{Title}: 虚构面板数据中的劳动力市场
+{Author}: 赵六;钱七
+{Journal}: 合成经济研究
+{Year}: 2020
+{Issue}: 4
+{Pages}: 33-51
+{Keywords}: 劳动力市场;合成数据
+{Abstract}: 本文基于虚构的面板数据。
+{DOI}: 10.5555/scholia.noteexpress.001
+{Database Provider}: Synthetic
+
+{Reference Type}: 学位论文
+{Title}: 合成样本的学位论文
+{Author}: 孙八
+{Year}: 2019
+""".encode()
+
+
+def references_endnote():
+    return """%0 Journal Article
+%T Tagged Synthetic Evidence
+%A Example, Ana
+%A 周九
+%D 2017
+%J Synthetic Letters
+%R 10.5555/scholia.endnote.001
+%X An abstract in a tagged file,
+continued on a second line.
+%> /Users/someone/papers/tagged.pdf
+%U https://example.org/synthetic
+
+""".encode()
+
+
 def _xml(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 

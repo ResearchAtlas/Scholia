@@ -152,12 +152,27 @@ export function detailsSource(t, material, project, date) {
   if (material.checked_by === 'lookup' && service) {
     return t('library.source.lookedUp', { source: t(`ask.service.${service}`), date: date(material.resolved_at) });
   }
+  if (material.source === 'reference_file') return referenceSource(t, material, project, date, service); // S1-14
   const lookup = material.lookup;
   if (!lookup) return t(project?.review_lock ? 'library.source.locked' : 'library.source.fromFile');
   if (lookup.status === 'running') return t(lookup.waiting ? 'library.source.waiting' : 'library.source.lookingUp');
   if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
   const outcome = lookup.outcome;
   return t(LOOKUP_OUTCOMES.includes(outcome) ? `library.source.${outcome}` : 'library.source.fromFile');
+}
+
+// Where a reference file's paper's details come from (S1-14): its record, completed by the service a
+// lookup found it in (which fills only what the record lacked), or with what its latest lookup did.
+const REFERENCE_OUTCOMES = ['not_found', 'unavailable', 'refused'];
+function referenceSource(t, material, project, date, service) {
+  if (service && material.resolved_at) {
+    return t('library.source.completedFrom', { source: t(`ask.service.${service}`), date: date(material.resolved_at) });
+  }
+  const lookup = material.lookup;
+  if (!lookup) return t(project?.review_lock ? 'library.source.referenceLocked' : 'library.source.fromReferenceFile');
+  if (lookup.status === 'running') return t(lookup.waiting ? 'library.source.waiting' : 'library.source.lookingUp');
+  if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
+  return t(REFERENCE_OUTCOMES.includes(lookup.outcome) ? `library.source.reference.${lookup.outcome}` : 'library.source.fromReferenceFile');
 }
 
 // What a paper's latest lookup did, as text, beside details that came from elsewhere (an edit or an
@@ -190,9 +205,10 @@ export function reasonKey(reason) {
   return reason ? `library.reason.${REASONS.has(reason) ? reason : 'other'}` : null;
 }
 
-// Whether the Library should look again soon: a paper is being read, a lookup runs, or an ask waits.
+// Whether the Library should look again soon: a paper is being read, a lookup runs, an ask waits, or a
+// merge has still to ask or to apply its answer (S1-14).
 export function unsettled(listing) {
-  return Boolean(listing && (listing.asks?.length
+  return Boolean(listing && (listing.asks?.length || listing.merging
     || listing.materials?.some((m) => m.state === 'reading' || m.lookup?.status === 'running')));
 }
 

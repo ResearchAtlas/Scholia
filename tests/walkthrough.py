@@ -99,8 +99,15 @@ RECORDS = MockScholarly(
                                            authors=("Chen Example",), year=2023, venue="合成经济研究"),
               DOIS["local"]: openalex_work(DOIS["local"], "A Codebook for Synthetic Interviews", year=2022),
               DOIS["scan"]: openalex_work(DOIS["scan"], "A Scanned Letter on Synthetic Wages",
-                                          authors=("Dana Example",), year=1998)},
-    crossref={DOIS["docx"]: crossref_work(DOIS["docx"], "Wages Across Synthetic Cities", retracted=True)},
+                                          authors=("Dana Example",), year=1998),
+              # S1-14: a reference file's record whose work is retracted, and a NoteExpress record's
+              synthetic_materials.REF_DOI: openalex_work(synthetic_materials.REF_DOI, "An OpenAlex Record",
+                                                         retracted=True),
+              "10.5555/scholia.noteexpress.001": openalex_work("10.5555/scholia.noteexpress.001", "A NoteExpress Record",
+                                                                venue="合成经济研究")},
+    crossref={DOIS["docx"]: crossref_work(DOIS["docx"], "Wages Across Synthetic Cities", retracted=True),
+              # S1-14: the reference file's Chinese record, completed from Crossref
+              synthetic_materials.REF_DOI_ZH: crossref_work(synthetic_materials.REF_DOI_ZH, "A Crossref Record")},
     arxiv={ARXIV_ID: "Labour Market Notes on a Synthetic Economy"})
 
 
@@ -126,6 +133,15 @@ def write_materials():
         "scanned-appendix.pdf": synthetic_materials.paper_pdf(title="Scanned Appendix", doi=None, scanned=2),
         "damaged.pdf": b"%PDF-1.7\n" + b"\x00 not a whole PDF " * 40,
         "interview-codebook.md": f"# Interview Codebook\n\ndoi:{DOIS['local']}\n\nSynthetic codes only.\n".encode(),
+        # S1-14: a reference file (three new records, a duplicate of the scanned letter by its DOI and one
+        # of the Markdown notes by title and year), a CNKI-style NoteExpress export, and a file to attach.
+        "reference-library.ris": synthetic_materials.references_ris() + (
+            f"\nTY  - JOUR\nTI  - A Scanned Letter on Synthetic Wages\nDO  - {DOIS['scan']}\n"
+            "AB  - A scanned letter on synthetic wages, read from a reference file's record.\nKW  - wages\nER  - \n"
+            "\nTY  - JOUR\nTI  - Labour Market Notes on a Synthetic Economy\nPY  - 2024\n"
+            "AB  - Notes on a synthetic labour market, from a reference file.\nER  - \n").encode(),
+        "cnki-export.txt": synthetic_materials.references_noteexpress(),
+        "chapter-full-text.md": b"# A Chapter without an Identifier\n\nThe full text of the synthetic chapter, attached later.\n",
         "long-notes.md": long_notes(),
         "crowded-page.pdf": synthetic_materials.pdf(  # one page of 220 passages, a line of three items each
             [[(72 + (i % 3) * 150, 780 - (i // 3) * 3.4, 1.2, f"Item {i}.") for i in range(660)]]),

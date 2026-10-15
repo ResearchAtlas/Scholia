@@ -14,6 +14,7 @@ import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEven
   stateKey, typeKey, unsettled, uploadsWaiting, watchUploads, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
+import { AddMenu } from './AddMenu.jsx'; // S1-14: Add offers a reference file
 import { Paper } from './Parts.jsx';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -112,9 +113,14 @@ export function Library({ project }) {
         </p>
         <input ref={input} type="file" multiple accept={ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1}
           data-testid="library-files" onChange={(event) => { add(event.target.files); event.target.value = ''; }} />
-        <Button size="sm" variant="outline" className="h-8" disabled={adding || !project} onClick={() => input.current?.click()}>
-          <FilePlus2 aria-hidden="true" />{t('library.addFiles')}
-        </Button>
+        <AddMenu project={project} onFiles={() => input.current?.click()} onStart={() => setNotice(null)}
+          onDone={(text) => { setNotice(text); load(); }}>
+          {(importing) => (
+            <Button size="sm" variant="outline" className="h-8" disabled={adding || !project || importing}>
+              <FilePlus2 aria-hidden="true" />{t('library.add')}
+            </Button>
+          )}
+        </AddMenu>
       </div>
       {project && <SearchField search={search} />}
       <div className="scroll-thin min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
@@ -183,6 +189,18 @@ export function Retracted({ material }) {
   );
 }
 
+// A paper with no file read (from a reference file, S1-14): its record's details and abstract are not
+// its full text, and say so.
+export function NoFullText({ material }) {
+  const t = useT();
+  if (!material.evidence_type || material.evidence_type === 'full_text') return null;
+  return (
+    <span className="inline-flex items-center rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+      {t('library.noFullText')}
+    </span>
+  );
+}
+
 export function Byline({ material }) {
   const t = useT();
   const names = authorNames(material.csl);
@@ -224,7 +242,7 @@ function PaperRow({ material, project, index, onOpen, onChanged }) {
         <Progress material={material} />
         {reason && <p className="text-xs text-warning">{t(reason, { count: material.extraction?.ocr_pages ?? 0 })}</p>}
         {material.readable && <ReadAgain material={material} onDone={onChanged} />}
-        <div className="flex flex-wrap items-center gap-2"><Retracted material={material} /></div>
+        <div className="flex flex-wrap items-center gap-2"><NoFullText material={material} /><Retracted material={material} /></div>
         <details className="group text-xs">
           <summary className="w-fit cursor-pointer select-none rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
             {t('library.details')}
@@ -244,8 +262,8 @@ export function Facts({ material, project, index }) {
   const date = (value) => new Intl.DateTimeFormat(language, { dateStyle: 'medium' }).format(new Date(value));
   const extraction = material.extraction;
   const rows = [
-    material.version && [t('library.fact.file'), `${t(typeKey(material.version.media_type))} · ${fileSize(material.version.size, language)}`
-      + (material.version.seq ? ` · ${t('library.version', { number: material.version.seq + 1 })}` : '')],
+    material.version && [t('library.fact.file'), (material.version.media_type ? `${t(typeKey(material.version.media_type))} · ${fileSize(material.version.size, language)}`
+      : t('library.noFile')) + (material.version.seq ? ` · ${t('library.version', { number: material.version.seq + 1 })}` : '')],
     extraction?.pages != null && [t('library.fact.pages'), String(extraction.pages)],
     extraction && [t('library.fact.passages'), String(extraction.passages)],
     ocrPages(t, extraction) && [t('library.fact.ocr'), ocrPages(t, extraction)],

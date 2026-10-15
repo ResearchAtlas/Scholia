@@ -11,6 +11,7 @@ import { post } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
 import { projectName } from '../projects.js';
+import { paperLine } from '../references.js';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { ModelDetails } from './LocalHelper.jsx'; // S1-17: the search model's offer
@@ -33,7 +34,8 @@ export function Ask({ ask, onAnswered }) {
   const questionKey = `ask.${ask.kind}.question`;
   const asked = t(questionKey, { count: ask.params?.identifiers ?? 0, services });
   const question = asked === questionKey ? ask.params?.question ?? '' : asked;
-  const body = named(t, `ask.${ask.kind}.body`, '');
+  // A Local only lookup of a reference file's papers says so (S1-14): its answer covers those papers.
+  const body = named(t, `ask.${ask.kind}.body${ask.params?.batch === 'reference_file' ? 'ReferenceFile' : ''}`, '');
 
   async function answer(reply) {
     const done = await run(() => post(`/api/runs/${encodeURIComponent(ask.run_id)}/asks/${encodeURIComponent(ask.ask_id)}`, reply));
@@ -68,6 +70,7 @@ export function Ask({ ask, onAnswered }) {
           <Button type="submit" size="sm" variant="outline" disabled={busy || !visible(text)}>{t('ask.send')}</Button>
         </form>
       )}
+      {ask.kind === 'merge' && <MergeComparison ask={ask} />}
       {problem && <p role="alert" className="text-destructive">{problem}</p>}
       <div className="flex flex-wrap gap-2">
         {ask.options.map((option, i) => (
@@ -79,5 +82,27 @@ export function Ask({ ask, onAnswered }) {
         ))}
       </div>
     </section>
+  );
+}
+
+// A merge question's two papers (S1-14), as the backend reads them when it lists the question: the
+// project's paper and the reference file's record, and what made them look like one paper.
+function MergeComparison({ ask }) {
+  const t = useT();
+  const { paper, record, matched } = ask.params ?? {};
+  if (!paper || !record) return null;
+  return (
+    <div className="grid grid-cols-1 gap-2">
+      {[['ask.merge.paper', paper], ['ask.merge.record', record]].map(([label, item]) => (
+        <div key={label} className="grid min-w-0 gap-0.5 rounded-lg border bg-background/70 px-3 py-2">
+          <p className="text-xs font-medium text-muted-foreground">{t(label)}</p>
+          <p className="line-clamp-2 break-words font-medium" title={item.title}>{item.title}</p>
+          <p className="truncate text-xs text-muted-foreground" title={paperLine(t, item)}>
+            {paperLine(t, item) || t('ask.merge.noDetails')}
+          </p>
+        </div>
+      ))}
+      {matched && <p className="text-xs text-muted-foreground">{t(`ask.merge.matched.${matched}`)}</p>}
+    </div>
   );
 }
