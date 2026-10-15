@@ -529,6 +529,7 @@
   "search.paperNotIndexed": "尚未加入搜索索引",
   "search.paperKeywordOnly": "已建立关键词索引。",
   "search.paperEmbedding": "已建立关键词索引；向量 {done}/{total}",
+  "search.paperEmbeddingRefused": "已建立关键词索引；向量 {done}/{total}；{refused} 个无法生成向量",
   "search.paperIndexed": "已建立关键词与语义索引",
   "search.paperRefused": {
     "other": "已建立关键词与语义索引，但有 {count} 个段落搜索模型无法处理；仍可按关键词找到。"

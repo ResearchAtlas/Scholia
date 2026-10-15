@@ -46,7 +46,7 @@ class Remote:
         self.hold, self.reached, self.free = None, asyncio.Event(), 0
         self.failing = False
         self.slow_queries = 0
-        self.refuse, self.refused, self.counted, self.tokenizing = None, [], [], None
+        self.refuse, self.refused, self.counted, self.tokenizing, self.fail_on = None, [], [], None, None
 
     def key(self, port):
         launches = self.fake.launches
@@ -73,6 +73,8 @@ class Remote:
             self.refused.append(body["input"])
             return refused
         texts = body["input"]
+        if self.fail_on is not None and any(self.fail_on in text for text in texts):
+            return httpx.Response(500, json={"error": "failed"})
         self.embedded.append(texts)
         query = any("Query:" in t for t in texts)
         if query and self.slow_queries:
@@ -822,6 +824,23 @@ async def test_a_passage_the_helper_refuses_is_counted_and_passed_over_until_its
         await search._embed_all(client.state)
         status = await idle(client, project)
         assert status["passages"]["refused"] == 0 and status["passages"]["embedded"] == status["passages"]["embeddable"]
+
+
+async def test_a_refusal_is_kept_when_a_later_passage_of_its_batch_fails_and_retry_does_not_send_it_again(tmp_path):
+    async with app(tmp_path, batch=10) as client:  # one batch for the paper's passages
+        client.remote.refuse, client.remote.fail_on = "Minimum wages", "Employment effects"  # the 2nd, then the 3rd
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        status = await idle(client, project)
+        [run] = await runs_of(client, "index", project)
+        assert (run["status"], run["result"]["reason"]) == ("failed", "request_failed")
+        assert status["passages"]["refused"] == 1 and len(client.remote.refused) == 1  # kept, though the batch failed
+        client.remote.fail_on = None
+        again = await client.post(f"/api/runs/{run['run_id']}/retry")
+        assert (await run_finished(client, again.json()["run_id"]))["status"] == "succeeded"
+        status = await idle(client, project)
+        assert len(client.remote.refused) == 1  # not sent again
+        assert status["passages"] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
 
 
 @pytest.mark.parametrize("status", [503, 500, 429])

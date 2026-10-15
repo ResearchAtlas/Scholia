@@ -92,14 +92,16 @@ export function whereIs(t, result) {
 }
 
 // A paper's line under Details for the search index, as [key, params]: not indexed yet, indexed for
-// keywords (search is keyword-only now), embeddings so far, indexed for both, or for both except the
-// passages the search model could not take (or for keywords only, when it could take none of them).
+// keywords (search is keyword-only now), embeddings so far (with any passages refused so far), indexed
+// for both, or for both except the passages the search model could not take (or for keywords only,
+// when it could take none of them).
 export function paperIndexed(index, materialId) {
   const counts = index?.materials?.[materialId];
   if (!counts) return ['search.paperNotIndexed', {}];
   if (index.mode === 'keyword_only' || !counts.embeddable) return ['search.paperKeywordOnly', {}];
-  if (!settled(counts.embedded, counts.refused, counts.embeddable)) {
-    return ['search.paperEmbedding', { done: counts.embedded, total: counts.embeddable }];
+  if (!settled(counts.embedded, counts.refused, counts.embeddable)) { // with those it could not take, if any
+    const done = { done: counts.embedded, total: counts.embeddable };
+    return counts.refused ? ['search.paperEmbeddingRefused', { ...done, refused: counts.refused }] : ['search.paperEmbedding', done];
   }
   if (!counts.refused) return ['search.paperIndexed', {}];
   return counts.embedded ? ['search.paperRefused', { count: counts.refused }] : ['search.paperRefusedAll', { count: counts.refused }];

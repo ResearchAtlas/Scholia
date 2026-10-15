@@ -447,8 +447,9 @@ async def _index_run(state, harness, active, project_id, inputs):
                 try:
                     [vector] = await local_helper.embed(state, [_text(reading)], project_id=project_id,
                                                         admit=lambda conn, pid=pid: _may_index(conn, run_id, project_id, pid))
-                except InputRefused as refusal:  # its text, refused as such: recorded, and the run goes on
-                    vectors.append((rowid, pid, mark, None))
+                except InputRefused as refusal:  # its text, refused as such: recorded at once (a later failure in
+                    # this batch must not lose it, or Retry would send it again), and the run goes on
+                    await drained(index.store, project_id, [(rowid, pid, mark, None)], stop)
                     refused[refusal.reason] = refused.get(refusal.reason, 0) + 1
                     continue
                 except HelperUnavailable as unavailable:
