@@ -30,6 +30,12 @@ frontend/), with no session, on port 8765, where that server sends API requests.
 free port is used. --request-log appends each request the test-owned provider receives to FILE, one
 JSON line each.
 
+S1-15: a test-owned Zotero (scholia_app.MockZotero) answers at Zotero's address behind the same transport,
+with made-up libraries, collections and items, whose PDFs are synthetic files in the materials folder.
+It reads its state from the file named by "zotero state": not_running, api_off, ready, or changed (ready,
+with one item's title and PDF changed since, for the re-import). Its requests go to the request log too,
+with their query ("target").
+
 tests/walkthrough_driver.mjs drives the rendered walkthrough against this server.
 """
 
@@ -57,7 +63,7 @@ network_guard.start()
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
-from scholia_app import FakeKeyring, MockProvider, MockScholarly, crossref_work, openalex_work  # noqa: E402
+from scholia_app import FakeKeyring, MockProvider, MockScholarly, MockZotero, crossref_work, openalex_work  # noqa: E402
 
 from backend import local_helper, reading  # noqa: E402
 from backend.app import create_app  # noqa: E402
@@ -100,6 +106,10 @@ RECORDS = MockScholarly(
               DOIS["local"]: openalex_work(DOIS["local"], "A Codebook for Synthetic Interviews", year=2022),
               DOIS["scan"]: openalex_work(DOIS["scan"], "A Scanned Letter on Synthetic Wages",
                                           authors=("Dana Example",), year=1998),
+              # S1-15: the Zotero item's DOI, completing its record
+              "10.5555/scholia.walkthrough.zotero": openalex_work("10.5555/scholia.walkthrough.zotero",
+                                                                  "An OpenAlex Record for a Zotero Item",
+                                                                  venue="Journal of Synthetic Towns"),
               # S1-14: a reference file's record whose work is retracted, and a NoteExpress record's
               synthetic_materials.REF_DOI: openalex_work(synthetic_materials.REF_DOI, "An OpenAlex Record",
                                                          retracted=True),
@@ -156,10 +166,54 @@ def write_materials():
         "large-figures.pdf": synthetic_materials.paper_pdf(title="Large Figures").replace(
             b"\n", b"\n%WALKTHROUGH-MEMORY\n", 1),
         "slow-source.tex": b"% WALKTHROUGH-SLOW\n" + synthetic_materials.paper_latex(title="A Slow Source"),
+        # S1-15: the PDFs the test-owned Zotero's attachments name
+        **{name: synthetic_materials.paper_pdf(title, doi=doi) for name, (title, doi) in ZOTERO_PDFS.items()},
     }
     for name, data in files.items():
         (folder / name).write_bytes(data)
     return folder
+
+
+# S1-15: the test-owned Zotero's items (made up), by key: (title, DOI, its PDF's file in the materials folder
+# or a file URL elsewhere, linked, collection).
+ZOTERO_DOI = "10.5555/scholia.walkthrough.zotero"
+ZOTERO_PDFS = {"zotero-wages.pdf": ("Minimum Wages in Synthetic Towns", ZOTERO_DOI),
+               "zotero-linked.pdf": ("Linked Notes on Synthetic Labour Markets", None),
+               "zotero-hanzi.pdf": ("合成数据中的工资与就业", None),
+               "zotero-hanzi-revised.pdf": ("合成数据中的工资与就业（修订版）", None)}
+ZOTERO_ITEMS = {
+    "ZWAGE001": ("Minimum Wages in Synthetic Towns", ZOTERO_DOI, "zotero-wages.pdf", False, "WAGECOL1"),
+    "ZLINK002": ("Linked Notes on Synthetic Labour Markets", None, "zotero-linked.pdf", True, "LINKCOL2"),
+    "ZMETA003": ("A Synthetic Working Paper Without a File", None, None, False, "WAGECOL1"),
+    "ZNAS0004": ("A Report Kept on a Network Share (synthetic)", None, "file://nas.example/share/report.pdf", False,
+                 "WAGECOL1"),
+    "ZHAN0005": ("合成数据中的工资与就业", None, "zotero-hanzi.pdf", False, "WAGECOL1"),
+    "ZLONG006": ("A Very Long Synthetic Title About Minimum Wages, Hours, Employment and Earnings in Small Towns and "
+                 "Large Cities Across Several Synthetic Decades, Written to Test How the Browser Shortens It", None, None,
+                 False, None),
+}
+
+
+class WalkthroughZotero(MockZotero):
+    """The walkthrough's Zotero: its state read from the control file at each request (see the module)."""
+
+    def __init__(self, control, materials):
+        super().__init__(server_id="walkthrough-zotero", groups=[(4711, "Synthetic Lab"), (4712, "合成课题组")])
+        self.control, self.materials = control, materials
+        self.collections["users/0"] = [{"key": "WAGECOL1", "name": "Wage studies"},
+                                       {"key": "LINKCOL2", "name": "Linked files", "parent": "WAGECOL1"}]
+        for key, (title, doi, pdf, linked, collection) in ZOTERO_ITEMS.items():
+            path = pdf if pdf is None or pdf.startswith("file:") else materials / pdf
+            self.item(key, title, doi=doi, pdf=path, linked=linked, collections=[collection] if collection else [])
+
+    async def __call__(self, request):
+        state = self.control.read_text().strip() if self.control.exists() else "not_running"
+        self.state = "ready" if state == "changed" else state
+        if state == "changed":  # the Chinese item retitled in Zotero, its PDF replaced by a revised one
+            item = self.items["users/0", "ZHAN0005"]
+            item["data"]["title"] = item["csljson"]["title"] = ZOTERO_PDFS["zotero-hanzi-revised.pdf"][0]
+            self.files["users/0", "ZHAN000Z"] = (self.materials / "zotero-hanzi-revised.pdf").as_uri()
+        return await super().__call__(request)
 
 
 # The search model the walkthrough offers: a synthetic file, never a model, with its own pin and the
@@ -223,6 +277,12 @@ class SyntheticProvider(MockProvider):
             with open(self.log, "a", encoding="utf-8") as out:
                 out.write(json.dumps({"method": request.method, "host": request.url.host, "path": request.url.path,
                                       "model": body.get("model") if isinstance(body, dict) else None}) + "\n")
+        if (request.url.host, request.url.port) == MockZotero.ORIGIN:  # S1-15: the test-owned Zotero
+            if self.log is not None:
+                with open(self.log, "a", encoding="utf-8") as out:
+                    out.write(json.dumps({"method": request.method, "host": "zotero",
+                                          "target": request.url.raw_path.decode()}) + "\n")
+            return await super().__call__(request)
         if request.url.host == "127.0.0.1":  # the stand-in helper (S1-17)
             return helper_answer(request, self.control)
         if request.url.host in FILE_HOSTS or request.url.host in FILE_HOSTS.values():
@@ -279,7 +339,12 @@ def main(argv=None):
                      keyring_backend=FakeKeyring(), transport=httpx.MockTransport(provider),
                      helper=local_helper.Config(binary=binary, models={MODEL["id"]: MODEL}))
     print(f"data folder: {data_dir}", flush=True)
-    print(f"materials: {write_materials()}", flush=True)
+    materials = write_materials()
+    zotero_control = harness / "zotero-state"  # S1-15
+    zotero_control.write_text("api_off")
+    provider.zotero = WalkthroughZotero(zotero_control, materials)
+    print(f"materials: {materials}", flush=True)
+    print(f"zotero state: {zotero_control}", flush=True)
     print(f"model file: {offline}", flush=True)
     print(f"helper control: {provider.control}", flush=True)
     print(f"open: {origin}/" + ("" if args.dev else f"#session={session}"), flush=True)

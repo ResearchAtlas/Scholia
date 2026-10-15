@@ -517,3 +517,30 @@ async def test_logs_hold_no_zotero_content(tmp_path, caplog):
         await imported(client, project, ["KKKK3333"])
     text = caplog.text
     assert not re.search(r"CANARY|KKKK3333", text)
+
+
+async def test_the_zotero_endpoints_answer_only_the_apps_own_window(tmp_path):
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        for method, path, body in (("GET", "/api/zotero/status", None),
+                                   ("GET", "/api/zotero/collections?library=users/0", None),
+                                   ("GET", "/api/zotero/items?library=users/0", None),
+                                   ("POST", f"/api/projects/{project}/materials/import-zotero",
+                                    {"library": "users/0", "items": KEYS})):
+            response = await client.request(method, path, json=body, headers={"Origin": "http://evil.example"})
+            assert response.status_code == 403, path
+        assert mock.requests == []
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'zotero_import'") == [(0,)]
+
+
+async def test_an_abstract_is_kept_as_the_records_never_as_text(tmp_path):
+    mock = MockZotero()
+    mock.item("LLLL4444", "A Record With an Abstract", extra={"abstract": "A synthetic abstract, never full text."})
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        await imported(client, project, ["LLLL4444"])
+        [paper] = (await papers(client, project)).values()
+        assert (paper["evidence_type"], paper["csl"]["abstract"]) == ("abstract", "A synthetic abstract, never full text.")
+        assert await rows(client, "SELECT count(*) FROM passages") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
