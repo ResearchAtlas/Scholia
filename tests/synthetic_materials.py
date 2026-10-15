@@ -182,7 +182,7 @@ VL  - 7
 IS  - 2
 SP  - 11
 EP  - 29
-DO  - https://doi.org/{doi.upper()}
+DO  - {doi.upper()}
 AB  - We study synthetic wage records drawn from a made-up reference file.
 KW  - wages
 KW  - synthetic data

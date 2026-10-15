@@ -78,47 +78,77 @@ def test_bibtex_blocks_it_cannot_read_are_counted_and_the_rest_imported():
     assert sorted(r["title"] for r in records) == ["Fine one", "Fine two", "Same key, read too"]
 
 
-def test_bibtex_macros_expand_through_aliases_concatenation_and_the_month_names():
-    text = ('@string{macroA = {Journal of A}}\n@string{macroB = macroA}\n@string{prefix = "A " # {Synthetic}}\n'
-            '@string{Deep = prefix}\n'
-            '@article{k, title = deep # { study of } # "{W}ages " # 12, journal = macroB, year = 2020,\n'
-            '  abstract = {Seen in } # MAR # ", twice"}\n')
-    [record], skipped, _ = parse(text)
-    assert (record["title"], record["container-title"], record["abstract"], skipped) == (
-        "A Synthetic study of Wages 12", "Journal of A", "Seen in March, twice", {})
+# BibTeX macros (Harold's reading, 2026-10-15): one literal, a number, or one macro name (a month, or an
+# @string defined once, before its use, as one literal); anything else refuses the record.
 
 
-def test_a_macro_chain_as_deep_as_its_bound_expands():
-    chain = "@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, rf.MACRO_DEPTH))
-    [record], skipped, _ = parse(chain + f"@misc{{k, title = m{rf.MACRO_DEPTH - 1} # {{ end}}}}\n")
-    assert record["title"] == "deep end" and skipped == {}
+def test_bibtex_months_and_a_macro_defined_once_before_its_use_as_one_literal():
+    text = ('@string{jss = {Journal of Synthetic Studies}}\n@string{Year = "2020"}\n'
+            '@article{k, title = "T", journal = JSS, year = year, volume = 7, abstract = mar}\n'
+            '@misc{l, title = {T2}, journal = jss}\n')
+    first, second = parse(text)[0]
+    assert (first["container-title"], first["issued"], first["volume"], first["abstract"]) == (
+        "Journal of Synthetic Studies", {"date-parts": [[2020]]}, "7", "March")
+    assert second["container-title"] == "Journal of Synthetic Studies"
 
 
-@pytest.mark.parametrize("strings, title", [
-    ("", "nowhere # {x}"),  # a macro no @string defines
-    ("@string{a = b}\n@string{b = {x} # a}\n", "b"),  # one that refers to itself
-    ("@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, rf.MACRO_DEPTH + 1)),
-     f"m{rf.MACRO_DEPTH}"),  # nested past the bound
-    ("@string{a0 = {xx}}\n" + "".join(f"@string{{a{i} = a{i - 1} # a{i - 1}}}\n" for i in range(1, 60)), "a59"),
+@pytest.mark.parametrize("strings, value", [
+    ('@string{prefix = {A }}\n', "prefix # {study}"),  # concatenation
+    ('@string{a = {x}}\n@string{b = a}\n', "b"),  # an alias
+    ('@string{a = "x" # "y"}\n', "a"),  # a definition that is no one literal
+    ("", "nowhere"),  # undefined
+    ('@string{a = {x}}\n@string{a = {x}}\n', "a"),  # defined twice, alike
+    ('@string{a = {x}}\n@string{A = {y}}\n', "a"),  # defined twice (names are case-insensitive)
+    ('@string{a = "x"}\n@string{a = a # "y"}\n', "a"),
 ])
-def test_a_bibtex_value_that_cannot_be_expanded_skips_its_record_never_read_wrong(strings, title):
+def test_a_bibtex_value_outside_what_is_read_refuses_its_record(strings, value):
+    records, skipped, _ = parse(f"{strings}@misc{{bad, title = {value}}}\n@misc{{good, title = {{Kept}}}}\n")
+    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
+
+
+@pytest.mark.parametrize("text", [
+    "@misc{before, title = a}\n@string{a = {x}}\n",  # defined after its use
+    "@misc{before, title = jan}\n@string{jan = {Janvier}}\n",  # a month an @string defines, used before it
+    "@string{a = {x}}\n@misc{before, title = a}\n@string{a = {y}}\n",  # defined again after the use
+])
+def test_a_macro_defined_after_its_use_or_twice_refuses_its_record(text):
+    records, skipped, _ = parse(text + "@misc{good, title = {Kept}}\n")
+    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
+
+
+@pytest.mark.parametrize("text", [
+    "@string{a={Old}}\n@string{a={Broken}\n@misc{k,title=a}\n",  # recheck 3's finding 11
+    "@string{jan={Broken}\n@misc{k,title=jan}\n",  # a malformed month leaves no January behind
+    "@string{x={X}}\n@STRING{y={Broken}\n@misc{k,title=x}\n",  # every later macro, whichever the block named
+])
+def test_after_an_unreadable_at_string_block_every_later_macro_use_refuses_its_record(text):
+    records, skipped, _ = parse(text + "@misc{good, title = {Kept}}\n")
+    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 2}  # the block and the record
+
+
+def test_a_macro_every_entry_uses_is_read_for_latex_once(monkeypatch):
+    calls = []
+    real = rf._latex
+    monkeypatch.setattr(rf, "_latex", lambda text: calls.append(text) or real(text))
+    parse("@string{j = {Caf\\'e Journal}}\n" + "".join(f"@misc{{k{i}, title={{T}}, journal=j}}\n" for i in range(50)))
+    assert calls.count("Caf\\'e Journal") == 1
+
+
+@pytest.mark.parametrize("title", [
+    "{Known " + "\\relax " * 700 + "tail}",  # one braced value past its cap
+    "long",  # a macro past the cap of the field that uses it
+])
+def test_a_value_past_its_cap_is_refused_never_cut_and_read(title):
+    strings = "@string{long = {" + "w" * (rf.TITLE_CHARS * 4 + 1) + "}}\n"
     records, skipped, _ = parse(f"{strings}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
     assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
 
 
-@pytest.mark.parametrize("deep_first", [True, False])
-def test_a_macros_depth_is_its_own_whatever_was_read_before(deep_first):
-    chain = "@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, rf.MACRO_DEPTH + 1))
-    deep, shallow = f"@misc{{a, title = m{rf.MACRO_DEPTH}}}\n", "@misc{b, title = m1}\n"
-    records, skipped, _ = parse(chain + (deep + shallow if deep_first else shallow + deep))
-    assert [r["title"] for r in records] == ["deep"] and skipped == {"unreadable": 1}
-
-
-def test_macros_expanding_past_their_bound_together_refuse_the_file():
-    # 6 doublings of 1,000 characters: each entry's own expression of it holds 64,000 characters, within its cap
-    text = "@string{a0 = {" + "w" * 1000 + "}}\n" + "".join(f"@string{{a{i} = a{i - 1} # a{i - 1}}}\n" for i in range(1, 7)) \
-        + "".join(f"@misc{{k{i}, title = {{T{i}}}, abstract = a6 # {{{i}}}}}\n" for i in range(400))
-    assert len(text) < 30_000 and unreadable(text) == "reference_file_too_large"
+def test_a_macro_longer_than_any_field_takes_is_refused_never_cut():
+    shared = "@string{m = {\\'e " + "w" * (rf.MAX_BYTES // 2) + "}}\n"
+    entries = "".join(f"@misc{{k{i}, title={{T{i}}}, author=m, abstract=m}}\n" for i in range(5000))
+    records, skipped, _ = parse(shared + entries)
+    assert records == [] and skipped == {"unreadable": 5000}
 
 
 def test_bibtex_names_are_split_on_their_text_as_written_then_read():
@@ -132,100 +162,12 @@ def test_bibtex_names_are_split_on_their_text_as_written_then_read():
         {"family": "van Beethoven", "given": "Ludwig"}, {"family": "Škoda", "given": "Jiří"}, {"literal": "王五"}]
 
 
-def test_bibtex_literal_fields_keep_their_characters():
-    text = (r'@misc{k, title={T}, url={https://example.org/~researcher/a_b%20c}, doi = "10.5555/a_b--c",'
-            r' eprint={2101.00001}, archiveprefix={arXiv}}')
-    [record], skipped, _ = parse(text)
-    assert (record["URL"], record["DOI"], record["number"], skipped) == (
-        "https://example.org/~researcher/a_b%20c", "10.5555/a_b--c", "arXiv:2101.00001", {})
-
-
-def test_values_left_out_as_invalid_are_counted_not_lost():
-    ris_text = "TY  - JOUR\nTI  - T\nDO  - not a doi\nUR  - file:///etc/hosts\nUR  - https://e.org/k\nPY  - n.d.\nER  - \n"
-    [record], skipped, _ = parse(ris_text)
-    assert record["URL"] == "https://e.org/k" and skipped == {"invalid_field": 3}
-    [record], skipped, _ = parse(r"@misc{k, title={T}, url={\url{https://e.org/a}}, doi={10.5555/a\textunderscore b}, year={2020}}")
-    assert "URL" not in record and "DOI" not in record and skipped == {"invalid_field": 2}  # LaTeX no URL or DOI holds
-    [record], skipped, _ = parse(r"@misc{k, title={T}, eprint={foo bar}, archiveprefix={arXiv}}")
-    assert "number" not in record and "URL" not in record and skipped == {"invalid_field": 1}  # an eprint no arXiv ID
-
-
-@pytest.mark.parametrize("eprint, number", [("2101.00001v2", "arXiv:2101.00001v2"), (" 2101.00001 ", "arXiv:2101.00001"),
-                                            ("math\\_ph/0301001", None)])
-def test_an_arxiv_eprint_as_exports_write_it(eprint, number):
-    [record], skipped, _ = parse(f"@misc{{k, title={{T}}, eprint={{{eprint}}}, archiveprefix={{arXiv}}}}")
-    assert (record.get("number"), skipped) == (number, {} if number else {"invalid_field": 1})
-    assert record.get("URL") == (f"https://arxiv.org/abs/{number[6:]}" if number else None)
-
-
-@pytest.mark.parametrize("number", ["arXiv preprint 5", "Preprint at arxiv.org"])
-def test_a_number_that_only_mentions_arxiv_is_kept(number):
-    [record], skipped, _ = parse(json.dumps([{"title": "T", "number": number}]))
-    assert record["number"] == number and skipped == {}
-
-
-def test_only_the_keywords_a_record_keeps_are_read():
+def test_only_the_keywords_a_record_keeps_are_read(monkeypatch):
     calls = []
     real = rf._latex
-    rf._latex = lambda text: calls.append(text) or real(text)
-    try:
-        [record], _, _ = parse("@misc{k, title={T}, keywords={" + ",".join(["\\a"] * 5000) + "}}")
-    finally:
-        rf._latex = real
+    monkeypatch.setattr(rf, "_latex", lambda text: calls.append(text) or real(text))
+    parse("@misc{k, title={T}, keywords={" + ",".join(["\\a"] * 5000) + "}}")
     assert len(calls) <= rf.KEYWORDS * 4 + 1
-
-
-@pytest.mark.parametrize("eprint", ["2101.123456", "2101.00001garbage", "2101.00001 2101.00002", "x2101.00001",
-                                    "hep-th/９９０１００１"])
-def test_an_eprint_the_whole_of_which_is_no_arxiv_id_is_left_out_and_never_looked_up(eprint):
-    [record], skipped, _ = parse(f"@misc{{k, title={{T}}, eprint={{{eprint}}}, archiveprefix={{arXiv}}}}")
-    assert "number" not in record and "URL" not in record and rf.identifier(record) is None
-    assert skipped == {"invalid_field": 1}
-
-
-def test_an_eprint_written_with_its_arxiv_prefix_is_that_id():
-    [record], skipped, _ = parse("@misc{k, title={T}, eprint={arXiv:2101.00001v3}, eprinttype={arxiv}}")
-    assert (record["number"], rf.identifier(record), skipped) == ("arXiv:2101.00001v3", ("arxiv", "2101.00001"), {})
-
-
-@pytest.mark.parametrize("number, found", [
-    ("arXiv:2101.123456", None), ("arXiv:2101.00001garbage", None), ("arXiv:2101.00001v2x", None),
-    ("xarxiv:2101.00001", None), ("evilarxiv.org/abs/2101.00001", None), ("arXiv:2101.123456 arXiv:2101.00001", None),
-    ("arXiv:2101.00001-2", None), ("arXiv:2101.00001.garbage", None), ("https://arxiv.org/abs/2101.00001", None),
-    ("arXiv:hep-th/９９０１００１", None),  # digits other than 0 to 9 are no arXiv ID's
-    ("arXiv:2101.00001 [cs.CL]", "2101.00001"), ("arXiv:2101.00001v2", "2101.00001"), ("arXiv:math.GT/0309136", "math.GT/0309136"),
-])
-def test_a_number_naming_arxiv_gives_a_whole_id_or_is_left_out(number, found):
-    [record], skipped, _ = parse(json.dumps([{"title": "T", "number": number}]))
-    assert rf.identifier(record) == (found and ("arxiv", found))
-    assert (record.get("number"), skipped) == ((number, {}) if found else (None, {"invalid_field": 1}))
-
-
-@pytest.mark.parametrize("url, found", [
-    ("https://arxiv.org/abs/2101.00001v2", "2101.00001"), ("https://arxiv.org/pdf/2101.00001.pdf", "2101.00001"),
-    ("https://arxiv.org/abs/2101.123456", None), ("https://arxiv.org/abs/2101.00001/extra", None),
-    ("https://proxy.example.org/arxiv.org/abs/2101.00001", None), ("https://arxiv.org/abs/hep-th/９９０１００１", None), ("https://example.org/?u=arxiv.org/abs/2101.00001", None),
-])
-def test_an_arxiv_id_comes_only_from_the_whole_path_of_an_arxiv_org_url(url, found):
-    [record], _, _ = parse(f"TY  - JOUR\nTI  - T\nUR  - {url}\nER  - \n")
-    assert record["URL"] == url and rf.identifier(record) == (found and ("arxiv", found))
-
-
-@pytest.mark.parametrize("title", [
-    "{Known " + "\\relax " * 600 + "} # missing",  # an undefined macro after the cap is reached
-    "{Known " + "\\relax " * 600 + "} # m11",  # a macro nested too deep after it
-    "{Known " + "\\relax " * 600 + "} # {tail}",  # past the cap, every part readable
-    "{Known " + "\\relax " * 700 + "tail}",  # one braced value past the cap
-])
-def test_a_value_past_its_cap_is_refused_never_cut_and_read(title):
-    chain = "@string{m0 = {deep}}\n" + "".join(f"@string{{m{i} = m{i - 1}}}\n" for i in range(1, 12))
-    records, skipped, _ = parse(f"{chain}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
-    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
-
-
-def test_an_eprints_version_is_written_as_arxiv_writes_it():
-    [record], _, _ = parse("@misc{k, title={T}, eprint={2101.00001V2}, archiveprefix={arXiv}}")
-    assert (record["number"], record["URL"]) == ("arXiv:2101.00001v2", "https://arxiv.org/abs/2101.00001v2")
 
 
 def test_a_field_given_twice_is_read_as_bibtex_reads_it_the_first():
@@ -243,111 +185,128 @@ def test_keywords_are_split_on_their_text_as_written_then_read():
     assert record["keyword"] == "über, a;b"
 
 
-_PADDED_ARXIV = "arXiv:2101.00001" + " " * 1200 + "garbage"
-_PADDED_URL = "https://arxiv.org/abs/2101.00001" + " " * 8100 + "garbage"
-_PADDED_DOI = "10.5555/example" + " " * 1600 + "garbage"
-
-
-@pytest.mark.parametrize("data", [
-    json.dumps([{"title": "T", "number": _PADDED_ARXIV}]),  # CSL JSON
-    "@misc{k, title={T}, number={" + _PADDED_ARXIV + "}}",  # BibTeX
-    "@misc{k, title={T}, number={arXiv:2101.00001\\garbage}}",  # BibTeX: a number read as written, not as LaTeX
-    "@misc{k, title={T}, number = \"arXiv:2101.00001{\\relax}\"}",
-    json.dumps([{"title": "T", "URL": _PADDED_URL}]),
-    f"TY  - JOUR\nTI  - T\nUR  - {_PADDED_URL}\nER  - \n",  # RIS
-    "@misc{k, title={T}, url={https://arxiv.org/abs/2101.00001" + " " * 1600 + "garbage}}",  # (longer: past its cap, refused)
-    json.dumps([{"title": "T", "DOI": _PADDED_DOI}]),
-    f"TY  - JOUR\nTI  - T\nDO  - {_PADDED_DOI}\nER  - \n",
-    f"%0 Journal Article\n%T T\n%R {_PADDED_DOI}\n",  # EndNote
-    "{Reference Type}: Journal Article\n{Title}: T\n{DOI}: " + _PADDED_DOI + "\n",  # NoteExpress
-    "@misc{k, title={T}, doi={" + _PADDED_DOI + "}}",
-    # the lines after an identifier's own: cut at their bound, never left out whole; blank lines add nothing
-    "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\n" + "g" * (rf.CONTINUATION_CHARS + 10) + "\nER  - \n",
-    "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\n" + "\n" * (rf.CONTINUATION_LINES + 10) + "garbage\nER  - \n",
-    "%0 Journal Article\n%T T\n%R 10.5555/example\n" + "  \n" * (rf.CONTINUATION_LINES + 10) + "garbage\n",
-    json.dumps([{"title": "T", "DOI": "10.5555/example."}]),  # nothing taken off but spaces and a prefix
-    # a number whose kept text would name arXiv though the file's does not (LaTeX read, a control character)
-    "@misc{k, title={T}, number={arX{}iv:2101.00001\\garbage}}",
-    "@misc{k, title={T}, number={{arXiv}:2101.00001\\garbage}}",
-    "@misc{k, title={T}, number={\\textbf{arXiv}:2101.00001 \\garbage}}",
-    json.dumps([{"title": "T", "number": "arXiv\u0000:2101.00001"}]),
-    json.dumps([{"title": "T", "number": "arXiv\u001c:2101.00001"}]),
-    "TY  - JOUR\nTI  - T\nUR  - https://arxiv.org/abs/2101.00001\ngarbage\nER  - \n",  # RIS: a URL's next line
-    json.dumps([{"title": "T", "DOI": "10.\u0661\u0662\u0663\u0664/abc"}]),  # a DOI of other than ASCII
-    json.dumps([{"title": "T", "DOI": "10.1000/\u212a"}]),  # the Kelvin sign lower-cases to k
-    "TY  - JOUR\nTI  - T\nUR  - https://arxiv.org/abs/2101.00001\nUR  -Xgarbage\nER  - \n",
-    json.dumps([{"title": "T", "number": "arXiv:2101.00001\u001f"}]),  # a control character around it
-    json.dumps([{"title": "T", "DOI": "10.5555/example\u001f"}]),
-    json.dumps([{"title": "T", "URL": "https://arxiv.org/abs/2101.00001\u001f"}]),
-])
-def test_an_identifiers_value_is_checked_whole_as_the_file_gives_it(data):
-    [record], skipped, _ = parse(data)
-    assert rf.identifier(record) is None and skipped == {"invalid_field": 1}
-    assert not {"DOI", "URL", "number"} & set(record)
-
-
-def test_a_ris_ur_line_is_one_value_and_a_tag_needs_its_space():
-    [record], skipped, _ = parse("TY  - JOUR\nTI  - T\nUR  - https://arxiv.org/abs/2101.00001;garbage\nER  - \n")
-    assert record["URL"] == "https://arxiv.org/abs/2101.00001;garbage" and rf.identifier(record) is None  # no ID's page
-    [record], skipped, _ = parse("TY  - JOUR\nTI  - T\nDO  -X10.5555/example\nER  - \n")
-    assert "DOI" not in record and rf.identifier(record) is None and record["title"] == "T DO -X10.5555/example"
-
-
-def test_exports_escapes_in_a_url_or_doi_are_read_as_their_characters():
-    [record], skipped, _ = parse(r"@misc{k, title={T}, url={http://example.com/a\_b\&c\%20d}, doi={10.1000/Ab\_c}}")
-    assert (record["URL"], record["DOI"], skipped) == ("http://example.com/a_b&c%20d", "10.1000/ab_c", {})
-
-
-@pytest.mark.parametrize("strings, use, title", [
-    ('@string{a = "x"}\n@string{a = "x"}\n', "a", "x"),  # defined again alike
-    ('@string{a = "x"}\n@string{a = "y"}\n', "a", "y"),  # a later definition replaces the earlier one
-    ('@string{a = "x"}\n@string{A = "y"}\n', "a", "y"),  # names are case-insensitive
-    ('@string{a = "x"}\n@string{a = a # "y"}\n', "a", "xy"),  # its own value reads the earlier one
-    ('@string{a = "x"}\n@string{b = a # "y"}\n@string{a = "z"}\n', "b", "xy"),  # b was read when it was defined
-])
-def test_a_macro_defined_again_applies_from_there_on(strings, use, title):
-    records, skipped, _ = parse(f"{strings}@misc{{k, title = {use}}}\n")
-    assert [r["title"] for r in records] == [title] and skipped == {}
-
-
-def test_each_entry_reads_the_macros_defined_before_it():
-    records, skipped, _ = parse("@misc{before, title = jan}\n@string{jan = {Janvier}}\n@misc{after, title = jan}\n")
-    assert [r["title"] for r in records] == ["January", "Janvier"] and skipped == {}
-
-
-@pytest.mark.parametrize("strings", [
-    "@string{b = a}\n@string{a = {x}}\n",  # an alias of a macro defined only later
-    "@string{b = {x} # nowhere}\n@string{nowhere = {y}}\n",
-    "@string{jan = nowhere}\n",  # a month name defined again as something unreadable
-])
-def test_a_macro_whose_definition_cannot_be_read_where_it_stands_refuses_what_uses_it(strings):
-    title = "jan" if "jan" in strings else "b"
-    records, skipped, _ = parse(f"{strings}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
-    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
-
-
-def test_a_month_name_an_at_string_defines_is_its_definition():
-    [record], _, _ = parse('@string{jan = {Janvier}}\n@misc{k, title = {T}, abstract = JAN # " and " # feb}\n')
-    assert record["abstract"] == "Janvier and February"
-
-
 def test_a_csl_json_name_given_whole_keeps_its_commas():
     [record], _, _ = parse(json.dumps([{"title": "T", "author": [{"literal": "Barnes and Noble, Inc."}, {"family": "Doe, Ltd"}]}]))
     assert record["author"] == [{"literal": "Barnes and Noble, Inc."}, {"literal": "Doe, Ltd"}]
 
 
-def test_a_macro_longer_than_any_field_takes_is_refused_never_cut():
-    shared = "@string{m = {\\'e " + "w" * (rf.MAX_BYTES // 2) + "}}\n"
-    entries = "".join(f"@misc{{k{i}, title={{T{i}}}, author=m, abstract=m}}\n" for i in range(5000))
-    records, skipped, _ = parse(shared + entries)
-    assert records == [] and skipped == {"unreadable": 5000}
+# Identifiers and URLs (Harold's reading, 2026-10-15): a lookup identifier only from a DOI field or an arXiv
+# eprint, its value the field's own text, whole, on one line; a URL display only, whole; else left out, counted.
+
+_PADDED_DOI = "10.5555/example" + " " * 1600 + "garbage"
+_PADDED_URL = "https://arxiv.org/abs/2101.00001" + " " * 8100 + "garbage"
 
 
-def test_one_long_macro_read_again_after_each_definition_refuses_the_file():
-    # each @string between entries makes the next entry read the macro again: together past the bound
-    shared = "@string{m = {" + "w" * (rf.ABSTRACT_CHARS * 3) + "}}\n"
-    entries = "".join(f"@string{{x{i} = {{x}}}}\n@misc{{k{i}, title={{T{i}}}, abstract=m}}\n" for i in range(400))
-    assert unreadable(shared + entries) == "reference_file_too_large"
+@pytest.mark.parametrize("data, doi", [
+    ("TY  - JOUR\nTI  - T\nDO  - 10.5555/Example \nER  - \n", "10.5555/example"),  # RIS
+    ("%0 Journal Article\n%T T\n%R 10.5555/example\n", "10.5555/example"),  # EndNote
+    ("{Reference Type}: Journal Article\n{Title}: T\n{DOI}: 10.5555/example\n", "10.5555/example"),  # NoteExpress
+    ('@misc{k, title={T}, doi = "10.5555/a_b--c"}', "10.5555/a_b--c"),  # BibTeX: inside its delimiters, as written
+    (json.dumps([{"title": "T", "DOI": "\t10.5555/example\n"}]), "10.5555/example"),  # CSL JSON
+    ("TY  - JOUR\nTI  - T\nDO  - 10.5555/same\nDO  - 10.5555/same\nER  - \n", "10.5555/same"),  # given twice alike
+])
+def test_a_doi_is_its_fields_own_text_whole(data, doi):
+    [record], skipped, _ = parse(data)
+    assert (rf.identifier(record), record["DOI"], skipped) == (("doi", doi), doi, {})
+
+
+@pytest.mark.parametrize("data", [
+    json.dumps([{"title": "T", "DOI": _PADDED_DOI}]),
+    f"TY  - JOUR\nTI  - T\nDO  - {_PADDED_DOI}\nER  - \n",
+    f"%0 Journal Article\n%T T\n%R {_PADDED_DOI}\n",
+    "{Reference Type}: Journal Article\n{Title}: T\n{DOI}: " + _PADDED_DOI + "\n",
+    "@misc{k, title={T}, doi={" + _PADDED_DOI + "}}",
+    # continued on the next line, whatever comes between (recheck 4's finding 12)
+    "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\n" + "g" * (rf.CONTINUATION_CHARS + 10) + "\nER  - \n",
+    "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\n" + " " * (rf.CONTINUATION_CHARS + 10) + "garbage\nER  - \n",
+    "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\n" + "\n" * (rf.CONTINUATION_LINES + 10) + "garbage\nER  - \n",
+    "%0 Journal Article\n%T T\n%R 10.5555/example\n" + "  \n" * (rf.CONTINUATION_LINES + 10) + "garbage\n",
+    "{Reference Type}: Journal Article\n{Title}: T\n{DOI}: 10.5555/example\ngarbage\n",
+    "@misc{k, title={T}, doi={10.5555/example\ngarbage}}",
+    # anything around it but spaces, tabs and line ends; no prefix, no escape, no other script (finding 13)
+    json.dumps([{"title": "T", "DOI": "10.5555/example."}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "doi:10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "\u000010.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "10.5555/example\u001f"}]),
+    "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\x1f\nER  - \n",
+    json.dumps([{"title": "T", "DOI": "10.١٢٣٤/abc"}]),
+    json.dumps([{"title": "T", "DOI": "10.1000/K"}]),
+    json.dumps([{"title": "T", "DOI": "10.5555/../etc"}]),
+    r"@misc{k, title={T}, doi={10.1000/ab\_c}}",
+    "@misc{k, title={T}, doi=d}\n",  # a macro is not the field's own text
+    "TY  - JOUR\nTI  - T\nDO  - 10.5555/one\nDO  - 10.5555/two\nER  - \n",  # given twice differently
+    json.dumps([{"title": "T", "DOI": 1234}]),  # not text (recheck 4's finding 16)
+])
+def test_a_doi_that_is_not_whole_its_fields_own_text_is_left_out_and_counted(data):
+    [record], skipped, _ = parse(data)
+    assert "DOI" not in record and rf.identifier(record) is None and skipped == {"invalid_field": 1}
+
+
+@pytest.mark.parametrize("eprint, arxiv", [("2101.00001", "2101.00001"), ("2101.00001v2", "2101.00001v2"),
+                                           ("math.GT/0309136", "math.GT/0309136"), (" 2101.00001\n", "2101.00001")])
+def test_an_arxiv_id_comes_from_a_bibtex_eprint_whole(eprint, arxiv):
+    [record], skipped, _ = parse(f"@misc{{k, title={{T}}, eprint={{{eprint}}}, archivePrefix={{arXiv}}}}")
+    assert (record["arxiv"], rf.identifier(record), skipped) == (arxiv, ("arxiv", arxiv.split("v")[0]), {})
+
+
+@pytest.mark.parametrize("eprint", ["2101.123456", "2101.00001garbage", "2101.00001 2101.00002", "x2101.00001",
+                                    "arXiv:2101.00001", "2101.00001V2", "hep-th/９９０１００１", "math\\_ph/0301001",
+                                    "2101.00001" + " " * 1200 + "garbage", "2101.00001\ngarbage"])
+def test_an_eprint_that_is_not_whole_an_arxiv_id_is_left_out_and_counted(eprint):
+    [record], skipped, _ = parse(f"@misc{{k, title={{T}}, eprint={{{eprint}}}, eprinttype={{arxiv}}}}")
+    assert "arxiv" not in record and rf.identifier(record) is None and skipped == {"invalid_field": 1}
+
+
+@pytest.mark.parametrize("data", [
+    json.dumps([{"title": "T", "number": "arXiv:2101.00001"}]),
+    "@misc{k, title={T}, number={arXiv:2101.00001}}",
+    "@misc{k, title={T}, number={{arXiv}:2101.00001\\garbage}}",
+    json.dumps([{"title": "T", "number": "arXiv:2101.00001" + " " * 1200 + "garbage"}]),
+    json.dumps([{"title": "T", "URL": "https://arxiv.org/abs/2101.00001"}]),
+    "TY  - JOUR\nTI  - T\nUR  - https://arxiv.org/abs/2101.00001\nER  - \n",
+    "@misc{k, title={T}, url={https://arxiv.org/abs/2101.00001}}",
+    "@misc{k, title={T}, eprint={2101.00001}}",  # an eprint of no archive named arXiv
+])
+def test_no_identifier_comes_from_a_number_a_url_or_another_eprint(data):
+    [record], skipped, _ = parse(data)
+    assert rf.identifier(record) is None and "arxiv" not in record and skipped == {}
+
+
+@pytest.mark.parametrize("url", ["https://example.org", "http://example.org/a", "https://example.org:8080/a?b=1#c",
+                                 "https://arxiv.org/abs/2101.00001v2", "https://example.org/~researcher/a_b%20c"])
+def test_a_url_that_is_whole_one_is_kept_for_display(url):
+    [record], skipped, _ = parse(json.dumps([{"title": "T", "URL": url}]))
+    assert (record["URL"], skipped) == (url, {})
+
+
+@pytest.mark.parametrize("data", [
+    json.dumps([{"title": "T", "URL": url}]) for url in [
+        "https://:80/abc", "https://@/abc", "https://arxiv.org:bad/abs/2101.00001", "https://arxiv.org:99999/abs/x",
+        "https://arxiv.org:0/x", "http://localhost/x", "https://u:p@arxiv.org/x", "ftp://example.org/a",
+        "file:///etc/hosts", "https://example.org/a b", "https://example.org/a\\b", "https://example.org/é",
+        _PADDED_URL, "https://example.org/a\u001f", 5]
+] + [
+    f"TY  - JOUR\nTI  - T\nUR  - {_PADDED_URL}\nER  - \n",
+    "TY  - JOUR\nTI  - T\nUR  - https://example.org/a\ngarbage\nER  - \n",
+    "TY  - JOUR\nTI  - T\nUR  - https://example.org/a;garbage b\nER  - \n",
+    "%0 Journal Article\n%T T\n%U https://example.org/a\ngarbage\n",
+    "@misc{k, title={T}, url={http://example.com/a\\_b}}",
+])
+def test_a_url_that_is_not_whole_one_is_left_out_and_counted(data):
+    [record], skipped, _ = parse(data)
+    assert "URL" not in record and skipped == {"invalid_field": 1}
+
+
+@pytest.mark.parametrize("text, titles", [
+    ("TY  - JOUR\nTI  - A\nER  -X\nDO  - 10.5555/a\nER  - \n", ["A ER  -X"]),  # no end without its space
+    ("TY  - JOUR\nTI  - A\nTY  -Xfoo\nER  - \n", ["A TY  -Xfoo"]),  # no start without its space
+    ("TY  - JOUR\nTI  - T\nDO  -X10.5555/example\nER  - \n", ["T DO  -X10.5555/example"]),
+])
+def test_a_ris_tag_needs_its_space_the_records_own_tags_too(text, titles):
+    records, skipped, _ = parse(text)
+    assert [" ".join(r["title"].split()) for r in records] == [" ".join(t.split()) for t in titles]
+    assert all(rf.identifier(r) in (None, ("doi", "10.5555/a")) for r in records)
 
 
 def test_csl_json_that_is_not_a_list_of_objects():
@@ -427,7 +386,7 @@ def test_bibtex_with_macros_latex_names_and_an_arxiv_eprint():
     assert article["author"] == [{"family": "Example", "given": "Ana"}, {"family": "Researcher", "given": "Bo"},
                                  {"literal": "王五"}]
     assert article["abstract"] == "An abstract with LaTeX in it." and article["DOI"] == "10.5555/scholia.bibtex.001"
-    assert preprint["number"] == f"arXiv:{synthetic.ARXIV}" and preprint["URL"] == f"https://arxiv.org/abs/{synthetic.ARXIV}"
+    assert preprint["arxiv"] == synthetic.ARXIV and "number" not in preprint and "URL" not in preprint
     assert rf.identifier(preprint) == ("arxiv", synthetic.ARXIV) and rf.identifier(article)[0] == "doi"
 
 

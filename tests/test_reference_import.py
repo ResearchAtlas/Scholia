@@ -398,8 +398,8 @@ async def test_two_imports_of_one_file_at_once_never_both_create_its_papers(tmp_
 
 
 @pytest.mark.parametrize("theirs, ours, matched", [
-    (f"DO  - {DOI}\n", f"DO  - https://doi.org/{DOI.upper()}\n", "doi"),
-    (f"DO  - {DOI}\n", f"DO  - doi:{DOI}\n", "doi"),
+    (f"DO  - {DOI}\n", f"DO  - {DOI.upper()}\n", "doi"),
+    (f"DO  - {DOI}\n", f"DO  - doi:{DOI}\n", "title"),  # a DOI field is the DOI alone: this one is left out
     ("PY  - 2020\n", "PY  - 2020\n", "title"),
     ("", "", "title"),  # neither has a year: the title alone
 ])
@@ -838,7 +838,7 @@ async def test_a_doi_change_drops_what_the_lookup_that_gave_the_doi_filled(tmp_p
         filled = (await client.get(f"/api/materials/{paper}")).json()["csl"]
         assert filled["DOI"] == "10.5555/from.arxiv" and filled["publisher"] == "arXiv"  # both the arXiv lookup's
         moved = (await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/the.right.doi"})).json()["csl"]
-        assert "publisher" not in moved and moved["volume"] == "2" and moved["number"] == "arXiv:2401.05555"
+        assert "publisher" not in moved and moved["volume"] == "2" and moved["arxiv"] == "2401.05555"
 
 
 async def test_a_doi_changed_twice_keeps_a_field_a_merge_gave_after_the_first(tmp_path, monkeypatch):
@@ -863,3 +863,54 @@ async def test_a_doi_changed_twice_keeps_a_field_a_merge_gave_after_the_first(tm
         await run_finished(client, ask["run_id"])
         second = (await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/third"})).json()["csl"]
         assert second["publisher"] == "Merged Press"  # the merged record's own
+
+
+# Finding 1's structural fix (Harold, 2026-10-15): the paper records the fields a lookup filled
+
+
+async def lookup_filled(client, paper):
+    [(filled,)] = await rows(client, "SELECT lookup_filled FROM materials WHERE id = ?", paper)
+    return json.loads(filled) if filled else None
+
+
+async def test_returning_to_an_earlier_doi_never_drops_a_field_a_merge_gave(tmp_path):
+    # review 1's finding 1: lookup of A fills volume 3; to B; a merge gives volume 9; back to A, then to C
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "First Work")})) as client:
+        project = await project_of(client)
+        result = await imported(client, project, ris(("Moved About", f"DO  - {DOI}\n")))
+        await run_finished(client, result["lookup_run_id"])
+        [paper] = result["imported"]
+        assert {"volume", "page"} <= set(await lookup_filled(client, paper))  # written with the fill
+        other = "10.5555/the.b.doi"
+        assert (await client.patch(f"/api/materials/{paper}", json={"doi": other})).json()["csl"].get("volume") is None
+        assert await lookup_filled(client, paper) is None  # dropped with them, and cleared
+        await imported(client, project, ris(("Moved About", f"DO  - {other}\nVL  - 9\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        assert await lookup_filled(client, paper) is None  # a merge never adds to it
+        assert (await client.patch(f"/api/materials/{paper}", json={"doi": DOI})).json()["csl"]["volume"] == "9"
+        moved = await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/the.c.doi"})
+        assert moved.json()["csl"]["volume"] == "9"
+
+
+async def test_a_doi_change_that_retitles_a_paper_queues_its_passages_again(tmp_path, monkeypatch):
+    from backend import search
+
+    calls, real = [], search.retitled
+    monkeypatch.setattr(search, "retitled", lambda conn, *args: calls.append(args[2]) or real(conn, *args))
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "Looked Up")})) as client:
+        project = await project_of(client)
+        result = await imported(client, project, ris(("Retitled", f"DO  - {DOI}\n")))
+        await run_finished(client, result["lookup_run_id"])
+        [paper] = result["imported"]
+        attached = await added(client, project, ("r.md", b"# Retitled\n\nSome text.\n"), material_id=paper)
+        await run_finished(client, attached["lookup_run_id"])
+        await settled(client, project)
+        calls.clear()
+        moved = await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/new.doi", "title": "Retitled Anew"})
+        assert moved.status_code == 200 and calls == [paper]
+        queued = await rows(client, "SELECT count(*) FROM index_queue WHERE target = 'passage' AND op = 'add'"
+                                    " AND project_id = ?", project)
+        runs = await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'index' AND project_id = ?", project)
+        assert queued[0][0] > 0 or runs[0][0] > 0  # queued, or already taken by the index run it requested

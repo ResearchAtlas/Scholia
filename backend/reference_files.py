@@ -13,31 +13,38 @@ gets. It never imports the database, the server or the window.
 
 Every bound holds before a value is worked on: the file's size (MAX_BYTES), its records
 (MAX_RECORDS; more refuse the whole file), each field's characters (a value is cut before it is
-cleaned, and kept at most to its field's bound; a BibTeX value longer than four times its bound, or
-whose macros expand past that, skips its record instead, as its LaTeX could read as far less), a field's continuation lines, and the authors and
-keywords of a record. A record keeps only what CSL names here (KEYS); what a record points to is
+cleaned, and kept at most to its field's bound; a BibTeX value longer than four times its bound skips
+its record instead, as its LaTeX could read as far less), a field's continuation lines, and the authors
+and keywords of a record. A record keeps only what CSL names here (KEYS); what a record points to is
 never read: file attachments (RIS L1, L2 and L4, EndNote %>, BibTeX file) are not kept, and a URL is
-kept only when it is http or https, never fetched. The values an identifier comes from (a DOI, a URL,
-a number naming arXiv, a BibTeX eprint, the last two read as written, not as LaTeX) are checked whole,
-as the file gives them, before anything is cut or cleaned. A DOI is kept only when it fits the pattern
-(extraction.clean_doi), an arXiv ID only as extraction.ARXIV reads one, and only whole: a BibTeX
-eprint that is the ID and nothing else, a number that is "arXiv:" and the ID (and its category), an
-arxiv.org URL whose whole path is the ID's page. A BibTeX field given twice is read as its first. Names are kept as the file
-gives them: "Family, Given" splits at its comma (BibTeX's by its name parts, split on the text as
-written so a braced group is one name), and any other name, a Han-script one included, is kept whole
-(literal), as is CSL JSON's literal. BibTeX's macros (aliases, # and the month names) are expanded
-as BibTeX reads them, in file order (a value sees the definitions before it, a later one replacing an
-earlier), within MACRO_DEPTH and MACRO_CHARS, or the record is skipped; its literal fields (url, doi, eprint) keep their characters, TeX's escapes of _ & % # $
-read as those characters. Nothing here logs content, and the parsers are kept from logging it.
+display only, never fetched. A BibTeX field given twice is read as its first.
+
+Identifiers (Harold's reading, 2026-10-15): a lookup identifier comes only from a DOI field (RIS DO,
+EndNote %R, NoteExpress {DOI}, BibTeX doi, CSL JSON's DOI) or a BibTeX arXiv eprint (its archivePrefix
+or eprinttype arXiv), kept as `arxiv`; never from a URL or a number. Its value is the record's own text
+for that field, before any parser's or our own change (the field's line as written, a BibTeX value
+inside its outer delimiters, a JSON string), with only spaces, tabs and line ends taken from its ends,
+on one line (a field continued on the next is refused), and it must be, whole, an ASCII DOI starting
+"10." (_DOI_WHOLE) or an arXiv ID with an optional version (_ARXIV_WHOLE). A URL is kept, as display
+only, when it is, whole, http or https, a host name with an optional port 1 to 65535, and a path
+(_URL_WHOLE). Any other value of these fields is left out and counted (invalid_field).
+
+Names are kept as the file gives them: "Family, Given" splits at its comma (BibTeX's by its name parts,
+split on the text as written so a braced group is one name), and any other name, a Han-script one
+included, is kept whole (literal), as is CSL JSON's literal.
+
+BibTeX macros (Harold's reading, 2026-10-15): a field's value is a braced or quoted literal, a number,
+or one macro name: a month, or an @string defined once in the file, before the value, as one literal.
+Anything else (# concatenation, an alias, a macro undefined, defined twice or after its use) refuses
+the record; after a block starting @string that the parser could not read, every later macro use
+refuses its record. Nothing here logs content, and the parsers are kept from logging it.
 """
 
 import io
 import json
 import logging
 import re
-from urllib.parse import urlsplit
-
-from backend.extraction import ARXIV, DOI_CHARS, Unreadable, clean_doi
+from backend.extraction import ARXIV, DOI_CHARS, Unreadable
 from backend.settings import visible
 
 MAX_BYTES = 10 * 1024 * 1024
@@ -55,27 +62,24 @@ KEYWORD_CHARS = 200
 CONTINUATION_LINES = 200  # a field's lines after its first; later ones are left out
 CONTINUATION_CHARS = 2 * ABSTRACT_CHARS  # and their characters
 RECORD_LINES = 1000  # a record's lines, a field (one an author) and its continuations; later fields are left out
-MACRO_DEPTH = 10  # a BibTeX macro's macros, and theirs, this deep at most (files use one or two)
-MACRO_CHARS = 4 * max(ABSTRACT_CHARS, AUTHORS * NAME_CHARS)  # a longer macro is refused: past what any field takes
-EXPANDED_CHARS = MAX_BYTES  # what a file's macros expand to, all of it together: no more than the file may hold
+ARXIV_CHARS = 40  # an arXiv ID with its version, at most
 BEAT_EVERY = 500  # records or lines between two beats
 PARSER = ("references", "1")  # what the child names when it is ready (backend/reading.py)
 FORMATS = ("ris", "bibtex", "csl_json", "noteexpress", "endnote")
 SKIPPED = ("no_title", "unreadable", "invalid_field")  # records, records, and a kept record's values left out
 KEYS = {"type", "title", "author", "issued", "container-title", "volume", "issue", "page", "publisher", "DOI",
-        "URL", "ISBN", "ISSN", "language", "abstract", "keyword", "number"}
+        "URL", "ISBN", "ISSN", "language", "abstract", "keyword", "number", "arxiv"}
 _SHORT = ("volume", "issue", "page", "publisher", "ISBN", "ISSN", "language", "number")
 _TYPE = re.compile(r"[a-z]{1,30}(?:-[a-z]{1,30}){0,3}")  # a CSL type name, as backend/lookup.py reads one
 _YEAR = re.compile(r"(?<!\d)(1\d{3}|2[01]\d{2}|2200)(?!\d)")  # the details form's years, 1000 to 2200
-_DOI_PREFIX = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
-# A number that names an arXiv ID is that ID and nothing else: "arXiv:" and the ID, its version, and the
-# category arXiv's own exports add ("arXiv:2101.00001v2 [cs.CL]"); extraction.ARXIV then checks the ID.
-_ARXIV_NUMBER = re.compile(r"\s*arxiv\s*:\s*(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?(?:\s*\[[a-z.-]{1,20}\])?\s*",
-                           re.IGNORECASE | re.ASCII)  # ASCII: a digit is 0 to 9, as in every arXiv ID
-_ARXIV_NAMED = re.compile(r"arxiv\s*:|arxiv\.org/", re.IGNORECASE)  # a value that says it names one
-_ARXIV_WHOLE = re.compile(rf"(?:{ARXIV.pattern})(?:v\d+)?", re.IGNORECASE | re.ASCII)  # an eprint: the ID and nothing else
-_ARXIV_PREFIX = re.compile(r"^arxiv\s*:\s*", re.IGNORECASE)
-_ARXIV_VERSION = re.compile(r"V(\d+)$")  # arXiv writes a version with a lower-case v
+# The identifiers and URLs a record keeps, each the whole value (ASCII: a digit is 0 to 9, a letter a to z).
+_DOI_WHOLE = re.compile(r"10\.[0-9]{4,9}/[-._;()/:A-Za-z0-9]*[A-Za-z0-9)]", re.ASCII)  # never ending in punctuation
+_ARXIV_WHOLE = re.compile(rf"(?:{ARXIV.pattern})(?-i:v[0-9]+)?", re.IGNORECASE | re.ASCII)
+_ARXIV_VERSION = re.compile(r"v[0-9]+$")
+_URL_WHOLE = re.compile(r"https?://((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63})"
+                        r"(?::([0-9]{1,5}))?(?:[/?#][!-\[\]-~]*)?", re.ASCII)  # no space, backslash or control
+_SPACES_AROUND = " \t\r\n"  # all an identifier's value may have around it
+_UNREADABLE = object()  # a field's value that is not one: continued, given twice differently, or not text
 _LATEX = re.compile(r"[\\{}$~]")
 _CONTROL = re.compile("[\x00-\x1f\x7f-\x9f]")  # Unicode's control characters (Cc)
 _SURROGATE = re.compile("[\ud800-\udfff]")  # half a pair, which only JSON's escapes can give: no text holds one
@@ -205,7 +209,8 @@ def _records(lines, starts, tagged, ends=lambda line: False):
         elif not line.strip():
             continue
         elif (after := after + 1) <= CONTINUATION_LINES and chars < CONTINUATION_CHARS:
-            record.append(line[:CONTINUATION_CHARS - chars])
+            piece = line[:CONTINUATION_CHARS - chars]  # never cut to nothing visible: the field went on
+            record.append(piece if piece.strip() else line.strip()[:CONTINUATION_CHARS - chars])
             chars += len(line)
     if record:
         yield record
@@ -214,16 +219,17 @@ def _records(lines, starts, tagged, ends=lambda line: False):
 def _ris(text, beat):
     import rispy
 
-    _counted(len(re.findall(r"^TY  -", text, re.MULTILINE)))
-    # A UR line is one value, checked whole (rispy would split it at ";": a URL followed by text would still
-    # read as that URL). A tag is two characters, two spaces, a hyphen and a space (or the line's end): a
-    # line otherwise like one is text, as rispy, which takes a value from the seventh character on, is shown.
-    parser = rispy.RisParser(skip_unknown_tags=True, delimiter_tags_mapping={})
+    # A tag is two characters, two spaces, a hyphen and a space (or the line's end), the record's TY and ER
+    # tags too: a line otherwise like one is text, and rispy, which takes a value from the seventh
+    # character on, is shown it as text. DO and UR are read from the record's own lines (_raw_fields).
     tag = re.compile(r"[A-Z][A-Z0-9]  -(?: |$)")
     loose = re.compile(r"[A-Z][A-Z0-9]  -")
-    for lines in _records(_lines(text, beat), lambda line: line.startswith("TY  -"), tag.match,
-                          lambda line: line.startswith("ER  -")):
-        lines = _joined([f" {line}" if loose.match(line) and not tag.match(line) else line for line in lines], tag, "UR  -")
+    _counted(len(re.findall(r"^TY  -(?: |$)", text, re.MULTILINE)))
+    parser = rispy.RisParser(skip_unknown_tags=True)
+    for lines in _records(_lines(text, beat), lambda line: line[:5] == "TY  -" and tag.match(line) is not None,
+                          tag.match, lambda line: line[:5] == "ER  -" and tag.match(line) is not None):
+        raw = _raw_fields(lines, lambda line: (line[:2], line[6:]) if tag.match(line) else None, ("DO", "UR"))
+        lines = [f" {line}" if loose.match(line) and not tag.match(line) else line for line in lines]
         try:  # one record at a time, closed here whether or not the file closed it
             entry = next(iter(parser.parse_lines(iter([*lines, "ER  - "]))), None)
         except Exception:  # a record it could not take apart: its type alone, never its text, is known here
@@ -244,26 +250,34 @@ def _ris(text, beat):
             or _first(entry.get("alternate_title1")),
             "volume": _first(entry.get("volume")), "issue": _first(entry.get("number")),
             "page": f"{start}-{end}" if start and end else start,
-            "publisher": _first(entry.get("publisher")), "DOI": _first(entry.get("doi")),
-            "URL": _list(entry.get("urls")), ("ISBN" if kind.strip().upper() in _BOOKS else "ISSN"): _first(entry.get("issn")),
+            "publisher": _first(entry.get("publisher")), "DOI": _one(raw.get("DO")), "URL": raw.get("UR", []),
+            ("ISBN" if kind.strip().upper() in _BOOKS else "ISSN"): _first(entry.get("issn")),
             "language": _first(entry.get("language")),
             "abstract": _first(entry.get("abstract")) or _first(entry.get("notes_abstract")),
             "keyword": _list(entry.get("keywords")),
         }
 
 
-def _joined(lines, tag, field):
-    """A record's lines with each continuation of a field (rispy makes a list tag's continuation an item of
-    its own: a URL followed by text would still read as that URL) joined to that field's line."""
-    out, joining = [], False
+def _raw_fields(lines, field_of, wanted):
+    """{tag: [value as its line writes it]} for the wanted tags among a record's lines; a field that goes
+    on to a next line is _UNREADABLE (an identifier or a URL is on one line). field_of(line): (tag,
+    value) for a line that starts a field, else None."""
+    found, current = {}, None
     for line in lines:
-        if tag.match(line):
-            joining = line.startswith(field)
-        elif joining:
-            out[-1] = f"{out[-1]} {line.strip()}"
-            continue
-        out.append(line)
-    return out
+        if (started := field_of(line)) is not None:
+            current = started[0] if started[0] in wanted else None
+            if current is not None:
+                found.setdefault(current, []).append(started[1])
+        elif current is not None and line.strip():
+            found[current][-1] = _UNREADABLE
+    return found
+
+
+def _one(values):
+    """A field's one value: None when it is not given, _UNREADABLE when it is given twice differently."""
+    if not values:
+        return None
+    return values[0] if all(value is values[0] or value == values[0] for value in values) else _UNREADABLE
 
 
 def _bibtex(text, beat):
@@ -286,76 +300,68 @@ def _bibtex(text, beat):
     except Exception:
         raise Unreadable("unreadable_file") from None
     beat()
-    # BibTeX reads a file in order: an entry, and an @string's own value, see the macros defined before it
-    # (the month names from the start), a later @string of the same name (in any case) replacing it from
-    # there on. env: name -> (text, depth), or None for a definition that cannot be read as written.
-    env, values, people, spent = {}, {}, {}, [0]
+    # Macros (the module's note): each @string is counted over the whole file, then read in its place.
+    defined = {}
+    for block in library.blocks:
+        found = getattr(block, "ignore_error_block", None) if isinstance(block, ParsingFailedBlock) else block
+        if isinstance(found, String):
+            defined[found.key.lower()] = defined.get(found.key.lower(), 0) + 1
+    env, decoded, people, poisoned = {}, {}, {}, False
     _counted(sum(isinstance(block, Entry) or isinstance(getattr(block, "ignore_error_block", None), Entry)
                  for block in library.blocks))
 
-    def spend(chars):
-        """What expanding macros makes, all of it together, holds EXPANDED_CHARS at most: macros
-        concatenated, or one long macro read again by many entries, could otherwise make far more than
-        the file."""
-        spent[0] += chars
-        if spent[0] > EXPANDED_CHARS:
-            raise Unreadable("reference_file_too_large")
-
-    def expand(parts, cap):
-        """(A value's parts joined by #, each macro by its definition at this point of the file, its
-        depth). _Refused when a macro is not defined here or its definition could not be read, when they
-        nest more than MACRO_DEPTH deep, or when the whole is longer than cap: every part is checked,
-        whatever the length so far, and a value past its cap is never cut short and read."""
-        texts, length, depth = [], 0, 0
-        for literal, part in parts:
-            if not literal:
-                name = part.lower()
-                found = env[name] if name in env else (_MONTHS[name], 0) if name in _MONTHS else None
-                if found is None:
-                    raise _Refused
-                part, depth = found[0], max(depth, found[1] + 1)
-            length += len(part)
-            if length <= cap:
-                texts.append(part)
-        if length > cap or depth > MACRO_DEPTH:
+    def macro(name):
+        """A macro's text where it is used: a month, or an @string defined once, before here, as one literal.
+        _Refused otherwise, and for every macro after an @string block the parser could not read."""
+        if poisoned:
             raise _Refused
-        return (texts[0] if len(texts) == 1 else "".join(texts)), depth
-
-    def define(block):
-        """An @string, read now, against the macros defined before it."""
-        name = block.key.lower()
-        try:
-            if not isinstance(block.value, str):
+        if name in defined:
+            if defined[name] != 1 or env.get(name) is None:  # defined twice, after its use, or not as one literal
                 raise _Refused
-            parts = _parts(block.value.strip())
-            text, depth = expand(parts, MACRO_CHARS)
-            if len(parts) > 1:
-                spend(len(text))
-            env[name] = (text, depth)
-        except _Refused:
-            env[name] = None
-        values.clear()  # a value read before may mean something else from here on
+            return env[name]
+        if name in _MONTHS:
+            return _MONTHS[name]
+        raise _Refused
 
     def value(fields, *names, limit=TITLE_CHARS, literal=False):
-        """The first of the fields named, as the file means it here: its macros and # expanded, its LaTeX
-        read unless it is a literal field (a URL, DOI or eprint keeps the characters it has). _Refused
-        when it cannot be read as written, or is longer than four times its field's bound (never cut
-        before it is read: the bound itself is applied to the text read)."""
+        """The first of the fields named, as the file means it: one literal or one macro, its LaTeX read
+        unless literal (an author list is split before its names are read). _Refused when it is anything
+        else, or longer than four times its field's bound (never cut before it is read: the bound itself
+        is applied to the text read)."""
         for name in names:
             if name in fields and isinstance(fields[name].value, str) and (raw := fields[name].value.strip()):
-                parts, cap = _parts(raw), limit * 4
-                if len(parts) == 1 and parts[0][0]:  # braced, quoted or a number: the file's own text
-                    text, _ = expand(parts, cap)
-                    text = text if literal else _latex(text)
-                else:
-                    if (raw, cap, literal) not in values:  # a macro every entry uses is expanded and read once
-                        text, _ = expand(parts, cap)
-                        spend(len(text))
-                        values[raw, cap, literal] = text if literal else _latex(text)
-                    text = values[raw, cap, literal]
+                parts = _parts(raw)
+                if len(parts) != 1:  # # concatenation
+                    raise _Refused
+                is_literal, text = parts[0]
+                if not is_literal:
+                    text = macro(text.lower())
+                if len(text) > limit * 4:
+                    raise _Refused
+                if not literal:  # a macro every entry uses is read once
+                    key = None if is_literal else (parts[0][1].lower(), limit)
+                    if key is None or key not in decoded:
+                        read = _latex(text)
+                        if key is None:
+                            text = read
+                        else:
+                            decoded[key] = read
+                    text = decoded[key] if key is not None else text
                 if text.strip():  # an empty one ({}) gives way to the next field named
                     return text
         return None
+
+    def written(fields, name):
+        """An identifier's or a URL's field as the file writes it: the text inside its outer delimiters,
+        _UNREADABLE when it is not one braced or quoted literal, None when it is not given."""
+        if name not in fields:
+            return None
+        raw = fields[name].value
+        try:
+            parts = _parts(raw.strip()) if isinstance(raw, str) else None
+        except _Refused:
+            parts = None
+        return parts[0][1] if parts and len(parts) == 1 and parts[0][0] and not parts[0][1].isdigit() else _UNREADABLE
 
     def names(text):
         """A field's people, split on its text as written: a braced group is one name (an organization,
@@ -377,10 +383,12 @@ def _bibtex(text, beat):
 
     for block in library.blocks:
         found = getattr(block, "ignore_error_block", None) if isinstance(block, ParsingFailedBlock) else block
-        if isinstance(found, String):  # a macro defined again is read as BibTeX reads it, in its place
-            define(found)
+        if isinstance(found, String):
+            env[found.key.lower()] = _one_literal(found.value)
             continue
         if isinstance(block, ParsingFailedBlock) and not isinstance(found, Entry):
+            if _STRING_BLOCK.match(getattr(block, "raw", None) or ""):  # which macro it defined is not known
+                poisoned = True
             yield None  # a block the parser could not read
             continue
         if not isinstance(found, Entry):  # a comment or a preamble
@@ -392,11 +400,8 @@ def _bibtex(text, beat):
             fields.setdefault(field.key.lower(), field)
         kind = entry.entry_type.lower()
         try:
-            eprint = _ARXIV_VERSION.sub(r"v\1", _ARXIV_PREFIX.sub("", (_escapes(value(fields, "eprint", literal=True)) or "").strip(_SPACES_AROUND)))
-            arxiv = eprint if eprint and (value(fields, "archiveprefix", "eprinttype") or "").lower() == "arxiv" else None
-            valid = bool(arxiv) and _ARXIV_WHOLE.fullmatch(arxiv) is not None
-            written = _escapes(value(fields, "number", literal=True))  # an identifier's field: as written
-            number = written if written and _ARXIV_NAMED.search(written) else value(fields, "number")
+            archive = (value(fields, "archiveprefix", "eprinttype") or "").strip().lower()
+            number = value(fields, "number")
             record = {
                 "type": _BIBTEX_TYPES.get(kind, "article"),
                 "title": value(fields, "title"),
@@ -407,17 +412,14 @@ def _bibtex(text, beat):
                 "issue": value(fields, "issue") or (number if kind == "article" else None),
                 "page": (value(fields, "pages") or "").replace("--", "-") or None,
                 "publisher": value(fields, "publisher", "institution", "school", "organization"),
-                "DOI": _escapes(value(fields, "doi", literal=True)),
-                "URL": [_escapes(value(fields, "url", literal=True))] + ([f"https://arxiv.org/abs/{arxiv}"] if valid else []),
+                "DOI": written(fields, "doi"), "URL": [written(fields, "url")],
+                "arxiv": written(fields, "eprint") if archive == "arxiv" else None,
                 "ISBN": value(fields, "isbn"), "ISSN": value(fields, "issn"),
                 "language": value(fields, "language", "langid"),
                 "abstract": value(fields, "abstract", limit=ABSTRACT_CHARS),
                 "keyword": [_latex(k) for k in _split_top(value(fields, "keywords", limit=KEYWORDS * KEYWORD_CHARS,
                                                                 literal=True) or "")[:KEYWORDS * 4]],  # as _finish keeps
-                # an arXiv eprint the whole of which is no arXiv ID is left out, and counted
-                "number": f"arXiv:{arxiv}" if valid else (number if kind != "article" else None),
-                "number_written": None if valid or kind == "article" else written,  # what _finish checks
-                "dropped": 1 if arxiv and not valid else 0,
+                "number": number if kind != "article" else None,
             }
         except _Refused:  # a value it cannot read as written: the record is skipped, never read wrong
             record = None
@@ -425,8 +427,19 @@ def _bibtex(text, beat):
 
 
 class _Refused(Exception):
-    """A BibTeX value that cannot be read as written: malformed, longer than its cap, or a macro not
-    defined before it (or whose own definition could not be read), or nested past MACRO_DEPTH."""
+    """A BibTeX value that is not one the module's note supports, or longer than its cap."""
+
+
+_STRING_BLOCK = re.compile(r"@\s*string\b", re.IGNORECASE)
+
+
+def _one_literal(value):
+    """An @string's text when its value is one braced or quoted literal or a number, else None."""
+    try:
+        parts = _parts(value.strip()) if isinstance(value, str) else None
+    except _Refused:
+        return None
+    return parts[0][1] if parts and len(parts) == 1 and parts[0][0] else None
 
 
 _DELIMITERS = re.compile(r'[{}"]')
@@ -494,13 +507,6 @@ def _split_top(value):
 _KEYWORD_MARKS = re.compile(r"[{},;]")
 
 
-def _escapes(value):
-    """A literal field's text with TeX's escapes of _ & % # $ read as those characters, as exports write
-    them in a URL or DOI (where a backslash cannot stand); anything else is kept as written."""
-    return _ESCAPED.sub(r"\1", value) if value and "\\" in value else value
-
-
-_ESCAPED = re.compile(r"\\([_&%#$])")
 _WORD = re.compile(r"[^\s#{}\"]*")
 _SPACES = re.compile(r"\s*")
 _MONTHS = {name[:3].lower(): name for name in ("January", "February", "March", "April", "May", "June", "July",
@@ -554,9 +560,10 @@ def _csl_json(text, beat):
         }
 
 
-def _tagged(text, start, line, beat):
+def _tagged(text, start, line, beat, written=()):
     """The records of a tagged format whose record starts with the tag start, one at a time, each a
-    list of (tag, value) as the pattern line reads them; a line no tag starts continues the one before."""
+    list of (tag, value) as the pattern line reads them; a line no tag starts continues the one before
+    (a written tag's value, an identifier's or a URL's, is its line's text, _UNREADABLE when continued)."""
     pattern = re.compile(line, re.MULTILINE)
     _counted(sum(1 for found in pattern.finditer(text) if found.group(1) == start))
     for lines in _records(_lines(text, beat), lambda row: (found := pattern.match(row)) is not None
@@ -567,33 +574,40 @@ def _tagged(text, start, line, beat):
                 fields.append((found.group(1), [found.group(2)]))
             elif row.strip():
                 fields[-1][1].append(row.strip())
-        yield [(tag, " ".join(parts)) for tag, parts in fields]
+        # identifiers and URLs: the field's line as written, and one line only (_raw_fields)
+        yield [(tag, (parts[0] if len(parts) == 1 else _UNREADABLE) if tag in written else " ".join(parts))
+               for tag, parts in fields]
 
 
 def _endnote(text, beat):
-    for fields in _tagged(text, "0", r"^%(\S) ?(.*)$", beat):
-        one = {}
+    for fields in _tagged(text, "0", r"^%(\S) ?(.*)$", beat, written=("R", "U")):
+        one, dois = {}, []
         for tag, value in fields:
             if tag in ("A", "K", "U"):
                 one.setdefault(tag, []).append(value)
+            elif tag == "R":
+                dois.append(value)
             else:
                 one.setdefault(tag, value)
         kind = (one.get("0") or "").strip().lower()
         yield {
             "type": _NAMED_TYPES.get(kind, "article"), "title": one.get("T"), "author": one.get("A", []),
             "issued": one.get("D"), "container-title": one.get("J") or one.get("B"), "volume": one.get("V"),
-            "issue": one.get("N"), "page": one.get("P"), "publisher": one.get("I"), "DOI": one.get("R"),
+            "issue": one.get("N"), "page": one.get("P"), "publisher": one.get("I"), "DOI": _one(dois),
             "URL": one.get("U", []), ("ISBN" if _NAMED_TYPES.get(kind) in ("book", "chapter") else "ISSN"): one.get("@"),
             "language": one.get("G"), "abstract": one.get("X"), "keyword": one.get("K", []),
         }
 
 
 def _noteexpress(text, beat):
-    for fields in _tagged(text, "Reference Type", r"^\{([^{}\n]{1,40})\}[ \t]*:[ \t]?(.*)$", beat):
-        one = {}
+    for fields in _tagged(text, "Reference Type", r"^\{([^{}\n]{1,40})\}[ \t]*:[ \t]?(.*)$", beat,
+                          written=("DOI", "URL")):
+        one, given = {}, {"DOI": [], "URL": []}
         for tag, value in fields:
             if tag == "Author":  # one a line, or several on one line, separated as CNKI's exports do
                 one.setdefault(tag, []).extend(re.split(r"[;；]", value))
+            elif tag in given:
+                given[tag].append(value)
             else:
                 one.setdefault(tag, value)
         kind = (one.get("Reference Type") or "").strip().lower()
@@ -602,7 +616,7 @@ def _noteexpress(text, beat):
             "issued": one.get("Year") or one.get("Date"),
             "container-title": one.get("Journal") or one.get("Secondary Title") or one.get("Tertiary Title"),
             "volume": one.get("Volume"), "issue": one.get("Issue"), "page": one.get("Pages"),
-            "publisher": one.get("Publisher"), "DOI": one.get("DOI"), "URL": [one.get("URL")],
+            "publisher": one.get("Publisher"), "DOI": _one(given["DOI"]), "URL": given["URL"],
             ("ISBN" if _NAMED_TYPES.get(kind) in ("book", "chapter") else "ISSN"): one.get("ISBN/ISSN"),
             "language": one.get("Language"), "abstract": one.get("Abstract"),
             "keyword": re.split(r"[;；,，]", one.get("Keywords") or ""),
@@ -652,39 +666,48 @@ def _name(value):
 
 
 def _url(values):
-    """The first http or https URL among values, or None, and how many of the values given were not
-    one: a local path or a file: URL never is, nor a longer one (left out, never cut short), nor one
-    with a backslash (LaTeX's escapes are no part of a URL)."""
+    """The first URL among values that is, whole, one _URL_WHOLE takes (display only, never fetched), or
+    None, and how many of the values given were not one."""
     found, wrong = None, 0
     for value in values if isinstance(values, list) else [values]:
-        if not isinstance(value, str) or visible(value) is None:
+        url = _whole(value)
+        if url is None:
             continue
-        url = value.strip(_SPACES_AROUND)  # checked whole, as the file gives it: never cut or cleaned first
-        try:
-            parts = urlsplit(url) if len(url) <= URL_CHARS and not _NOT_IN_URL.search(url) else None
-        except ValueError:
-            parts = None
-        if parts and parts.scheme.lower() in ("http", "https") and parts.netloc:
+        match = _URL_WHOLE.fullmatch(url) if url is not _UNREADABLE and len(url) <= URL_CHARS else None
+        if match and len(match.group(1)) <= 253 and (match.group(2) is None or 1 <= int(match.group(2)) <= 65535):
             found = found or url
         else:
             wrong += 1
     return found, wrong
 
 
-_SPACES_AROUND = " \t\r\n"  # all an identifier's value may have around it: str.strip() would take control characters too
-_NOT_IN_URL = re.compile("[\\s\\\\\x00-\x1f\x7f-\x9f\ud800-\udfff]")  # spaces, backslashes, controls, half pairs
-
-
 def _doi(value):
-    """(The DOI a value is, whole, or None; 1 when a value was given and is not one, else 0.) Only its
-    surrounding spaces and a doi.org or doi: prefix are taken off, and only its case is changed: a DOI
-    the pattern takes followed by anything else, spaces included, is no DOI, nor one of other than ASCII
-    characters (a digit of another script, a letter that lower-cases to an ASCII one)."""
-    if not isinstance(value, str) or visible(value) is None:
+    """(The DOI a value is, whole, in lower case, or None; 1 when a value was given and is not one.)"""
+    doi = _whole(value)
+    if doi is None:
         return None, 0
-    text = _DOI_PREFIX.sub("", value.strip(_SPACES_AROUND))
-    doi = clean_doi(text) if len(text) <= DOI_CHARS else None
-    return (doi, 0) if doi and text.isascii() and doi == text.lower() else (None, 1)
+    if doi is _UNREADABLE or len(doi) > DOI_CHARS or not _DOI_WHOLE.fullmatch(doi) or {".", ".."} & set(doi.split("/")):
+        return None, 1  # a dot segment: a URL holding it would name another path once resolved
+    return doi.lower(), 0
+
+
+def _arxiv(value):
+    """(The arXiv ID a value is, whole, with its version, or None; 1 when a value was given and is not one.)"""
+    found = _whole(value)
+    if found is None:
+        return None, 0
+    return (found, 0) if found is not _UNREADABLE and len(found) <= ARXIV_CHARS and _ARXIV_WHOLE.fullmatch(found) \
+        else (None, 1)
+
+
+def _whole(value):
+    """An identifier's or a URL's value as the file gives it, only spaces, tabs and line ends taken from
+    its ends: None when none is given, _UNREADABLE when it is not text (a number in JSON, say)."""
+    if value is None or value is _UNREADABLE:
+        return value
+    if not isinstance(value, str):
+        return _UNREADABLE
+    return value.strip(_SPACES_AROUND) or None
 
 
 def _finish(record):
@@ -693,7 +716,7 @@ def _finish(record):
     title = _text(record.get("title"), TITLE_CHARS)
     if title is None:
         return None, 0
-    dropped = record.get("dropped", 0)  # what a reader left out itself (BibTeX: an eprint no arXiv ID)
+    dropped = 0
     csl = {"type": record["type"] if isinstance(record.get("type"), str) and _TYPE.fullmatch(record["type"])
            else "article", "title": title}
     authors = [name for name in map(_name, (record.get("author") or [])[:AUTHORS * 4]) if name][:AUTHORS]
@@ -708,25 +731,16 @@ def _finish(record):
     for key in _SHORT:
         if key != "number" and (text := _text(record.get(key), FIELD_CHARS)):
             csl[key] = text
-    # The values an identifier comes from (a number naming arXiv, a DOI, a URL) are checked whole, as the
-    # file gives them, before anything is cut or cleaned; one that is not what its field takes is left out.
-    # A number names arXiv when the file's text does or the text kept would (after LaTeX is read, control
-    # characters made spaces); then the file's own text, whole, must be "arXiv:" and an ID, or it is left out.
-    number, text = record.get("number"), _text(record.get("number"), FIELD_CHARS)
-    written = record.get("number_written") if isinstance(record.get("number_written"), str) else number
-    if isinstance(written, str) and _ARXIV_NAMED.search(written) or text and _ARXIV_NAMED.search(text):
-        whole = written.strip(_SPACES_AROUND) if isinstance(written, str) else ""
-        found = _ARXIV_NUMBER.fullmatch(whole) if len(whole) <= 100 and not _CONTROL.search(whole) else None
-        if found and ARXIV.fullmatch(found.group(1)):
-            csl["number"] = " ".join(whole.split())
-        else:
-            dropped += 1  # it names an arXiv ID the pattern does not take: not kept as one
-    elif text:
+    if text := _text(record.get("number"), FIELD_CHARS):  # display only, never an identifier
         csl["number"] = text
     doi, wrong = _doi(record.get("DOI"))
     dropped += wrong
     if doi:
         csl["DOI"] = doi
+    arxiv, wrong = _arxiv(record.get("arxiv"))
+    dropped += wrong
+    if arxiv:
+        csl["arxiv"] = arxiv
     url, wrong = _url(record.get("URL"))
     dropped += wrong
     if url:
@@ -741,21 +755,13 @@ def _finish(record):
 
 def identifier(csl):
     """The identifier a record gives (slice-1 spec section 3, F3a: from a reference file, validated
-    by its pattern): ("doi", DOI), else ("arxiv", ID) from its number or its arxiv.org URL, or None."""
-    if isinstance(csl.get("DOI"), str) and (doi := clean_doi(csl["DOI"])):
+    by its pattern): ("doi", DOI) from its DOI field, else ("arxiv", ID without its version) from its arXiv
+    eprint, each whole (the module's note), or None. Never from a URL or a number."""
+    if (doi := _doi(csl.get("DOI"))[0]) is not None:
         return "doi", doi
-    found = _ARXIV_NUMBER.fullmatch(csl["number"]) if isinstance(csl.get("number"), str) else None
-    if found is None and isinstance(csl.get("URL"), str):  # an arxiv.org URL whose whole path is an ID's page
-        try:
-            url = urlsplit(csl["URL"])
-            found = _ARXIV_PATH.fullmatch(url.path) if (url.hostname or "") in _ARXIV_HOSTS else None
-        except ValueError:
-            found = None
-    return ("arxiv", found.group(1)) if found and ARXIV.fullmatch(found.group(1)) else None
-
-
-_ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org", "export.arxiv.org"}
-_ARXIV_PATH = re.compile(r"/(?:abs|pdf)/(\d{4}\.\d{4,5}|[a-z-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?(?:\.pdf)?/?", re.IGNORECASE | re.ASCII)
+    if (arxiv := _arxiv(csl.get("arxiv"))[0]) is not None:
+        return "arxiv", _ARXIV_VERSION.sub("", arxiv)
+    return None
 
 
 def valid(csl):
@@ -782,7 +788,9 @@ def valid(csl):
     bounds = {"title": TITLE_CHARS, "container-title": TITLE_CHARS, "URL": URL_CHARS, "abstract": ABSTRACT_CHARS,
               "keyword": KEYWORDS * (KEYWORD_CHARS + 2), **dict.fromkeys(_SHORT, FIELD_CHARS)}
     return (text(csl.get("title"), TITLE_CHARS) and all(text(csl[key], bound) for key, bound in bounds.items() if key in csl)
-            and ("DOI" not in csl or type(csl["DOI"]) is str and clean_doi(csl["DOI"]) == csl["DOI"])
+            and ("DOI" not in csl or type(csl["DOI"]) is str and _doi(csl["DOI"])[0] == csl["DOI"])
+            and ("arxiv" not in csl or type(csl["arxiv"]) is str and _arxiv(csl["arxiv"])[0] == csl["arxiv"])
+            and ("URL" not in csl or type(csl["URL"]) is str and _url(csl["URL"])[0] == csl["URL"])
             and ("author" not in csl or type(csl["author"]) is list and 0 < len(csl["author"]) <= AUTHORS
                  and all(map(name, csl["author"])))
             and ("issued" not in csl or year(csl["issued"])))
