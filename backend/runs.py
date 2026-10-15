@@ -228,11 +228,12 @@ class _Cancelled(Exception):
 
 class RunOutcome(Exception):
     """Ends local work otherwise than succeeded: status failed (reason, a stable code), cancelled
-    (cancel_reason limit, or researcher for an answer that declined it) or interrupted."""
+    (cancel_reason limit, or researcher for an answer that declined it) or interrupted. details, if
+    given, joins the reason in the run's result (what the work did before it ended)."""
 
-    def __init__(self, status, reason=None, cancel_reason=None):
+    def __init__(self, status, reason=None, cancel_reason=None, details=None):
         super().__init__(reason or status)
-        self.status, self.reason, self.cancel_reason = status, reason, cancel_reason
+        self.status, self.reason, self.cancel_reason, self.details = status, reason, cancel_reason, details
 
 
 def _running(conn, run_id) -> bool:
@@ -1113,8 +1114,8 @@ class Harness:
             summary, effect = await self.workflows[workflow](self, active, project_id, inputs)
             outcome = ("succeeded", None)
         except RunOutcome as ended:
-            summary, effect, outcome = {"reason": ended.reason} if ended.reason else None, None, \
-                (ended.status, ended.cancel_reason)
+            summary = {**({"reason": ended.reason} if ended.reason else {}), **(ended.details or {})} or None
+            effect, outcome = None, (ended.status, ended.cancel_reason)
         except Exception as error:  # a defect: the run ends failed rather than starting again at each launch
             log.error("local background work failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
             summary, effect, outcome = {"reason": "internal"}, None, ("failed", None)

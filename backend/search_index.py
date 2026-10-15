@@ -12,7 +12,8 @@ thread makes every change, in order; searches read on connections of their own.
 - `vec_memory`: memory embeddings, partitioned by scope, written from S1-21.
 - `index_rows`: the rowid the two share for one project's passage, its material and kind, a digest
   of its index text and whether it is embedded (1), not yet (0), or refused by the helper (-1: not
-  asked for again until its text changes or the vectors are dropped, which set it back to 0); no text.
+  asked for again while its text and the model are unchanged; a changed text or dropped vectors set it
+  back to 0, and a project's rebuild keeps it on an unchanged text); no text.
 - `index_meta`: the model, its revision, quantization, runtime and dimensions, the tokenizer and its
   version, the file's schema version, the main database file it was built from, the last index_queue
   sequence applied, and whether a whole rebuild is under way.
@@ -759,10 +760,11 @@ class SearchIndex:
 
     def rebuild_project(self, project_id, run_id, stop=None):
         """Replace the project's rows from the main database (keyword rows; its vectors go, to be
-        embedded again), in one transaction, so search keeps its keyword rows throughout. Done once
-        per run: a run started again after a restart goes on to its embeddings. stop(), if given, is
-        asked every STOP_EVERY rows: a true answer rolls the rebuild back, leaving the rows as they were (or
-        withdraws it while it waits its turn)."""
+        embedded again, but a refusal stays with a passage whose index text is unchanged, as it does
+        everywhere while the model is the same), in one transaction, so search keeps its keyword rows
+        throughout. Done once per run: a run started again after a restart goes on to its embeddings.
+        stop(), if given, is asked every STOP_EVERY rows: a true answer rolls the rebuild back, leaving
+        the rows as they were (or withdraws it while it waits its turn)."""
         return self._write(self._rebuild_project, project_id, run_id, stop, withdraw=stop)
 
     def _rebuild_project(self, project_id, run_id, stop=None):
@@ -777,13 +779,17 @@ class SearchIndex:
             check(0)
             found = self.db.read(lambda conn: readings(conn, project_id))
             with self._conn:
-                old = self._conn.execute("SELECT passage_id FROM index_rows WHERE project_id = ?", (project_id,)).fetchall()
-                for count, (pid,) in enumerate(old, start=1):
+                old = self._conn.execute("SELECT passage_id, digest, embedded FROM index_rows WHERE project_id = ?",
+                                         (project_id,)).fetchall()
+                refused = {(pid, mark) for pid, mark, embedded in old if embedded == -1}
+                for count, (pid, _, _) in enumerate(old, start=1):
                     self._remove(project_id, pid)
                     check(count)
                 for count, (pid, reading) in enumerate(found.items(), start=len(old) + 1):
                     self._add(project_id, pid, reading)
                     check(count)
+                self._conn.executemany("UPDATE index_rows SET embedded = -1 WHERE project_id = ? AND passage_id = ?"
+                                       " AND digest = ?", [(project_id, pid, mark) for pid, mark in refused])
                 self._conn.execute("DELETE FROM index_meta WHERE key LIKE 'rebuilt:%'")
                 self._meta(**{f"rebuilt:{run_id}": 1})
         except _Stopped:

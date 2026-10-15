@@ -833,7 +833,7 @@ async def test_a_refusal_is_kept_when_a_later_passage_of_its_batch_fails_and_ret
         await added(client, project, WAGES)
         status = await idle(client, project)
         [run] = await runs_of(client, "index", project)
-        assert (run["status"], run["result"]["reason"]) == ("failed", "request_failed")
+        assert (run["status"], run["result"]) == ("failed", {"reason": "request_failed", "refused": {"input_refused": 1}})
         assert status["passages"]["refused"] == 1 and len(client.remote.refused) == 1  # kept, though the batch failed
         client.remote.fail_on = None
         again = await client.post(f"/api/runs/{run['run_id']}/retry")
@@ -841,6 +841,39 @@ async def test_a_refusal_is_kept_when_a_later_passage_of_its_batch_fails_and_ret
         status = await idle(client, project)
         assert len(client.remote.refused) == 1  # not sent again
         assert status["passages"] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
+
+
+async def test_a_rebuild_and_its_retry_keep_a_refusal_while_its_text_is_unchanged(tmp_path):
+    async with app(tmp_path, batch=10) as client:
+        client.remote.refuse, client.remote.fail_on = "Minimum wages", "Employment effects"
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)  # refused, then failed: the refusal kept (above)
+        response = await client.post(f"/api/projects/{project}/index/rebuild")
+        rebuilt = await run_finished(client, response.json()["run_id"])
+        assert (rebuilt["status"], rebuilt["result"]["reason"]) == ("failed", "request_failed")
+        assert len(client.remote.refused) == 1  # the rebuild kept the refusal: the text was not sent again
+        assert (await idle(client, project))["passages"]["refused"] == 1
+        client.remote.fail_on = None
+        again = await client.post(f"/api/runs/{rebuilt['run_id']}/retry")
+        ended = await run_finished(client, again.json()["run_id"])
+        assert (ended["status"], ended["result"]["rebuilt"]) == ("succeeded", True)  # a rebuild again
+        assert len(client.remote.refused) == 1
+        assert (await idle(client, project))["passages"] == {"indexed": 4, "embedded": 3, "embeddable": 4, "refused": 1}
+
+
+async def test_a_cancelled_run_keeps_the_refusals_it_met_in_its_result(tmp_path):
+    async with app(tmp_path, batch=10) as client:
+        client.remote.refuse = "Minimum wages"
+        client.remote.hold, client.remote.free = asyncio.Event(), 2  # the passage after the refused one waits
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = [r for r in await runs_of(client, "index", project) if r["status"] == "running"]
+        await client.post(f"/api/runs/{run['run_id']}/cancel")
+        client.remote.hold.set()
+        ended = await run_finished(client, run["run_id"])
+        assert (ended["status"], ended["result"]) == ("cancelled", {"refused": {"input_refused": 1}})
 
 
 @pytest.mark.parametrize("status", [503, 500, 429])
