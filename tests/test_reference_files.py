@@ -97,9 +97,11 @@ def test_month_names_are_read_in_a_file_that_names_no_at_string():
     "@string{jss = {Journal of Synthetic Studies}}\n",  # a definition
     "@STRING (x = {X})\n", "@ string{x = {X}}\n", "@comment{ @string{x={X}} }\n",  # any case, spacing or place
     "@stringify{j={Invented Journal}}\n",  # recheck 5's finding 19: a lookalike, still the text "@string"
+    "@misc{other, title = {O}, note = {about @string{x}}}\n",  # only inside a value
 ])
 def test_a_file_that_names_an_at_string_anywhere_reads_no_month_name(text):
-    [record], skipped = parsed(text + "@article{k, title = {T}, abstract = mar}\n")
+    records, skipped = parsed(text + "@article{k, title = {T}, abstract = mar}\n")
+    [record] = [r for r in records if r["title"] == "T"]
     assert "abstract" not in record and skipped == {"unsupported_macro": 1}
 
 
@@ -113,6 +115,8 @@ def test_a_file_that_names_an_at_string_anywhere_reads_no_month_name(text):
     ("journal = undefined, journaltitle = {Next}", {"container-title": "Next"}, 1),  # the next field named is read
     ("doi = d", {}, 1),  # an identifier's field given by a macro: left out as a macro
     ("journal = a, publisher = b # c, note = d", {}, 3),  # each counted
+    ("journal = Nature Reviews", {}, 1),  # words side by side (internal review, batch 5): no literal, no refusal
+    ("journal = {A} jss", {}, 1), ("pages = 12 -- 15", {}, 1), ("doi = 10.5555/x y", {}, 1),
 ])
 def test_a_bare_name_or_a_joined_value_is_left_out_and_counted_the_record_kept(fields, kept, count):
     [record], skipped = parsed("@string{jss = {Journal of Synthetic Studies}}\n"
@@ -134,6 +138,11 @@ def test_no_macro_ever_gives_a_value(text):
     records, skipped = parsed(text)
     [record] = [r for r in records if r["title"] == "T"]
     assert "container-title" not in record and skipped.get("unsupported_macro") == 1
+
+
+def test_an_at_string_after_the_last_entry_still_turns_month_names_off():
+    [record], skipped = parsed("@article{k, title = {T}, abstract = mar}\n@string{x = {X}}\n")
+    assert "abstract" not in record and skipped == {"unsupported_macro": 1}
 
 
 def test_a_title_given_by_a_macro_leaves_the_record_without_a_title():

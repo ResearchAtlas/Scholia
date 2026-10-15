@@ -35,9 +35,10 @@ included, is kept whole (literal), as is CSL JSON's literal.
 
 BibTeX macros (Harold's reading, 2026-10-15, the second): no @string is read. A field's value is a
 braced or quoted literal, a number, or (only in a file whose text names no @string anywhere, in any case
-or spacing) one of the twelve month names; a value that is any other bare name or joins parts with # is
-left out of its record and counted (unsupported_macro), on every field of every record, whether it is
-read or not. A record is never refused for a macro. Nothing here logs content, and the parsers are kept from logging it.
+or spacing) one of the twelve month names; any other value (a bare name, parts joined with #, words or a literal
+and a word side by side) is left out of its record and counted (unsupported_macro), on every field of
+every record kept, whether the field is read or not. A record is never refused for a macro; one whose
+title is a macro has no title (no_title). Nothing here logs content, and the parsers are kept from logging it.
 """
 
 import io
@@ -130,7 +131,7 @@ def parse(data, beat=lambda: None):
         if record.get("macros"):  # BibTeX: values given as macros or by #, left out
             skipped["unsupported_macro"] = skipped.get("unsupported_macro", 0) + record["macros"]
         chars += size(csl)
-        if chars > MAX_CHARS:  # macros a file's entries share can make its records larger than the file
+        if chars > MAX_CHARS:  # LaTeX and the month names read can make the records a little larger than the file
             raise Unreadable("reference_file_too_large")
         records.append(csl)
     if not records and not skipped:
@@ -313,7 +314,10 @@ def _bibtex(text, beat):
     def plain(raw):
         """A field's text when its value is one braced or quoted literal, a number, or a month name; None for
         a macro (any other bare name) or # concatenation, which the record leaves out (unsupported_macro)."""
-        parts = _parts(raw)
+        try:
+            parts = _parts(raw)
+        except _Refused:  # words without # between them, a literal then a word: no literal either
+            return None
         if len(parts) != 1:
             return None
         is_literal, word = parts[0]
@@ -342,12 +346,12 @@ def _bibtex(text, beat):
         if name not in fields:
             return None
         raw = fields[name].value
-        try:
-            parts = _parts(raw.strip()) if isinstance(raw, str) else None
-        except _Refused:
-            parts = None
-        if not parts:
+        if not isinstance(raw, str):
             return _UNREADABLE
+        try:
+            parts = _parts(raw.strip())
+        except _Refused:  # counted as a macro (macros)
+            return None
         if len(parts) != 1 or not parts[0][0]:
             return _UNREADABLE if len(parts) == 1 and months and parts[0][1].lower() in _MONTHS else None
         return parts[0][1]
@@ -359,7 +363,8 @@ def _bibtex(text, beat):
             if isinstance(field.value, str) and (raw := field.value.strip()):
                 try:
                     parts = _parts(raw)
-                except _Refused:  # not BibTeX's: the record is refused if it reads the field, else left out
+                except _Refused:  # words without # between them, a literal then a word: no one literal either
+                    count += 1
                     continue
                 count += len(parts) != 1 or not parts[0][0] and not (months and parts[0][1].lower() in _MONTHS)
         return count
