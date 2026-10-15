@@ -250,9 +250,28 @@ def test_a_doi_that_is_not_whole_its_fields_own_text_is_left_out_and_counted(dat
     assert "DOI" not in record and rf.identifier(record) is None and skipped == {"invalid_field": 1}
 
 
+@pytest.mark.parametrize("c", ["\x0b", "\x0c", "\x1c", "\x1e"])
+def test_a_url_holding_a_control_character_is_left_out_and_counted(c):
+    [record], skipped, _ = parse(f"TY  - JOUR\nTI  - T\nUR  - https://example.org/a{c}\nER  - \n")
+    assert "URL" not in record and skipped == {"invalid_field": 1}
+
+
+
 def test_an_endnote_tag_needs_its_space():
     [record], skipped, _ = parse("%0 Journal Article\n%T T\n%R10.5555/abc\n")
     assert "DOI" not in record and record["title"] == "T %R10.5555/abc" and skipped == {}  # text of the title
+
+
+@pytest.mark.parametrize("hidden", [
+    "@ string{jan = {X}}\n",  # left as text
+    "@comment{ @string{jan={X}} }\n", "@preamble{ @string{jan={X}} }\n",
+    "@comment{unclosed @string{jan={X}}\n",  # in an unreadable comment (internal recheck, batch 4)
+    "@misc{k, title={T}\n@string\n{jan={X}}\n",  # swallowed by an unreadable entry
+    "@misc{k, title={T} @string{jan={X}}}\n",  # swallowed by an entry
+])
+def test_an_at_string_hidden_in_another_block_refuses_every_later_macro_use(hidden):
+    records, _, _ = parse(f"@misc{{before, title=jan}}\n{hidden}@article{{b, title={{B}}, journal=jan}}\n")
+    assert [r["title"] for r in records] == ["January"]  # before it; the one after is refused, never "January"
 
 
 def test_an_at_string_the_parser_leaves_as_text_is_still_a_definition_of_some_macro():

@@ -389,14 +389,15 @@ def _bibtex(text, beat):
         if isinstance(found, String):
             env[found.key.lower()] = _one_literal(found.value)
             continue
+        # Any other block whose text holds an @string (an unreadable one, one a failed or a whole block
+        # swallowed, one in a comment or a preamble, "@ string{"): BibTeX may read it as a definition, and
+        # which macro it defined is not certain, so every macro use from here on refuses its record.
+        if _STRING_IN_TEXT.search(getattr(block, "raw", None) or ""):
+            poisoned = True
         if isinstance(block, ParsingFailedBlock) and not isinstance(found, Entry):
-            if _STRING_BLOCK.match(getattr(block, "raw", None) or ""):  # which macro it defined is not known
-                poisoned = True
             yield None  # a block the parser could not read
             continue
         if not isinstance(found, Entry):  # a comment or a preamble
-            if _STRING_IN_TEXT.search(getattr(block, "raw", None) or ""):  # "@ string{...}", which the parser
-                poisoned = True  # leaves as text but BibTeX reads as a definition: which one, not certain
             continue
         entry = found
         beat()  # each entry: a long value's LaTeX takes a moment
@@ -435,7 +436,6 @@ class _Refused(Exception):
     """A BibTeX value that is not one the module's note supports, or longer than its cap."""
 
 
-_STRING_BLOCK = re.compile(r"@\s*string\b", re.IGNORECASE)
 _STRING_IN_TEXT = re.compile(r"@\s*string\s*[{(]", re.IGNORECASE)
 
 
