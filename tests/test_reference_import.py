@@ -894,26 +894,21 @@ async def test_returning_to_an_earlier_doi_never_drops_a_field_a_merge_gave(tmp_
         assert moved.json()["csl"]["volume"] == "9"
 
 
-async def test_a_doi_change_that_retitles_a_paper_queues_its_passages_again(tmp_path, monkeypatch):
-    from backend import search
+async def test_a_doi_change_that_retitles_a_paper_reindexes_its_passages_by_the_new_title(tmp_path):
+    from test_search import app, idle  # S1-17's index with its stand-in helper
 
-    calls, real = [], search.retitled
-    monkeypatch.setattr(search, "retitled", lambda conn, *args: calls.append(args[2]) or real(conn, *args))
-    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "Looked Up")})) as client:
+    async with app(tmp_path) as client:
         project = await project_of(client)
-        result = await imported(client, project, ris(("Retitled", f"DO  - {DOI}\n")))
-        await run_finished(client, result["lookup_run_id"])
-        [paper] = result["imported"]
-        attached = await added(client, project, ("r.md", b"# Retitled\n\nSome text.\n"), material_id=paper)
-        await run_finished(client, attached["lookup_run_id"])
-        await settled(client, project)
-        calls.clear()
-        moved = await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/new.doi", "title": "Retitled Anew"})
-        assert moved.status_code == 200 and calls == [paper]
-        queued = await rows(client, "SELECT count(*) FROM index_queue WHERE target = 'passage' AND op = 'add'"
-                                    " AND project_id = ?", project)
-        runs = await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'index' AND project_id = ?", project)
-        assert queued[0][0] > 0 or runs[0][0] > 0  # queued, or already taken by the index run it requested
+        [paper] = (await imported(client, project, ris(("Quixotic Ledger", f"DO  - {DOI}\n"))))["imported"]
+        await added(client, project, ("r.md", b"# Plain Heading\n\nPlain text with nothing special.\n"), material_id=paper)
+        await idle(client, project)
+        keyword = client.state["index"].keyword
+        assert len(await asyncio.to_thread(keyword, project, "quixotic", 50)) > 0  # its passages, by their title
+        moved = await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/new.doi", "title": "Zephyr Accounts"})
+        assert moved.status_code == 200 and moved.json()["csl"]["DOI"] == "10.5555/new.doi"
+        await idle(client, project)
+        assert len(await asyncio.to_thread(keyword, project, "zephyr", 50)) > 0  # indexed again under the new title
+        assert await asyncio.to_thread(keyword, project, "quixotic", 50) == []  # and no longer under the old
 
 
 async def test_each_lookups_fill_joins_the_fields_a_lookup_filled(tmp_path):
