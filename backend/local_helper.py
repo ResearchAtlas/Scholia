@@ -397,7 +397,7 @@ class Helper:
         search over the prefix's length in characters (code points), each candidate counted with
         /tokenize, keeping the longest one found within the bound (the shorter end always counted
         within it, or empty; the longer end always counted over). The prefix sent is within the bound,
-        and the longest within it when the count grows with the prefix, as it does for ordinary text;
+        and the longest within it when the count grows with the prefix, as it usually does;
         the text is refused (InputRefused) only when its first character alone counts over the bound,
         or the helper refuses to count. About log2(characters) + 1 counts per input. Each request
         carries admit, as the embedding's does, so nothing goes out that the embedding itself could
