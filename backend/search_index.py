@@ -166,6 +166,18 @@ def digest(text):
 # The main database's side
 
 
+def _readings_from(passage_ids=None):
+    """SQL FROM clause: the passages (p) a current version (w) of a material (m) reads now through its
+    reading (e). Driven from the given passage ids by their keys up to the material, else from the
+    project's materials down, in that order (CROSS JOIN), so a check costs what it asks for. The caller
+    keeps the project check, WHERE m.project_id = ?, which the whole-project order searches by."""
+    if passage_ids is None:
+        return (f"materials m CROSS JOIN material_versions w ON w.material_id = m.id"
+                f" CROSS JOIN extractions e ON {_reads_now('w', 'e')} CROSS JOIN passages p ON p.extraction_id = e.id")
+    return (f"passages p CROSS JOIN extractions e ON e.id = p.extraction_id"
+            f" CROSS JOIN material_versions w ON {_reads_now('w', 'e')} CROSS JOIN materials m ON m.id = w.material_id")
+
+
 def readings(conn, project_id, passage_ids=None, references=True):
     """{passage id: (material id, title, section path, kind, text, page, ordinal, version id)} for the
     passages a current version of a material in the project reads now (its file read by this version
@@ -173,8 +185,7 @@ def readings(conn, project_id, passage_ids=None, references=True):
     of passage_ids; without references, never a reference passage. A passage two of the project's
     materials read is given once, for the first added."""
     sql = (f"SELECT p.id, m.id, m.title, p.section_path, p.kind, p.text, p.page, p.ordinal, w.id"
-           f" FROM materials m JOIN material_versions w ON w.material_id = m.id AND w.is_current = 1"
-           f" JOIN extractions e ON {_reads_now('w', 'e')} JOIN passages p ON p.extraction_id = e.id"
+           f" FROM {_readings_from(passage_ids)}"
            f" WHERE m.project_id = ?{'' if references else ' AND p.kind != ' + repr('reference')}")
     args = [project_id]
     if passage_ids is not None:
@@ -189,10 +200,7 @@ def readings(conn, project_id, passage_ids=None, references=True):
 
 def granted(conn, project_id):
     """The ids of the passages a current version of a material in the project reads now (as readings)."""
-    return {pid for (pid,) in conn.execute(
-        f"SELECT p.id FROM materials m JOIN material_versions w ON w.material_id = m.id AND w.is_current = 1"
-        f" JOIN extractions e ON {_reads_now('w', 'e')} JOIN passages p ON p.extraction_id = e.id"
-        f" WHERE m.project_id = ?", (project_id,))}
+    return {pid for (pid,) in conn.execute(f"SELECT p.id FROM {_readings_from()} WHERE m.project_id = ?", (project_id,))}
 
 
 def connect(path, create=False):
