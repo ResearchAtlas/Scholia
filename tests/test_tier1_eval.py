@@ -518,3 +518,17 @@ async def test_a_passage_the_helper_refuses_is_counted_and_the_hybrid_arm_still_
     hybrid = beir["arms"]["hybrid"]
     assert hybrid["complete"] and hybrid["fallbacks"] == {} and hybrid["metrics"]["ndcg@10"]["n"] == 3
     assert "(1 refused by the helper;" in "\n".join(tier1.report(results))
+
+
+def test_the_committed_baseline_is_a_finished_full_run_of_all_five_with_ids_only_where_allowed():
+    manifest = tier1.load_manifest()
+    baseline = tier1.load_manifest(ROOT / "evals" / "baseline" / "tier1-baseline.json")
+    assert baseline["status"] == "finished" and baseline["gaps"] == [] and baseline["level"] == "full"
+    assert baseline["like_for_like"] and baseline["model_settings"] == manifest["model_settings"]
+    assert set(baseline["benchmarks"]) == set(manifest["benchmarks"])
+    for name, bench in baseline["benchmarks"].items():
+        assert (bench["keys"] is not None) == manifest["benchmarks"][name]["ids_committable"], name
+        assert all(entry["complete"] and entry["metrics"] for entry in bench["arms"].values()), name
+        assert bench["query_language"] == bench["document_language"] == "en"
+    assert all(line.startswith(("qasper", "scifact", "nfcorpus", "scidocs", "litsearch", "  "))
+               for line in tier1.compare(manifest, baseline, baseline))
