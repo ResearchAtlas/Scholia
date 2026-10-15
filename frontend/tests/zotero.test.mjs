@@ -38,6 +38,7 @@ test('the status and the report are said in each supported interface language', 
     'zotero.report.versions', 'zotero.report.waiting', 'zotero.report.pdfNotRead', 'zotero.report.notFound',
     'references.leftOut']);
   assert.deepEqual(reportParts(null), []);
+  assert.deepEqual(reportParts({ reason: 'zotero_not_running' }), [['zotero.report.kept', {}]]); // no counts it does not hold
   for (const catalog of [en, zh]) {
     const t = makeT(catalog);
     for (const state of ['checking', 'ready', 'off', 'not_running', 'api_off', 'not_yours', 'unsupported', 'error']) {
@@ -71,5 +72,5 @@ test('a Zotero paper says where its details came from and why its PDF was not re
 test('the browser says what an import did only from its finished run', () => {
   const browser = source('ZoteroBrowser.jsx');
   assert.match(browser, /const row = await followRun\(runId/);
-  assert.match(browser, /reportParts\(row\.result\)/);
+  assert.match(browser, /reportParts\(row\.result \?\?/);
 });

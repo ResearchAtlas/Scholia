@@ -544,3 +544,111 @@ async def test_an_abstract_is_kept_as_the_records_never_as_text(tmp_path):
         assert (paper["evidence_type"], paper["csl"]["abstract"]) == ("abstract", "A synthetic abstract, never full text.")
         assert await rows(client, "SELECT count(*) FROM passages") == [(0,)]
         assert await rows(client, "SELECT count(*) FROM index_queue") == [(0,)]
+
+
+# Review 1's cases
+
+
+async def test_a_doi_edited_in_scholia_keeps_the_paper_keyed_to_its_zotero_item(tmp_path):
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        await imported(client, project, KEYS[1:2])
+        [paper] = (await papers(client, project)).values()
+        assert (await client.patch(f"/api/materials/{paper['id']}", json={"doi": "10.5555/scholia.edited"})).status_code == 200
+        pdf_file(tmp_path, "two.pdf", "A Changed File", doi=None)
+        row = await imported(client, project, KEYS[1:2])
+        assert (row["result"]["updated"], row["result"]["versions"], row["result"]["imported"]) == (1, 1, 0)
+        [again] = (await papers(client, project)).values()
+        assert again["id"] == paper["id"] and again["csl"]["DOI"] == "10.5555/scholia.edited"
+
+
+async def test_a_zotero_pdf_matching_an_earlier_version_never_displaces_the_researchers_file(tmp_path):
+    import base64
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        await imported(client, project, KEYS[1:2])
+        await background_idle(client, 60)
+        [paper] = (await papers(client, project)).values()
+        mine = synthetic.paper_pdf("The Researcher's Own File", doi=None)
+        response = await client.post(f"/api/projects/{project}/materials", json={
+            "files": [{"name": "mine.pdf", "data": base64.b64encode(mine).decode()}], "material_id": paper["id"],
+            "replaces": paper["version"]["id"]})
+        assert response.status_code == 201
+        row = await imported(client, project, KEYS[1:2])
+        assert (row["result"]["unchanged"], row["result"]["versions"]) == (1, 0)
+        assert (await papers(client, project))[f"users/0/items/{KEYS[1]}"]["version"]["seq"] == 1
+
+
+async def test_a_redirect_from_zotero_fails_as_unavailable_never_as_a_changed_project(tmp_path):
+    import httpx
+    mock = library(tmp_path, pdfs=False)
+    moved = lambda request: httpx.Response(302, headers={"Location": "file:///etc/passwd"})  # noqa: E731
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        mock.answers = [moved] * 3  # its first request, and both tries again
+        row = await imported(client, project, KEYS[:1])
+        assert (row["status"], row["cancel_reason"], row["result"]["reason"]) == ("failed", None, "zotero_unavailable")
+        mock.answers = [moved]
+        assert (await client.get("/api/zotero/status")).json() == {"state": "error"}
+        mock.answers = [moved]
+        response = await client.get("/api/zotero/items", params={"library": "users/0"})
+        assert (response.status_code, response.json()["code"]) == (502, "zotero_unavailable")
+
+
+async def test_malformed_answers_fail_as_unavailable(tmp_path):
+    import httpx
+    mock = library(tmp_path, pdfs=False)
+    answer = lambda body, **headers: lambda request: httpx.Response(  # noqa: E731
+        200, content=body, headers={"Zotero-API-Version": "3", **headers})
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        mock.answers = [answer(b'["x", 3, {"id": "1"}]')]
+        assert (await client.get("/api/zotero/status")).json() == {"state": "ready", "libraries": [
+            {"id": "users/0", "name": None}], "server_id": None}
+        mock.answers = [answer(b"[]", **{"Total-Results": b"\xb2"})]
+        assert (await client.get("/api/zotero/items", params={"library": "users/0"})).json()["total"] is None
+        for body, headers in ((b"[" * 100_000, {}), (b"{}", {"Content-Encoding": "gzip"}),
+                              (b" " * (zotero.MAX_ANSWER + 1), {}), (b"not json", {})):
+            mock.answers = [answer(body, **headers)]
+            response = await client.get("/api/zotero/collections", params={"library": "users/0"})
+            assert (response.status_code, response.json()["code"]) == (502, "zotero_unavailable")
+        mock.answers = [answer(b"{\"data\": 1}"), answer(b"[]")]  # an item of the wrong shape: not found
+        row = await imported(client, project, KEYS[:1])
+        assert row["status"] == "succeeded" and row["result"]["not_found"] == 1
+
+
+async def test_a_trashed_item_is_not_imported(tmp_path):
+    mock = library(tmp_path, pdfs=False)
+    mock.items["users/0", KEYS[0]]["data"]["deleted"] = True
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        row = await imported(client, project, KEYS[:2])
+        assert (row["result"]["not_found"], row["result"]["imported"]) == (1, 1)
+
+
+async def test_cancel_while_a_pdf_is_read_writes_nothing_for_it(tmp_path, monkeypatch):
+    mock = library(tmp_path)
+    reading, release = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    real = zotero.read_attachment
+
+    def slow(text, **kwargs):
+        loop.call_soon_threadsafe(reading.set)
+        asyncio.run_coroutine_threadsafe(release.wait(), loop).result(10)
+        return real(text, **kwargs)
+
+    monkeypatch.setattr(zotero, "read_attachment", slow)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        run = await start(client, project, KEYS[:1])
+        await asyncio.wait_for(reading.wait(), 10)
+        cancelling = asyncio.create_task(client.post(f"/api/runs/{run}/cancel"))
+        await asyncio.sleep(0.05)
+        release.set()
+        assert (await cancelling).status_code == 200
+        row = await run_finished(client, run)
+        assert (row["status"], row["cancel_reason"]) == ("cancelled", "researcher")
+        assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM content_files") == [(0,)]  # read to its end, never stored

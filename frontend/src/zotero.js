@@ -51,9 +51,12 @@ export function collectionTree(collections, compare = (a, b) => a.localeCompare(
 // The status's text and whether it says how to turn the API on, as catalog keys.
 export const statusKey = (status) => `zotero.status.${status?.state ?? 'checking'}`;
 
-// What an import's report says (its run's summary, read after its commit), as [catalog key, params].
+// What an import's report says (its run's summary, read after its commit), as [catalog key, params]. A
+// run that did not finish counts nothing (its summary holds its reason only): the items it committed
+// before it stopped are in the Library, and it says so.
 export function reportParts(summary) {
   if (!summary) return [];
+  if (summary.imported === undefined) return [['zotero.report.kept', {}]];
   const notRead = Object.values(summary.pdf ?? {}).reduce((sum, n) => sum + n, 0);
   return [
     ['zotero.report.imported', { count: summary.imported ?? 0 }],

@@ -1108,5 +1108,6 @@
   "zotero.report.noTitle": {
     "one": "{count} item was skipped: it has no title.",
     "other": "{count} items were skipped: they have no title."
-  }
+  },
+  "zotero.report.kept": "Items imported before it stopped stay in the Library."
 }

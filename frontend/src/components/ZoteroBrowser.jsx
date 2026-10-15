@@ -1,8 +1,9 @@
 // i18n: migrated
 // The Zotero browser (S11; slice-1 spec F3c; S1-15): Zotero's connection status, its libraries, the
 // chosen library's collections and a page of its items with checkboxes, and the import of the items
-// chosen. Loaded when first opened (Parts.jsx). What an import did is said only from its run's record once it has
-// ended (followRun), never before its commit.
+// chosen. Loaded when first opened (Parts.jsx). Closing it while an import runs leaves the import running
+// (the background-run list shows it, with Cancel), and the Library shows what it adds. What an import did
+// is said only from its run's record once it has ended (followRun), never before its commit.
 import { useCallback, useContext, useEffect, useId, useState } from 'react';
 import { BookOpen, FolderClosed, Loader2, RefreshCw } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
@@ -67,7 +68,7 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
   async function more() {
     try {
       const found = await zoteroItems(library, collection, page.next);
-      setPage((shown) => ({ ...found, items: [...shown.items, ...found.items] }));
+      setPage((shown) => (shown ? { ...found, items: [...shown.items, ...found.items] } : shown)); // none: another list since
     } catch (error) {
       setProblem(codeOf(error));
     }
@@ -84,7 +85,7 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
       const { run_id: runId } = await importZotero(project.id, library, chosen, status.server_id);
       const row = await followRun(runId, (running) => { if (running.progress) setImporting(running.progress); });
       const outcome = runOutcome(row);
-      setReport({ parts: reportParts(row.result), problem: outcome.ok ? null : outcome.code ?? null,
+      setReport({ parts: reportParts(row.result ?? (outcome.ok ? null : {})), problem: outcome.ok ? null : outcome.code ?? null,
         key: outcome.ok ? null : outcome.key ?? null });
       setChosen([]);
     } catch (error) {
@@ -100,7 +101,7 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
   const over = chosen.length > MAX_ITEMS;
   const libraries = status?.libraries ?? [];
   return (
-    <Dialog open={open} onOpenChange={(next) => { if (!importing) onOpenChange(next); }}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[min(88vh,760px)] max-w-3xl flex-col gap-4">
         <DialogHeader>
           <DialogTitle>{t('zotero.title')}</DialogTitle>

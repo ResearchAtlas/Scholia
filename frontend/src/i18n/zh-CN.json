@@ -1076,5 +1076,6 @@
   },
   "zotero.report.noTitle": {
     "other": "跳过了 {count} 个条目：没有标题。"
-  }
+  },
+  "zotero.report.kept": "停止之前已导入的条目保留在文献库中。"
 }

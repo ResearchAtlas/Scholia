@@ -1035,7 +1035,9 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
             csl.pop("DOI", None) if doi is None else csl.__setitem__("DOI", doi)
         now = utc_now()
         conn.execute("UPDATE materials SET title = ?, csl = ?, checked_by = 'researcher', checked_at = ?, updated_at = ?"
-                     + (", source_key = NULL, resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL,"
+                     # A Zotero paper keeps its source_key, its Zotero library and item, which re-imports find it by (S1-15).
+                     + (", source_key = CASE source WHEN 'zotero' THEN source_key END, resolved_at = NULL,"
+                        " retraction = 'unknown', retraction_checked_at = NULL,"
                         " lookup_filled = NULL" if moved else "") + " WHERE id = ?", (title, json.dumps(csl), now, now, material_id))
         used = []
 
