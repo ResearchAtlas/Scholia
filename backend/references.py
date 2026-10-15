@@ -44,7 +44,7 @@ from pydantic import BaseModel, Field
 from backend import asks, extraction, reading, reference_files
 from backend.db import new_id, utc_now
 from backend.local_guard import MAX_BODY
-from backend.materials import _FORM_FIELDS, _no_store, _refused, _to_end
+from backend.materials import _FORM_FIELDS, _no_store, _refused, _to_end, add_version
 from backend.runs import RunOutcome, _running, _revoked
 from backend.settings import visible
 
@@ -183,12 +183,11 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
 def new_material(conn, project_id, csl, source="reference_file"):
     """A metadata-only paper of the project from a record's CSL JSON, in the caller's transaction:
     the material and its first version, with no file. Returns (material id, version id)."""
-    material, version = new_id(), new_id()
+    material = new_id()
     conn.execute("INSERT INTO materials (id, project_id, title, csl, source, evidence_type, proposed_by)"
                  " VALUES (?, ?, ?, ?, ?, ?, 'researcher')",
                  (material, project_id, csl["title"], json.dumps(csl), source, _evidence(csl)))
-    conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current) VALUES (?, ?, 0, NULL, 1)",
-                 (version, material))
+    version, _ = add_version(conn, None, project_id, material, None, None, None, None)  # with no file
     return material, version
 
 

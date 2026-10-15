@@ -181,11 +181,11 @@ async def add_files(project_id: str, body: Upload, request: Request):
             used.append(run)
             conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
                          (run, project, workflow, json.dumps(inputs)))
+            return run
 
         locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
         added, looked_up = [], {}  # looked_up: {material id: the version its lookup is for}
         for name, sha256, kind in stored:
-            replaced = None
             if body.material_id is not None:
                 material = body.material_id
                 # Only the version current when the file was chosen is replaced: a slower, earlier
@@ -193,14 +193,6 @@ async def add_files(project_id: str, body: Upload, request: Request):
                 if conn.execute("SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1",
                                 (body.replaces, material)).fetchone() is None:
                     raise _refused(409, "replaced_meanwhile", "The paper's file was replaced meanwhile")
-                (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM material_versions WHERE material_id = ?",
-                                      (material,)).fetchone()
-                replaced = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
-                                        " content_files c ON c.sha256 = v.file_sha256 WHERE v.material_id = ?"
-                                        " AND v.is_current = 1", (material,)).fetchone()
-                conn.execute("UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material,))
-                conn.execute("UPDATE materials SET evidence_type = 'full_text', updated_at = ? WHERE id = ?",
-                             (utc_now(), material))  # a file read from now on: a reference file's paper has its text
             else:
                 same = conn.execute(
                     "SELECT m.id FROM materials m JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
@@ -208,30 +200,11 @@ async def add_files(project_id: str, body: Upload, request: Request):
                 if same is not None:
                     added.append({"id": same[0], "existing": True})
                     continue
-                material, seq = new_id(), 0
+                material = new_id()
                 title = name.rsplit(".", 1)[0].strip() or name
                 conn.execute("INSERT INTO materials (id, project_id, title, source, evidence_type, proposed_by)"
                              " VALUES (?, ?, ?, 'upload', 'full_text', 'researcher')", (material, project_id, title[:500]))
-            version = new_id()
-            conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
-                         " VALUES (?, ?, ?, ?, 1, ?)", (version, material, seq, sha256, kind))
-            extractor, extractor_version = extraction.extractor_of(kind)
-            shared = conn.execute(
-                f"SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ? AND extractor_version = ?"
-                f" AND status IN {_SHARED}", (sha256, extractor, extractor_version)).fetchone()
-            run, indexed = None, False
-            if shared is not None:  # read already, for another project or version: shared, not read again
-                if indexed := _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
-                    search.queued(conn, harness, project_id, origin, recorded)
-            else:
-                run = next(ids)
-                used.append(run)
-                conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
-                             " 'extract', ?)", (run, project_id, json.dumps({"material_ids": [material],
-                                                                             "version_id": version, "origin": origin})))
-            if replaced is not None and replaced[1] in extraction.EXTRACTORS:  # its old file's readings, unless read still
-                if _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0]) and not indexed:
-                    search.removed(conn, harness, project_id, recorded)  # its index run takes those removals now
+            version, run = add_version(conn, harness, project_id, material, sha256, kind, origin, recorded)
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
             looked_up[material] = version
         lookup_run = None  # a review-locked project never looks identifiers up
@@ -250,6 +223,51 @@ async def add_files(project_id: str, body: Upload, request: Request):
     # The runs start with the commit (record_background): none is ever running in the record and not held.
     # Each file may take two (its reading, and an index run for its old file's removals).
     return await harness.record_background(2 * len(stored) + 2, record)
+
+
+def add_version(conn, harness, project_id, material, sha256, kind, origin, recorded):
+    """A material's next version (its first when it has none), in the caller's transaction: the
+    version, current from now on; its earlier versions no longer current, and its evidence full text
+    once a file replaces another version (a reference file's paper has its text); and for a file, its
+    reading: one already made of it (by another project or version) is shared and its passages queued
+    for the project's index with an index run (search.queued, which offers the search model at the
+    project's first material, shown where origin says), else a reading run. A replaced file's
+    readings that no current version reads leave the index. sha256 None (and kind None) is a version
+    with no file, which has no reading. record(conn, project, workflow, inputs) records a run that
+    starts with the commit and returns its id. Returns (version id, its reading run's id or None).
+    Shared by adding files, a reference file's import (backend/references.py) and Zotero's
+    (backend/zotero.py)."""
+    (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM material_versions WHERE material_id = ?",
+                          (material,)).fetchone()
+    replaced = None
+    if seq:
+        replaced = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
+                                " content_files c ON c.sha256 = v.file_sha256 WHERE v.material_id = ?"
+                                " AND v.is_current = 1", (material,)).fetchone()
+        conn.execute("UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material,))
+        if sha256 is not None:
+            conn.execute("UPDATE materials SET evidence_type = 'full_text', updated_at = ? WHERE id = ?",
+                         (utc_now(), material))  # a file read from now on: a reference file's paper has its text
+    version = new_id()
+    conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
+                 " VALUES (?, ?, ?, ?, 1, ?)", (version, material, seq, sha256, kind))
+    if sha256 is None:
+        return version, None
+    extractor, extractor_version = extraction.extractor_of(kind)
+    shared = conn.execute(
+        f"SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ? AND extractor_version = ?"
+        f" AND status IN {_SHARED}", (sha256, extractor, extractor_version)).fetchone()
+    run, indexed = None, False
+    if shared is not None:  # read already, for another project or version: shared, not read again
+        if indexed := _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
+            search.queued(conn, harness, project_id, origin, recorded)
+    else:
+        run = recorded(conn, project_id, "extract", {"material_ids": [material], "version_id": version,
+                                                     "origin": origin})
+    if replaced is not None and replaced[1] in extraction.EXTRACTORS:  # its old file's readings, unless read still
+        if _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0]) and not indexed:
+            search.removed(conn, harness, project_id, recorded)  # its index run takes those removals now
+    return version, run
 
 
 def _add_to_batch(conn, project_id, run_id, looked_up, more, registry):
