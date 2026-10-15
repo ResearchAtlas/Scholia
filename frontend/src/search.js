@@ -11,7 +11,8 @@ export const LIBRARY_LIMIT = 20; // results the Library shows (the API's default
 export const searchProject = (projectId, query) =>
   post(`/api/projects/${encodeURIComponent(projectId)}/search`, { query, limit: LIBRARY_LIMIT });
 
-export const indexStatus = (projectId) => get(`/api/projects/${encodeURIComponent(projectId)}/index`);
+export const indexStatus = (projectId, after) => get(`/api/projects/${encodeURIComponent(projectId)}/index`
+  + (after ? `?after=${encodeURIComponent(after)}` : ''));
 
 export const rebuildIndex = (projectId) => post(`/api/projects/${encodeURIComponent(projectId)}/index/rebuild`);
 

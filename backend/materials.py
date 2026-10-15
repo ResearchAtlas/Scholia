@@ -1279,7 +1279,8 @@ async def retry_run(run_id: str, request: Request):
     and recorded interrupted, so no launch starts it again; one a kick has held again meanwhile is
     running, and is not tried again. An index run's retry is a request for its project's run (S1-17),
     made once the old run is recorded interrupted: the run running, if one does, runs again after it,
-    and its id is the answer."""
+    and its id is the answer; one no process holds (a failed terminal write left it running) is started
+    then, as for any request (search._started)."""
     state = _state(request)
 
     def again(conn, ids):
@@ -1309,14 +1310,16 @@ async def retry_run(run_id: str, request: Request):
             else insert(conn, project_id, inputs)
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
                      (retried, run_id))
+        if retried != ids[0]:  # the project's run an index request answered with, not recorded here
+            answered.append(retried)
         return retried, [ids[0]] if retried == ids[0] else []
 
-    registry = state["harness"].registry
+    registry, answered = state["harness"].registry, []
     try:
-        run_id = await state["harness"].record_background(1, again)
-        # A run its project's request answered with that no process holds (an index run a failed terminal write
-        # left running) starts now, as for any request (search._started)
-        return {"run_id": await search._started(state["harness"], run_id)}
+        retried = await state["harness"].record_background(1, again)
+        if answered:  # one no process holds (a failed terminal write left it running) starts now (search._started)
+            await search._started(state["harness"], retried)
+        return {"run_id": retried}
     except BaseException:
         # A Retry refused or failed leaves the run as it was, for a kick or a resume to start again. One whose
         # retry committed is never started again whatever this undoes (retried_by, its record interrupted).

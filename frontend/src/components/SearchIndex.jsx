@@ -35,7 +35,7 @@ export function IndexSection({ project }) {
     load();
     let ended = await followRun(started.run_id, () => load());
     if (started.rebuild_pending) { // asked while another run ran: the rebuild is the run that one's end records
-      const next = rebuildAfter(started, ended, await indexStatus(project.id).catch(() => null));
+      const next = rebuildAfter(started, ended, await indexStatus(project.id, started.run_id).catch(() => null));
       ended = next ? await followRun(next, () => load()) : { status: 'cancelled' };
     }
     setOutcome(ended.status === 'succeeded' ? 'rebuilt' : 'stopped');

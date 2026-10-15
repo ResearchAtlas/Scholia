@@ -349,7 +349,8 @@ def register(harness, state):
         if not again or row[0] == "cancelled" or not conn.execute("SELECT 1 FROM projects WHERE id = ?",
                                                                    (project_id,)).fetchone():
             return
-        harness.record_in(conn, active, project_id, "index",  # after: the run it follows, for a Rebuild following it
+        # inputs.after: the run it follows, so a Rebuild asked while that one ran can follow it (index_status)
+        harness.record_in(conn, active, project_id, "index",
                           {"rebuild": True, "after": active.run_id} if again.get("rebuild") else {"after": active.run_id})
 
     async def offer_run(harness, active, project_id, inputs):
@@ -605,11 +606,11 @@ async def search_passages(project_id: str, body: Query, request: Request):
 
 
 @router.get("/api/projects/{project_id}/index")
-async def index_status(project_id: str, request: Request):
+async def index_status(project_id: str, request: Request, after: str | None = None):
     """The project's index: whether it is ready or being rebuilt, whether search is keyword-only and
     why, its passages indexed and embedded (in all, and by paper), and its index run: the one running
-    (with whether a rebuild is to follow it), else the latest; and its latest rebuild, with the run it was
-    recorded after."""
+    (with whether a rebuild is to follow it), else the latest; and its latest rebuild (or, with after, the
+    rebuild recorded as that run ended), with the run it was recorded after."""
     state = _state(request)
     registry = state["harness"].registry
 
@@ -617,8 +618,9 @@ async def index_status(project_id: str, request: Request):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
             raise AdmissionError(404, "not_found", "No such project")
         runs = "SELECT id, status, inputs FROM runs WHERE project_id = ? AND workflow = 'index'"
-        rebuild = conn.execute(runs + " AND json_extract(inputs, '$.rebuild') ORDER BY rowid DESC LIMIT 1",
-                               (project_id,)).fetchone()
+        rebuild = conn.execute(runs + " AND json_extract(inputs, '$.rebuild') AND (?2 IS NULL OR"
+                               " json_extract(inputs, '$.after') = ?2) ORDER BY rowid DESC LIMIT 1",
+                               (project_id, after)).fetchone()
         return [*conn.execute(runs + " AND status = 'running' ORDER BY rowid DESC", (project_id,)),
                 *conn.execute(runs + " ORDER BY rowid DESC LIMIT 1", (project_id,))], rebuild
 

@@ -1838,3 +1838,9 @@ async def test_the_index_status_names_the_rebuild_a_run_recorded_and_the_run_it_
         assert last["after"] == run and last["run_id"] != run
         ended = await run_finished(client, last["run_id"])
         assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+        # a later rebuild recorded since (another tab's): the one recorded as that run ended is still found by it
+        later = (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"]
+        await run_finished(client, later)
+        assert (await client.get(f"/api/projects/{project}/index")).json()["last_rebuild"]["run_id"] == later
+        found = (await client.get(f"/api/projects/{project}/index", params={"after": run})).json()["last_rebuild"]
+        assert (found["run_id"], found["after"]) == (last["run_id"], run)

@@ -170,6 +170,6 @@ test('a Rebuild asked while another index run ran follows that run, then the reb
   assert.equal(rebuildAfter({ run_id: 'r2', rebuild_pending: false }, { status: 'succeeded' }, next), null);
   for (const catalog of [en, zhCN]) assert.ok('search.rebuildAfterRun' in catalog);
   const component = readFileSync(fileURLToPath(new URL('../src/components/SearchIndex.jsx', import.meta.url)), 'utf8');
-  assert.match(component, /rebuildAfter\(started, ended, await indexStatus\(project\.id\)/);
+  assert.match(component, /rebuildAfter\(started, ended, await indexStatus\(project\.id, started\.run_id\)/);
   assert.match(component, /index\.run\?\.rebuild_pending && \(/);
 });
