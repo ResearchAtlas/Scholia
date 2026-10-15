@@ -14,6 +14,7 @@ import { projectName } from '../projects.js';
 import { paperLine } from '../references.js';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { ModelDetails } from './LocalHelper.jsx'; // S1-17: the search model's offer
 
 // A catalog entry when there is one, else what was given.
 function named(t, key, fallback) {
@@ -52,6 +53,14 @@ export function Ask({ ask, onAnswered }) {
           </p>
           <p className="font-medium leading-snug">{question}</p>
           {body && <p className="leading-relaxed text-muted-foreground">{body}</p>}
+          {ask.kind === 'model_download' && (
+            <details className="text-xs">
+              <summary className="w-fit cursor-pointer select-none rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
+                {t('library.details')}
+              </summary>
+              <ModelDetails />
+            </details>
+          )}
         </div>
       </div>
       {ask.text_box && (

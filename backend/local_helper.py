@@ -345,10 +345,12 @@ class Helper:
         return {"state": self.state, "problem": self.problem, "failures": self.failures,
                 "ready_seconds": self.ready_seconds}
 
-    async def embed(self, texts, *, project_id=None, query=False) -> list[list[float]]:
+    async def embed(self, texts, *, project_id=None, query=False, admit=None) -> list[list[float]]:
         """One embedding per text, in order. A question's (query) go ahead of indexing batches: a
         batch holds at most one of the server's slots, INDEXING_INPUTS texts at a time, and the
-        other stays free for questions. Raises HelperUnavailable when the helper cannot serve."""
+        other stays free for questions. admit(conn), if given, is each request's dispatch check in
+        the outbound gate's decision transaction (an index run's, S1-17). Raises HelperUnavailable
+        when the helper cannot serve, or the check refuses."""
         texts = list(texts)
         size = len(texts) if query else INDEXING_INPUTS
         vectors = []
@@ -361,7 +363,8 @@ class Helper:
                     async with self._slots:
                         await self._ready()
                         part = texts[start:start + size]
-                        vectors += _vectors(await self._post("/v1/embeddings", {"input": part}, project_id), len(part))
+                        vectors += _vectors(await self._post("/v1/embeddings", {"input": part}, project_id, admit),
+                                            len(part))
         finally:
             self._in_use -= 1
             self.last_used = time.monotonic()
@@ -395,12 +398,13 @@ class Helper:
             raise HelperUnavailable("request_failed")
         return scores
 
-    async def _post(self, path, body, project_id):
+    async def _post(self, path, body, project_id, admit=None):
         url, key = self.url, self._key
         if url is None:
             raise HelperUnavailable(self.problem or "helper_unavailable")
         try:
-            async with await self.local.client(project_id, timeout=REQUEST_TIMEOUT) as http:
+            async with await self.local.client(project_id, timeout=REQUEST_TIMEOUT,
+                                               **({"admit": admit} if admit is not None else {})) as http:
                 response = await http.post(url + path, json=body, headers={"Authorization": f"Bearer {key}"})
             if response.status_code != 200:
                 raise HelperUnavailable("request_failed")
@@ -570,10 +574,13 @@ class Helper:
             self._starting = asyncio.create_task(self._start())
 
     def model_installed(self):
-        """The model file was just installed: what the last check found no longer holds."""
+        """The model file was just installed: what the last check found no longer holds. The app's
+        `model_installed` callback, if any, hears of it (S1-17 embeds what waited for the model)."""
         self.installs += 1
         if self.state == "stopped" and self.problem in _CHECKS:
             self.problem = None
+        if (installed_hook := self.local.state.get("model_installed")) is not None:
+            installed_hook()
 
     async def close(self):
         """Stop everything: a start under way, a pending restart, then the watch and the server, or
@@ -995,12 +1002,12 @@ def urls(state) -> tuple[str, ...]:
     return tuple(url for helper in local.helpers.values() if (url := helper.url)) if local else ()
 
 
-async def embed(state, texts, *, project_id=None, query=False) -> list[list[float]]:
+async def embed(state, texts, *, project_id=None, query=False, admit=None) -> list[list[float]]:
     """Embeddings from the app's embedding helper (see Helper.embed)."""
     local = state.get("local_helper")
     if local is None or EMBEDDING not in local.helpers:
         raise HelperUnavailable("closing")
-    return await local.helpers[EMBEDDING].embed(texts, project_id=project_id, query=query)
+    return await local.helpers[EMBEDDING].embed(texts, project_id=project_id, query=query, admit=admit)
 
 
 # The API

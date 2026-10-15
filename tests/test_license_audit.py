@@ -447,12 +447,40 @@ def test_native_code_is_reviewed_file_by_file(bundle):
     _ship(bundle, "apsw")
     found, problems = la.audit(bundle)
     assert problems == [] and "SQLite" in found
-    # apsw's Unicode tables are a separate native file, not reviewed
+    # apsw's Unicode extension, reviewed apart: the Unicode data tables built into it, whose license ships
     _put(bundle, "Contents/Frameworks/apsw/_unicode.cpython-313-darwin.so", MACHO)
+    assert la.audit(bundle)[1] == ["Unicode-data: license file LICENSE is not shipped in Contents/Resources/licenses/Unicode-data/"]
+    _ship(bundle, "Unicode-data")
+    found, problems = la.audit(bundle)
+    assert problems == [] and found["Unicode-data"] == {"Contents/Frameworks/apsw/_unicode.cpython-313-darwin.so"}
+    # another of its native files (an SQLite extension it carries, which the app never loads) is not reviewed
+    _put(bundle, "Contents/Frameworks/apsw/sqlite_extra_binaries/compress.dylib", MACHO)
     assert la.audit(bundle)[1] == [
-        "Contents/Frameworks/apsw/_unicode.cpython-313-darwin.so: native code from apsw "
+        "Contents/Frameworks/apsw/sqlite_extra_binaries/compress.dylib: native code from apsw "
         "has not been reviewed for the libraries it embeds"
     ]
+
+
+def test_apsws_shipped_native_files_are_reviewed_at_the_reviewed_version(bundle):
+    # The review of each is of this version: another one is reviewed again before it ships.
+    assert metadata.version("apsw") == "3.53.4.0"
+    modules = sorted(f.as_posix() for f in metadata.distribution("apsw").files if f.suffix == ".so")
+    assert modules == ["apsw/__init__.cpython-313-darwin.so", "apsw/_unicode.cpython-313-darwin.so"]
+    for native in modules:
+        _put(bundle, f"Contents/Frameworks/{native}", MACHO)
+    _ship(bundle, "apsw")
+    _ship(bundle, "Unicode-data")
+    found, problems = la.audit(bundle)
+    assert problems == [] and {"apsw", "SQLite", "Unicode-data"} <= set(found)
+
+
+def test_the_unicode_data_notice_is_the_unicode_license_v3():
+    license, [(source, dest)] = la.component("Unicode-data")
+    text = source.read_text(encoding="utf-8")
+    assert (license, dest) == ("Unicode-3.0", "LICENSE") and la.allowed(license)
+    assert text.startswith("UNICODE LICENSE V3\n") and "Copyright © 1991-2026 Unicode, Inc." in text
+    assert "provided that either (a)\nthis copyright and permission notice appear with all copies" in text
+    assert "Unicode-data" in la._shipped_by_default()  # every build ships it (notice_datas)
 
 
 def test_reviewed_licenses_and_supplied_notices():

@@ -60,7 +60,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from backend import asks, backups, extraction, lookup, reading
+from backend import asks, backups, extraction, lookup, reading, search
 from backend.db import ContentCorruptError, delete, new_id, utc_now
 from backend.db.deletion import supersede
 from backend.outbound_gate import OutboundDenied
@@ -80,7 +80,7 @@ BATCH_IDLE_SECONDS = 120  # an open batch (a drop still being sent) with no addi
 WAIT_SECONDS = 0.5  # a lookup's look at whether its materials have been read, and at its ask
 LOOKUP_WAIT_SECONDS = EXTRACTION_SECONDS + 60  # how long a lookup waits for its readings, at most
 PASSAGE_PAGE = 500
-_WORKFLOWS = ("extract", "lookup")
+_WORKFLOWS = ("extract", "lookup", "index", "model_offer")  # index and model_offer: S1-17's (backend/search.py)
 _SHARED = ("complete", "ocr_needed")  # an extraction's statuses: written whole, never partly
 
 
@@ -169,9 +169,19 @@ async def add_files(project_id: str, body: Upload, request: Request):
     for name, data, kind in files:  # stored before the records: a file no record names is collected later
         stored.append((name, await asyncio.to_thread(content.put, data, kind), kind))
 
-    def record(conn, ids):  # ids: one for each file's reading and one for the lookup, each used only if needed
+    origin = {"conversation_id": body.conversation_id} if body.conversation_id else None
+
+    def record(conn, ids):  # ids: for each file, its reading or its index run, and one for the lookup and the
+        # search model's offer each, all used only if needed
         check(conn)
         ids, used = iter(ids), []
+
+        def recorded(conn, project, workflow, inputs):  # a run that starts with the commit (search.queued)
+            run = next(ids)
+            used.append(run)
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
+                         (run, project, workflow, json.dumps(inputs)))
+
         locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
         added, looked_up = [], {}  # looked_up: {material id: the version its lookup is for}
         for name, sha256, kind in stored:
@@ -209,17 +219,19 @@ async def add_files(project_id: str, body: Upload, request: Request):
             shared = conn.execute(
                 f"SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ? AND extractor_version = ?"
                 f" AND status IN {_SHARED}", (sha256, extractor, extractor_version)).fetchone()
-            run = None
+            run, indexed = None, False
             if shared is not None:  # read already, for another project or version: shared, not read again
-                _queue_adds(conn, shared[0], project_id)
+                if indexed := _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
+                    search.queued(conn, harness, project_id, origin, recorded)
             else:
                 run = next(ids)
                 used.append(run)
                 conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
                              " 'extract', ?)", (run, project_id, json.dumps({"material_ids": [material],
-                                                                             "version_id": version})))
+                                                                             "version_id": version, "origin": origin})))
             if replaced is not None and replaced[1] in extraction.EXTRACTORS:  # its old file's readings, unless read still
-                _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0])
+                if _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0]) and not indexed:
+                    search.removed(conn, harness, project_id, recorded)  # its index run takes those removals now
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
             looked_up[material] = version
         lookup_run = None  # a review-locked project never looks identifiers up
@@ -228,7 +240,6 @@ async def add_files(project_id: str, body: Upload, request: Request):
         if not locked and lookup_run is None and looked_up:
             lookup_run = next(ids)
             used.append(lookup_run)
-            origin = {"conversation_id": body.conversation_id} if body.conversation_id else None
             inputs = {"material_ids": list(looked_up), "versions": looked_up, "origin": origin,
                       **({"open": True, "touched": time.time()} if body.more else {})}
             conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
@@ -237,7 +248,8 @@ async def add_files(project_id: str, body: Upload, request: Request):
         return {"materials": added, "lookup_run_id": lookup_run}, used
 
     # The runs start with the commit (record_background): none is ever running in the record and not held.
-    return await harness.record_background(len(stored) + 1, record)
+    # Each file may take two (its reading, and an index run for its old file's removals).
+    return await harness.record_background(2 * len(stored) + 2, record)
 
 
 def _add_to_batch(conn, project_id, run_id, looked_up, more, registry):
@@ -276,15 +288,18 @@ def _queue_removes(conn, extraction_id, project_id):
     time, as _queue_adds), unless the project's latest queued operation for them is already a
     removal. The index takes an applied row off the queue (backend/db/migrations.py), so an add
     may no longer be there to see; a removal of passages the index never had changes nothing. The
-    extraction and its passages stay."""
+    extraction and its passages stay. Returns whether removals were queued: the caller records an index
+    run to take them, unless one it records anyway does."""
     first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1",
                          (extraction_id,)).fetchone()
     last = first and conn.execute("SELECT op FROM index_queue WHERE target = 'passage' AND target_id = ?"
                                   " AND project_id = ? ORDER BY seq DESC LIMIT 1", (first[0], project_id)).fetchone()
-    if first is not None and (last is None or last[0] != "remove"):
-        conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
-                     " SELECT 'passage', id, ?, 'remove' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
-                     (project_id, extraction_id))
+    if first is None or (last is not None and last[0] == "remove"):
+        return False
+    conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
+                 " SELECT 'passage', id, ?, 'remove' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
+                 (project_id, extraction_id))
+    return True
 
 
 def _queue_adds(conn, extraction_id, project_id):
@@ -292,16 +307,17 @@ def _queue_adds(conn, extraction_id, project_id):
     adding a passage the project's index holds already changes nothing there), unless the project's
     latest queued operation for them is already an add, so no reading queues them twice. They are
     queued and removed (backend/db/deletion.py) a whole extraction at a time, so its first passage
-    stands for all of them."""
+    stands for all of them. Returns whether the extraction has passages."""
     first = conn.execute("SELECT id FROM passages WHERE extraction_id = ? ORDER BY ordinal LIMIT 1",
                          (extraction_id,)).fetchone()
     last = first and conn.execute("SELECT op FROM index_queue WHERE target = 'passage' AND target_id = ?"
                                   " AND project_id = ? ORDER BY seq DESC LIMIT 1", (first[0], project_id)).fetchone()
     if first is None or (last is not None and last[0] == "add"):
-        return
+        return first is not None
     conn.execute("INSERT INTO index_queue (target, target_id, project_id, op)"
                  " SELECT 'passage', id, ?, 'add' FROM passages WHERE extraction_id = ? ORDER BY ordinal",
                  (project_id, extraction_id))
+    return True
 
 
 # Reading
@@ -356,8 +372,8 @@ def register(harness, content):
         except reading.ChildError:  # logged there, as its type and place
             raise RunOutcome("failed", "internal") from None
         summary = {"passages": len(extracted.passages), "pages": extracted.pages, "ocr_pages": extracted.ocr_pages}
-        return summary, lambda conn: _store(conn, version_id, sha256, extracted, lambda conn, project, follow: (
-            harness.record_in(conn, active, project, "lookup", follow)))
+        return summary, lambda conn: _store(conn, version_id, sha256, extracted, lambda conn, project, workflow, follow: (
+            harness.record_in(conn, active, project, workflow, follow)), harness, inputs.get("origin"))
 
     async def lookup_run(harness, active, project_id, inputs):
         return await _look_up(harness, active, project_id, inputs, pace)
@@ -366,11 +382,13 @@ def register(harness, content):
     harness.workflows["lookup"] = lookup_run
 
 
-def _store(conn, version_id, sha256, extracted, look_up):
+def _store(conn, version_id, sha256, extracted, record, harness=None, origin=None):
     """The extraction, its passages and the project's index queue rows, in the run's terminal
     transaction; an extraction of the same file and version written meanwhile is shared instead.
     Every version this reading now gives text to, in any project, whose latest lookup concluded
-    without it (not_read) gets a lookup in the same transaction: look_up(conn, project id, inputs)."""
+    without it (not_read) gets a lookup in the same transaction, and each project an index run (with
+    the search model's offer at its first material, search.queued): record(conn, project id,
+    workflow, inputs). origin is where this run's version was added (its offer is shown there)."""
     found = conn.execute("SELECT m.project_id FROM material_versions v JOIN materials m ON m.id = v.material_id"
                          " WHERE v.id = ?", (version_id,)).fetchone()
     if found is None:
@@ -392,35 +410,41 @@ def _store(conn, version_id, sha256, extracted, look_up):
             ((new_id(), extraction_id, ordinal, p.page, json.dumps(p.section_path), p.kind, p.text, p.char_start,
               p.char_end, json.dumps(p.boxes) if p.boxes else None)  # each row made as it is written
              for ordinal, p in enumerate(extracted.passages)))
-    _serve(conn, sha256, (extracted.extractor, extracted.version), extraction_id, look_up,
-           bool(extraction.identifiers(extracted.passages)))
+    _serve(conn, sha256, (extracted.extractor, extracted.version), extraction_id, record,
+           bool(extraction.identifiers(extracted.passages)), harness, {version_id: origin})
 
 
 def _unread_out(conn, project_id, sha256, name):
     """A project's index holds the readings its current versions read: each reading of the file by
     that extractor (any version) that none of them reads now (its file replaced, or read by an
-    earlier version) has its passages queued to leave it. The readings stay."""
+    earlier version) has its passages queued to leave it. The readings stay. Returns whether removals
+    were queued (see _queue_removes)."""
     read = {extraction.extractor_of(kind) for (kind,) in conn.execute(
         f"SELECT {_VERSION_TYPE} FROM material_versions v JOIN materials m ON m.id = v.material_id LEFT JOIN"
         " content_files c ON c.sha256 = v.file_sha256 WHERE m.project_id = ? AND v.file_sha256 = ? AND v.is_current = 1",
         (project_id, sha256)) if kind in extraction.EXTRACTORS}
+    queued = False
     for extraction_id, version in conn.execute("SELECT id, extractor_version FROM extractions WHERE file_sha256 = ?"
                                                " AND extractor = ?", (sha256, name)).fetchall():
         if (name, version) not in read:
-            _queue_removes(conn, extraction_id, project_id)
+            queued = _queue_removes(conn, extraction_id, project_id) or queued
+    return queued
 
 
-def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
+def _serve(conn, sha256, extractor, extraction_id, record, gives=False, harness=None, origins=None):
     """A reading of the file just committed: every current version it reads, in any project, has its
-    passages queued for that project's index (once, see _queue_adds), and each whose latest lookup
-    recorded not_read (it concluded before any reading of its file had), or no_identifier when this
-    reading gives one (gives: an earlier reading had none, as a page read by OCR now does), gets a
-    lookup now, as at import: a Local only project's asks first, a review-locked project's gets
-    none, and it starts where the lookup it continues started (a conversation shows its ask). A
-    lookup made for that version since, or one that has still to read its identifiers, covers it.
-    The earlier readings are then removed through the deletion service (deletion.supersede), and the
-    citations without a passage of any version it reads are resolved again through their quotes
-    (_resolve)."""
+    passages queued for that project's index (once, see _queue_adds) with an index run (search.queued,
+    which also offers the search model at a project's first material, where origins says the version
+    was added; a reading without passages gets the run alone when an earlier reading's removals are
+    queued, so the index takes them now), and each whose latest lookup recorded not_read (it
+    concluded before any reading of its file had), or no_identifier when this reading gives one
+    (gives: an earlier reading had none, as a page read by OCR now does), gets a lookup now, as at import: a Local only project's asks first, a
+    review-locked project's gets none, and it starts where the lookup it continues started (a
+    conversation shows its ask). A lookup made for that version since, or one that has still to read
+    its identifiers, covers it. record(conn, project id, workflow, inputs) records those runs. The
+    earlier readings are then removed through the deletion service (deletion.supersede): they do not
+    stay. The citations without a passage of any version it reads are resolved again through their
+    quotes (_resolve)."""
     # Readings of the file by another version of the extractor are no version's reading now: their
     # passages leave the index of every project whose current version reads the file (a replaced
     # version's left it at its replacement), and then the readings go.
@@ -432,9 +456,13 @@ def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
             " JOIN projects p ON p.id = m.project_id WHERE v.file_sha256 = ? AND v.is_current = 1", (sha256,)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
+        removing = False
         for earlier in older:
-            _queue_removes(conn, earlier, project)
-        _queue_adds(conn, extraction_id, project)
+            removing = _queue_removes(conn, earlier, project) or removing
+        if _queue_adds(conn, extraction_id, project):  # a reading with passages: indexed, offered for
+            search.queued(conn, harness, project, (origins or {}).get(version), record)
+        elif removing:  # a reading without passages: its project's index run still takes the earlier reading's removals
+            search.removed(conn, harness, project, record)
         if locked:
             continue
         latest = conn.execute("SELECT r.id, json_extract(r.inputs, '$.origin') FROM runs r, json_each(r.inputs, '$.versions') j"
@@ -445,8 +473,8 @@ def _serve(conn, sha256, extractor, extraction_id, look_up, gives=False):
                 " AND json_extract(data, '$.material_id') = ? AND json_extract(data, '$.outcome') IN (?, ?)",
                 (latest[0], material, "not_read", "no_identifier" if gives else "not_read")).fetchone():
             # it continues that lookup: where it started, its ask is shown
-            look_up(conn, project, {"material_ids": [material], "versions": {material: version},
-                                    "origin": json.loads(latest[1]) if latest[1] else None})
+            record(conn, project, "lookup", {"material_ids": [material], "versions": {material: version},
+                                             "origin": json.loads(latest[1]) if latest[1] else None})
     for earlier in older:  # each project's index has its removal queued now (above, or when its paper left)
         supersede(conn, earlier, extraction_id)
     _resolve(conn, sha256, extractor, extraction_id)
@@ -618,8 +646,12 @@ async def _look_up(harness, active, project_id, inputs, pace):
                         raise RunOutcome("cancelled", "project_changed", "revoked") from None
                     else:
                         found, outcome = None, "refused"
-            if not await _write_if_running(write, run_id, lambda conn: _apply(conn, run_id, project_id, mine, scheme,
-                                                                              value, found, outcome)):
+            written = await _write_if_running(write, run_id, lambda conn: _apply(
+                conn, run_id, project_id, mine, scheme, value, found, outcome,
+                lambda conn, project, workflow, inputs: harness.record_in(conn, active, project, workflow, inputs),
+                harness))
+            harness.start_follows(active)  # an index run a title change recorded starts now, not at the lookup's end
+            if not written:
                 break
             resolved += found is not None
             missed += [outcome] if outcome in ("unavailable", "refused") else []
@@ -738,15 +770,16 @@ async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
         await asyncio.sleep(WAIT_SECONDS)
 
 
-def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
+def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, record=None, harness=None):
     """An identifier's outcome for the papers it was found in, [(material id, version id)]: their
     metadata is written only while that version is still the material's current file; a paper whose
     file was replaced meanwhile keeps what its newer file gives (outcome replaced). A retraction
     check is about one DOI: a record of another DOI, or of none, that says nothing on retraction
-    leaves the paper unchecked rather than keeping the old DOI's check."""
+    leaves the paper unchecked rather than keeping the old DOI's check. A changed title is indexed anew
+    (search.retitled), its project's index run requested with record (harness: its runs, for the request)."""
     now = utc_now()
     for material, version in pairs:
-        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI') FROM materials m"
+        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title FROM materials m"
                            " JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
                            " WHERE m.id = ? AND m.project_id = ?",
                            (version, material, project_id)).fetchone()
@@ -759,6 +792,8 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome):
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
                              (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
+                if record is not None and mine.csl["title"] != row[3]:
+                    search.retitled(conn, harness, project_id, material, record)
                 if mine.retracted is None and row[2] != mine.csl.get("DOI"):  # another work, of which no check is known
                     conn.execute("UPDATE materials SET retraction = 'unknown', retraction_checked_at = NULL WHERE id = ?",
                                  (material,))
@@ -956,6 +991,7 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
     it resolved, its retraction check, and the fields of its record the form does not show (type,
     volume, issue, pages). The fields the form shows stay as saved; the file's evidence type stays."""
     state = _state(request)
+    harness = state["harness"]
     changes = body.model_dump(exclude_unset=True)
     if "title" in changes and visible(changes["title"]) is None:
         raise _refused(400, "title_needed", "A paper needs a title")
@@ -965,8 +1001,8 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
         if doi is None:
             raise _refused(400, "invalid_doi", "That is not a DOI")
 
-    def update(conn):
-        row = conn.execute("SELECT title, csl FROM materials WHERE id = ?", (material_id,)).fetchone()
+    def update(conn, ids):
+        row = conn.execute("SELECT title, csl, project_id FROM materials WHERE id = ?", (material_id,)).fetchone()
         if row is None:
             raise _refused(404, "not_found", "No such material")
         csl = json.loads(row[1]) if row[1] else {}
@@ -990,9 +1026,18 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
         conn.execute("UPDATE materials SET title = ?, csl = ?, checked_by = 'researcher', checked_at = ?, updated_at = ?"
                      + (", source_key = NULL, resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL"
                         if moved else "") + " WHERE id = ?", (title, json.dumps(csl), now, now, material_id))
-        return _describe(conn, _material_row(conn, material_id), state["harness"].registry)
+        used = []
 
-    return await _to_end(asyncio.to_thread(state["db"].write, update))
+        def recorded(conn, project, workflow, inputs):  # the index run, which starts with the commit
+            used.append(ids[0])
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
+                         (ids[0], project, workflow, json.dumps(inputs)))
+
+        if title != row[0]:  # the index text carries the title (S1-17)
+            search.retitled(conn, harness, row[2], material_id, recorded)
+        return _describe(conn, _material_row(conn, material_id), harness.registry), used
+
+    return await harness.record_background(1, update)
 
 
 _FORM_FIELDS = ("title", "author", "issued", "container-title", "DOI")  # the CSL fields the details form edits
@@ -1017,12 +1062,12 @@ async def delete_material(material_id: str, request: Request, purge_backups: boo
         "SELECT project_id FROM materials WHERE id = ?", (material_id,)).fetchone())
     if project is None:
         raise _refused(404, "not_found", "No such material")
-
     async def deleting():
         revoked = await asyncio.to_thread(
             delete, state["db"], state["content"], "material", material_id, remove_all_trace=remove_all_trace,
             on_committed=lambda ids: loop.call_soon_threadsafe(harness.revoke, ids))
         harness.revoke(revoked)
+        await search.after_deletion(state, project[0])  # what lacks embeddings now: its project's run is requested
         if not purge_backups:
             return {"ok": True}
         try:
@@ -1184,9 +1229,12 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
     return Response(image, media_type="image/png", headers={"Cache-Control": "no-store"})  # see _no_store
 
 
-def run_details(conn, run_id, workflow, status, inputs, registry):
+def run_details(conn, run_id, workflow, status, inputs, registry, derived=None):
     """What the background-run list shows of a material's run beside its status: the titles of the
-    papers it works on (up to three, with their count), its open ask, and whether Retry applies."""
+    papers it works on (up to three, with their count), its open ask, whether Retry applies, and for
+    an index run whether its project offers the search model's download and whether it rebuilds the
+    project's rows (S1-17). derived: the status the
+    list shows (derived_status), worked out in the same read, which Retry is decided by."""
     if workflow not in _WORKFLOWS:
         return _other(conn, run_id, workflow, status)
     ids = json.loads(inputs or "{}").get("material_ids") or []
@@ -1196,8 +1244,14 @@ def run_details(conn, run_id, workflow, status, inputs, registry):
     (kept,) = conn.execute("SELECT count(*) FROM materials WHERE id IN (SELECT value FROM json_each(?))",
                            (json.dumps(ids),)).fetchone()
     ask = asks.open_asks(conn, run_id=run_id) if status == "running" else []
-    return {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
-            "retryable": _retry(conn, run_id, registry)[1] is None}
+    details = {"materials": {"titles": titles, "count": kept}, "ask": ask[0] if ask else None,
+               "retryable": _retry(conn, run_id, registry, derived)[1] is None}
+    if workflow == "index":  # S1-17: a project's run (no papers named); its reason worded as its project offers the model
+        level = conn.execute("SELECT p.sensitivity FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?",
+                             (run_id,)).fetchone()
+        details["download_offered"] = level is not None and level[0] != "local_only"
+        details["rebuild"] = bool(json.loads(inputs or "{}").get("rebuild"))
+    return details
 
 
 def _live(run_id, registry):
@@ -1238,7 +1292,7 @@ def _unreadable(conn, version_id, registry):
     return None
 
 
-def _retry(conn, run_id, registry):
+def _retry(conn, run_id, registry, derived=None):
     """A retry of a material's run: ((project id, workflow, the new run's inputs), None), or (None,
     (status, code, message)) saying why it cannot be tried again. The background-run list's Retry
     and the retry endpoint both ask this, so the list offers Retry exactly where the endpoint takes
@@ -1247,7 +1301,9 @@ def _retry(conn, run_id, registry):
     earlier extractor version included (its file has no reading by this one); a lookup in a
     project not locked.
     Statuses are read as the list reads them (derived_status): a run left running in the record
-    that this app does not hold is interrupted, so it may be tried again and is not being read."""
+    that this app does not hold is interrupted, so it may be tried again and is not being read.
+    derived, if given, is that status as the list worked it out in this read (the run's state may
+    change between two looks at the registry)."""
     row = conn.execute("SELECT project_id, workflow, status, inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
         return None, (404, "not_found", "No such run")
@@ -1255,10 +1311,14 @@ def _retry(conn, run_id, registry):
     inputs = json.loads(inputs or "{}")
     if inputs.get("retried_by"):  # tried again already: that run is the one to follow, or to try again
         return None, (409, "not_retryable", "This run was tried again already")
-    status = derived_status(status, run_id, registry)
-    if workflow not in _WORKFLOWS or (status not in ("failed", "cancelled", "interrupted")
+    status = derived or derived_status(status, run_id, registry)
+    if workflow not in _WORKFLOWS or workflow == "model_offer" or (status not in ("failed", "cancelled", "interrupted")
                                       and (workflow, status) != ("extract", "succeeded")):  # read by an earlier version
         return None, (409, "not_retryable", "This run cannot be tried again")
+    if workflow == "index":  # S1-17: its project's run requested again (search.request_run), a rebuild again if it
+        # was one or one was pending after it
+        rebuild = inputs.get("rebuild") or (inputs.get("again") or {}).get("rebuild")
+        return (project_id, workflow, {"rebuild": True} if rebuild else {}), None
     kept = [m for m in inputs.get("material_ids", []) if conn.execute(
         "SELECT 1 FROM materials WHERE id = ? AND project_id = ?", (m, project_id)).fetchone()]
     if not kept:
@@ -1305,7 +1365,9 @@ async def retry_run(run_id: str, request: Request):
     retry of it (a second press) gets that same run. An old run left running in the record, held by
     no process (it reads interrupted), is retired (Registry.retire), so no kick holds it from then on,
     and recorded interrupted, so no launch starts it again; one a kick has held again meanwhile is
-    running, and is not tried again."""
+    running, and is not tried again. An index run with a rerun pending (its id given out, S1-17) is
+    retired before the Retry holds that id, so its end never records that run meanwhile; one still held
+    is running (refused), its end recording that run."""
     state = _state(request)
 
     def again(conn, ids):
@@ -1318,16 +1380,57 @@ async def retry_run(run_id: str, request: Request):
             raise _refused(*refusal)
         left_running = _running(conn, run_id)  # it reads interrupted: running in the record, held by no process
         if left_running and not registry.retire(run_id):  # held again meanwhile (a kick started it): running
+            if registry.closed:  # or the app is closing: its resume starts the run again
+                raise _refused(503, "shutting_down", "The app is closing")
             raise _refused(409, "not_retryable", "This run is running")
         project_id, workflow, inputs = retry
-        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
-                     (ids[0], project_id, workflow, json.dumps(inputs)))
+
+        def insert(conn, project, inputs):
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
+                         (ids[0], project, workflow, json.dumps(inputs)))
+            return ids[0]
+        # An index run's retry is a request for its project's run (S1-17): the one running, if one does, runs
+        # again. The run left pending after it (an interface follows its id) is the one this records (pending).
+        retried = search.request_run(conn, registry, project_id, insert, bool(inputs.get("rebuild")),
+                                     run_id=ids[0] if pending else None) if workflow == "index" \
+            else insert(conn, project_id, inputs)
+        if workflow == "index" and not pending:  # S1-17: a rerun it left pending that this did not hold (it was
+            # held when this looked, and ended unrecorded since): its id, given out, ends, superseded by this run
+            left = json.loads(conn.execute("SELECT json_extract(inputs, '$.again') FROM runs WHERE id = ?",
+                                           (run_id,)).fetchone()[0] or "null")
+            if left:
+                search._close_pending(conn, project_id, left["run_id"], "superseded", left.get("rebuild"))
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
-                     (ids[0], run_id))
+                     (retried, run_id))
         if left_running:  # retired: no kick holds it here from now on, and the record says it ended
             _event(conn, run_id, "run_finished", {"status": "interrupted"})
             conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
                          (utc_now(), run_id))
-        return ids[0], ids
+        return retried, started(conn, ids[0])
 
-    return {"run_id": await state["harness"].record_background(1, again)}
+    def started(conn, held):
+        # The id held here starts only if its run was recorded here. One that only marks the project's
+        # running run to run once more (S1-17) is released, inside this transaction, and is held when that
+        # run ends.
+        return [held] if _running(conn, held) else []
+
+    def left_pending(conn):  # S1-17: the id of the run an index run left pending, when none has it yet
+        row = conn.execute("SELECT json_extract(inputs, '$.again.run_id') FROM runs WHERE id = ? AND workflow = 'index'"
+                           " AND json_extract(inputs, '$.retried_by') IS NULL", (run_id,)).fetchone()
+        unused = row and row[0] and conn.execute("SELECT 1 FROM runs WHERE id = ?", (row[0],)).fetchone() is None
+        return [row[0]] if unused else []
+    # One Retry at a time: a second press reads what the first wrote (its run), never the pending id the first
+    # holds (S1-17), whichever write would reach the database first.
+    async with state.setdefault("retry_lock", asyncio.Lock()):
+        registry = state["harness"].registry
+        pending = await asyncio.to_thread(state["db"].read, left_pending)
+        try:
+            if pending:  # S1-17: the run it was pending after must never end (recording it) while this holds its id
+                # retired, it is never held again; held, it runs: refused
+                pending = await asyncio.to_thread(state["db"].read, left_pending) if registry.retire(run_id) else []
+            return {"run_id": await state["harness"].record_background(1, again, ids=pending)}
+        except BaseException:
+            # A Retry refused or failed leaves the run as it was, for a kick or a resume to start again. One whose
+            # retry committed is never started again whatever this undoes (retried_by, its record interrupted).
+            registry.unretire(run_id)
+            raise
