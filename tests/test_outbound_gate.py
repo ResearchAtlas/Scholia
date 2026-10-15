@@ -1918,3 +1918,145 @@ async def test_the_async_client_follows_a_model_download_hop_the_same_way(db, re
         with pytest.raises(OutboundDenied, match="cross_origin_redirect"):
             await client.get(HF_FILE)
     assert [str(r.url) for r in remote.received] == [HF_FILE, HF_CDN, HF_FILE]
+
+
+# S1-15: Zotero's local API, a destination kind of its own (slice-1 spec F3c and section 10; ticket 71)
+
+ZOTERO = "http://127.0.0.1:23119"
+
+
+def zsend(gate, project_id, method, url, asynchronous, follow=False, **kwargs):
+    """One request through a sync or an async Zotero client."""
+    if not asynchronous:
+        with gate.client(project_id, zotero=True, follow_redirects=follow) as client:
+            return client.request(method, url, **kwargs)
+
+    async def run():
+        async with gate.async_client(project_id, zotero=True, follow_redirects=follow) as client:
+            return await client.request(method, url, **kwargs)
+
+    return asyncio.run(run())
+
+ZOTERO_CALLS = [
+    "/api/users/0/groups?format=json",
+    "/api/users/0/collections?format=json&limit=100&start=0",
+    "/api/groups/4711/collections?format=json&limit=100&start=200",
+    "/api/users/0/items/top?format=json&limit=50&start=0",
+    "/api/groups/4711/collections/ABCD2345/items/top?format=json&limit=50&start=50",
+    "/api/users/0/items/ABCD2345?format=json&include=data,csljson",
+    "/api/users/0/items/ABCD2345/children?format=json",
+    "/api/groups/1/items/ABCD234Z/file/view/url",
+]
+ZOTERO_REFUSED = [
+    "/api/", "/api/local/authorize", "/api/local/uploads/ABCD2345", "/connector/ping",
+    "/api/users/0/items/ABCD2345/file", "/api/users/0/items/ABCD2345/file/view",
+    "/api/users/0/items/ABCD2345/fulltext", "/api/users/0/searches", "/api/users/0/tags",
+    "/api/users/1/items/top?format=json&limit=50&start=0", "/api/groups/0/collections?format=json&limit=100&start=0",
+    "/api/users/0/items/abcd2345/children?format=json", "/api/users/0/items/ABCD23456/children?format=json",
+    "/api/users/0/items/ABCD2345%2Fchildren?format=json", "/api/users/0/items/%2E%2E/children?format=json",
+    "/api/users/0//items/ABCD2345/children?format=json", "/api/users/0/items/ABCD2345/children?format=json&v=3",
+    "/api/users/0/items/ABCD2345/children?format=csljson", "/api/users/0/collections?limit=100&format=json&start=0",
+    "/api/users/0/collections?format=json&limit=101&start=0", "/api/users/0/items/top?format=json&limit=50&start=1234567",
+    "/api/users/0/items/ABCD2345?format=json&include=data,csljson,bib", "/api/users/0/groups?format=json&format=json",
+]
+
+
+@pytest.mark.parametrize("level", ["normal", "private", "local_only"])
+@pytest.mark.parametrize("locked", [False, True])
+def test_a_zotero_client_reads_the_allowlisted_calls_at_every_level(db, remote, setup, level, locked):
+    project_id = project(db, level)
+    db.write(lambda conn: conn.execute("UPDATE projects SET review_lock = ? WHERE id = ?", (int(locked), project_id)))
+    with setup.gate.client(project_id, zotero=True) as client:
+        for path in ZOTERO_CALLS:
+            assert client.get(ZOTERO + path, headers={"Zotero-Server-ID": "abc-123"}).status_code == 200
+    assert [request.url.raw_path.decode() for request in remote.received] == ZOTERO_CALLS
+    assert {(row["decision"], row["kind"], row["destination"], row["method"], row["sensitivity"])
+            for _, row in audit(db)} == {("allow", "zotero_local_api", ZOTERO, "GET", level)}
+    assert not any("ABCD" in json.dumps(row) for _, row in audit(db))  # no path or key is kept
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_zotero_client_refuses_every_other_call_and_every_write(db, remote, setup, asynchronous):
+    project_id = project(db)
+    cases = [("GET", path, {}, "zotero_call_not_allowed") for path in ZOTERO_REFUSED] + [
+        ("HEAD", ZOTERO_CALLS[0], {}, "zotero_call_not_allowed"),
+        *[(method, ZOTERO_CALLS[0], {}, "not_a_fetch") for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS")],
+        ("GET", ZOTERO_CALLS[0], {"headers": {"Zotero-API-Key": "k"}}, "credential_to_non_provider"),
+        ("GET", ZOTERO_CALLS[0], {"headers": {"Zotero-Write-Token": "t"}}, "credential_to_non_provider"),
+        ("GET", ZOTERO_CALLS[0], {"headers": {"Authorization": "Bearer x"}}, "credential_to_non_provider"),
+        ("GET", ZOTERO_CALLS[0], {"headers": {"Cookie": "a=b"}}, "credential_to_non_provider"),
+        ("GET", ZOTERO_CALLS[0], {"content": b"x"}, "not_a_fetch"),
+    ]
+    for method, path, options, reason in cases:
+        with pytest.raises(OutboundDenied) as caught:
+            zsend(setup.gate, project_id, method, ZOTERO + path, asynchronous, **options)
+        assert caught.value.reason == reason, (method, path)
+    with pytest.raises(OutboundDenied):
+        zsend(setup.gate, project_id, "GET", "http://user:pw@127.0.0.1:23119" + ZOTERO_CALLS[0], asynchronous)
+    assert remote.received == []
+    assert {row["kind"] for _, row in audit(db)} == {"zotero_local_api"}
+
+
+@pytest.mark.parametrize("url", ["http://localhost:23119", "http://[::1]:23119", "http://127.0.0.1:23120",
+                                 "http://127.0.0.2:23119", "https://127.0.0.1:23119", HELPER, OPENROUTER_API,
+                                 "https://api.openalex.org"])
+def test_a_zotero_client_reaches_nothing_but_zotero(db, remote, setup, url):
+    with setup.gate.client(project(db), zotero=True) as client:
+        refused(client, "GET", url + ZOTERO_CALLS[0], "unknown_destination")
+    assert remote.received == []
+
+
+def test_only_a_zotero_client_reaches_zotero_even_when_a_provider_is_set_there(db, remote, setup):
+    setup.change(provider_urls=(OPENROUTER_API, f"{ZOTERO}/v1"), helper_urls=(ZOTERO,))
+    with setup.gate.client(project(db)) as client:
+        refused(client, "GET", ZOTERO + ZOTERO_CALLS[0], "unknown_destination")
+        refused(client, "POST", f"{ZOTERO}/v1/chat/completions", "unknown_destination", json=chat())
+    assert remote.received == []
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("location", ["file:///Users/someone/Zotero/storage/ABCD2345/paper.pdf",
+                                      "http://example.org/paper.pdf", "http://localhost:23119/api/"])
+def test_a_redirect_from_zotero_never_leads_elsewhere(db, remote, setup, asynchronous, location):
+    url = ZOTERO + ZOTERO_CALLS[-1]
+    remote.redirects[url] = (302, location)
+    with pytest.raises(OutboundDenied) as caught:
+        zsend(setup.gate, project(db), "GET", url, asynchronous, follow=True)
+    assert caught.value.reason == "cross_origin_redirect"
+    assert [str(r.url) for r in remote.received] == [url]
+
+
+def test_a_same_origin_redirect_from_zotero_is_checked_against_the_allowlist(db, remote, setup):
+    url = ZOTERO + ZOTERO_CALLS[-1]
+    remote.redirects[url] = (302, "/api/users/0/items/ABCD234Z/file")
+    with setup.gate.client(project(db), zotero=True, follow_redirects=True) as client:
+        refused(client, "GET", url, "zotero_call_not_allowed")
+    with setup.gate.client(project(db), zotero=True) as client:  # not followed: the 302 is the answer
+        assert client.get(url).status_code == 302
+    assert [str(r.url) for r in remote.received] == [url, url]
+
+
+@pytest.mark.parametrize("ours", [True, False, None])
+def test_zotero_gets_a_request_only_while_this_account_listens_there(db, remote, ours):
+    def listener(host, port):
+        if ours is None:
+            raise OSError("lsof failed")
+        assert (host, port) == ("127.0.0.1", 23119)
+        return ours
+
+    gate = OutboundGate(db, lambda: GateInputs(), transport=httpx.MockTransport(remote), local_listener=listener)
+    with gate.client(project(db), zotero=True) as client:
+        if ours:
+            assert client.get(ZOTERO + ZOTERO_CALLS[0]).status_code == 200
+        else:
+            refused(client, "GET", ZOTERO + ZOTERO_CALLS[0], "local_server_not_yours")
+    assert len(remote.received) == (1 if ours else 0)
+
+
+def test_a_zotero_clients_dispatch_check_stops_it(db, remote, setup):
+    allowed = [True]
+    with setup.gate.client(project(db), zotero=True, admit=lambda conn: allowed[0]) as client:
+        client.get(ZOTERO + ZOTERO_CALLS[0])
+        allowed[0] = False
+        refused(client, "GET", ZOTERO + ZOTERO_CALLS[0], "revoked")
+    assert len(remote.received) == 1
