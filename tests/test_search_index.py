@@ -1535,6 +1535,47 @@ async def test_what_a_failed_close_leaves_of_a_deletion_is_purged_at_the_next_op
 
 
 @pytest.mark.asyncio
+async def test_the_purge_at_open_keeps_a_refused_row_of_a_granted_passage_and_removes_an_ungranted_one(tmp_path,
+                                                                                                         monkeypatch):
+    """The launch purge beside the helper's refusal marks (PR 31; embedded = -1): a refused row of a passage the main
+    database still grants survives the purge, still refused (not asked for again); a refused row of a passage it no
+    longer grants goes with the rest of that paper's rows, before any read."""
+    from backend.db import deletion
+    english = "Quokkas annotate vermilion abacuses"
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [doomed] = (await added(client, project, paper("Quokka Ledger", english)))["materials"]
+        [kept] = (await added(client, project, WAGES))["materials"]
+        await until_embedded(client, project)
+        await background_idle(client)
+        index = client.state["index"]
+
+        def refuse_one_of_each():
+            refused = {}
+            with index._conn:
+                for material in (kept["id"], doomed["id"]):
+                    rowid, pid = index._conn.execute("SELECT id, passage_id FROM index_rows WHERE material_id = ?"
+                                                     " ORDER BY id LIMIT 1", (material,)).fetchone()
+                    index._conn.execute("DELETE FROM vec_passages WHERE rowid = ?", (rowid,))
+                    index._conn.execute("UPDATE index_rows SET embedded = -1 WHERE id = ?", (rowid,))
+                    refused[material] = pid
+            return refused
+        refused = await asyncio.to_thread(index._write, refuse_one_of_each)
+        monkeypatch.setitem(deletion.CLEANUP, client.state["db"], lambda: None)  # left to the next open
+        assert (await client.delete(f"/api/materials/{doomed['id']}")).status_code == 200
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute("DELETE FROM index_queue"))
+    monkeypatch.undo()
+    async with app(tmp_path) as client:
+        left = await asyncio.to_thread(client.state["index"]._read, lambda conn: conn.execute(
+            "SELECT passage_id, material_id, embedded FROM index_rows").fetchall())
+        assert (refused[kept["id"]], kept["id"], -1) in left  # granted, refused: kept as it was
+        assert not any(material == doomed["id"] for _, material, _ in left)  # ungranted: gone, its refused row too
+        status = await idle(client, project)
+        assert status["passages"]["refused"] == 1 and list(status["materials"]) == [kept["id"]]
+        assert client.remote.indexing == []  # the refused passage is not asked for again
+
+
+@pytest.mark.asyncio
 async def test_a_discard_that_fails_as_the_index_closes_fails_the_close(tmp_path, monkeypatch):
     """Finding 44: the close's discard of a file a whole rebuild has not finished, its unlink failing, is the
     close's failure, never a logged success: the database's close raises and close_failed() holds; the next open
