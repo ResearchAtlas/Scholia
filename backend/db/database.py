@@ -301,8 +301,8 @@ class Database:
         (DatabaseClosedError); reads in progress finish first, and a write already
         submitted runs before the writer connection closes. So work still running when
         the app stops gets an error, never a connection closed under it. A backup in
-        progress is stopped, and waited for up to STOP_SECONDS. First the marker is written (if one is set);
-        then writes are refused and those already admitted commit (as hold_writes does); then what reads this
+        progress is stopped, and waited for up to STOP_SECONDS. First writes are refused, then the marker is
+        written (if one is set), then those already admitted commit (as hold_writes does); then what reads this
         database (closing: the search index) is closed, its work drained, so it sees every write that will ever
         commit (a deletion's queued removals). The marker is removed only once every step succeeded. The first
         close() closes it, and one called while it runs, or after, waits for it to finish (but one called from

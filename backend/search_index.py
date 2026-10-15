@@ -410,6 +410,7 @@ class SearchIndex:
             log.warning("the search index was not closed cleanly; it is discarded and rebuilt")
             for suffix in ("", "-wal", "-shm"):
                 Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+            _fsync(self.path.parent)  # the file gone for good before its marker goes
             self.marker.unlink()
             _fsync(self.path.parent)
         self._create()
@@ -512,8 +513,11 @@ class SearchIndex:
         the index closes, an unfinished rebuild's. Every step is tried whatever the others meet; the first
         failure is raised after (as the index closes, its marker then stays, and the next launch discards it)."""
         self.unusable = True
-        conn, self._conn = self._conn, None
-        steps = [conn.close] if conn is not None else []
+
+        def close_conn():  # kept if its close fails, so the close of the index tries it again
+            self._conn.close()
+            self._conn = None
+        steps = [close_conn] if self._conn is not None else []
         steps += [self._close_readers, *(lambda suffix=suffix: Path(f"{self.path}{suffix}").unlink(missing_ok=True)
                                          for suffix in ("", "-wal", "-shm"))]
         failed = None

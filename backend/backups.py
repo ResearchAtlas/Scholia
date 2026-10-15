@@ -858,7 +858,10 @@ async def _roll_back(state, restored, damaged, restore_id):
             log.error("the previous database could not be started again after a failed restore (%s)",
                       type(error).__name__)
             if previous is not None:
-                await asyncio.to_thread(previous.close)
+                try:
+                    await asyncio.to_thread(previous.close)
+                except DatabaseCloseError:  # logged by the close; the app is limited all the same
+                    pass
             damaged_now = isinstance(error, DatabaseDamagedError)
             _limit(state, "database_damaged" if damaged_now else "database_unavailable",
                    "The database could not be opened again after a failed restore; restore a backup")

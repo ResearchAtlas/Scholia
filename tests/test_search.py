@@ -1768,3 +1768,33 @@ async def test_a_request_while_the_app_closes_marks_the_run_left_running(tmp_pat
         [rerun] = [r["run_id"] for r in await runs_of(client, "index", project) if r["run_id"] != run]
         ended = await run_finished(client, rerun)
         assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+
+
+async def test_a_rebuild_whose_projects_run_no_process_holds_starts_that_run_and_then_the_rebuild(tmp_path, monkeypatch):
+    """Review 4, F1: a Rebuild while the project's run is one a failed terminal write left running (held by no
+    process): the answer is that run, which the Rebuild starts at once (no dead end until a turn's end), and the
+    rebuild its end records follows it, as the interface follows them."""
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        from backend.runs import Harness
+        real = Harness._finish_local
+
+        def failing(self, conn, active, status, cancel_reason, summary, effect=None):
+            if active.run_id == run:
+                raise OSError("the disk is full")
+            return real(self, conn, active, status, cancel_reason, summary, effect)
+        monkeypatch.setattr(Harness, "_finish_local", failing)
+        client.remote.hold.set()
+        assert (await run_finished(client, run))["status"] == "interrupted"
+        monkeypatch.setattr(Harness, "_finish_local", real)
+        answer = (await client.post(f"/api/projects/{project}/index/rebuild")).json()
+        assert answer == {"run_id": run, "rebuild_pending": True}
+        assert client.state["harness"].registry.is_active(run)  # started by the Rebuild
+        assert (await run_finished(client, run))["status"] == "succeeded"
+        [rebuild] = [r for r in await runs_of(client, "index", project) if r["run_id"] != run]
+        ended = await run_finished(client, rebuild["run_id"])
+        assert (ended["status"], ended["rebuild"], ended["result"]["rebuilt"]) == ("succeeded", True, True)

@@ -126,7 +126,10 @@ async def open_index(state, db):
         wanted, rebuilding = await asyncio.to_thread(index.open)
     except Exception as error:
         log.error("the search index could not be opened (%s); search is unavailable", type(error).__name__)
-        await asyncio.to_thread(index.close)
+        try:
+            await asyncio.to_thread(index.close)
+        except Exception as failure:  # its marker, if any, stays for the next open
+            log.warning("closing the search index that could not be opened failed (%s)", type(failure).__name__)
         return
     db.closing.append(index.close)  # a restore under way or abandoned, or shutdown: nothing outlives db
     db.marker = index.marker  # kept by a close that fails: the next open discards the file (fail closed)
@@ -195,8 +198,10 @@ def _insert_run(conn, run_id, project_id, inputs):
 
 def request_run(conn, project_id, record, rebuild=False):
     """Ask for the project's index run, in the caller's transaction (see the module's docstring). The
-    project's run is the index run recorded running (unrevoked; at most one: a launch records every one
-    still running interrupted, and a Retry its own): while there is one, it is marked to run once more
+    project's run is the unrevoked index run recorded running (only one is ever recorded: a launch records
+    every one still running interrupted, a Retry its own, and a run's rerun is recorded as it ends; one a
+    failed terminal write left running, held by no process, is it until a kick, a Retry or a launch; a
+    revoked one still ending is not): while there is one, it is marked to run once more
     when it ends, a rebuild if any request asked for one (a Rebuild while a rebuild runs is that one),
     and its id is returned. Else record(conn, project id, inputs) records one, and its id is returned."""
     live = conn.execute(
@@ -221,7 +226,16 @@ async def _request(harness, project_id, rebuild=False):
         run_id = request_run(conn, project_id, lambda conn, project, inputs: _insert_run(conn, ids[0], project, inputs),
                              rebuild)
         return run_id, [ids[0]] if run_id == ids[0] else []
-    return await harness.record_background(1, write)
+    return await _started(harness, await harness.record_background(1, write))
+
+
+async def _started(harness, run_id):
+    """The run a request was answered with, started if no process holds it (one a failed terminal write left
+    running in its record, which reads interrupted): a kick starts it, so the request's work and its rerun are
+    not left waiting for the next turn's end. Returns run_id."""
+    if run_id is not None and not harness.registry.is_active(run_id):
+        await harness.kick_background()
+    return run_id
 
 
 def _installed(state):
@@ -642,4 +656,4 @@ async def rebuild(project_id: str, request: Request):
         return (run_id, not json.loads(inputs or "{}").get("rebuild")), [ids[0]] if run_id == ids[0] else []
 
     run_id, pending = await harness.record_background(1, record)
-    return {"run_id": run_id, "rebuild_pending": pending}
+    return {"run_id": await _started(harness, run_id), "rebuild_pending": pending}
