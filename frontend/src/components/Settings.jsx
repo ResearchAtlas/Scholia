@@ -34,6 +34,7 @@ const POLL_MS = 2000; // ponytail: polled while open; a pushed event stream if t
 const EFFORT_SUGGESTIONS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const LIMITS = ['agent_steps', 'tool_calls', 'turn_minutes'];
 WORKFLOWS.merge = 'settings.workflowMerge'; // S1-14: a reference file's record merged into a paper
+WORKFLOWS.zotero_import = 'settings.workflowZotero'; // S1-15: importing from Zotero
 const ROLES = ['council', 'chairman', 'router', 'judge', 'extractor'];
 const MAX_SUBAGENT_MODELS = 5;
 
@@ -104,6 +105,13 @@ function General({ onLanguage, projectId }) {
           <CommitField id="conversation-budget" type="number" above={0} value={values.budget.conversation_usd}
             suggestions={BUDGET_SUGGESTIONS}
             onCommit={checked(setProblem, (value) => personal.save({ 'budget.conversation_usd': value }))} />
+        </div>
+      </Field>
+      <Field label={t('settings.zotero')} hint={t('settings.zoteroHint')}>
+        <div>
+          <Segmented label={t('settings.zotero')} value={values.zotero?.enabled === false ? 'off' : 'on'}
+            options={[{ value: 'on', label: t('settings.zoteroOn') }, { value: 'off', label: t('settings.zoteroOff') }]}
+            onChange={(value) => personal.save({ 'zotero.enabled': value === 'on' })} />
         </div>
       </Field>
       <InstructionsEditor label={t('settings.personalInstructions')} hint={t('settings.personalInstructionsHint')}

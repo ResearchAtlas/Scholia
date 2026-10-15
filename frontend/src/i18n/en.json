@@ -1003,5 +1003,110 @@
   "errors.target_changed": "The server's address changed since it was shown. Check it, then declare it again.",
   "errors.key_changed": "The key changed since it was shown. Read the statement again, then confirm.",
   "errors.export_failed": "The audit log could not be written to the data folder.",
-  "audit.pair": "{field}: {value}"
+  "audit.pair": "{field}: {value}",
+  "library.addMenu.zotero": "Zotero…",
+  "settings.workflowZotero": "Importing from Zotero",
+  "settings.zotero": "Zotero",
+  "settings.zoteroHint": "Add, then Zotero, reads your Zotero library through Zotero's local API on this Mac. Scholia only reads it and never changes your library.",
+  "settings.zoteroOn": "On",
+  "settings.zoteroOff": "Off",
+  "audit.kind.zotero_local_api": "Zotero's local API",
+  "audit.reason.zotero_call_not_allowed": "not a Zotero request Scholia makes",
+  "ask.identifier_lookup.bodyZotero": "This project is Local only. Only each DOI is sent, one at a time, never your files or anything else. The answer covers the papers this Zotero import added or updated, not later ones.",
+  "ask.merge.bodyZotero": "Merge keeps the paper in this project and fills in only what it lacks from the Zotero item's record; the item's PDF is not added. Keep both imports the Zotero item as a paper of its own, with its PDF.",
+  "ask.merge.recordZotero": "From Zotero",
+  "library.source.fromZotero": "From Zotero",
+  "library.source.zoteroLocked": "From Zotero: a review-locked project never looks identifiers up",
+  "library.source.zoteroCompletedFrom": "From Zotero, completed from {source}, {date}",
+  "library.source.zotero.not_found": "From Zotero: no record was found for its DOI",
+  "library.source.zotero.unavailable": "From Zotero: the lookup got no answer, so details may be missing",
+  "library.source.zotero.refused": "From Zotero: this project's protection did not allow the lookup",
+  "library.reason.pdf_missing": "Zotero names no PDF file for it on this Mac, so only its details were imported.",
+  "library.reason.pdf_not_local": "Its PDF is not on this Mac (Zotero names a file elsewhere), so only its details were imported.",
+  "library.reason.pdf_on_network": "Its PDF is on a network drive, which Scholia does not read, so only its details were imported.",
+  "library.reason.pdf_not_downloaded": "Its PDF is in cloud storage and not downloaded to this Mac, so only its details were imported. Download it, then import the item again.",
+  "library.reason.pdf_not_a_file": "What Zotero names as its PDF is not a file, so only its details were imported.",
+  "library.reason.pdf_too_large": "Its PDF is larger than Scholia reads (100 MB), so only its details were imported.",
+  "library.reason.pdf_not_a_pdf": "What Zotero names as its PDF is not a PDF, so only its details were imported.",
+  "library.reason.pdf_unreadable": "Its PDF could not be read, so only its details were imported.",
+  "errors.zotero_off": "Zotero is turned off in Scholia. Turn it on in Settings, General.",
+  "errors.zotero_not_running": "Zotero is not running. Open Zotero, then try again.",
+  "errors.zotero_api_off": "Zotero's local API is off. In Zotero, open Settings, then Advanced, and turn on “Allow other applications on this computer to communicate with Zotero”.",
+  "errors.zotero_not_yours": "The program at Zotero's address is not run by your account, so Scholia did not read it.",
+  "errors.zotero_unavailable": "Zotero did not answer as expected. Try again.",
+  "errors.zotero_changed": "A different Zotero library answered than the one you browsed. Check Zotero again, then choose the items again.",
+  "zotero.title": "Import from Zotero",
+  "zotero.description": "Scholia reads your Zotero library through Zotero's local API on this Mac. It only reads, and never changes your library.",
+  "zotero.status.checking": "Checking Zotero…",
+  "zotero.status.ready": "Connected to Zotero",
+  "zotero.status.off": "Zotero is turned off in Scholia",
+  "zotero.status.not_running": "Zotero is not running",
+  "zotero.status.api_off": "Zotero's local API is off",
+  "zotero.status.not_yours": "The program at Zotero's address is not run by your account",
+  "zotero.status.unsupported": "This Zotero cannot be read: Scholia needs Zotero 7 or later",
+  "zotero.status.error": "Zotero's status could not be checked",
+  "zotero.howToTurnOn": "In Zotero, open Settings, then Advanced, and turn on “Allow other applications on this computer to communicate with Zotero”. Then check again.",
+  "zotero.howToStart": "Open Zotero on this Mac, then check again.",
+  "zotero.howToUpdate": "Update Zotero to version 7 or later, then check again.",
+  "zotero.howToSwitchOn": "Turn it on in Settings, General.",
+  "zotero.checkAgain": "Check again",
+  "zotero.library": "Library",
+  "zotero.myLibrary": "My Library",
+  "zotero.collections": "Collections",
+  "zotero.allItems": "All items",
+  "zotero.items": "Items",
+  "zotero.itemCount": {
+    "one": "{count} item",
+    "other": "{count} items"
+  },
+  "zotero.untitled": "Untitled item",
+  "zotero.noItems": "No items here.",
+  "zotero.more": "Show more",
+  "zotero.chosen": {
+    "one": "{count} chosen",
+    "other": "{count} chosen"
+  },
+  "zotero.tooMany": "Choose at most {max} items for one import.",
+  "zotero.import": {
+    "one": "Import {count} item",
+    "other": "Import {count} items"
+  },
+  "zotero.importing": "Importing {done} of {total}…",
+  "zotero.done": "Done",
+  "zotero.report.imported": {
+    "one": "Imported {count} paper.",
+    "other": "Imported {count} papers."
+  },
+  "zotero.report.updated": {
+    "one": "{count} paper imported before was updated.",
+    "other": "{count} papers imported before were updated."
+  },
+  "zotero.report.versions": {
+    "one": "{count} of them has a new version of its PDF.",
+    "other": "{count} of them have a new version of their PDF."
+  },
+  "zotero.report.unchanged": {
+    "one": "{count} paper imported before is unchanged.",
+    "other": "{count} papers imported before are unchanged."
+  },
+  "zotero.report.waiting": {
+    "one": "{count} duplicate waits for your answer.",
+    "other": "{count} duplicates wait for your answer."
+  },
+  "zotero.report.already": {
+    "one": "{count} was in the project already, with nothing to add.",
+    "other": "{count} were in the project already, with nothing to add."
+  },
+  "zotero.report.pdfNotRead": {
+    "one": "{count} PDF could not be read: its paper has its details only, with the reason under Details.",
+    "other": "{count} PDFs could not be read: their papers have their details only, with the reason under Details."
+  },
+  "zotero.report.notFound": {
+    "one": "{count} item was not found in Zotero: deleted, in the trash, or a note.",
+    "other": "{count} items were not found in Zotero: deleted, in the trash, or notes."
+  },
+  "zotero.report.noTitle": {
+    "one": "{count} item was skipped: it has no title.",
+    "other": "{count} items were skipped: they have no title."
+  }
 }

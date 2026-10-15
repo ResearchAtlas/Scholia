@@ -983,5 +983,98 @@
   "errors.target_changed": "服务器地址在显示之后已更改。请核对后再次声明。",
   "errors.key_changed": "密钥在显示之后已更改。请重新阅读声明后再确认。",
   "errors.export_failed": "无法把审计日志写入数据文件夹。",
-  "audit.pair": "{field}：{value}"
+  "audit.pair": "{field}：{value}",
+  "library.addMenu.zotero": "Zotero…",
+  "settings.workflowZotero": "从 Zotero 导入",
+  "settings.zotero": "Zotero",
+  "settings.zoteroHint": "“添加”中的 Zotero 通过本机上 Zotero 的本地 API 读取你的 Zotero 文献库。Scholia 只读取，从不修改你的文献库。",
+  "settings.zoteroOn": "开启",
+  "settings.zoteroOff": "关闭",
+  "audit.kind.zotero_local_api": "Zotero 本地 API",
+  "audit.reason.zotero_call_not_allowed": "不是 Scholia 会发出的 Zotero 请求",
+  "ask.identifier_lookup.bodyZotero": "本项目为“仅本机”。只会逐个发送 DOI，绝不发送你的文件或其他内容。此回答只适用于这次从 Zotero 导入时添加或更新的文献，不适用于之后的文献。",
+  "ask.merge.bodyZotero": "合并会保留本项目中的文献，只用 Zotero 条目的记录补充它缺少的信息，不添加该条目的 PDF。都保留会把这个 Zotero 条目连同 PDF 作为一篇单独的文献导入。",
+  "ask.merge.recordZotero": "来自 Zotero",
+  "library.source.fromZotero": "来自 Zotero",
+  "library.source.zoteroLocked": "来自 Zotero：评审锁定的项目从不查询标识符",
+  "library.source.zoteroCompletedFrom": "来自 Zotero，并由 {source} 补全，{date}",
+  "library.source.zotero.not_found": "来自 Zotero：没有找到其 DOI 的记录",
+  "library.source.zotero.unavailable": "来自 Zotero：查询没有得到回应，信息可能不完整",
+  "library.source.zotero.refused": "来自 Zotero：本项目的保护级别不允许查询",
+  "library.reason.pdf_missing": "Zotero 没有给出它在本机上的 PDF 文件，因此只导入了它的信息。",
+  "library.reason.pdf_not_local": "它的 PDF 不在本机上（Zotero 给出的文件在其他位置），因此只导入了它的信息。",
+  "library.reason.pdf_on_network": "它的 PDF 在网络驱动器上，Scholia 不读取这类文件，因此只导入了它的信息。",
+  "library.reason.pdf_not_downloaded": "它的 PDF 在云存储中，尚未下载到本机，因此只导入了它的信息。请先下载，再重新导入该条目。",
+  "library.reason.pdf_not_a_file": "Zotero 给出的 PDF 不是文件，因此只导入了它的信息。",
+  "library.reason.pdf_too_large": "它的 PDF 超过了 Scholia 可读取的大小（100 MB），因此只导入了它的信息。",
+  "library.reason.pdf_not_a_pdf": "Zotero 给出的 PDF 实际上不是 PDF，因此只导入了它的信息。",
+  "library.reason.pdf_unreadable": "无法读取它的 PDF，因此只导入了它的信息。",
+  "errors.zotero_off": "Scholia 中的 Zotero 已关闭。请在“设置”的“通用”中开启。",
+  "errors.zotero_not_running": "Zotero 没有运行。请打开 Zotero 后重试。",
+  "errors.zotero_api_off": "Zotero 的本地 API 已关闭。请在 Zotero 中打开“设置”，进入“高级”，开启“允许此计算机上的其他应用程序与 Zotero 通信”。",
+  "errors.zotero_not_yours": "占用 Zotero 地址的程序不是由你的账户运行的，因此 Scholia 没有读取它。",
+  "errors.zotero_unavailable": "Zotero 的回应不符合预期。请重试。",
+  "errors.zotero_changed": "回应的 Zotero 文献库与你浏览的不是同一个。请重新检查 Zotero，再重新选择条目。",
+  "zotero.title": "从 Zotero 导入",
+  "zotero.description": "Scholia 通过本机上 Zotero 的本地 API 读取你的 Zotero 文献库。它只读取，从不修改你的文献库。",
+  "zotero.status.checking": "正在检查 Zotero…",
+  "zotero.status.ready": "已连接 Zotero",
+  "zotero.status.off": "Scholia 中的 Zotero 已关闭",
+  "zotero.status.not_running": "Zotero 没有运行",
+  "zotero.status.api_off": "Zotero 的本地 API 已关闭",
+  "zotero.status.not_yours": "占用 Zotero 地址的程序不是由你的账户运行的",
+  "zotero.status.unsupported": "无法读取这个 Zotero：Scholia 需要 Zotero 7 或更高版本",
+  "zotero.status.error": "无法检查 Zotero 的状态",
+  "zotero.howToTurnOn": "请在 Zotero 中打开“设置”，进入“高级”，开启“允许此计算机上的其他应用程序与 Zotero 通信”，然后再检查一次。",
+  "zotero.howToStart": "请在本机上打开 Zotero，然后再检查一次。",
+  "zotero.howToUpdate": "请把 Zotero 更新到 7 或更高版本，然后再检查一次。",
+  "zotero.howToSwitchOn": "请在“设置”的“通用”中开启。",
+  "zotero.checkAgain": "再次检查",
+  "zotero.library": "文献库",
+  "zotero.myLibrary": "我的文献库",
+  "zotero.collections": "分类",
+  "zotero.allItems": "所有条目",
+  "zotero.items": "条目",
+  "zotero.itemCount": {
+    "other": "{count} 个条目"
+  },
+  "zotero.untitled": "无标题条目",
+  "zotero.noItems": "这里没有条目。",
+  "zotero.more": "显示更多",
+  "zotero.chosen": {
+    "other": "已选 {count} 个"
+  },
+  "zotero.tooMany": "一次导入最多选择 {max} 个条目。",
+  "zotero.import": {
+    "other": "导入 {count} 个条目"
+  },
+  "zotero.importing": "正在导入，第 {done} 个，共 {total} 个…",
+  "zotero.done": "完成",
+  "zotero.report.imported": {
+    "other": "已导入 {count} 篇文献。"
+  },
+  "zotero.report.updated": {
+    "other": "已更新 {count} 篇之前导入的文献。"
+  },
+  "zotero.report.versions": {
+    "other": "其中 {count} 篇有了新版本的 PDF。"
+  },
+  "zotero.report.unchanged": {
+    "other": "{count} 篇之前导入的文献没有变化。"
+  },
+  "zotero.report.waiting": {
+    "other": "{count} 篇重复文献等待你的回答。"
+  },
+  "zotero.report.already": {
+    "other": "{count} 篇已在项目中，没有可补充的信息。"
+  },
+  "zotero.report.pdfNotRead": {
+    "other": "{count} 个 PDF 无法读取：对应文献只有其信息，原因见“详情”。"
+  },
+  "zotero.report.notFound": {
+    "other": "在 Zotero 中没有找到 {count} 个条目：已删除、在回收站中，或是笔记。"
+  },
+  "zotero.report.noTitle": {
+    "other": "跳过了 {count} 个条目：没有标题。"
+  }
 }

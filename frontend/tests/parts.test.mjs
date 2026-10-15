@@ -92,7 +92,7 @@ function imports(text, file) {
 }
 
 test('Settings, a paper\'s page and the Markdown renderer load only through Parts.jsx\'s import()', () => {
-  const LATER = ['components/Settings.jsx', 'components/Paper.jsx', 'markdown.js'];
+  const LATER = ['components/Settings.jsx', 'components/Paper.jsx', 'markdown.js', 'components/ZoteroBrowser.jsx']; // S1-15: the Zotero browser
   const found = Object.fromEntries(readdirSync(SRC, { recursive: true }).filter((name) => /\.jsx?$/.test(name))
     .map((name) => [name, imports(readFileSync(join(SRC, name), 'utf8'), name)]));
   assert.deepEqual(Object.entries(found).flatMap(([name, { static: sources }]) => sources
@@ -145,7 +145,7 @@ test('every part has a fallback and a failure, and the failure offers Try again 
   const config = [{ files: ['**/*.jsx'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } },
     plugins: { check: { rules: { parts: rule } } }, rules: { 'check/parts': 'error' } }];
   assert.deepEqual(new Linter().verify(text, config, 'Parts.jsx').filter((m) => m.fatal), []);
-  assert.deepEqual(found.boundaries, [['failed', 'fallback'], ['failed', 'fallback'], ['failed', 'fallback']]);
+  assert.deepEqual(found.boundaries, [['failed', 'fallback'], ['failed', 'fallback'], ['failed', 'fallback'], ['failed', 'fallback']]);
   assert.deepEqual(found.loadStates, [{ problem: 'part_not_loaded', onRetry: '() => window.location.reload()' }]);
   assert.equal(found.statuses, 1); // the one loading status every fallback uses
   assert.ok(en['errors.part_not_loaded'] && zhCN['errors.part_not_loaded']);
