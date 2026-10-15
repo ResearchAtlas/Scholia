@@ -81,7 +81,7 @@ DOCS = [("d1", "Coral bleaching", "Coral reefs bleach when ocean temperatures ri
         ("d5", "", "")]
 QUERIES = [("q1", "coral reefs bleach ocean temperatures", {"d1": 2}),
            ("q2", "drought wheat yields", {"d2": 1, "d4": 1, "d3": 0}),
-           ("q3", "songbirds migrate stars", {"d3": 1})]
+           ("q3", "songbirds migrate stars", {"d3": 1, "d5": 1})]
 
 
 def _sets(folder):
@@ -274,7 +274,8 @@ async def test_a_full_run_builds_through_the_app_scores_each_benchmark_apart_and
     assert beir["keys"] is None and beir["query_language"] == beir["document_language"] == "en"
     hybrid = beir["arms"]["hybrid"]
     assert hybrid["complete"] and hybrid["fallbacks"] == {}
-    assert hybrid["metrics"]["ndcg@10"]["n"] == 3 and hybrid["metrics"]["ndcg@10"]["mean"] > 0.9
+    assert hybrid["metrics"]["ndcg@10"]["n"] == 3 and hybrid["metrics"]["ndcg@10"]["mean"] > 0.8
+    assert beir["relevant_documents_not_indexed"] == 1  # d5 has no title or text: judged, never searchable
     assert beir["arms"]["keyword_only"]["minus_hybrid"]["ndcg@10"]["n"] == 3
     assert beir["build"]["passages"] == 3 and beir["build"]["passage_chars"]["n"] == 3
     assert beir["commit"] == {"sha": "test", "modified": False} and beir["started_at"] <= beir["finished_at"]

@@ -574,6 +574,9 @@ async def evaluate(name, bench, boot, files, chosen, client, state, install, arm
                             # BEIR's evaluate drops a document whose id is the query's; LitSearch's keys are positions
                             **({"specific": specific[0]} if specific else {"drop": qid})})
         record["exclusions"] = {"query_empty_or_too_long": skipped}
+        indexed = {doc for held in documents_of.values() for doc in held}  # judged relevant, but never searchable
+        record["relevant_documents_not_indexed"] = sum(1 for q in queries for doc, grade in q["relevant"].items()
+                                                       if grade > 0 and doc not in indexed)
 
         def rank(answer, query):  # a document at its best passage's rank
             ranked = metrics.documents([r["material_id"] for r in answer["results"]], lambda m: documents_of.get(m, ()))
@@ -816,8 +819,8 @@ def report(results):
                   + "; ".join(f"{arm} {e['search_seconds']['median']}, {e['search_seconds']['p95']}"
                               for arm, e in bench["arms"].items() if e.get("search_seconds")), ""]
         for key in ("evidence_items_mapped", "evidence_items_unmatched", "figure_or_table_items_dropped", "documents",
-                    "documents_empty",
-                    "documents_sharing_a_file", "queries_with_fewer_documents_than_largest_cutoff"):
+                    "documents_empty", "documents_sharing_a_file", "relevant_documents_not_indexed",
+                    "queries_with_fewer_documents_than_largest_cutoff"):
             if key in bench:
                 lines.append(f"- {key.replace('_', ' ')}: {bench[key]}")
         lines.append("")
