@@ -120,6 +120,9 @@ test('a request that finds the app limited tells the window, so it can offer the
   assert.deepEqual(seen, ['scholia:limited', 'scholia:limited', 'scholia:limited']);
   const app = readFileSync(fileURLToPath(new URL('../src/App.jsx', import.meta.url)), 'utf8');
   assert.match(app, /restart=\{state\.health\?\.limited === 'restart_required'\}/);
+  // each limited answer reads health again, so a failed restore's restore_interrupted gives way to its
+  // restart_required (the backend ranks it first) and the window shows the restart screen
+  assert.match(app, /if \(health\.database_damaged\) setState\(\{ phase: 'damaged', health \}\)/);
   for (const key of ['backups.restartTitle', 'backups.restartBody']) {
     for (const catalog of [en, zhCN]) assert.ok(key in catalog, key);
   }

@@ -982,7 +982,7 @@ async def test_a_replayed_restore_whose_database_fails_to_close_is_not_put_back_
     monkeypatch.setattr(Database, "_close_writer", close_writer)
     monkeypatch.setattr(backups_module, "_back", lambda *args, **kwargs: put_back.append(args) or real_back(*args, **kwargs))
     async with started(data, setup=False) as client:
-        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"
+        assert (await client.get("/api/projects")).json()["code"] == "restart_required"  # outranks restore_interrupted
     assert put_back == [] and (data / "backups" / backups_module.JOURNAL).exists()
 
 
@@ -1009,5 +1009,5 @@ async def test_a_replay_that_ran_but_could_not_commit_and_whose_close_fails_is_n
     monkeypatch.setattr(Database, "_close_writer", close_writer)
     monkeypatch.setattr(backups_module, "_back", lambda *args, **kwargs: put_back.append(args) or real_back(*args, **kwargs))
     async with started(data, setup=False) as client:
-        assert (await client.get("/api/projects")).json()["code"] == "restore_interrupted"
+        assert (await client.get("/api/projects")).json()["code"] == "restart_required"  # outranks restore_interrupted
     assert closes and put_back == [] and (data / "backups" / backups_module.JOURNAL).exists()

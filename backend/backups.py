@@ -33,7 +33,6 @@ import shutil
 import sqlite3
 import threading
 import uuid
-from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -47,7 +46,7 @@ from backend import APP_VERSION, i18n
 from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
 from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
-    list_generations
+    closing_connection, list_generations
 from backend.db.migrations import MIGRATIONS
 from backend.runs import RunOutcome, _through
 from backend.settings import known_only, write_private
@@ -146,7 +145,10 @@ def _limit(state, code, reason):
 def limited(state):
     """(code, why) when only LIMITED is served, else None: the app was limited (_limit), or the
     database it runs on found itself damaged since it opened (the full check of a backup, at
-    launch, while idle or asked for), which stops its writes."""
+    launch, while idle or asked for), which stops its writes. A close that failed in this process
+    (close_failed) outranks them all: restart_required, until the app is opened again."""
+    if close_failed():
+        return "restart_required", "A close failed in this process; open Scholia again"
     if "damaged" in state:
         return state.get("damaged_code", "database_damaged"), state["damaged"]
     db = state.get("db")
@@ -571,7 +573,7 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
     try:
         with _backup_errors():
             info = db.snapshot(staging / "copy")
-        with closing(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro", uri=True)) as copy:
+        with closing_connection(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro", uri=True)) as copy:
             sensitive, projects = copy.execute(
                 f"SELECT count(*) FILTER (WHERE sensitivity IN {SENSITIVE}), count(*) FROM projects").fetchone()
             # Only the files the copy's records refer to: one of a project deleted moments ago, which
@@ -895,7 +897,7 @@ def _stage(data_dir, body, staging):
         raise BackupError(409, "newer_schema", str(error)) from None
     except (ForeignDatabaseError, DatabaseDamagedError, sqlite3.DatabaseError):
         raise BackupError(400, "backup_damaged", "The backup's database is damaged or not Scholia's") from None
-    with closing(check):
+    with closing_connection(check):
         if check.execute("SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)").fetchone()[0]:
             raise BackupError(400, "backup_damaged", "The backup's database is empty")
 

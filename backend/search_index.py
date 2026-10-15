@@ -60,7 +60,7 @@ import apsw.fts5
 import sqlite_vec
 
 from backend.db import DatabaseClosedError
-from backend.db.database import note_close_failed
+from backend.db.database import close_connection, note_close_failed
 from backend.db.deletion import _reads_now
 from backend.settings import _make_private_dirs
 
@@ -263,7 +263,7 @@ def self_check(folder):
         return {"sqlite": apsw.sqlite_lib_version(), "apsw": apsw.apsw_version(),
                 "sqlite_vec": conn.execute("SELECT vec_version()").get}
     finally:
-        conn.close()
+        close_connection(conn)
 
 
 def high_water(conn):
@@ -345,8 +345,8 @@ class SearchIndex:
         with self._lock:
             if self.closed:
                 raise DatabaseClosedError("the search index is closed")
-            if self.unusable:
-                raise Unavailable()
+            if self.unusable or self.building:  # a whole rebuild asked for or under way: the old file, never purged,
+                raise Unavailable()               # is not read; nor a partial one (fail closed, as an unusable file)
             generation = self._generation
             self._reading += 1
         try:
@@ -367,7 +367,7 @@ class SearchIndex:
                         self._readers.put(conn)
                 if not keep:  # a replaced file's
                     try:
-                        conn.close()
+                        close_connection(conn)  # a failure sets close_failed() at once
                     except Exception as error:  # the index's close fails with it (_drain_reads)
                         with self._lock:
                             self._read_failures.append(error)
@@ -389,7 +389,7 @@ class SearchIndex:
             except queue.Empty:
                 break
             try:
-                conn.close()
+                close_connection(conn)  # a failure sets close_failed() at once
             except Exception as error:  # the index's close fails with it, whenever this ran (_drain_reads)
                 with self._lock:
                     self._read_failures.append(error)
@@ -543,8 +543,8 @@ class SearchIndex:
         failure is raised after (as the index closes, the close then fails, and the next open purges the file)."""
         self.unusable = True
 
-        def close_conn():  # kept if its close fails, so the close of the index tries it again
-            self._conn.close()
+        def close_conn():  # kept if its close fails, so the close of the index tries it again (close_failed() is set)
+            close_connection(self._conn)
             self._conn = None
         steps = [close_conn] if self._conn is not None else []
         steps += [self._close_readers, *(lambda suffix=suffix: Path(f"{self.path}{suffix}").unlink(missing_ok=True)
@@ -593,7 +593,7 @@ class SearchIndex:
         if self.closed:
             return False
         if self._conn is not None:
-            self._conn.close()
+            close_connection(self._conn)  # a failure sets close_failed() at once, whatever a retry then does
             self._conn = None
         self._close_readers()
         for suffix in ("", "-wal", "-shm"):
@@ -1008,7 +1008,7 @@ class SearchIndex:
                     except Exception as error:
                         failed = failed or error
                 self._conn = None
-                conn.close()
+                close_connection(conn)
                 if failed is not None:
                     raise failed
         failures = []  # every step is tried whatever failed before; the first failure is the close's

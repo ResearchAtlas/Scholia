@@ -1548,6 +1548,8 @@ async def test_a_failed_restore_whose_restored_database_fails_to_close_puts_noth
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
         assert moved == [] and (data / "backups" / backups_module.JOURNAL).exists()
+        # recheck 5, finding 5: the failed close outranks the interrupted restore, so the window says to restart
+        assert (await client.get("/api/health")).json()["limited"] == "restart_required"
         monkeypatch.setattr(backups_module, "_put_in_place", lambda *args: moved.append("put") or real_put(*args))
         again = await client.post("/api/backups/restore", json={"generation": backup})
         assert (again.status_code, again.json()["code"]) == (409, "restart_required") and moved == []
@@ -1566,7 +1568,7 @@ async def test_after_a_failed_close_a_restore_is_refused_before_it_stops_anythin
         response = await client.post("/api/backups/restore", json={"generation": backup})
         assert (response.status_code, response.json()["code"]) == (409, "restart_required")
         assert not client.state["harness"].registry.closed  # nothing was stopped
-        assert (await client.get(f"/api/projects/{project}")).status_code == 200
+        assert (await client.get("/api/health")).json()["limited"] == "restart_required"  # the window: open it again
         staged = data / "backups" / ".staged-test"
         staged.mkdir(parents=True)
         with pytest.raises(backups_module.ReplacementRefused):

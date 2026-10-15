@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -84,6 +84,25 @@ def note_close_failed():
     _close_failed.set()
 
 
+def close_connection(conn):
+    """Close a database connection (sqlite3 or APSW, of the main database or the search index): every one is
+    closed through here. A close that fails sets close_failed() at once, whoever catches its error, and raises."""
+    try:
+        conn.close()
+    except BaseException:
+        _close_failed.set()
+        raise
+
+
+@contextmanager
+def closing_connection(conn):
+    """conn, closed through close_connection as the block ends (the with form of it)."""
+    try:
+        yield conn
+    finally:
+        close_connection(conn)
+
+
 class DatabaseDamagedError(RuntimeError):
     """An integrity check failed. Writing stops and the file is left as it is."""
 
@@ -138,7 +157,7 @@ class Database:
             # empty one to it on every open), so they are owner-only too.
             _create_private(self.path)
         except FileExistsError:  # refuse another app's, a newer or a damaged file before anything writes to it
-            _open_checked(self.path, "quick_check", latest=len(migrations)).close()
+            close_connection(_open_checked(self.path, "quick_check", latest=len(migrations)))
         self._writer = ThreadPoolExecutor(1, thread_name_prefix="scholia-db-writer")
         try:
             self._writer_ident = self._writer.submit(self._open_writer, migrations).result()
@@ -286,7 +305,7 @@ class Database:
             try:
                 info = self._copy(source, Path(target))
             finally:
-                source.close()
+                close_connection(source)
         self._retry_truncation()
         return info
 
@@ -362,7 +381,7 @@ class Database:
                         self._reads_done.wait()
                     readers, self._readers = self._readers, []
                 for conn in readers:
-                    attempt(conn.close)
+                    attempt(lambda conn=conn: close_connection(conn))
             attempt(readers)
 
             def stopped():
@@ -465,7 +484,7 @@ class Database:
         if self._damaged:
             # Closing the last connection would checkpoint the WAL into the damaged file.
             self._conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-        self._conn.close()
+        close_connection(self._conn)
 
     # Backups
 
@@ -493,7 +512,7 @@ class Database:
                 shutil.rmtree(published or tmp, ignore_errors=True)
                 raise
         finally:
-            source.close()
+            close_connection(source)
         self._apply_retention(keep=generation)
         return generation
 
@@ -540,11 +559,13 @@ class Database:
             except sqlite3.OperationalError:
                 self._raise_if_closed()
                 raise
-            with closing(check):
+            try:
                 schema_version = check.execute("PRAGMA user_version").fetchone()[0]
                 has_projects = check.execute("SELECT 1 FROM sqlite_schema WHERE name = 'projects'").fetchone()
                 projects = {project_id for (project_id,) in check.execute("SELECT id FROM projects")} \
                     if has_projects else set()  # before migration 0001
+            finally:
+                close_connection(check)
             self._raise_if_closed()
             _copy_settings(self.data_dir, target, projects)
             if _file_state(self.data_dir) == before:
@@ -601,7 +622,7 @@ def _connect(path, *, readonly=False, check_same_thread=True):
         for pragma in _PRAGMAS:
             conn.execute(f"PRAGMA {pragma}")
     except BaseException:
-        conn.close()
+        close_connection(conn)
         raise
     return conn
 
@@ -651,7 +672,7 @@ def _open_checked(path, check, latest=None, stop=None):
         return conn
     except BaseException as error:
         if conn is not None:
-            conn.close()
+            close_connection(conn)
         if _is_damage(error):
             raise DatabaseDamagedError(f"{check} failed: {error}") from error
         raise
@@ -700,7 +721,7 @@ def _check_identity(uri, latest):
         raise DatabaseDamagedError(f"the file cannot be read as a database: {error}") from error
     finally:
         if conn is not None:
-            conn.close()
+            close_connection(conn)
 
 
 def _usable_state(conn, latest):

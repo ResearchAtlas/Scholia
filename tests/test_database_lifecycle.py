@@ -1150,3 +1150,32 @@ def test_a_closed_database_says_so_even_to_a_thread_given_its_writers_id(tmp_pat
     monkeypatch.setattr(database_module.threading, "get_ident", lambda: writer)  # thread ids are reused
     with pytest.raises(DatabaseClosedError):
         db.write(add_audit_row)
+
+
+@pytest.mark.parametrize("taking", ["snapshot", "backup"])
+def test_a_backup_source_whose_close_fails_sets_the_flag_at_once(tmp_path, monkeypatch, taking):
+    """PR 29 recheck 5, finding 3: the separate source connection a snapshot or a backup reads, its close failing,
+    sets close_failed() at that moment (that connection is no reader the database's close would find)."""
+    from backend.db import close_failed
+    db = Database(tmp_path / "data")
+    real = database_module._open_checked
+
+    class Failing:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def close(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    def opened(path, check, latest=None, stop=None):
+        conn = real(path, check, latest=latest, stop=stop)
+        return Failing(conn) if check == "integrity_check" else conn
+    monkeypatch.setattr(database_module, "_open_checked", opened)
+    with pytest.raises(sqlite3.OperationalError):
+        db.snapshot(tmp_path / "copy") if taking == "snapshot" else db.backup()
+    assert close_failed()
+    monkeypatch.setattr(database_module, "_open_checked", real)
+    db.close()
