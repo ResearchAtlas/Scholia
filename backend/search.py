@@ -6,7 +6,8 @@ Index runs (workflow `index`) belong to a project and name no papers: each time,
 queue (keyword search), rebuilds the project's rows if asked (`inputs.rebuild`), checks the project's
 rows against the main database (`SearchIndex.reconcile`), then embeds every passage of the project
 that lacks a vector, worked out at that moment, one index run at a time, `[retrieval]
-embedding_batch` at a time, each committed to the index as one batch. At most one runs per project:
+embedding_batch` at a time, each batch's vectors committed to the index together (a refusal, below,
+at once). At most one runs per project:
 every trigger (a reading's commit, a title change, a deletion, the model's install, the launch, a
 restore, a whole-file rebuild, Retry, Rebuild) only requests one (`request_run`): while the project's run
 runs, it is marked to run once more when it ends (one rerun pending, a rebuild if one was asked
@@ -15,10 +16,14 @@ else one is recorded, in the trigger's own transaction. Every embedding request 
 run's dispatch check, read in the outbound gate's decision transaction: the run still runs,
 unrevoked, and the passage is still one a current version in the project reads (`_may_index`); so
 nothing deleted or replaced is sent, and a vector is written only while its passage's row is there
-with the text it was made from. Without the search model, the run ends after the keyword part and
-says search is keyword-only. Embedding sends nothing off the Mac, so a stricter level or the review
-lock leaves indexing running (governance's UNSENT_WORKFLOWS); a paper's deletion leaves the project's
-run running, its passages refused at their requests; a project's deletion takes its run with it.
+with the text it was made from. A passage whose text the helper refuses itself (InputRefused: each
+text is first bounded to what the helper's slot holds, so this is rare) is marked refused in the index
+and the run goes on to the rest; it counts as not embedded, in the run's result and the index's
+status, and is asked for again only when its text or the model changes. Without the search model,
+the run ends after the keyword part and says search is keyword-only. Embedding sends nothing off the
+Mac, so a stricter level or the review lock leaves indexing running (governance's UNSENT_WORKFLOWS); a
+paper's deletion leaves the project's run running, its passages refused at their requests; a
+project's deletion takes its run with it.
 
 The offer (workflow `model_offer`, ask kind `model_download`): the first material whose reading
 gives a Normal or Private project passages, while the model is not installed and no download runs,
@@ -53,7 +58,7 @@ from pydantic import BaseModel, Field
 
 from backend import asks, local_helper
 from backend.db import deletion, new_id, utc_now
-from backend.local_helper import EMBEDDING, HelperUnavailable, Refused
+from backend.local_helper import EMBEDDING, HelperUnavailable, InputRefused, Refused
 from backend.runs import AdmissionError, RunOutcome, _event, _revoked, _running, derived_status
 from backend.search_index import DAMAGE, DIMENSIONS, SearchIndex, Unavailable, digest, index_text, readings
 from backend.settings import load_settings, visible
@@ -393,7 +398,8 @@ async def _index_run(state, harness, active, project_id, inputs):
     """The project's index brought in step with the main database, then its missing embeddings made (see
     the module's docstring). Its result says what it did: queue rows applied, rows the check against the
     main database added and removed, whether it rebuilt the project's rows, the embeddings it stored, and
-    the project's passages indexed and embedded as it ended."""
+    the project's passages indexed, embedded and refused (read from the index, which keeps each refusal)
+    as it ended. A run that fails or is cancelled says its reason only."""
     index, db, run_id = state.get("index"), harness.db, active.run_id
     if index is None:
         raise RunOutcome("failed", "index_unavailable")
@@ -411,9 +417,8 @@ async def _index_run(state, harness, active, project_id, inputs):
 
     async def counted(result):
         counts = await asyncio.to_thread(index.counts, project_id)
-        passages = {"indexed": sum(c[0] for c in counts.values()), "embedded": sum(c[1] for c in counts.values()),
-                    "embeddable": sum(c[2] for c in counts.values())}
-        active.progress = {"done": passages["embedded"], "total": passages["embeddable"]}
+        passages = _totals(counts)
+        active.progress = {"done": passages["embedded"], "total": passages["embeddable"] - passages["refused"]}
         return {**result, **did, "passages": passages}
 
     # At launch, background runs start before the helper's own startup has run: a moment's wait.
@@ -443,6 +448,10 @@ async def _index_run(state, harness, active, project_id, inputs):
                 try:
                     [vector] = await local_helper.embed(state, [_text(reading)], project_id=project_id,
                                                         admit=lambda conn, pid=pid: _may_index(conn, run_id, project_id, pid))
+                except InputRefused:  # its text, refused as such: recorded at once (a later failure in this
+                    # batch must not lose it, or Retry would send it again), and the run goes on
+                    await drained(index.store, project_id, [(rowid, pid, mark, None)], stop)
+                    continue
                 except HelperUnavailable as unavailable:
                     def now(conn, pid=pid):
                         return (_running(conn, run_id) and not _revoked(conn, run_id),
@@ -530,6 +539,14 @@ async def _offer_run(state, harness, active, project_id, inputs):
 # Search
 
 
+_COUNTS = ("indexed", "embedded", "embeddable", "refused")  # SearchIndex.counts, by name
+
+
+def _totals(counts):
+    """The project's passages indexed, embedded, embeddable and refused, from SearchIndex.counts."""
+    return {name: sum(c[i] for c in counts.values()) for i, name in enumerate(_COUNTS)}
+
+
 async def _counts(index, project_id):
     """The index's counts for the project, or none while the file cannot be read (being replaced)."""
     try:
@@ -571,7 +588,8 @@ async def search(state, project_id, query, limit=None):
         return {"results": [], "mode": mode, "reason": reason, "index": "unavailable", "coverage": None}
     keyword = asyncio.ensure_future(asyncio.to_thread(index.keyword, project_id, text, values["bm25_candidates"]))
     counts = await _counts(index, project_id)
-    coverage = {"embedded": sum(c[1] for c in counts.values()), "total": sum(c[2] for c in counts.values())}
+    totals = _totals(counts)
+    coverage = {"embedded": totals["embedded"], "total": totals["embeddable"], "refused": totals["refused"]}
     dense = []
     if mode == "hybrid" and coverage["embedded"]:
         try:  # the deadline covers the query's embedding: past it, keyword results, said; a helper start goes on
@@ -633,9 +651,8 @@ async def index_status(project_id: str, request: Request):
     mode, reason = search_mode(state)
     return {"state": "unavailable" if index is None else "building" if index.building or index.damaged else "ready",
             "mode": mode, "reason": reason,
-            "passages": {"indexed": sum(c[0] for c in counts.values()), "embedded": sum(c[1] for c in counts.values()),
-                         "embeddable": sum(c[2] for c in counts.values())},
-            "materials": {m: {"indexed": c[0], "embedded": c[1], "embeddable": c[2]} for m, c in counts.items()},
+            "passages": _totals(counts),
+            "materials": {m: dict(zip(_COUNTS, c)) for m, c in counts.items()},
             "run": {"run_id": run[0], "status": run[1], "rebuild": bool(run[2].get("rebuild")),
                     "rebuild_pending": run[1] == "running" and bool((run[2].get("again") or {}).get("rebuild")),
                     "progress": active.progress if active is not None else None} if run else None}

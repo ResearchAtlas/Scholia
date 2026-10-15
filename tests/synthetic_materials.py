@@ -207,3 +207,32 @@ CHINESE_NOTES = """# 最低工资与就业笔记
 
 合成面板追踪 120 个地区十年的数据，其中一半地区上调了最低工资。
 """.encode()
+
+
+# S1-18's finding (embedding inputs over the helper's slot): a paper with a Han passage past the slot,
+# embedded on its bounded prefix, and a passage of private-use characters (glyphs PDF extraction left
+# unmapped) that the stand-in helper refuses (GLYPHS_REFUSED), for the walkthrough.
+GLYPHS_REFUSED = "\ue000" * 100
+GLYPH_NOTES = ("# Unmapped Glyphs (synthetic)\n\n## Findings\n\n"
+               "Minimum wages raised the earnings of low-paid workers; this passage is embedded as it is.\n\n"
+               + "最低工资提高了低收入工人的收入" * 130 + "\n\n" + "\ue000" * 120 + "\n").encode()
+
+
+def helper_tokenizer(path, body, slot, *, extra=0, refuse=None, count=None):
+    """The stand-in helper's tokenizer and slot, as llama-server answers them, as (status, JSON), or None
+    for a path it leaves to its caller: one token per UTF-8 byte (byte-level BPE at its most spread out;
+    `extra` tokens more), or count(text) tokens when a test gives its own count, and an embedding input
+    over the slot (its tokens and the one special token the server adds) refused with HTTP 400, as is
+    one containing `refuse`."""
+    tokens = count or (lambda text: len(text.encode()) + extra)
+    if path == "/tokenize":
+        return 200, {"tokens": [32] * tokens(body["content"])}
+    if path == "/v1/embeddings":
+        for text in body["input"]:
+            if refuse is not None and refuse in text:
+                return 400, {"error": {"code": 400, "type": "invalid_request_error"}}
+            if (counted := tokens(text) + 1) > slot:
+                return 400, {"error": {"code": 400, "type": "exceed_context_size_error", "n_prompt_tokens": counted,
+                                       "n_ctx": slot, "message": f"request ({counted} tokens) exceeds the available"
+                                                                 f" context size ({slot} tokens)"}}
+    return None

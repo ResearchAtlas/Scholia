@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import stat
@@ -28,6 +29,7 @@ from backend import local_helper, logs, outbound_gate
 from backend.db import DatabaseDamagedError, new_id
 from backend.outbound_gate import OutboundDenied
 from backend.local_helper import EMBEDDING, EMBEDDING_MODEL, RERANKER_MODEL, Config, HelperUnavailable
+import synthetic_materials
 from network_guard import allow_subprocess
 from scholia_app import started
 
@@ -110,9 +112,20 @@ class Fake:
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
+SLOT = local_helper.CONTEXT // local_helper.SLOTS  # what the stand-in holds per input, as llama-server's slot
+
+
+def tokenizer(path, body, extra=0, refuse=None, count=None):
+    """The stand-in's tokenizer and slot (synthetic_materials.helper_tokenizer), as a response."""
+    answer = synthetic_materials.helper_tokenizer(path, body, SLOT, extra=extra, refuse=refuse, count=count)
+    return None if answer is None else httpx.Response(answer[0], json=answer[1])
+
+
 class Remote:
-    """Answers everything the gate lets out: the helper's HTTP side on 127.0.0.1 (health, embeddings
-    and reranking, with the key of the server launched last) and the model download sources."""
+    """Answers everything the gate lets out: the helper's HTTP side on 127.0.0.1 (health, tokenizing,
+    embeddings and reranking, with the key of the server launched last) and the model download sources.
+    `extra`, `refuse` and `counter` (its count) are the tokenizer's (above); `status` answers every
+    embedding and tokenizer request with that status instead."""
 
     def __init__(self, fake):
         self.fake = fake
@@ -123,6 +136,7 @@ class Remote:
         self.files = {}  # URL -> (status, headers, body or async iterator)
         self.scores = None  # reranking scores to answer with, instead of 1 / (rank + 1)
         self.rows = None  # embedding reply rows to answer with, instead of one per input
+        self.extra, self.refuse, self.status, self.counter = 0, None, None, None
 
     def key(self, port):
         """The key of the server that announced port (50000 + its launch's number)."""
@@ -149,6 +163,10 @@ class Remote:
             return httpx.Response(401, json={"error": "invalid api key"})
         if request.url.path in self.hold:
             await self.hold[request.url.path].wait()
+        if self.status is not None and request.url.path in ("/tokenize", "/v1/embeddings"):
+            return httpx.Response(self.status, json={"error": "as the test says"})
+        if (answer := tokenizer(request.url.path, body, self.extra, self.refuse, self.counter)) is not None:
+            return answer
         if request.url.path == "/v1/embeddings":
             return httpx.Response(200, json={"data": self.rows or [{"index": i, "embedding": [0.5, 0.5, 0.5, 0.5]}
                                                                    for i, _ in reversed(list(enumerate(body["input"])))]})
@@ -787,6 +805,178 @@ async def test_an_embedding_reply_that_is_not_one_vector_of_real_numbers_per_tex
         client.remote.rows = rows
         with pytest.raises(HelperUnavailable, match="request_failed"):
             await local_helper.embed(client.state, ["text"] * len(rows), query=True)
+
+
+# Embedding inputs bounded to the helper's slot (found by S1-18: a passage over it was refused, its run
+# failed, and Retry met it again)
+
+
+def test_an_embedding_input_is_bounded_by_the_helpers_own_limits_with_a_margin():
+    assert local_helper.LIMITS[:6] == ["-c", "4096", "-ub", "2048", "-np", "2"]  # section 13
+    assert local_helper.INPUT_TOKENS == min(4096 // 2, 2048) - local_helper.TOKEN_MARGIN > 0
+
+
+def _sent(client, path):
+    return [body for _, at, body in client.remote.helper_requests if at == path]
+
+
+def _longest_within(text):
+    """The longest prefix of text, in whole characters, that the stand-in counts within the bound."""
+    while len(text.encode()) > local_helper.INPUT_TOKENS:
+        text = text[:-1]
+    return text
+
+
+def _counts_bound(text):
+    """The most counts the search may ask for text: the whole, then one per halving."""
+    return 1 + math.ceil(math.log2(len(text)))
+
+
+GLYPHS = "\ue000\ue123\uf8ff" * 500 + "\nA title of unmapped glyphs"  # private-use characters, as PDF extraction leaves
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", [
+    GLYPHS,
+    "最低工资" * 542 + "最",  # Han text of 2,169 characters
+    "w" * 4000,  # one byte each
+    "w" + "最" * 1000,  # the bound falls inside a character
+    "\ufffd" * 1000,  # replacement characters the text itself holds (recheck 3)
+    "Prefix\nFindings\n" + "w" * 1998 + "\ufffd" * 2,  # the bound inside its own U+FFFD (recheck 4)
+    "w" * 2015 + "\ufffd" * 400,
+], ids=["private use", "han", "ascii", "split character", "replacement characters", "recheck 4", "own U+FFFD run"])
+@pytest.mark.parametrize("query", [False, True], ids=["passage", "question"])
+async def test_an_input_over_the_slot_is_embedded_on_its_longest_prefix_within_it(tmp_path, fake, timings, text, query):
+    """Counted by the helper's own tokenizer, prefix by prefix in a binary search over its characters:
+    the longest prefix within the bound is sent, after at most log2(characters) + 1 counts."""
+    async with app(tmp_path, fake) as client:
+        [vector] = await local_helper.embed(client.state, [text], query=query)
+        assert vector == [0.5] * 4
+        [[sent]] = [body["input"] for body in _sent(client, "/v1/embeddings")]
+        assert sent == _longest_within(text) and len(sent.encode()) + 1 <= SLOT  # with the server's special token
+        counted = [body["content"] for body in _sent(client, "/tokenize")]
+        assert counted[0] == text and all(text.startswith(c) for c in counted) and len(counted) <= _counts_bound(text)
+        assert _sent(client, "/detokenize") == []
+
+
+@pytest.mark.asyncio
+async def test_the_longest_prefix_is_sent_whatever_u_fffd_or_character_the_bound_falls_in(tmp_path, fake, timings):
+    """The text's own trailing U+FFFD (0 to 4) before a U+FFFD, a Han or a 4-byte character the bound
+    falls in or before (rechecks 3 and 4's inputs): the longest prefix within the bound is sent."""
+    async with app(tmp_path, fake) as client:
+        cases = [("w" * (local_helper.INPUT_TOKENS - 3 * own - into) + "\ufffd" * own + tail * 400)
+                 for own in range(5) for tail in ("\ufffd", "最", "\U0001d400") for into in range(len(tail.encode()))]
+        wrong = []
+        for number, text in enumerate(cases):
+            before = len(_sent(client, "/v1/embeddings"))
+            await local_helper.embed(client.state, [text])
+            [sent] = _sent(client, "/v1/embeddings")[before]["input"]
+            if sent != _longest_within(text):
+                wrong.append((number, len(sent.encode()), len(_longest_within(text).encode())))
+        assert wrong == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,count,longest", [
+    # A merge spanning a run and the character after it: the whole counts 2,018, a prefix without the
+    # character counts every "a" apart (recheck 5, finding 1); "q" * 2015 + "a" fits.
+    ("q" * 2015 + "a" * 2030 + "最", lambda t: t.count("q") + (1 if t.endswith("最") else t.count("a")) + t.count("最") * 2,
+     "q" * 2015 + "a"),
+    # "bc" ranked before "ab": the whole counts q's + a + bc; "ab" alone merges (recheck 5, finding 2).
+    ("q" * 2015 + "abc", lambda t: t.count("q") + {"": 0, "a": 1, "ab": 1, "abc": 2}[t[2015:]], "q" * 2015 + "ab"),
+], ids=["merge across the bound", "merge order"])
+async def test_a_tokenizer_whose_merges_change_with_the_prefix_still_gets_its_longest_fitting_prefix(
+        tmp_path, fake, timings, text, count, longest):
+    async with app(tmp_path, fake) as client:
+        client.remote.counter = count
+        await local_helper.embed(client.state, [text])
+        [[sent]] = [body["input"] for body in _sent(client, "/v1/embeddings")]
+        assert sent == longest and len(_sent(client, "/tokenize")) <= _counts_bound(text)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed", range(20))
+async def test_a_count_that_does_not_grow_with_the_prefix_still_gives_a_fitting_prefix_never_a_refusal(
+        tmp_path, fake, timings, seed):
+    """Whatever a prefix counts, the prefix sent was counted within the bound, and nothing is refused
+    while the first character fits."""
+    import random
+    rng = random.Random(seed)
+    noise = {}
+
+    def count(prefix):  # roughly its length, but jumping above and below the bound by chance
+        return noise.setdefault(len(prefix), len(prefix) + rng.choice([0, 0, 5, -5, 900, -900]) if len(prefix) > 1 else 1)
+    async with app(tmp_path, fake) as client:
+        client.remote.counter = count
+        text = "w" * rng.randint(2100, 6000)
+        await local_helper.embed(client.state, [text])
+        [[sent]] = [body["input"] for body in _sent(client, "/v1/embeddings")]
+        assert sent and text.startswith(sent) and count(sent) <= local_helper.INPUT_TOKENS
+        assert len(_sent(client, "/tokenize")) <= _counts_bound(text)
+
+
+@pytest.mark.asyncio
+async def test_a_text_within_the_margin_in_bytes_is_sent_as_it_is_uncounted(tmp_path, fake, timings):
+    async with app(tmp_path, fake) as client:
+        text = "é" * (local_helper.INPUT_TOKENS // 2)  # two bytes each: at most as many tokens
+        await local_helper.embed(client.state, [text, "short"])
+        assert [body["input"] for body in _sent(client, "/v1/embeddings")] == [[text], ["short"]]
+        assert _sent(client, "/tokenize") == []
+
+
+@pytest.mark.asyncio
+async def test_extra_tokens_in_every_count_give_the_longest_prefix_that_still_fits(tmp_path, fake, timings):
+    async with app(tmp_path, fake) as client:
+        client.remote.extra = 5  # every text counts 5 tokens more than its bytes
+        await local_helper.embed(client.state, ["w" * 3000])
+        [[sent]] = [body["input"] for body in _sent(client, "/v1/embeddings")]
+        assert sent == "w" * (local_helper.INPUT_TOKENS - 5)
+
+
+@pytest.mark.asyncio
+async def test_an_input_whose_first_character_alone_is_over_is_refused_and_never_sent(tmp_path, fake, timings):
+    async with app(tmp_path, fake) as client:
+        client.remote.extra = 3000  # even one character counts over
+        text = "w" * 3000
+        with pytest.raises(local_helper.InputRefused, match="input_refused"):
+            await local_helper.embed(client.state, [text])
+        assert _sent(client, "/v1/embeddings") == []
+        assert [len(body["content"]) for body in _sent(client, "/tokenize")][-1] == 1  # down to the first character
+        assert len(_sent(client, "/tokenize")) <= _counts_bound(text)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,refused", [(400, True), (413, True), (422, True), (401, False), (404, False),
+                                            (408, False), (429, False), (500, False), (503, False)])
+async def test_a_status_that_refuses_the_input_is_told_apart_from_a_helper_that_cannot_serve(tmp_path, fake, timings,
+                                                                                            status, refused):
+    async with app(tmp_path, fake) as client:
+        client.remote.status = status
+        for text in ("short", "w" * 3000):  # the embedding's own refusal, and the tokenizer's
+            with pytest.raises(HelperUnavailable) as raised:
+                await local_helper.embed(client.state, [text])
+            assert isinstance(raised.value, local_helper.InputRefused) is refused
+            assert raised.value.reason == ("input_refused" if refused else "request_failed")
+
+
+@pytest.mark.asyncio
+async def test_counting_an_input_goes_through_the_gate_with_the_embeddings_dispatch_check(tmp_path, fake, timings):
+    """Deny-first: an input the dispatch check refuses is not even counted; one it admits is counted,
+    and embedded in requests each decided and audited as the embedding is."""
+    async with app(tmp_path, fake) as client:
+        await local_helper.embed(client.state, ["start the helper"])
+        before = len(await outbound(client))
+        with pytest.raises(HelperUnavailable, match="request_failed"):
+            await local_helper.embed(client.state, ["w" * 3000], admit=lambda conn: False)
+        assert _sent(client, "/tokenize") == []
+        [refusal] = [data for _, data in (await outbound(client))[before:]]
+        assert (refusal["decision"], refusal["reason"], refusal["kind"]) == ("deny", "revoked", "local_helper")
+        asked = []
+        await local_helper.embed(client.state, ["w" * 3000], admit=lambda conn: asked.append(1) or True)
+        allowed = [data for _, data in (await outbound(client))[before + 1:]]
+        counts = len(_sent(client, "/tokenize"))
+        assert len(asked) == len(allowed) == counts + 1 <= _counts_bound("w" * 3000) + 1  # counted, then embedded
+        assert {(d["decision"], d["kind"], d["method"]) for d in allowed} == {("allow", "local_helper", "POST")}
 
 
 def test_lifecycle_values_come_from_the_helper_settings(tmp_path):
