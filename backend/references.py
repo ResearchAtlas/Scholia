@@ -301,7 +301,8 @@ async def _merge_run(harness, active, project_id, inputs):
         asked, answer = asks.asked(conn, run_id)
         if asked is not None and answer is None:  # asked under a policy the project no longer has
             asks.withdraw(conn, run_id, asked["ask_id"], "policy_changed")
-        asks.raise_ask(conn, run_id, "merge", list(OPTIONS), {"matched": inputs.get("matched")})
+        asks.raise_ask(conn, run_id, "merge", list(OPTIONS), {"matched": inputs.get("matched"), **(  # S1-15: worded so
+            {"from": "zotero"} if (inputs.get("held") or {}).get("zotero") else {})})
         return None
 
     while True:
@@ -314,14 +315,19 @@ async def _merge_run(harness, active, project_id, inputs):
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(active.answered.wait(), POLICY_SECONDS)
     [material] = inputs["material_ids"]
-    return {"option": option}, lambda conn: _answered(conn, project_id, material, record, option)
+    # S1-15: a Zotero item's Keep both imports it from Zotero as its own paper, its PDF with it.
+    zotero = (inputs.get("held") or {}).get("zotero")
+    keep = zotero and (lambda conn: harness.record_in(conn, active, project_id, "zotero_import", {
+        **zotero, "material_ids": [], "done": [], "keep_both": True, "origin": None}))
+    return {"option": option}, lambda conn: _answered(conn, project_id, material, record, option, keep)
 
 
-def _answered(conn, project_id, material, record, option):
+def _answered(conn, project_id, material, record, option, keep=None):
     """The answer's effect, in the run's terminal transaction (which drops it when the run was
-    revoked or cancelled before it): Merge fills the paper from the record, Keep both makes it a paper."""
+    revoked or cancelled before it): Merge fills the paper from the record, Keep both makes it a paper
+    (keep(conn), for a Zotero item: S1-15)."""
     if option == "keep_both":
-        new_material(conn, project_id, record)
+        (keep or (lambda conn: new_material(conn, project_id, record)))(conn)
         return
     row = conn.execute("SELECT csl, checked_by, evidence_type, title FROM materials WHERE id = ? AND project_id = ?",
                        (material, project_id)).fetchone()

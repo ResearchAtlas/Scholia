@@ -35,6 +35,7 @@ from backend import asks, materials
 from backend import references  # S1-14: reference file import and the merge confirmation
 from backend import local_helper
 from backend import search  # S1-17: the search index, index runs and the search model's offer
+from backend import zotero  # S1-15: Zotero's library, read only
 from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
@@ -302,6 +303,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         references.register(harness)  # S1-14: merging a reference file's duplicates
         backups.register(harness, state)
         search.register(harness, state)  # S1-17: indexing and the search model's offer
+        zotero.register(harness, content)  # S1-15: importing from Zotero
         loop = asyncio.get_running_loop()
 
         def damaged():  # a backup's full check found it damaged: the app is limited, so its work stops too
@@ -365,6 +367,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app.include_router(references.router)  # S1-14: reference file import
     app.include_router(local_helper.router)  # the local model helper and its models, under Advanced
     app.include_router(search.router)  # S1-17: search, and the index's status and rebuild
+    app.include_router(zotero.router)  # S1-15: Zotero's status, collections and items, and imports
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)

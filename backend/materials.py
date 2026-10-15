@@ -708,7 +708,7 @@ def _identifiers(conn, project_id, materials, versions):
         # A reference file's paper is identified by its record (S1-14), whatever file it has since, unless
         # the researcher edited its details: an identifier they typed is not the record's, so then only a
         # file's text gives one. A version with no file has nothing to read: it is read, giving none.
-        record = json.loads(row[4] or "{}") if row[3] == "reference_file" and row[5] != "researcher" else None
+        record = json.loads(row[4] or "{}") if row[3] in _RECORDED and row[5] != "researcher" else None
         for key in json.loads(row[6] or "[]") if record else ():  # a lookup's fields (arXiv's DOI, say) are not the record's
             record.pop(key, None)
         if record and (given := reference_files.identifier(record)):
@@ -831,7 +831,7 @@ def _fill_imported(conn, material, found):
 
     row = conn.execute("SELECT source, csl, checked_by, title, lookup_filled FROM materials WHERE id = ?",
                        (material,)).fetchone()
-    if row is None or row[0] != "reference_file":
+    if row is None or row[0] not in _RECORDED:
         return None
     if row[2] == "researcher":
         return []
@@ -840,10 +840,17 @@ def _fill_imported(conn, material, found):
     csl.update(added)
     now = utc_now()
     filled = sorted(set(json.loads(row[4] or "[]")) | set(added))
-    conn.execute("UPDATE materials SET csl = ?, title = ?, source_key = ?, resolved_at = ?, updated_at = ?,"
-                 " lookup_filled = ? WHERE id = ?", (json.dumps(csl), added.get("title", row[3]), found.source_key, now,
-                                                     now, json.dumps(filled) if filled else None, material))
+    # A Zotero paper's source_key is its Zotero library and item, which its re-import finds it by (S1-15).
+    conn.execute("UPDATE materials SET csl = ?, title = ?, source_key = CASE source WHEN 'zotero' THEN source_key"
+                 " ELSE ? END, resolved_at = ?, updated_at = ?, lookup_filled = ? WHERE id = ?",
+                 (json.dumps(csl), added.get("title", row[3]), found.source_key, now, now,
+                  json.dumps(filled) if filled else None, material))
     return sorted(added)
+
+
+# Papers whose details are their own record, which a lookup only completes: a reference file's (S1-14)
+# and a Zotero item's (S1-15).
+_RECORDED = ("reference_file", "zotero")
 
 
 def _kept_on_move(conn, material, csl):
@@ -851,7 +858,7 @@ def _kept_on_move(conn, material, csl):
     form shows; a reference file's paper also keeps every other field but those a lookup filled
     (lookup_filled, which the change clears; S1-14)."""
     row = conn.execute("SELECT source, lookup_filled FROM materials WHERE id = ?", (material,)).fetchone()
-    if row is None or row[0] != "reference_file":
+    if row is None or row[0] not in _RECORDED:
         return {key: value for key, value in csl.items() if key in _FORM_FIELDS}
     filled = set(json.loads(row[1] or "[]"))
     return {key: value for key, value in csl.items() if key in _FORM_FIELDS or key not in filled}
@@ -894,8 +901,9 @@ def _describe(conn, row, registry):
                        (version,)).fetchone() if version else None
     status = run and derived_status(run[1], run[0], registry)  # as the background-run list reads it
     state, reason, progress = "ready", None, None
-    if sha256 is None:
-        pass  # metadata only
+    if sha256 is None:  # metadata only; a Zotero paper whose PDF could not be read says why (S1-15)
+        if source == "zotero" and (why := _attachment_problem(conn, material)) is not None:
+            state, reason = "needs_attention", why
     elif run is not None and status == "running":
         state = "reading"
         active = registry.runs.get(run[0])
@@ -1271,12 +1279,28 @@ def _earlier(conn, sha256, kind):
 
 
 def _other(conn, run_id, workflow, status):
-    """Another module's run in the background-run list: S1-14's merge (backend/references.py)."""
+    """Another module's run in the background-run list: S1-14's merge (backend/references.py), S1-15's
+    Zotero import (backend/zotero.py)."""
+    if workflow == "zotero_import":
+        from backend import zotero  # it builds on this module
+
+        return zotero.run_details(conn, run_id)
     if workflow != "merge":
         return {}
     from backend import references  # it builds on this module
 
     return references.run_details(conn, run_id, status)
+
+
+def _attachment_problem(conn, material):
+    """Why a Zotero paper has no file, as its latest import recorded it (a PDF it could not read:
+    pdf_not_local, pdf_too_large, ...), or None (S1-15). ponytail: a scan of the paper's import
+    events; an index on them if imports run into the thousands."""
+    row = conn.execute("SELECT json_extract(e.data, '$.pdf') FROM run_events e JOIN runs r ON r.id = e.run_id"
+                       " WHERE r.workflow = 'zotero_import' AND e.type = 'step_finished'"
+                       " AND json_extract(e.data, '$.material_id') = ? ORDER BY e.rowid DESC LIMIT 1",
+                       (material,)).fetchone()
+    return row[0] if row else None
 
 
 def _unreadable(conn, version_id, registry):
