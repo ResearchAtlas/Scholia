@@ -414,6 +414,9 @@
   "references.skipped": {
     "other": "跳过了 {count} 条记录：没有标题或无法读取。"
   },
+  "references.unsupportedMacro": {
+    "other": "有 {count} 个 BibTeX 字段值未导入：Scholia 不展开 @string 缩写或用 # 连接的值。"
+  },
   "references.leftOut": {
     "other": "有 {count} 项信息未导入：不是有效的年份、DOI、网址或 arXiv 编号。"
   },

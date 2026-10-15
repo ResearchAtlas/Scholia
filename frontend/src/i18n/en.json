@@ -426,6 +426,10 @@
     "one": "{count} record was skipped: it had no title or could not be read.",
     "other": "{count} records were skipped: they had no title or could not be read."
   },
+  "references.unsupportedMacro": {
+    "one": "{count} BibTeX value was left out: Scholia does not expand @string abbreviations or values joined with #.",
+    "other": "{count} BibTeX values were left out: Scholia does not expand @string abbreviations or values joined with #."
+  },
   "references.leftOut": {
     "one": "{count} value was left out: it was not a valid year, DOI, URL or arXiv ID.",
     "other": "{count} values were left out: they were not valid years, DOIs, URLs or arXiv IDs."

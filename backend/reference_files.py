@@ -33,11 +33,11 @@ Names are kept as the file gives them: "Family, Given" splits at its comma (BibT
 split on the text as written so a braced group is one name), and any other name, a Han-script one
 included, is kept whole (literal), as is CSL JSON's literal.
 
-BibTeX macros (Harold's reading, 2026-10-15): a field's value is a braced or quoted literal, a number,
-or one macro name: a month, or an @string defined once in the file, before the value, as one literal.
-Anything else (# concatenation, an alias, a macro undefined, defined twice or after its use) refuses
-the record; after a block starting @string that the parser could not read, every later macro use
-refuses its record. Nothing here logs content, and the parsers are kept from logging it.
+BibTeX macros (Harold's reading, 2026-10-15, the second): no @string is read. A field's value is a
+braced or quoted literal, a number, or (only in a file whose text names no @string anywhere, in any case
+or spacing) one of the twelve month names; a value that is any other bare name or joins parts with # is
+left out of its record and counted (unsupported_macro), on every field of every record, whether it is
+read or not. A record is never refused for a macro. Nothing here logs content, and the parsers are kept from logging it.
 """
 
 import io
@@ -66,7 +66,7 @@ ARXIV_CHARS = 40  # an arXiv ID with its version, at most
 BEAT_EVERY = 500  # records or lines between two beats
 PARSER = ("references", "1")  # what the child names when it is ready (backend/reading.py)
 FORMATS = ("ris", "bibtex", "csl_json", "noteexpress", "endnote")
-SKIPPED = ("no_title", "unreadable", "invalid_field")  # records, records, and a kept record's values left out
+SKIPPED = ("no_title", "unreadable", "invalid_field", "unsupported_macro")  # records, records; a kept record's values
 KEYS = {"type", "title", "author", "issued", "container-title", "volume", "issue", "page", "publisher", "DOI",
         "URL", "ISBN", "ISSN", "language", "abstract", "keyword", "number", "arxiv"}
 _SHORT = ("volume", "issue", "page", "publisher", "ISBN", "ISSN", "language", "number")
@@ -127,6 +127,8 @@ def parse(data, beat=lambda: None):
             continue
         if dropped:
             skipped["invalid_field"] = skipped.get("invalid_field", 0) + dropped
+        if record.get("macros"):  # BibTeX: values given as macros or by #, left out
+            skipped["unsupported_macro"] = skipped.get("unsupported_macro", 0) + record["macros"]
         chars += size(csl)
         if chars > MAX_CHARS:  # macros a file's entries share can make its records larger than the file
             raise Unreadable("reference_file_too_large")
@@ -303,60 +305,40 @@ def _bibtex(text, beat):
     except Exception:
         raise Unreadable("unreadable_file") from None
     beat()
-    # Macros (the module's note): each @string is counted over the whole file, then read in its place.
-    defined = {}
-    for block in library.blocks:
-        found = getattr(block, "ignore_error_block", None) if isinstance(block, ParsingFailedBlock) else block
-        if isinstance(found, String):
-            defined[found.key.lower()] = defined.get(found.key.lower(), 0) + 1
-    env, decoded, people, poisoned = {}, {}, {}, False
+    # Macros (the module's note): none is read. A month name is one only in a file whose text names no @string.
+    months, people = not _STRING_ANYWHERE.search(text), {}
     _counted(sum(isinstance(block, Entry) or isinstance(getattr(block, "ignore_error_block", None), Entry)
                  for block in library.blocks))
 
-    def macro(name):
-        """A macro's text where it is used: a month, or an @string defined once, before here, as one literal.
-        _Refused otherwise, and for every macro after an @string block the parser could not read."""
-        if poisoned:
-            raise _Refused
-        if name in defined:
-            if defined[name] != 1 or env.get(name) is None:  # defined twice, after its use, or not as one literal
-                raise _Refused
-            return env[name]
-        if name in _MONTHS:
-            return _MONTHS[name]
-        raise _Refused
+    def plain(raw):
+        """A field's text when its value is one braced or quoted literal, a number, or a month name; None for
+        a macro (any other bare name) or # concatenation, which the record leaves out (unsupported_macro)."""
+        parts = _parts(raw)
+        if len(parts) != 1:
+            return None
+        is_literal, word = parts[0]
+        return word if is_literal else _MONTHS.get(word.lower()) if months else None
 
     def value(fields, *names, limit=TITLE_CHARS, literal=False):
-        """The first of the fields named, as the file means it: one literal or one macro, its LaTeX read
-        unless literal (an author list is split before its names are read). _Refused when it is anything
-        else, or longer than four times its field's bound (never cut before it is read: the bound itself
+        """The first of the fields named that has a value read as the module's note reads one, its LaTeX read
+        unless literal (an author list is split before its names are read). _Refused when its value is not
+        BibTeX's, or longer than four times its field's bound (never cut before it is read: the bound itself
         is applied to the text read)."""
         for name in names:
             if name in fields and isinstance(fields[name].value, str) and (raw := fields[name].value.strip()):
-                parts = _parts(raw)
-                if len(parts) != 1:  # # concatenation
-                    raise _Refused
-                is_literal, text = parts[0]
-                if not is_literal:
-                    text = macro(text.lower())
+                text = plain(raw)
+                if text is None:  # a macro: left out, counted with the record's other macros
+                    continue
                 if len(text) > limit * 4:
                     raise _Refused
-                if not literal:  # a macro every entry uses is read once
-                    key = None if is_literal else (parts[0][1].lower(), limit)
-                    if key is None or key not in decoded:
-                        read = _latex(text)
-                        if key is None:
-                            text = read
-                        else:
-                            decoded[key] = read
-                    text = decoded[key] if key is not None else text
+                text = text if literal else _latex(text)
                 if text.strip():  # an empty one ({}) gives way to the next field named
                     return text
         return None
 
     def written(fields, name):
-        """An identifier's or a URL's field as the file writes it: the text inside its outer delimiters,
-        _UNREADABLE when it is not one braced or quoted literal, None when it is not given."""
+        """An identifier's or a URL's field as the file writes it: the text inside its outer delimiters; None
+        when it is not given or is a macro (counted as one); _UNREADABLE when it is anything else (a month)."""
         if name not in fields:
             return None
         raw = fields[name].value
@@ -364,7 +346,23 @@ def _bibtex(text, beat):
             parts = _parts(raw.strip()) if isinstance(raw, str) else None
         except _Refused:
             parts = None
-        return parts[0][1] if parts and len(parts) == 1 and parts[0][0] and not parts[0][1].isdigit() else _UNREADABLE
+        if not parts:
+            return _UNREADABLE
+        if len(parts) != 1 or not parts[0][0]:
+            return _UNREADABLE if len(parts) == 1 and months and parts[0][1].lower() in _MONTHS else None
+        return parts[0][1]
+
+    def macros(entry):
+        """How many of an entry's fields, every one of them, are macros or # concatenations: each left out."""
+        count = 0
+        for field in entry.fields:
+            if isinstance(field.value, str) and (raw := field.value.strip()):
+                try:
+                    parts = _parts(raw)
+                except _Refused:  # not BibTeX's: the record is refused if it reads the field, else left out
+                    continue
+                count += len(parts) != 1 or not parts[0][0] and not (months and parts[0][1].lower() in _MONTHS)
+        return count
 
     def names(text):
         """A field's people, split on its text as written: a braced group is one name (an organization,
@@ -386,14 +384,8 @@ def _bibtex(text, beat):
 
     for block in library.blocks:
         found = getattr(block, "ignore_error_block", None) if isinstance(block, ParsingFailedBlock) else block
-        if isinstance(found, String):
-            env[found.key.lower()] = _one_literal(found.value)
+        if isinstance(found, String):  # no @string is read
             continue
-        # Any other block whose text holds an @string (an unreadable one, one a failed or a whole block
-        # swallowed, one in a comment or a preamble, "@ string{"): BibTeX may read it as a definition, and
-        # which macro it defined is not certain, so every macro use from here on refuses its record.
-        if _STRING_IN_TEXT.search(getattr(block, "raw", None) or ""):
-            poisoned = True
         if isinstance(block, ParsingFailedBlock) and not isinstance(found, Entry):
             yield None  # a block the parser could not read
             continue
@@ -426,6 +418,7 @@ def _bibtex(text, beat):
                 "keyword": [_latex(k) for k in _split_top(value(fields, "keywords", limit=KEYWORDS * KEYWORD_CHARS,
                                                                 literal=True) or "")[:KEYWORDS * 4]],  # as _finish keeps
                 "number": number if kind != "article" else None,
+                "macros": macros(entry),
             }
         except _Refused:  # a value it cannot read as written: the record is skipped, never read wrong
             record = None
@@ -436,16 +429,7 @@ class _Refused(Exception):
     """A BibTeX value that is not one the module's note supports, or longer than its cap."""
 
 
-_STRING_IN_TEXT = re.compile(r"@\s*string\s*[{(]", re.IGNORECASE)
-
-
-def _one_literal(value):
-    """An @string's text when its value is one braced or quoted literal or a number, else None."""
-    try:
-        parts = _parts(value.strip()) if isinstance(value, str) else None
-    except _Refused:
-        return None
-    return parts[0][1] if parts and len(parts) == 1 and parts[0][0] else None
+_STRING_ANYWHERE = re.compile(r"@\s*string", re.IGNORECASE)
 
 
 _DELIMITERS = re.compile(r'[{}"]')

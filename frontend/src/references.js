@@ -19,9 +19,10 @@ export async function importReferences(projectId, file) {
 
 // What an import's report says, as [catalog key, params] pairs: the papers imported, the duplicates
 // waiting for an answer, those already in the project with nothing to add, the records skipped, and
-// the values left out of the records kept (invalid_field: a year, DOI, URL or arXiv ID that is not one).
+// the values left out of the records kept (invalid_field: a year, DOI, URL or arXiv ID that is not one;
+// unsupported_macro: a BibTeX value given by an @string macro or joined with #, which is not read).
 export function reportParts(report) {
-  const { invalid_field: leftOut = 0, ...records } = report.skipped ?? {};
+  const { invalid_field: leftOut = 0, unsupported_macro: macros = 0, ...records } = report.skipped ?? {};
   const skipped = Object.values(records).reduce((sum, n) => sum + n, 0);
   return [
     ['references.imported', { count: report.imported.length }],
@@ -29,6 +30,7 @@ export function reportParts(report) {
     report.already.length && ['references.already', { count: report.already.length }],
     skipped && ['references.skipped', { count: skipped }],
     leftOut && ['references.leftOut', { count: leftOut }],
+    macros && ['references.unsupportedMacro', { count: macros }],
   ].filter(Boolean);
 }
 

@@ -78,77 +78,81 @@ def test_bibtex_blocks_it_cannot_read_are_counted_and_the_rest_imported():
     assert sorted(r["title"] for r in records) == ["Fine one", "Fine two", "Same key, read too"]
 
 
-# BibTeX macros (Harold's reading, 2026-10-15): one literal, a number, or one macro name (a month, or an
-# @string defined once, before its use, as one literal); anything else refuses the record.
+# BibTeX macros (Harold's reading, 2026-10-15, the second): no @string is read; a bare name or a value
+# joined with # is left out of its record and counted, on every field; month names only in a file naming
+# no @string anywhere. A record is never refused for a macro.
 
 
-def test_bibtex_months_and_a_macro_defined_once_before_its_use_as_one_literal():
-    text = ('@string{jss = {Journal of Synthetic Studies}}\n@string{Year = "2020"}\n'
-            '@article{k, title = "T", journal = JSS, year = year, volume = 7, abstract = mar}\n'
-            '@misc{l, title = {T2}, journal = jss}\n')
-    first, second = parse(text)[0]
-    assert (first["container-title"], first["issued"], first["volume"], first["abstract"]) == (
-        "Journal of Synthetic Studies", {"date-parts": [[2020]]}, "7", "March")
-    assert second["container-title"] == "Journal of Synthetic Studies"
+def parsed(text):
+    records, skipped, _ = parse(text)
+    return records, skipped
 
 
-@pytest.mark.parametrize("strings, value", [
-    ('@string{prefix = {A }}\n', "prefix # {study}"),  # concatenation
-    ('@string{a = {x}}\n@string{b = a}\n', "b"),  # an alias
-    ('@string{a = "x" # "y"}\n', "a"),  # a definition that is no one literal
-    ("", "nowhere"),  # undefined
-    ('@string{a = {x}}\n@string{a = {x}}\n', "a"),  # defined twice, alike
-    ('@string{a = {x}}\n@string{A = {y}}\n', "a"),  # defined twice (names are case-insensitive)
-    ('@string{a = "x"}\n@string{a = a # "y"}\n', "a"),
-])
-def test_a_bibtex_value_outside_what_is_read_refuses_its_record(strings, value):
-    records, skipped, _ = parse(f"{strings}@misc{{bad, title = {value}}}\n@misc{{good, title = {{Kept}}}}\n")
-    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
+def test_month_names_are_read_in_a_file_that_names_no_at_string():
+    [record], skipped = parsed("@article{k, title = {T}, abstract = mar, volume = 7, month = jan}\n")
+    assert (record["abstract"], record["volume"], skipped) == ("March", "7", {})
 
 
 @pytest.mark.parametrize("text", [
-    "@misc{before, title = a}\n@string{a = {x}}\n",  # defined after its use
-    "@misc{before, title = jan}\n@string{jan = {Janvier}}\n",  # a month an @string defines, used before it
-    "@string{a = {x}}\n@misc{before, title = a}\n@string{a = {y}}\n",  # defined again after the use
+    "@string{jss = {Journal of Synthetic Studies}}\n",  # a definition
+    "@STRING (x = {X})\n", "@ string{x = {X}}\n", "@comment{ @string{x={X}} }\n",  # any case, spacing or place
+    "@stringify{j={Invented Journal}}\n",  # recheck 5's finding 19: a lookalike, still the text "@string"
 ])
-def test_a_macro_defined_after_its_use_or_twice_refuses_its_record(text):
-    records, skipped, _ = parse(text + "@misc{good, title = {Kept}}\n")
-    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
+def test_a_file_that_names_an_at_string_anywhere_reads_no_month_name(text):
+    [record], skipped = parsed(text + "@article{k, title = {T}, abstract = mar}\n")
+    assert "abstract" not in record and skipped == {"unsupported_macro": 1}
+
+
+@pytest.mark.parametrize("fields, kept, count", [
+    ("journal = jss", {}, 1),  # a macro, defined or not
+    ("journal = undefined", {}, 1),
+    ("title2 = prefix # {study}", {}, 1),  # # with a macro, in a field not read
+    ("abstract = {A } # {study}", {}, 1),  # # with literals only
+    ("month = undefined", {}, 1),  # recheck 5's finding 18: a field not read is checked too
+    ("journal = {Good}, journaltitle = undefined", {"container-title": "Good"}, 1),  # and a second journal field
+    ("journal = undefined, journaltitle = {Next}", {"container-title": "Next"}, 1),  # the next field named is read
+    ("doi = d", {}, 1),  # an identifier's field given by a macro: left out as a macro
+    ("journal = a, publisher = b # c, note = d", {}, 3),  # each counted
+])
+def test_a_bare_name_or_a_joined_value_is_left_out_and_counted_the_record_kept(fields, kept, count):
+    [record], skipped = parsed("@string{jss = {Journal of Synthetic Studies}}\n"
+                               f"@misc{{k, title = {{T}}, {fields}}}\n")
+    assert {key: record[key] for key in kept} == kept and not ({"container-title", "abstract", "DOI", "publisher"}
+                                                                - set(kept)) & set(record)
+    assert skipped == {"unsupported_macro": count}
 
 
 @pytest.mark.parametrize("text", [
-    "@string{a={Old}}\n@string{a={Broken}\n@misc{k,title=a}\n",  # recheck 3's finding 11
-    "@string{jan={Broken}\n@misc{k,title=jan}\n",  # a malformed month leaves no January behind
-    "@string{x={X}}\n@STRING{y={Broken}\n@misc{k,title=x}\n",  # every later macro, whichever the block named
+    # recheck 5's finding 17: an @string hidden in another @string's value never gives the stale value
+    "@string{j={Old Journal}}\n@string{x={X} @string{j={New Journal}}}\n@misc{k,title={T},journal=j}\n",
+    # finding 19: a lookalike directive never invents one
+    "@stringify{j={Invented Journal}}\n@misc{k,title={T},journal=j}\n",
+    # finding 11: a malformed redefinition
+    "@string{a={Old}}\n@string{a={Broken}\n@misc{k,title={T},journal=a}\n",
 ])
-def test_after_an_unreadable_at_string_block_every_later_macro_use_refuses_its_record(text):
-    records, skipped, _ = parse(text + "@misc{good, title = {Kept}}\n")
-    assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 2}  # the block and the record
+def test_no_macro_ever_gives_a_value(text):
+    records, skipped = parsed(text)
+    [record] = [r for r in records if r["title"] == "T"]
+    assert "container-title" not in record and skipped.get("unsupported_macro") == 1
 
 
-def test_a_macro_every_entry_uses_is_read_for_latex_once(monkeypatch):
-    calls = []
-    real = rf._latex
-    monkeypatch.setattr(rf, "_latex", lambda text: calls.append(text) or real(text))
-    parse("@string{j = {Caf\\'e Journal}}\n" + "".join(f"@misc{{k{i}, title={{T}}, journal=j}}\n" for i in range(50)))
-    assert calls.count("Caf\\'e Journal") == 1
+def test_a_title_given_by_a_macro_leaves_the_record_without_a_title():
+    records, skipped = parsed("@misc{k, title = t}\n@misc{l, title = {Kept}}\n")
+    assert [r["title"] for r in records] == ["Kept"] and skipped == {"no_title": 1}  # a record with no title: skipped
 
 
-@pytest.mark.parametrize("title", [
-    "{Known " + "\\relax " * 700 + "tail}",  # one braced value past its cap
-    "long",  # a macro past the cap of the field that uses it
-])
-def test_a_value_past_its_cap_is_refused_never_cut_and_read(title):
-    strings = "@string{long = {" + "w" * (rf.TITLE_CHARS * 4 + 1) + "}}\n"
-    records, skipped, _ = parse(f"{strings}@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
+def test_a_value_past_its_cap_is_refused_never_cut_and_read():
+    title = "{Known " + "\\relax " * 700 + "tail}"
+    records, skipped = parsed(f"@misc{{bad, title = {title}}}\n@misc{{good, title = {{Kept}}}}\n")
     assert [r["title"] for r in records] == ["Kept"] and skipped == {"unreadable": 1}
 
 
-def test_a_macro_longer_than_any_field_takes_is_refused_never_cut():
+def test_a_long_macro_every_entry_names_is_never_read():
     shared = "@string{m = {\\'e " + "w" * (rf.MAX_BYTES // 2) + "}}\n"
     entries = "".join(f"@misc{{k{i}, title={{T{i}}}, author=m, abstract=m}}\n" for i in range(5000))
-    records, skipped, _ = parse(shared + entries)
-    assert records == [] and skipped == {"unreadable": 5000}
+    records, skipped = parsed(shared + entries)
+    assert len(records) == 5000 and not any("abstract" in r or "author" in r for r in records)
+    assert skipped == {"unsupported_macro": 10_000}
 
 
 def test_bibtex_names_are_split_on_their_text_as_written_then_read():
@@ -234,7 +238,6 @@ def test_a_doi_is_its_fields_own_text_whole(data, doi):
     json.dumps([{"title": "T", "DOI": "10.1000/K"}]),
     json.dumps([{"title": "T", "DOI": "10.5555/../etc"}]),
     r"@misc{k, title={T}, doi={10.1000/ab\_c}}",
-    "@misc{k, title={T}, doi=d}\n",  # a macro is not the field's own text
     "TY  - JOUR\nTI  - T\nDO  - 10.5555/one\nDO  - 10.5555/two\nER  - \n",  # given twice differently
     json.dumps([{"title": "T", "DOI": 1234}]),  # not text (recheck 4's finding 16)
     # a control character that splitlines() takes for a line end is no line end here (internal review, batch 4)
@@ -260,24 +263,6 @@ def test_a_url_holding_a_control_character_is_left_out_and_counted(c):
 def test_an_endnote_tag_needs_its_space():
     [record], skipped, _ = parse("%0 Journal Article\n%T T\n%R10.5555/abc\n")
     assert "DOI" not in record and record["title"] == "T %R10.5555/abc" and skipped == {}  # text of the title
-
-
-@pytest.mark.parametrize("hidden", [
-    "@ string{jan = {X}}\n",  # left as text
-    "@comment{ @string{jan={X}} }\n", "@preamble{ @string{jan={X}} }\n",
-    "@comment{unclosed @string{jan={X}}\n",  # in an unreadable comment (internal recheck, batch 4)
-    "@misc{k, title={T}\n@string\n{jan={X}}\n",  # swallowed by an unreadable entry
-    "@misc{k, title={T} @string{jan={X}}}\n",  # swallowed by an entry
-])
-def test_an_at_string_hidden_in_another_block_refuses_every_later_macro_use(hidden):
-    records, _, _ = parse(f"@misc{{before, title=jan}}\n{hidden}@article{{b, title={{B}}, journal=jan}}\n")
-    assert [r["title"] for r in records] == ["January"]  # before it; the one after is refused, never "January"
-
-
-def test_an_at_string_the_parser_leaves_as_text_is_still_a_definition_of_some_macro():
-    text = "@misc{before, title=jan}\n@ string{jan = {X}}\n@article{b, title={B}, journal=jan}\n@misc{c, title={Kept}}\n"
-    records, skipped, _ = parse(text)
-    assert [r["title"] for r in records] == ["January", "Kept"] and skipped == {"unreadable": 1}
 
 
 @pytest.mark.parametrize("eprint, arxiv", [("2101.00001", "2101.00001"), ("2101.00001v2", "2101.00001v2"),
@@ -416,10 +401,10 @@ def test_ris_records_in_english_and_chinese():
 
 def test_bibtex_with_macros_latex_names_and_an_arxiv_eprint():
     records, skipped, kind = rf.parse(synthetic.references_bibtex())
-    assert (kind, skipped) == ("bibtex", {})
+    assert (kind, skipped) == ("bibtex", {"unsupported_macro": 1})  # its journal, given by an @string
     article, preprint = records
     assert article["title"] == "Café Wages and Synthetic Workers"
-    assert article["container-title"] == "Journal of Synthetic Studies"
+    assert "container-title" not in article
     assert article["author"] == [{"family": "Example", "given": "Ana"}, {"family": "Researcher", "given": "Bo"},
                                  {"literal": "王五"}]
     assert article["abstract"] == "An abstract with LaTeX in it." and article["DOI"] == "10.5555/scholia.bibtex.001"
