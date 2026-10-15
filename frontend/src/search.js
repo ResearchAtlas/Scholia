@@ -93,7 +93,7 @@ export function whereIs(t, result) {
 
 // A paper's line under Details for the search index, as [key, params]: not indexed yet, indexed for
 // keywords (search is keyword-only now), embeddings so far, indexed for both, or for both except the
-// passages the search model could not take.
+// passages the search model could not take (or for keywords only, when it could take none of them).
 export function paperIndexed(index, materialId) {
   const counts = index?.materials?.[materialId];
   if (!counts) return ['search.paperNotIndexed', {}];
@@ -101,7 +101,8 @@ export function paperIndexed(index, materialId) {
   if (!settled(counts.embedded, counts.refused, counts.embeddable)) {
     return ['search.paperEmbedding', { done: counts.embedded, total: counts.embeddable }];
   }
-  return counts.refused ? ['search.paperRefused', { count: counts.refused }] : ['search.paperIndexed', {}];
+  if (!counts.refused) return ['search.paperIndexed', {}];
+  return counts.embedded ? ['search.paperRefused', { count: counts.refused }] : ['search.paperRefusedAll', { count: counts.refused }];
 }
 
 // Whether the index status is worth reading again soon: an index run is running, or the index is

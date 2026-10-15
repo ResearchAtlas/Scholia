@@ -533,6 +533,9 @@
   "search.paperRefused": {
     "other": "已建立关键词与语义索引，但有 {count} 个段落搜索模型无法处理；仍可按关键词找到。"
   },
+  "search.paperRefusedAll": {
+    "other": "仅建立关键词索引：搜索模型无法处理它的 {count} 个段落。"
+  },
   "search.indexTitle": "搜索索引",
   "search.indexHint": "搜索按关键词查找段落；安装搜索模型后，也按语义查找。“重建”会把每篇论文的段落重新读入索引。",
   "search.indexState": "状态",

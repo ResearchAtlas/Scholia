@@ -79,6 +79,8 @@ test('passages the search model could not take are counted, not taken for embedd
   assert.equal(t(...paperIndexed(index, 'a')),
     'Indexed for keyword and meaning search, except 1 passage the search model could not take; keywords still find it.');
   assert.deepEqual(paperIndexed(index, 'b'), ['search.paperEmbedding', { done: 2, total: 4 }]);
+  const none = { mode: 'hybrid', materials: { c: { indexed: 3, embedded: 0, embeddable: 2, refused: 2 } } };
+  assert.equal(t(...paperIndexed(none, 'c')), 'Indexed for keyword search only: the search model could not take its 2 passages.');
   assert.equal(t(...indexCounts({ indexed: 12, embedded: 9, embeddable: 11, refused: 2 })),
     '12 indexed; embeddings 9 of 11; 2 could not be embedded');
   assert.equal(t(...indexCounts({ indexed: 12, embedded: 11, embeddable: 11, refused: 0 })), '12 indexed; embeddings 11 of 11');
@@ -88,7 +90,8 @@ test('passages the search model could not take are counted, not taken for embedd
   const zh = makeT('zh-CN');
   assert.equal(zh(...paperIndexed(index, 'a')), '已建立关键词与语义索引，但有 1 个段落搜索模型无法处理；仍可按关键词找到。');
   assert.equal(zh(...indexCounts({ indexed: 12, embedded: 9, embeddable: 11, refused: 2 })), '已索引 12 个；向量 9/11；2 个无法生成向量');
-  for (const key of ['search.partialRefused', 'search.paperRefused', 'search.indexCountsRefused', 'search.runHybridRefused']) {
+  for (const key of ['search.partialRefused', 'search.paperRefused', 'search.paperRefusedAll', 'search.indexCountsRefused',
+    'search.runHybridRefused']) {
     for (const catalog of [en, zhCN]) assert.ok(key in catalog, key);
   }
   const source = readFileSync(fileURLToPath(new URL('../src/components/SearchIndex.jsx', import.meta.url)), 'utf8');

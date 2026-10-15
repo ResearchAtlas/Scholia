@@ -400,8 +400,8 @@ class Helper:
         deeper by as much. Each request carries admit, as the embedding's does, so nothing goes out
         that the embedding itself could not send. A text of at most INPUT_TOKENS UTF-8 bytes is sent as
         it is, uncounted: the model's byte-level BPE gives each token at least one byte. Raises
-        InputRefused when the helper refuses to count it, reads back something else, or BOUND_TRIES
-        cuts leave it over."""
+        InputRefused when the helper refuses to count it, reads back nothing or something else, or
+        BOUND_TRIES cuts leave it over."""
         if len(text.encode()) <= INPUT_TOKENS:
             return text
         for attempt in range(BOUND_TRIES + 1):
@@ -420,7 +420,7 @@ class Helper:
             if not isinstance(content, str):
                 raise HelperUnavailable("request_failed")
             content = content.rstrip("\ufffd")  # a character the cut split
-            if not text.startswith(content):
+            if not content or not text.startswith(content):  # nothing left to send, or not the text's own
                 break
             text = content
         raise InputRefused()

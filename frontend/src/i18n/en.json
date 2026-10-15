@@ -544,6 +544,10 @@
     "one": "Indexed for keyword and meaning search, except {count} passage the search model could not take; keywords still find it.",
     "other": "Indexed for keyword and meaning search, except {count} passages the search model could not take; keywords still find them."
   },
+  "search.paperRefusedAll": {
+    "one": "Indexed for keyword search only: the search model could not take its {count} passage.",
+    "other": "Indexed for keyword search only: the search model could not take its {count} passages."
+  },
   "search.indexTitle": "Search index",
   "search.indexHint": "Search finds passages by keywords and, once the search model is installed, by meaning. Rebuild reads every paper's passages into the index again.",
   "search.indexState": "State",

@@ -862,8 +862,9 @@ async def test_a_cut_that_counts_over_again_is_cut_deeper_by_as_much(tmp_path, f
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra", [3000, -1], ids=["never within", "read back as other text"])
-async def test_an_input_no_cut_brings_within_the_slot_is_refused_and_never_sent(tmp_path, fake, timings, extra):
+@pytest.mark.parametrize("extra,text", [(3000, "w" * 3000), (-1, "w" * 3000), (0, "\ufffd" * 1000)],
+                         ids=["never within", "read back as other text", "nothing left once a split character goes"])
+async def test_an_input_no_cut_brings_within_the_slot_is_refused_and_never_sent(tmp_path, fake, timings, extra, text):
     async with app(tmp_path, fake) as client:
         if extra < 0:  # the tokens read back as something that is not the text's prefix
             client.remote.hold = {}
@@ -878,7 +879,7 @@ async def test_an_input_no_cut_brings_within_the_slot_is_refused_and_never_sent(
         else:
             client.remote.extra = extra
         with pytest.raises(local_helper.InputRefused, match="input_refused"):
-            await local_helper.embed(client.state, ["w" * 3000])
+            await local_helper.embed(client.state, [text])
         assert _sent(client, "/v1/embeddings") == []
         assert 1 <= len(_sent(client, "/tokenize")) <= local_helper.BOUND_TRIES + 1
 

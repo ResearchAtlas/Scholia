@@ -24,8 +24,8 @@ socket and only prints the line a llama-server prints once it listens; its HTTP 
 here, behind the outbound gate's transport, with synthetic vectors (synthetic_materials.embedding).
 While the file named by "helper control" exists, it answers embedding requests 503, as a helper that
 stopped answering. It counts tokens as llama-server's tokenizer at its most spread out (one per byte),
-refuses an input over its slot as llama-server does, and refuses one passage of "Unmapped glyphs". --dev serves no interface and admits the Vite server on
-127.0.0.1:5173 instead (`npm run dev` in frontend/), with no session, on port 8765, where
+refuses an input over its slot as llama-server does, and refuses one passage of "Unmapped glyphs".
+--dev serves no interface and admits the Vite server on 127.0.0.1:5173 instead (`npm run dev` in frontend/), with no session, on port 8765, where
 that server sends API requests. Without --port, a free port is used. --request-log appends
 each request the test-owned provider receives to FILE, one JSON line each.
 
