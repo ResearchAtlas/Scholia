@@ -1313,7 +1313,10 @@ async def retry_run(run_id: str, request: Request):
 
     registry = state["harness"].registry
     try:
-        return {"run_id": await state["harness"].record_background(1, again)}
+        run_id = await state["harness"].record_background(1, again)
+        # A run its project's request answered with that no process holds (an index run a failed terminal write
+        # left running) starts now, as for any request (search._started)
+        return {"run_id": await search._started(state["harness"], run_id)}
     except BaseException:
         # A Retry refused or failed leaves the run as it was, for a kick or a resume to start again. One whose
         # retry committed is never started again whatever this undoes (retried_by, its record interrupted).

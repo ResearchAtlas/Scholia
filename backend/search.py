@@ -349,7 +349,8 @@ def register(harness, state):
         if not again or row[0] == "cancelled" or not conn.execute("SELECT 1 FROM projects WHERE id = ?",
                                                                    (project_id,)).fetchone():
             return
-        harness.record_in(conn, active, project_id, "index", {"rebuild": True} if again.get("rebuild") else {})
+        harness.record_in(conn, active, project_id, "index",  # after: the run it follows, for a Rebuild following it
+                          {"rebuild": True, "after": active.run_id} if again.get("rebuild") else {"after": active.run_id})
 
     async def offer_run(harness, active, project_id, inputs):
         return await _offer_run(state, harness, active, project_id, inputs)
@@ -607,7 +608,8 @@ async def search_passages(project_id: str, body: Query, request: Request):
 async def index_status(project_id: str, request: Request):
     """The project's index: whether it is ready or being rebuilt, whether search is keyword-only and
     why, its passages indexed and embedded (in all, and by paper), and its index run: the one running
-    (with whether a rebuild is to follow it), else the latest."""
+    (with whether a rebuild is to follow it), else the latest; and its latest rebuild, with the run it was
+    recorded after."""
     state = _state(request)
     registry = state["harness"].registry
 
@@ -615,10 +617,12 @@ async def index_status(project_id: str, request: Request):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
             raise AdmissionError(404, "not_found", "No such project")
         runs = "SELECT id, status, inputs FROM runs WHERE project_id = ? AND workflow = 'index'"
+        rebuild = conn.execute(runs + " AND json_extract(inputs, '$.rebuild') ORDER BY rowid DESC LIMIT 1",
+                               (project_id,)).fetchone()
         return [*conn.execute(runs + " AND status = 'running' ORDER BY rowid DESC", (project_id,)),
-                *conn.execute(runs + " ORDER BY rowid DESC LIMIT 1", (project_id,))]
+                *conn.execute(runs + " ORDER BY rowid DESC LIMIT 1", (project_id,))], rebuild
 
-    runs = await asyncio.to_thread(state["db"].read, latest)
+    runs, rebuild = await asyncio.to_thread(state["db"].read, latest)
     # Each status worked out once (a run may be released between two looks at the registry). The latest is
     # last: one running in its record that this process does not hold (interrupted) is not taken over it.
     found = [(run_id, derived_status(status, run_id, registry), json.loads(inputs or "{}")) for run_id, status, inputs in runs]
@@ -636,7 +640,10 @@ async def index_status(project_id: str, request: Request):
             "materials": {m: {"indexed": c[0], "embedded": c[1], "embeddable": c[2]} for m, c in counts.items()},
             "run": {"run_id": run[0], "status": run[1], "rebuild": bool(run[2].get("rebuild")),
                     "rebuild_pending": run[1] == "running" and bool((run[2].get("again") or {}).get("rebuild")),
-                    "progress": active.progress if active is not None else None} if run else None}
+                    "progress": active.progress if active is not None else None} if run else None,
+            # the latest rebuild, and the run it was recorded after (a Rebuild asked while that one ran follows it)
+            "last_rebuild": {"run_id": rebuild[0], "status": derived_status(rebuild[1], rebuild[0], registry),
+                             "after": json.loads(rebuild[2] or "{}").get("after")} if rebuild else None}
 
 
 @router.post("/api/projects/{project_id}/index/rebuild", status_code=202)

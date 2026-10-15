@@ -1798,3 +1798,43 @@ async def test_a_rebuild_whose_projects_run_no_process_holds_starts_that_run_and
         [rebuild] = [r for r in await runs_of(client, "index", project) if r["run_id"] != run]
         ended = await run_finished(client, rebuild["run_id"])
         assert (ended["status"], ended["rebuild"], ended["result"]["rebuilt"]) == ("succeeded", True, True)
+
+
+async def test_a_retry_answered_with_a_newer_run_no_process_holds_starts_it(tmp_path):
+    """PR 29 finding 52: a Retry of an older failed index run while a newer one is left running in its record (a failed
+    terminal write; held by no process) is answered with that newer run, which the Retry starts at once, as a
+    Rebuild or any request does."""
+    from backend.search import _insert_run
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        db = client.state["db"]
+
+        def old_and_new(conn):
+            old = _insert_run(conn, None, project, {})
+            conn.execute("UPDATE runs SET status = 'failed', finished_at = ? WHERE id = ?", ("2026-10-15T00:00:00.000Z", old))
+            return old, _insert_run(conn, None, project, {})
+        old, newer = await asyncio.to_thread(db.write, old_and_new)
+        answer = await client.post(f"/api/runs/{old}/retry")
+        assert answer.status_code == 201 and answer.json()["run_id"] == newer
+        assert client.state["harness"].registry.is_active(newer)  # started by the Retry
+        assert (await run_finished(client, newer))["status"] == "succeeded"
+
+
+async def test_the_index_status_names_the_rebuild_a_run_recorded_and_the_run_it_follows(tmp_path):
+    """PR 29 finding 53: the rebuild a run's end records says which run it follows, and the index status names the
+    project's latest rebuild with it, so the interface follows that rebuild to its end whatever runs after it."""
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        assert (await client.post(f"/api/projects/{project}/index/rebuild")).json() == {"run_id": run, "rebuild_pending": True}
+        client.remote.hold.set()
+        assert (await run_finished(client, run))["status"] == "succeeded"
+        last = (await client.get(f"/api/projects/{project}/index")).json()["last_rebuild"]
+        assert last["after"] == run and last["run_id"] != run
+        ended = await run_finished(client, last["run_id"])
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
