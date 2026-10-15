@@ -51,6 +51,11 @@ test('the report says what the import did, counted, in each supported interface 
     '1 record was skipped: it had no title or could not be read.',
     '2 values were left out: they were not valid years, DOIs, URLs or arXiv IDs.']);
   assert.equal(zh_(...reportParts(leftOut)[2]), '有 2 项信息未导入：不是有效的年份、DOI、网址或 arXiv 编号。');
+  // fields past the lines read of one record, counted apart (the S1-14 follow-up)
+  const past = { imported: ['a'], waiting: [], already: [], skipped: { past_record_bound: 2 } };
+  assert.deepEqual(reportParts(past).slice(1).map(([key, params]) => en_(key, params)), [
+    '2 fields were left out: their records run past the first 1,000 lines, which is all Scholia reads of one record.']);
+  assert.equal(zh_(...reportParts(past)[1]), '有 2 个字段未导入：所在记录超过 Scholia 对一条记录读取的前 1,000 行。');
   // values a BibTeX file gives by a macro or #, counted apart too
   const macros = { imported: ['a'], waiting: [], already: [], skipped: { unsupported_macro: 1 } };
   assert.deepEqual(reportParts(macros).slice(1).map(([key, params]) => en_(key, params)), [

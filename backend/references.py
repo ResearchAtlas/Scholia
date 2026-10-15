@@ -28,7 +28,12 @@ under the earlier policy, is withdrawn and asked again under the current one. Th
 is applied with the run's terminal record, once: Merge fills the paper's missing fields from the
 record (`fills`; a paper whose details the researcher edited keeps the details form's fields as they
 are) and its evidence follows what it now holds (a file stays full text); Keep both makes the record
-its own paper, as at import, not looked up. Cancel leaves the record out.
+its own paper, as at import, not looked up. Cancel leaves the record out. Merge first checks, in that
+transaction, that the paper still matches the record as a duplicate (`_matches`, Duplicates' rule): one
+whose DOI or title changed while the question waited takes nothing (the run fails no_longer_duplicate).
+A Merge that gives the paper the DOI or arXiv ID it lacked records that identifier's lookup in the same
+transaction, as the import's (`_merged_lookup`). The request's base64 is refused unread past what the
+largest file read encodes to (`_ENCODED`); an empty file reaches the parser, which says it holds no records.
 """
 
 import asyncio
@@ -71,7 +76,12 @@ router = APIRouter(dependencies=[Depends(_no_store)])
 
 class ReferenceFile(BaseModel):
     name: str = Field(min_length=1, max_length=255)
-    data: str = Field(min_length=1, max_length=MAX_BODY)  # base64; its decoded size is checked after
+    # base64, empty for an empty file (the parser says it holds no records); longer than a file of
+    # reference_files.MAX_BYTES encodes to, it is refused before it is decoded (_ENCODED)
+    data: str = Field(max_length=MAX_BODY)
+
+
+_ENCODED = (reference_files.MAX_BYTES + 2) // 3 * 4 + 4  # base64 of the largest file read, as NewFile bounds it
 
 
 class _Stop(Exception):
@@ -84,6 +94,8 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
     db, harness = state["db"], state["harness"]
     if visible(body.name) is None:
         raise _refused(400, "invalid_request", "A file needs a name")
+    if len(body.data) > _ENCODED:  # never decoded here: the file is larger than Scholia reads
+        raise _refused(413, "reference_file_too_large", _MESSAGES["reference_file_too_large"])
     try:
         data = base64.b64decode(body.data, validate=True)
     except (binascii.Error, ValueError):
@@ -315,12 +327,15 @@ async def _merge_run(harness, active, project_id, inputs):
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(active.answered.wait(), POLICY_SECONDS)
     [material] = inputs["material_ids"]
-    return {"option": option}, lambda conn: _answered(conn, project_id, material, record, option)
+    return {"option": option}, lambda conn: _answered(conn, project_id, material, record, option, harness, active)
 
 
-def _answered(conn, project_id, material, record, option):
+def _answered(conn, project_id, material, record, option, harness=None, active=None):
     """The answer's effect, in the run's terminal transaction (which drops it when the run was
-    revoked or cancelled before it): Merge fills the paper from the record, Keep both makes it a paper."""
+    revoked or cancelled before it): Merge fills the paper from the record, Keep both makes it a paper.
+    A Merge whose paper no longer matches the record as a duplicate (its DOI or title changed while
+    the question waited) applies nothing: the run ends failed, no_longer_duplicate. One that gives the
+    paper the DOI or arXiv ID it lacked records its lookup, as the import's (_merged_lookup)."""
     if option == "keep_both":
         new_material(conn, project_id, record)
         return
@@ -329,10 +344,43 @@ def _answered(conn, project_id, material, record, option):
     if row is None:  # deleted meanwhile, which revokes the run first: nothing to merge into
         return
     csl = json.loads(row[0]) if row[0] else {}
+    if not _matches(csl, record):
+        raise RunOutcome("failed", "no_longer_duplicate")
     added = fills(csl, row[1] == "researcher", record)
+    before = reference_files.identifier(csl)
     csl.update(added)
     conn.execute("UPDATE materials SET csl = ?, title = ?, evidence_type = ?, updated_at = ? WHERE id = ?",
                  (json.dumps(csl), added.get("title", row[3]), _evidence(csl, row[2]), utc_now(), material))
+    given = reference_files.identifier({key: added[key] for key in ("DOI", "arxiv") if key in added})
+    if harness is not None and before is None and given is not None and row[1] != "researcher":
+        _merged_lookup(conn, harness, active, project_id, material, given)
+
+
+def _matches(paper, record):
+    """Whether a record still duplicates a paper as Duplicates.find reads one: the same DOI, else the
+    same normalized title and year, and never two different DOIs."""
+    doi, other = _doi(record), _doi(paper)
+    if doi and other:
+        return doi == other
+    return title_key(record.get("title")) is not None and \
+        (title_key(record.get("title")), _year(record)) == (title_key(paper.get("title")), _year(paper))
+
+
+def _merged_lookup(conn, harness, active, project_id, material, given):
+    """The lookup of an identifier a merge gave a paper, as the import's lookup (a review-locked project
+    never looks one up; a Local only project asks first, its question about this reference file's
+    papers; the outbound gate and the lookup's own checks hold), recorded in the merge's terminal
+    transaction and started once it commits (harness.record_in). It looks up that identifier, the
+    record's own, whatever the paper's file gives (given)."""
+    if conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]:
+        return
+    version = conn.execute("SELECT id FROM material_versions WHERE material_id = ? AND is_current = 1",
+                           (material,)).fetchone()
+    if version is None:
+        return
+    harness.record_in(conn, active, project_id, "lookup", {
+        "material_ids": [material], "versions": {material: version[0]}, "origin": None,
+        "batch": "reference_file", "given": {material: list(given)}})
 
 
 def _summary(csl):

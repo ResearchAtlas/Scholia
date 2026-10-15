@@ -618,3 +618,44 @@ def test_a_run_of_spaces_after_an_at_sign_is_read_as_one():
 def test_marks_inside_values_never_refuse_a_file_within_the_record_bound():
     entry = "@article{k%d, title={T}, author={LeQua @ {CLEF}}}\n"  # bibtexparser's own example of an @ in a value
     assert len(parse("".join(entry % i for i in range(rf.MAX_RECORDS)))[0]) == rf.MAX_RECORDS
+
+
+# The S1-14 follow-up (recheck 5's finding 20, recheck 7's finding 23, the connector's threads)
+
+
+@pytest.mark.parametrize("make", [
+    lambda notes: "TY  - JOUR\nTI  - T\n" + notes("N1  - n\n") + "DO  - 10.5555/late\nER  - \n",  # RIS
+    lambda notes: "%0 Journal Article\n%T T\n" + notes("%Z n\n") + "%R 10.5555/late\n",  # EndNote
+    lambda notes: "{Reference Type}: Journal Article\n{Title}: T\n" + notes("{Notes}: n\n") + "{DOI}: 10.5555/late\n",
+])
+def test_fields_past_a_records_line_bound_are_counted_never_lost_silently(make):
+    [record], skipped, _ = parse(make(lambda line: line * (rf.RECORD_LINES - 2)))  # the record full, then its DOI
+    assert "DOI" not in record and skipped == {"past_record_bound": 1}  # the bound holds; what it leaves out is said
+
+
+def test_a_record_refused_by_its_cap_keeps_its_macros_counted():
+    records, skipped = parse("@misc{k, title={" + "t" * (rf.TITLE_CHARS * 4 + 1) + "}, journal=j}\n")[:2]
+    assert records == [] and skipped == {"unreadable": 1, "unsupported_macro": 1}
+
+
+@pytest.mark.parametrize("value, title", [
+    ('"Schr\\"odinger"', "Schrödinger"),  # an escaped quote ends nothing
+    ("{Set \\{ notation}", "Set { notation"),  # an escaped brace opens nothing
+    ("{Set \\} notation}", "Set } notation"),  # nor closes
+    ("{Tab \\\\{x}}", None),  # an escaped backslash, then a brace that counts
+])
+def test_escaped_delimiters_in_a_bibtex_value(value, title):
+    records, skipped = parse(f"@misc{{k, title = {value}, year = {{2020}}}}\n")[:2]
+    assert [r["title"] for r in records] == ([title] if title else [])
+
+
+def test_an_escaped_delimiter_in_an_identifiers_value_is_inside_its_outer_delimiters():
+    [record], skipped = parse("@misc{k, title={T}, doi={10.5555/a\\}b}}")[:2]  # the value is 10.5555/a\}b: no DOI
+    assert "DOI" not in record and skipped == {"invalid_field": 1}
+
+
+def test_unreadable_bibtex_blocks_count_toward_the_record_bound(monkeypatch):
+    monkeypatch.setattr(rf, "MAX_RECORDS", 3)
+    entries = "".join(f"@misc{{k{i}, title={{T{i}}}}}\n" for i in range(3))
+    assert parse(entries)[1] == {}  # three records: within the bound
+    assert unreadable(entries + "@article{bad, title={unbalanced, year=2020\n") == "too_many_records"
