@@ -113,7 +113,7 @@ def manifest_for(folder):
                        "subset": {"benchmarks": {"qasper": {"papers": ["0001.00001"]}}}}}
 
 
-def opener(seen=None, before_yield=None):
+def opener(seen=None, before_yield=None, refuse_import=False):
     """The runner's app: the test app with the stand-in helper, the model imported through the API when
     the runner installs it (as the runner does with the real model)."""
     @contextlib.asynccontextmanager
@@ -126,10 +126,14 @@ def opener(seen=None, before_yield=None):
 
             async def install():
                 weights = data.parent / "Qwen3-Embedding-0.6B-Q8_0.gguf"
-                weights.write_bytes(WEIGHTS)
-                response = await client.post("/api/helper/models/import", json={"model": EMBEDDING, "path": str(weights)})
-                assert response.status_code == 200, response.text
-                installs.append(data.name)
+                weights.write_bytes(WEIGHTS[:-1] if refuse_import else WEIGHTS)
+                passages = await asyncio.to_thread(client.state["db"].read, lambda c: c.execute(
+                    "SELECT count(*) FROM passages").fetchone()[0])
+                read = await asyncio.to_thread(client.state["db"].read, lambda c: c.execute(
+                    "SELECT count(*) FROM runs WHERE workflow = 'extract' AND status = 'running'").fetchone()[0])
+                installs.append((data.name, passages, read, len(client.remote.indexing)))
+                await tier1._post(
+                    client, "/api/helper/models/import", {"model": EMBEDDING, "path": str(weights)}, 200)
             yield client, client.state, install
     return open_app
 
@@ -214,6 +218,25 @@ async def test_a_failure_during_the_build_leaves_an_incomplete_file_and_no_data_
 
 
 @pytest.mark.asyncio
+async def test_a_refused_model_import_leaves_an_incomplete_file(tmp_path):
+    _, out, running = await _run(tmp_path, ["scifact"], open_app=opener(refuse_import=True))
+    with pytest.raises(RuntimeError, match="/api/helper/models/import: 400"):
+        await running
+    assert json.loads(out.read_text())["status"] == "incomplete"
+
+
+def test_the_command_exits_nonzero_when_the_run_is_not_finished(tmp_path, monkeypatch):
+    async def gapped(*args, **kwargs):
+        return {"status": "incomplete", "gaps": ["scifact hybrid: did not run as named"], "benchmarks": {}}
+    monkeypatch.setattr(tier1, "verify", lambda *args: {})
+    monkeypatch.setattr(tier1, "check_models", lambda *args: None)
+    monkeypatch.setattr(tier1, "run", gapped)
+    with pytest.raises(SystemExit, match="incomplete: scifact hybrid: did not run as named"):
+        tier1.main(["run", "--level", "full", "--benchmarks", "scifact", "--sets", str(tmp_path), "--helper", "h",
+                    "--model", "m", "--out", str(tmp_path / "out.json")])
+
+
+@pytest.mark.asyncio
 async def test_a_failing_helper_marks_its_queries_and_its_keyword_results_are_never_scored_as_hybrid(tmp_path, monkeypatch):
     clients, real = [], tier1.until_built
 
@@ -262,7 +285,9 @@ async def test_a_full_run_builds_through_the_app_scores_each_benchmark_apart_and
     manifest, out, running = await _run(tmp_path, ["qasper", "scifact", "litsearch"])
     results = await running
     assert results["status"] == "finished" and json.loads(out.read_text()) == json.loads(json.dumps(results))
-    assert installs[-3:] == ["qasper", "scifact", "litsearch"]  # each benchmark's model imported once its files were read
+    # each benchmark's model imported once its files were read, before any passage was sent to be embedded
+    assert [(name, passages > 0, running, sent) for name, passages, running, sent in installs[-3:]] == [
+        ("qasper", True, 0, 0), ("scifact", True, 0, 0), ("litsearch", True, 0, 0)]
     assert results["benchmarks"]["scifact"]["build"]["embedding_seconds"] >= 0
     assert results["model_settings"]["retrieval"] == manifest["model_settings"]["retrieval"]
     assert results["model_settings"]["helper_flags"] == manifest["model_settings"]["helper_flags"]
@@ -419,7 +444,8 @@ def test_the_manifest_records_rule_e_word_for_word_with_each_benchmarks_own_metr
         assert bench["primary"] in {m["name"] for m in bench["metrics"]}
         assert rule["own_metric"][name].startswith(bench["primary"])
     assert "no reranker can qualify in M2" in rule["chinese"]
-    assert manifest["model_settings"]["reranker"] is None and list(tier1.ARMS) == ["hybrid", "keyword_only"]
+    assert manifest["model_settings"]["reranker"] is None and set(tier1.ARMS) == {"hybrid", "keyword_only"}
+    assert list(tier1.ARMS)[-1] == "hybrid"  # last, so the helper still runs when its sockets are listed
     from backend.search import MAX_LIMIT, QUERY_INSTRUCTION
     assert manifest["search_limit"] == MAX_LIMIT and manifest["model_settings"]["query_instruction"] == QUERY_INSTRUCTION
     assert len(manifest["levels"]["subset"]["benchmarks"]["qasper"]["papers"]) == 50

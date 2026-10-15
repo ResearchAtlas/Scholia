@@ -7,6 +7,10 @@ and written to one results file.
         --helper <Scholia.app>/Contents/MacOS/llama-server --model <Qwen3-Embedding-0.6B-Q8_0.gguf> --out FILE
     uv run --no-sync python -I evals/tier1.py compare BASELINE RUN
 
+Each benchmark's files are added and read (and keyword-indexed) before the search model is imported,
+so one index run per project embeds them, as when a researcher installs the model after adding papers;
+meanwhile each project not Local only has the model's offer open, unanswered, as the app records it.
+
 Everything a run reads is pinned in evals/tier1_manifest.json: each set's files (size and SHA-256,
 checked before anything is built; a file that differs or is missing is refused, and nothing is ever
 downloaded), the small fixed subset, the model settings and ticket 72's rule E. Each benchmark gets a
@@ -265,7 +269,8 @@ async def keyword_only(state, project_id, query):
     return await search({**state, "local_helper": _NoDense()}, project_id, query, MAX_LIMIT)
 
 
-ARMS = {"hybrid": hybrid, "keyword_only": keyword_only}
+# keyword_only first: the hybrid arm, last, keeps the helper running for the socket check after the arms
+ARMS = {"keyword_only": keyword_only, "hybrid": hybrid}
 # What each arm's answers must say (mode, reason) to count as that arm; an arm S1-19 adds names its own.
 EXPECTED = {"hybrid": ("hybrid", None), "keyword_only": ("keyword_only", "reference_arm")}
 
@@ -341,11 +346,15 @@ async def built(state, install, began):
     await until_read(state)
     read = time.perf_counter()
     await install()
+    installed = time.perf_counter()
     await until_built(state)
     stats = await build_stats(state, began)
+    embeddable = await asyncio.to_thread(state["db"].read, lambda c: c.execute(
+        "SELECT count(*) FROM passages WHERE kind != 'reference'").fetchone()[0])
     stats["read_and_keyword_seconds"] = round(read - began, 1)
-    stats["embedding_seconds"] = round(time.perf_counter() - read, 1)
-    stats["embedded_per_second"] = round(stats["passages"] / max(stats["embedding_seconds"], 0.001), 1)
+    stats["model_import_seconds"] = round(installed - read, 1)  # the copy and its SHA-256 check
+    stats["embedding_seconds"] = round(time.perf_counter() - installed, 1)  # the helper's start included
+    stats["embedded_per_second"] = round(embeddable / max(stats["embedding_seconds"], 0.001), 1)
     return stats
 
 
