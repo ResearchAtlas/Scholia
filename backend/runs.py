@@ -1132,7 +1132,8 @@ class Harness:
                 raise
             # Its effect found it could not be applied.
             await _through(self._write(lambda conn: self._finish_local(
-                conn, active, error.status, error.cancel_reason, {"reason": error.reason} if error.reason else None)))
+                conn, active, error.status, error.cancel_reason,
+                {**({"reason": error.reason} if error.reason else {}), **(error.details or {})} or None)))
         self.start_follows(active)  # recorded with its terminal record, which has committed
 
     def start_follows(self, active):

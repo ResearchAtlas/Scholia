@@ -761,8 +761,8 @@ class SearchIndex:
     def rebuild_project(self, project_id, run_id, stop=None):
         """Replace the project's rows from the main database (keyword rows; its vectors go, to be
         embedded again, but a refusal stays with a passage whose index text is unchanged, as it does
-        everywhere while the model is the same), in one transaction, so search keeps its keyword rows
-        throughout. Done once per run: a run started again after a restart goes on to its embeddings.
+        everywhere but in a whole-file rebuild while the model is the same), in one transaction, so
+        search keeps its keyword rows throughout. Done once per run: a run started again after a restart goes on to its embeddings.
         stop(), if given, is asked every STOP_EVERY rows: a true answer rolls the rebuild back, leaving
         the rows as they were (or withdraws it while it waits its turn)."""
         return self._write(self._rebuild_project, project_id, run_id, stop, withdraw=stop)
