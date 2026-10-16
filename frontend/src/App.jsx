@@ -91,14 +91,14 @@ export function App() {
   if (!language) return null;
   return (
     <LanguageContext.Provider value={language}>
-      {englishUnsaved && <EnglishNotSaved onRetry={saveEnglish} />}
+      {englishUnsaved && <EnglishNotSaved onRetry={saveEnglish} onClose={() => setEnglishUnsaved(false)} />}
       {state.phase === 'loading' && <Splash />}
       {state.phase === 'error' && <Failure code={state.code} onRetry={load} />}
       {state.phase === 'dataFolder' && <DataFolderScreen health={state.health} />}
       {state.phase === 'damaged' && <DamagedDatabaseScreen onRestored={load} />}
       {state.phase === 'setup' && <FirstRun onDone={load} />}
       {state.phase === 'ready' && <Shell health={state.health} settings={state.settings}
-        onLanguage={(setting) => languages.want(resolveLanguage(setting, navigator.language))} />}
+        onLanguage={(setting) => { setEnglishUnsaved(false); languages.want(resolveLanguage(setting, navigator.language)); }} />}
     </LanguageContext.Provider>
   );
 }
@@ -124,14 +124,18 @@ function Failure({ code, onRetry }) {
   );
 }
 
-// English chosen on that screen but not saved as the setting: said over the window, which keeps its
-// layout, with Try again.
-function EnglishNotSaved({ onRetry }) {
+// English chosen on that screen but not saved as the setting: said over the top of the window, which
+// keeps its layout (the composer and the window's own notices are at the bottom), with Try again
+// and Close. A language saved in Settings since then (onLanguage) clears it.
+function EnglishNotSaved({ onRetry, onClose }) {
   const t = useT();
   return (
-    <div role="alert" className="fixed inset-x-4 bottom-4 z-50 mx-auto flex max-w-lg items-center gap-3 rounded-md border bg-background px-3 py-3 text-sm text-destructive shadow-md">
-      <p className="flex-1">{t('errors.english_not_saved')}</p>
-      <Button variant="outline" size="sm" onClick={onRetry}>{t('common.retry')}</Button>
+    <div role="alert" className="fixed inset-x-4 top-4 z-50 mx-auto flex max-w-lg flex-wrap items-center gap-3 rounded-md border bg-background px-3 py-3 text-sm text-destructive shadow-md">
+      <p className="min-w-48 flex-1">{t('errors.english_not_saved')}</p>
+      <div className="flex gap-2">
+        <Button variant="outline" size="sm" onClick={onRetry}>{t('common.retry')}</Button>
+        <Button variant="ghost" size="sm" onClick={onClose}>{t('common.close')}</Button>
+      </div>
     </div>
   );
 }

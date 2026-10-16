@@ -153,8 +153,13 @@ test('Use English saves the setting as English (once more if that did not take),
   assert.match(app, /const saveEnglish = async \(\) => \{\n\s*const save = \(\) => saveSettings\(\{ 'ui\.language': 'en' \}\)\.catch\(\(\) => null\);\n\s*setEnglishUnsaved\(!\(await save\(\) \|\| await save\(\)\)\);\n\s*\};/);
   assert.match(app, /const chooseEnglish = async \(\) => \{\n\s*await saveEnglish\(\);\n\s*await languages\.want\('en'\);\n\s*\};/);
   // over the window, in the language drawn (English), with Try again saving once more
-  assert.match(app, /<LanguageContext\.Provider value=\{language\}>\n\s*\{englishUnsaved && <EnglishNotSaved onRetry=\{saveEnglish\} \/>\}/);
-  assert.match(app, /\{t\('errors\.english_not_saved'\)\}<\/p>\n\s*<Button[^>]*onClick=\{onRetry\}>\{t\('common\.retry'\)\}<\/Button>/);
+  assert.match(app, /<LanguageContext\.Provider value=\{language\}>\n\s*\{englishUnsaved && <EnglishNotSaved onRetry=\{saveEnglish\} onClose=\{\(\) => setEnglishUnsaved\(false\)\} \/>\}/);
+  // a language saved in Settings since then clears it, so its Try again cannot overwrite that choice
+  assert.match(app, /onLanguage=\{\(setting\) => \{ setEnglishUnsaved\(false\); languages\.want\(/);
+  // at the top, clear of the composer and the window's own notices at the bottom, and it can be closed
+  assert.match(app, /role="alert" className="fixed inset-x-4 top-4 /);
+  assert.match(app, /onClick=\{onClose\}>\{t\('common\.close'\)\}/);
+  assert.match(app, /\{t\('errors\.english_not_saved'\)\}<\/p>\n\s*<div className="flex gap-2">\n\s*<Button[^>]*onClick=\{onRetry\}>\{t\('common\.retry'\)\}<\/Button>/);
   assert.match(en['errors.english_not_saved'], /could not be saved[\s\S]*Try again saves it once more/);
 });
 
@@ -224,8 +229,8 @@ test('in Settings a language that cannot load saves nothing and says so; a save 
 
 test('Settings chooses the language through languageChooser, and a failed one shows Try again, which reloads the window', () => {
   const settings = source('components/Settings.jsx');
-  assert.match(settings, /const \[chooser\] = useState\(\(\) => languageChooser\(\)\);/);
-  assert.match(settings, /chooser\(value, \{ save: \(choice\) => personal\.save\(\{ 'ui\.language': choice \}\), draw: onLanguage,\n\s*failed: \(\) => setLanguageFailed\(true\) \}\);/);
+  assert.match(settings, /^const chooseLanguageSetting = languageChooser\(\);$/m); // one for the window, across Settings' opening
+  assert.match(settings, /const chooseLanguage = \(value\) => \{\n\s*setLanguageFailed\(false\);\n\s*chooseLanguageSetting\(value, \{ save: \(choice\) => personal\.save\(\{ 'ui\.language': choice \}\), draw: onLanguage,\n\s*failed: \(\) => setLanguageFailed\(true\) \}\);/);
   assert.match(settings, /onChange=\{chooseLanguage\} \/>\n\s*\{languageFailed && <div className="mt-3"><LoadState problem="language_not_loaded" onRetry=\{\(\) => window\.location\.reload\(\)\} \/><\/div>\}/);
   assert.doesNotMatch(settings, /loadLanguage|personal\.save\(\{ 'ui\.language': value \}\)/); // no other way to the setting
   assert.match(en['errors.language_not_loaded'], /was not changed\. Try again reloads the window\.$/); // names the button

@@ -73,18 +73,21 @@ function PageTitle({ children }) {
   return <h2 className="text-lg font-semibold tracking-tight">{children}</h2>;
 }
 
+// One for the window, so a choice made after Settings was closed and opened again still supersedes
+// one still loading.
+const chooseLanguageSetting = languageChooser();
+
 function General({ onLanguage, projectId }) {
   const t = useT();
   const personal = useSettingsFile();
   const [problem, setProblem] = useState(null);
-  // The language's catalog loads before the setting is saved (languageChooser): one that cannot load
-  // leaves the setting and the window as they were, and says so with Try again, which reloads the
-  // window (a catalog that failed stays failed until then).
+  // The language's catalog loads before the setting is saved (chooseLanguageSetting): one that cannot
+  // load leaves the setting and the window as they were, and says so with Try again, which reloads
+  // the window (a catalog that failed stays failed until then).
   const [languageFailed, setLanguageFailed] = useState(false);
-  const [chooser] = useState(() => languageChooser());
   const chooseLanguage = (value) => {
     setLanguageFailed(false);
-    chooser(value, { save: (choice) => personal.save({ 'ui.language': choice }), draw: onLanguage,
+    chooseLanguageSetting(value, { save: (choice) => personal.save({ 'ui.language': choice }), draw: onLanguage,
       failed: () => setLanguageFailed(true) });
   };
   const values = personal.values;
