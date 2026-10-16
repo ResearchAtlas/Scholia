@@ -61,6 +61,7 @@ import re
 import stat
 import sys
 import time
+import unicodedata
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -314,6 +315,8 @@ async def collections(request: Request, library: str = ""):
             rows = _rows(answer)
             for data in rows:
                 parent = _field(data, "parentCollection", (TEXT, FLAG), optional=True)  # a key, or false at the top
+                if parent is True:
+                    raise Unreachable("zotero_unavailable")
                 found.append({"key": data["key"], "name": _text(_field(data, "name", TEXT, optional=True), TITLE_CHARS)
                               or data["key"], "parent": _key(data, "parentCollection") if isinstance(parent, str) else None})
         except Unreachable as unreachable:
@@ -440,7 +443,7 @@ def read_attachment(text, fs_type=None, mounts=None):
         return None, "pdf_not_local"
     try:
         table = mounts()
-    except OSError:  # the Mac's mounts cannot be told: nothing is opened
+    except (OSError, AttributeError, ctypes.ArgumentError):  # the Mac's mounts cannot be told: nothing is opened
         return None, "pdf_unreadable"
     if table is not None and _on_other_mount(names, table):  # never opened: opening it could mount a share
         return None, "pdf_on_network"
@@ -502,9 +505,9 @@ def read_attachment(text, fs_type=None, mounts=None):
 
 
 def _spelled(names):
-    """A path's names as compared with mount points: lower case (APFS's default ignores case), and
-    without the data volume's firmlinked prefix, so both of its spellings are one path."""
-    lowered = [name.lower() for name in names]
+    """A path's names as compared with mount points: in one Unicode form, case folded (APFS's default
+    ignores both), and without the data volume's firmlinked prefix, so both of its spellings are one path."""
+    lowered = [unicodedata.normalize("NFD", name).casefold() for name in names]
     return lowered[3:] if lowered[:3] == _FIRMLINK else lowered
 
 
@@ -648,9 +651,10 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
         text = None if url is NOT_FOUND else url.decode("utf-8").strip()
     except UnicodeDecodeError:
         raise Unreachable("zotero_unavailable") from None
-    # Its answer is text: a URL, or "false" for an attachment with no file (Zotero's getLocalFileURL). Any
-    # other answer (null, {}, nothing) is no answer to go by, never "no file".
-    if text == "false":
+    # Its answer is text: a URL, or, for an attachment with no file, getLocalFileURL's false, which Zotero's
+    # server sends as an empty body (it writes a body only when there is one), or as "false". Any other
+    # answer (null, {}, a word) is no answer to go by, never "no file".
+    if text in ("", "false"):
         text = None
     elif text is not None and not _URL_START.match(text):
         raise Unreachable("zotero_unavailable")

@@ -813,7 +813,7 @@ async def test_a_failed_file_url_request_stops_the_import_and_never_loses_the_pd
         assert json.loads(inputs)["done"] == []  # read again by the next import
 
 
-@pytest.mark.parametrize("answer", [400, 404, "false"])
+@pytest.mark.parametrize("answer", [400, 404, "false", ""])  # "": getLocalFileURL's false, as Zotero's server sends it
 async def test_zoteros_own_no_file_answers_import_the_details_with_their_reason(tmp_path, answer):
     mock = library(tmp_path)
     mock.files["users/0", KEYS[1][:7] + "Z"] = answer
@@ -1146,8 +1146,10 @@ IMPORT_FIELDS = [  # (what is changed, how), each a value of another type than Z
     ("item csljson", lambda m: m.items["users/0", KEYS[1]].__setitem__("csljson", "a record")),
     ("file URL null", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "null")),
     ("file URL object", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "{}")),
-    ("file URL empty", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "")),
+    ("file URL a word", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "nothing")),
+    ("collection parent true", None),  # browse only: see BROWSE_FIELDS
 ]
+IMPORT_FIELDS = [(f, c) for f, c in IMPORT_FIELDS if c]
 
 
 @pytest.mark.parametrize("field, change", IMPORT_FIELDS, ids=[f for f, _ in IMPORT_FIELDS])
@@ -1167,6 +1169,8 @@ BROWSE_FIELDS = [  # (endpoint, what is changed, how)
     ("collections", "name", lambda m: m.collections.__setitem__("users/0", [{"key": "COL00001", "name": 5}])),
     ("collections", "parent", lambda m: m.collections.__setitem__("users/0", [{"key": "COL00001", "name": "A",
                                                                                "parent": 5}])),
+    ("collections", "parent true", lambda m: m.collections.__setitem__("users/0", [{"key": "COL00001", "name": "A",
+                                                                                    "parent": True}])),
     ("items", "itemType", lambda m: m.items["users/0", KEYS[0]]["data"].__setitem__("itemType", [])),
     ("items", "title", lambda m: m.items["users/0", KEYS[0]]["data"].__setitem__("title", 5)),
     ("items", "meta", lambda m: m.items["users/0", KEYS[0]].__setitem__("meta", "x")),

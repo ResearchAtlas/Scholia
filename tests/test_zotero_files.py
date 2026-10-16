@@ -4,6 +4,7 @@ Synthetic files in a temporary folder only; never Zotero's own folders."""
 
 import os
 import stat
+import sys
 
 import pytest
 
@@ -186,6 +187,30 @@ def test_a_local_external_volume_is_read_and_an_unreadable_table_opens_nothing(p
     assert opened == []
 
 
+@pytest.mark.parametrize("text", ["file:///homework/x.pdf", "file:///Volumes/Share2/x.pdf", "file:///networking/x.pdf"])
+def test_mount_points_match_whole_names_only(text):
+    assert zotero.read_attachment(text, mounts=lambda: TABLE) == (None, "pdf_missing")  # looked for, not refused
+
+
+def test_a_mount_point_in_another_unicode_form_or_case_is_one_path(tmp_path, monkeypatch):
+    import unicodedata
+    opened = []
+    monkeypatch.setattr(zotero.os, "open", lambda path, *a, **k: opened.append(path) or (_ for _ in ()).throw(OSError()))
+    table = [("/", "apfs"), (unicodedata.normalize("NFD", "/Volumes/Café"), "autofs")]
+    assert zotero.read_attachment("file:///volumes/CAF%C3%89/x.pdf", mounts=lambda: table) == (None, "pdf_on_network")
+    assert opened == []
+
+
+@pytest.mark.parametrize("error", [OSError("failed"), AttributeError("no getfsstat")])
+def test_a_mount_table_that_cannot_be_read_opens_nothing(pdf, monkeypatch, error):
+    def broken():
+        raise error
+
+    monkeypatch.setattr(zotero.os, "open", lambda *a, **k: (_ for _ in ()).throw(AssertionError("opened")))
+    assert zotero.read_attachment(url(pdf), mounts=broken) == (None, "pdf_unreadable")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the Mac's mount table")
 def test_this_macs_own_mount_table_is_read():
     table = zotero._mount_table()
     assert ("/", "apfs") in table and all(isinstance(point, str) and isinstance(kind, str) for point, kind in table)
