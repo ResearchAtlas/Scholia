@@ -54,52 +54,60 @@ def test_files_that_are_not_regular_pdfs_are_refused(tmp_path, pdf):
     assert zotero.read_attachment(url(other)) == (None, "pdf_not_a_pdf")
 
 
-def test_links_are_resolved_and_the_final_file_decides(tmp_path, pdf):
+def test_no_link_is_followed_anywhere_in_the_path(tmp_path, pdf):
     link = tmp_path / "link.pdf"
     link.symlink_to(pdf)
     chain = tmp_path / "chain.pdf"
     chain.symlink_to(link)
     folder = tmp_path / "folder"
     folder.symlink_to(pdf.parent)
-    assert zotero.read_attachment(url(link)) == (PDF, None)
-    assert zotero.read_attachment(url(chain)) == (PDF, None)
-    assert zotero.read_attachment(url(folder / pdf.name)) == (PDF, None)
     database = tmp_path / "zotero.sqlite"
     database.write_bytes(PDF)  # even one that starts like a PDF
     named = tmp_path / "paper2.pdf"
     named.symlink_to(database)
-    assert zotero.read_attachment(url(named)) == (None, "pdf_not_a_pdf")
-    assert zotero.read_attachment(url(database)) == (None, "pdf_not_a_pdf")
     dangling = tmp_path / "dangling.pdf"
     dangling.symlink_to(tmp_path / "nowhere.pdf")
-    assert zotero.read_attachment(url(dangling)) == (None, "pdf_missing")
     loop = tmp_path / "loop.pdf"
     loop.symlink_to(loop)
-    assert zotero.read_attachment(url(loop)) == (None, "pdf_unreadable")
+    for path in (link, chain, folder / pdf.name, named, dangling, loop):
+        assert zotero.read_attachment(url(path)) == (None, "pdf_link"), path
+    assert zotero.read_attachment(url(database)) == (None, "pdf_not_a_pdf")
+    assert zotero.read_attachment(url(pdf)) == (PDF, None)
 
 
-def test_a_link_put_in_place_after_resolving_is_not_followed(tmp_path, pdf, monkeypatch):
-    target = tmp_path / "swapped.pdf"
-    target.write_bytes(PDF)
+@pytest.mark.parametrize("swapped", ["folder", "file"])
+def test_a_folder_or_file_swapped_for_a_link_during_the_walk_is_refused(tmp_path, monkeypatch, swapped):
+    real = tmp_path / "real"
+    (real / "inner").mkdir(parents=True)
+    (real / "inner" / "paper.pdf").write_bytes(PDF)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "inner").mkdir(parents=True)
+    (elsewhere / "inner" / "paper.pdf").write_bytes(PDF + b"elsewhere")
+    target = real / "inner" if swapped == "folder" else real / "inner" / "paper.pdf"
     real_open = os.open
 
-    def swapped(path, flags, *args):  # the final file becomes a link between the checks and the open
-        if str(path) == str(target) and not target.is_symlink():
-            target.unlink()
-            target.symlink_to(pdf)
-        return real_open(path, flags, *args)
+    def swapping(path, flags, *args, **kwargs):  # the name is replaced by a link just before it is opened
+        if path == target.name and not target.is_symlink():
+            if swapped == "folder":
+                target.rename(tmp_path / "moved")
+                target.symlink_to(elsewhere / "inner")
+            else:
+                target.unlink()
+                target.symlink_to(elsewhere / "inner" / "paper.pdf")
+        return real_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(zotero.os, "open", swapped)
-    assert zotero.read_attachment(url(target)) == (None, "pdf_unreadable")
+    monkeypatch.setattr(zotero.os, "open", swapping)
+    assert zotero.read_attachment(url(real / "inner" / "paper.pdf")) == (None, "pdf_link")
 
 
-def test_network_files_and_cloud_placeholders_are_never_opened(tmp_path, pdf, monkeypatch):
-    assert zotero.read_attachment(url(pdf), fs_type=lambda path: "smbfs") == (None, "pdf_on_network")
-    link = tmp_path / "remote.pdf"
-    link.symlink_to(pdf)
-    seen = []
-    assert zotero.read_attachment(url(link), fs_type=lambda path: seen.append(path) or "nfs") == (None, "pdf_on_network")
-    assert seen == [str(pdf)]  # the final file's file system, not the link's
+def test_network_folders_and_files_and_cloud_placeholders_are_never_read(tmp_path, pdf, monkeypatch):
+    opened = []
+    real_open = os.open
+    monkeypatch.setattr(zotero.os, "open", lambda path, *a, **k: opened.append(path) or real_open(path, *a, **k))
+    assert zotero.read_attachment(url(pdf), fs_type=lambda fd: "smbfs") == (None, "pdf_on_network")
+    assert opened == ["/", pdf.parts[1]]  # stopped at the first folder on a network file system
+    deeper = iter(["apfs", "apfs", "nfs"])
+    assert zotero.read_attachment(url(pdf), fs_type=lambda fd: next(deeper, "apfs")) == (None, "pdf_on_network")
     monkeypatch.setattr(zotero, "SF_DATALESS", stat.UF_HIDDEN)  # a flag a test can set, standing in for dataless
     os.chflags(pdf, stat.UF_HIDDEN)
     assert zotero.read_attachment(url(pdf)) == (None, "pdf_not_downloaded")
@@ -132,15 +140,29 @@ def test_a_pdf_named_like_a_database_topic_is_read_but_a_database_never(tmp_path
 
 
 @pytest.mark.parametrize("text", ["file:///net/nas.example/export/x.pdf", "file:///home/someone/x.pdf",
-                                  "file:///Network/Servers/x.pdf", "file:///tmp/../net/nas/x.pdf",
-                                  "file:////net/nas/x.pdf", "file:///%2Fnet/nas/x.pdf",
+                                  "file:///Network/Servers/x.pdf", "file:////net/nas/x.pdf", "file:///%2Fnet/nas/x.pdf",
                                   "file:///System/Volumes/Data/home/x.pdf", "file:///System/Volumes/Data/net/nas/x.pdf"])
-def test_automounted_network_folders_are_refused_before_they_are_resolved(text, monkeypatch):
+def test_automounted_network_folders_are_refused_before_anything_is_opened(text, monkeypatch):
     def never(*args, **kwargs):
-        raise AssertionError("resolved")
+        raise AssertionError("opened")
 
-    monkeypatch.setattr(zotero.os.path, "realpath", never)
+    monkeypatch.setattr(zotero.os, "open", never)
     assert zotero.read_attachment(text) == (None, "pdf_on_network")
+
+
+def test_a_link_into_an_automounted_folder_is_never_followed(tmp_path, monkeypatch):
+    link = tmp_path / "share.pdf"
+    link.symlink_to("/net/nas.example/export/x.pdf")
+    opened = []
+    real_open = os.open
+    monkeypatch.setattr(zotero.os, "open", lambda path, *a, **k: opened.append(path) or real_open(path, *a, **k))
+    monkeypatch.setattr(zotero.os.path, "realpath", lambda *a, **k: (_ for _ in ()).throw(AssertionError("resolved")))
+    assert zotero.read_attachment(url(link)) == (None, "pdf_link")
+    assert "net" not in opened
+
+
+def test_a_path_with_dot_segments_is_not_local():
+    assert zotero.read_attachment("file:///tmp/../net/nas/x.pdf") == (None, "pdf_not_local")
 
 
 def test_a_file_url_with_a_host_it_cannot_read_is_refused():

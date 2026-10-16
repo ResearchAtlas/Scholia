@@ -199,11 +199,12 @@ class WalkthroughZotero(MockZotero):
 
     def __init__(self, control, materials):
         super().__init__(server_id="walkthrough-zotero", groups=[(4711, "Synthetic Lab"), (4712, "合成课题组")])
-        self.control, self.materials = control, materials
+        # the folder by its own path: Scholia follows no link to an attachment (/var is one on macOS)
+        self.control, self.materials = control, materials.resolve()
         self.collections["users/0"] = [{"key": "WAGECOL1", "name": "Wage studies"},
                                        {"key": "LINKCOL2", "name": "Linked files", "parent": "WAGECOL1"}]
         for key, (title, doi, pdf, linked, collection) in ZOTERO_ITEMS.items():
-            path = pdf if pdf is None or pdf.startswith("file:") else materials / pdf
+            path = pdf if pdf is None or pdf.startswith("file:") else self.materials / pdf
             self.item(key, title, doi=doi, pdf=path, linked=linked, collections=[collection] if collection else [])
 
     async def __call__(self, request):

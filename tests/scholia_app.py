@@ -175,9 +175,9 @@ class MockZotero:
     """A test-owned stand-in for Zotero's local API (S1-15), behind the gate's mock transport, holding
     made-up items only, never a real library. state: ready, api_off (403), old (404: Zotero before 7),
     not_running (no connection). Each request is kept in `requests` as (method, raw path and query,
-    headers). `answers` holds answers given first, before any route: a status, or a callable of the
-    request (async or not) giving a response. `hold`, when set to an asyncio.Event, keeps requests
-    waiting until it is set, after `started` is set. Files are named by `files` (the attachment's file
+    headers). `answers` holds answers given first, before any route: a status, a callable of the
+    request (async or not) giving a response, or None (that request answered as usual). `hold`, when
+    set to an asyncio.Event, keeps requests waiting until it is set, after `started` is set. Files are named by `files` (the attachment's file
     URL text, or a status), as Zotero's file/view/url answers."""
 
     ORIGIN = ("127.0.0.1", 23119)
@@ -222,10 +222,10 @@ class MockZotero:
             await self.hold.wait()
         if self.state == "not_running":
             raise httpx.ConnectError("connection refused", request=request)
-        if self.answers:
-            answer = self.answers.pop(0)
-            if isinstance(answer, int):
-                return self._answer(answer)
+        answer = self.answers.pop(0) if self.answers else None  # None: answered as Zotero would
+        if isinstance(answer, int):
+            return self._answer(answer)
+        if answer is not None:
             answer = answer(request)
             return await answer if asyncio.iscoroutine(answer) else answer
         if self.state == "api_off":

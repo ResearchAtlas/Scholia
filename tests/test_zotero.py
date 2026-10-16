@@ -218,7 +218,23 @@ async def test_an_item_whose_transaction_fails_writes_nothing_and_ends_the_run(t
         assert await rows(client, "SELECT count(*) FROM material_versions") == [(1,)]
 
 
-async def test_a_restart_goes_on_from_the_next_item_and_never_makes_a_deleted_paper_again(tmp_path):
+async def test_a_restart_goes_on_from_the_next_item(tmp_path):
+    mock = library(tmp_path)
+    mock.hold, mock.held = asyncio.Event(), f"items/{KEYS[1]}?"
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        run = await start(client, project)
+        await asyncio.wait_for(mock.started.wait(), 10)
+    again = library(tmp_path)
+    async with started(tmp_path / "data", provider(again), setup=False) as client:
+        row = await run_finished(client, run, 30)
+        assert row["status"] == "succeeded"
+        assert sorted(await papers(client, project)) == [f"users/0/items/{k}" for k in KEYS]
+        assert not any(KEYS[0] in path for path in again.paths)  # done before: not asked again
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'extract'") == [(2,)]
+
+
+async def test_deleting_a_paper_an_import_made_stops_it_and_a_restart_never_makes_it_again(tmp_path):
     mock = library(tmp_path)
     mock.hold, mock.held = asyncio.Event(), f"items/{KEYS[1]}?"
     async with started(tmp_path / "data", provider(mock)) as client:
@@ -227,13 +243,12 @@ async def test_a_restart_goes_on_from_the_next_item_and_never_makes_a_deleted_pa
         await asyncio.wait_for(mock.started.wait(), 10)
         [(first,)] = await rows(client, "SELECT id FROM materials WHERE source_key = ?", f"users/0/items/{KEYS[0]}")
         assert (await client.delete(f"/api/materials/{first}")).status_code == 200
-    again = library(tmp_path)
-    async with started(tmp_path / "data", provider(again), setup=False) as client:
-        row = await run_finished(client, run, 30)
-        assert row["status"] == "succeeded"
-        assert sorted(await papers(client, project)) == [f"users/0/items/{k}" for k in KEYS[1:]]
-        assert not any(KEYS[0] in path for path in again.paths)  # done before: not asked again
-        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'extract'") == [(2,)]
+        mock.hold.set()
+        row = await run_finished(client, run)
+        assert (row["status"], row["cancel_reason"]) == ("cancelled", "revoked")
+    async with started(tmp_path / "data", provider(library(tmp_path)), setup=False) as client:
+        await background_idle(client, 30)
+        assert await papers(client, project) == {}
 
 
 async def test_a_restarted_import_whose_zotero_is_gone_fails(tmp_path):
@@ -604,9 +619,9 @@ async def test_malformed_answers_fail_as_unavailable(tmp_path):
         200, content=body, headers={"Zotero-API-Version": "3", **headers})
     async with started(tmp_path / "data", provider(mock)) as client:
         project = await project_of(client)
-        mock.answers = [answer(b'["x", 3, {"id": "1"}]')]
-        assert (await client.get("/api/zotero/status")).json() == {"state": "ready", "libraries": [
-            {"id": "users/0", "name": None}], "server_id": None}
+        for groups in (b'["x", 3, {"id": "1"}]', b'{"id": 1}', b'[{"id": "1", "data": {}}]'):
+            mock.answers = [answer(groups)]
+            assert (await client.get("/api/zotero/status")).json() == {"state": "error"}
         mock.answers = [answer(b"[]", **{"Total-Results": b"\xb2"})]
         assert (await client.get("/api/zotero/items", params={"library": "users/0"})).json()["total"] is None
         for body, headers in ((b"[" * 100_000, {}), (b"{}", {"Content-Encoding": "gzip"}),
@@ -614,9 +629,17 @@ async def test_malformed_answers_fail_as_unavailable(tmp_path):
             mock.answers = [answer(body, **headers)]
             response = await client.get("/api/zotero/collections", params={"library": "users/0"})
             assert (response.status_code, response.json()["code"]) == (502, "zotero_unavailable")
-        mock.answers = [answer(b"{\"data\": 1}"), answer(b"[]")]  # an item of the wrong shape: not found
-        row = await imported(client, project, KEYS[:1])
-        assert row["status"] == "succeeded" and row["result"]["not_found"] == 1
+        for items in (b'{"x": 1}', b'[{"data": {"key": "not a key"}}]', b'[{"key": "AAAA2222"}]'):
+            mock.answers = [answer(items)]
+            response = await client.get("/api/zotero/items", params={"library": "users/0"})
+            assert (response.status_code, response.json()["code"]) == (502, "zotero_unavailable")
+        # An item, or its attachments, of another shape: the import fails, never "no attachments"
+        for first, second in ((b'{"data": 1}', None), (b'{"data": {"key": "BBBB3333"}}', None),
+                              (None, b'{"data": []}'), (None, b'[{"data": "x"}]'), (None, b'[{"key": "AAAA222Z"}]')):
+            mock.answers = [answer(first)] if first else [None, answer(second)]  # or the item as it is, then its children
+            row = await imported(client, project, KEYS[:1])
+            assert (row["status"], row["result"]["reason"]) == ("failed", "zotero_unavailable"), (first, second)
+        assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
 
 
 async def test_a_trashed_item_is_not_imported(tmp_path):
@@ -685,3 +708,75 @@ async def test_an_archive_id_of_the_exact_form_is_looked_up_in_the_imports_one_b
                                                                       "2401.00006", "2401.00007", "2401.99999"))
         [preprint_paper] = [m for m in await settled(client, project) if m["source_key"] == "users/0/items/PPPP2222"]
         assert preprint_paper["title"] == "A Synthetic Preprint" and preprint_paper["lookup"]["source"] == "arxiv"
+
+
+# gpt-6-astra review 1 (PR 33)
+
+
+async def test_a_lookup_for_a_doi_the_record_no_longer_gives_applies_nothing(tmp_path):
+    other = "10.5555/scholia.zotero.other"
+    mock = library(tmp_path, pdfs=False)
+    scholarly = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A", retracted=True)})
+    scholarly.hold = asyncio.Event()
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=scholarly)) as client:
+        project = await project_of(client)
+        await imported(client, project, KEYS[:1])
+        await asyncio.wait_for(scholarly.started.wait(), 10)  # A's lookup is under way, its answer held
+        mock.items["users/0", KEYS[0]]["csljson"]["DOI"] = other  # Zotero's record now names B
+        row = await imported(client, project, KEYS[:1])
+        assert row["result"]["updated"] == 1
+        scholarly.hold.set()
+        await background_idle(client, 30)
+        [paper] = (await papers(client, project)).values()
+        assert paper["csl"]["DOI"] == other
+        assert "container-title" not in paper["csl"] and paper["retraction"] != "retracted" and paper["resolved_at"] is None
+        steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events e JOIN runs r ON r.id = e.run_id"
+                                                         " WHERE r.workflow = 'lookup' AND e.type = 'step_finished'")]
+        assert {(s["identifier"], s["outcome"]) for s in steps} == {(f"doi:{DOI}", "replaced"), (f"doi:{other}", "not_found")}
+
+
+async def test_deleting_a_paper_revokes_every_import_of_its_item_even_one_admitted_before_it_existed(tmp_path,
+                                                                                                    monkeypatch):
+    mock = library(tmp_path, pdfs=False)
+    real, calls, both, later = zotero._fetch_item, [], asyncio.Event(), asyncio.Event()
+
+    async def fetch(harness, active, *args):
+        calls.append(active.run_id)
+        await (both if len(calls) == 1 else later).wait()
+        return await real(harness, active, *args)
+
+    monkeypatch.setattr(zotero, "_fetch_item", fetch)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        runs = [await start(client, project, KEYS[:1]), await start(client, project, KEYS[:1])]
+        both.set()  # both admitted while the paper did not exist: the first goes on
+        first = await run_finished(client, calls[0])
+        assert first["status"] == "succeeded"
+        [(paper,)] = await rows(client, "SELECT id FROM materials")
+        assert (await client.delete(f"/api/materials/{paper}")).status_code == 200
+        later.set()
+        second = await run_finished(client, next(r for r in runs if r != calls[0]))
+        assert (second["status"], second["cancel_reason"]) == ("cancelled", "revoked")
+        assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
+
+
+async def test_an_import_has_one_lookup_batch_and_one_question_however_long_it_takes(tmp_path, monkeypatch):
+    monkeypatch.setattr(materials_module, "BATCH_IDLE_SECONDS", 0.2)
+    mock = library(tmp_path, pdfs=False)
+    for n, key in enumerate(KEYS[1:], start=2):
+        mock.items["users/0", key]["csljson"]["DOI"] = f"10.5555/scholia.zotero.00{n}"
+    real = zotero._fetch_item
+
+    async def slow(harness, active, client, library_id, key, *args):
+        if key != KEYS[0]:
+            await asyncio.sleep(0.8)  # each later item past the drop batch's idle time
+        return await real(harness, active, client, library_id, key, *args)
+
+    monkeypatch.setattr(zotero, "_fetch_item", slow)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client, level="local_only")
+        row = await imported(client, project)
+        assert row["result"]["imported"] == 3
+        [ask] = await asks_of(client, project)
+        assert ask["params"]["identifiers"] == 3 and ask["params"]["batch"] == "zotero"
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]

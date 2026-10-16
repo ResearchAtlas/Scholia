@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { collectionTree, MAX_ITEMS, reportParts, statusKey } from '../src/zotero.js';
+import { appendPage, collectionTree, MAX_ITEMS, reportParts, statusKey } from '../src/zotero.js';
 import { detailsSource, reasonKey } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
@@ -62,7 +62,7 @@ test('a Zotero paper says where its details came from and why its PDF was not re
     const missed = { ...paper, lookup: { status: 'failed', outcome: 'unavailable' } };
     assert.equal(detailsSource(t, missed, {}, date), t('library.source.zotero.unavailable'));
     for (const reason of ['pdf_missing', 'pdf_not_local', 'pdf_on_network', 'pdf_not_downloaded', 'pdf_not_a_file',
-      'pdf_too_large', 'pdf_not_a_pdf', 'pdf_unreadable']) {
+      'pdf_too_large', 'pdf_not_a_pdf', 'pdf_unreadable', 'pdf_link']) {
       assert.equal(reasonKey(reason), `library.reason.${reason}`);
       assert.notEqual(t(reasonKey(reason)), reasonKey(reason));
     }
@@ -73,4 +73,25 @@ test('the browser says what an import did only from its finished run', () => {
   const browser = source('ZoteroBrowser.jsx');
   assert.match(browser, /const row = await followRun\(runId/);
   assert.match(browser, /reportParts\(row\.result \?\?/);
+});
+
+test('a further page joins only the list it was asked for', () => {
+  const list = (library, collection, generation, keys, next) => ({ library, collection, generation, next,
+    items: keys.map((key) => ({ key })), total: 120 });
+  const a = list('users/0', null, 1, ['A1'], 50);
+  const page = { items: [{ key: 'A2' }], next: 100, total: 120 };
+  const asked = { library: 'users/0', collection: null, generation: 1, start: 50 };
+  assert.deepEqual(appendPage(a, page, asked).items.map((i) => i.key), ['A1', 'A2']);
+  const b = list('groups/4711', null, 2, ['B1'], 50); // another library shown since, also at 50
+  assert.equal(appendPage(b, page, asked), b);
+  assert.equal(appendPage(list('users/0', 'COL00001', 1, ['C1'], 50), page, asked).items.length, 1);
+  assert.equal(appendPage(list('users/0', null, 3, ['A1'], 50), page, asked).items.length, 1); // the same list asked again
+  const added = appendPage(a, page, asked);
+  assert.equal(appendPage(added, page, asked), added); // added once
+  assert.equal(appendPage(null, page, asked), null);
+});
+
+test('the Local only question for a Zotero import names both identifiers it may send', () => {
+  assert.match(en['ask.identifier_lookup.bodyZotero'], /DOI or arXiv ID/);
+  assert.match(zh['ask.identifier_lookup.bodyZotero'], /DOI 或 arXiv 编号/);
 });

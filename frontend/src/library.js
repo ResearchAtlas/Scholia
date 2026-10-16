@@ -211,7 +211,7 @@ const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_
   'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'memory_limit', 'step_limit',
   // S1-15: a Zotero paper whose PDF could not be read (backend/zotero.py read_attachment)
   'pdf_missing', 'pdf_not_local', 'pdf_on_network', 'pdf_not_downloaded', 'pdf_not_a_file', 'pdf_too_large',
-  'pdf_not_a_pdf', 'pdf_unreadable']);
+  'pdf_not_a_pdf', 'pdf_unreadable', 'pdf_link']);
 
 // A reading's scanned pages under Details: read by text recognition, or waiting for it where no OCR
 // engine read them (status ocr_needed); null when it has none.

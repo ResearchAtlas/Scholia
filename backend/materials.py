@@ -578,6 +578,11 @@ async def _look_up(harness, active, project_id, inputs, pace):
     def close_if_idle(conn):  # in its transaction, so an addition that comes meanwhile keeps it open
         row = conn.execute("SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
         now = json.loads(row[0]) if row and row[0] else {}
+        # A Zotero import's batch (S1-15) closes with its import, however long it takes: never idle while it runs.
+        if now.get("open") and now.get("import_run") and _running(conn, now["import_run"]):
+            now["touched"] = time.time()  # looked at again once the idle time has passed once more
+            conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(now), run_id))
+            return now
         if now.get("open") and time.time() - now.get("touched", 0) > BATCH_IDLE_SECONDS:
             del now["open"], now["touched"]
             conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(now), run_id))
@@ -633,23 +638,27 @@ async def _look_up(harness, active, project_id, inputs, pace):
     approved = False
     if level == "local_only":
         approved = await _approval(read, write, run_id, project_id, inputs, distinct, wanted)
-    resolved, missed, asking, stale = 0, [], [[]], []  # asking[0]: the papers the identifier in hand is for
+    # asking: the identifier in hand and the papers it is for
+    resolved, missed, asking, stale = 0, [], [None, []], []
 
     def admit(conn):
         """The gate's check of each request, in the transaction that decides it (after the source's turn,
         before every attempt): the run may still send, and at least one of its papers still has the file
-        the identifier came from. A replaced one is refused, so its identifier is never sent."""
+        the identifier came from, and the record it came from still gives it (S1-15). A replaced one is
+        refused, so its identifier is never sent."""
         if not may_dispatch(conn, run_id):
             return False
-        if not _current(conn, asking[0]):
+        if not _current(conn, asking[1], asking[0]):
             stale.append(True)
             return False
         return True
 
     async with harness.gate.async_client(project_id, approved=approved, admit=admit) as client:
         for done, (scheme, value) in enumerate(distinct, start=1):
-            mine = asking[0] = [(m, version) for m, (version, found, _) in wanted.items() if found == (scheme, value)]
-            if not await read(lambda conn: _current(conn, mine)):  # every paper it was for has another file now
+            mine = asking[1] = [(m, version) for m, (version, found, _) in wanted.items() if found == (scheme, value)]
+            asking[0] = (scheme, value)
+            if not await read(lambda conn: _current(conn, mine, (scheme, value))):  # every paper it was for has
+                # another file now, or a record that gives another identifier
                 found, outcome = None, "replaced"
             else:
                 try:
@@ -726,10 +735,27 @@ def _identifiers(conn, project_id, materials, versions):
     return found
 
 
-def _current(conn, pairs):
-    """Of [(material id, version id)], those whose version is still its material's current one."""
+def _current(conn, pairs, identifier=None):
+    """Of [(material id, version id)], those whose version is still its material's current one and, given
+    the identifier a lookup is for, whose record still gives it (_gives)."""
     return [(m, v) for m, v in pairs if conn.execute(
-        "SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1", (v, m)).fetchone()]
+        "SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1", (v, m)).fetchone()
+        and (identifier is None or _gives(conn, m, identifier))]
+
+
+def _gives(conn, material, identifier):
+    """Whether a paper still gives the identifier a lookup was made for. A reference file's or a Zotero
+    paper's comes from its record (_identifiers), which a re-import (S1-15) or a merge can change while
+    its file stays: a lookup for the identifier it had then sends and applies nothing. A paper whose
+    identifier comes from its file's text is bound by its version (_current)."""
+    row = conn.execute("SELECT source, csl, checked_by, lookup_filled FROM materials WHERE id = ?",
+                       (material,)).fetchone()
+    if row is None or row[0] not in _RECORDED or row[2] == "researcher":
+        return row is not None
+    record = json.loads(row[1] or "{}")
+    for key in json.loads(row[3] or "[]"):  # a lookup's fields are not the record's
+        record.pop(key, None)
+    return reference_files.identifier(record) == tuple(identifier)
 
 
 async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
@@ -797,7 +823,8 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
                            (version, material, project_id)).fetchone()
         if row is None:
             continue
-        mine, result = (found, outcome) if row[1] else (None, "replaced")
+        # S1-15: a record that gives another identifier now is not this lookup's to fill
+        mine, result = (found, outcome) if row[1] and _gives(conn, material, (scheme, value)) else (None, "replaced")
         filled = _fill_imported(conn, material, mine) if mine is not None else None  # S1-14: its record stays
         if mine is not None:
             if row[0] != "researcher" and filled is None:  # what the researcher edited stays

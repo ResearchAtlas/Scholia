@@ -22,16 +22,17 @@ still exists. The review lock is not part of it: nothing leaves this Mac, so eve
 An import reads, for each item in turn: the item with its CSL JSON (one request), its children, and,
 for its PDF attachment (a stored file before a linked one, then the earliest added), the attachment's
 file URL. Zotero's local API serves no file bytes: it names the file on disk (a file:// URL). Scholia
-reads that local file itself (read_attachment), only when it is on this Mac's own disk, a regular PDF
-of at most extraction.MAX_FILE_BYTES; otherwise the item is imported with its details only, and the
-reason recorded. The record is read with S1-14's CSL JSON reader and bounds (backend/reference_files.py),
+reads that local file itself (read_attachment), only when it is on this Mac's own disk, reached through
+no link, a regular PDF of at most extraction.MAX_FILE_BYTES; otherwise the item is imported with its
+details only, and the reason recorded. Every answer of Zotero's is checked for its shape before it is
+used; one of another shape fails the import (zotero_unavailable), never read as an empty answer. The record is read with S1-14's CSL JSON reader and bounds (backend/reference_files.py),
 so its identifier follows S1-14's rule: a DOI only from the record's DOI field, whole, else an arXiv ID
 only from Zotero's archiveID field when it is, whole, "arXiv:" and an ID (Harold, 2026-10-17); never
-from a URL or `number`. Each item is written in its own transaction, while the run is running, not revoked and not
-cancelled:
+from a URL or `number`. Each item is written in its own transaction, while the run is running, not revoked
+and not cancelled:
 - an item already imported into the project (keyed by library and item key, `source_key`
   "<library>/items/<KEY>") is updated: its details replaced by the record when they changed and the
-  researcher has not edited them, and a PDF that is not its current file becomes its next version;
+  researcher has not edited them, and a PDF that is none of its files becomes its next version;
 - a new item that duplicates a paper of the project (S1-14's `references.Duplicates`) is reported
   already there when it would add nothing, else asked about through S1-14's merge run (Keep both
   imports it as its own paper, through a one-item import of its own); a PDF that is already a paper's
@@ -39,17 +40,24 @@ cancelled:
 - otherwise it becomes the project's paper, source zotero, with its first version (its PDF, read in
   a reading run, or none).
 Papers it made or whose details it replaced, carrying an identifier, join one lookup batch for the
-import (S1-13's, batch `zotero`): a Local only project asks once, a review-locked one never looks up.
-Its step events record each item's outcome, from which the summary is counted. Its inputs name the
-papers it was admitted to update (`material_ids`: deleting one revokes it) and the items done, so a
-restart goes on from the next item and never makes a paper deleted since again.
+import (S1-13's, batch `zotero`), bound to the import run: it stays open while the import runs, however
+long and across a restart, and closes when the import ends, so a Local only project asks once per
+import; a review-locked one never looks up. A lookup applies only while the paper's record still gives
+the identifier it was made for (materials._gives). Its step events record each item's outcome, from
+which the summary is counted. Its inputs name its items and the items done, so a restart goes on from
+the next item; deleting a Zotero paper revokes every running import of its item into its project
+(backend/db/deletion.py SCOPE_LINKS), so none makes it again.
 """
 
 import asyncio
+import ctypes
+import errno
 import json
 import os
+import platform
 import re
 import stat
+import sys
 import time
 from urllib.parse import unquote, urlsplit
 
@@ -58,7 +66,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from backend import extraction, reference_files, references, search
-from backend.data_folder import NETWORK_FILE_SYSTEMS, file_system_type
+from backend.data_folder import NETWORK_FILE_SYSTEMS, _StatFS
 from backend.db import new_id, utc_now
 from backend.materials import _add_to_batch, _no_store, _refused, add_version
 from backend.outbound_gate import ZOTERO, OutboundDenied, _show
@@ -80,10 +88,9 @@ _KEY = re.compile(r"[A-Z0-9]{8}")
 _SERVER_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _NOT_ITEMS = ("note", "attachment", "annotation")  # never offered or imported as a paper
 _DATABASES = (".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm", "-journal", ".sqlite.bak")  # file names never read
-# macOS's automounted network folders (and their firmlinked spelling under /System/Volumes/Data): a path under
-# one is refused before it is resolved, since resolving it mounts the share. ponytail: a link elsewhere that
-# points into one, or a ".." after a link, is resolved first (realpath mounts it), then refused by its file
-# system's type; a no-follow walk of each component if that ever matters.
+# macOS's automounted network folders (and their firmlinked spelling under /System/Volumes/Data): a path into
+# one is refused before anything of it is opened, since opening it mounts the share (no link is followed, so
+# no other path reaches one).
 _AUTOMOUNTS = ("net", "home", "network")
 _LINKS = ("imported_file", "imported_url", "linked_file")  # attachments with a file on disk, stored ones first
 # What a paper's import outcome is, counted in the run's summary.
@@ -176,16 +183,26 @@ def _text(value, limit):
     return reference_files._text(value, limit)
 
 
+def _objects(answer, keyed=True):
+    """A list answer as Zotero gives one: each an object with its data object (and, keyed, the data's
+    item or collection key). Any other shape is no answer to go by: Unreachable zotero_unavailable, never
+    read as an empty list."""
+    if not isinstance(answer, list) or not all(
+            isinstance(row, dict) and isinstance(row.get("data"), dict)
+            and (not keyed or isinstance(row["data"].get("key"), str) and _KEY.fullmatch(row["data"]["key"]))
+            for row in answer):
+        raise Unreachable("zotero_unavailable")
+    return answer
+
+
 def _libraries(groups):
     """My Library and each group, as the browser lists them: {id, name} (name None for My Library)."""
     found = [{"id": "users/0", "name": None}]
-    for group in groups if isinstance(groups, list) else []:
-        if not isinstance(group, dict):
-            continue
+    for group in _objects(groups, keyed=False):
         number = group.get("id")
-        name = group["data"].get("name") if isinstance(group.get("data"), dict) else None
-        if type(number) is int and _LIBRARY.fullmatch(f"groups/{number}"):
-            found.append({"id": f"groups/{number}", "name": _text(name, TITLE_CHARS) or f"{number}"})
+        if not (type(number) is int and _LIBRARY.fullmatch(f"groups/{number}")):
+            raise Unreachable("zotero_unavailable")
+        found.append({"id": f"groups/{number}", "name": _text(group["data"].get("name"), TITLE_CHARS) or f"{number}"})
     return found
 
 
@@ -230,7 +247,11 @@ async def status(request: Request):
     if groups is None or headers.get("zotero-api-version") != "3":  # Zotero before 7, or another API
         return {"state": "unsupported"}
     server_id = headers.get("zotero-server-id")
-    return {"state": "ready", "libraries": _libraries(groups),
+    try:
+        libraries = _libraries(groups)
+    except Unreachable:  # an answer of another shape
+        return {"state": "error"}
+    return {"state": "ready", "libraries": libraries,
             "server_id": server_id if server_id and _SERVER_ID.fullmatch(server_id) else None}
 
 
@@ -241,13 +262,14 @@ async def collections(request: Request, library: str = ""):
     found = []
     for page in range(COLLECTION_PAGES):
         answer, headers = await _browse(state, f"/api/{library}/collections?format=json&limit=100&start={page * 100}")
-        rows = answer if isinstance(answer, list) else []
-        for row in rows:
-            data = row.get("data") if isinstance(row, dict) else None
-            if isinstance(data, dict) and isinstance(data.get("key"), str) and _KEY.fullmatch(data["key"]):
-                parent = data.get("parentCollection")
-                found.append({"key": data["key"], "name": _text(data.get("name"), TITLE_CHARS) or data["key"],
-                              "parent": parent if isinstance(parent, str) and _KEY.fullmatch(parent) else None})
+        try:
+            rows = _objects(answer)
+        except Unreachable as unreachable:
+            raise _refused(502, unreachable.code, "Zotero could not be read") from None
+        for data in (row["data"] for row in rows):
+            parent = data.get("parentCollection")
+            found.append({"key": data["key"], "name": _text(data.get("name"), TITLE_CHARS) or data["key"],
+                          "parent": parent if isinstance(parent, str) and _KEY.fullmatch(parent) else None})
         if len(rows) < 100:
             return {"collections": found}
     raise _refused(502, "zotero_unavailable", "The library has more collections than Scholia reads")
@@ -279,7 +301,10 @@ async def items(request: Request, library: str = "", collection: str | None = No
     answer, headers = await _browse(state, f"/api/{library}/{where}items/top?format=json&limit={PAGE}&start={start}")
     if answer is None:
         raise _refused(404, "not_found", "No such Zotero library or collection")
-    rows = answer if isinstance(answer, list) else []
+    try:
+        rows = _objects(answer)
+    except Unreachable as unreachable:
+        raise _refused(502, unreachable.code, "Zotero could not be read") from None
     total = headers.get("total-results", "")
     total = int(total) if re.fullmatch(r"[0-9]{1,9}", total) else None
     more = total > start + PAGE if total is not None else len(rows) == PAGE
@@ -324,14 +349,20 @@ async def import_zotero(project_id: str, body: ZoteroImport, request: Request):
     return {"run_id": await state["harness"].record_background(1, admit)}
 
 
-def read_attachment(text, fs_type=file_system_type):
+def read_attachment(text, fs_type=None):
     """(the PDF's bytes, None) or (None, why not) for the file URL Zotero named for an attachment.
-    Only a file on this Mac's own disk is read: a file: URL with no host, its path resolved whole,
-    every link followed, before any check, and every check made on that final file (never on the name
-    Zotero gave); not a file named like a database (zotero.sqlite and its kin), not on a network file
-    system, not a cloud placeholder whose contents are elsewhere; a regular file, opened read-only
-    without following a link put in its place since, checked again once open, of at most
-    MAX_FILE_BYTES (at most one byte more is read), that is a PDF. Nothing is written."""
+    Only a file on this Mac's own disk is read, and no link is ever followed: a file: URL with no host,
+    whose path (with no "." or ".." in it) is opened from / one folder at a time, each relative to the
+    folder opened before it and never by name again, refusing a link at any step (pdf_link: an
+    attachment reached through an alias or a symbolic link imports with its details only). Before any of
+    it is opened, a path into one of macOS's automounted network folders is refused, and a file named
+    like a database (zotero.sqlite and its kin); each folder opened is checked, on its own descriptor,
+    not to be on a network file system or a cloud placeholder before the next is opened in it; the file
+    is opened read-only and without waiting (a FIFO), then checked on its descriptor: a regular file on
+    this Mac's disk, its contents here, of at most MAX_FILE_BYTES (at most one byte more is read), that
+    starts as a PDF (only its first 5 bytes are read from one that does not). Nothing is written.
+    fs_type(fd), the file system type of an open descriptor, is for tests."""
+    fs_type = fs_type or _file_system_type
     if not isinstance(text, str):
         return None, "pdf_missing"
     try:
@@ -346,42 +377,44 @@ def read_attachment(text, fs_type=file_system_type):
         path = unquote(parts.path, errors="strict")
     except UnicodeDecodeError:
         return None, "pdf_not_local"
-    if not path.startswith("/") or "\x00" in path:
+    names = [name for name in path.split("/") if name]
+    if not path.startswith("/") or "\x00" in path or not names or {".", ".."} & set(names):
         return None, "pdf_not_local"
-    names = [name.lower() for name in os.path.normpath(re.sub("/+", "/", path)).split("/") if name]
-    if names[:3] == ["system", "volumes", "data"]:
-        names = names[3:]
-    if names[:1] and names[0] in _AUTOMOUNTS:  # never even resolved: it would mount a share
+    lowered = [name.lower() for name in names]
+    if lowered[:3] == ["system", "volumes", "data"]:  # the firmlinked spelling of / on macOS
+        lowered = lowered[3:]
+    if lowered[:1] and lowered[0] in _AUTOMOUNTS:  # never opened: opening it would mount a share
         return None, "pdf_on_network"
+    if lowered[-1].endswith(_DATABASES):
+        return None, "pdf_not_a_pdf"  # never Zotero's database or its kin
     try:
-        real = os.path.realpath(path, strict=True)
-        info = os.stat(real)
-    except FileNotFoundError:
-        return None, "pdf_missing"
-    except OSError:  # a loop of links, or a folder on the way that cannot be read
-        return None, "pdf_unreadable"
-    if os.path.basename(real).lower().endswith(_DATABASES):
-        return None, "pdf_not_a_pdf"  # never Zotero's database or its kin, whatever a link names
-    if getattr(info, "st_flags", 0) & SF_DATALESS:
-        return None, "pdf_not_downloaded"
-    if fs_type(real) in NETWORK_FILE_SYSTEMS:
-        return None, "pdf_on_network"
-    if not stat.S_ISREG(info.st_mode):
-        return None, "pdf_not_a_file"
-    if info.st_size > extraction.MAX_FILE_BYTES:
-        return None, "pdf_too_large"
-    try:
-        fd = os.open(real, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)  # a FIFO never waits; a link put there since is refused
-    except FileNotFoundError:
-        return None, "pdf_missing"
+        folder = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
         return None, "pdf_unreadable"
+    try:
+        for name in names[:-1]:
+            try:
+                inner = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
+            except OSError as error:
+                return None, _open_problem(error, name, folder)
+            os.close(folder)
+            folder = inner
+            if (problem := _place(os.fstat(folder), fs_type(folder))) is not None:
+                return None, problem
+        try:  # O_NONBLOCK: a FIFO never waits for a writer; O_NOFOLLOW: a link here is refused
+            fd = os.open(names[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=folder)
+        except OSError as error:
+            return None, _open_problem(error, names[-1], folder)
+    finally:
+        os.close(folder)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             return None, "pdf_not_a_file"
-        if getattr(info, "st_flags", 0) & SF_DATALESS:
-            return None, "pdf_not_downloaded"
+        if (problem := _place(info, fs_type(fd))) is not None:
+            return None, problem
+        if info.st_size > extraction.MAX_FILE_BYTES:
+            return None, "pdf_too_large"
         data = bytearray(os.read(fd, 5))
         if data != b"%PDF-":  # nothing more of a file that is not a PDF is read
             return None, "pdf_not_a_pdf"
@@ -396,19 +429,52 @@ def read_attachment(text, fs_type=file_system_type):
         os.close(fd)
     if len(data) > extraction.MAX_FILE_BYTES:  # it grew as it was read
         return None, "pdf_too_large"
-    if not data.startswith(b"%PDF-"):
-        return None, "pdf_not_a_pdf"
     return bytes(data), None
+
+
+def _open_problem(error, name, folder):
+    """Why a step of the walk could not be opened: a link (ELOOP under O_NOFOLLOW, or a link where a
+    folder was opened, looked at without following it), nothing there, or anything else."""
+    try:
+        link = error.errno == errno.ELOOP or stat.S_ISLNK(os.stat(name, dir_fd=folder, follow_symlinks=False).st_mode)
+    except OSError:
+        link = False
+    if link:
+        return "pdf_link"
+    if isinstance(error, (FileNotFoundError, NotADirectoryError)):
+        return "pdf_missing"
+    return "pdf_unreadable"
+
+
+def _place(info, kind):
+    """Why an opened folder or file is not on this Mac's own disk (its stat and its file system's type), or None."""
+    if getattr(info, "st_flags", 0) & SF_DATALESS:
+        return "pdf_not_downloaded"
+    if kind in NETWORK_FILE_SYSTEMS:
+        return "pdf_on_network"
+    return None
+
+
+def _file_system_type(fd):
+    """The type name of the file system an open descriptor is on (apfs, smbfs, ...), or None off macOS or
+    when unknown: data_folder.file_system_type, by descriptor."""
+    if sys.platform != "darwin":
+        return None
+    libc = ctypes.CDLL(None, use_errno=True)
+    fstatfs = libc["fstatfs$INODE64"] if platform.machine() == "x86_64" else libc.fstatfs
+    fstatfs.argtypes = [ctypes.c_int, ctypes.POINTER(_StatFS)]
+    info = _StatFS()
+    if fstatfs(fd, ctypes.byref(info)) != 0:
+        return None
+    return info.f_fstypename.decode(errors="replace")
 
 
 def _pdf_child(children):
     """The item's PDF attachment's key: a stored file before a linked one, then the earliest added."""
     found = []
-    for child in children if isinstance(children, list) else []:
-        data = child.get("data") if isinstance(child, dict) else None
-        if isinstance(data, dict) and data.get("itemType") == "attachment" \
-                and data.get("contentType") == "application/pdf" and data.get("linkMode") in _LINKS \
-                and isinstance(data.get("key"), str) and _KEY.fullmatch(data["key"]):
+    for data in (child["data"] for child in _objects(children)):  # any other shape: zotero_unavailable
+        if data.get("itemType") == "attachment" and data.get("contentType") == "application/pdf" \
+                and data.get("linkMode") in _LINKS:
             found.append((data["linkMode"] == "linked_file", str(data.get("dateAdded") or ""), data["key"]))
     return min(found)[2] if found else None
 
@@ -448,12 +514,16 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
     """What Zotero holds of one item: None when it is gone (or a note, an attachment, in the trash),
     else (its record, values left out, its PDF's stored SHA-256 or None, why its PDF was not read or None)."""
     item, _ = await _read(client, f"/api/{library}/items/{key}?format=json&include=data,csljson", server_id, RETRIES)
-    data = item.get("data") if isinstance(item, dict) else None
-    if not isinstance(data, dict) or data.get("itemType") in _NOT_ITEMS or data.get("deleted"):
+    if item is None:  # 404: gone since it was browsed
+        return None
+    if not (isinstance(item, dict) and isinstance(item.get("data"), dict) and item["data"].get("key") == key):
+        raise Unreachable("zotero_unavailable")  # not the item asked for: no answer to go by
+    data = item["data"]
+    if data.get("itemType") in _NOT_ITEMS or data.get("deleted"):
         return None
     csl, dropped = _record(item)
     children, _ = await _read(client, f"/api/{library}/items/{key}/children?format=json", server_id, RETRIES)
-    child = _pdf_child(children)
+    child = _pdf_child(children if children is not None else [])  # a 404: none
     if child is None:
         return csl, dropped, None, None
     try:
@@ -571,7 +641,7 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
                                           harness.registry) is None:
             batch = recorded(conn, project_id, "lookup", {
                 "material_ids": [material], "versions": {material: version}, "origin": None, "batch": "zotero",
-                "open": True, "touched": time.time()})
+                "open": True, "touched": time.time(), "import_run": run_id})  # open while the import runs
     _event(conn, run_id, "step_finished", step)
     conn.execute("UPDATE runs SET inputs = json_set(json_insert(inputs, '$.done[#]', ?), '$.batch', ?) WHERE id = ?",
                  (key, batch, run_id))

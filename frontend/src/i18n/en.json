@@ -1012,7 +1012,7 @@
   "settings.zoteroOff": "Off",
   "audit.kind.zotero_local_api": "Zotero's local API",
   "audit.reason.zotero_call_not_allowed": "not a Zotero request Scholia makes",
-  "ask.identifier_lookup.bodyZotero": "This project is Local only. Only each DOI is sent, one at a time, never your files or anything else. The answer covers the papers this Zotero import added or updated, not later ones.",
+  "ask.identifier_lookup.bodyZotero": "This project is Local only. Only each DOI or arXiv ID is sent, one at a time, never your files or anything else. The answer covers the papers this Zotero import added or updated, not later ones.",
   "ask.merge.bodyZotero": "Merge keeps the paper in this project and fills in only what it lacks from the Zotero item's record; the item's PDF is not added. Keep both imports the Zotero item as a paper of its own, with its PDF.",
   "ask.merge.recordZotero": "From Zotero",
   "library.source.fromZotero": "From Zotero",
@@ -1109,5 +1109,6 @@
     "one": "{count} item was skipped: it has no title.",
     "other": "{count} items were skipped: they have no title."
   },
-  "zotero.report.kept": "Items imported before it stopped stay in the Library."
+  "zotero.report.kept": "Items imported before it stopped stay in the Library.",
+  "library.reason.pdf_link": "Its PDF is reached through an alias or a symbolic link, which Scholia does not follow, so only its details were imported."
 }

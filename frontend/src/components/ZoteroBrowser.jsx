@@ -4,14 +4,14 @@
 // chosen. Loaded when first opened (Parts.jsx). Closing it while an import runs leaves the import running
 // (the background-run list shows it, with Cancel), and the Library shows what it adds. What an import did
 // is said only from its run's record once it has ended (followRun), never before its commit.
-import { useCallback, useContext, useEffect, useId, useState } from 'react';
+import { useCallback, useContext, useEffect, useId, useRef, useState } from 'react';
 import { BookOpen, FolderClosed, Loader2, RefreshCw } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { errorText } from '../text.js';
 import { followRun, runOutcome } from '../runs.js';
 import { libraryChanged } from '../library.js';
-import { collectionTree, importZotero, MAX_ITEMS, reportParts, statusKey, zoteroCollections, zoteroItems,
+import { appendPage, collectionTree, importZotero, MAX_ITEMS, reportParts, statusKey, zoteroCollections, zoteroItems,
   zoteroStatus } from '../zotero.js';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -56,21 +56,22 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
       .catch((error) => { if (live) { setCollections([]); setProblem(codeOf(error)); } });
     return () => { live = false; };
   }, [ready, library]);
+  const generation = useRef(0); // each list shown has its own: a page asked for another one is dropped
   useEffect(() => { // the first page of the library's (or the collection's) items
     if (!ready) return undefined;
     let live = true;
+    const shown = { library, collection, generation: ++generation.current };
     setPage(null);
-    zoteroItems(library, collection).then((found) => { if (live) setPage(found); })
+    zoteroItems(library, collection).then((found) => { if (live) setPage({ ...found, ...shown }); })
       .catch((error) => { if (live) { setPage({ items: [], total: 0, next: null }); setProblem(codeOf(error)); } });
     return () => { live = false; };
   }, [ready, library, collection]);
 
   async function more() {
-    const start = page.next;
+    const asked = { library, collection, generation: generation.current, start: page.next };
     try {
-      const found = await zoteroItems(library, collection, start);
-      // Added only to the list it continues: not to another list shown since, nor twice.
-      setPage((shown) => (shown?.next === start ? { ...found, items: [...shown.items, ...found.items] } : shown));
+      const found = await zoteroItems(asked.library, asked.collection, asked.start);
+      setPage((shown) => appendPage(shown, found, asked));
     } catch (error) {
       setProblem(codeOf(error));
     }

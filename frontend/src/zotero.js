@@ -48,6 +48,15 @@ export function collectionTree(collections, compare = (a, b) => a.localeCompare(
   return out;
 }
 
+// The list shown with a further page added: only to the list it was asked for (its library, collection
+// and generation, the first page's), continuing from where it ends; else the list as it is (a page of
+// another library, collection or earlier list, or one already added, is dropped).
+export function appendPage(shown, found, asked) {
+  if (!shown || shown.library !== asked.library || shown.collection !== asked.collection
+    || shown.generation !== asked.generation || shown.next !== asked.start) return shown;
+  return { ...shown, ...found, items: [...shown.items, ...found.items] };
+}
+
 // The status's text and whether it says how to turn the API on, as catalog keys.
 export const statusKey = (status) => `zotero.status.${status?.state ?? 'checking'}`;
 
