@@ -82,6 +82,7 @@ _HAN = "㐀-䶿一-鿿豈-﫿\U00020000-\U0003134f"
 # A run of Han characters, or a run of other letters and digits (combining marks kept with them).
 _RUNS = re.compile(rf"([{_HAN}]+)|(?:[^\W_{_HAN}]|[̀-ͯ])+")
 DAMAGE = (apsw.CorruptError, apsw.NotADBError)  # a file SQLite finds damaged, or not a database
+LOCKED = (apsw.BusyError, apsw.LockedError)  # a file another connection holds: not damage
 
 SCHEMA = f"""
 CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -219,6 +220,9 @@ def connect(path, create=False):
     flags = apsw.SQLITE_OPEN_READWRITE | (apsw.SQLITE_OPEN_CREATE if create else 0)
     conn = apsw.Connection(str(path), flags=flags)
     conn.set_busy_timeout(5000)
+    # The schema read first: a file another connection holds is BusyError here (not damage), where the
+    # tokenizer's registration would say NoFTS5Error; a damaged one fails here or there.
+    conn.execute("SELECT count(*) FROM sqlite_schema").fetchall()
     conn.register_fts5_tokenizer(TOKENIZER, _tokenizer)
     conn.execute("PRAGMA secure_delete = ON")
     loaded = False
@@ -295,6 +299,9 @@ class SearchIndex:
         self._owed = False
         self.unusable = False  # a whole rebuild failed: its partial file is neither read nor written (Unavailable)
         self._rebuild_retry, self._rebuild_failures = None, 0  # the same, for a whole rebuild
+        # This process rebuilt the file and no read of it has succeeded yet: damage found now makes the index unusable
+        # (its retry later) rather than rebuilding it again at once (_damaged), so a file that keeps failing never loops.
+        self._fresh = False
         # Called (in the writer) once rows were made outside an index run: a damaged file found while the app runs
         # rebuilt, or the queue applied after a failed pass (_retried).
         self.rebuilt = None
@@ -342,41 +349,46 @@ class SearchIndex:
 
     def _read(self, fn):
         """fn(conn) on an idle read connection, in one read transaction. Refused (Unavailable) from the moment damage
-        is found or a whole rebuild is asked for, while one is under way, or after one failed. A read whose connection
-        cannot open, or whose query meets an SQL error, has the file checked (_is_damaged): damaged, it is replaced and
-        rebuilt; locked, or only that query's error, nothing is. Admitted, given its connection (an idle one, or a new one to
-        the file as it is then), and that connection given back to the idle ones, all under _lock: so a file that
-        replaces this one, or its removal, waits for the reads admitted before (_quiet), and no read admitted before
-        reaches a file made after; close() refuses later reads, waits for these, then closes what they gave back."""
+        is found or a whole rebuild is asked for, while one is under way, or after one failed. Reads are the index's own
+        fixed queries, so an APSW error one meets, opening its connection or in its query, is the file's: damage
+        (_damaged), unless the file is only busy or locked (another connection holds it), which refuses the read and
+        rebuilds nothing. Admitted, given its connection (an idle one, or a new one to the file as it is then), and that
+        connection given back to the idle ones, all under _lock: so a file that replaces this one, or its removal, waits
+        for the reads admitted before (_quiet), and no read admitted before reaches a file made after; close() refuses
+        later reads, waits for these, then closes what they gave back. No connection to the file is opened otherwise."""
         with self._lock:
             if self.closed:
                 raise DatabaseClosedError("the search index is closed")
             if self.unusable or self.building:  # a whole rebuild asked for or under way: the old file, never purged,
                 raise Unavailable()               # is not read; nor a partial one (fail closed, as an unusable file)
-            generation, failed = self._generation, False
+            generation, failed, damaged = self._generation, False, False
             try:
                 conn = self._readers.get_nowait()
             except queue.Empty:
                 try:
                     conn, _ = self._connect()
-                except apsw.Error:  # damaged (a corrupt header fails the tokenizer's registration), or only locked
+                except LOCKED:
                     failed = True
+                except apsw.Error:  # a corrupt header, a missing file, and so on
+                    failed = damaged = True
             if not failed:
                 self._reading += 1
-        if failed:  # after the lock (_damaged takes it): replaced and rebuilt if damaged; refused either way
-            if self._is_damaged():
+        if failed:  # after the lock (_damaged takes it)
+            if damaged:
                 self._damaged()
             raise Unavailable()
         try:
             try:
                 with conn:
-                    return fn(conn)
-            except DAMAGE:
-                self._damaged()
+                    found = fn(conn)
+                with self._lock:  # a file this process rebuilt has been read: damage found later rebuilds it again
+                    if self._fresh:
+                        self._fresh, self._rebuild_failures = False, 0
+                return found
+            except LOCKED:
                 raise
-            except apsw.SQLError:  # the index's own tables gone (an emptied file), or the query's own error
-                if self._is_damaged():
-                    self._damaged()
+            except apsw.Error:  # a damaged page, a missing table (an emptied file, a virtual table's backing table)
+                self._damaged()
                 raise
             finally:
                 with self._lock:  # once the index closes, kept for close() to close (and know if that fails)
@@ -394,33 +406,6 @@ class SearchIndex:
             with self._lock:
                 self._reading -= 1
                 self._reads_done.notify_all()
-
-    def _is_damaged(self):
-        """Whether the file is damaged, not merely held by another connection: on a fresh, plain connection (no
-        tokenizer, no waiting for a lock), the index's own tables must be there and readable (its schema, its
-        metadata and its rows' table, read whole; the FTS5 and vec0 tables need the app's tokenizer and extension,
-        and a damaged page of theirs shows in the read that meets it, DAMAGE). A busy or locked file is not damaged
-        (a read is refused for now, and nothing is rebuilt); any other failure to read it is. Only called when a
-        read fails."""
-        try:
-            conn = apsw.Connection(str(self.path), flags=apsw.SQLITE_OPEN_READONLY)
-        except (apsw.BusyError, apsw.LockedError):
-            return False
-        except apsw.Error:
-            return True
-        try:
-            tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")}
-            if not {"index_meta", "index_rows", "fts_passages"} <= tables:
-                return True
-            conn.execute("SELECT count(*) FROM index_meta").fetchall()
-            conn.execute("SELECT count(*), sum(length(digest)) FROM index_rows").fetchall()
-            return False
-        except (apsw.BusyError, apsw.LockedError):
-            return False
-        except apsw.Error:
-            return True
-        finally:
-            close_connection(conn)
 
     def _quiet(self):
         """Before the file is removed or replaced: no read is admitted from here (the caller has set building or
@@ -567,13 +552,9 @@ class SearchIndex:
                     return
             except Exception as error:
                 log.error("rebuilding the search index failed (%s); it is tried again", type(error).__name__)
-                try:
-                    self._discard()
-                finally:  # whatever the discard meets, a retry is armed
-                    self._rebuild_later()
+                self._give_up()
                 return
-            with self._lock:
-                self._rebuild_failures = 0
+            with self._lock:  # the failures in a row are counted until a read of the new file succeeds (_read)
                 if self._rebuild_retry is not None:
                     self._rebuild_retry.cancel()
                     self._rebuild_retry = None
@@ -613,6 +594,13 @@ class SearchIndex:
                 failed = failed or error
         if failed is not None:
             raise failed
+
+    def _give_up(self):
+        """In the writer: the file discarded and the index left unusable, another whole rebuild armed for later."""
+        try:
+            self._discard()
+        finally:  # whatever the discard meets, a retry is armed
+            self._rebuild_later()
 
     def _rebuild_later(self):
         """Another whole rebuild after a delay that doubles with each failure in a row (RETRY_SECONDS), one at
@@ -676,17 +664,30 @@ class SearchIndex:
         with self._conn:
             self._meta(state="ready", last_seq=last)
         self._prune(last)  # what it read leaves the queue (no pass applies rows at or below last)
+        self._fresh = True
         self.damaged = self.unusable = False
         self.building = False
         return True
 
     def _damaged(self):
         """A read or a pass found the file damaged: it is replaced and rebuilt in the writer, once, and its
-        vectors are wanted again (self.rebuilt), as when a launch rebuilds it."""
+        vectors are wanted again (self.rebuilt), as when a launch rebuilds it. A file this process rebuilt that no
+        read has yet succeeded on is not rebuilt again at once: the index is unusable, its file discarded, and the
+        rebuild tried later (_rebuild_later, its delay doubling while it keeps failing so), as after a failed one."""
         with self._lock:
             if self.damaged or self.closed or (self.building and not self.unusable):  # a rebuild asked for or under
                 return  # way, not failed, makes a new file anyway (one that failed, its retry waiting, is asked again)
             self.damaged = self.building = True  # no read admitted from here (the rebuild sets it too)
+            again = self._fresh
+            if again:
+                self.unusable = True
+        if again:
+            log.error("the search index rebuilt by this process is damaged again; it is tried again later")
+            try:
+                self._writer.submit(self._give_up)
+            except RuntimeError:  # the writer stopped meanwhile (closing): the close discards the file
+                pass
+            return
         log.warning("the search index is damaged; it is rebuilt")
         self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
 
@@ -976,6 +977,8 @@ class SearchIndex:
         """The nearest embedded passage ids in the project to vector, nearest first (references have none)."""
         if not self.vectors:
             return []
+        if len(vector) != DIMENSIONS:  # refused before the read: an error the read met would be taken for damage
+            raise ValueError(f"a query vector of {len(vector)} dimensions, not {DIMENSIONS}")
         return [pid for (pid,) in self._read(lambda conn: conn.execute(
             "SELECT passage_id FROM vec_passages WHERE embedding MATCH ? AND k = ? AND project_id = ? ORDER BY distance",
             (sqlite_vec.serialize_float32(vector), limit, project_id)).fetchall())]
