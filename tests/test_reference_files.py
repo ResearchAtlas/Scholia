@@ -302,6 +302,20 @@ def test_a_doi_after_one_of_the_four_approved_prefixes_is_that_doi(prefix, form)
     assert (record["DOI"], rf.identifier(record), skipped) == ("10.5555/example", ("doi", "10.5555/example"), {})
 
 
+@pytest.mark.parametrize("near", ["https://doi.org.evil/", "doi.org/", "http://dx.doi.org/", "urn:doi:"])
+@pytest.mark.parametrize("form", [
+    lambda doi: f"TY  - JOUR\nTI  - T\nDO  - {doi}\nER  - \n",  # RIS
+    lambda doi: f"%0 Journal Article\n%T T\n%R {doi}\n",  # EndNote
+    lambda doi: "{Reference Type}: Journal Article\n{Title}: T\n{DOI}: " + doi + "\n",  # NoteExpress
+    lambda doi: "@misc{k, title={T}, doi={" + doi + "}}",  # BibTeX
+])
+def test_a_doi_after_any_other_prefix_is_left_out_and_counted_in_every_format(near, form):
+    [record], skipped, _ = parse(form(near + "10.5555/example"))
+    assert "DOI" not in record and rf.identifier(record) is None and skipped == {"invalid_field": 1}
+    [record], skipped, _ = parse(form("https://doi.org/10.5555/example junk"))  # an approved one, then junk
+    assert "DOI" not in record and skipped == {"invalid_field": 1}
+
+
 @pytest.mark.parametrize("eprint, arxiv", [("2101.00001", "2101.00001"), ("2101.00001v2", "2101.00001v2"),
                                            ("math.GT/0309136", "math.GT/0309136"), (" 2101.00001\n", "2101.00001")])
 def test_an_arxiv_id_comes_from_a_bibtex_eprint_whole(eprint, arxiv):

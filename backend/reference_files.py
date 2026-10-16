@@ -29,9 +29,8 @@ inside its outer delimiters, a JSON string), with only spaces, tabs and line end
 on one line (a field continued on the next is refused), and it must be, whole, an ASCII DOI starting
 "10." (_DOI_WHOLE; after one of four prefixes, if it has one: https://doi.org/, http://doi.org/,
 https://dx.doi.org/ or doi:, Harold 2026-10-17) or an arXiv ID with an optional version (_ARXIV_WHOLE).
-A URL is kept, as display
-only, when it is, whole, http or https, a host name with an optional port 1 to 65535, and a path
-(_URL_WHOLE). Any other value of these fields is left out and counted (invalid_field).
+A URL is kept, as display only, when it is, whole, http or https, a host name with an optional port 1
+to 65535, and a path (_URL_WHOLE). Any other value of these fields is left out and counted (invalid_field).
 
 Names are kept as the file gives them: "Family, Given" splits at its comma (BibTeX's by its name parts,
 split on the text as written so a braced group is one name), and any other name, a Han-script one
