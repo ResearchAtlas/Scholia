@@ -177,3 +177,19 @@ def test_only_a_pdfs_header_is_read_from_a_file_that_is_not_one(tmp_path, monkey
     monkeypatch.setattr(zotero.os, "read", lambda fd, n: reads.append(n) or real_read(fd, n))
     assert zotero.read_attachment(url(backup)) == (None, "pdf_not_a_pdf")
     assert reads == [5]
+
+
+@pytest.mark.parametrize("failing", ["fstat", "file system"])
+def test_a_folder_or_file_whose_place_cannot_be_read_is_never_taken_for_local(pdf, monkeypatch, failing):
+    def broken(*args):
+        raise OSError("cannot be read")
+
+    if failing == "fstat":
+        monkeypatch.setattr(zotero.os, "fstat", broken)
+        assert zotero.read_attachment(url(pdf)) == (None, "pdf_unreadable")
+    else:
+        assert zotero.read_attachment(url(pdf), fs_type=broken) == (None, "pdf_unreadable")
+        monkeypatch.setattr(zotero.ctypes, "CDLL", lambda *a, **k: type("libc", (), {
+            "fstatfs": type("f", (), {"argtypes": None, "__call__": lambda self, fd, info: -1})(),
+            "__getitem__": lambda self, name: self.fstatfs})())
+        assert zotero.read_attachment(url(pdf)) == (None, "pdf_unreadable")

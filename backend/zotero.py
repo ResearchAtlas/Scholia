@@ -43,8 +43,9 @@ cancelled:
 Papers it made or whose details it replaced, carrying an identifier, join one lookup batch for the
 import (S1-13's, batch `zotero`), bound to the import run: it stays open while the import runs, however
 long and across a restart, and closes when the import ends, so a Local only project asks once per
-import; a review-locked one never looks up. A lookup applies only while the paper's record still gives
-the identifier it was made for (materials._gives). Its step events record each item's outcome, from
+import; a review-locked one never looks up. A lookup applies only while the paper still gives the
+identifier it was made for, as the lookup worked it out (its record, else its file's text;
+materials._gives). Its step events record each item's outcome, from
 which the summary is counted. Its inputs name its items and the items done, so a restart goes on from
 the next item; deleting a Zotero paper revokes every running import of its item into its project
 (backend/db/deletion.py SCOPE_LINKS), so none makes it again.
@@ -463,8 +464,9 @@ def _place(info, kind):
 
 
 def _file_system_type(fd):
-    """The type name of the file system an open descriptor is on (apfs, smbfs, ...), or None off macOS or
-    when unknown: data_folder.file_system_type, by descriptor."""
+    """The type name of the file system an open descriptor is on (apfs, smbfs, ...), or None off macOS:
+    data_folder.file_system_type, by descriptor. A descriptor whose file system cannot be read is never
+    taken for local: OSError, which the walk reads as pdf_unreadable."""
     if sys.platform != "darwin":
         return None
     libc = ctypes.CDLL(None, use_errno=True)
@@ -472,7 +474,7 @@ def _file_system_type(fd):
     fstatfs.argtypes = [ctypes.c_int, ctypes.POINTER(_StatFS)]
     info = _StatFS()
     if fstatfs(fd, ctypes.byref(info)) != 0:
-        return None
+        raise OSError(ctypes.get_errno(), "fstatfs failed")
     return info.f_fstypename.decode(errors="replace")
 
 

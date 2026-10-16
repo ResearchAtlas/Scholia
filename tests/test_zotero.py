@@ -857,3 +857,27 @@ async def test_a_record_without_an_identifier_is_looked_up_by_its_attached_files
                                                          " WHERE r.workflow = 'lookup' AND e.type = 'step_finished'")]
         assert (steps[-1]["identifier"], steps[-1]["outcome"]) == (f"doi:{DOI}", "resolved")
         assert ("api.openalex.org", f"/works/doi:{DOI}") in [(h, p) for h, p, _ in records.requests]
+
+
+async def test_a_lookup_for_a_doi_the_record_dropped_applies_nothing(tmp_path):
+    mock = library(tmp_path, pdfs=False)
+    scholarly = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A", retracted=True)})
+    scholarly.hold = asyncio.Event()
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=scholarly)) as client:
+        project = await project_of(client)
+        await imported(client, project, KEYS[:1])
+        await asyncio.wait_for(scholarly.started.wait(), 10)
+        del mock.items["users/0", KEYS[0]]["csljson"]["DOI"]
+        await imported(client, project, KEYS[:1])
+        scholarly.hold.set()
+        await background_idle(client, 30)
+        [paper] = (await papers(client, project)).values()
+        assert "DOI" not in paper["csl"] and "container-title" not in paper["csl"] and paper["retraction"] != "retracted"
+
+
+async def test_collections_of_a_library_zotero_does_not_know_are_not_found(tmp_path):
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        mock.answers = [404]
+        response = await client.get("/api/zotero/collections", params={"library": "groups/99"})
+        assert (response.status_code, response.json()["code"]) == (404, "not_found")
