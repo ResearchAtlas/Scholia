@@ -2084,7 +2084,6 @@ async def test_a_rebuild_or_discard_waits_for_the_reads_admitted_before_it(tmp_p
             await asyncio.wait_for(_until(lambda: not index.path.exists()), 20)  # then removed
 
 
-
 @pytest.mark.parametrize("error", ["CorruptError", "NotADBError", "NoFTS5Error"])
 @pytest.mark.asyncio
 async def test_a_read_whose_connection_cannot_open_on_a_damaged_file_has_it_rebuilt(tmp_path, monkeypatch, error):
@@ -2101,7 +2100,7 @@ async def test_a_read_whose_connection_cannot_open_on_a_damaged_file_has_it_rebu
         real, failed = SearchIndex._connect, []
 
         def connect(self):
-            if not failed and threading.current_thread() is not None and self._writer_ident != threading.get_ident():
+            if not failed and self._writer_ident != threading.get_ident():  # a read's, not the rebuild's
                 failed.append(True)
                 raise getattr(search_index.apsw, error)("damaged")
             return real(self)

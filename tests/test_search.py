@@ -1744,15 +1744,18 @@ async def _interrupted_with_a_rebuild_pending(client, monkeypatch):
     [run] = await _running_index_runs(client, project)
     assert (await client.post(f"/api/projects/{project}/index/rebuild")).json() == {"run_id": run, "rebuild_pending": True}
 
+    failures = []
+
     def failing(self, conn, active, status, cancel_reason, summary, effect=None):
         if active.run_id == run:
+            failures.append(True)
             raise OSError("the disk is full")
         return real(self, conn, active, status, cancel_reason, summary, effect)
     monkeypatch.setattr(Harness, "_finish_local", failing)
     client.remote.hold.set()
     harness = client.state["harness"]
     deadline = asyncio.get_running_loop().time() + 20
-    while not (run in harness._started_again and not harness.registry.is_active(run)):
+    while not (len(failures) == 2 and not harness.registry.is_active(run)):  # its one start again has failed too
         assert asyncio.get_running_loop().time() < deadline
         await asyncio.sleep(0.02)
     assert (await run_finished(client, run))["status"] == "interrupted"
@@ -2010,7 +2013,6 @@ async def test_the_index_status_names_the_rebuild_a_run_recorded_and_the_run_it_
         assert (found["run_id"], found["after"]) == (last["run_id"], run)
 
 
-
 # PR 29 recheck 7 and connector threads 4283763992, 4283764003, 4296864820: a run left running is always started again
 
 
@@ -2103,3 +2105,27 @@ async def test_a_retry_pressed_again_starts_the_run_it_was_answered_with_if_no_p
         assert answer.status_code == 201 and answer.json()["run_id"] == newer
         assert client.state["harness"].registry.is_active(newer)
         assert (await run_finished(client, newer))["status"] == "succeeded"
+
+
+async def test_starting_a_run_left_running_starts_that_run_only(tmp_path, monkeypatch):
+    """Review 9, P3-2: the start of a run a request was answered with (or of an index run left running) starts that
+    run only: another run left running, held by no process (a reading whose terminal write failed, which reads
+    interrupted with Retry), is left for its own rules, not started by it."""
+    from backend.search import _insert_run
+    started_for = _counting_starts(monkeypatch)
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+
+        def left(conn):
+            stale = _insert_run(conn, None, project, {})
+            reading = "00000000-0000-4000-8000-0000000000bb"
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', 'extract',"
+                         " ?)", (reading, project, json.dumps({"material_ids": [], "version_id": None})))
+            return stale, reading
+        stale, reading = await asyncio.to_thread(client.state["db"].write, left)
+        answer = (await client.post(f"/api/projects/{project}/index/rebuild")).json()
+        assert answer["run_id"] == stale and stale in started_for
+        assert (await run_finished(client, stale))["status"] == "succeeded"
+        assert reading not in started_for  # left as it was

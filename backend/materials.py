@@ -1347,7 +1347,8 @@ async def retry_run(run_id: str, request: Request):
     interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again.
     A version read again whose lookup concluded unread gets a lookup once the reading commits
     (_serve). Once per run: the old run records its retry in the same transaction, and a later
-    retry of it (a second press) gets that same run. An old run left running in the record, held by
+    retry of it (a second press) gets that same run, started if it is recorded running and no process
+    holds it (its first start lost). An old run left running in the record, held by
     no process (it reads interrupted), is retired (Registry.retire), so no kick holds it from then on,
     and recorded interrupted, so no launch starts it again; one a kick has held again meanwhile is
     running, and is not tried again. An index run's retry is a request for its project's run (S1-17),

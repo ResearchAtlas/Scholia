@@ -235,11 +235,11 @@ async def _request(harness, project_id, rebuild=False):
 
 async def _started(harness, run_id):
     """The run a request was answered with, started if no process holds it (one a failed terminal write left
-    running in its record, which reads interrupted): a kick starts it, so the request's work and its rerun are
+    running in its record, which reads interrupted): it is started (Harness.start_again), so the request's work and its rerun are
     not left waiting for the next turn's end. Run by record_background once the request has committed, whatever
     happens to the request after (committed). Returns run_id."""
     if run_id is not None and not harness.registry.is_active(run_id):
-        await harness.kick_background()
+        await harness.start_again(run_id)  # that run only, if it is recorded running and not tried again
     return run_id
 
 

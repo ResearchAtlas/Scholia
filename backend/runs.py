@@ -899,6 +899,19 @@ class Harness:
             if active is not None:
                 active.task = asyncio.create_task(self._background(active))
 
+    async def start_again(self, run_id):
+        """Start the one background run run_id if it is recorded running, not tried again (retried_by) and held by no
+        process here (left so by a terminal write that failed), as a kick would start it, but this run only."""
+        if self.registry.closed:
+            return
+        if await self._read(lambda conn: conn.execute(
+                "SELECT 1 FROM runs WHERE id = ? AND kind = 'background' AND status = 'running'"
+                " AND json_extract(inputs, '$.retried_by') IS NULL", (run_id,)).fetchone()) is None:
+            return
+        active = self.registry.add_background(run_id)
+        if active is not None:
+            active.task = asyncio.create_task(self._background(active))
+
     async def _ended(self, active, write):
         """Await a background run's terminal write; once it has committed, the run is known finished
         here (Registry.finished), before it is released. A write that raises marks nothing."""
@@ -973,12 +986,13 @@ class Harness:
             self.registry.release(active)
             if (index_run and active.run_id not in self.registry.finished and not active.cancel_requested.is_set()
                     and not self.registry.closed and active.run_id not in self._started_again):
-                # An index run left running in its record, held by no process (its terminal write failed): a kick
-                # starts it again in this session, once, so what it was asked to do (a rerun marked on it included) is
-                # never left waiting for an unrelated trigger or the next launch. Other runs keep their own rules (a
-                # reading so left reads interrupted, with Retry; a model call's run waits for the next start).
+                # An index run left running in its record, held by no process (its terminal write failed) is started
+                # again in this session, once, and only it (start_again), so what it was asked to do (a rerun marked
+                # on it included) is never left waiting for an unrelated trigger or the next launch. Other runs keep
+                # their own rules (a reading so left reads interrupted, with Retry; a model call's run waits for the
+                # next start); a turn's end still kicks them all, as before.
                 self._started_again.add(active.run_id)
-                self._detach(self.kick_background())
+                self._detach(self.start_again(active.run_id))
             if active.follows:  # recorded mid-run by writes that committed (a run with no row ends at its start)
                 if self.registry.closed:
                     for held in active.follows:
@@ -1077,8 +1091,10 @@ class Harness:
         (which reads as interrupted). The ids it did not use are released inside the transaction.
         committed(result), if given, is a coroutine run once the transaction has committed, whatever
         happens to the caller after (a detached task: S1-17's start of a run a request was answered
-        with); it is awaited unless the caller was cancelled. Returns the result; a cancellation of the
-        caller waits for the transaction (see _through), starts the runs and committed, and is raised after."""
+        with); it is awaited unless the caller was cancelled, and an error it raises then reaches the
+        caller after the commit (unawaited, after a cancellation, it is logged by asyncio). Returns the
+        result; a cancellation of the caller waits for the transaction (see _through), starts the runs and
+        committed, and is raised after."""
         actives = [self.registry.add_background(new_id()) for _ in range(count)]
         if None in actives:
             for active in actives:
