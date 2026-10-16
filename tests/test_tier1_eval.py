@@ -588,6 +588,14 @@ def test_runs_with_no_query_in_common_are_not_paired_and_flag_nothing():
     assert lines == ["scifact: no query in common with the baseline; not compared"]
     assert tier1.paired(manifest["benchmarks"]["scifact"], manifest["bootstrap"], {"ndcg@10": [0.0]},
                         {"ndcg@10": [0.9]}, [0], [None], [])["ndcg@10"] == {"difference": None, "n": 0, "interval": None}
+    # Runs of unequal length with no query in common (positional pairs would index past the shorter one)
+    longer = {**run, "queries": 3, "keys": ["q2", "q3", "q4"],
+              "arms": {"hybrid": {"scores": {"ndcg@10": [0.0, 0.1, 0.2]}, "ranking_digests": ["x", "y", "z"],
+                                  "fallbacks": {}}}}
+    assert tier1.compare(manifest, _finished(base), _finished(longer)) == [
+        "scifact: no query in common with the baseline; not compared"]
+    assert tier1.paired(manifest["benchmarks"]["scifact"], manifest["bootstrap"], {"ndcg@10": [0.0, 0.1, 0.2]},
+                        {"ndcg@10": [0.9]}, [0, 1, 2], [None] * 3, [])["ndcg@10"]["n"] == 0
 
 
 def test_a_metric_one_file_lacks_is_said_and_skipped_with_the_warning_kept():
