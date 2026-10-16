@@ -692,6 +692,24 @@ def test_escaped_delimiters_in_a_bibtex_value(value, title):
     assert skipped == ({} if title else {"unreadable": 1})  # never kept without the fields the split lost
 
 
+@pytest.mark.parametrize("fields", [
+    r"abstract={x} \, year={2020}",  # internal review: a backslash hides a comma from the parser's split
+    r"author={Doe, J}\, year={2020}", r"doi={10.1234/x}\, year={2020}", r"abstract=foo\, year={2020}",
+    r"title2={x},\, author={Doe, J}, year={2020}",  # a field name no field has
+    r"abstract={x} year={2020}",  # a comma missing: one value ran into the next field
+    r'abstract="a {b", year={2020}',  # a part left unclosed
+])
+def test_a_record_whose_split_our_reading_does_not_account_for_is_refused(fields):
+    records, skipped = parse(f"@misc{{k, title={{T}}, {fields}}}\n")[:2]
+    assert records == [] and skipped == {"unreadable": 1}
+
+
+@pytest.mark.parametrize("fields", ["note={a, b = c}", "journal = Nature Reviews", "bdsk-url-1={x}", "date-added={2020}"])
+def test_commas_and_equals_inside_a_value_and_ordinary_field_names_are_read(fields):
+    [record], skipped = parse(f"@misc{{k, title={{T}}, {fields}, year={{2020}}}}\n")[:2]
+    assert record["issued"] == {"date-parts": [[2020]]} and "unreadable" not in skipped
+
+
 @pytest.mark.parametrize("field", ["abstract", "author", "keywords", "title", "note"])
 def test_a_record_where_the_parsers_split_and_ours_differ_is_refused_never_kept_short(field):
     # review 1 of PR 35: bibtexparser ends {Tab \\{x} where its own rule says, and the year is lost after it

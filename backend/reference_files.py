@@ -17,7 +17,10 @@ cleaned, and kept at most to its field's bound; a BibTeX value longer than four 
 its record instead, as its LaTeX could read as far less), a field's continuation lines, a record's
 lines (RECORD_LINES: the fields after them are left out and counted, past_record_bound), and the authors
 and keywords of a record; every BibTeX block it yields, read or not, counts toward MAX_RECORDS. A
-delimiter after an odd run of backslashes (\\", \\{, \\}) is text in a BibTeX value. A record keeps only what CSL names here (KEYS); what a record points to is
+delimiter after an odd run of backslashes (\\", \\{, \\}) is text in a BibTeX value; a BibTeX record whose
+fields bibtexparser split otherwise than our reading accounts for (_agrees: a part closed elsewhere or not
+at all, a backslash, comma or = outside the parts, a field name no field has) is refused, unreadable,
+never kept without the fields the split may have lost. A record keeps only what CSL names here (KEYS); what a record points to is
 never read: file attachments (RIS L1, L2 and L4, EndNote %>, BibTeX file) are not kept, and a URL is
 display only, never fetched. A BibTeX field given twice is read as its first.
 
@@ -423,7 +426,8 @@ def _bibtex(text, beat):
             fields.setdefault(field.key.lower(), field)
         kind = entry.entry_type.lower()
         try:
-            if not all(_agrees(field.value.strip()) for field in entry.fields if isinstance(field.value, str)):
+            if not all(_FIELD_KEY.fullmatch(field.key) and (not isinstance(field.value, str) or _agrees(field.value.strip()))
+                       for field in entry.fields):
                 raise _Refused  # where our reading and the parser's split differ, fields may be missing
             archive = (value(fields, "archiveprefix", "eprinttype") or "").strip().lower()
             number = value(fields, "number")
@@ -494,22 +498,29 @@ def _closing(value, start, parsers=False):
 
 
 def _agrees(raw):
-    """Whether each braced or quoted part of a BibTeX value closes where bibtexparser closed it when it
-    split the block into fields: where the two rules differ (\\\\{, an escaped backslash then a brace, say),
-    the parser may have ended the value, or the entry, elsewhere than the file does, and fields after it
-    may be lost, so its record is refused (unreadable) rather than kept without them."""
+    """Whether a BibTeX value, as bibtexparser split the block into fields, is all accounted for by our
+    reading: each braced or quoted part closes, and where bibtexparser closed it (its rule: any backslash
+    just before a delimiter hides it; ours: an odd run does, \\\\{ being an escaped backslash then a brace),
+    and outside them no backslash, comma or = (a backslash hides a comma or an = from bibtexparser's split,
+    and a comma or an = there means one value ran into the next field). Otherwise the parser may have
+    ended the value, or the entry, elsewhere than BibTeX does, and fields after it may be lost: its record
+    is refused (unreadable) rather than kept without them."""
     at = 0
     while (at := _SPACES.match(raw, at).end()) < len(raw):
         if raw[at] in '{"':
             end = _closing(raw, at)
-            if end != _closing(raw, at, parsers=True):
+            if end is None or end != _closing(raw, at, parsers=True):
                 return False
-            if end is None:
-                return True
             at = end + 1
+        elif raw[at] in "\\,=":
+            return False
         else:
-            at += max(1, len(_WORD.match(raw, at).group()))
+            at += max(1, len(_OUTSIDE.match(raw, at).group()))
     return True
+
+
+_OUTSIDE = re.compile(r'[^\s{}"\\,=]*')  # a value's text between its delimited parts
+_FIELD_KEY = re.compile(r"[^\s{}\"#%'(),=\\]+")  # a field's name as BibTeX takes one
 
 
 def _parts(raw):
