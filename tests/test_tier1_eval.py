@@ -550,3 +550,13 @@ def test_a_run_under_this_manifest_is_like_for_like_with_the_baseline_and_a_chan
     assert "NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's" in \
         tier1.compare(manifest, baseline, other)
     assert tier1.rules_sha256({**manifest, "levels": {}}) == tier1.rules_sha256(manifest)
+    # The recorded rules are this manifest's: change its pins, rules or metrics and this fails, so updating
+    # rules_unchanged_since is a deliberate step; and a run under a changed manifest no longer pairs as like.
+    assert manifest["rules_unchanged_since"]["rules_sha256"] == tier1.rules_sha256(manifest)
+    wider = {**manifest, "search_limit": manifest["search_limit"] + 1}
+    later = {**run, "manifest_rules_sha256": tier1.rules_sha256(wider)}
+    assert "NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's" in \
+        tier1.compare(wider, baseline, later)
+    # An earlier file whose whole manifest is not the one recorded is judged by that hash: it differs.
+    older = {k: v for k, v in run.items() if k != "manifest_rules_sha256"}
+    assert tier1.rules_of(manifest, older) == "a newer file" != tier1.rules_of(manifest, baseline)

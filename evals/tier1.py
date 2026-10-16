@@ -745,14 +745,14 @@ def rules_sha256(manifest):
 
 
 def rules_of(manifest, results):
-    """A results file's rules hash: recorded since the subset changed; for an earlier file, this
-    manifest's own when the file's whole-manifest hash is the one rules_unchanged_since names (its rules
-    are this manifest's), else that whole-manifest hash (so it differs)."""
+    """A results file's rules hash: recorded since the subset changed; for an earlier file, the rules hash
+    rules_unchanged_since records for the whole-manifest hash it names (fixed there, so a later change of
+    pins, rules or metrics still differs from it), else that whole-manifest hash (so it differs)."""
     if results.get("manifest_rules_sha256"):
         return results["manifest_rules_sha256"]
     since = manifest.get("rules_unchanged_since") or {}
     if results.get("manifest_sha256") and results.get("manifest_sha256") == since.get("manifest_sha256"):
-        return rules_sha256(manifest)
+        return since.get("rules_sha256")
     return results.get("manifest_sha256")
 
 

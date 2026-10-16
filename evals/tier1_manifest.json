@@ -436,7 +436,8 @@
   "rules_unchanged_since": {
     "commit": "dbed9f1efadd6dac93d1993e0242737da48e1292",
     "manifest_sha256": "c6e9de905ef1e76be27f88c7ad109c44a79fdf44449c76a02accd980229cd8eb",
-    "changed": "only `levels` (the small subset, Harold 2026-10-17) and this record: a results file whose manifest_sha256 is the one above was run under the same pins, rules, metrics and settings as this manifest (evals/tier1.py rules_of)"
+    "rules_sha256": "692683fd214a613156d526db343a76807ca5418d3be73bf1bd85659aecb37dfa",
+    "changed": "only `levels` (the small subset, Harold 2026-10-17) and this record: a results file whose manifest_sha256 is the one above was run under the pins, rules, metrics and settings whose rules_sha256 is recorded here (evals/tier1.py rules_of); a test fails when this manifest's rules no longer have that hash"
   },
   "arms": {
     "hybrid": "backend.search.search as the app runs it: BM25 50 and dense 50 concurrently, RRF k 60, within [retrieval] hybrid_ms; a query that falls back to keyword-only at the deadline is scored as the app returned it, counted and marked, and the hybrid metrics are also given without such queries; a fallback for any other reason, an index not ready or partial meaning-search coverage leaves the arm unscored, its queries marked",
