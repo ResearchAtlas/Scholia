@@ -3,7 +3,8 @@
 // [ui] language setting ("system" follows the system), and light or dark follows the system.
 // A language other than English is drawn once its catalog has loaded (i18n languageSwitch): until
 // then the window shows nothing, or stays in the language it was in; one that cannot load shows
-// as a part that could not load, with Try again.
+// as a part that could not load, with Try again. Until the setting is read, the loading state is
+// in the system's language; what follows it waits for the setting's language to be drawn.
 // A data folder Scholia will not open, or a damaged database, shows its own screen; health is
 // read first, since a limited app serves little else.
 import { useCallback, useEffect, useState } from 'react';
@@ -43,17 +44,17 @@ export function App() {
       const health = await get('/api/health');
       if (health.data_folder_problem || health.database_damaged) {
         const settings = await get('/api/settings').catch(() => null); // a limited app may not serve it
-        setLanguage(resolveLanguage(settings?.values?.ui?.language ?? 'system', navigator.language));
+        await setLanguage(resolveLanguage(settings?.values?.ui?.language ?? 'system', navigator.language));
         setState({ phase: health.data_folder_problem ? 'dataFolder' : 'damaged', health });
         return;
       }
       const [setup, settings] = await Promise.all([get('/api/setup'), get('/api/settings')]);
-      setLanguage(resolveLanguage(settings.values?.ui?.language ?? 'system', navigator.language));
+      await setLanguage(resolveLanguage(settings.values?.ui?.language ?? 'system', navigator.language));
       setState({ phase: setup.needed ? 'setup' : 'ready', health, settings });
     } catch (error) {
       setState({ phase: 'error', code: error instanceof ApiError ? error.code : 'internal' });
     }
-  }, []);
+  }, [setLanguage]);
 
   useEffect(() => {
     load();

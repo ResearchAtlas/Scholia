@@ -29,15 +29,17 @@ export function loadLanguage(language) {
 // when its catalog is here, else once it has loaded, so nothing shows in another language meanwhile;
 // the last language asked for wins. show({ language, failed }) is told each change: language is the
 // one drawn (null before any), and failed whether the catalog of the language asked for could not
-// be loaded, which the window shows as a part that could not load.
+// be loaded, which the window shows as a part that could not load. want returns a promise that
+// settles, never rejecting, once show has been told (or a later language was asked for meanwhile),
+// so what is drawn next waits for it.
 export function languageSwitch(show, load = loadLanguage) {
   let wanted = null;
   let drawn = null;
   const draw = (language) => { drawn = language; show({ language, failed: false }); };
   return function want(language) {
     wanted = language;
-    if (languageLoaded(language)) return draw(language);
-    load(language).then(() => { if (wanted === language) draw(language); },
+    if (languageLoaded(language)) return Promise.resolve(draw(language));
+    return load(language).then(() => { if (wanted === language) draw(language); },
       () => { if (wanted === language) show({ language: drawn, failed: true }); });
   };
 }

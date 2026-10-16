@@ -92,6 +92,32 @@ test('a catalog that cannot load shows as failed, never as English', async () =>
   assert.deepEqual(stale, [{ language: 'en', failed: false }]);
 });
 
+test('want settles once the language is drawn or has failed, so what is drawn next waits for it', async () => {
+  const { load, loads } = pending();
+  const shown = [];
+  const want = languageSwitch((state) => shown.push(state), load);
+  await want('en');
+  assert.deepEqual(shown, [{ language: 'en', failed: false }]);
+  let settled = false;
+  const drawn = want('xx').then(() => { settled = true; });
+  await settle();
+  assert.equal(settled, false); // the setting's language is still loading: the window waits
+  loads[0].resolve();
+  await drawn;
+  assert.deepEqual(shown.at(-1), { language: 'xx', failed: false });
+  const failing = want('yy');
+  loads[1].reject(new NotLoaded('refused'));
+  assert.equal(await failing, undefined); // never rejects: the failure is in what show was told
+  assert.deepEqual(shown.at(-1), { language: 'xx', failed: true });
+});
+
+test('at launch the window waits for the setting\'s language before it draws what follows the loading state', () => {
+  const app = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
+  const reads = [...app.matchAll(/(await )?setLanguage\(resolveLanguage\(settings[^\n]*\n\s*setState\(/g)];
+  assert.equal(reads.length, 2); // the limited app's screens and the setup or the window
+  assert.ok(reads.every(([, awaited]) => awaited));
+});
+
 test('the window shows a failed catalog as a part that could not load, with Try again, and nothing before one loads', () => {
   const app = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
   assert.match(app, /if \(shown\.failed\) \{[\s\S]*?<LoadState problem="part_not_loaded" onRetry=\{\(\) => window\.location\.reload\(\)\} \/>/);
