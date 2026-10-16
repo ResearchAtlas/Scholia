@@ -31,8 +31,8 @@ are) and its evidence follows what it now holds (a file stays full text); Keep b
 its own paper, as at import, not looked up. Cancel leaves the record out. Merge first checks, in that
 transaction, that the paper still matches the record as a duplicate (`_matches`, Duplicates' rule): one
 whose DOI or title changed while the question waited takes nothing (the run fails no_longer_duplicate).
-A Merge that gives a reference file's paper a DOI or an arXiv ID of a kind it lacked records its lookup
-in the same transaction, as the import's (`_merged_lookup`); a paper not from a reference file is identified
+A Merge that changes the identifier a reference file's paper is looked up by (a DOI where it had none,
+an arXiv ID where it had no identifier) records its lookup in the same transaction, as the import's (`_merged_lookup`); a paper not from a reference file is identified
 by its file's text alone, so none is recorded for it. The request's base64 is refused unread past what the
 largest file read encodes to (`_ENCODED`); an empty file reaches the parser, which says it holds no records.
 """
@@ -335,30 +335,37 @@ def _answered(conn, project_id, material, record, option, harness, active):
     """The answer's effect, in the run's terminal transaction (which drops it when the run was
     revoked or cancelled before it): Merge fills the paper from the record, Keep both makes it a paper.
     A Merge whose paper no longer matches the record as a duplicate (its DOI or title changed while
-    the question waited) applies nothing: the run ends failed, no_longer_duplicate. One that gives a
-    reference file's paper a DOI or an arXiv ID of a kind it lacked records its lookup, as the import's
+    the question waited) applies nothing: the run ends failed, no_longer_duplicate. One that changes
+    the identifier a reference file's paper is looked up by (DOI first) records its lookup, as the import's
     (_merged_lookup)."""
     if option == "keep_both":
         new_material(conn, project_id, record)
         return
-    row = conn.execute("SELECT csl, checked_by, evidence_type, title, source FROM materials WHERE id = ?"
-                       " AND project_id = ?", (material, project_id)).fetchone()
+    row = conn.execute("SELECT csl, checked_by, evidence_type, title, source, lookup_filled FROM materials"
+                       " WHERE id = ? AND project_id = ?", (material, project_id)).fetchone()
     if row is None:  # deleted meanwhile, which revokes the run first: nothing to merge into
         return
     csl = json.loads(row[0]) if row[0] else {}
     if not _matches(csl, record):
         raise RunOutcome("failed", "no_longer_duplicate")
     added = fills(csl, row[1] == "researcher", record)
+    filled = set(json.loads(row[5] or "[]"))  # a lookup's fields are never the record's identifier
+
+    def chosen(paper):  # the identifier its lookup would take: materials._identifiers' choice, DOI first
+        return reference_files.identifier({key: value for key, value in paper.items() if key not in filled})
+
+    before = chosen(csl)
     csl.update(added)
     conn.execute("UPDATE materials SET csl = ?, title = ?, evidence_type = ?, updated_at = ? WHERE id = ?",
                  (json.dumps(csl), added.get("title", row[3]), _evidence(csl, row[2]), utc_now(), material))
     # A reference file's paper is identified by its record (materials._identifiers), which now holds it. A
     # paper not from a reference file is identified by its file's text alone, as every lookup's identifier
     # is (its own text or record): what a merge gives it is its details, never looked up.
-    # Merge fills only the fields the paper lacks, so an identifier it adds (a DOI, an arXiv ID) is of a kind
-    # the paper had none of: looked up, whatever other identifier it has.
-    given = reference_files.identifier({key: added[key] for key in ("DOI", "arxiv") if key in added})
-    if given is not None and row[1] != "researcher" and row[4] == "reference_file":
+    # A lookup is recorded only when the merge changes the identifier the lookup takes (a DOI where the paper
+    # had none, an arXiv ID where it had no identifier): an arXiv ID added to a paper with a DOI leaves the DOI
+    # the lookup's, looked up already, so nothing is asked again.
+    after = chosen(csl)
+    if after is not None and after != before and row[1] != "researcher" and row[4] == "reference_file":
         _merged_lookup(conn, harness, active, project_id, material)
 
 
