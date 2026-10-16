@@ -1040,3 +1040,86 @@ async def test_a_new_pdf_with_a_record_change_also_takes_the_old_resolution_with
         paper = (await papers(client, project))["users/0/items/PDFD2222"]
         assert paper["title"] == "A Record Without Its DOI, Retitled" and "container-title" not in paper["csl"]
         assert (paper["retraction"], paper["resolved_at"]) == ("unknown", None)
+
+
+# gpt-6-astra recheck 4, Z17: every caller that gives a paper another file forgets the old file's lookup
+
+
+async def replace_file(client, paper, data, name="b.pdf"):
+    import base64
+    response = await client.post(f"/api/projects/{paper['project_id']}/materials", json={
+        "files": [{"name": name, "data": base64.b64encode(data).decode()}], "material_id": paper["id"],
+        "replaces": paper["version"]["id"]})
+    assert response.status_code == 201, response.text
+
+
+async def test_replace_file_on_a_zotero_paper_takes_the_old_files_lookup_with_it(tmp_path):
+    other = "10.5555/scholia.zotero.other"
+    mock = MockZotero()
+    mock.item("PDFD2222", "A Record Without Its DOI", pdf=pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI",
+                                                                   doi=DOI))
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A"),
+                                      other: openalex_work(other, "Record B", venue="Journal of B", retracted=True)})
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=records)) as client:
+        project = await project_of(client)
+        await imported(client, project, ["PDFD2222"])
+        await background_idle(client, 60)
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert (paper["csl"]["DOI"], paper["csl"]["container-title"]) == (DOI, "Journal of A")
+        await replace_file(client, paper, synthetic.paper_pdf("A Record Without Its DOI", doi=other))
+        await background_idle(client, 60)
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert (paper["csl"]["DOI"], paper["csl"]["container-title"], paper["retraction"]) == (other, "Journal of B",
+                                                                                                "retracted")
+
+
+async def test_replace_file_on_an_upload_forgets_the_old_files_lookup(tmp_path):
+    import base64
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A", retracted=True)})
+    async with started(tmp_path / "data", MockProvider(scholarly=records)) as client:
+        project = await project_of(client)
+        response = await client.post(f"/api/projects/{project}/materials", json={"files": [
+            {"name": "a.pdf", "data": base64.b64encode(synthetic.paper_pdf("An Upload", doi=DOI)).decode()}]})
+        assert response.status_code == 201
+        await background_idle(client, 60)
+        [paper] = (await listing(client, project))["materials"]
+        assert (paper["checked_by"], paper["retraction"], paper["csl"]["container-title"]) == ("lookup", "retracted",
+                                                                                               "Journal of A")
+        await replace_file(client, paper, synthetic.paper_pdf("An Upload", doi="10.5555/scholia.zotero.unknown"))
+        await background_idle(client, 60)
+        [paper] = (await listing(client, project))["materials"]
+        assert (paper["retraction"], paper["resolved_at"], paper["checked_by"]) == ("unknown", None, None)
+        assert "container-title" not in paper["csl"]
+
+
+async def test_replace_file_keeps_a_record_given_identifiers_lookup(tmp_path):
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A")})
+    async with started(tmp_path / "data", MockProvider(scholarly=records)) as client:
+        project = await project_of(client)
+        await imported_references(client, project, ris(("A Referenced Paper", f"DO  - {DOI}\n")))
+        await background_idle(client, 60)
+        [paper] = (await listing(client, project))["materials"]
+        assert paper["csl"]["container-title"] == "Journal of A" and paper["resolved_at"] is not None
+        await replace_file(client, paper, synthetic.paper_pdf("A Referenced Paper", doi="10.5555/scholia.zotero.other"))
+        await background_idle(client, 60)
+        [paper] = (await listing(client, project))["materials"]
+        assert (paper["csl"]["DOI"], paper["csl"]["container-title"]) == (DOI, "Journal of A")
+        assert paper["resolved_at"] is not None
+
+
+async def test_replace_file_keeps_the_researchers_edits(tmp_path):
+    mock = MockZotero()
+    mock.item("PDFD2222", "A Record Without Its DOI", pdf=pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI",
+                                                                   doi=DOI))
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A")})
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=records)) as client:
+        project = await project_of(client)
+        await imported(client, project, ["PDFD2222"])
+        await background_idle(client, 60)
+        [paper] = (await papers(client, project)).values()
+        assert (await client.patch(f"/api/materials/{paper['id']}", json={"venue": "My Venue"})).status_code == 200
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        await replace_file(client, paper, synthetic.paper_pdf("A Record Without Its DOI", doi="10.5555/scholia.zotero.other"))
+        await background_idle(client, 60)
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert (paper["csl"]["container-title"], paper["csl"]["DOI"], paper["checked_by"]) == ("My Venue", DOI, "researcher")

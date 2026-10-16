@@ -248,6 +248,7 @@ def add_version(conn, harness, project_id, material, sha256, kind, origin, recor
         if sha256 is not None:
             conn.execute("UPDATE materials SET evidence_type = 'full_text', updated_at = ? WHERE id = ?",
                          (utc_now(), material))  # a file read from now on: a reference file's paper has its text
+            _forget_file_lookup(conn, material)
     version = new_id()
     conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
                  " VALUES (?, ?, ?, ?, 1, ?)", (version, material, seq, sha256, kind))
@@ -268,6 +269,36 @@ def add_version(conn, harness, project_id, material, sha256, kind, origin, recor
         if _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0]) and not indexed:
             search.removed(conn, harness, project_id, recorded)  # its index run takes those removals now
     return version, run
+
+
+def _forget_file_lookup(conn, material):
+    """A paper given another file, in add_version's transaction: when its identifier came from its old
+    file's text (an upload's always; a reference file's or a Zotero paper's when its record gives none),
+    what that file's lookup gave it goes, with its resolution and retraction check, so the new file's
+    lookup starts afresh and no paper mixes two works' details: an upload's looked-up details (its title
+    stays, until a lookup gives another), a recorded paper's lookup-filled fields (S1-14's lookup_filled).
+    A paper whose details the researcher edited keeps them, and one whose record gives its identifier
+    keeps its lookup's results, which are about that identifier."""
+    row = conn.execute("SELECT source, csl, checked_by, lookup_filled FROM materials WHERE id = ?", (material,)).fetchone()
+    if row is None or row[2] == "researcher":
+        return
+    source, csl, checked_by, filled = row
+    if source in _RECORDED:
+        record = json.loads(csl or "{}")
+        for key in json.loads(filled or "[]"):  # a lookup's fields are not the record's
+            record.pop(key, None)
+        if reference_files.identifier(record) is not None:
+            return
+        conn.execute("UPDATE materials SET csl = ?, lookup_filled = NULL, source_key = CASE source WHEN 'zotero'"
+                     " THEN source_key END, resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL"
+                     " WHERE id = ?", (json.dumps(record), material))
+    elif checked_by == "lookup":
+        conn.execute("UPDATE materials SET csl = NULL, checked_by = NULL, checked_at = NULL, source_key = NULL,"
+                     " resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL WHERE id = ?",
+                     (material,))
+    else:  # an upload no lookup completed: only what a retraction check said goes
+        conn.execute("UPDATE materials SET resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL"
+                     " WHERE id = ?", (material,))
 
 
 def _add_to_batch(conn, project_id, run_id, looked_up, more, registry):
