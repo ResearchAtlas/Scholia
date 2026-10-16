@@ -572,7 +572,6 @@ def test_the_committed_subset_reference_is_a_finished_subset_run_under_this_mani
     assert not [line for line in tier1.compare(manifest, reference, reference) if line.startswith("NOT LIKE")]
 
 
-
 def _finished(bench):
     return {"status": "finished", "like_for_like": True, "model_settings": {}, "machine": {}, "bootstrap": {},
             "manifest_rules_sha256": "r", "benchmarks": {"scifact": bench}}
@@ -614,3 +613,29 @@ def test_a_missing_model_is_refused_and_an_earlier_finished_file_at_out_says_inc
                     str(tmp_path / "llama-server"), "--model", str(tmp_path / "missing.gguf"), "--out", str(out)])
     written = json.loads(out.read_text())
     assert written["status"] == "incomplete" and written["reason"].startswith("refused: FileNotFoundError")
+
+
+def test_out_says_incomplete_before_any_input_is_checked_and_an_unreadable_set_file_is_refused(tmp_path, monkeypatch):
+    out = tmp_path / "out.json"
+    argv = ["run", "--level", "full", "--benchmarks", "scifact", "--sets", str(tmp_path / "sets"), "--helper", "h",
+            "--model", "m", "--out", str(out)]
+    out.write_text(json.dumps({"status": "finished"}))
+
+    def stuck(*args):  # not a refusal: what --out says if checking the inputs stops some other way
+        raise RuntimeError("stopped")
+    monkeypatch.setattr(tier1, "verify", stuck)
+    with pytest.raises(RuntimeError):
+        tier1.main(argv)
+    assert json.loads(out.read_text()) == {"status": "incomplete", "reason": "checking the inputs", "level": "full"}
+    monkeypatch.undo()
+    _sets(tmp_path / "sets")
+    manifest = manifest_for(tmp_path / "sets")
+    monkeypatch.setattr(tier1, "load_manifest", lambda path=None: manifest)
+    qrels = tmp_path / "sets" / "beir" / "qrels" / "test.tsv"
+    qrels.chmod(0)
+    try:
+        with pytest.raises(SystemExit, match="refused: PermissionError"):
+            tier1.main(argv)
+    finally:
+        qrels.chmod(0o644)
+    assert json.loads(out.read_text())["reason"].startswith("refused: PermissionError")
