@@ -1063,7 +1063,7 @@ async def test_a_merge_that_gives_a_paper_its_arxiv_id_looks_it_up(tmp_path):
 
 
 @pytest.mark.parametrize("case", ["had_one", "edited"])
-async def test_a_merge_looks_nothing_up_for_a_paper_with_an_identifier_or_the_researchers_details(tmp_path, case):
+async def test_a_merges_new_identifier_kind_is_looked_up_unless_the_details_are_the_researchers(tmp_path, case):
     feed = MockScholarly(arxiv={"2401.05555": "A Preprint"}, openalex={DOI: openalex_work(DOI, "A Preprint")})
     async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
         project = await project_of(client)
@@ -1082,5 +1082,28 @@ async def test_a_merge_looks_nothing_up_for_a_paper_with_an_identifier_or_the_re
         assert (await answer(client, ask, "merge")).status_code == 200
         assert (await run_finished(client, ask["run_id"]))["status"] == "succeeded"
         assert "arxiv" in (await client.get(f"/api/materials/{paper}")).json()["csl"]  # merged
-        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup' AND project_id = ?",
-                          project) == before  # but nothing looked up
+        after = await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup' AND project_id = ?", project)
+        # an arXiv ID where the paper had none is looked up (it had a DOI: review 1 of PR 35); the researcher's
+        # details are never
+        assert after[0][0] == before[0][0] + (1 if case == "had_one" else 0)
+
+
+async def test_a_merge_that_gives_an_arxiv_papers_its_doi_looks_the_doi_up(tmp_path):
+    # review 1 of PR 35: the paper had an arXiv ID (looked up); the DOI a merge adds is of a kind it lacked
+    feed = MockScholarly(arxiv={"2401.05555": "A Preprint"}, openalex={DOI: openalex_work(DOI, "A Preprint", retracted=True)})
+    async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
+        project = await project_of(client)
+        first = await imported(client, project, b"@misc{k, title={A Preprint}, year={2024}, eprint={2401.05555},"
+                                                b" archivePrefix={arXiv}}", "a.bib")
+        [paper] = first["imported"]
+        await run_finished(client, first["lookup_run_id"])
+        await imported(client, project, ris(("A Preprint", f"PY  - 2024\nDO  - {DOI}\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        runs = await rows(client, "SELECT id FROM runs WHERE workflow = 'lookup' AND project_id = ? ORDER BY started_at",
+                          project)
+        assert len(runs) == 2 and (await run_finished(client, runs[1][0]))["status"] == "succeeded"
+        assert any(path == f"/works/doi:{DOI}" for _, path, _ in feed.requests)
+        found = (await client.get(f"/api/materials/{paper}")).json()
+        assert (found["csl"]["DOI"], found["retraction"]) == (DOI, "retracted")

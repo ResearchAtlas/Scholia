@@ -682,12 +682,21 @@ def test_a_record_refused_by_its_cap_keeps_its_macros_counted():
     ('"Schr\\"odinger"', "Schrödinger"),  # an escaped quote ends nothing
     ("{Set \\{ notation}", "Set { notation"),  # an escaped brace opens nothing
     ("{Set \\} notation}", "Set } notation"),  # nor closes
-    ("{Tab \\\\{x}}", None),  # an escaped backslash, then a brace that counts: the value runs on past its close
+    ("{a \\\\\\{ b}", "a { b"),  # an odd run: escaped by both rules
+    ("{Tab \\\\{x}}", None),  # an escaped backslash, then a brace that counts: bibtexparser's split differs
+    ('"a \\\\" b"', None),
 ])
 def test_escaped_delimiters_in_a_bibtex_value(value, title):
     records, skipped = parse(f"@misc{{k, title = {value}, year = {{2020}}}}\n")[:2]
     assert [r["title"] for r in records] == ([title] if title else [])
-    assert skipped == ({} if title else {"no_title": 1, "unsupported_macro": 1})  # never read as a title
+    assert skipped == ({} if title else {"unreadable": 1})  # never kept without the fields the split lost
+
+
+@pytest.mark.parametrize("field", ["abstract", "author", "keywords", "title", "note"])
+def test_a_record_where_the_parsers_split_and_ours_differ_is_refused_never_kept_short(field):
+    # review 1 of PR 35: bibtexparser ends {Tab \\{x} where its own rule says, and the year is lost after it
+    records, skipped = parse(f"@misc{{k, title={{T}}, {field}={{Tab \\\\{{x}}}}, year={{2020}}}}\n")[:2]
+    assert records == [] and skipped == {"unreadable": 1}
 
 
 def test_escaped_braces_in_keywords_are_text():

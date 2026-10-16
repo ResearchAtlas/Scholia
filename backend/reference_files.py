@@ -28,7 +28,9 @@ for that field, before any parser's or our own change (the field's line as writt
 inside its outer delimiters, a JSON string), with only spaces, tabs and line ends taken from its ends,
 on one line (a field continued on the next is refused), and it must be, whole, an ASCII DOI starting
 "10." (_DOI_WHOLE; after one of four prefixes, if it has one: https://doi.org/, http://doi.org/,
-https://dx.doi.org/ or doi:, Harold 2026-10-17) or an arXiv ID with an optional version (_ARXIV_WHOLE).
+https://dx.doi.org/ or doi:, Harold 2026-10-17, the URLs' scheme and host and "doi:" in any case, as a
+URL's are, and doi: with spaces or tabs after it, as an export writes "DOI: 10.…"; what follows is checked
+whole all the same) or an arXiv ID with an optional version (_ARXIV_WHOLE).
 A URL is kept, as display only, when it is, whole, http or https, a host name with an optional port 1
 to 65535, and a path (_URL_WHOLE). Any other value of these fields is left out and counted (invalid_field).
 
@@ -378,7 +380,7 @@ def _bibtex(text, beat):
         """How many of an entry's fields, every one of them, are macros or # concatenations: each left out."""
         count = 0
         for field in entry.fields:
-            if isinstance(field.value, str) and (raw := field.value.strip()):
+            if isinstance(field.value, str) and (raw := field.value.strip()) and _agrees(raw):
                 try:
                     parts = _parts(raw)
                 except _Refused:  # words without # between them, a literal then a word: no one literal either
@@ -421,6 +423,8 @@ def _bibtex(text, beat):
             fields.setdefault(field.key.lower(), field)
         kind = entry.entry_type.lower()
         try:
+            if not all(_agrees(field.value.strip()) for field in entry.fields if isinstance(field.value, str)):
+                raise _Refused  # where our reading and the parser's split differ, fields may be missing
             archive = (value(fields, "archiveprefix", "eprinttype") or "").strip().lower()
             number = value(fields, "number")
             record = {
@@ -466,14 +470,17 @@ def _escaped(value, at, start=-1):
     return run % 2 == 1
 
 
-def _closing(value, start):
+def _closing(value, start, parsers=False):
     """Where the brace or quote opening value at start closes (braces inside it balanced), or None. A
     delimiter after an odd run of backslashes is escaped (TeX's \\{, \\} and \\"), so it neither opens,
-    closes nor ends anything; after an even run (\\\\, an escaped backslash) it is a delimiter."""
+    closes nor ends anything; after an even run (\\\\, an escaped backslash) it is a delimiter. parsers:
+    bibtexparser's rule instead, which splits a block into its fields: any backslash before a delimiter
+    hides it."""
     depth, at = 0, start + 1
     while found := _DELIMITERS.search(value, at):
         at = found.end()
-        if _escaped(value, found.start(), start):
+        if (found.start() - 1 > start and value[found.start() - 1] == "\\") if parsers \
+                else _escaped(value, found.start(), start):
             continue
         if found.group() == "{":
             depth += 1
@@ -484,6 +491,25 @@ def _closing(value, start):
         elif depth == 0 and value[start] == '"':
             return found.start()
     return None
+
+
+def _agrees(raw):
+    """Whether each braced or quoted part of a BibTeX value closes where bibtexparser closed it when it
+    split the block into fields: where the two rules differ (\\\\{, an escaped backslash then a brace, say),
+    the parser may have ended the value, or the entry, elsewhere than the file does, and fields after it
+    may be lost, so its record is refused (unreadable) rather than kept without them."""
+    at = 0
+    while (at := _SPACES.match(raw, at).end()) < len(raw):
+        if raw[at] in '{"':
+            end = _closing(raw, at)
+            if end != _closing(raw, at, parsers=True):
+                return False
+            if end is None:
+                return True
+            at = end + 1
+        else:
+            at += max(1, len(_WORD.match(raw, at).group()))
+    return True
 
 
 def _parts(raw):
