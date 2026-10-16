@@ -342,7 +342,9 @@ class SearchIndex:
 
     def _read(self, fn):
         """fn(conn) on an idle read connection, in one read transaction. Refused (Unavailable) from the moment damage
-        is found or a whole rebuild is asked for, while one is under way, or after one failed. Admitted, given its connection (an idle one, or a new one to
+        is found or a whole rebuild is asked for, while one is under way, or after one failed. A read whose connection
+        cannot open, or whose query meets an SQL error, has the file checked (_is_damaged): damaged, it is replaced and
+        rebuilt; locked, or only that query's error, nothing is. Admitted, given its connection (an idle one, or a new one to
         the file as it is then), and that connection given back to the idle ones, all under _lock: so a file that
         replaces this one, or its removal, waits for the reads admitted before (_quiet), and no read admitted before
         reaches a file made after; close() refuses later reads, waits for these, then closes what they gave back."""
@@ -682,7 +684,7 @@ class SearchIndex:
         """A read or a pass found the file damaged: it is replaced and rebuilt in the writer, once, and its
         vectors are wanted again (self.rebuilt), as when a launch rebuilds it."""
         with self._lock:
-            if self.damaged or self.closed:
+            if self.damaged or self.closed or self.building:  # a rebuild asked for or under way makes a new file anyway
                 return
             self.damaged = self.building = True  # no read admitted from here (the rebuild sets it too)
         log.warning("the search index is damaged; it is rebuilt")

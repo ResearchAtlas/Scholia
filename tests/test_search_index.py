@@ -2120,7 +2120,7 @@ async def test_a_read_whose_connection_cannot_open_on_a_damaged_file_has_it_rebu
 
 @pytest.mark.asyncio
 async def test_a_healthy_index_another_connection_holds_is_not_taken_for_damaged(tmp_path):
-    """Recheck 8, item 2: a healthy index file another connection holds (exclusive locking) is not damaged when
+    """Recheck 8, item 1 (lock): a healthy index file another connection holds (exclusive locking) is not damaged when
     checked on a fresh connection: it is busy, and nothing is to be rebuilt."""
     from backend.db import Database
     db = await asyncio.to_thread(Database, tmp_path / "data")
@@ -2144,7 +2144,7 @@ async def test_a_healthy_index_another_connection_holds_is_not_taken_for_damaged
 @pytest.mark.asyncio
 async def test_a_read_whose_connection_cannot_open_on_a_healthy_file_is_refused_and_nothing_rebuilt(tmp_path,
                                                                                                     monkeypatch):
-    """Recheck 8, item 2: a read whose new connection fails (as the tokenizer's registration does after a lock's busy
+    """Recheck 8, item 1 (lock): a read whose new connection fails (as the tokenizer's registration does after a lock's busy
     timeout) on a file the check finds healthy is refused as unavailable, and the index is not replaced (its
     embeddings stay)."""
     async with app(tmp_path) as client:
@@ -2190,7 +2190,7 @@ async def test_a_corrupt_header_met_opening_a_read_is_confirmed_and_rebuilt(tmp_
 
 @pytest.mark.asyncio
 async def test_an_emptied_index_file_is_taken_for_damaged_and_rebuilt(tmp_path):
-    """Recheck 8, item 1: the index file emptied (zero bytes) while the app runs. A read's new connection opens, and
+    """Recheck 8, item 2 (emptied file): the index file emptied (zero bytes) while the app runs. A read's new connection opens, and
     its query fails for the missing tables: the check finds the index's tables gone, so the file is replaced and
     rebuilt (before, it was left so, search unavailable while the status said ready)."""
     async with app(tmp_path) as client:
@@ -2208,3 +2208,36 @@ async def test_an_emptied_index_file_is_taken_for_damaged_and_rebuilt(tmp_path):
         assert index.damaged
         await asyncio.wait_for(_until(lambda: not index.building), 20)
         assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+
+@pytest.mark.asyncio
+async def test_a_read_whose_own_query_fails_on_a_healthy_file_rebuilds_nothing(tmp_path):
+    """Review 10, P3-2: an SQL error that is the read's own (here a query of a table that does not exist) on a healthy
+    file is only that read's: it is raised, and the index is not taken for damaged."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        with pytest.raises(search_index.apsw.SQLError):
+            await asyncio.to_thread(index._read, lambda conn: conn.execute("SELECT * FROM no_such_table").fetchall())
+        assert not index.damaged and not index.building
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
+async def test_damage_found_while_a_rebuild_is_under_way_asks_for_no_second_one(tmp_path, monkeypatch):
+    """Review 10, P3-1: damage reported while a whole rebuild is already asked for or under way (a read whose check met
+    the file the rebuild is replacing) asks for no second rebuild."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        asked = []
+        monkeypatch.setattr(SearchIndex, "_rebuild_soon", lambda self, then=None: asked.append(True))
+        index.building = True  # as a rebuild under way
+        await asyncio.to_thread(index._damaged)
+        assert asked == [] and not index.damaged
+        index.building = False
