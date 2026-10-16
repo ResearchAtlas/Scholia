@@ -148,18 +148,24 @@ test('the screen of a language that cannot load speaks that language, from strin
   assert.doesNotMatch(app, /LanguageContext\.Provider value=\{language \?\? 'en'\}/);
 });
 
-test('Use English saves the setting as English, then draws English', () => {
+test('Use English saves the setting as English (once more if that did not take), then draws English', () => {
   const app = source('App.jsx');
-  assert.match(app, /const chooseEnglish = async \(\) => \{\n\s*await saveSettings\(\{ 'ui\.language': 'en' \}\)[^\n]*\n\s*await languages\.want\('en'\);\n\s*\};/);
+  assert.match(app, /const chooseEnglish = async \(\) => \{\n\s*const save = \(\) => saveSettings\(\{ 'ui\.language': 'en' \}\)\.catch\(\(\) => null\);\n\s*if \(!await save\(\)\) await save\(\);\n\s*await languages\.want\('en'\);\n\s*\};/);
 });
 
 test('at launch only the setting\'s language is asked for, the system\'s only when the setting is not read', () => {
   const app = source('App.jsx');
-  const reads = [...app.matchAll(/(await )?languages\.want\(resolveLanguage\(settings[^\n]*\n\s*setState\(/g)];
-  assert.equal(reads.length, 2); // the limited app's screens, and the setup or the window: each waits for it
-  assert.ok(reads.every(([, awaited]) => awaited));
+  const load = app.slice(app.indexOf('const load = useCallback('), app.indexOf('}, [languages]);'));
+  const reads = load.split('\n').filter((line) => line.includes('languages.want(resolveLanguage(settings'));
+  assert.equal(reads.length, 2); // the limited app's screens, and the setup or the window
+  assert.ok(reads.every((line) => line.includes('await languages.want(')));
+  // each is drawn before the screen it leads to
+  for (const line of reads) assert.ok(load.indexOf(line) < load.indexOf('setState({ phase: ', load.indexOf(line)));
+  // the settings read is kept when the setup read fails, so the error screen is in the setting's language
+  assert.match(load, /await Promise\.allSettled\(\[get\('\/api\/setup'\), get\('\/api\/settings'\)\]\);\n\s*if \(settings\.status === 'fulfilled'\) await languages\.want\(/);
   const system = [...app.matchAll(/^.*resolveLanguage\('system'.*$/gm)].map(([line]) => line.trim());
   assert.deepEqual(system, ["await languages.fallback(resolveLanguage('system', navigator.language)); // the setting was not read"]);
+  assert.ok(load.indexOf('} catch (error) {') < load.indexOf('languages.fallback('));
   assert.doesNotMatch(app, /useEffect\(\(\) => \{\n\s*(setLanguage|languages\.want)\(/);
 });
 
@@ -174,4 +180,5 @@ test('a change in Settings loads the language first and saves it only once loade
   assert.match(change, /\) onLanguage\(value\);/);
   assert.ok(en['errors.language_not_loaded'] && !HAN.test(en['errors.language_not_loaded']));
   assert.match(zhCN['errors.language_not_loaded'], HAN);
+  assert.match(en['errors.language_not_loaded'], /Reload the window/); // a load that failed stays failed until then
 });

@@ -44,19 +44,23 @@ export function App() {
         setState({ phase: health.data_folder_problem ? 'dataFolder' : 'damaged', health });
         return;
       }
-      const [setup, settings] = await Promise.all([get('/api/setup'), get('/api/settings')]);
-      await languages.want(resolveLanguage(settings.values?.ui?.language ?? 'system', navigator.language));
-      setState({ phase: setup.needed ? 'setup' : 'ready', health, settings });
+      // The setting's language is drawn whenever the settings were read, even if the setup was not.
+      const [setup, settings] = await Promise.allSettled([get('/api/setup'), get('/api/settings')]);
+      if (settings.status === 'fulfilled') await languages.want(resolveLanguage(settings.value.values?.ui?.language ?? 'system', navigator.language));
+      for (const answer of [setup, settings]) if (answer.status === 'rejected') throw answer.reason;
+      setState({ phase: setup.value.needed ? 'setup' : 'ready', health, settings: settings.value });
     } catch (error) {
       await languages.fallback(resolveLanguage('system', navigator.language)); // the setting was not read
       setState({ phase: 'error', code: error instanceof ApiError ? error.code : 'internal' });
     }
   }, [languages]);
 
-  // Use English, on the screen of a language that could not load: the setting becomes English,
-  // and English is drawn even if it could not be saved, since the researcher chose it.
+  // Use English, on the screen of a language that could not load: the setting becomes English
+  // (saved once more if the settings changed meanwhile or the save failed), and English is drawn
+  // even if it could not be saved, since the researcher chose it.
   const chooseEnglish = async () => {
-    await saveSettings({ 'ui.language': 'en' }).catch(() => null);
+    const save = () => saveSettings({ 'ui.language': 'en' }).catch(() => null);
+    if (!await save()) await save();
     await languages.want('en');
   };
 
