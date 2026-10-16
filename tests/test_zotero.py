@@ -1020,3 +1020,23 @@ async def test_a_new_pdf_keeps_the_researchers_edits(tmp_path):
         await background_idle(client, 60)
         paper = (await papers(client, project))["users/0/items/PDFD2222"]
         assert (paper["csl"]["container-title"], paper["csl"]["DOI"], paper["checked_by"]) == ("My Venue", DOI, "researcher")
+
+
+
+async def test_a_new_pdf_with_a_record_change_also_takes_the_old_resolution_with_it(tmp_path):
+    mock = MockZotero()
+    mock.item("PDFD2222", "A Record Without Its DOI", pdf=pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI",
+                                                                   doi=DOI))
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A", retracted=True)})
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=records)) as client:
+        project = await project_of(client)
+        await imported(client, project, ["PDFD2222"])
+        await background_idle(client, 60)
+        assert (await papers(client, project))["users/0/items/PDFD2222"]["retraction"] == "retracted"
+        mock.items["users/0", "PDFD2222"]["csljson"]["title"] = "A Record Without Its DOI, Retitled"
+        pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI", doi="10.5555/scholia.zotero.unknown")
+        await imported(client, project, ["PDFD2222"])
+        await background_idle(client, 60)  # the new file's DOI has no record anywhere
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert paper["title"] == "A Record Without Its DOI, Retitled" and "container-title" not in paper["csl"]
+        assert (paper["retraction"], paper["resolved_at"]) == ("unknown", None)

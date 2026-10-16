@@ -712,13 +712,15 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
                                            (material, sha256)).fetchone() is None:  # one of its files already: none
         version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
         step["version"] = True
-        if not changed and checked_by != "researcher" and reference_files.identifier(own) is None:
-            # Its identifier came from its file's text, which is another file now: what a lookup of the
-            # old one filled goes (S1-14's lookup_filled), with its resolution and retraction check, and
-            # the new file's lookup completes the record afresh. A researcher's edits stay as they are.
+        record = csl if changed else own  # the record it has now, without a lookup's fields
+        if checked_by != "researcher" and reference_files.identifier(record) is None:
+            # Its identifier came from its file's text, which is another file now (whether or not its record
+            # changed too): what a lookup of the old one filled goes (S1-14's lookup_filled), with its
+            # resolution and retraction check, and the new file's lookup completes the record afresh. A
+            # researcher's edits stay as they are.
             conn.execute("UPDATE materials SET csl = ?, lookup_filled = NULL, resolved_at = NULL, retraction = 'unknown',"
                          " retraction_checked_at = NULL, updated_at = ? WHERE id = ?",
-                         (json.dumps(own), utc_now(), material))
+                         (json.dumps(record), utc_now(), material))
     elif sha256 is None and step.get("pdf") and current is not None and current[1] is not None:
         step["kept"] = True  # its PDF could not be read this time: the paper keeps the file it had
     step["outcome"] = "updated" if changed or step["version"] else "unchanged"
