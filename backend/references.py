@@ -32,8 +32,9 @@ its own paper, as at import, not looked up. Cancel leaves the record out. Merge 
 transaction, that the paper still matches the record as a duplicate (`_matches`, Duplicates' rule): one
 whose DOI or title changed while the question waited takes nothing (the run fails no_longer_duplicate).
 A Merge that changes the identifier a reference file's paper is looked up by (a DOI where it had none,
-an arXiv ID where it had no identifier) records its lookup in the same transaction, as the import's (`_merged_lookup`); a paper not from a reference file is identified
-by its file's text alone, so none is recorded for it. The request's base64 is refused unread past what the
+an arXiv ID where it had no identifier) records its lookup in the same transaction, as the import's
+(`_merged_lookup`); a paper not from a reference file is identified by its file's text alone, so none is
+recorded for it. The request's base64 is refused unread past what the
 largest file read encodes to (`_ENCODED`); an empty file reaches the parser, which says it holds no records.
 """
 

@@ -1111,7 +1111,7 @@ async def test_a_merge_giving_a_paper_with_no_identifier_one_asks_for_that_one(t
 
 
 async def test_a_merge_that_gives_an_arxiv_papers_its_doi_looks_the_doi_up(tmp_path):
-    # review 1 of PR 35: the paper had an arXiv ID (looked up); the DOI a merge adds is of a kind it lacked
+    # review 1 of PR 35: the paper had an arXiv ID (looked up); the DOI a merge adds changes the identifier its lookup takes
     feed = MockScholarly(arxiv={"2401.05555": "A Preprint"}, openalex={DOI: openalex_work(DOI, "A Preprint", retracted=True)})
     async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
         project = await project_of(client)
