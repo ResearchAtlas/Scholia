@@ -57,7 +57,7 @@ network_guard.start()
 
 import httpx  # noqa: E402
 import uvicorn  # noqa: E402
-from scholia_app import FakeKeyring, MockProvider, MockScholarly, crossref_work, openalex_work  # noqa: E402
+from scholia_app import FakeKeyring, MockProvider, MockScholarly, crossref_work, openalex_work, streaming  # noqa: E402
 
 from backend import local_helper, reading  # noqa: E402
 from backend.app import create_app  # noqa: E402
@@ -276,7 +276,7 @@ def main(argv=None):
     app = create_app(data_dir, origin=origin, session=session,
                      dev_origins=("http://127.0.0.1:5173",) if args.dev else (),
                      frontend_dir=None if args.dev else ROOT / "frontend" / "dist",
-                     keyring_backend=FakeKeyring(), transport=httpx.MockTransport(provider),
+                     keyring_backend=FakeKeyring(), transport=httpx.MockTransport(streaming(provider)),
                      helper=local_helper.Config(binary=binary, models={MODEL["id"]: MODEL}))
     print(f"data folder: {data_dir}", flush=True)
     print(f"materials: {write_materials()}", flush=True)

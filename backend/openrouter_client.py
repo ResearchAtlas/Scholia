@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import time
+import zlib
 
 import httpx
 
@@ -35,6 +36,7 @@ CATALOG_SECONDS = 20
 COMPRESSION_WINDOW = 8192
 
 _caches: dict[tuple, dict] = {}
+_listings: dict[tuple, tuple] = {}  # (provider, base URL, model) -> (when read, its endpoints)
 _generation = 0  # bumped by clear_cache(); a snapshot taken before it lists nothing (Scholia)
 
 
@@ -59,6 +61,32 @@ def _cache_state(provider, key):
     return state
 
 
+async def _bounded(response, limit):
+    """A response's body, decoded here (gzip or none, nothing else) and counted as decoded bytes, given
+    up (ValueError) once it would pass limit, so a small compressed body that expands is never held
+    whole; a gzip body is one gzip stream read to its end, and anything after its end (another member,
+    a tail) is given up as well, as backend/lookup.py reads scholarly answers (Scholia)."""
+    encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if encoding not in ("identity", "gzip"):
+        raise ValueError("unsupported encoding")
+    inflate = zlib.decompressobj(16 + zlib.MAX_WBITS) if encoding == "gzip" else None
+    body = bytearray()
+    try:
+        async for raw in response.aiter_raw():
+            body += inflate.decompress(raw, limit + 1 - len(body)) if inflate else raw
+            if len(body) > limit or (inflate and (inflate.unconsumed_tail or inflate.unused_data)):
+                raise ValueError("oversized catalog")
+        if inflate:
+            body += inflate.flush()
+            if not inflate.eof:  # cut before its trailer
+                raise ValueError("truncated catalog")
+    except zlib.error:
+        raise ValueError("invalid encoding") from None
+    if len(body) > limit:
+        raise ValueError("oversized catalog")
+    return bytes(body)
+
+
 async def _fetch_catalog_rows(client, url, id_field, key):
     """Only send credentials to the configured URL. Never follow provider links."""
     headers = {"Authorization": f"Bearer {key}"} if key else {}
@@ -72,15 +100,11 @@ async def _fetch_catalog_rows(client, url, id_field, key):
             while True:
                 if time.monotonic() > deadline:
                     raise ValueError("catalog deadline")
-                async with client.stream("GET", url, headers=headers, params={"after": cursor} if cursor else None,
-                                         timeout=10.0) as response:
+                async with client.stream("GET", url, headers={**headers, "Accept-Encoding": "gzip"},
+                                         params={"after": cursor} if cursor else None, timeout=10.0) as response:
                     response.raise_for_status()
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        total_bytes += len(chunk)
-                        if total_bytes > MAX_CATALOG_BYTES or time.monotonic() > deadline:
-                            raise ValueError("oversized catalog")
+                    body = await _bounded(response, MAX_CATALOG_BYTES - total_bytes)  # every page's, together
+                    total_bytes += len(body)
                     payload = json.loads(body)
                 if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
                     raise ValueError("invalid catalog shape")
@@ -268,6 +292,56 @@ def clear_cache():
     global _generation
     _generation += 1
     _caches.clear()
+    _listings.clear()
+
+
+def _endpoint(row):
+    """An endpoint row as Scholia reads it, or None when its tag is missing or malformed."""
+    tag = row.get("tag") if isinstance(row, dict) else None
+    if not isinstance(tag, str) or not tag or tag != tag.strip() or len(tag) > 512 or any(ord(c) < 32 for c in tag):
+        return None
+    context = row.get("context_length")
+    parameters = row.get("supported_parameters")
+    return {"tag": tag, "context_length": context if type(context) is int and context > 0 else None,
+            "supported_parameters": parameters if isinstance(parameters, list)
+            and all(isinstance(p, str) for p in parameters) else None,
+            "pricing": row.get("pricing") if isinstance(row.get("pricing"), dict) else {}}
+
+
+def cached_endpoints(provider, model):
+    """The model's endpoint listing as last read, while it is fresh; else None. No network I/O."""
+    cached = _listings.get((provider.name, provider.base_url, model))
+    return cached[1] if cached is not None and time.time() - cached[0] < CACHE_TTL_SECONDS else None
+
+
+async def endpoints(client, provider, model):
+    """Every endpoint OpenRouter lists for a model (`/models/{model}/endpoints`, public metadata, read
+    without the key), cached for an hour; None when it could not be read, or a row's tag could not be
+    (a request could reach an endpoint nothing here describes). Scholia: model-route rules 1, 3 and 6
+    read what a request can reach from it (backend/reach.py)."""
+    scope = (provider.name, provider.base_url, model)
+    if (cached := cached_endpoints(provider, model)) is not None:
+        return cached
+    url = f"{provider.base_url.rstrip('/')}/models/{model}/endpoints"
+    generation_read = _generation
+    try:
+        async with asyncio.timeout(CATALOG_SECONDS):
+            async with client.stream("GET", url, headers={"Accept-Encoding": "gzip"}, timeout=10.0) as response:
+                response.raise_for_status()
+                payload = json.loads(await _bounded(response, MAX_CATALOG_BYTES))
+        data = payload.get("data") if isinstance(payload, dict) else None
+        rows = data.get("endpoints") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or len(rows) > MAX_CATALOG_MODELS:
+            raise ValueError("invalid endpoint listing")
+        found = [_endpoint(row) for row in rows]
+        if None in found:
+            raise ValueError("invalid endpoint row")
+    except Exception as error:  # cancellation propagates
+        log.warning("endpoint listing fetch failed (%s)", classify_error(error))
+        return None
+    if generation_read == _generation:  # settings changed meanwhile: not cached
+        _listings[scope] = (time.time(), found)
+    return found
 
 
 async def check_connectivity(client, provider, key):

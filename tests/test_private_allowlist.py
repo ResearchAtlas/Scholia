@@ -414,3 +414,20 @@ async def test_a_failed_refresh_during_its_cooldown_is_refused_at_the_listing_an
                                     json={"content": "SECRET-INTERVIEW", "model": ZDR_MODEL})
         assert (refused.status_code, refused.json()["code"]) == (403, "private_route_not_allowed")
         assert provider.chats == [] and await rows(client, "SELECT count(*) FROM runs") == [(0,)]
+
+
+async def test_a_private_request_that_requires_its_parameters_still_passes_the_gate(tmp_path, monkeypatch):
+    # Model-route rule 2 on a Private route: provider.require_parameters goes with zdr, only and ignore,
+    # and the gate lets it out (here with a reasoning object, as a model whose record allowed one would).
+    from backend import openrouter
+    monkeypatch.setattr(openrouter, "resolve_model_reasoning",
+                        lambda route, effort, **kw: ({"effort": effort}, None) if effort else (None, None))
+    provider = provider_for_private()
+    async with started(tmp_path / "data", provider) as client:
+        _, conversation = await private_conversation(client)
+        stream = await send(client, conversation, model=ZDR_MODEL, effort="high")
+        assert stream[-1]["status"] == "succeeded"
+        [body] = provider.answers
+        assert body["provider"] == {"zdr": True, "only": ["example"], "require_parameters": True}
+        assert body["reasoning"] == {"effort": "high"}
+        await background_idle(client)

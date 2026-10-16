@@ -21,7 +21,10 @@ interrupted at shutdown), settling a call that may have gone out at its estimate
 and releasing a reservation whose call never left. A running turn that is not
 in this process's registry reads as interrupted, and startup records it so.
 
-Every model call passes the dispatch check (may_dispatch) inside the outbound
+Every model call goes through one dispatch path (Harness._call): its request is built by the
+context assembler (backend/context.py) for the window every endpoint it can reach accepts
+(backend/reach.py), its reservation is sized from that request at the highest rate it can
+reach, and it passes the dispatch check (may_dispatch) inside the outbound
 gate's decision transaction: a run revoked by a deletion or a change to its
 project (cancel_reason 'revoked' in the record), or one whose owners are gone or
 whose project is review-locked, sends nothing more. A revoked run ends cancelled
@@ -55,7 +58,8 @@ import traceback
 from contextlib import suppress
 from dataclasses import dataclass, field
 
-from backend import budget_router, credentials, governance, openrouter, openrouter_client, providers, spending
+from backend import (budget_router, context, credentials, governance, openrouter, openrouter_client, providers, reach,
+                     spending)
 from backend.db import new_id, utc_now
 from backend.openrouter_client import catalog_read, catalog_status, get_model_metadata
 from backend.settings import load_instructions, load_settings, visible
@@ -65,7 +69,6 @@ log = logging.getLogger(__name__)
 STALE_CLAIM_SECONDS = 30  # an admitted turn whose response has not started by then was dropped
 MODEL_CALL_SECONDS = 120  # one call's total bound, both attempts included
 MAX_MESSAGE_CHARS = 100_000
-HISTORY_TURNS = 20  # ponytail: a fixed history window until the context assembler counts tokens
 BACKGROUND_ATTEMPTS = 2
 CANCEL_WAIT_SECONDS = 10  # how long a cancel request waits to report how the run ended
 SYSTEM_RULES = (
@@ -82,15 +85,33 @@ TITLE_RULES = (
 def _unusable(table, provider, model) -> str | None:
     """Why a model may not be called, or None: model_not_offered when its provider does not offer
     it (Recommended, All or Pick) or its catalog, once read, no longer lists it; model_window when
-    its window is not usable (slice-1 spec section 8: needed, or under 4,096). A catalog not read
-    yet cannot judge either; the context assembler sizes every request against the window (S1-19)."""
+    its window is not usable (slice-1 spec section 8: needed, or under 4,096); catalog_unread when
+    its provider's catalog has not been read, so its window is unknown (an OpenRouter model's
+    always, another's unless a setting gives it). Before a call, the window every endpoint it can
+    reach accepts is checked too (Harness._route_facts)."""
     if not providers.offered(table, provider, model, budget_router.RECOMMENDED):
         return "model_not_offered"
     route = providers.Route(provider, model)
     row = get_model_metadata(route)
-    if row is None:
-        return "model_not_offered" if catalog_read(route) else None
-    return None if providers.window(table, model, row.get("context_length"))["status"] == "ok" else "model_window"
+    if row is None and catalog_read(route):
+        return "model_not_offered"
+    if row is None and provider.is_openrouter:
+        return "catalog_unread"
+    if providers.window(table, model, (row or {}).get("context_length"))["status"] == "ok":
+        return None
+    return "model_window" if row is not None else "catalog_unread"
+
+
+_REFUSED = {  # an admission refusal's English text, by code; the interface shows its own by code
+    "model_not_offered": "That model is not offered for this provider",
+    "model_window": "That model has no usable window; set one in Settings",
+    "catalog_unread": "The provider's model list could not be read; try again or set a window",
+    "route_unverified": "The model's endpoints could not be read from the provider; try again",
+    "route_unpriced": "The model's endpoints publish a charge Scholia cannot estimate",
+    "route_unsupported": "No endpoint of that model accepts this request",
+    "message_over_window": "The message is too large for this model's window",
+    "instructions_over_window": "The project's instructions are too large for this model's window",
+}
 
 
 def _default_provider(configured, policy) -> str:
@@ -531,9 +552,6 @@ class Harness:
             if not policy.allows_provider(provider_config):  # none of its models, whichever is asked for
                 raise AdmissionError(403, policy.problem(provider_config, chosen),
                                      "This project's protection does not allow that provider")
-            if chosen != budget_router.AUTO and (problem := _unusable(table, provider_config, chosen)):
-                raise AdmissionError(400, problem, "That model is not offered for this provider" if problem == "model_not_offered"
-                                     else "That model has no usable window; set one in Settings")
         # The key is read outside the lock (a credential store may ask the researcher first);
         # it cannot change meanwhile, since key changes are refused while claim.provider is set,
         # and neither can the provider's settings, so the plan is made from the snapshot.
@@ -541,13 +559,17 @@ class Harness:
         if key is None:
             raise AdmissionError(400, "provider_key_missing", "The provider has no key")
         zero_retention = policy.zero_retention and provider_config.is_openrouter
-        if zero_retention and catalog_status(provider_config, key)["stale"]:  # unread, expired or failed
-            await self.catalog(provider_config, key)  # which models OpenRouter serves with zero retention now
+        # Which models OpenRouter serves with zero retention now; and a catalog never read, whose
+        # windows nothing here knows yet (status.md's S1-19 follow-up).
+        if (zero_retention and catalog_status(provider_config, key)["stale"]) \
+                or not catalog_read(providers.Route(provider_config, chosen)):
+            await self.catalog(provider_config, key)
+        if chosen != budget_router.AUTO and (problem := _unusable(table, provider_config, chosen)):
+            raise AdmissionError(400, problem, _REFUSED[problem])
 
         def plan_among(allowed):
             return budget_router.create_run_plan(
-                message, chosen, lambda m: providers.Route(provider_config, m), effort=effort,
-                is_openrouter=provider_config.is_openrouter,
+                message, chosen, is_openrouter=provider_config.is_openrouter,
                 offered=lambda m: _unusable(table, provider_config, m) is None and allowed(m),
                 picked=table["models"] if isinstance(table.get("models"), list) else ())
 
@@ -555,6 +577,8 @@ class Harness:
         # Before anything is written or sent: a model the project does not allow is refused, and
         # when Auto found none, the project's rule is named if it ruled out the one Auto would pick.
         model_for_problem = plan.model or plan_among(lambda m: True).model
+        if model_for_problem is None and not catalog_read(providers.Route(provider_config, chosen)):
+            raise AdmissionError(400, "catalog_unread", _REFUSED["catalog_unread"])  # Auto cannot tell
         if model_for_problem is None:
             raise AdmissionError(400, "model_needed", "Choose a model for this provider")
         if problem := policy.problem(provider_config, model_for_problem, key):
@@ -563,7 +587,11 @@ class Harness:
                 conn, self.data_dir, provider_config.name, key)):
             raise AdmissionError(403, "key_not_confirmed", "Confirm the key's OpenRouter data settings first")
         route = providers.Route(provider_config, plan.model)
+        problem, facts = await self._route_facts(route, key, table, zero_retention=zero_retention, effort=effort)
+        if problem:
+            raise AdmissionError(400, problem, _REFUSED[problem])
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
+        budgets = personal.values["context"]
 
         def admit(conn):
             moved = conn.execute("SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone()
@@ -579,10 +607,21 @@ class Harness:
                 raise AdmissionError(404, "not_found", "No such conversation")
             (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM turns WHERE conversation_id = ?",
                                   (claim.conversation_id,)).fetchone()
+            # Only succeeded turns' answers: a failed, cancelled or revoked turn's text never enters a
+            # later request as the assistant's words (section 1.5). Newest first, read as far as they fit.
             history = conn.execute(
                 "SELECT t.user_message, t.answer FROM turns t JOIN runs r ON r.id = t.run_id"
                 " WHERE t.conversation_id = ? AND r.status = 'succeeded' AND t.answer IS NOT NULL"
-                " ORDER BY t.seq DESC LIMIT ?", (claim.conversation_id, HISTORY_TURNS)).fetchall()
+                " ORDER BY t.seq DESC", (claim.conversation_id,))
+            try:
+                request = context.assemble(
+                    "answer", window=facts["window"], output=budgets["output_limit"], budgets=budgets,
+                    margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=message,
+                    sections={"agents_md": [instructions] if instructions else []},
+                    history=((json.loads(u).get("text", ""), json.loads(a).get("text", "")) for u, a in history))
+            except context.OverWindow as over:  # before anything is written or sent
+                raise AdmissionError(400, over.code, _REFUSED[over.code]) from None
+            plan.predicted_cost = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
             conn.execute(
                 "INSERT INTO runs (id, project_id, conversation_id, kind, workflow, limits, inputs)"
                 " VALUES (?, ?, ?, 'turn', 'agent', ?, ?)",
@@ -596,22 +635,18 @@ class Harness:
                 "INSERT INTO turns (run_id, conversation_id, seq, author, user_message, retry_of_run_id)"
                 " VALUES (?, ?, ?, 'researcher', ?, ?)",
                 (claim.run_id, claim.conversation_id, seq, json.dumps({"text": message}), retry_of))
-            _event(conn, claim.run_id, "route", {"route": route.key, "plan": plan.to_dict()})
-            return seq, history[::-1]
+            _event(conn, claim.run_id, "route", {"route": route.key, "effort": facts["effort"], "plan": plan.to_dict(),
+                                                 "window": facts["window"], "endpoints": facts["endpoints"]})
+            return seq, request
 
-        (seq, history), cancelled = await self._write_through(admit)
+        (seq, request), cancelled = await self._write_through(admit)
         if cancelled:  # its request went away while the run was written: it never runs, as by Stop
             await _through(self._write(lambda conn: self._finish_turn(
                 conn, claim.run_id, "cancelled", "researcher", "cancelled")))
             raise asyncio.CancelledError()
-        messages = [{"role": "system", "content": SYSTEM_RULES + (f"\n\n{instructions}" if instructions else "")}]
-        for user_message, answer in history:
-            messages.append({"role": "user", "content": json.loads(user_message).get("text", "")})
-            messages.append({"role": "assistant", "content": json.loads(answer).get("text", "")})
-        messages.append({"role": "user", "content": message})
         claim.context = {
-            "project_id": project_id, "seq": seq, "route": route, "key": key, "messages": messages,
-            "effort": effort, "estimate": plan.predicted_cost, "zero_retention": zero_retention,
+            "project_id": project_id, "seq": seq, "route": route, "key": key, "request": request, "facts": facts,
+            "estimate": plan.predicted_cost, "zero_retention": zero_retention,
         }
         claim.admitted = time.monotonic()
         return claim
@@ -656,15 +691,16 @@ class Harness:
             await handed({"type": "run_started", "run_id": claim.run_id, "conversation_id": claim.conversation_id,
                           "seq": ctx["seq"]})
             call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, ctx["estimate"],
-                                       phase="answer")
+                                       phase="answer", step=_step(ctx["route"], ctx["facts"], ctx["request"]))
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
-            result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["messages"], effort=ctx["effort"],
+            result = await self._call(claim, call, ctx["route"], ctx["key"], ctx["request"], ctx["facts"],
                                       zero_retention=ctx["zero_retention"])
-            if not result.ok:
+            if not result.ok or visible(result.content) is None:  # tool calls alone: no tools were offered
+                code = result.error_kind or "malformed"
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
-                                                                          result.error_kind, claim=claim))
+                                                                          code, claim=claim))
                 if final["status"] == "failed":  # not a Stop that came first
-                    emit({"type": "error", "code": result.error_kind})
+                    emit({"type": "error", "code": code})
                 emit({"type": "run_finished", **final})
                 return
             answer = {"text": result.content, **({"reasoning": result.reasoning} if result.reasoning else {})}
@@ -791,10 +827,10 @@ class Harness:
             lambda: (load_settings(self.data_dir), load_settings(self.data_dir, project_id)))
         return project.values["project"]["budget_usd"], personal.values["budget"]["conversation_usd"]
 
-    async def _reserve(self, active, project_id, paying_conversation_id, estimate, *, phase):
-        """Admit one model call: its reservation and step_started event, against the budgets
-        as they are now (read under settings_lock). A cancellation during the write releases
-        the reservation once it is written."""
+    async def _reserve(self, active, project_id, paying_conversation_id, estimate, *, phase, step):
+        """Admit one model call: its reservation and step_started event (with step, what _step
+        records of its route and request), against the budgets as they are now (read under
+        settings_lock). A cancellation during the write releases the reservation once it is written."""
         run_id = active.run_id
 
         def reserve(conn):
@@ -802,15 +838,15 @@ class Harness:
                 raise _Cancelled()
             (own,) = conn.execute("SELECT budget_usd FROM conversations WHERE id = ?",
                                   (paying_conversation_id,)).fetchone() or (None,)
-            (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
-                                   (run_id,)).fetchone()
-            reservation = spending.reserve(conn, run_id=run_id, step_seq=step, project_id=project_id,
+            (seq,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
+                                  (run_id,)).fetchone()
+            reservation = spending.reserve(conn, run_id=run_id, step_seq=seq, project_id=project_id,
                                            paying_conversation_id=paying_conversation_id, estimate_usd=estimate,
                                            project_budget_usd=project_budget,
                                            conversation_budget_usd=own if own is not None else default_budget)
-            _event(conn, run_id, "step_started", {"step": step, "phase": phase, "estimate_usd": estimate,
-                                                   "reservation_id": reservation})
-            return _Call(run_id, step, reservation)
+            _event(conn, run_id, "step_started", {"step": seq, "phase": phase, "estimate_usd": estimate,
+                                                   "reservation_id": reservation, **step})
+            return _Call(run_id, seq, reservation)
 
         async with self.settings_lock:
             project_budget, default_budget = await self._budgets(project_id)
@@ -823,21 +859,51 @@ class Harness:
             raise asyncio.CancelledError()
         return call
 
+    async def _general(self):
+        return await self._read(lambda conn: conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
+
     async def catalog(self, provider, key, *, force=False, generation=None):
         """The provider's models (openrouter_client.models), read through the gate under the
         General project, which stays Normal: a catalog request holds no project's content."""
-        general = await self._read(lambda conn: conn.execute(
-            "SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
-        async with self.gate.async_client(general) as client:
+        async with self.gate.async_client(await self._general()) as client:
             return await openrouter_client.models(client, provider, key, force=force, generation=generation)
 
-    async def _call(self, active, call, route, key, messages, *, effort=None, max_tokens=None, output=None,
-                    zero_retention=False):
-        """Dispatch one admitted call through the gate, with the dispatch check, and record it,
-        settling its reservation. zero_retention sends it with provider.zdr = true (a Private
-        project's OpenRouter call). Each attempt is recorded with the retention terms the gate
-        applied when it let it out. output(result), if given, is recorded on the finished step,
-        so a run can later finish from the record."""
+    async def _route_facts(self, route, key, table, *, zero_retention, effort):
+        """(None, facts) for a request on route, or (a problem code, None). facts: the window W every
+        endpoint the request can reach accepts (with the window settings), the highest rates among
+        them, the effort it is sent with, their tags, and the catalog row its payload is built from
+        (the M2 charter's model-route rules 1, 3 and 6; backend/reach.py). OpenRouter's endpoint
+        listing for the model is read, like the catalog, through the gate under the General project."""
+        row = get_model_metadata(route, key) if zero_retention else get_model_metadata(route)
+        listing = openrouter_client.cached_endpoints(route.provider, route.model)
+        if route.provider.is_openrouter and listing is None:
+            async with self.gate.async_client(await self._general()) as client:
+                listing = await openrouter_client.endpoints(client, route.provider, route.model)
+        reasoning, pin = openrouter.resolve_model_reasoning(route, effort, model_entry=row, zdr_enabled=zero_retention)
+        found = reach.reach(route.provider, row, listing, zero_retention=zero_retention, pin=pin,
+                            needs=("reasoning",) if reasoning else ())
+        if reasoning and found.problem == "route_unsupported":
+            # Its reasoning record does not name exactly the endpoints it would reach (rule 1): sent without.
+            effort = None
+            found = reach.reach(route.provider, row, listing, zero_retention=zero_retention)
+        if found.problem:
+            return found.problem, None
+        window = providers.window(table, route.model, found.window)
+        if window["status"] != "ok":
+            return "model_window", None
+        return None, {"window": window["in_use"], "rates": found.rates, "effort": effort,
+                      "endpoints": list(found.tags), "row": row}
+
+    async def _call(self, active, call, route, key, request, facts, *, output=None, zero_retention=False):
+        """The dispatch path: every model call goes through here, and nowhere else calls the provider
+        adapter (tests/test_dispatch_path.py). It sends the request the context assembler built, for
+        an admitted call (its reservation), through the gate with the dispatch check, and records it,
+        settling its reservation. facts are what _route_facts found for the route. zero_retention
+        sends it with provider.zdr = true (a Private project's OpenRouter call). Each attempt is
+        recorded with the retention terms the gate applied when it let it out. output(result), if
+        given, is recorded on the finished step, so a run can later finish from the record."""
+        if not isinstance(request, context.Request):
+            raise TypeError("a model request is built by the context assembler")
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         project_id = await self._read(lambda conn: conn.execute(
@@ -852,11 +918,11 @@ class Harness:
         async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id),
                                           provider=route.provider.name) as client:
             result = await openrouter.query_model(
-                client, route, key, messages, timeout=MODEL_CALL_SECONDS, effort=effort, max_tokens=max_tokens,
-                zdr_enabled=zero_retention, on_dispatch=dispatched,
-                # A Private call is limited to the endpoints the catalog read with its key lists,
-                # as the gate checks it.
-                model_entry=get_model_metadata(route, key) if zero_retention else get_model_metadata(route))
+                client, route, key, request.messages, timeout=MODEL_CALL_SECONDS, effort=facts["effort"],
+                max_tokens=request.max_tokens, zdr_enabled=zero_retention, on_dispatch=dispatched,
+                # The catalog row the route's facts were read from, so the request is the one they
+                # describe; a Private call is limited to the endpoints it lists, as the gate checks.
+                model_entry=facts["row"])
             finished = {"step": call.step, "outcome": result.error_kind or "ok"}
             if output is not None and result.ok:
                 finished["output"] = output(result)
@@ -870,7 +936,7 @@ class Harness:
                                {"step": call.step, "route": route.key, **attempt.record()})
                     _event(conn, active.run_id, "step_finished", finished)
                 if result.dispatched:
-                    _settle_attempts(conn, call.reservation_id, route, result.attempts)
+                    _settle_attempts(conn, call.reservation_id, facts["rates"], result.attempts)
                 else:
                     spending.release(conn, call.reservation_id)
 
@@ -988,11 +1054,8 @@ class Harness:
             active.provider = inputs.get("provider")
             route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),
                                             inputs.get("model"))
-            if route is not None:  # a model its provider no longer offers is not called: no title
-                personal = await asyncio.to_thread(load_settings, self.data_dir)
-                table = (personal.values.get("providers") or {}).get(route.provider.name) or {}
-                if _unusable(table, route.provider, route.model):
-                    route = None
+            personal = await asyncio.to_thread(load_settings, self.data_dir)
+            table = ((personal.values.get("providers") or {}).get(route.provider.name) or {}) if route else {}
         key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
                                                 self.keyring_backend)
         if route is None or key is None:
@@ -1004,8 +1067,21 @@ class Harness:
         if policy is None:
             return None
         zero_retention = policy.zero_retention and route.provider.is_openrouter
-        if zero_retention and catalog_status(route.provider, key)["stale"]:  # unread, expired or failed
+        if (zero_retention and catalog_status(route.provider, key)["stale"]) or not catalog_read(route):
             await self.catalog(route.provider, key)
+        if _unusable(table, route.provider, route.model):  # a model its provider no longer offers: no title
+            return None
+        problem, facts = await self._route_facts(route, key, table, zero_retention=zero_retention, effort=None)
+        if problem:
+            return None
+        budgets = personal.values["context"]
+        try:  # the title step's output limit is the least a step has
+            request = context.assemble("title", window=facts["window"], output=context.MIN_OUTPUT, budgets=budgets,
+                                       margin_percent=budgets["margin_percent"], system_rules=TITLE_RULES,
+                                       request=inputs["message"])
+        except context.OverWindow:
+            return None
+        estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
 
         def start(conn):
             if not _running(conn, active.run_id) or _revoked(conn, active.run_id):
@@ -1013,12 +1089,12 @@ class Harness:
             conn.execute("UPDATE runs SET attempts = attempts + 1 WHERE id = ?", (active.run_id,))  # before the call
             (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
                                    (active.run_id,)).fetchone()
-            estimate = budget_router.estimate_title_cost(route)
             reservation = spending.reserve(conn, run_id=active.run_id, step_seq=step, project_id=project_id,
                                            paying_conversation_id=None, estimate_usd=estimate,
                                            project_budget_usd=budget, conversation_budget_usd=None)
             _event(conn, active.run_id, "step_started", {"step": step, "phase": "title", "estimate_usd": estimate,
-                                                          "reservation_id": reservation})
+                                                          "reservation_id": reservation,
+                                                          **_step(route, facts, request)})
             return _Call(active.run_id, step, reservation)
 
         async with self.settings_lock:  # the project's budget as it is now
@@ -1030,8 +1106,7 @@ class Harness:
         active.call = call
         if cancelled:
             raise asyncio.CancelledError()
-        messages = [{"role": "system", "content": TITLE_RULES}, {"role": "user", "content": inputs["message"]}]
-        result = await self._call(active, call, route, key, messages, max_tokens=60, zero_retention=zero_retention,
+        result = await self._call(active, call, route, key, request, facts, zero_retention=zero_retention,
                                   output=lambda result: _clean_title(result.content))
         return _clean_title(result.content) if result.ok else None
 
@@ -1220,9 +1295,18 @@ async def _through(awaitable):
             cancelled = True
 
 
-def _settle_attempts(conn, reservation_id, route, attempts):
+def _step(route, facts, request):
+    """What a step_started event records of a step's route and request: the route and effort, which a
+    turn keeps from its admission to its end; the window, the endpoints it can reach, the request's
+    counted size and output limit, and what the assembler left out."""
+    return {"route": route.key, "effort": facts["effort"], "window": request.window, "endpoints": facts["endpoints"],
+            "input_tokens": request.input_tokens, "max_tokens": request.max_tokens,
+            **({"cuts": request.cuts} if request.cuts else {})}
+
+
+def _settle_attempts(conn, reservation_id, rates, attempts):
     """Settle a recorded call from all of its dispatched attempts: their reported costs, or
-    priced reported tokens where an attempt reported no cost (then marked estimated). An
+    reported tokens at the step's rates where an attempt reported no cost (then marked estimated). An
     attempt that went out and reported no usage keeps the estimate: the call settles at the
     reservation's estimate, or at what the others cost when that is more, marked estimated."""
     total, basis = 0.0, "reported"
@@ -1231,7 +1315,7 @@ def _settle_attempts(conn, reservation_id, route, attempts):
             continue
         cost = attempt.reported_cost
         if cost is None:
-            cost = budget_router.cost_from_usage(route, attempt.usage)
+            cost = budget_router.cost_from_usage(rates, attempt.usage)
             if cost is None:
                 basis = "unknown"
                 continue

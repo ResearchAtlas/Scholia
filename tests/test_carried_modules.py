@@ -58,8 +58,32 @@ from backend.desktop import data_folder
 sent_keys = []
 
 
+class _Streamed(httpx.AsyncByteStream):  # an answer as a server's arrives, read by the caller
+    def __init__(self, data):
+        self.data = data
+
+    async def __aiter__(self):
+        yield self.data
+
+
+def listing(request):  # the model catalog and endpoint listing a turn's admission reads; None for a chat
+    path = request.url.path
+    if path.endswith("/models"):
+        body = {"data": [{"id": "google/gemini-3.1-pro-preview", "context_length": 128000}]}
+    elif path.endswith("/endpoints/zdr"):
+        body = {"data": []}
+    elif path.endswith("/endpoints"):
+        body = {"data": {"endpoints": [{"tag": "example", "context_length": 128000}]}}
+    else:
+        return None
+    return httpx.Response(200, stream=_Streamed(json.dumps(body).encode()))
+
+
 async def provider(request):
-    sent_keys.append(request.headers.get("authorization"))
+    if request.headers.get("authorization") is not None:  # the endpoint listing is read without a key
+        sent_keys.append(request.headers.get("authorization"))
+    if (found := listing(request)) is not None:
+        return found
     return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}], "usage": {"cost": 0.001}})
 
 
@@ -123,5 +147,6 @@ def test_carried_modules_read_no_legacy_configuration_and_import_without_side_ef
     assert result["touched"] == []
     assert result["before"] == result["after_import"]  # importing created no file
     assert result["succeeded"]
-    assert result["sent_keys"] == ["Bearer sk-or-keyring-key"]  # the keyring's, never the environment's or a .env file's
+    # The keyring's (for the catalog and the call), never the environment's or a .env file's.
+    assert set(result["sent_keys"]) == {"Bearer sk-or-keyring-key"} and len(result["sent_keys"]) >= 2
     assert result["data_folder"] == str(home / "Library" / "Application Support" / "Scholia")

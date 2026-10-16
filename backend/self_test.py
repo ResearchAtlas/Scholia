@@ -300,8 +300,23 @@ def check_backend() -> dict:
 
     calls = []
 
+    class Streamed(httpx.AsyncByteStream):  # a body as a server's arrives: the catalog's reader decodes it
+        def __init__(self, data):
+            self.data = data
+
+        async def __aiter__(self):
+            yield self.data
+
+    listings = {  # what a turn's admission reads first: the catalog and the model's endpoints
+        "/models": {"data": [{"id": "google/gemini-3.1-pro-preview", "context_length": 131072}]},
+        "/endpoints/zdr": {"data": []},
+        "/endpoints": {"data": {"endpoints": [{"tag": "self-test", "context_length": 131072}]}},
+    }
+
     async def provider(request):
         calls.append(request.url.path)
+        if listed := next((body for end, body in listings.items() if request.url.path.endswith(end)), None):
+            return httpx.Response(200, stream=Streamed(json.dumps(listed).encode()))
         return httpx.Response(200, json={"choices": [{"message": {"content": "Self-test answer."}}],
                                          "usage": {"cost": 0}})
 
@@ -333,7 +348,8 @@ def check_backend() -> dict:
 
     with tempfile.TemporaryDirectory() as folder:
         asyncio.run(drive(Path(folder) / "data"))
-    if calls != ["/api/v1/chat/completions"]:
+    if calls != ["/api/v1/models", "/api/v1/endpoints/zdr", "/api/v1/models/google/gemini-3.1-pro-preview/endpoints",
+                 "/api/v1/chat/completions"]:
         raise RuntimeError(f"unexpected provider calls {calls}")
     return {"turn": "succeeded"}
 

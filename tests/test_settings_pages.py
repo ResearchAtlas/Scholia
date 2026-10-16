@@ -74,7 +74,7 @@ async def test_the_models_a_provider_offers():
     assert not providers.offered({"models": ["llama3"]}, LOCAL, "qwen", budget_router.RECOMMENDED)
     for table in ({}, {"models": "all"}, {"models": ["auto"]}):  # the id means Auto, never a model
         assert not providers.offered(table, LOCAL, "auto", budget_router.RECOMMENDED)
-    plan = budget_router.create_run_plan("hi", "auto", lambda m: None, is_openrouter=False, picked=["auto"],
+    plan = budget_router.create_run_plan("hi", "auto", is_openrouter=False, picked=["auto"],
                                          offered=lambda m: providers.offered({"models": ["auto"]}, LOCAL, m,
                                                                              budget_router.RECOMMENDED))
     assert plan.model is None  # Auto never resolves to a picked model named auto
@@ -123,7 +123,8 @@ async def test_the_model_listing_says_window_offer_and_effort(tmp_path):
 
 
 async def test_recent_models_are_the_last_three_chosen(tmp_path):
-    async with started(tmp_path / "data") as client:
+    async with started(tmp_path / "data", MockProvider(catalog=[*RECOMMENDED, "a/one", "b/two", "c/three",
+                                                                "d/four"])) as client:
         assert (await save(client, {"providers.openrouter.models": "all"})).status_code == 200
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
         for model in ("a/one", "b/two", "a/one", "c/three", None, "d/four"):
@@ -184,7 +185,7 @@ async def test_invalid_settings_are_reported_by_key_and_line(tmp_path):
 
 
 async def test_recent_models_survive_many_repeats_of_one(tmp_path):
-    async with started(tmp_path / "data") as client:
+    async with started(tmp_path / "data", MockProvider(catalog=["b/two", "c/three"])) as client:
         assert (await save(client, {"providers.openrouter.models": "all"})).status_code == 200
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
         for model in ("c/three", "b/two"):
@@ -231,7 +232,7 @@ async def test_an_instruction_file_not_in_utf8_is_flagged_before_it_is_rewritten
 
 
 async def test_admission_keeps_to_the_models_a_provider_offers(tmp_path):
-    provider = MockProvider()
+    provider = MockProvider(catalog=[*RECOMMENDED, "x/picked"])
     async with started(tmp_path / "data", provider) as client:
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
         refused = await client.post(f"/api/conversations/{conversation}/message/stream",
@@ -281,7 +282,7 @@ async def test_a_catalog_read_empty_lists_no_model(tmp_path):
 
 async def test_a_title_run_does_not_call_a_model_no_longer_offered(tmp_path):
     data = tmp_path / "data"
-    first = MockProvider()
+    first = MockProvider(catalog=["x/picked"])
     held = asyncio.Event()
 
     async def hold(body):  # the title call never finishes: shutdown interrupts it
@@ -297,14 +298,14 @@ async def test_a_title_run_does_not_call_a_model_no_longer_offered(tmp_path):
             await asyncio.sleep(0.01)
     config = data / "config.toml"  # while closed (a running call keeps its provider's settings fixed)
     config.write_text(config.read_text().replace('models = "all"', 'models = ["y/other"]'))
-    second = MockProvider()
+    second = MockProvider(catalog=["x/picked"])  # still listed: only the provider's offer changed
     async with started(data, second, keyring=keyring, setup=False) as client:
         await background_idle(client)  # recovery restarts the interrupted title run
         assert second.titles == []  # ... which does not call a model its provider no longer offers
 
 
 async def test_auto_records_the_tier_of_the_model_it_picked():
-    plan = budget_router.create_run_plan("hello", "auto", lambda m: providers.Route(OPENROUTER, m),
+    plan = budget_router.create_run_plan("hello", "auto",
                                          offered=lambda m: m == budget_router.MODEL_TIERS["budget"][0])
     assert (plan.model, plan.model_tier, plan.policy_reason) == (
         budget_router.MODEL_TIERS["budget"][0], "budget", "auto_offered")

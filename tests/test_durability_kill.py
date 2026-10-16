@@ -51,7 +51,30 @@ class Keyring:
         pass
 
 
+class _Streamed(httpx.AsyncByteStream):  # an answer as a server's arrives, read by the caller
+    def __init__(self, data):
+        self.data = data
+
+    async def __aiter__(self):
+        yield self.data
+
+
+def listing(request):  # the model catalog and endpoint listing a turn's admission reads; None for a chat
+    path = request.url.path
+    if path.endswith("/models"):
+        body = {"data": [{"id": "google/gemini-3.1-pro-preview", "context_length": 128000}]}
+    elif path.endswith("/endpoints/zdr"):
+        body = {"data": []}
+    elif path.endswith("/endpoints"):
+        body = {"data": {"endpoints": [{"tag": "example", "context_length": 128000}]}}
+    else:
+        return None
+    return httpx.Response(200, stream=_Streamed(json.dumps(body).encode()))
+
+
 async def answer(request):
+    if (found := listing(request)) is not None:
+        return found
     body = json.loads(request.content)
     title = body["messages"][0]["content"].startswith("Write a title")
     if (scenario == "turn_model" and not title) or (scenario in ("title_model", "restart_title_model") and title):
