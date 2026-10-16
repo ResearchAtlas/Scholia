@@ -426,8 +426,9 @@ def _bibtex(text, beat):
             fields.setdefault(field.key.lower(), field)
         kind = entry.entry_type.lower()
         try:
-            if not all(_FIELD_KEY.fullmatch(field.key) and (not isinstance(field.value, str) or _agrees(field.value.strip()))
-                       for field in entry.fields):
+            if "\\" in (entry.key or "") or not all(  # a backslash in the cite key hides a comma or an = from the split
+                    _FIELD_KEY.fullmatch(field.key) and (not isinstance(field.value, str) or _agrees(field.value.strip()))
+                    for field in entry.fields):
                 raise _Refused  # where our reading and the parser's split differ, fields may be missing
             archive = (value(fields, "archiveprefix", "eprinttype") or "").strip().lower()
             number = value(fields, "number")

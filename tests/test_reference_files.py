@@ -704,6 +704,12 @@ def test_a_record_whose_split_our_reading_does_not_account_for_is_refused(fields
     assert records == [] and skipped == {"unreadable": 1}
 
 
+@pytest.mark.parametrize("text", [r"@misc{k\, title\= foo, year={2020}}", r"@misc{k\, title, year={2020}}"])
+def test_a_cite_key_that_swallows_a_field_refuses_its_record(text):  # the internal recheck of PR 35's batch 1
+    records, skipped = parse(text)[:2]
+    assert records == [] and skipped == {"unreadable": 1}
+
+
 @pytest.mark.parametrize("fields", ["note={a, b = c}", "journal = Nature Reviews", "bdsk-url-1={x}", "date-added={2020}"])
 def test_commas_and_equals_inside_a_value_and_ordinary_field_names_are_read(fields):
     [record], skipped = parse(f"@misc{{k, title={{T}}, {fields}, year={{2020}}}}\n")[:2]
