@@ -35,7 +35,9 @@ export function Ask({ ask, onAnswered }) {
   const asked = t(questionKey, { count: ask.params?.identifiers ?? 0, services });
   const question = asked === questionKey ? ask.params?.question ?? '' : asked;
   // A Local only lookup of a reference file's papers says so (S1-14): its answer covers those papers.
-  const body = named(t, `ask.${ask.kind}.body${ask.params?.batch === 'reference_file' ? 'ReferenceFile' : ''}`, '');
+  // S1-15: so does a Zotero import's, and a Zotero item's merge question says the record is Zotero's.
+  const zotero = ask.params?.batch === 'zotero' || ask.params?.from === 'zotero';
+  const body = named(t, `ask.${ask.kind}.body${ask.params?.batch === 'reference_file' ? 'ReferenceFile' : ''}${zotero ? 'Zotero' : ''}`, '');
 
   async function answer(reply) {
     const done = await run(() => post(`/api/runs/${encodeURIComponent(ask.run_id)}/asks/${encodeURIComponent(ask.ask_id)}`, reply));
@@ -93,7 +95,7 @@ function MergeComparison({ ask }) {
   if (!paper || !record) return null;
   return (
     <div className="grid grid-cols-1 gap-2">
-      {[['ask.merge.paper', paper], ['ask.merge.record', record]].map(([label, item]) => (
+      {[['ask.merge.paper', paper], [ask.params?.from === 'zotero' ? 'ask.merge.recordZotero' : 'ask.merge.record', record]].map(([label, item]) => (
         <div key={label} className="grid min-w-0 gap-0.5 rounded-lg border bg-background/70 px-3 py-2">
           <p className="text-xs font-medium text-muted-foreground">{t(label)}</p>
           <p className="line-clamp-2 break-words font-medium" title={item.title}>{item.title}</p>

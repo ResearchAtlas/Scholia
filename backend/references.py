@@ -44,7 +44,7 @@ from pydantic import BaseModel, Field
 from backend import asks, extraction, reading, reference_files
 from backend.db import new_id, utc_now
 from backend.local_guard import MAX_BODY
-from backend.materials import _FORM_FIELDS, _no_store, _refused, _to_end
+from backend.materials import _FORM_FIELDS, _no_store, _refused, _to_end, add_version
 from backend.runs import RunOutcome, _running, _revoked
 from backend.settings import visible
 
@@ -183,12 +183,11 @@ async def import_references(project_id: str, body: ReferenceFile, request: Reque
 def new_material(conn, project_id, csl, source="reference_file"):
     """A metadata-only paper of the project from a record's CSL JSON, in the caller's transaction:
     the material and its first version, with no file. Returns (material id, version id)."""
-    material, version = new_id(), new_id()
+    material = new_id()
     conn.execute("INSERT INTO materials (id, project_id, title, csl, source, evidence_type, proposed_by)"
                  " VALUES (?, ?, ?, ?, ?, ?, 'researcher')",
                  (material, project_id, csl["title"], json.dumps(csl), source, _evidence(csl)))
-    conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current) VALUES (?, ?, 0, NULL, 1)",
-                 (version, material))
+    version, _ = add_version(conn, None, project_id, material, None, None, None, None)  # with no file
     return material, version
 
 
@@ -302,7 +301,8 @@ async def _merge_run(harness, active, project_id, inputs):
         asked, answer = asks.asked(conn, run_id)
         if asked is not None and answer is None:  # asked under a policy the project no longer has
             asks.withdraw(conn, run_id, asked["ask_id"], "policy_changed")
-        asks.raise_ask(conn, run_id, "merge", list(OPTIONS), {"matched": inputs.get("matched")})
+        asks.raise_ask(conn, run_id, "merge", list(OPTIONS), {"matched": inputs.get("matched"), **(  # S1-15: worded so
+            {"from": "zotero"} if (inputs.get("held") or {}).get("zotero") else {})})
         return None
 
     while True:
@@ -315,14 +315,19 @@ async def _merge_run(harness, active, project_id, inputs):
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(active.answered.wait(), POLICY_SECONDS)
     [material] = inputs["material_ids"]
-    return {"option": option}, lambda conn: _answered(conn, project_id, material, record, option)
+    # S1-15: a Zotero item's Keep both imports it from Zotero as its own paper, its PDF with it.
+    zotero = (inputs.get("held") or {}).get("zotero")
+    keep = zotero and (lambda conn: harness.record_in(conn, active, project_id, "zotero_import", {
+        **zotero, "material_ids": [], "done": [], "keep_both": True, "origin": None}))
+    return {"option": option}, lambda conn: _answered(conn, project_id, material, record, option, keep)
 
 
-def _answered(conn, project_id, material, record, option):
+def _answered(conn, project_id, material, record, option, keep=None):
     """The answer's effect, in the run's terminal transaction (which drops it when the run was
-    revoked or cancelled before it): Merge fills the paper from the record, Keep both makes it a paper."""
+    revoked or cancelled before it): Merge fills the paper from the record, Keep both makes it a paper
+    (keep(conn), for a Zotero item: S1-15)."""
     if option == "keep_both":
-        new_material(conn, project_id, record)
+        (keep or (lambda conn: new_material(conn, project_id, record)))(conn)
         return
     row = conn.execute("SELECT csl, checked_by, evidence_type, title FROM materials WHERE id = ? AND project_id = ?",
                        (material, project_id)).fetchone()
