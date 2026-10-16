@@ -201,6 +201,7 @@
   "dataFolder.synced": "The data folder is inside a folder that syncs to the cloud or sits on a network drive, where its database could be damaged.",
   "dataFolder.unsafe": "Another account on this Mac could change what the data folder holds, so Scholia will not open it.",
   "dataFolder.where": "Data folder",
+  "errors.no_longer_duplicate": "The paper changed while the question waited and no longer matches the record, so nothing was merged.",
   "errors.internal": "Something went wrong. Try again.",
   "errors.unreachable": "Scholia's engine is not responding. Close Scholia and open it again.",
   "errors.part_not_loaded": "This part of Scholia could not be loaded. Try again reloads the window.",
@@ -432,6 +433,10 @@
   "references.unsupportedMacro": {
     "one": "{count} BibTeX value was left out: Scholia does not expand @string abbreviations or values joined with #.",
     "other": "{count} BibTeX values were left out: Scholia does not expand @string abbreviations or values joined with #."
+  },
+  "references.pastBound": {
+    "one": "{count} field was left out: its record runs past the first {lines} lines, which is all Scholia reads of one record.",
+    "other": "{count} fields were left out: their records run past the first {lines} lines, which is all Scholia reads of one record."
   },
   "references.leftOut": {
     "one": "{count} value was left out: it was not a valid year, DOI, URL or arXiv ID.",
