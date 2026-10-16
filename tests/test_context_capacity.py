@@ -80,10 +80,11 @@ def test_the_worked_example():
     assert request.max_tokens == 4096 and math.ceil(16384 * 5 / 100) == 820
     assert 16384 - 4096 - 820 == 11468
     room = 11468 - (2 * context.MESSAGE_FRAMING + context.REPLY_FRAMING)
-    filler = build(16384, request="x " * (room - context.count(RULES)))  # the protected sections fill it exactly
+    fill = " ".join(["x"] * (room - context.count(RULES)))  # the protected sections fill it exactly
+    filler = build(16384, request=fill)
     assert filler.input_tokens + filler.max_tokens + 820 <= 16384
     with pytest.raises(context.OverWindow) as over:
-        build(16384, request="x " * (room - context.count(RULES)) + "x")
+        build(16384, request=fill + " x")
     assert over.value.code == "message_over_window"
 
 
@@ -134,6 +135,19 @@ def test_a_pipeline_needing_evidence_refuses_when_too_little_room_is_left_unless
 ])
 def test_counting_is_conservative_for_latin_and_han_text(text, at_least):
     assert context.count(text) >= at_least
+
+
+def test_dense_letters_and_spaced_digits_count_as_a_tokenizer_splits_them():
+    # Found by the internal review against cl100k and o200k: 2,000 letters of a DNA sequence, a
+    # protein or random mixed-case text take 940 to 1,310 tokens; 1,000 spaced single digits 1,999.
+    import random
+    rng = random.Random(7)
+    for alphabet in ("ACGT", "acgt", "ACDEFGHIKLMNPQRSTVWY", "abcdefghijklmnopqrstuvwxyz",
+                     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"):
+        assert context.count("".join(rng.choice(alphabet) for _ in range(2000))) >= 1310, alphabet
+    assert context.count(" ".join(str(rng.randrange(10)) for _ in range(1000))) >= 1999
+    assert context.count("half \ud800 pair") >= 7  # a lone surrogate counts, rather than failing
+    assert context.count("The cohort was followed for ten years.") < 38  # prose stays near its size
 
 
 RECORDED = Path(__file__).parent / "fixtures" / "recorded_usage.json"

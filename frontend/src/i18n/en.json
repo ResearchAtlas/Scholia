@@ -794,6 +794,8 @@
   "errors.instructions_over_window": "The project's instructions (AGENTS.md) are too long for the model's context window. Shorten them, or pick a model with a larger window.",
   "errors.model_refusal": "The model declined to answer this request.",
   "errors.policy_block": "The provider's content policy stopped this answer.",
+  "errors.output_limit": "The model reached its output limit before writing any answer.",
+  "errors.evidence_over_window": "The evidence this question needs does not fit the model's context window. Pick a model with a larger window.",
   "settings.instructionsUnreadable": "This file could not be read, so it cannot be edited here. Check its permissions in the data folder.",
   "level.normal": "Normal",
   "level.private": "Private",

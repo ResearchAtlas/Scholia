@@ -120,3 +120,15 @@ def test_what_a_request_can_reach():
     assert reach.reach(OPENROUTER, {}, [{**listing[0], "pricing": {"prompt": "0", "completion": "0",
                                                                    "new_fee": "1"}}]).problem == "route_unpriced"
     assert reach.reach(GENERIC, {"context_length": 8192}, None) == reach.Reach((), 8192, budget_router.UNKNOWN_RATES)
+    # A rate that is no price (-1 for a variable-priced router, or not finite) refuses: never $0.
+    for bad in ("-1", "nan", "inf"):
+        priced = [{**listing[0], "pricing": {"prompt": bad, "completion": "0.000001"}}]
+        assert reach.reach(OPENROUTER, {}, priced).problem == "route_unpriced", bad
+    # An endpoint that reports no window leaves the smallest reported one as the report, which a
+    # setting may lower but never raise; the smallest completion limit listed caps the output.
+    unreported = [{**listing[0], "context_length": None}, {**listing[1], "max_completion_tokens": 4096},
+                  {**listing[2], "max_completion_tokens": 16384}]
+    found = reach.reach(OPENROUTER, {}, unreported)
+    assert (found.window, found.output) == (32768, 4096)
+    from backend import providers
+    assert providers.window({"default_window": 131072}, "m", found.window)["in_use"] == 32768

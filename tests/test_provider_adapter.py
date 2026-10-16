@@ -224,6 +224,7 @@ async def test_no_request_forces_a_tool_choice():
 @pytest.mark.parametrize("message, finish, kind", [
     ({"content": None, "refusal": "I cannot help with that."}, "stop", "model_refusal"),
     ({"content": "Partial answer"}, "content_filter", "policy_block"),
+    ({"content": "", "reasoning": "Long thoughts"}, "length", "output_limit"),  # the limit spent before any text
 ])
 async def test_a_refusal_or_a_policy_block_is_its_own_outcome_with_its_cost_and_no_retry(message, finish, kind):
     client, sent = client_for(httpx.Response(200, json={"choices": [{"message": message, "finish_reason": finish}],

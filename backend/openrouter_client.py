@@ -300,12 +300,18 @@ def _endpoint(row):
     tag = row.get("tag") if isinstance(row, dict) else None
     if not isinstance(tag, str) or not tag or tag != tag.strip() or len(tag) > 512 or any(ord(c) < 32 for c in tag):
         return None
-    context = row.get("context_length")
+    context, cap = row.get("context_length"), row.get("max_completion_tokens")
     parameters = row.get("supported_parameters")
     return {"tag": tag, "context_length": context if type(context) is int and context > 0 else None,
+            "max_completion_tokens": cap if type(cap) is int and cap > 0 else None,
             "supported_parameters": parameters if isinstance(parameters, list)
             and all(isinstance(p, str) for p in parameters) else None,
             "pricing": row.get("pricing") if isinstance(row.get("pricing"), dict) else {}}
+
+
+def forget_endpoints(provider, model):
+    """Drop a model's cached endpoint listing, so the next request reads it again."""
+    _listings.pop((provider.name, provider.base_url, model), None)
 
 
 def cached_endpoints(provider, model):

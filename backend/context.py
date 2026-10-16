@@ -23,7 +23,8 @@ MIN_OUTPUT = 1024  # the smallest output limit a step has
 MESSAGE_FRAMING = 8  # tokens a message's role and template take, counted generously
 REPLY_FRAMING = 8  # the template tokens that open the reply
 EVIDENCE_FLOOR = 2000  # a pipeline needing evidence refuses under this unless its evidence fits whole (F15)
-LETTERS_PER_TOKEN = 3  # ponytail: a fixed ratio for runs of ASCII letters; calibrate on recorded counts
+LETTERS_PER_TOKEN = 3  # ponytail: fixed ratios for runs of ASCII letters; calibrate on recorded counts
+WORD_LETTERS = 12  # a run longer than a word counts each letter after these
 
 # The sections after the system rules, in the order the request holds them, with their labels.
 LABELS = {
@@ -58,23 +59,33 @@ class Request:
 def count(text: str) -> int:
     """Tokens in text, never fewer than a provider counts (section 8, Counting). Each non-ASCII
     character counts as its UTF-8 bytes (Han three), the most a byte-level or byte-fallback
-    tokenizer gives it; each ASCII digit, punctuation mark or whitespace character one, but a
-    single space, which joins the word after it; and runs of ASCII letters one token for every
-    LETTERS_PER_TOKEN letters, rounded up."""
+    tokenizer gives it (a lone surrogate three); each ASCII digit, punctuation mark or whitespace
+    character one, but a single space before a letter, which joins the word after it. A run of ASCII
+    letters shaped like a word (lower case, or capitalized) counts one token for every
+    LETTERS_PER_TOKEN of its first WORD_LETTERS letters and one for each letter after them; any
+    other run (mixed or upper case, as in identifiers, sequences or encoded text) one per letter."""
     tokens = run = 0
-    previous = ""
-    for char in text:
+    start = 0
+    for index, char in enumerate(text):
         if char.isascii() and char.isalpha():
+            if not run:
+                start = index
             run += 1
-        else:
-            tokens += -(-run // LETTERS_PER_TOKEN)
+            continue
+        if run:
+            tokens += _letters(text[start:start + run])
             run = 0
-            if not char.isascii():
-                tokens += len(char.encode())
-            elif char != " " or previous == " ":
-                tokens += 1
-        previous = char
-    return tokens + -(-run // LETTERS_PER_TOKEN)
+        if not char.isascii():
+            tokens += len(char.encode("utf-8", "surrogatepass"))
+        elif char != " " or text[index - 1:index] == " " or not text[index + 1:index + 2].isalpha():
+            tokens += 1
+    return tokens + (_letters(text[start:start + run]) if run else 0)
+
+
+def _letters(run):
+    if run.islower() or (run[0].isupper() and run[1:].islower()):
+        return -(-min(len(run), WORD_LETTERS) // LETTERS_PER_TOKEN) + max(0, len(run) - WORD_LETTERS)
+    return len(run)
 
 
 def output_limit(window: int, setting: int) -> int:
@@ -142,9 +153,12 @@ def assemble(function, *, window, output, budgets, system_rules, request, sectio
         fill(name)
     turns, history_room, left = [], min(budgets["history"], room), 0
     for message, answer in history:
+        if left:  # older turns are left out whole (compaction comes with S1-21)
+            left += 1
+            continue
         cost = count(message) + count(answer) + 2 * MESSAGE_FRAMING
-        if left or cost > history_room:
-            left += 1  # older turns are left out whole (compaction comes with S1-21)
+        if cost > history_room:
+            left = 1
             continue
         turns.append((message, answer))
         history_room -= cost

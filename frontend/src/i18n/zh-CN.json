@@ -774,6 +774,8 @@
   "errors.instructions_over_window": "项目说明（AGENTS.md）超出了该模型的上下文窗口。请缩短说明，或选择窗口更大的模型。",
   "errors.model_refusal": "模型拒绝回答这个请求。",
   "errors.policy_block": "服务商的内容政策中止了这个回答。",
+  "errors.output_limit": "模型在写出任何回答之前就达到了输出上限。",
+  "errors.evidence_over_window": "这个问题所需的证据超出了该模型的上下文窗口。请选择窗口更大的模型。",
   "settings.instructionsUnreadable": "无法读取此文件，因此不能在此编辑。请检查数据文件夹中该文件的权限。",
   "level.normal": "普通",
   "level.private": "私密",

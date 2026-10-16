@@ -10,6 +10,7 @@ estimate takes the highest rate among them, from OpenRouter's per-endpoint listi
 OpenAI-compatible server) is its one endpoint: its model row says what it has.
 """
 
+import math
 from dataclasses import dataclass
 
 from backend import endpoint_pricing
@@ -22,6 +23,7 @@ class Reach:
     window: int | None  # the smallest window among them; None when one does not report its window
     rates: dict  # USD per token, the highest among them ("input", "output", "request")
     problem: str | None = None  # why nothing can be reached: route_unverified, route_unpriced, route_unsupported
+    output: int | None = None  # the smallest completion limit any of them lists, if one does
 
 
 def _related(tag, pin):
@@ -53,7 +55,10 @@ def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -
         found = [e for e in found if set(needs) <= set(e["supported_parameters"] or ())]
     if not found:
         return Reach((), None, UNKNOWN_RATES, "route_unsupported")
-    windows = [e["context_length"] for e in found]
+    # The smallest window any of them reports; one that reports none leaves it to a setting, which
+    # can lower this but never raise it (providers.window).
+    windows = [e["context_length"] for e in found if e["context_length"] is not None]
+    caps = [e["max_completion_tokens"] for e in found if e.get("max_completion_tokens") is not None]
     rates = {"input": 0.0, "output": 0.0, "request": 0.0}
     for endpoint in found:
         try:
@@ -63,9 +68,14 @@ def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -
                      "max_output_per_token": UNKNOWN_RATES["output"], "per_request_usd": 0.0}
         except (TypeError, ValueError):  # an unreadable rate is no evidence that it is low
             return Reach((), None, UNKNOWN_RATES, "route_unpriced")
-        if price["unaccounted_nonzero_price_keys"]:
-            return Reach((), None, UNKNOWN_RATES, "route_unpriced")  # a charge nothing here can bound
+        if price["unaccounted_nonzero_price_keys"] or not all(
+                math.isfinite(price[k]) and price[k] >= 0
+                for k in ("max_input_per_token", "max_output_per_token", "per_request_usd")):
+            # A charge nothing here can bound, or a rate that is no price (OpenRouter's -1 for a
+            # variable-priced router, a non-finite value): never an estimate of $0.
+            return Reach((), None, UNKNOWN_RATES, "route_unpriced")
         rates = {"input": max(rates["input"], price["max_input_per_token"]),
                  "output": max(rates["output"], price["max_output_per_token"]),
                  "request": max(rates["request"], price["per_request_usd"])}
-    return Reach(tuple(e["tag"] for e in found), None if None in windows else min(windows), rates)
+    return Reach(tuple(e["tag"] for e in found), min(windows) if windows else None, rates,
+                 output=min(caps) if caps else None)

@@ -301,9 +301,10 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         refusal = _refusal(body)
         tool_calls = _tool_calls(body)
         if refusal is not None or (visible(content) is None and not tool_calls):
-            # Nothing to show, invisible characters included; or the model or a policy declined. Its
-            # reported cost is kept, and the same prompt is never sent again (model-route rule 4).
-            kind = refusal or "malformed"
+            # Nothing to show, invisible characters included (the output limit spent before any text,
+            # say on reasoning); or the model or a policy declined. Its reported cost is kept, and the
+            # same prompt is never sent again (model-route rule 4).
+            kind = refusal or ("output_limit" if _choice(body).get("finish_reason") == "length" else "malformed")
             attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
                                     retention=sent[-1] if sent else None))
             return _failed(kind, attempts, route)

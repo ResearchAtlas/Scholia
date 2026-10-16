@@ -111,6 +111,7 @@ _REFUSED = {  # an admission refusal's English text, by code; the interface show
     "route_unsupported": "No endpoint of that model accepts this request",
     "message_over_window": "The message is too large for this model's window",
     "instructions_over_window": "The project's instructions are too large for this model's window",
+    "evidence_over_window": "The evidence this needs does not fit this model's window",
 }
 
 
@@ -615,7 +616,7 @@ class Harness:
                 " ORDER BY t.seq DESC", (claim.conversation_id,))
             try:
                 request = context.assemble(
-                    "answer", window=facts["window"], output=budgets["output_limit"], budgets=budgets,
+                    "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
                     margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=message,
                     sections={"agents_md": [instructions] if instructions else []},
                     history=((json.loads(u).get("text", ""), json.loads(a).get("text", "")) for u, a in history))
@@ -886,13 +887,15 @@ class Harness:
             # Its reasoning record does not name exactly the endpoints it would reach (rule 1): sent without.
             effort = None
             found = reach.reach(route.provider, row, listing, zero_retention=zero_retention)
+        if found.problem == "route_unverified":  # read the listing again next time, not an hour later
+            openrouter_client.forget_endpoints(route.provider, route.model)
         if found.problem:
             return found.problem, None
         window = providers.window(table, route.model, found.window)
         if window["status"] != "ok":
             return "model_window", None
         return None, {"window": window["in_use"], "rates": found.rates, "effort": effort,
-                      "endpoints": list(found.tags), "row": row}
+                      "endpoints": list(found.tags), "row": row, "output": found.output}
 
     async def _call(self, active, call, route, key, request, facts, *, output=None, zero_retention=False):
         """The dispatch path: every model call goes through here, and nowhere else calls the provider
@@ -904,11 +907,13 @@ class Harness:
         given, is recorded on the finished step, so a run can later finish from the record."""
         if not isinstance(request, context.Request):
             raise TypeError("a model request is built by the context assembler")
+        if request.input_tokens + request.max_tokens > request.window:
+            raise ValueError("a model request must fit its window")
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         project_id = await self._read(lambda conn: conn.execute(
             "SELECT b.project_id FROM budget_reservations b JOIN runs r ON r.id = b.run_id"
-            " WHERE b.id = ? AND r.status = 'running'", (call.reservation_id,)).fetchone())
+            " WHERE b.id = ? AND b.status = 'open' AND r.status = 'running'", (call.reservation_id,)).fetchone())
         if project_id is None:  # its run, conversation or project was deleted (or it ended) since admission
             raise asyncio.CancelledError()
         def dispatched(terms=None):  # the gate let the request out: from here it may be billed
@@ -1076,7 +1081,8 @@ class Harness:
             return None
         budgets = personal.values["context"]
         try:  # the title step's output limit is the least a step has
-            request = context.assemble("title", window=facts["window"], output=context.MIN_OUTPUT, budgets=budgets,
+            request = context.assemble("title", window=facts["window"], output=_output(context.MIN_OUTPUT, facts),
+                                       budgets=budgets,
                                        margin_percent=budgets["margin_percent"], system_rules=TITLE_RULES,
                                        request=inputs["message"])
         except context.OverWindow:
@@ -1293,6 +1299,11 @@ async def _through(awaitable):
             if task.cancelled():
                 raise
             cancelled = True
+
+
+def _output(setting, facts):
+    """A step's output setting, no larger than the completion limit its endpoints list."""
+    return min(setting, facts["output"]) if facts["output"] else setting
 
 
 def _step(route, facts, request):

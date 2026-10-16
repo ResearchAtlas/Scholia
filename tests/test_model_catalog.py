@@ -388,8 +388,10 @@ async def test_a_models_endpoint_listing_is_read_bounded_and_cached():
 
     client = client_for(serve)
     listing = await catalog.endpoints(client, OPENROUTER, "model/x")
-    assert listing == [{"tag": "a", "context_length": 8192, "supported_parameters": ["tools"], "pricing": {"prompt": "1"}},
-                       {"tag": "b", "context_length": None, "supported_parameters": None, "pricing": {}}]
+    assert listing == [{"tag": "a", "context_length": 8192, "max_completion_tokens": None,
+                        "supported_parameters": ["tools"], "pricing": {"prompt": "1"}},
+                       {"tag": "b", "context_length": None, "max_completion_tokens": None,
+                        "supported_parameters": None, "pricing": {}}]
     assert await catalog.endpoints(client, OPENROUTER, "model/x") == listing and len(seen) == 1  # cached
     assert seen == ["/api/v1/models/model/x/endpoints"]
 
