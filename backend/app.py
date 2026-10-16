@@ -32,6 +32,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
 from backend import asks, materials
+from backend import references  # S1-14: reference file import and the merge confirmation
 from backend import local_helper
 from backend import search  # S1-17: the search index, index runs and the search model's offer
 from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
@@ -298,6 +299,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         content = ContentStore(db)
         # Local background work: reading materials and looking their identifiers up; full backups and exports.
         materials.register(harness, content)
+        references.register(harness)  # S1-14: merging a reference file's duplicates
         backups.register(harness, state)
         search.register(harness, state)  # S1-17: indexing and the search model's offer
         loop = asyncio.get_running_loop()
@@ -360,6 +362,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app.include_router(backups.router)  # backups, restore and project export, ahead of the catch-all routes
     app.include_router(materials.router)  # materials, passages, page images and retries (S1-13)
     app.include_router(asks.router)  # the shared confirmation (S1-13)
+    app.include_router(references.router)  # S1-14: reference file import
     app.include_router(local_helper.router)  # the local model helper and its models, under Advanced
     app.include_router(search.router)  # S1-17: search, and the index's status and rebuild
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore

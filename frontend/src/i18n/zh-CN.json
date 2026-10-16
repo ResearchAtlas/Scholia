@@ -388,6 +388,58 @@
   "ask.answer.lookup": "查询",
   "ask.answer.skip": "暂不",
   "ask.answer.text": "文字回答",
+  "library.add": "添加",
+  "library.addMenu.files": "文件…",
+  "library.addMenu.referenceFile": "参考文献文件…",
+  "library.noFullText": "无全文",
+  "library.noFile": "无文件",
+  "library.source.fromReferenceFile": "来自参考文献文件",
+  "library.source.referenceLocked": "来自参考文献文件：评审锁定的项目从不查询标识符",
+  "library.source.completedFrom": "来自参考文献文件，并由 {source} 补全，{date}",
+  "library.source.reference.not_found": "来自参考文献文件：没有找到其标识符的记录",
+  "library.source.reference.unavailable": "来自参考文献文件：查询没有得到回应，信息可能不完整",
+  "library.source.reference.refused": "来自参考文献文件：本项目的保护级别不允许查询",
+  "paper.attach": "附加文件",
+  "paper.attaching": "正在附加…",
+  "references.importing": "正在导入…",
+  "references.imported": {
+    "other": "已导入 {count} 篇文献。"
+  },
+  "references.waiting": {
+    "other": "{count} 篇疑似重复的文献等待你的回答。"
+  },
+  "references.already": {
+    "other": "{count} 篇已在本项目中，没有可补充的信息。"
+  },
+  "references.skipped": {
+    "other": "跳过了 {count} 条记录：没有标题或无法读取。"
+  },
+  "references.unsupportedMacro": {
+    "other": "有 {count} 个 BibTeX 字段值未导入：Scholia 不展开 @string 缩写或用 # 连接的值。"
+  },
+  "references.leftOut": {
+    "other": "有 {count} 项信息未导入：不是有效的年份、DOI、网址或 arXiv 编号。"
+  },
+  "references.doi": "DOI {doi}",
+  "ask.merge.question": "这两篇文献看起来是重复的",
+  "ask.merge.body": "合并会保留本项目中的文献，只用参考文献文件中的记录补充它缺少的信息。都保留会把这条记录另存为一篇文献。",
+  "ask.merge.option.merge": "合并",
+  "ask.merge.option.keep_both": "都保留",
+  "ask.merge.paper": "本项目中的文献",
+  "ask.merge.record": "参考文献文件中的记录",
+  "ask.merge.noDetails": "没有其他信息",
+  "ask.merge.matched.doi": "两者的 DOI 相同。",
+  "ask.merge.matched.title": "两者的标题和年份相同。",
+  "ask.kindName.merge": "合并重复文献",
+  "ask.answer.merge": "合并",
+  "ask.answer.keep_both": "都保留",
+  "ask.identifier_lookup.bodyReferenceFile": "本项目为“仅本机”。只会逐个发送 DOI 或 arXiv 编号，绝不发送你的文件或其他内容。此回答只适用于这个参考文献文件添加的文献，不适用于之后添加的文献。",
+  "settings.workflowMerge": "合并重复文献",
+  "errors.unsupported_reference_file": "Scholia 可读取 RIS、BibTeX、CSL JSON、NoteExpress 和 EndNote 标签格式的参考文献文件。",
+  "errors.reference_file_too_large": "该参考文献文件超过了 Scholia 可读取的大小（10 MB）。",
+  "errors.too_many_records": "该参考文献文件包含超过 10,000 条记录。请分批导出后逐个导入。",
+  "errors.no_records": "该参考文献文件不含任何记录。",
+  "errors.readings_busy": "Scholia 正在读取其他文件。请在它们读取完成后再导入这个参考文献文件。",
   "runs.started": "开始于 {date}",
   "runs.retry": "重试",
   "runs.progressLabel": "进度",

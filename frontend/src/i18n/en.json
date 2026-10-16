@@ -396,6 +396,64 @@
   "ask.answer.lookup": "look them up",
   "ask.answer.skip": "not now",
   "ask.answer.text": "a written answer",
+  "library.add": "Add",
+  "library.addMenu.files": "Files…",
+  "library.addMenu.referenceFile": "A reference file…",
+  "library.noFullText": "No full text",
+  "library.noFile": "No file",
+  "library.source.fromReferenceFile": "From the reference file",
+  "library.source.referenceLocked": "From the reference file: a review-locked project never looks identifiers up",
+  "library.source.completedFrom": "From the reference file, completed from {source}, {date}",
+  "library.source.reference.not_found": "From the reference file: no record was found for its identifier",
+  "library.source.reference.unavailable": "From the reference file: the lookup got no answer, so details may be missing",
+  "library.source.reference.refused": "From the reference file: this project's protection did not allow the lookup",
+  "paper.attach": "Attach a file",
+  "paper.attaching": "Attaching…",
+  "references.importing": "Importing…",
+  "references.imported": {
+    "one": "Imported {count} paper.",
+    "other": "Imported {count} papers."
+  },
+  "references.waiting": {
+    "one": "{count} duplicate waits for your answer.",
+    "other": "{count} duplicates wait for your answer."
+  },
+  "references.already": {
+    "one": "{count} was in the project already, with nothing to add.",
+    "other": "{count} were in the project already, with nothing to add."
+  },
+  "references.skipped": {
+    "one": "{count} record was skipped: it had no title or could not be read.",
+    "other": "{count} records were skipped: they had no title or could not be read."
+  },
+  "references.unsupportedMacro": {
+    "one": "{count} BibTeX value was left out: Scholia does not expand @string abbreviations or values joined with #.",
+    "other": "{count} BibTeX values were left out: Scholia does not expand @string abbreviations or values joined with #."
+  },
+  "references.leftOut": {
+    "one": "{count} value was left out: it was not a valid year, DOI, URL or arXiv ID.",
+    "other": "{count} values were left out: they were not valid years, DOIs, URLs or arXiv IDs."
+  },
+  "references.doi": "DOI {doi}",
+  "ask.merge.question": "These two papers look like duplicates",
+  "ask.merge.body": "Merge keeps the paper in this project and fills in only what it lacks from the reference file's record. Keep both adds the record as a paper of its own.",
+  "ask.merge.option.merge": "Merge",
+  "ask.merge.option.keep_both": "Keep both",
+  "ask.merge.paper": "In this project",
+  "ask.merge.record": "From the reference file",
+  "ask.merge.noDetails": "No other details",
+  "ask.merge.matched.doi": "They have the same DOI.",
+  "ask.merge.matched.title": "They have the same title and year.",
+  "ask.kindName.merge": "merging duplicates",
+  "ask.answer.merge": "merge",
+  "ask.answer.keep_both": "keep both",
+  "ask.identifier_lookup.bodyReferenceFile": "This project is Local only. Only each DOI or arXiv ID is sent, one at a time, never your files or anything else. The answer covers the papers this reference file added, not later ones.",
+  "settings.workflowMerge": "Merging a duplicate",
+  "errors.unsupported_reference_file": "Scholia reads RIS, BibTeX, CSL JSON, NoteExpress and EndNote tagged reference files.",
+  "errors.reference_file_too_large": "That reference file is larger than Scholia reads (10 MB).",
+  "errors.too_many_records": "That reference file holds more than 10,000 records. Export it in parts and import each one.",
+  "errors.no_records": "That reference file holds no records.",
+  "errors.readings_busy": "Scholia is reading other files. Import this reference file again once they are read.",
   "runs.started": "Started {date}",
   "runs.retry": "Try again",
   "runs.progressLabel": "Progress",
