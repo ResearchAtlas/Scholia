@@ -351,18 +351,19 @@ class SearchIndex:
                 raise DatabaseClosedError("the search index is closed")
             if self.unusable or self.building:  # a whole rebuild asked for or under way: the old file, never purged,
                 raise Unavailable()               # is not read; nor a partial one (fail closed, as an unusable file)
-            generation, damaged = self._generation, False
+            generation, failed = self._generation, False
             try:
                 conn = self._readers.get_nowait()
             except queue.Empty:
                 try:
                     conn, _ = self._connect()
-                except (*DAMAGE, apsw.NoFTS5Error):  # a damaged file (its header may fail the tokenizer's registration)
-                    damaged = True
-            if not damaged:
+                except apsw.Error:  # damaged (a corrupt header fails the tokenizer's registration), or only locked
+                    failed = True
+            if not failed:
                 self._reading += 1
-        if damaged:  # replaced and rebuilt, as for a read that finds it so (after the lock: _damaged takes it)
-            self._damaged()
+        if failed:  # after the lock (_damaged takes it): replaced and rebuilt if damaged; refused either way
+            if self._is_damaged():
+                self._damaged()
             raise Unavailable()
         try:
             try:
@@ -370,6 +371,10 @@ class SearchIndex:
                     return fn(conn)
             except DAMAGE:
                 self._damaged()
+                raise
+            except apsw.SQLError:  # the index's own tables gone (an emptied file), or the query's own error
+                if self._is_damaged():
+                    self._damaged()
                 raise
             finally:
                 with self._lock:  # once the index closes, kept for close() to close (and know if that fails)
@@ -387,6 +392,33 @@ class SearchIndex:
             with self._lock:
                 self._reading -= 1
                 self._reads_done.notify_all()
+
+    def _is_damaged(self):
+        """Whether the file is damaged, not merely held by another connection: on a fresh, plain connection (no
+        tokenizer, no waiting for a lock), the index's own tables must be there and readable (its schema, its
+        metadata and its rows' table, read whole; the FTS5 and vec0 tables need the app's tokenizer and extension,
+        and a damaged page of theirs shows in the read that meets it, DAMAGE). A busy or locked file is not damaged
+        (a read is refused for now, and nothing is rebuilt); any other failure to read it is. Only called when a
+        read fails."""
+        try:
+            conn = apsw.Connection(str(self.path), flags=apsw.SQLITE_OPEN_READONLY)
+        except (apsw.BusyError, apsw.LockedError):
+            return False
+        except apsw.Error:
+            return True
+        try:
+            tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")}
+            if not {"index_meta", "index_rows", "fts_passages"} <= tables:
+                return True
+            conn.execute("SELECT count(*) FROM index_meta").fetchall()
+            conn.execute("SELECT count(*), sum(length(digest)) FROM index_rows").fetchall()
+            return False
+        except (apsw.BusyError, apsw.LockedError):
+            return False
+        except apsw.Error:
+            return True
+        finally:
+            close_connection(conn)
 
     def _quiet(self):
         """Before the file is removed or replaced: no read is admitted from here (the caller has set building or

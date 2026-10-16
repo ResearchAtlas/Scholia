@@ -2105,8 +2105,106 @@ async def test_a_read_whose_connection_cannot_open_on_a_damaged_file_has_it_rebu
                 raise getattr(search_index.apsw, error)("damaged")
             return real(self)
         monkeypatch.setattr(SearchIndex, "_connect", connect)
+        monkeypatch.setattr(SearchIndex, "_is_damaged", lambda self: True)  # the file found damaged when checked
         with pytest.raises(search_index.Unavailable):
             await asyncio.to_thread(index.keyword, project, "wage", 5)
+        monkeypatch.undo()
         assert failed and index.damaged
         await asyncio.wait_for(_until(lambda: not index.building), 20)
         assert await asyncio.to_thread(index.keyword, project, "wage", 5)  # rebuilt, read again
+
+
+
+# PR 29 recheck 8: damage confirmed on a fresh connection; a lock is not damage; an emptied file is
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_index_another_connection_holds_is_not_taken_for_damaged(tmp_path):
+    """Recheck 8, item 2: a healthy index file another connection holds (exclusive locking) is not damaged when
+    checked on a fresh connection: it is busy, and nothing is to be rebuilt."""
+    from backend.db import Database
+    db = await asyncio.to_thread(Database, tmp_path / "data")
+    index = SearchIndex(tmp_path / "data", db, {"model": "m"})
+    _, rebuild = await asyncio.to_thread(index.open)
+    if rebuild is not None:
+        await asyncio.wrap_future(rebuild)
+    await asyncio.to_thread(index.close)
+    holder = search_index.apsw.Connection(str(index.path))
+    try:
+        holder.execute("PRAGMA locking_mode = EXCLUSIVE")
+        holder.execute("BEGIN EXCLUSIVE")
+        holder.execute("UPDATE index_meta SET value = value WHERE key = 'state'")
+        assert SearchIndex(tmp_path / "data", db, {"model": "m"})._is_damaged() is False  # locked, not damaged
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+        await asyncio.to_thread(db.close)
+
+
+@pytest.mark.asyncio
+async def test_a_read_whose_connection_cannot_open_on_a_healthy_file_is_refused_and_nothing_rebuilt(tmp_path,
+                                                                                                    monkeypatch):
+    """Recheck 8, item 2: a read whose new connection fails (as the tokenizer's registration does after a lock's busy
+    timeout) on a file the check finds healthy is refused as unavailable, and the index is not replaced (its
+    embeddings stay)."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        while not index._readers.empty():
+            index._readers.get_nowait().close()
+        real, failed = SearchIndex._connect, []
+
+        def connect(self):
+            if not failed and self._writer_ident != threading.get_ident():  # a read's, once
+                failed.append(True)
+                raise search_index.apsw.NoFTS5Error("Getting the FTS5 API failed")
+            return real(self)
+        monkeypatch.setattr(SearchIndex, "_connect", connect)
+        with pytest.raises(search_index.Unavailable):
+            await asyncio.to_thread(index.keyword, project, "wage", 5)
+        assert failed and not index.damaged and not index.building  # nothing rebuilt
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)  # the next read is answered
+
+
+@pytest.mark.asyncio
+async def test_a_corrupt_header_met_opening_a_read_is_confirmed_and_rebuilt(tmp_path):
+    """Recheck 8, end to end: the file's header made unreadable while the app runs; a read's new connection fails
+    (the tokenizer's registration), the check confirms the damage, and the file is replaced and rebuilt."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        while not index._readers.empty():
+            index._readers.get_nowait().close()
+        with open(index.path, "r+b") as file:  # SQLite's header string, overwritten
+            file.write(b"not a database!!")
+        with pytest.raises(search_index.Unavailable):
+            await asyncio.to_thread(index.keyword, project, "wage", 5)
+        assert index.damaged
+        await asyncio.wait_for(_until(lambda: not index.building), 20)
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
+async def test_an_emptied_index_file_is_taken_for_damaged_and_rebuilt(tmp_path):
+    """Recheck 8, item 1: the index file emptied (zero bytes) while the app runs. A read's new connection opens, and
+    its query fails for the missing tables: the check finds the index's tables gone, so the file is replaced and
+    rebuilt (before, it was left so, search unavailable while the status said ready)."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        while not index._readers.empty():
+            index._readers.get_nowait().close()
+        for suffix in ("-wal", "-shm"):
+            Path(f"{index.path}{suffix}").unlink(missing_ok=True)
+        os.truncate(index.path, 0)
+        with pytest.raises(search_index.apsw.SQLError):
+            await asyncio.to_thread(index.keyword, project, "wage", 5)
+        assert index.damaged
+        await asyncio.wait_for(_until(lambda: not index.building), 20)
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)
