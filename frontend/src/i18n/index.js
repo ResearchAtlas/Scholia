@@ -2,13 +2,45 @@
 // Catalog values are strings with {name} placeholders, or an object of plural
 // forms ("one", "other", ...) chosen by Intl.PluralRules from params.count.
 import { createContext, useContext, useMemo } from 'react';
+import { loader } from '../parts.js';
 import en from './en.json' with { type: 'json' };
-import zhCN from './zh-CN.json' with { type: 'json' };
 
-const CATALOGS = { en, 'zh-CN': zhCN };
+// English is in the script loaded at start: it is the fallback for a key missing in another
+// language. Every other language's catalog is a part of its own (parts.js), loaded when it is the
+// language of the window (loadLanguage), and only then in CATALOGS.
+const CATALOGS = { en };
+const PARTS = { 'zh-CN': () => import('./zh-CN.json', { with: { type: 'json' } }) };
 
 // The supported interface languages, each named in its own language (catalog key language.<code>).
-export const LANGUAGES = Object.keys(CATALOGS);
+export const LANGUAGES = ['en', ...Object.keys(PARTS)];
+
+// Whether a language's catalog is here, so the window can be drawn in it.
+export const languageLoaded = (language) => Object.hasOwn(CATALOGS, language);
+
+// Loads a language's catalog, once: settles once it is in CATALOGS, or rejects with NotLoaded.
+const loading = {};
+export function loadLanguage(language) {
+  if (languageLoaded(language)) return Promise.resolve();
+  return (loading[language] ??= loader(PARTS[language], 'default')()
+    .then((module) => { CATALOGS[language] = module.default; }));
+}
+
+// The language the window is drawn in, following the language asked for, want(language): at once
+// when its catalog is here, else once it has loaded, so nothing shows in another language meanwhile;
+// the last language asked for wins. show({ language, failed }) is told each change: language is the
+// one drawn (null before any), and failed whether the catalog of the language asked for could not
+// be loaded, which the window shows as a part that could not load.
+export function languageSwitch(show, load = loadLanguage) {
+  let wanted = null;
+  let drawn = null;
+  const draw = (language) => { drawn = language; show({ language, failed: false }); };
+  return function want(language) {
+    wanted = language;
+    if (languageLoaded(language)) return draw(language);
+    load(language).then(() => { if (wanted === language) draw(language); },
+      () => { if (wanted === language) show({ language: drawn, failed: true }); });
+  };
+}
 
 // The [ui] language setting is "system", "en" or "zh-CN". "system" follows the
 // OS locale: any Chinese locale maps to zh-CN, every other locale to English.
