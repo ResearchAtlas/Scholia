@@ -1,15 +1,15 @@
 // i18n: migrated
 // The app: the first-run setup, then the window's three columns. The language follows the
 // [ui] language setting ("system" follows the system), and light or dark follows the system.
-// The window is drawn in a language once its catalog has loaded (i18n languageSwitch), and only
-// the setting's language is loaded (the system's when the setting cannot be read): until then the
-// window shows nothing. One that cannot load says so in that language (NOT_LOADED), with Try again
-// and Use English, which sets the language to English. A change in Settings loads its catalog
-// before it is saved, so the window changes language at once.
+// The window's language is decided once, at launch: the setting's ("system" resolved from the
+// system's locale then), or the system's when the setting cannot be read. Only that language's
+// catalog is loaded, and the window shows nothing until it has. One that cannot load says so in
+// that language (NOT_LOADED), with Try again and Use English. A change in Settings is saved and
+// applies when the window reloads; nothing is redrawn in another language in place.
 // A data folder Scholia will not open, or a damaged database, shows its own screen; health is
 // read first, since a limited app serves little else.
-import { useCallback, useEffect, useState } from 'react';
-import { LanguageContext, NOT_LOADED, languageSwitch, resolveLanguage, useT } from './i18n/index.js';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { LanguageContext, NOT_LOADED, chooseEnglish, loadLanguage, resolveLanguage, useT } from './i18n/index.js';
 import { ApiError, get, saveSettings } from './api.js';
 import { errorText } from './text.js';
 import { FirstRun } from './components/FirstRun.jsx';
@@ -32,42 +32,46 @@ export function App() {
   useSystemTheme();
   const [state, setState] = useState({ phase: 'loading' });
   const [shown, setShown] = useState({ language: null, failed: null });
-  const [languages] = useState(() => languageSwitch(setShown));
   const { language } = shown;
+  // The window's language, decided by the first launch step that knows it; later ones (load again
+  // after the setup, a restore or Try again) leave it as it is.
+  const decided = useRef(false);
+  const launchLanguage = useCallback(async (setting) => {
+    if (decided.current) return;
+    decided.current = true;
+    const chosen = resolveLanguage(setting, navigator.language);
+    await loadLanguage(chosen).then(() => setShown({ language: chosen, failed: null }),
+      () => setShown({ language: null, failed: chosen }));
+  }, []);
 
   const load = useCallback(async () => {
     try {
       const health = await get('/api/health');
       if (health.data_folder_problem || health.database_damaged) {
         const settings = await get('/api/settings').catch(() => null); // a limited app may not serve it
-        await languages.want(resolveLanguage(settings?.values?.ui?.language ?? 'system', navigator.language));
+        await launchLanguage(settings?.values?.ui?.language ?? 'system');
         setState({ phase: health.data_folder_problem ? 'dataFolder' : 'damaged', health });
         return;
       }
       // The setting's language is drawn whenever the settings were read, even if the setup was not.
       const [setup, settings] = await Promise.allSettled([get('/api/setup'), get('/api/settings')]);
-      if (settings.status === 'fulfilled') await languages.want(resolveLanguage(settings.value.values?.ui?.language ?? 'system', navigator.language));
+      if (settings.status === 'fulfilled') await launchLanguage(settings.value.values?.ui?.language ?? 'system');
       for (const answer of [setup, settings]) if (answer.status === 'rejected') throw answer.reason;
       setState({ phase: setup.value.needed ? 'setup' : 'ready', health, settings: settings.value });
     } catch (error) {
-      await languages.fallback(resolveLanguage('system', navigator.language)); // the setting was not read
+      await launchLanguage('system'); // the setting was not read
       setState({ phase: 'error', code: error instanceof ApiError ? error.code : 'internal' });
     }
-  }, [languages]);
+  }, [launchLanguage]);
 
-  // Use English, on the screen of a language that could not load: the setting becomes English
-  // (saved once more if the settings changed meanwhile or the save failed), and English is drawn
-  // even if it could not be saved, since the researcher chose it; the window then says it was not
-  // saved, with Try again, which saves it again.
+  // Use English, on the screen of a language that could not load (chooseEnglish): saved, then the
+  // window reloads in it; if it could not be saved, English is drawn for this window, which says
+  // so, with Try again (one more save).
   const [englishUnsaved, setEnglishUnsaved] = useState(false);
-  const saveEnglish = async () => {
-    const save = () => saveSettings({ 'ui.language': 'en' }).catch(() => null);
-    setEnglishUnsaved(!(await save() || await save()));
-  };
-  const chooseEnglish = async () => {
-    await saveEnglish();
-    await languages.want('en');
-  };
+  const saveEnglish = () => saveSettings({ 'ui.language': 'en' }).then(Boolean, () => false);
+  const englishInstead = () => chooseEnglish({ save: saveEnglish, reload: () => window.location.reload(),
+    draw: () => { setEnglishUnsaved(true); setShown({ language: 'en', failed: null }); } });
+  const retryEnglish = async () => { if (await saveEnglish()) setEnglishUnsaved(false); };
 
   useEffect(() => {
     load();
@@ -87,18 +91,18 @@ export function App() {
     if (language) document.documentElement.lang = language;
   }, [language]);
 
-  if (shown.failed) return <LanguageNotLoaded language={shown.failed} onEnglish={chooseEnglish} />;
+  if (shown.failed) return <LanguageNotLoaded language={shown.failed} onEnglish={englishInstead} />;
   if (!language) return null;
   return (
     <LanguageContext.Provider value={language}>
-      {englishUnsaved && <EnglishNotSaved onRetry={saveEnglish} onClose={() => setEnglishUnsaved(false)} />}
+      {englishUnsaved && <EnglishNotSaved onRetry={retryEnglish} onClose={() => setEnglishUnsaved(false)} />}
       {state.phase === 'loading' && <Splash />}
       {state.phase === 'error' && <Failure code={state.code} onRetry={load} />}
       {state.phase === 'dataFolder' && <DataFolderScreen health={state.health} />}
       {state.phase === 'damaged' && <DamagedDatabaseScreen onRestored={load} />}
       {state.phase === 'setup' && <FirstRun onDone={load} />}
       {state.phase === 'ready' && <Shell health={state.health} settings={state.settings}
-        onLanguage={(setting) => { setEnglishUnsaved(false); languages.want(resolveLanguage(setting, navigator.language)); }} />}
+        onLanguage={() => setEnglishUnsaved(false)} />}
     </LanguageContext.Provider>
   );
 }

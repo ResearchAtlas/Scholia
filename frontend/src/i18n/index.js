@@ -6,8 +6,8 @@ import { loader } from '../parts.js';
 import en from './en.json' with { type: 'json' };
 
 // English is in the script loaded at start: it is the fallback for a key missing in another
-// language. Every other language's catalog is a part of its own (parts.js), loaded when it is the
-// language of the window (loadLanguage), and only then in CATALOGS.
+// language. Every other language's catalog is a part of its own (parts.js), loaded at launch when it
+// is the window's language (loadLanguage), and only then in CATALOGS.
 const CATALOGS = { en };
 const PARTS = { 'zh-CN': () => import('./zh-CN.json', { with: { type: 'json' } }) };
 
@@ -25,41 +25,12 @@ export function loadLanguage(language) {
     .then((module) => { CATALOGS[language] = module.default; }));
 }
 
-// The language the window is drawn in, following the language asked for, want(language): at once
-// when its catalog is here, else once it has loaded, so nothing shows in another language meanwhile;
-// the last language asked for wins. show({ language, failed }) is told each change: language is the
-// one drawn (null before any), and failed the language asked for whose catalog could not be loaded
-// (else null), which the window shows as a part that could not load (NOT_LOADED). want returns a
-// promise that settles, never rejecting, once show has been told (or a later language was asked for
-// meanwhile), so what is drawn next waits for it. fallback(language) wants a language only if none
-// has been asked for: the system's, when the setting could not be read.
-export function languageSwitch(show, load = loadLanguage) {
-  let wanted = null;
-  let drawn = null;
-  const draw = (language) => { drawn = language; show({ language, failed: null }); };
-  const want = (language) => {
-    wanted = language;
-    if (languageLoaded(language)) return Promise.resolve(draw(language));
-    return load(language).then(() => { if (wanted === language) draw(language); },
-      () => { if (wanted === language) show({ language: drawn, failed: language }); });
-  };
-  return { want, fallback: (language) => (wanted === null ? want(language) : Promise.resolve()) };
-}
-
-// Choices of the language setting in Settings, choose(value, { save, draw, failed }): the
-// language's catalog loads first, then the setting is saved and the window drawn in it, but only if
-// it is still the latest choice once loaded, so an earlier choice still loading saves and draws
-// nothing. A catalog that cannot load saves nothing and is told (failed), if still the latest choice.
-export function languageChooser({ load = loadLanguage, systemLocale = globalThis.navigator?.language } = {}) {
-  let latest = null;
-  return async function choose(value, { save, draw, failed }) {
-    const choice = {};
-    latest = choice;
-    const loaded = await load(resolveLanguage(value, systemLocale)).then(() => true, () => false);
-    if (latest !== choice) return;
-    if (!loaded) return failed();
-    if (await save(value)) draw(value);
-  };
+// Use English, on the screen of a language that could not load at launch: English is saved (once
+// more if that did not take, the settings having changed meanwhile), then the window reloads in it;
+// if it could not be saved, English is drawn for this window, which says it was not saved (draw).
+export async function chooseEnglish({ save, reload, draw }) {
+  if (await save() || await save()) return reload();
+  return draw();
 }
 
 // What the window says when a language's catalog could not be loaded, in that language: kept here,

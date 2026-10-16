@@ -4,7 +4,7 @@
 // the project's in its own; keys live in the credential store (section 4.4).
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, X } from 'lucide-react';
-import { LANGUAGES, LanguageContext, languageChooser, useT } from '../i18n/index.js';
+import { LANGUAGES, LanguageContext, resolveLanguage, useT } from '../i18n/index.js';
 import { ApiError, get, patch, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText, money } from '../text.js';
@@ -73,23 +73,14 @@ function PageTitle({ children }) {
   return <h2 className="text-lg font-semibold tracking-tight">{children}</h2>;
 }
 
-// One for the window, so a choice made after Settings was closed and opened again still supersedes
-// one still loading.
-const chooseLanguageSetting = languageChooser();
-
 function General({ onLanguage, projectId }) {
   const t = useT();
   const personal = useSettingsFile();
   const [problem, setProblem] = useState(null);
-  // The language's catalog loads before the setting is saved (chooseLanguageSetting): one that cannot
-  // load leaves the setting and the window as they were, and says so with Try again, which reloads
-  // the window (a catalog that failed stays failed until then).
-  const [languageFailed, setLanguageFailed] = useState(false);
-  const chooseLanguage = (value) => {
-    setLanguageFailed(false);
-    chooseLanguageSetting(value, { save: (choice) => personal.save({ 'ui.language': choice }), draw: onLanguage,
-      failed: () => setLanguageFailed(true) });
-  };
+  // The window's language is decided at launch (App.jsx): a change is saved, and applies when the
+  // window reloads (Reload now). The choice shown is the saved setting; a save that fails says so
+  // (Problem) and changes nothing.
+  const drawn = useContext(LanguageContext);
   const values = personal.values;
   if (!values) return <LoadState problem={personal.problem} onRetry={personal.reload} />;
   return (
@@ -102,8 +93,13 @@ function General({ onLanguage, projectId }) {
           <Segmented label={t('settings.language')} value={values.ui.language}
             options={[{ value: 'system', label: t('settings.languageSystem') },
               ...LANGUAGES.map((code) => ({ value: code, label: t(`language.${code}`) }))]}
-            onChange={chooseLanguage} />
-          {languageFailed && <div className="mt-3"><LoadState problem="language_not_loaded" onRetry={() => window.location.reload()} /></div>}
+            onChange={async (value) => { if (await personal.save({ 'ui.language': value })) onLanguage(value); }} />
+          {resolveLanguage(values.ui.language, navigator.language) !== drawn && (
+            <div role="status" className="mt-3 flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+              <p>{t('settings.languageOnReload')}</p>
+              <Button variant="outline" size="sm" onClick={() => window.location.reload()}>{t('settings.reloadNow')}</Button>
+            </div>
+          )}
         </div>
       </Field>
       <Field label={t('settings.followUp')} hint={t('settings.followUpHint')}>
