@@ -691,10 +691,10 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     material, stored, checked_by, filled, title, evidence = found
     step["material_id"] = material
     changed = False
+    own = json.loads(stored or "{}")
+    for field in json.loads(filled or "[]"):  # a lookup's fields are not the record's (S1-14's lookup_filled)
+        own.pop(field, None)
     if csl is not None and checked_by != "researcher":
-        own = json.loads(stored or "{}")
-        for field in json.loads(filled or "[]"):  # a lookup's fields are not the record's
-            own.pop(field, None)
         if own != csl:
             changed = True
             # its retraction check and resolution were about the identifier it had: a DOI or an arXiv ID changed or gone
@@ -712,6 +712,15 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
                                            (material, sha256)).fetchone() is None:  # one of its files already: none
         version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
         step["version"] = True
+        if not changed and checked_by != "researcher" and reference_files.identifier(own) is None:
+            # Its identifier came from its file's text, which is another file now: what a lookup of the
+            # old one filled goes (S1-14's lookup_filled), with its resolution and retraction check, and
+            # the new file's lookup completes the record afresh. A researcher's edits stay as they are.
+            conn.execute("UPDATE materials SET csl = ?, lookup_filled = NULL, resolved_at = NULL, retraction = 'unknown',"
+                         " retraction_checked_at = NULL, updated_at = ? WHERE id = ?",
+                         (json.dumps(own), utc_now(), material))
+    elif sha256 is None and step.get("pdf") and current is not None and current[1] is not None:
+        step["kept"] = True  # its PDF could not be read this time: the paper keeps the file it had
     step["outcome"] = "updated" if changed or step["version"] else "unchanged"
     if not (changed or step["version"]) or version is None:
         return None
@@ -769,15 +778,17 @@ def _close_batch(conn, harness, project_id, run_id):
 
 def _summary(conn, run_id):
     """What the import did, counted from its items' step events: each outcome, the new versions, the
-    PDFs not read by reason, and the values left out of the records."""
+    PDFs not read by reason (pdf: the paper has its details only; pdf_kept: it keeps the file it had),
+    and the values left out of the records."""
     summary = {outcome: 0 for outcome in OUTCOMES} | {"versions": 0, "pdf": {}, "left_out": 0}
     for (data,) in conn.execute("SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'", (run_id,)):
         step = json.loads(data)
         summary[step["outcome"]] += 1
         summary["versions"] += bool(step.get("version")) and step["outcome"] == "updated"
         summary["left_out"] += step.get("left_out") or 0
-        if step.get("pdf"):
-            summary["pdf"][step["pdf"]] = summary["pdf"].get(step["pdf"], 0) + 1
+        if step.get("pdf"):  # not read: a paper with its details only, or one that keeps the file it had
+            counted = summary.setdefault("pdf_kept", {}) if step.get("kept") else summary["pdf"]
+            counted[step["pdf"]] = counted.get(step["pdf"], 0) + 1
     return summary
 
 

@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { appendPage, collectionTree, MAX_ITEMS, reportParts, statusKey } from '../src/zotero.js';
+import { appendPage, chosenFor, collectionTree, MAX_ITEMS, reportParts, statusKey } from '../src/zotero.js';
 import { detailsSource, reasonKey } from '../src/library.js';
 import { makeT } from '../src/i18n/index.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
@@ -94,4 +94,18 @@ test('a further page joins only the list it was asked for', () => {
 test('the Local only question for a Zotero import names both identifiers it may send', () => {
   assert.match(en['ask.identifier_lookup.bodyZotero'], /DOI or arXiv ID/);
   assert.match(zh['ask.identifier_lookup.bodyZotero'], /DOI 或 arXiv 编号/);
+});
+
+test('a PDF not read again is reported as kept, never as details only', () => {
+  const parts = reportParts({ imported: 0, updated: 0, unchanged: 1, pdf: {}, pdf_kept: { pdf_missing: 1 } });
+  assert.deepEqual(parts.map(([key]) => key), ['zotero.report.imported', 'zotero.report.unchanged', 'zotero.report.pdfKept']);
+  for (const catalog of [en, zh]) assert.doesNotMatch(makeT(catalog)('zotero.report.pdfKept', { count: 1 }), /zotero\.|\{/);
+});
+
+test('items chosen under one Zotero are not sent to another', () => {
+  assert.deepEqual(chosenFor(['AAAA2222'], 'server-a', 'server-a'), ['AAAA2222']);
+  assert.deepEqual(chosenFor(['AAAA2222'], 'server-a', 'server-b'), []);
+  assert.deepEqual(chosenFor(['AAAA2222'], null, undefined), ['AAAA2222']); // a Zotero sending no id, both times
+  assert.deepEqual(chosenFor(['AAAA2222'], null, 'server-b'), []);
+  assert.match(source('ZoteroBrowser.jsx'), /setChosen\(\(keys\) => chosenFor\(keys, under, status\.server_id\)\)/);
 });

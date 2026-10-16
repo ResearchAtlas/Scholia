@@ -386,7 +386,7 @@ async def test_a_reimport_updates_details_and_a_changed_pdf_becomes_the_next_ver
         # A PDF no longer readable leaves the current file as it is.
         mock.files["users/0", KEYS[1][:7] + "Z"] = "file:///nowhere/gone.pdf"
         row = await imported(client, project, KEYS[1:2])
-        assert row["result"]["pdf"] == {"pdf_missing": 1}
+        assert (row["result"]["pdf"], row["result"]["pdf_kept"]) == ({}, {"pdf_missing": 1})  # kept, not details only
         paper = (await papers(client, project))[f"users/0/items/{KEYS[1]}"]
         assert (paper["version"]["seq"], paper["state"]) == (1, "ready")
 
@@ -976,3 +976,47 @@ async def test_a_record_change_looks_a_pdf_identified_paper_up_again(tmp_path):
         paper = (await papers(client, project))["users/0/items/PDFD2222"]
         assert paper["title"] == "A Record Without Its DOI, Retitled" and paper["csl"]["container-title"] == "Journal of PDFs"
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(2,)]
+
+
+
+# gpt-6-astra recheck 3 (PR 33)
+
+
+async def test_a_new_pdf_with_another_doi_takes_the_old_lookups_fields_with_it(tmp_path):
+    other = "10.5555/scholia.zotero.other"
+    mock = MockZotero()
+    mock.item("PDFD2222", "A Record Without Its DOI", pdf=pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI",
+                                                                   doi=DOI))
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A"),
+                                      other: openalex_work(other, "Record B", venue="Journal of B", retracted=True)})
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=records)) as client:
+        project = await project_of(client)
+        await imported(client, project, ["PDFD2222"])
+        await background_idle(client, 60)
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert (paper["csl"]["DOI"], paper["csl"]["container-title"], paper["retraction"]) == (DOI, "Journal of A", "none")
+        pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI", doi=other)  # the same record, another PDF
+        assert (await imported(client, project, ["PDFD2222"]))["result"]["versions"] == 1
+        await background_idle(client, 60)
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert (paper["csl"]["DOI"], paper["csl"]["container-title"], paper["retraction"]) == (other, "Journal of B",
+                                                                                                "retracted")
+        assert paper["title"] == "A Record Without Its DOI"  # the record's own fields stay
+
+
+async def test_a_new_pdf_keeps_the_researchers_edits(tmp_path):
+    mock = MockZotero()
+    mock.item("PDFD2222", "A Record Without Its DOI", pdf=pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI",
+                                                                   doi=DOI))
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Record A", venue="Journal of A")})
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=records)) as client:
+        project = await project_of(client)
+        await imported(client, project, ["PDFD2222"])
+        await background_idle(client, 60)
+        [paper] = (await papers(client, project)).values()
+        assert (await client.patch(f"/api/materials/{paper['id']}", json={"venue": "My Venue"})).status_code == 200
+        pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI", doi="10.5555/scholia.zotero.other")
+        await imported(client, project, ["PDFD2222"])
+        await background_idle(client, 60)
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert (paper["csl"]["container-title"], paper["csl"]["DOI"], paper["checked_by"]) == ("My Venue", DOI, "researcher")

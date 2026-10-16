@@ -11,7 +11,7 @@ import { ApiError } from '../api.js';
 import { errorText } from '../text.js';
 import { followRun, runOutcome } from '../runs.js';
 import { libraryChanged } from '../library.js';
-import { appendPage, collectionTree, importZotero, MAX_ITEMS, reportParts, statusKey, zoteroCollections, zoteroItems,
+import { appendPage, chosenFor, collectionTree, importZotero, MAX_ITEMS, reportParts, statusKey, zoteroCollections, zoteroItems,
   zoteroStatus } from '../zotero.js';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -50,6 +50,13 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
   }, [open, check]);
 
   const ready = status?.state === 'ready';
+  const chosenUnder = useRef(null); // the server id the items were chosen under
+  useEffect(() => { // a Zotero answering with another server id since: its items are not the ones chosen
+    if (!ready) return;
+    const under = chosenUnder.current; // read here: an update never reads a ref
+    setChosen((keys) => chosenFor(keys, under, status.server_id));
+    chosenUnder.current = status.server_id ?? null;
+  }, [ready, status]);
   useEffect(() => { // the library's collections, once Zotero is ready
     if (!ready) return undefined;
     let live = true;

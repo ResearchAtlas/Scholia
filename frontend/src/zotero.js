@@ -57,6 +57,10 @@ export function appendPage(shown, found, asked) {
   return { ...shown, ...found, items: [...shown.items, ...found.items] };
 }
 
+// The items chosen, kept only while the Zotero they were chosen in still answers: a different server id
+// (another Zotero, or its database replaced) has other items under the same keys, so the choice is dropped.
+export const chosenFor = (chosen, chosenUnder, serverId) => ((chosenUnder ?? null) === (serverId ?? null) ? chosen : []);
+
 // The status's text and whether it says how to turn the API on, as catalog keys.
 export const statusKey = (status) => `zotero.status.${status?.state ?? 'checking'}`;
 
@@ -67,6 +71,7 @@ export function reportParts(summary) {
   if (!summary) return [];
   if (summary.imported === undefined) return [['zotero.report.kept', {}]];
   const notRead = Object.values(summary.pdf ?? {}).reduce((sum, n) => sum + n, 0);
+  const kept = Object.values(summary.pdf_kept ?? {}).reduce((sum, n) => sum + n, 0); // its paper keeps its file
   return [
     ['zotero.report.imported', { count: summary.imported ?? 0 }],
     summary.updated && ['zotero.report.updated', { count: summary.updated }],
@@ -75,6 +80,7 @@ export function reportParts(summary) {
     summary.waiting && ['zotero.report.waiting', { count: summary.waiting }],
     summary.already && ['zotero.report.already', { count: summary.already }],
     notRead && ['zotero.report.pdfNotRead', { count: notRead }],
+    kept && ['zotero.report.pdfKept', { count: kept }],
     summary.not_found && ['zotero.report.notFound', { count: summary.not_found }],
     summary.no_title && ['zotero.report.noTitle', { count: summary.no_title }],
     summary.left_out && ['references.leftOut', { count: summary.left_out }],
