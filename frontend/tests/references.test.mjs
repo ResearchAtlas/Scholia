@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { importReferences, MAX_REFERENCE_BYTES, paperLine, REFERENCE_ACCEPT, reportParts } from '../src/references.js';
+import { importReferences, MAX_REFERENCE_BYTES, paperLine, RECORD_LINES, REFERENCE_ACCEPT, reportParts } from '../src/references.js';
 import { detailsSource, latestLookup, unsettled } from '../src/library.js';
 import { loadLanguage, makeT } from '../src/i18n/index.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
@@ -53,6 +53,11 @@ test('the report says what the import did, counted, in each supported interface 
     '1 record was skipped: it had no title or could not be read.',
     '2 values were left out: they were not valid years, DOIs, URLs or arXiv IDs.']);
   assert.equal(zh_(...reportParts(leftOut)[2]), '有 2 项信息未导入：不是有效的年份、DOI、网址或 arXiv 编号。');
+  // fields past the lines read of one record, counted apart (the S1-14 follow-up)
+  const past = { imported: ['a'], waiting: [], already: [], skipped: { past_record_bound: 2 } };
+  assert.deepEqual(reportParts(past).slice(1).map(([key, params]) => en_(key, params)), [
+    '2 fields were left out: their records run past the first 1,000 lines, which is all Scholia reads of one record.']);
+  assert.equal(zh_(...reportParts(past)[1]), '有 2 个字段未导入：所在记录超过 Scholia 对一条记录读取的前 1,000 行。');
   // values a BibTeX file gives by a macro or #, counted apart too
   const macros = { imported: ['a'], waiting: [], already: [], skipped: { unsupported_macro: 1 } };
   assert.deepEqual(reportParts(macros).slice(1).map(([key, params]) => en_(key, params)), [
@@ -117,4 +122,9 @@ test('the Library looks again while a merge has still to ask or to apply its ans
   assert.equal(unsettled(settled), false);
   assert.equal(unsettled({ ...settled, merging: 1 }), true); // Keep both answered: its paper is still to come
   assert.equal(unsettled({ ...settled, asks: [{ kind: 'merge' }] }), true);
+});
+
+test('the lines read of one record are the backend\'s', () => {
+  const backend = readFileSync(fileURLToPath(new URL('../../backend/reference_files.py', import.meta.url)), 'utf8');
+  assert.equal(Number(backend.match(/^RECORD_LINES = (\d+)/m)[1]), RECORD_LINES);
 });
