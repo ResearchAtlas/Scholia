@@ -40,12 +40,12 @@ cancelled:
   current file in the project is reported already there, as an upload is;
 - otherwise it becomes the project's paper, source zotero, with its first version (its PDF, read in
   a reading run, or none).
-Papers it made or whose details it replaced, carrying an identifier, join one lookup batch for the
-import (S1-13's, batch `zotero`), bound to the import run: it stays open while the import runs, however
-long and across a restart, and closes when the import ends, so a Local only project asks once per
-import; a review-locked one never looks up. A lookup applies only while the paper still gives the
-identifier it was made for, as the lookup worked it out (its record, else its file's text;
-materials._gives). Its step events record each item's outcome, from
+Papers it made or whose details or file it replaced, carrying an identifier in their record or a file
+whose text may give one, join one lookup batch for the import (S1-13's, batch `zotero`), bound to the
+import run: it stays open while the import runs, however long and across a restart, and closes when the
+import ends, so a Local only project asks once per import; a review-locked one never looks up. A
+lookup applies only while the paper still gives the identifier it was made for, as the lookup worked it
+out (its record, else its file's text; materials._gives). Its step events record each item's outcome, from
 which the summary is counted. Its inputs name its items and the items done, so a restart goes on from
 the next item; deleting a Zotero paper revokes every running import of its item into its project
 (backend/db/deletion.py SCOPE_LINKS), so none makes it again.
@@ -686,8 +686,8 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
 def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     """An item imported before: its details replaced by its record when they changed (and the
     researcher has not edited them), and its PDF, when it is none of its files, its next version.
-    Returns (material, version, record, whether a file was added) to look up when its details were
-    replaced or a file added, else None."""
+    Returns (material, version, its record or {}, whether its current version has a file) to look up
+    when its details were replaced or a file added, else None."""
     material, stored, checked_by, filled, title, evidence = found
     step["material_id"] = material
     changed = False
@@ -713,7 +713,12 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
         version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
         step["version"] = True
     step["outcome"] = "updated" if changed or step["version"] else "unchanged"
-    return (material, version, csl, step["version"]) if (changed or step["version"]) and version is not None else None
+    if not (changed or step["version"]) or version is None:
+        return None
+    # Looked up again whenever its record or its file changed: by the record's identifier, else by the
+    # text of the file it has (a lookup's fields were cleared with the record it completed).
+    has_file = conn.execute("SELECT file_sha256 IS NOT NULL FROM material_versions WHERE id = ?", (version,)).fetchone()[0]
+    return material, version, csl or {}, bool(has_file)
 
 
 def _new(conn, harness, project_id, inputs, key, source_key, csl, sha256, step, recorded):

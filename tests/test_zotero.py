@@ -943,3 +943,36 @@ async def test_a_changed_or_dropped_archive_id_takes_the_old_resolution_with_it(
         await background_idle(client, 30)
         paper = (await papers(client, project))["users/0/items/ARXV2222"]
         assert paper["resolved_at"] is None and paper["csl"].get("arxiv") == (later and later.removeprefix("arXiv:"))
+
+
+# Internal review 4
+
+
+async def test_a_reimport_with_no_title_and_a_new_pdf_keeps_the_details_and_adds_the_file(tmp_path):
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        await imported(client, project, KEYS[1:2])
+        mock.items["users/0", KEYS[1]]["csljson"]["title"] = "   "
+        pdf_file(tmp_path, "two.pdf", "A Changed File", doi=None)
+        row = await imported(client, project, KEYS[1:2])
+        assert (row["status"], row["result"]["updated"], row["result"]["versions"]) == ("succeeded", 1, 1)
+        assert (await papers(client, project))[f"users/0/items/{KEYS[1]}"]["title"] == "合成数据中的最低工资"
+
+
+async def test_a_record_change_looks_a_pdf_identified_paper_up_again(tmp_path):
+    mock = MockZotero()
+    mock.item("PDFD2222", "A Record Without Its DOI", pdf=pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI",
+                                                                   doi=DOI))
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Resolved From the PDF", venue="Journal of PDFs")})
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=records)) as client:
+        project = await project_of(client)
+        await imported(client, project, ["PDFD2222"])
+        await background_idle(client, 60)
+        assert (await papers(client, project))["users/0/items/PDFD2222"]["csl"]["container-title"] == "Journal of PDFs"
+        mock.items["users/0", "PDFD2222"]["csljson"]["title"] = "A Record Without Its DOI, Retitled"
+        assert (await imported(client, project, ["PDFD2222"]))["result"]["updated"] == 1
+        await background_idle(client, 60)
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert paper["title"] == "A Record Without Its DOI, Retitled" and paper["csl"]["container-title"] == "Journal of PDFs"
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(2,)]
