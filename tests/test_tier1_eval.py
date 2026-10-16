@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -534,6 +535,8 @@ def test_the_committed_baseline_is_a_finished_full_run_of_all_five_with_ids_only
         assert (bench["keys"] is not None) == manifest["benchmarks"][name]["ids_committable"], name
         assert all(entry["complete"] and entry["metrics"] for entry in bench["arms"].values()), name
         assert bench["query_language"] == bench["document_language"] == "en"
+        if identical := manifest["benchmarks"][name]["rules"].get("identical_documents"):  # the run's count
+            assert bench["documents_sharing_a_file"] == int(identical.split()[0]), name
     one = {**baseline, "benchmarks": {"nfcorpus": baseline["benchmarks"]["nfcorpus"]}}  # one, to be quick
     assert all(line.startswith(("nfcorpus", "  ")) for line in tier1.compare(manifest, one, one))
 
@@ -634,3 +637,25 @@ def test_a_documents_file_carries_its_title_so_only_identical_documents_share_on
     assert tier1.document_file("", "Only text.") == ("Untitled.md", b"Only text.\n")
     assert tier1.document_file("", "") is None
     assert b"d1" not in tier1.document_file("Coral bleaching", "Coral reefs bleach.")[1]  # no id in the file
+
+
+@pytest.mark.asyncio
+async def test_identical_documents_rank_together_and_a_document_named_like_the_query_is_dropped(tmp_path, monkeypatch):
+    """d1 and d6 are one file (title and text identical): both credited, at consecutive ranks. d2 and d4 share
+    their text, not their title: two papers, two ranks; the query named d2 drops d2, so d4 is first."""
+    queries = [("q1", "coral reefs bleach ocean temperatures", {"d1": 1, "d6": 1}),
+               ("d2", "drought wheat yields", {"d4": 1})]
+    monkeypatch.setattr(sys.modules[__name__], "QUERIES", queries)
+    _, _, running = await _run(tmp_path, ["scifact"])
+    results = await running
+    for arm in ("hybrid", "keyword_only"):
+        scores = results["benchmarks"]["scifact"]["arms"][arm]["scores"]
+        assert scores["ndcg@10"] == [1.0, 1.0] and scores["recall@10"] == [1.0, 1.0], arm
+
+
+def test_the_rules_hash_ignores_the_levels_only_and_an_older_file_is_judged_by_its_whole_manifest():
+    manifest = tier1.load_manifest()
+    assert tier1.rules_sha256({**manifest, "levels": {}}) == tier1.rules_sha256(manifest)
+    assert tier1.rules_sha256({**manifest, "search_limit": 49}) != tier1.rules_sha256(manifest)
+    assert tier1.rules_of({"manifest_rules_sha256": "r", "manifest_sha256": "m"}) == "r"
+    assert tier1.rules_of({"manifest_sha256": "m"}) == "m"  # predates the rules hash: never like a newer run
