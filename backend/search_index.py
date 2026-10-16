@@ -301,7 +301,7 @@ class SearchIndex:
         self._readers = queue.SimpleQueue()  # idle read connections
         self._generation = 0  # a replaced file's readers are closed, not used again
         self._lock = threading.Lock()
-        self._reading = 0  # reads in progress, admitted under _lock; close() waits for none
+        self._reading = 0  # reads in progress, admitted under _lock; close(), a whole rebuild and a discard wait for none (_quiet)
         self._read_failures = []  # read connections a read could not close, under _lock: the close's failure
         self._reads_done = threading.Condition(self._lock)
         self._close_error = None  # what made close() fail, if it did: raised to every later close() too
@@ -341,8 +341,8 @@ class SearchIndex:
             raise
 
     def _read(self, fn):
-        """fn(conn) on an idle read connection, in one read transaction. Refused (Unavailable) while a whole rebuild
-        is asked for or under way, or after one failed. Admitted, given its connection (an idle one, or a new one to
+        """fn(conn) on an idle read connection, in one read transaction. Refused (Unavailable) from the moment damage
+        is found or a whole rebuild is asked for, while one is under way, or after one failed. Admitted, given its connection (an idle one, or a new one to
         the file as it is then), and that connection given back to the idle ones, all under _lock: so a file that
         replaces this one, or its removal, waits for the reads admitted before (_quiet), and no read admitted before
         reaches a file made after; close() refuses later reads, waits for these, then closes what they gave back."""
@@ -551,7 +551,9 @@ class SearchIndex:
         """A file that may hold text a deletion since has removed from the main database goes: a failed
         whole rebuild's partial file (the index stays unusable, building, until a rebuild succeeds), or, as
         the index closes, an unfinished rebuild's. Every step is tried whatever the others meet; the first
-        failure is raised after (as the index closes, the close then fails, and the next open purges the file)."""
+        failure is raised after (as the index closes, the close then fails, and the next open purges the file). No
+        read is admitted from its start, and it waits for the reads admitted before (_quiet) before it closes or
+        removes anything."""
         with self._lock:
             self.unusable = True  # no read admitted from here
         self._quiet()  # nor any still running on the file it removes
@@ -601,7 +603,8 @@ class SearchIndex:
         then brings in what changed meanwhile (the caller's next pass). Readers never make the file
         (connect), so the new one is this writer's, owner-only.
         Returns whether it finished (else the index closed meanwhile). One that raises leaves building
-        set: the caller discards its file."""
+        set: the caller discards its file. No read is admitted from its start, and it waits for the reads
+        admitted before (_quiet) before it closes, removes or makes any file."""
         with self._lock:
             self.building = True  # no read admitted from here
         if self.closed:

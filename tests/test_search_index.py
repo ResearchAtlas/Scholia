@@ -2043,3 +2043,41 @@ async def test_a_read_after_damage_is_found_is_refused_at_once(tmp_path, monkeyp
         with pytest.raises(search_index.Unavailable):
             await asyncio.to_thread(index.keyword, project, "wage", 5)
         index.building = index.damaged = False  # as no rebuild ran, for the app's close
+
+
+@pytest.mark.parametrize("replacing", ["rebuild", "discard"])
+@pytest.mark.asyncio
+async def test_a_rebuild_or_discard_waits_for_the_reads_admitted_before_it(tmp_path, replacing):
+    """PR 29 recheck 6, review 8 P3-1: a read still running as a whole rebuild (damage found) or a discard of the
+    file begins: the file is neither removed nor replaced, nor its connection closed, until that read has ended."""
+    import os
+    import threading
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        reading, go, seen = threading.Event(), threading.Event(), []
+
+        def slow(conn):
+            reading.set()
+            go.wait(20)
+            return conn.execute("SELECT value FROM index_meta WHERE key = 'state'").fetchone()
+        reader = threading.Thread(target=lambda: seen.append(index._read(slow)))
+        reader.start()
+        assert await asyncio.to_thread(reading.wait, 10)
+        inode, conn = os.stat(index.path).st_ino, index._conn
+        if replacing == "rebuild":
+            await asyncio.to_thread(index._damaged)
+        else:
+            index._writer.submit(index._discard)
+        await asyncio.sleep(0.5)  # its chance to remove or replace the file under the read
+        assert os.stat(index.path).st_ino == inode and index._conn is conn  # waiting
+        go.set()
+        await asyncio.to_thread(reader.join, 10)
+        assert seen == [("ready",)]
+        if replacing == "rebuild":
+            await asyncio.wait_for(_until(lambda: not index.building), 20)
+            assert os.stat(index.path).st_ino != inode  # then replaced
+        else:
+            await asyncio.wait_for(_until(lambda: not index.path.exists()), 20)  # then removed
