@@ -265,7 +265,9 @@ async def test_a_restore_reopens_the_index_against_the_restored_database_and_reb
 
 
 @pytest.mark.asyncio
-async def test_a_read_during_a_rebuild_never_makes_the_file_and_the_rebuilt_file_is_owner_only(tmp_path):
+async def test_a_read_during_a_rebuild_never_makes_the_file_and_the_rebuilt_file_is_owner_only(tmp_path, monkeypatch):
+    """A read that finds the file gone never makes it (only the writer's rebuild does, owner-only); it asks for that
+    rebuild (PR 29 recheck 8: a missing file is damaged), which runs here once the read is refused."""
     async with app(tmp_path) as client:
         project = await project_of(client)
         await added(client, project, WAGES)
@@ -276,9 +278,12 @@ async def test_a_read_during_a_rebuild_never_makes_the_file_and_the_rebuilt_file
         for suffix in ("", "-wal", "-shm"):
             Path(f"{path}{suffix}").unlink(missing_ok=True)
         index._close_readers()
+        asked = []
+        monkeypatch.setattr(SearchIndex, "_rebuild_soon", lambda self, then=None: asked.append(True))
         with pytest.raises(Exception):  # as a read landing while the file is replaced: refused, the file not made
             await asyncio.to_thread(index.counts, project)
-        assert not path.exists()
+        assert not path.exists() and asked == [True]  # the read made nothing, and asked for the rebuild
+        monkeypatch.undo()
         await asyncio.to_thread(index._write, index._rebuild_all)
         assert stat.S_IMODE(path.stat().st_mode) == 0o600 and len(await index_rows(client, project)) == 4
         found = (await client.post(f"/api/projects/{project}/search", json={"query": "earnings"})).json()

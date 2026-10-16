@@ -684,8 +684,8 @@ class SearchIndex:
         """A read or a pass found the file damaged: it is replaced and rebuilt in the writer, once, and its
         vectors are wanted again (self.rebuilt), as when a launch rebuilds it."""
         with self._lock:
-            if self.damaged or self.closed or self.building:  # a rebuild asked for or under way makes a new file anyway
-                return
+            if self.damaged or self.closed or (self.building and not self.unusable):  # a rebuild asked for or under
+                return  # way, not failed, makes a new file anyway (one that failed, its retry waiting, is asked again)
             self.damaged = self.building = True  # no read admitted from here (the rebuild sets it too)
         log.warning("the search index is damaged; it is rebuilt")
         self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
