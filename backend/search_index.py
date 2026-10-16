@@ -351,12 +351,19 @@ class SearchIndex:
                 raise DatabaseClosedError("the search index is closed")
             if self.unusable or self.building:  # a whole rebuild asked for or under way: the old file, never purged,
                 raise Unavailable()               # is not read; nor a partial one (fail closed, as an unusable file)
-            generation = self._generation
+            generation, damaged = self._generation, False
             try:
                 conn = self._readers.get_nowait()
             except queue.Empty:
-                conn, _ = self._connect()
-            self._reading += 1
+                try:
+                    conn, _ = self._connect()
+                except (*DAMAGE, apsw.NoFTS5Error):  # a damaged file (its header may fail the tokenizer's registration)
+                    damaged = True
+            if not damaged:
+                self._reading += 1
+        if damaged:  # replaced and rebuilt, as for a read that finds it so (after the lock: _damaged takes it)
+            self._damaged()
+            raise Unavailable()
         try:
             try:
                 with conn:

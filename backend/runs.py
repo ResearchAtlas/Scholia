@@ -306,6 +306,9 @@ class Harness:
         # work began; S1-17: a project's index run, asked for again while it ran, runs once more).
         self.endings = {}
         self._tasks = set()  # detached tasks, kept referenced until they finish
+        # Index runs a kick started again after they were left running unheld (a terminal write that failed): once
+        # each, so a failure that lasts never makes a loop of them (the next trigger, Retry or launch takes it then)
+        self._started_again = set()
         # Orders settings saves with the budget reads of call admission: a lowered budget either
         # lands before a call reads it or after that call was admitted.
         self.settings_lock = asyncio.Lock()
@@ -905,6 +908,7 @@ class Harness:
 
     async def _background(self, active: ActiveRun) -> None:
         active.started = True
+        index_run = False  # S1-17's index run: started again once if it is left running (see finally)
         try:
             if active.cancel_requested.is_set():  # stopped before it began
                 raise asyncio.CancelledError()
@@ -921,6 +925,7 @@ class Harness:
                     lambda conn: self._finish_background(conn, active, "cancelled", None, inputs)))
                 return
             if workflow in self.workflows:  # it returns once its terminal record has committed
+                index_run = workflow == "index"
                 await self._ended(active, self._local(active, project_id, workflow, inputs))
                 return
             inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
@@ -966,6 +971,14 @@ class Harness:
             # running in the record: left for the next start, or by a terminal write that raised, which
             # reads interrupted from here on. At no moment does a finished run read interrupted.
             self.registry.release(active)
+            if (index_run and active.run_id not in self.registry.finished and not active.cancel_requested.is_set()
+                    and not self.registry.closed and active.run_id not in self._started_again):
+                # An index run left running in its record, held by no process (its terminal write failed): a kick
+                # starts it again in this session, once, so what it was asked to do (a rerun marked on it included) is
+                # never left waiting for an unrelated trigger or the next launch. Other runs keep their own rules (a
+                # reading so left reads interrupted, with Retry; a model call's run waits for the next start).
+                self._started_again.add(active.run_id)
+                self._detach(self.kick_background())
             if active.follows:  # recorded mid-run by writes that committed (a run with no row ends at its start)
                 if self.registry.closed:
                     for held in active.follows:
@@ -1056,14 +1069,16 @@ class Harness:
         active.task = asyncio.create_task(self._background(active))
         return run_id
 
-    async def record_background(self, count, write):
+    async def record_background(self, count, write, committed=None):
         """Record new background runs in one transaction and start them. write(conn, ids) gets count
         fresh run ids, records the runs it needs under some of them, and returns (result, the ids it
         used). Each id is held in the registry before the transaction commits, and the runs recorded
         start as soon as it has, so no read ever finds one running in the record and not held here
         (which reads as interrupted). The ids it did not use are released inside the transaction.
-        Returns the result; a cancellation of the caller waits for the transaction (see _through),
-        starts the runs, and is raised after."""
+        committed(result), if given, is a coroutine run once the transaction has committed, whatever
+        happens to the caller after (a detached task: S1-17's start of a run a request was answered
+        with); it is awaited unless the caller was cancelled. Returns the result; a cancellation of the
+        caller waits for the transaction (see _through), starts the runs and committed, and is raised after."""
         actives = [self.registry.add_background(new_id()) for _ in range(count)]
         if None in actives:
             for active in actives:
@@ -1085,8 +1100,11 @@ class Harness:
         for active in actives:
             if active.run_id in used:
                 active.task = asyncio.create_task(self._background(active))
+        after = self._detach(committed(result)) if committed is not None else None
         if cancelled:
             raise asyncio.CancelledError()
+        if after is not None:
+            await asyncio.shield(after)
         return result
 
     async def work(self, active, fn):

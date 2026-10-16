@@ -1358,7 +1358,8 @@ async def retry_run(run_id: str, request: Request):
 
     def again(conn, ids):
         row = conn.execute("SELECT json_extract(inputs, '$.retried_by') FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if row is not None and row[0] is not None:
+        if row is not None and row[0] is not None:  # tried again already: that run, started if no process holds it
+            answered.append(row[0])
             return row[0], []
         registry = state["harness"].registry
         retry, refusal = _retry(conn, run_id, registry)
@@ -1388,11 +1389,12 @@ async def retry_run(run_id: str, request: Request):
         return retried, [ids[0]] if retried == ids[0] else []
 
     registry, answered = state["harness"].registry, []
-    try:
-        retried = await state["harness"].record_background(1, again)
-        if answered:  # one no process holds (a failed terminal write left it running) starts now (search._started)
+
+    async def started(retried):  # once the Retry has committed, whatever becomes of its request (record_background)
+        if answered:  # a run it did not record, which no process may hold (a failed terminal write left it running)
             await search._started(state["harness"], retried)
-        return {"run_id": retried}
+    try:
+        return {"run_id": await state["harness"].record_background(1, again, committed=started)}
     except BaseException:
         # A Retry refused or failed leaves the run as it was, for a kick or a resume to start again. One whose
         # retry committed is never started again whatever this undoes (retried_by, its record interrupted).

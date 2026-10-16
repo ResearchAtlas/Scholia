@@ -1733,7 +1733,8 @@ async def test_the_index_status_shows_the_latest_run_over_an_older_one_left_runn
 
 async def _interrupted_with_a_rebuild_pending(client, monkeypatch):
     """A project's run whose terminal write failed (left running, held by no process: it reads interrupted) with a
-    Rebuild pending (the app with batch=1): (project, run)."""
+    Rebuild pending (the app with batch=1): (project, run). Its one start again in the session (Harness, after a
+    failed terminal write) fails the same way, so it is left so."""
     from backend.runs import Harness
     real = Harness._finish_local
     project = await project_of(client)
@@ -1749,6 +1750,11 @@ async def _interrupted_with_a_rebuild_pending(client, monkeypatch):
         return real(self, conn, active, status, cancel_reason, summary, effect)
     monkeypatch.setattr(Harness, "_finish_local", failing)
     client.remote.hold.set()
+    harness = client.state["harness"]
+    deadline = asyncio.get_running_loop().time() + 20
+    while not (run in harness._started_again and not harness.registry.is_active(run)):
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.02)
     assert (await run_finished(client, run))["status"] == "interrupted"
     monkeypatch.setattr(Harness, "_finish_local", real)
     client.remote.hold = None
@@ -1776,10 +1782,10 @@ async def test_a_request_after_a_failed_terminal_write_marks_that_run_and_a_kick
         await added(client, project, paper("Later", "A later paragraph."))
         await _readings_done(client, project)
         assert await _running_index_runs(client, project) == [run] and await _pending(client, run) == {"rebuild": True}
-        harness = client.state["harness"]
+        harness, starts = client.state["harness"], started_for.count(run)
         await harness.kick_background()
         await harness.kick_background()  # a second kick holds nothing more
-        assert await _running_index_runs(client, project) == [run] and started_for.count(run) == 2
+        assert await _running_index_runs(client, project) == [run] and started_for.count(run) == starts + 1
         assert (await run_finished(client, run))["status"] == "succeeded"
         [rerun] = [r for r in await runs_of(client, "index", project) if r["run_id"] != run]
         assert (rerun["rebuild"], (await run_finished(client, rerun["run_id"]))["status"]) == (True, "succeeded")
@@ -2002,3 +2008,98 @@ async def test_the_index_status_names_the_rebuild_a_run_recorded_and_the_run_it_
         assert (await client.get(f"/api/projects/{project}/index")).json()["last_rebuild"]["run_id"] == later
         found = (await client.get(f"/api/projects/{project}/index", params={"after": run})).json()["last_rebuild"]
         assert (found["run_id"], found["after"]) == (last["run_id"], run)
+
+
+
+# PR 29 recheck 7 and connector threads 4283763992, 4283764003, 4296864820: a run left running is always started again
+
+
+async def test_an_index_run_whose_terminal_write_fails_once_is_started_again_and_runs_its_rerun(tmp_path, monkeypatch):
+    """Thread 4283763992: a request marks the project's run just before that run's terminal write fails. The harness,
+    releasing the run it no longer holds, starts it again in the session (once), with no other trigger, so the rerun
+    the request asked for runs."""
+    from backend.runs import Harness
+    real, failed = Harness._finish_local, []
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        assert (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"] == run  # marked
+
+        def failing_once(self, conn, active, status, cancel_reason, summary, effect=None):
+            if active.run_id == run and not failed:
+                failed.append(True)
+                raise OSError("the disk is full")
+            return real(self, conn, active, status, cancel_reason, summary, effect)
+        monkeypatch.setattr(Harness, "_finish_local", failing_once)
+        client.remote.hold.set()
+        deadline = asyncio.get_running_loop().time() + 20
+        while (await rows(client, "SELECT status FROM runs WHERE id = ?", run)) != [("succeeded",)]:
+            assert asyncio.get_running_loop().time() < deadline  # started again on its own: no kick, no trigger
+            await asyncio.sleep(0.05)
+        assert failed
+        [rerun] = [r["run_id"] for r in await runs_of(client, "index", project) if r["run_id"] != run]
+        ended = await run_finished(client, rerun)
+        assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
+
+
+async def test_a_request_cancelled_after_its_commit_still_starts_the_run_it_was_answered_with(tmp_path):
+    """Threads 4283764003 and 4296864820: a request (as a Rebuild's, a Retry's or a trigger's) whose caller is
+    cancelled after its transaction commits: the run it was answered with, held by no process, is started all the
+    same, since the start runs once the write has committed, whatever becomes of the request."""
+    import threading
+    import backend.search as search
+    from backend.db import Database
+    from backend.search import _insert_run
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        stale = await asyncio.to_thread(client.state["db"].write, lambda conn: _insert_run(conn, None, project, {}))
+        harness = client.state["harness"]
+        real_write, entered, go = Database.write, threading.Event(), threading.Event()
+
+        def write(self, fn):
+            if "record_background" in fn.__qualname__ and not entered.is_set():
+                entered.set()
+                go.wait(10)
+            return real_write(self, fn)
+        Database.write = write
+        try:
+            request = asyncio.ensure_future(search._request(harness, project))
+            assert await asyncio.to_thread(entered.wait, 10)
+            request.cancel()  # the caller goes before its write has run; the write still commits
+            go.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+        finally:
+            Database.write = real_write
+        deadline = asyncio.get_running_loop().time() + 20
+        while await rows(client, "SELECT status FROM runs WHERE id = ?", stale) != [("succeeded",)]:
+            assert asyncio.get_running_loop().time() < deadline  # started all the same, and ran to its end
+            await asyncio.sleep(0.02)
+
+
+async def test_a_retry_pressed_again_starts_the_run_it_was_answered_with_if_no_process_holds_it(tmp_path):
+    """Thread 4283764003: a second Retry of a run that was tried again already answers with the stored run, and
+    starts it if no process holds it (its first start was lost), instead of leaving it waiting."""
+    from backend.search import _insert_run
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+
+        def tried(conn):
+            newer = _insert_run(conn, None, project, {})
+            old = _insert_run(conn, None, project, {})
+            conn.execute("UPDATE runs SET status = 'failed', finished_at = ?, inputs = json_set(inputs, '$.retried_by', ?)"
+                         " WHERE id = ?", ("2026-10-17T00:00:00.000Z", newer, old))
+            return old, newer
+        old, newer = await asyncio.to_thread(client.state["db"].write, tried)
+        assert not client.state["harness"].registry.is_active(newer)
+        answer = await client.post(f"/api/runs/{old}/retry")
+        assert answer.status_code == 201 and answer.json()["run_id"] == newer
+        assert client.state["harness"].registry.is_active(newer)
+        assert (await run_finished(client, newer))["status"] == "succeeded"

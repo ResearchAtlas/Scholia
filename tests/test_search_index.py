@@ -10,6 +10,7 @@ import json
 import os
 import re
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -2081,3 +2082,32 @@ async def test_a_rebuild_or_discard_waits_for_the_reads_admitted_before_it(tmp_p
             assert os.stat(index.path).st_ino != inode  # then replaced
         else:
             await asyncio.wait_for(_until(lambda: not index.path.exists()), 20)  # then removed
+
+
+
+@pytest.mark.parametrize("error", ["CorruptError", "NotADBError", "NoFTS5Error"])
+@pytest.mark.asyncio
+async def test_a_read_whose_connection_cannot_open_on_a_damaged_file_has_it_rebuilt(tmp_path, monkeypatch, error):
+    """PR 29 recheck 7: with no idle connection, the read's own connection meets a damaged file (as SQLite says it,
+    or as the tokenizer's registration fails on a corrupt header): the read is refused as unavailable, and the
+    file is replaced and rebuilt, as for a read that finds it damaged."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        while not index._readers.empty():
+            index._readers.get_nowait().close()
+        real, failed = SearchIndex._connect, []
+
+        def connect(self):
+            if not failed and threading.current_thread() is not None and self._writer_ident != threading.get_ident():
+                failed.append(True)
+                raise getattr(search_index.apsw, error)("damaged")
+            return real(self)
+        monkeypatch.setattr(SearchIndex, "_connect", connect)
+        with pytest.raises(search_index.Unavailable):
+            await asyncio.to_thread(index.keyword, project, "wage", 5)
+        assert failed and index.damaged
+        await asyncio.wait_for(_until(lambda: not index.building), 20)
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)  # rebuilt, read again

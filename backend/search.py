@@ -230,13 +230,14 @@ async def _request(harness, project_id, rebuild=False):
         run_id = request_run(conn, project_id, lambda conn, project, inputs: _insert_run(conn, ids[0], project, inputs),
                              rebuild)
         return run_id, [ids[0]] if run_id == ids[0] else []
-    return await _started(harness, await harness.record_background(1, write))
+    return await harness.record_background(1, write, committed=lambda run_id: _started(harness, run_id))
 
 
 async def _started(harness, run_id):
     """The run a request was answered with, started if no process holds it (one a failed terminal write left
     running in its record, which reads interrupted): a kick starts it, so the request's work and its rerun are
-    not left waiting for the next turn's end. Returns run_id."""
+    not left waiting for the next turn's end. Run by record_background once the request has committed, whatever
+    happens to the request after (committed). Returns run_id."""
     if run_id is not None and not harness.registry.is_active(run_id):
         await harness.kick_background()
     return run_id
@@ -682,5 +683,5 @@ async def rebuild(project_id: str, request: Request):
         (inputs,) = conn.execute("SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
         return (run_id, not json.loads(inputs or "{}").get("rebuild")), [ids[0]] if run_id == ids[0] else []
 
-    run_id, pending = await harness.record_background(1, record)
-    return {"run_id": await _started(harness, run_id), "rebuild_pending": pending}
+    run_id, pending = await harness.record_background(1, record, committed=lambda result: _started(harness, result[0]))
+    return {"run_id": run_id, "rebuild_pending": pending}
