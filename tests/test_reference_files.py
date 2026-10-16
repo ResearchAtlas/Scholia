@@ -240,8 +240,20 @@ def test_a_doi_is_its_fields_own_text_whole(data, doi):
     "@misc{k, title={T}, doi={10.5555/example\ngarbage}}",
     # anything around it but spaces, tabs and line ends; no prefix, no escape, no other script (finding 13)
     json.dumps([{"title": "T", "DOI": "10.5555/example."}]),
-    json.dumps([{"title": "T", "DOI": "https://doi.org/10.5555/example"}]),
-    json.dumps([{"title": "T", "DOI": "doi:10.5555/example"}]),
+    # prefixes not among the four approved (Harold, 2026-10-17), or one followed by anything not a DOI
+    json.dumps([{"title": "T", "DOI": "https://doi.org.evil/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "doi.org/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "http://dx.doi.org/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://www.doi.org/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/10.5555/example junk"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/ 10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org//10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/doi:10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/10.5555/example."}]),
+    json.dumps([{"title": "T", "DOI": "doi\u0131:10.5555/example"}]),  # a dotless i is no "doi:"
+    json.dumps([{"title": "T", "DOI": "doi\u00a0:10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "urn:doi:10.5555/example"}]),
+    r"@misc{k, title={T}, doi={https://doi.org/10.1000/ab\_c}}",
     json.dumps([{"title": "T", "DOI": "\u000010.5555/example"}]),
     json.dumps([{"title": "T", "DOI": "10.5555/example\u001f"}]),
     "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\x1f\nER  - \n",
@@ -274,6 +286,34 @@ def test_a_url_holding_a_control_character_is_left_out_and_counted(c):
 def test_an_endnote_tag_needs_its_space():
     [record], skipped, _ = parse("%0 Journal Article\n%T T\n%R10.5555/abc\n")
     assert "DOI" not in record and record["title"] == "T %R10.5555/abc" and skipped == {}  # text of the title
+
+
+@pytest.mark.parametrize("prefix", ["https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:", "doi: ",
+                                    "DOI:\t", "HTTPS://DOI.ORG/", "Https://Dx.Doi.Org/"])
+@pytest.mark.parametrize("form", [
+    lambda doi: f"TY  - JOUR\nTI  - T\nDO  - {doi}\nER  - \n",  # RIS
+    lambda doi: f"%0 Journal Article\n%T T\n%R {doi}\n",  # EndNote
+    lambda doi: "{Reference Type}: Journal Article\n{Title}: T\n{DOI}: " + doi + "\n",  # NoteExpress
+    lambda doi: "@misc{k, title={T}, doi={" + doi + "}}",  # BibTeX
+    lambda doi: json.dumps([{"title": "T", "DOI": doi}]),  # CSL JSON
+])
+def test_a_doi_after_one_of_the_four_approved_prefixes_is_that_doi(prefix, form):
+    [record], skipped, _ = parse(form(prefix + "10.5555/Example"))
+    assert (record["DOI"], rf.identifier(record), skipped) == ("10.5555/example", ("doi", "10.5555/example"), {})
+
+
+@pytest.mark.parametrize("near", ["https://doi.org.evil/", "doi.org/", "http://dx.doi.org/", "urn:doi:"])
+@pytest.mark.parametrize("form", [
+    lambda doi: f"TY  - JOUR\nTI  - T\nDO  - {doi}\nER  - \n",  # RIS
+    lambda doi: f"%0 Journal Article\n%T T\n%R {doi}\n",  # EndNote
+    lambda doi: "{Reference Type}: Journal Article\n{Title}: T\n{DOI}: " + doi + "\n",  # NoteExpress
+    lambda doi: "@misc{k, title={T}, doi={" + doi + "}}",  # BibTeX
+])
+def test_a_doi_after_any_other_prefix_is_left_out_and_counted_in_every_format(near, form):
+    [record], skipped, _ = parse(form(near + "10.5555/example"))
+    assert "DOI" not in record and rf.identifier(record) is None and skipped == {"invalid_field": 1}
+    [record], skipped, _ = parse(form("https://doi.org/10.5555/example junk"))  # an approved one, then junk
+    assert "DOI" not in record and skipped == {"invalid_field": 1}
 
 
 @pytest.mark.parametrize("eprint, arxiv", [("2101.00001", "2101.00001"), ("2101.00001v2", "2101.00001v2"),
@@ -618,3 +658,83 @@ def test_a_run_of_spaces_after_an_at_sign_is_read_as_one():
 def test_marks_inside_values_never_refuse_a_file_within_the_record_bound():
     entry = "@article{k%d, title={T}, author={LeQua @ {CLEF}}}\n"  # bibtexparser's own example of an @ in a value
     assert len(parse("".join(entry % i for i in range(rf.MAX_RECORDS)))[0]) == rf.MAX_RECORDS
+
+
+# The S1-14 follow-up (recheck 5's finding 20, recheck 7's finding 23, the connector's threads)
+
+
+@pytest.mark.parametrize("make", [
+    lambda notes: "TY  - JOUR\nTI  - T\n" + notes("N1  - n\n") + "DO  - 10.5555/late\nER  - \n",  # RIS
+    lambda notes: "%0 Journal Article\n%T T\n" + notes("%Z n\n") + "%R 10.5555/late\n",  # EndNote
+    lambda notes: "{Reference Type}: Journal Article\n{Title}: T\n" + notes("{Notes}: n\n") + "{DOI}: 10.5555/late\n",
+])
+def test_fields_past_a_records_line_bound_are_counted_never_lost_silently(make):
+    [record], skipped, _ = parse(make(lambda line: line * (rf.RECORD_LINES - 2)))  # the record full, then its DOI
+    assert "DOI" not in record and skipped == {"past_record_bound": 1}  # the bound holds; what it leaves out is said
+
+
+def test_a_record_refused_by_its_cap_keeps_its_macros_counted():
+    records, skipped = parse("@misc{k, title={" + "t" * (rf.TITLE_CHARS * 4 + 1) + "}, journal=j}\n")[:2]
+    assert records == [] and skipped == {"unreadable": 1, "unsupported_macro": 1}
+
+
+@pytest.mark.parametrize("value, title", [
+    ('"Schr\\"odinger"', "Schrödinger"),  # an escaped quote ends nothing
+    ("{Set \\{ notation}", "Set { notation"),  # an escaped brace opens nothing
+    ("{Set \\} notation}", "Set } notation"),  # nor closes
+    ("{a \\\\\\{ b}", "a { b"),  # an odd run: escaped by both rules
+    ("{Tab \\\\{x}}", None),  # an escaped backslash, then a brace that counts: bibtexparser's split differs
+    ('"a \\\\" b"', None),
+])
+def test_escaped_delimiters_in_a_bibtex_value(value, title):
+    records, skipped = parse(f"@misc{{k, title = {value}, year = {{2020}}}}\n")[:2]
+    assert [r["title"] for r in records] == ([title] if title else [])
+    assert skipped == ({} if title else {"unreadable": 1})  # never kept without the fields the split lost
+
+
+@pytest.mark.parametrize("fields", [
+    r"abstract={x} \, year={2020}",  # internal review: a backslash hides a comma from the parser's split
+    r"author={Doe, J}\, year={2020}", r"doi={10.1234/x}\, year={2020}", r"abstract=foo\, year={2020}",
+    r"title2={x},\, author={Doe, J}, year={2020}",  # a field name no field has
+    r"abstract={x} year={2020}",  # a comma missing: one value ran into the next field
+    r'abstract="a {b", year={2020}',  # a part left unclosed
+])
+def test_a_record_whose_split_our_reading_does_not_account_for_is_refused(fields):
+    records, skipped = parse(f"@misc{{k, title={{T}}, {fields}}}\n")[:2]
+    assert records == [] and skipped == {"unreadable": 1}
+
+
+@pytest.mark.parametrize("text", [r"@misc{k\, title\= foo, year={2020}}", r"@misc{k\, title, year={2020}}"])
+def test_a_cite_key_that_swallows_a_field_refuses_its_record(text):  # the internal recheck of PR 35's batch 1
+    records, skipped = parse(text)[:2]
+    assert records == [] and skipped == {"unreadable": 1}
+
+
+@pytest.mark.parametrize("fields", ["note={a, b = c}", "journal = Nature Reviews", "bdsk-url-1={x}", "date-added={2020}"])
+def test_commas_and_equals_inside_a_value_and_ordinary_field_names_are_read(fields):
+    [record], skipped = parse(f"@misc{{k, title={{T}}, {fields}, year={{2020}}}}\n")[:2]
+    assert record["issued"] == {"date-parts": [[2020]]} and "unreadable" not in skipped
+
+
+@pytest.mark.parametrize("field", ["abstract", "author", "keywords", "title", "note"])
+def test_a_record_where_the_parsers_split_and_ours_differ_is_refused_never_kept_short(field):
+    # review 1 of PR 35: bibtexparser ends {Tab \\{x} where its own rule says, and the year is lost after it
+    records, skipped = parse(f"@misc{{k, title={{T}}, {field}={{Tab \\\\{{x}}}}, year={{2020}}}}\n")[:2]
+    assert records == [] and skipped == {"unreadable": 1}
+
+
+def test_escaped_braces_in_keywords_are_text():
+    [record], _ = parse("@misc{k, title={T}, keywords={Set \\{ a, b, c}}")[:2]
+    assert record["keyword"] == "Set { a, b, c"
+
+
+def test_an_escaped_delimiter_in_an_identifiers_value_is_inside_its_outer_delimiters():
+    [record], skipped = parse("@misc{k, title={T}, doi={10.5555/a\\}b}}")[:2]  # the value is 10.5555/a\}b: no DOI
+    assert "DOI" not in record and skipped == {"invalid_field": 1}
+
+
+def test_unreadable_bibtex_blocks_count_toward_the_record_bound(monkeypatch):
+    monkeypatch.setattr(rf, "MAX_RECORDS", 3)
+    entries = "".join(f"@misc{{k{i}, title={{T{i}}}}}\n" for i in range(3))
+    assert parse(entries)[1] == {}  # three records: within the bound
+    assert unreadable(entries + "@article{bad, title={unbalanced, year=2020\n") == "too_many_records"
