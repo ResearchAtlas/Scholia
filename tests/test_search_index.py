@@ -2149,12 +2149,12 @@ async def test_a_healthy_index_another_connection_holds_is_busy_opening_not_dama
 
 
 @pytest.mark.parametrize("where", ["connect", "query"])
-@pytest.mark.parametrize("error", ["BusyError", "LockedError"])
+@pytest.mark.parametrize("error", ["BusyError", "LockedError", "ProtocolError"])
 @pytest.mark.asyncio
 async def test_a_read_that_finds_the_file_busy_or_locked_is_refused_and_nothing_rebuilt(tmp_path, monkeypatch, where,
                                                                                          error):
-    """A read whose new connection, or whose query, finds the file busy or locked is refused, and the index is not
-    replaced (its embeddings stay); the next read is answered."""
+    """A read whose new connection, or whose query, finds the file busy or locked (or a WAL lock race, ProtocolError)
+    is refused, and the index is not replaced (its embeddings stay); the next read is answered."""
     async with app(tmp_path) as client:
         project = await project_of(client)
         await added(client, project, WAGES)
@@ -2303,7 +2303,36 @@ async def test_a_query_vector_of_other_dimensions_is_refused_before_the_read_and
         index = client.state["index"]
         with pytest.raises(ValueError):
             await asyncio.to_thread(index.dense, project, [0.1] * (DIMENSIONS - 1), 5)
+        for k in (-1, 4097):  # nor a k vec0 refuses
+            with pytest.raises(ValueError):
+                await asyncio.to_thread(index.dense, project, [0.1] * DIMENSIONS, k)
         assert not index.damaged and not index.building
+
+
+@pytest.mark.asyncio
+async def test_a_read_connection_without_sqlite_vec_is_refused_not_taken_for_damage(tmp_path, monkeypatch):
+    """Review 11, P2-1: a read's new connection in which sqlite-vec did not load (the index's vectors are there) is
+    refused as unavailable, and not used: its vector read would fail for want of the module, which is not damage."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await until_embedded(client, project)
+        index = client.state["index"]
+        assert index.vectors
+        while not index._readers.empty():
+            index._readers.get_nowait().close()
+        real, plain = SearchIndex._connect, []
+
+        def connect(self):
+            if not plain and self._writer_ident != threading.get_ident():  # a read's, once: no sqlite-vec
+                plain.append(search_index.apsw.Connection(str(self.path)))
+                return plain[0], False
+            return real(self)
+        monkeypatch.setattr(SearchIndex, "_connect", connect)
+        with pytest.raises(search_index.Unavailable):
+            await asyncio.to_thread(index.dense, project, [0.1] * DIMENSIONS, 5)
+        assert plain and not index.damaged and not index.building  # nothing rebuilt
+        assert await asyncio.to_thread(index.dense, project, [0.1] * DIMENSIONS, 5)  # the next read is answered
 
 
 @pytest.mark.asyncio

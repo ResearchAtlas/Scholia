@@ -74,7 +74,8 @@ SCHEMA_VERSION = "1"  # a file of another schema is replaced and rebuilt
 QUEUE_PAGE = 1000  # queue rows applied in one index transaction
 MAX_TERMS = 64  # a query's distinct tokens, at most
 # A failed pass, WAL truncation or whole rebuild is tried again after 1 s, doubling with each failure in a
-# row to at most 60 s (each kind counted apart); a success sets it back to 1 s.
+# row to at most 60 s (each kind counted apart); a success sets it back to 1 s (for a whole rebuild, the first
+# successful read of the file it made: one damaged again before any is not a success).
 RETRY_SECONDS = (1, 60)
 STOP_EVERY = 1000  # rows between a project rebuild's looks at whether its run was stopped
 # Han characters: CJK unified ideographs, extension A, the compatibility ideographs and extensions B on.
@@ -82,7 +83,8 @@ _HAN = "㐀-䶿一-鿿豈-﫿\U00020000-\U0003134f"
 # A run of Han characters, or a run of other letters and digits (combining marks kept with them).
 _RUNS = re.compile(rf"([{_HAN}]+)|(?:[^\W_{_HAN}]|[̀-ͯ])+")
 DAMAGE = (apsw.CorruptError, apsw.NotADBError)  # a file SQLite finds damaged, or not a database
-LOCKED = (apsw.BusyError, apsw.LockedError)  # a file another connection holds: not damage
+# A file another connection holds (ProtocolError: a WAL lock race SQLite gave up retrying): not damage.
+LOCKED = (apsw.BusyError, apsw.LockedError, apsw.ProtocolError)
 
 SCHEMA = f"""
 CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
@@ -119,7 +121,8 @@ class _Stopped(Exception):
 class Unavailable(Exception):
     """Nothing is read from the file now: a whole rebuild of it is asked for or under way (the old file is never
     read unpurged, nor a partial one), or one failed (nothing is read from or written to the partial file until
-    one succeeds; it is tried again, SearchIndex._rebuild_later)."""
+    one succeeds; it is tried again, SearchIndex._rebuild_later), or a file this process rebuilt was found damaged
+    again before any read of it succeeded (the same, SearchIndex._damaged)."""
 
 
 # Tokens
@@ -366,7 +369,10 @@ class SearchIndex:
                 conn = self._readers.get_nowait()
             except queue.Empty:
                 try:
-                    conn, _ = self._connect()
+                    conn, loaded = self._connect()
+                    if self.vectors and not loaded:  # sqlite-vec not loaded in this one: its vector reads would
+                        failed = True                # fail for that, not for the file (refused, not damage)
+                        close_connection(conn)
                 except LOCKED:
                     failed = True
                 except apsw.Error:  # a corrupt header, a missing file, and so on
@@ -684,7 +690,9 @@ class SearchIndex:
         if again:
             log.error("the search index rebuilt by this process is damaged again; it is tried again later")
             try:
-                self._writer.submit(self._give_up)
+                self._writer.submit(self._give_up).add_done_callback(
+                    lambda future: not future.cancelled() and future.exception() is not None and log.error(
+                        "discarding the damaged search index failed (%s)", type(future.exception()).__name__))
             except RuntimeError:  # the writer stopped meanwhile (closing): the close discards the file
                 pass
             return
@@ -977,8 +985,8 @@ class SearchIndex:
         """The nearest embedded passage ids in the project to vector, nearest first (references have none)."""
         if not self.vectors:
             return []
-        if len(vector) != DIMENSIONS:  # refused before the read: an error the read met would be taken for damage
-            raise ValueError(f"a query vector of {len(vector)} dimensions, not {DIMENSIONS}")
+        if len(vector) != DIMENSIONS or not 0 <= limit <= 4096:  # refused before the read (vec0's largest k is 4096):
+            raise ValueError(f"a query of {len(vector)} dimensions for {limit}")  # an error it met would be damage
         return [pid for (pid,) in self._read(lambda conn: conn.execute(
             "SELECT passage_id FROM vec_passages WHERE embedding MATCH ? AND k = ? AND project_id = ? ORDER BY distance",
             (sqlite_vec.serialize_float32(vector), limit, project_id)).fetchall())]
