@@ -892,8 +892,11 @@ class Harness:
         if found.problem:
             return found.problem, None
         window = providers.window(table, route.model, found.window)
-        if window["status"] != "ok":
+        setting = (table.get("windows") or {}).get(route.model) or table.get("default_window")
+        if window["status"] != "ok" or (found.unreported and not setting):  # an endpoint's window is unknown
             return "model_window", None
+        if found.output is not None and found.output < context.MIN_OUTPUT:  # cannot take the least output limit
+            return "route_unsupported", None
         return None, {"window": window["in_use"], "rates": found.rates, "effort": effort,
                       "endpoints": list(found.tags), "row": row, "output": found.output}
 
@@ -907,8 +910,8 @@ class Harness:
         given, is recorded on the finished step, so a run can later finish from the record."""
         if not isinstance(request, context.Request):
             raise TypeError("a model request is built by the context assembler")
-        if request.input_tokens + request.max_tokens > request.window:
-            raise ValueError("a model request must fit its window")
+        if context.serialized_tokens(request.messages, request.tools) + request.max_tokens > request.window:
+            raise ValueError("a model request must fit its window")  # counted again, as it is sent
         if active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         project_id = await self._read(lambda conn: conn.execute(

@@ -222,3 +222,21 @@ async def test_the_window_is_the_smallest_any_reachable_endpoint_accepts(tmp_pat
         assert (step["window"], step["endpoints"], step["max_tokens"]) == (16384, ["big", "small"], 4096)
         # Priced at the highest rate either endpoint publishes: 2e-6 a prompt token, 1.2e-5 an output one.
         assert step["estimate_usd"] == pytest.approx(step["input_tokens"] * 2e-6 + 4096 * 1.2e-5)
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_that_reports_no_window_needs_a_setting_which_never_raises_a_reported_one(tmp_path):
+    # Section 8 and model-route rule 3: with one endpoint at 8,192 and one that reports nothing, the
+    # route is unusable until a window is set, and a larger setting still leaves W at 8,192.
+    model = "google/gemini-3.1-pro-preview"
+    provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 8192}, {"tag": "b"}]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "model_window")
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"],
+                                                "updates": {"providers.openrouter.default_window": 131072}})
+        await send(client, conversation, "hi")
+        [body] = provider.answers
+        assert body["max_tokens"] == 2048  # a quarter of 8,192

@@ -68,7 +68,8 @@ def test_the_dispatch_path_sends_what_the_assembler_built():
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "_call")
     text = ast.unparse(call)
     assert "isinstance(request, context.Request)" in text  # refused otherwise, before anything is sent
-    assert "request.input_tokens + request.max_tokens > request.window" in text  # and one that does not fit
+    assert "context.serialized_tokens(request.messages, request.tools) + request.max_tokens > request.window" \
+        in text  # and one that does not fit, counted again as it is sent
     assert "b.status = 'open'" in text  # an admitted call whose reservation is still open
     adapter = next(node for node in ast.walk(call) if isinstance(node, ast.Call)
                    and isinstance(node.func, ast.Attribute) and node.func.attr == "query_model")
