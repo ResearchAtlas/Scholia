@@ -1974,3 +1974,72 @@ async def test_a_read_connection_whose_close_fails_sets_the_flag_at_once(tmp_pat
             with pytest.raises(search_index.apsw.IOError):
                 await asyncio.to_thread(index._read, replaced)
         assert close_failed() and not index.closed
+
+
+@pytest.mark.asyncio
+async def test_a_read_admitted_before_a_rebuild_never_reaches_the_file_the_rebuild_makes(tmp_path, monkeypatch):
+    """PR 29 recheck 6: a read admitted, its connection not yet made, as damage found elsewhere starts a whole rebuild.
+    The read takes its connection within its admission, and the rebuild waits for the reads admitted before it
+    before it removes the file and makes the new one: the read reads the file it was admitted to (ready), never the
+    new, unfinished one."""
+    import threading
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        while not index._readers.empty():  # the read opens a connection of its own
+            index._readers.get_nowait().close()
+        connecting, go, adding, add_go = threading.Event(), threading.Event(), threading.Event(), threading.Event()
+        reader_thread, real_connect, real_add = [], SearchIndex._connect, SearchIndex._add
+
+        def connect(self):
+            if threading.current_thread() in reader_thread:  # the read, admitted, about to make its connection
+                connecting.set()
+                go.wait(20)
+            return real_connect(self)
+
+        def add(self, project_id, pid, reading):
+            if self.building:  # the rebuild, its new file made, filling it
+                adding.set()
+                add_go.wait(20)
+            return real_add(self, project_id, pid, reading)
+        monkeypatch.setattr(SearchIndex, "_connect", connect)
+        monkeypatch.setattr(SearchIndex, "_add", add)
+        seen = []
+
+        def read():
+            try:
+                seen.append(index._read(lambda conn: conn.execute(
+                    "SELECT value FROM index_meta WHERE key = 'state'").fetchone()))
+            except Exception as error:
+                seen.append(error)
+        reader = threading.Thread(target=read)
+        reader_thread.append(reader)
+        reader.start()
+        assert await asyncio.to_thread(connecting.wait, 10)
+        damage = threading.Thread(target=index._damaged)  # damage found by another read or a pass
+        damage.start()
+        await asyncio.to_thread(adding.wait, 1)  # the rebuild's chance to make its file while the read waits
+        go.set()
+        await asyncio.to_thread(reader.join, 10)
+        add_go.set()
+        await asyncio.to_thread(damage.join, 10)
+        assert seen == [("ready",)]
+        await asyncio.wait_for(_until(lambda: not index.building), 20)
+
+
+@pytest.mark.asyncio
+async def test_a_read_after_damage_is_found_is_refused_at_once(tmp_path, monkeypatch):
+    """PR 29 recheck 6, the _damaged() gap: once damage is found, no read is admitted, even before the rebuild it asks
+    for has been queued."""
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        monkeypatch.setattr(SearchIndex, "_rebuild_soon", lambda self, then=None: None)  # not queued yet
+        await asyncio.to_thread(index._damaged)
+        with pytest.raises(search_index.Unavailable):
+            await asyncio.to_thread(index.keyword, project, "wage", 5)
+        index.building = index.damaged = False  # as no rebuild ran, for the app's close

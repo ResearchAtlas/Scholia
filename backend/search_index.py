@@ -342,20 +342,22 @@ class SearchIndex:
 
     def _read(self, fn):
         """fn(conn) on an idle read connection, in one read transaction. Refused (Unavailable) while a whole rebuild
-        is asked for or under way, or after one failed. Admitted, and its connection given back to the idle ones,
-        under _lock, so close() refuses later reads, waits for these, then closes every connection they gave back."""
+        is asked for or under way, or after one failed. Admitted, given its connection (an idle one, or a new one to
+        the file as it is then), and that connection given back to the idle ones, all under _lock: so a file that
+        replaces this one, or its removal, waits for the reads admitted before (_quiet), and no read admitted before
+        reaches a file made after; close() refuses later reads, waits for these, then closes what they gave back."""
         with self._lock:
             if self.closed:
                 raise DatabaseClosedError("the search index is closed")
             if self.unusable or self.building:  # a whole rebuild asked for or under way: the old file, never purged,
                 raise Unavailable()               # is not read; nor a partial one (fail closed, as an unusable file)
             generation = self._generation
-            self._reading += 1
-        try:
             try:
                 conn = self._readers.get_nowait()
             except queue.Empty:
                 conn, _ = self._connect()
+            self._reading += 1
+        try:
             try:
                 with conn:
                     return fn(conn)
@@ -378,6 +380,13 @@ class SearchIndex:
             with self._lock:
                 self._reading -= 1
                 self._reads_done.notify_all()
+
+    def _quiet(self):
+        """Before the file is removed or replaced: no read is admitted from here (the caller has set building or
+        unusable), and the reads admitted before have ended (their connections given back, or closed)."""
+        with self._lock:
+            while self._reading:
+                self._reads_done.wait()
 
     def _close_readers(self):
         """Close the idle read connections, every one of them though one fails; the first failure is raised after, and
@@ -543,7 +552,9 @@ class SearchIndex:
         whole rebuild's partial file (the index stays unusable, building, until a rebuild succeeds), or, as
         the index closes, an unfinished rebuild's. Every step is tried whatever the others meet; the first
         failure is raised after (as the index closes, the close then fails, and the next open purges the file)."""
-        self.unusable = True
+        with self._lock:
+            self.unusable = True  # no read admitted from here
+        self._quiet()  # nor any still running on the file it removes
 
         def close_conn():  # kept if its close fails, so the close of the index tries it again (close_failed() is set)
             close_connection(self._conn)
@@ -591,9 +602,11 @@ class SearchIndex:
         (connect), so the new one is this writer's, owner-only.
         Returns whether it finished (else the index closed meanwhile). One that raises leaves building
         set: the caller discards its file."""
-        self.building = True
+        with self._lock:
+            self.building = True  # no read admitted from here
         if self.closed:
             return False
+        self._quiet()  # nor any still running on the file it replaces
         if self._conn is not None:
             close_connection(self._conn)  # a failure sets close_failed() at once, whatever a retry then does
             self._conn = None
@@ -629,7 +642,7 @@ class SearchIndex:
         with self._lock:
             if self.damaged or self.closed:
                 return
-            self.damaged = True
+            self.damaged = self.building = True  # no read admitted from here (the rebuild sets it too)
         log.warning("the search index is damaged; it is rebuilt")
         self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
 
