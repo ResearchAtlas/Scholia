@@ -105,7 +105,7 @@ def test_network_folders_and_files_and_cloud_placeholders_are_never_read(tmp_pat
     real_open = os.open
     monkeypatch.setattr(zotero.os, "open", lambda path, *a, **k: opened.append(path) or real_open(path, *a, **k))
     assert zotero.read_attachment(url(pdf), fs_type=lambda fd: "smbfs") == (None, "pdf_on_network")
-    assert opened == ["/", pdf.parts[1]]  # stopped at the first folder on a network file system
+    assert opened == ["/"]  # / itself is checked before anything in it is opened
     deeper = iter(["apfs", "apfs", "nfs"])
     assert zotero.read_attachment(url(pdf), fs_type=lambda fd: next(deeper, "apfs")) == (None, "pdf_on_network")
     monkeypatch.setattr(zotero, "SF_DATALESS", stat.UF_HIDDEN)  # a flag a test can set, standing in for dataless
@@ -193,3 +193,18 @@ def test_a_folder_or_file_whose_place_cannot_be_read_is_never_taken_for_local(pd
             "fstatfs": type("f", (), {"argtypes": None, "__call__": lambda self, fd, info: -1})(),
             "__getitem__": lambda self, name: self.fstatfs})())
         assert zotero.read_attachment(url(pdf)) == (None, "pdf_unreadable")
+
+
+@pytest.mark.parametrize("kind", ["autofs", "smbfs", "nfs", "webdav", "afpfs", "macfuse", "", None])
+def test_only_local_file_systems_are_descended_into(pdf, monkeypatch, kind):
+    opened = []
+    real_open = os.open
+    monkeypatch.setattr(zotero.os, "open", lambda path, *a, **k: opened.append(path) or real_open(path, *a, **k))
+    kinds = iter(["apfs"])  # / is on this Mac's disk; the first folder below it is not
+    assert zotero.read_attachment(url(pdf), fs_type=lambda fd: next(kinds, kind)) == (None, "pdf_on_network")
+    assert opened == ["/", pdf.parts[1]]  # nothing below that folder is opened
+
+
+@pytest.mark.parametrize("kind", ["apfs", "hfs", "exfat", "msdos"])
+def test_this_macs_disks_and_attached_drives_are_read(pdf, kind):
+    assert zotero.read_attachment(url(pdf), fs_type=lambda fd: kind) == (PDF, None)

@@ -33,6 +33,8 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
   const [importing, setImporting] = useState(null); // { done, total } while an import runs
   const [report, setReport] = useState(null); // [[key, params]] or { problem } once it ended
 
+  const mounted = useRef(true); // an import is followed only while the browser is there to say what it did
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const check = useCallback(async () => {
     setStatus(null);
     setProblem(null);
@@ -86,7 +88,9 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
     setImporting({ done: 0, total: chosen.length });
     try {
       const { run_id: runId } = await importZotero(project.id, library, chosen, status.server_id);
-      const row = await followRun(runId, (running) => { if (running.progress) setImporting(running.progress); });
+      const row = await followRun(runId, (running) => { if (running.progress) setImporting(running.progress); },
+        undefined, () => mounted.current);
+      if (!row) return; // gone with the window: the background-run list and the Library say what it did
       const outcome = runOutcome(row);
       setReport({ parts: reportParts(row.result ?? (outcome.ok ? null : {})), problem: outcome.ok ? null : outcome.code ?? null,
         key: outcome.ok ? null : outcome.key ?? null });

@@ -785,3 +785,20 @@ test('Details counts a reading\'s scanned pages: read by text recognition, or wa
   assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 3 }), '3 pages read');
   assert.equal(t(reasonKey('ocr_failed')), 'Text recognition failed. Try again from Settings, Advanced.');
 });
+
+test('a run that no longer exists has ended, and following stops when what follows it goes', async () => {
+  const original = globalThis.fetch;
+  let reads = 0;
+  globalThis.fetch = async () => { reads += 1; return { ok: true, json: async () => ({ runs: [] }) }; };
+  try {
+    assert.deepEqual(await followRun('gone', () => {}, async () => {}),
+      { status: 'cancelled', cancel_reason: 'revoked', result: null, run_id: 'gone' });
+    assert.equal(reads, 1);
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ runs: [{ status: 'running' }] }) });
+    let turns = 0;
+    assert.equal(await followRun('r', () => {}, async () => { turns += 1; }, () => turns < 3), null);
+    assert.equal(turns, 3);
+  } finally {
+    globalThis.fetch = original;
+  }
+});

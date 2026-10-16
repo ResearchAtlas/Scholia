@@ -68,7 +68,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from backend import extraction, reference_files, references, search
-from backend.data_folder import NETWORK_FILE_SYSTEMS, _StatFS
+from backend.data_folder import _StatFS
 from backend.db import new_id, utc_now
 from backend.materials import _add_to_batch, _no_store, _refused, add_version
 from backend.outbound_gate import ZOTERO, OutboundDenied, _show
@@ -94,6 +94,11 @@ _DATABASES = (".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm", "-journal", "
 # one is refused before anything of it is opened, since opening it mounts the share (no link is followed, so
 # no other path reaches one).
 _AUTOMOUNTS = ("net", "home", "network")
+# The file systems an attachment's folders and file may be on: this Mac's own disks (APFS, HFS+) and
+# drives attached to it (exFAT, FAT). Anything else (smbfs, afpfs, nfs, webdav, autofs, a FUSE file
+# system, one whose type cannot be read) is refused on the folder's own descriptor before anything below
+# it is opened, so no automount, network share or remote file system is ever descended into.
+LOCAL_FILE_SYSTEMS = frozenset({"apfs", "hfs", "exfat", "msdos"})
 _LINKS = ("imported_file", "imported_url", "linked_file")  # attachments with a file on disk, stored ones first
 # What a paper's import outcome is, counted in the run's summary.
 OUTCOMES = ("imported", "updated", "unchanged", "already", "waiting", "not_found", "no_title")
@@ -151,9 +156,17 @@ async def _get(client, path, server_id=None):
         raise Unreachable("zotero_unavailable") from None
 
 
+class _NotFound:
+    """What a status in _read's none answers (404: no such item), never a 200 answer's value (JSON null
+    included, which is an answer of another shape)."""
+
+
+NOT_FOUND = _NotFound()
+
+
 async def _read(client, path, server_id=None, retries=(), none=(404,)):
     """The body of a 200 answer, parsed as JSON when it is JSON (text otherwise), and its headers; a
-    status in none (404: no such item) is None. Unreachable otherwise: 403 api_off, 412 zotero_changed
+    status in none (404: no such item) is NOT_FOUND. Unreachable otherwise: 403 api_off, 412 zotero_changed
     (another Zotero than the one browsed), anything else unavailable. retries: delays to try again after
     when Zotero gave no answer or failed (5xx)."""
     for delay in (*retries, None):
@@ -171,7 +184,7 @@ async def _read(client, path, server_id=None, retries=(), none=(404,)):
             except (ValueError, RecursionError):
                 raise Unreachable("zotero_unavailable") from None
         if status in none:
-            return None, headers
+            return NOT_FOUND, headers
         if status == 403:
             raise Unreachable("zotero_api_off")
         if status == 412:
@@ -246,7 +259,7 @@ async def status(request: Request):
         except Unreachable as unreachable:
             return {"state": {"zotero_not_running": "not_running", "zotero_api_off": "api_off",
                               "zotero_not_yours": "not_yours"}.get(unreachable.code, "error")}
-    if groups is None or headers.get("zotero-api-version") != "3":  # Zotero before 7, or another API
+    if groups is NOT_FOUND or headers.get("zotero-api-version") != "3":  # Zotero before 7, or another API
         return {"state": "unsupported"}
     server_id = headers.get("zotero-server-id")
     try:
@@ -264,7 +277,7 @@ async def collections(request: Request, library: str = ""):
     found = []
     for page in range(COLLECTION_PAGES):
         answer, headers = await _browse(state, f"/api/{library}/collections?format=json&limit=100&start={page * 100}")
-        if answer is None:
+        if answer is NOT_FOUND:
             raise _refused(404, "not_found", "No such Zotero library")
         try:
             rows = _objects(answer)
@@ -303,7 +316,7 @@ async def items(request: Request, library: str = "", collection: str | None = No
     start = max(0, min(start, 999_950))
     where = f"collections/{collection}/" if collection else ""
     answer, headers = await _browse(state, f"/api/{library}/{where}items/top?format=json&limit={PAGE}&start={start}")
-    if answer is None:
+    if answer is NOT_FOUND:
         raise _refused(404, "not_found", "No such Zotero library or collection")
     try:
         rows = _objects(answer)
@@ -360,8 +373,9 @@ def read_attachment(text, fs_type=None):
     folder opened before it and never by name again, refusing a symbolic link at any step (pdf_link: an
     attachment reached through one imports with its details only; a Finder alias is a file, not a PDF). Before any of
     it is opened, a path into one of macOS's automounted network folders is refused, and a file named
-    like a database (zotero.sqlite and its kin); each folder opened is checked, on its own descriptor,
-    not to be on a network file system or a cloud placeholder before the next is opened in it; the file
+    like a database (zotero.sqlite and its kin); each folder opened, / first, is checked on its own
+    descriptor to be on one of LOCAL_FILE_SYSTEMS and not a cloud placeholder before anything in it is
+    opened (any other type, autofs included, or one that cannot be read, is refused); the file
     is opened read-only and without waiting (a FIFO), then checked on its descriptor: a regular file on
     this Mac's disk, its contents here, of at most MAX_FILE_BYTES (at most one byte more is read), that
     starts as a PDF (only its first 5 bytes are read from one that does not). Nothing is written.
@@ -396,6 +410,12 @@ def read_attachment(text, fs_type=None):
     except OSError:
         return None, "pdf_unreadable"
     try:
+        try:  # / too is checked before anything in it is opened
+            problem = _place(os.fstat(folder), fs_type(folder))
+        except OSError:
+            return None, "pdf_unreadable"
+        if problem is not None:
+            return None, problem
         for name in names[:-1]:
             try:
                 inner = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=folder)
@@ -455,11 +475,12 @@ def _open_problem(error, name, folder):
 
 
 def _place(info, kind):
-    """Why an opened folder or file is not on this Mac's own disk (its stat and its file system's type), or None."""
+    """Why an opened folder or file is not on this Mac's own disk (its stat and its file system's type:
+    only LOCAL_FILE_SYSTEMS are), or None."""
+    if kind not in LOCAL_FILE_SYSTEMS:
+        return "pdf_on_network"
     if getattr(info, "st_flags", 0) & SF_DATALESS:
         return "pdf_not_downloaded"
-    if kind in NETWORK_FILE_SYSTEMS:
-        return "pdf_on_network"
     return None
 
 
@@ -492,8 +513,10 @@ def _record(item):
     """(the item's CSL JSON as S1-14 keeps a record, or None without a visible title; how many of its
     values were left out as not what their field takes). Its DOI is kept only when the DOI field is,
     whole, a DOI (S1-14's rule); its arXiv ID only from Zotero's archiveID (_archive_id)."""
-    csl = item.get("csljson") if isinstance(item, dict) else None
-    found = next(reference_files._csl_json(json.dumps([csl if isinstance(csl, dict) else {}]), lambda: None), None)
+    csl = item.get("csljson")
+    if not isinstance(csl, dict):  # an answer of another shape (null, a list): no record to go by
+        raise Unreachable("zotero_unavailable")
+    found = next(reference_files._csl_json(json.dumps([csl]), lambda: None), None)
     if found is None:
         return None, 0
     data = item.get("data") if isinstance(item.get("data"), dict) else {}
@@ -523,7 +546,7 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
     """What Zotero holds of one item: None when it is gone (or a note, an attachment, in the trash),
     else (its record, values left out, its PDF's stored SHA-256 or None, why its PDF was not read or None)."""
     item, _ = await _read(client, f"/api/{library}/items/{key}?format=json&include=data,csljson", server_id, RETRIES)
-    if item is None:  # 404: gone since it was browsed
+    if item is NOT_FOUND:  # 404: gone since it was browsed
         return None
     if not (isinstance(item, dict) and isinstance(item.get("data"), dict) and item["data"].get("key") == key):
         raise Unreachable("zotero_unavailable")  # not the item asked for: no answer to go by
@@ -532,7 +555,7 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
         return None
     csl, dropped = _record(item)
     children, _ = await _read(client, f"/api/{library}/items/{key}/children?format=json", server_id, RETRIES)
-    child = _pdf_child(children if children is not None else [])  # a 404: none
+    child = _pdf_child([] if children is NOT_FOUND else children)  # a 404: none; null or any other shape fails
     if child is None:
         return csl, dropped, None, None
     # Zotero's own answers that the attachment has no file: 400 (not a file attachment), 404 (no such
@@ -541,7 +564,7 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
     # (zotero_unavailable) before the item is written or done, so a resume or a new import reads it again.
     url, _ = await _read(client, f"/api/{library}/items/{child}/file/view/url", server_id, RETRIES, none=(400, 404))
     try:
-        text = url.decode("utf-8") if url is not None else None
+        text = None if url is NOT_FOUND else url.decode("utf-8")
     except UnicodeDecodeError:
         raise Unreachable("zotero_unavailable") from None
     def read_and_store():  # run to its end (Harness.work), so nothing of it outlasts the run's record
@@ -628,7 +651,7 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
     library = inputs["library"]
     source_key = f"{library}/items/{key}"
     step = {"key": key, "material_id": None, "outcome": "not_found", "pdf": None, "version": False}
-    looked_up = None  # (material, version) to look up
+    looked_up = None  # (material, version, record, whether a file came) to look up
     if fetched is not None:
         csl, dropped, sha256, why = fetched
         step.update(pdf=why, left_out=dropped)
@@ -643,7 +666,9 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
             looked_up = _new(conn, harness, project_id, inputs, key, source_key, csl, sha256, step, recorded)
     locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
     batch = conn.execute("SELECT json_extract(inputs, '$.batch') FROM runs WHERE id = ?", (run_id,)).fetchone()[0]
-    if looked_up is not None and not locked and reference_files.identifier(looked_up[2]) is not None:
+    # Looked up as a file added through Add is: by its record's identifier, else by its file's text once read
+    # (the lookup waits for that reading), in the import's one batch.
+    if looked_up is not None and not locked and (reference_files.identifier(looked_up[2]) is not None or looked_up[3]):
         material, version = looked_up[:2]
         if batch is None or _add_to_batch(conn, project_id, batch, {material: version}, True,
                                           harness.registry) is None:
@@ -660,8 +685,9 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
 
 def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
     """An item imported before: its details replaced by its record when they changed (and the
-    researcher has not edited them), and its PDF, when it is not its current file, its next version.
-    Returns (material, version, record) to look up when its details were replaced, else None."""
+    researcher has not edited them), and its PDF, when it is none of its files, its next version.
+    Returns (material, version, record, whether a file was added) to look up when its details were
+    replaced or a file added, else None."""
     material, stored, checked_by, filled, title, evidence = found
     step["material_id"] = material
     changed = False
@@ -671,7 +697,8 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
             own.pop(field, None)
         if own != csl:
             changed = True
-            moved = own.get("DOI") != csl.get("DOI")  # its retraction check and resolution were about the old one
+            # its retraction check and resolution were about the identifier it had: a DOI or an arXiv ID changed or gone
+            moved = reference_files.identifier(own) != reference_files.identifier(csl)
             conn.execute("UPDATE materials SET title = ?, csl = ?, evidence_type = ?, lookup_filled = NULL, updated_at = ?"
                          + (", resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL" if moved else "")
                          + " WHERE id = ?", (csl["title"], json.dumps(csl), references._evidence(csl, evidence),
@@ -686,13 +713,13 @@ def _update(conn, harness, project_id, found, csl, sha256, step, recorded):
         version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF, None, recorded)
         step["version"] = True
     step["outcome"] = "updated" if changed or step["version"] else "unchanged"
-    return (material, version, csl) if changed and version is not None else None
+    return (material, version, csl, step["version"]) if (changed or step["version"]) and version is not None else None
 
 
 def _new(conn, harness, project_id, inputs, key, source_key, csl, sha256, step, recorded):
     """A new item: already in the project (its PDF a paper's current file, or a duplicate with nothing
     to add), asked about (a duplicate that would add something: S1-14's merge), or a new paper.
-    Returns (material, version, record) to look up for a new paper, else None."""
+    Returns (material, version, record, whether it has a file) to look up for a new paper, else None."""
     if sha256 is not None and (same := conn.execute(
             "SELECT m.id FROM materials m JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
             " WHERE m.project_id = ? AND v.file_sha256 = ?", (project_id, sha256)).fetchone()) is not None:
@@ -724,7 +751,7 @@ def _new(conn, harness, project_id, inputs, key, source_key, csl, sha256, step, 
     version, _ = add_version(conn, harness, project_id, material, sha256, extraction.PDF if sha256 else None, None,
                              recorded)
     step.update(outcome="imported", material_id=material, version=sha256 is not None)
-    return material, version, csl
+    return material, version, csl, sha256 is not None
 
 
 def _close_batch(conn, harness, project_id, run_id):

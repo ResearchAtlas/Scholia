@@ -881,3 +881,65 @@ async def test_collections_of_a_library_zotero_does_not_know_are_not_found(tmp_p
         mock.answers = [404]
         response = await client.get("/api/zotero/collections", params={"library": "groups/99"})
         assert (response.status_code, response.json()["code"]) == (404, "not_found")
+
+
+# gpt-6-astra recheck 2 (PR 33)
+
+
+@pytest.mark.parametrize("where, body", [("item", b"null"), ("item", b'[{"data": {}}]'), ("children", b"null"),
+                                         ("csljson", None), ("csljson", [])])
+async def test_an_answer_of_json_null_or_another_shape_is_never_read_as_not_found(tmp_path, where, body):
+    import httpx
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        if where == "csljson":
+            mock.items["users/0", KEYS[1]]["csljson"] = body
+        else:
+            answer = lambda request: httpx.Response(200, content=body, headers={"Zotero-API-Version": "3"})  # noqa: E731
+            mock.answers = [answer] if where == "item" else [None, answer]
+        row = await imported(client, project, KEYS[1:2])
+        assert (row["status"], row["result"]["reason"]) == ("failed", "zotero_unavailable")
+        assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
+        mock.answers = [404]  # only an actual 404 is an item gone from Zotero
+        mock.items["users/0", KEYS[1]]["csljson"] = {"title": "Back", "type": "article-journal"}
+        assert (await imported(client, project, KEYS[1:2]))["result"]["not_found"] == 1
+
+
+async def test_an_identifier_only_in_the_imported_pdf_is_looked_up_in_the_imports_one_question(tmp_path):
+    mock = library(tmp_path)
+    mock.item("PDFD2222", "A Record Without Its DOI", pdf=pdf_file(tmp_path, "doi-in-text.pdf", "A Record Without Its DOI",
+                                                                   doi=DOI))
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Resolved From the PDF", venue="Journal of PDFs")})
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=records)) as client:
+        project = await project_of(client, level="local_only")
+        await imported(client, project, ["PDFD2222", KEYS[1]])  # KEYS[1]: a PDF and record with no identifier
+        [ask] = await asks_of(client, project)
+        assert ask["params"] == {"services": ["crossref", "openalex"], "identifiers": 1, "batch": "zotero"}
+        assert records.requests == []  # nothing before the answer
+        assert (await answer(client, ask, "lookup")).status_code == 200
+        await background_idle(client, 60)
+        assert ("api.openalex.org", f"/works/doi:{DOI}") in [(h, p) for h, p, _ in records.requests]
+        paper = (await papers(client, project))["users/0/items/PDFD2222"]
+        assert paper["csl"]["container-title"] == "Journal of PDFs" and paper["lookup"]["source"] == "openalex"
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]
+
+
+@pytest.mark.parametrize("later", ["arXiv:2401.00009", None])
+async def test_a_changed_or_dropped_archive_id_takes_the_old_resolution_with_it(tmp_path, later):
+    mock = MockZotero()
+    mock.item("ARXV2222", "A Synthetic Preprint")["data"]["archiveID"] = "arXiv:2401.00002"
+    records = MockScholarly(arxiv={"2401.00002": "A Synthetic Preprint, as arXiv has it"})
+    async with started(tmp_path / "data", MockProvider(zotero=mock, scholarly=records)) as client:
+        project = await project_of(client)
+        await imported(client, project, ["ARXV2222"])
+        await background_idle(client, 30)
+        assert (await papers(client, project))["users/0/items/ARXV2222"]["resolved_at"] is not None
+        if later is None:
+            del mock.items["users/0", "ARXV2222"]["data"]["archiveID"]
+        else:
+            mock.items["users/0", "ARXV2222"]["data"]["archiveID"] = later
+        await imported(client, project, ["ARXV2222"])
+        await background_idle(client, 30)
+        paper = (await papers(client, project))["users/0/items/ARXV2222"]
+        assert paper["resolved_at"] is None and paper["csl"].get("arxiv") == (later and later.removeprefix("arXiv:"))
