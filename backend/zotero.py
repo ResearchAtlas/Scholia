@@ -25,8 +25,9 @@ file URL. Zotero's local API serves no file bytes: it names the file on disk (a 
 reads that local file itself (read_attachment), only when it is on this Mac's own disk, a regular PDF
 of at most extraction.MAX_FILE_BYTES; otherwise the item is imported with its details only, and the
 reason recorded. The record is read with S1-14's CSL JSON reader and bounds (backend/reference_files.py),
-so its identifier follows S1-14's rule: a DOI only from the record's DOI field, whole; never from a
-URL. Each item is written in its own transaction, while the run is running, not revoked and not
+so its identifier follows S1-14's rule: a DOI only from the record's DOI field, whole, else an arXiv ID
+only from Zotero's archiveID field when it is, whole, "arXiv:" and an ID (Harold, 2026-10-17); never
+from a URL or `number`. Each item is written in its own transaction, while the run is running, not revoked and not
 cancelled:
 - an item already imported into the project (keyed by library and item key, `source_key`
   "<library>/items/<KEY>") is updated: its details replaced by the record when they changed and the
@@ -415,10 +416,32 @@ def _pdf_child(children):
 def _record(item):
     """(the item's CSL JSON as S1-14 keeps a record, or None without a visible title; how many of its
     values were left out as not what their field takes). Its DOI is kept only when the DOI field is,
-    whole, a DOI (S1-14's rule)."""
+    whole, a DOI (S1-14's rule); its arXiv ID only from Zotero's archiveID (_archive_id)."""
     csl = item.get("csljson") if isinstance(item, dict) else None
     found = next(reference_files._csl_json(json.dumps([csl if isinstance(csl, dict) else {}]), lambda: None), None)
-    return reference_files._finish(found) if found is not None else (None, 0)
+    if found is None:
+        return None, 0
+    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+    if (arxiv := _archive_id(data.get("archiveID"))) is not None:
+        found["arxiv"] = arxiv  # kept as S1-14 keeps a BibTeX eprint, so identifier() reads it
+    return reference_files._finish(found)
+
+
+ARXIV_PREFIX = "arXiv:"
+
+
+def _archive_id(value):
+    """The arXiv ID a Zotero record gives in its archiveID field (Harold, 2026-10-17): its whole value,
+    only ASCII spaces, tabs and line ends taken from its ends, is exactly "arXiv:" followed by an ID that
+    S1-14's strict pattern takes whole (a version allowed). Anything else there is not an identifier and
+    is ignored; the CSL `number` Zotero exports it as is never read for one."""
+    if not isinstance(value, str):
+        return None
+    whole = value.strip(" \t\r\n")
+    rest = whole.removeprefix(ARXIV_PREFIX)
+    if rest == whole or rest != rest.strip(" \t\r\n"):  # no prefix, or space after it
+        return None
+    return reference_files._arxiv(rest)[0]
 
 
 async def _fetch_item(harness, active, client, library, key, server_id, content):

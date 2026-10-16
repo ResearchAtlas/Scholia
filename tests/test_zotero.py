@@ -654,3 +654,34 @@ async def test_cancel_while_a_pdf_is_read_writes_nothing_for_it(tmp_path, monkey
         assert (row["status"], row["cancel_reason"]) == ("cancelled", "researcher")
         assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
         assert await rows(client, "SELECT count(*) FROM content_files") == [(0,)]  # read to its end, never stored
+
+
+# Harold's decision of 2026-10-17: an arXiv ID from Zotero's archiveID, in its exact form only
+
+
+async def test_an_archive_id_of_the_exact_form_is_looked_up_in_the_imports_one_batch(tmp_path):
+    mock = library(tmp_path, pdfs=False)
+    preprint = mock.item("PPPP2222", "A Synthetic Preprint", extra={"number": "arXiv:2401.99999"})
+    preprint["data"]["archiveID"] = " arXiv:2401.00002v3\n"
+    for key, near in (("QQQQ2222", "arXiv: 2401.00003"), ("RRRR2222", "arxiv:2401.00004"), ("SSSS2222", "2401.00005"),
+                      ("TTTT2222", "arXiv:2401.00006 (v2)"), ("UUUU2222", "arXiv:https://arxiv.org/abs/2401.00007")):
+        mock.item(key, f"A Near Miss {key}")["data"]["archiveID"] = near
+    async with started(tmp_path / "data", provider(mock, openalex={DOI: openalex_work(DOI, "Resolved")},
+                                                    arxiv={"2401.00002": "A Synthetic Preprint, as arXiv has it"})) as client:
+        project = await project_of(client, level="local_only")
+        keys = [KEYS[0], "PPPP2222", "QQQQ2222", "RRRR2222", "SSSS2222", "TTTT2222", "UUUU2222"]
+        row = await imported(client, project, keys)
+        assert row["result"]["imported"] == 7 and row["result"]["left_out"] == 0  # a near miss is ignored, not counted
+        [ask] = await asks_of(client, project)  # one question for the import: the DOI and the arXiv ID
+        assert ask["params"] == {"services": ["arxiv", "crossref", "openalex"], "identifiers": 2, "batch": "zotero"}
+        found = await rows(client, "SELECT source_key, json_extract(csl, '$.arxiv') FROM materials WHERE source = 'zotero'")
+        assert dict(found) == {f"users/0/items/{KEYS[0]}": None, "users/0/items/PPPP2222": "2401.00002v3",
+                               **{f"users/0/items/{k}": None for k in keys[2:]}}
+        assert (await answer(client, ask, "lookup")).status_code == 200
+        await background_idle(client, 30)
+        sent = [(host, path) for host, path, _ in client.provider.scholarly.requests]
+        assert ("export.arxiv.org", "/api/query?id_list=2401.00002&max_results=1") in sent
+        assert not any(near in path for _, path in sent for near in ("2401.00003", "2401.00004", "2401.00005",
+                                                                      "2401.00006", "2401.00007", "2401.99999"))
+        [preprint_paper] = [m for m in await settled(client, project) if m["source_key"] == "users/0/items/PPPP2222"]
+        assert preprint_paper["title"] == "A Synthetic Preprint" and preprint_paper["lookup"]["source"] == "arxiv"
