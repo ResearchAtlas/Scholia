@@ -691,6 +691,7 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
     level = manifest["levels"][level_name]
     results = {"status": "running", "level": level_name, "benchmarks_asked": names, "manifest_sha256":
                hashlib.sha256(MANIFEST.read_bytes()).hexdigest() if MANIFEST.exists() else None,
+               "manifest_rules_sha256": rules_sha256(manifest),
                "commit": commit(), "machine": machine(), "reference_machine": manifest["reference_machine"],
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "load_average_start": os.getloadavg(),
                "arms": list(arms), "bootstrap": manifest["bootstrap"], "benchmarks": {}}
@@ -736,6 +737,25 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
 # Comparing a run with the baseline
 
 
+def rules_sha256(manifest):
+    """The SHA-256 of what makes two runs like for like: the manifest without its levels (which runs
+    which queries; compare pairs queries by key or order) and without rules_unchanged_since."""
+    kept = {k: v for k, v in manifest.items() if k not in ("levels", "rules_unchanged_since")}
+    return hashlib.sha256(json.dumps(kept, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def rules_of(manifest, results):
+    """A results file's rules hash: recorded since the subset changed; for an earlier file, this
+    manifest's own when the file's whole-manifest hash is the one rules_unchanged_since names (its rules
+    are this manifest's), else that whole-manifest hash (so it differs)."""
+    if results.get("manifest_rules_sha256"):
+        return results["manifest_rules_sha256"]
+    since = manifest.get("rules_unchanged_since") or {}
+    if results.get("manifest_sha256") and results.get("manifest_sha256") == since.get("manifest_sha256"):
+        return rules_sha256(manifest)
+    return results.get("manifest_sha256")
+
+
 def compare(manifest, baseline, current):
     """Lines giving each benchmark's paired difference (current minus baseline) per arm and metric with
     its interval, flagging a drop whose interval lies wholly below zero for investigation. Nothing here
@@ -746,8 +766,8 @@ def compare(manifest, baseline, current):
     lines = []
     if not current.get("like_for_like") or current.get("model_settings") != baseline.get("model_settings"):
         lines.append("NOT LIKE FOR LIKE: the model settings differ from the baseline's or the manifest's")
-    if current.get("manifest_sha256") != baseline.get("manifest_sha256"):
-        lines.append("NOT LIKE FOR LIKE: the manifest (pins, rules, subset) differs from the baseline's")
+    if rules_of(manifest, current) != rules_of(manifest, baseline):
+        lines.append("NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's")
     if current.get("bootstrap") != baseline.get("bootstrap"):
         lines.append("the bootstrap settings differ from the baseline's; the intervals below use the manifest's")
     if current.get("machine") != baseline.get("machine"):

@@ -448,7 +448,8 @@ def test_the_manifest_records_rule_e_word_for_word_with_each_benchmarks_own_metr
     assert list(tier1.ARMS)[-1] == "hybrid"  # last, so the helper still runs when its sockets are listed
     from backend.search import MAX_LIMIT, QUERY_INSTRUCTION
     assert manifest["search_limit"] == MAX_LIMIT and manifest["model_settings"]["query_instruction"] == QUERY_INSTRUCTION
-    assert len(manifest["levels"]["subset"]["benchmarks"]["qasper"]["papers"]) == 50
+    subset = manifest["levels"]["subset"]["benchmarks"]  # Harold, 2026-10-17: 100 QASPER papers only
+    assert list(subset) == ["qasper"] and len(set(subset["qasper"]["papers"])) == 100
 
 
 def test_the_models_and_the_conversion_refuse_files_that_differ_from_their_pins(tmp_path):
@@ -502,7 +503,7 @@ def test_gaps_keep_a_run_from_finishing_and_metrics_without_fallbacks_leave_out_
     finished = {"status": "finished", "like_for_like": True, "model_settings": {}, "machine": {}, "benchmarks": {},
                 "manifest_sha256": "a", "bootstrap": {}}
     lines = tier1.compare({}, finished, {**finished, "manifest_sha256": "b"})
-    assert lines == ["NOT LIKE FOR LIKE: the manifest (pins, rules, subset) differs from the baseline's"]
+    assert lines == ["NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's"]
     assert "Not finished: running" in "\n".join(tier1.report({"status": "incomplete", "reason": "running"}))
 
 
@@ -530,5 +531,22 @@ def test_the_committed_baseline_is_a_finished_full_run_of_all_five_with_ids_only
         assert (bench["keys"] is not None) == manifest["benchmarks"][name]["ids_committable"], name
         assert all(entry["complete"] and entry["metrics"] for entry in bench["arms"].values()), name
         assert bench["query_language"] == bench["document_language"] == "en"
-    assert all(line.startswith(("qasper", "scifact", "nfcorpus", "scidocs", "litsearch", "  "))
-               for line in tier1.compare(manifest, baseline, baseline))
+    one = {**baseline, "benchmarks": {"nfcorpus": baseline["benchmarks"]["nfcorpus"]}}  # one, to be quick
+    assert all(line.startswith(("nfcorpus", "  ")) for line in tier1.compare(manifest, one, one))
+
+
+def test_a_run_under_this_manifest_is_like_for_like_with_the_baseline_and_a_changed_rule_is_not():
+    """The subset changed after the baseline (Harold, 2026-10-17): only `levels` did, so a run under this
+    manifest pairs with the baseline as like for like; any change to pins, rules or metrics does not."""
+    manifest = tier1.load_manifest()
+    baseline = tier1.load_manifest(ROOT / "evals" / "baseline" / "tier1-baseline.json")
+    assert manifest["rules_unchanged_since"]["manifest_sha256"] == baseline["manifest_sha256"]
+    assert "manifest_rules_sha256" not in baseline  # it predates the rules hash
+    baseline = {**baseline, "benchmarks": {"scifact": baseline["benchmarks"]["scifact"]}}  # one, to be quick
+    run = {**baseline, "manifest_sha256": "a newer file", "manifest_rules_sha256": tier1.rules_sha256(manifest)}
+    assert not [line for line in tier1.compare(manifest, baseline, run) if line.startswith("NOT LIKE FOR LIKE")]
+    changed = {**manifest, "bootstrap": {**manifest["bootstrap"], "seed": 1}}
+    other = {**run, "manifest_rules_sha256": tier1.rules_sha256(changed)}
+    assert "NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's" in \
+        tier1.compare(manifest, baseline, other)
+    assert tier1.rules_sha256({**manifest, "levels": {}}) == tier1.rules_sha256(manifest)
