@@ -139,15 +139,56 @@ def test_a_pdf_named_like_a_database_topic_is_read_but_a_database_never(tmp_path
         assert zotero.read_attachment(url(tmp_path / name)) == (None, "pdf_not_a_pdf"), name
 
 
+# A mount table as getfsstat gives it, with the automounts macOS's auto_master names and a direct map.
+TABLE = [("/", "apfs"), ("/dev", "devfs"), ("/System/Volumes/Data", "apfs"), ("/System/Volumes/Data/home", "autofs"),
+         ("/net", "autofs"), ("/Network/Servers", "autofs"), ("/Volumes/Share", "smbfs")]
+
+
 @pytest.mark.parametrize("text", ["file:///net/nas.example/export/x.pdf", "file:///home/someone/x.pdf",
                                   "file:///Network/Servers/x.pdf", "file:////net/nas/x.pdf", "file:///%2Fnet/nas/x.pdf",
-                                  "file:///System/Volumes/Data/home/x.pdf", "file:///System/Volumes/Data/net/nas/x.pdf"])
-def test_automounted_network_folders_are_refused_before_anything_is_opened(text, monkeypatch):
+                                  "file:///System/Volumes/Data/home/x.pdf", "file:///System/Volumes/Data/net/nas/x.pdf",
+                                  "file:///HOME/someone/x.pdf", "file:///Volumes/Share/x.pdf", "file:///net"])
+def test_a_path_on_any_mount_not_local_is_refused_before_anything_is_opened(text, monkeypatch):
     def never(*args, **kwargs):
         raise AssertionError("opened")
 
     monkeypatch.setattr(zotero.os, "open", never)
-    assert zotero.read_attachment(text) == (None, "pdf_on_network")
+    assert zotero.read_attachment(text, mounts=lambda: TABLE) == (None, "pdf_on_network")
+
+
+def test_a_direct_map_automount_under_a_local_folder_is_never_opened(tmp_path, monkeypatch):
+    trigger = tmp_path / "Library" / "Shares"  # a custom mount point, under an APFS folder
+    trigger.mkdir(parents=True)
+    opened = []
+    real_open = os.open
+    monkeypatch.setattr(zotero.os, "open", lambda path, *a, **k: opened.append(path) or real_open(path, *a, **k))
+    table = [("/", "apfs"), (str(trigger), "autofs")]
+    assert zotero.read_attachment(url(trigger / "paper.pdf"), mounts=lambda: table) == (None, "pdf_on_network")
+    assert opened == []  # nothing at all, not even /
+    firmlinked = [("/", "apfs"), ("/System/Volumes/Data" + str(trigger), "autofs")]  # the table's other spelling
+    assert zotero.read_attachment(url(trigger / "paper.pdf"), mounts=lambda: firmlinked) == (None, "pdf_on_network")
+    assert zotero.read_attachment("file:///System/Volumes/Data" + str(trigger) + "/paper.pdf",
+                                  mounts=lambda: table) == (None, "pdf_on_network")  # the path's other spelling
+    assert opened == []
+
+
+def test_a_local_external_volume_is_read_and_an_unreadable_table_opens_nothing(pdf, monkeypatch):
+    external = [("/", "apfs"), ("/" + pdf.parts[1], "exfat")]  # the PDF's folder as an exFAT drive
+    assert zotero.read_attachment(url(pdf), mounts=lambda: external) == (PDF, None)
+    opened = []
+    real_open = os.open
+    monkeypatch.setattr(zotero.os, "open", lambda path, *a, **k: opened.append(path) or real_open(path, *a, **k))
+
+    def unreadable():
+        raise OSError("getfsstat failed")
+
+    assert zotero.read_attachment(url(pdf), mounts=unreadable) == (None, "pdf_unreadable")
+    assert opened == []
+
+
+def test_this_macs_own_mount_table_is_read():
+    table = zotero._mount_table()
+    assert ("/", "apfs") in table and all(isinstance(point, str) and isinstance(kind, str) for point, kind in table)
 
 
 def test_a_link_into_an_automounted_folder_is_never_followed(tmp_path, monkeypatch):
@@ -192,7 +233,7 @@ def test_a_folder_or_file_whose_place_cannot_be_read_is_never_taken_for_local(pd
         monkeypatch.setattr(zotero.ctypes, "CDLL", lambda *a, **k: type("libc", (), {
             "fstatfs": type("f", (), {"argtypes": None, "__call__": lambda self, fd, info: -1})(),
             "__getitem__": lambda self, name: self.fstatfs})())
-        assert zotero.read_attachment(url(pdf)) == (None, "pdf_unreadable")
+        assert zotero.read_attachment(url(pdf), mounts=lambda: [("/", "apfs")]) == (None, "pdf_unreadable")
 
 
 @pytest.mark.parametrize("kind", ["autofs", "smbfs", "nfs", "webdav", "afpfs", "macfuse", "", None])

@@ -1123,3 +1123,78 @@ async def test_replace_file_keeps_the_researchers_edits(tmp_path):
         await background_idle(client, 60)
         paper = (await papers(client, project))["users/0/items/PDFD2222"]
         assert (paper["csl"]["container-title"], paper["csl"]["DOI"], paper["checked_by"]) == ("My Venue", DOI, "researcher")
+
+
+# Z13 (Harold, 2026-10-17): one checked reader for every value read from a Zotero answer
+
+
+def child_of(mock, key):
+    return mock.items["users/0", key]["children"][0]["data"]
+
+
+IMPORT_FIELDS = [  # (what is changed, how), each a value of another type than Zotero gives
+    ("child itemType", lambda m: child_of(m, KEYS[1]).__setitem__("itemType", [])),
+    ("child contentType", lambda m: child_of(m, KEYS[1]).__setitem__("contentType", [])),
+    ("child linkMode", lambda m: child_of(m, KEYS[1]).__setitem__("linkMode", 5)),
+    ("child dateAdded", lambda m: child_of(m, KEYS[1]).__setitem__("dateAdded", 7)),
+    ("child key", lambda m: child_of(m, KEYS[1]).__setitem__("key", 5)),
+    ("child data", lambda m: m.items["users/0", KEYS[1]]["children"][0].__setitem__("data", "x")),
+    ("item key", lambda m: m.items["users/0", KEYS[1]]["data"].__setitem__("key", 5)),
+    ("item itemType", lambda m: m.items["users/0", KEYS[1]]["data"].__setitem__("itemType", None)),
+    ("item deleted", lambda m: m.items["users/0", KEYS[1]]["data"].__setitem__("deleted", "yes")),
+    ("item archiveID", lambda m: m.items["users/0", KEYS[1]]["data"].__setitem__("archiveID", 5)),
+    ("item csljson", lambda m: m.items["users/0", KEYS[1]].__setitem__("csljson", "a record")),
+    ("file URL null", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "null")),
+    ("file URL object", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "{}")),
+    ("file URL empty", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "")),
+]
+
+
+@pytest.mark.parametrize("field, change", IMPORT_FIELDS, ids=[f for f, _ in IMPORT_FIELDS])
+async def test_every_value_an_import_reads_of_another_type_fails_it(tmp_path, field, change):
+    mock = library(tmp_path)
+    change(mock)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        row = await imported(client, project, KEYS[1:2])
+        assert (row["status"], row["result"]["reason"]) == ("failed", "zotero_unavailable"), field
+        assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
+
+
+BROWSE_FIELDS = [  # (endpoint, what is changed, how)
+    ("status", "group id", lambda m: setattr(m, "groups", [("1", "A Group")])),
+    ("status", "group name", lambda m: setattr(m, "groups", [(1, 5)])),
+    ("collections", "name", lambda m: m.collections.__setitem__("users/0", [{"key": "COL00001", "name": 5}])),
+    ("collections", "parent", lambda m: m.collections.__setitem__("users/0", [{"key": "COL00001", "name": "A",
+                                                                               "parent": 5}])),
+    ("items", "itemType", lambda m: m.items["users/0", KEYS[0]]["data"].__setitem__("itemType", [])),
+    ("items", "title", lambda m: m.items["users/0", KEYS[0]]["data"].__setitem__("title", 5)),
+    ("items", "meta", lambda m: m.items["users/0", KEYS[0]].__setitem__("meta", "x")),
+    ("items", "creatorSummary", lambda m: m.items["users/0", KEYS[0]]["meta"].__setitem__("creatorSummary", 5)),
+    ("items", "parsedDate", lambda m: m.items["users/0", KEYS[0]]["meta"].__setitem__("parsedDate", 2024)),
+]
+
+
+@pytest.mark.parametrize("endpoint, field, change", BROWSE_FIELDS, ids=[f"{e} {f}" for e, f, _ in BROWSE_FIELDS])
+async def test_every_value_the_browser_reads_of_another_type_fails_its_request(tmp_path, endpoint, field, change):
+    mock = library(tmp_path, groups=[(4711, "A Group")])
+    change(mock)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        if endpoint == "status":
+            assert (await client.get("/api/zotero/status")).json() == {"state": "error"}
+        else:
+            response = await client.get(f"/api/zotero/{endpoint}", params={"library": "users/0"})
+            assert (response.status_code, response.json()["code"]) == (502, "zotero_unavailable"), field
+
+
+async def test_optional_values_zotero_leaves_out_are_read_as_absent(tmp_path):
+    mock = library(tmp_path)
+    for name in ("contentType", "linkMode", "dateAdded"):  # a note child, say, has none of these
+        child_of(mock, KEYS[0]).pop(name)
+    mock.items["users/0", KEYS[2]]["meta"] = None  # JSON null: absent
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        listed = (await client.get("/api/zotero/items", params={"library": "users/0"})).json()["items"]
+        assert [i["creators"] for i in listed if i["key"] == KEYS[2]] == [None]
+        row = await imported(client, project, KEYS[:1])
+        assert (row["status"], row["result"]["imported"], row["result"]["pdf"]) == ("succeeded", 1, {})

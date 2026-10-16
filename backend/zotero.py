@@ -88,12 +88,11 @@ SF_DATALESS = 0x40000000  # a file whose contents are not on this Mac (a cloud p
 _LIBRARY = re.compile(r"users/0|groups/[1-9][0-9]{0,9}")
 _KEY = re.compile(r"[A-Z0-9]{8}")
 _SERVER_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_URL_START = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")  # a URL's scheme
 _NOT_ITEMS = ("note", "attachment", "annotation")  # never offered or imported as a paper
 _DATABASES = (".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm", "-journal", ".sqlite.bak")  # file names never read
-# macOS's automounted network folders (and their firmlinked spelling under /System/Volumes/Data): a path into
-# one is refused before anything of it is opened, since opening it mounts the share (no link is followed, so
-# no other path reaches one).
-_AUTOMOUNTS = ("net", "home", "network")
+MNT_NOWAIT = 2  # getfsstat(2): the kernel's table as it is, mounting nothing and asking no file system
+_FIRMLINK = ["system", "volumes", "data"]  # macOS's data volume, also seen at / (a firmlink)
 # The file systems an attachment's folders and file may be on: this Mac's own disks (APFS, HFS+) and
 # drives attached to it (exFAT, FAT). Anything else (smbfs, afpfs, nfs, webdav, autofs, a FUSE file
 # system, one whose type cannot be read) is refused on the folder's own descriptor before anything below
@@ -198,26 +197,58 @@ def _text(value, limit):
     return reference_files._text(value, limit)
 
 
-def _objects(answer, keyed=True):
-    """A list answer as Zotero gives one: each an object with its data object (and, keyed, the data's
-    item or collection key). Any other shape is no answer to go by: Unreachable zotero_unavailable, never
-    read as an empty list."""
-    if not isinstance(answer, list) or not all(
-            isinstance(row, dict) and isinstance(row.get("data"), dict)
-            and (not keyed or isinstance(row["data"].get("key"), str) and _KEY.fullmatch(row["data"]["key"]))
-            for row in answer):
+# The one checked reader (Harold, 2026-10-17): every value Scholia reads from a Zotero answer is read by
+# its expected type, or as absent where Zotero may leave it out; any other value is no answer to go by and
+# fails what asked for it (Unreachable zotero_unavailable), never read as empty or as nothing. The fields
+# of an item's CSL JSON are S1-14's reader's (backend/reference_files.py), which leaves out and counts a
+# value of the wrong kind.
+OBJECT, LIST, TEXT, INTEGER, FLAG = dict, list, str, int, bool
+
+
+def _as(value, kind, optional=False):
+    """value, when its type is kind (or one of a tuple of kinds; a flag is never an integer); None when
+    optional and absent (or JSON null)."""
+    if value is None and optional:
+        return None
+    if type(value) in (kind if isinstance(kind, tuple) else (kind,)):
+        return value
+    raise Unreachable("zotero_unavailable")
+
+
+def _field(container, name, kind, optional=False):
+    """A checked object's field, read by _as."""
+    return _as(container.get(name), kind, optional)
+
+
+def _key(container, name="key", optional=False):
+    """An item's or a collection's key field: text of Zotero's key form."""
+    value = _field(container, name, TEXT, optional)
+    if value is not None and not _KEY.fullmatch(value):
         raise Unreachable("zotero_unavailable")
-    return answer
+    return value
+
+
+def _rows(answer, keyed=True):
+    """A list answer's rows' data objects: a list of objects, each with its data object (keyed: with
+    its key)."""
+    found = []
+    for row in _as(answer, LIST):
+        data = _field(_as(row, OBJECT), "data", OBJECT)
+        if keyed:
+            _key(data)
+        found.append(data)
+    return found
 
 
 def _libraries(groups):
     """My Library and each group, as the browser lists them: {id, name} (name None for My Library)."""
     found = [{"id": "users/0", "name": None}]
-    for group in _objects(groups, keyed=False):
-        number = group.get("id")
-        if not (type(number) is int and _LIBRARY.fullmatch(f"groups/{number}")):
+    for group in _as(groups, LIST):
+        number = _field(_as(group, OBJECT), "id", INTEGER)
+        name = _field(_field(group, "data", OBJECT), "name", TEXT, optional=True)
+        if not _LIBRARY.fullmatch(f"groups/{number}"):
             raise Unreachable("zotero_unavailable")
-        found.append({"id": f"groups/{number}", "name": _text(group["data"].get("name"), TITLE_CHARS) or f"{number}"})
+        found.append({"id": f"groups/{number}", "name": _text(name, TITLE_CHARS) or f"{number}"})
     return found
 
 
@@ -280,31 +311,33 @@ async def collections(request: Request, library: str = ""):
         if answer is NOT_FOUND:
             raise _refused(404, "not_found", "No such Zotero library")
         try:
-            rows = _objects(answer)
+            rows = _rows(answer)
+            for data in rows:
+                parent = _field(data, "parentCollection", (TEXT, FLAG), optional=True)  # a key, or false at the top
+                found.append({"key": data["key"], "name": _text(_field(data, "name", TEXT, optional=True), TITLE_CHARS)
+                              or data["key"], "parent": _key(data, "parentCollection") if isinstance(parent, str) else None})
         except Unreachable as unreachable:
             raise _refused(502, unreachable.code, "Zotero could not be read") from None
-        for data in (row["data"] for row in rows):
-            parent = data.get("parentCollection")
-            found.append({"key": data["key"], "name": _text(data.get("name"), TITLE_CHARS) or data["key"],
-                          "parent": parent if isinstance(parent, str) and _KEY.fullmatch(parent) else None})
         if len(rows) < 100:
             return {"collections": found}
     raise _refused(502, "zotero_unavailable", "The library has more collections than Scholia reads")
 
 
 def _row(item):
-    """An item as the browser lists it, or None for a note, an attachment or anything unreadable."""
-    data = item.get("data") if isinstance(item, dict) else None
-    meta = item.get("meta") if isinstance(item, dict) and isinstance(item.get("meta"), dict) else {}
-    if not isinstance(data, dict) or data.get("itemType") in _NOT_ITEMS or not isinstance(data.get("key"), str) \
-            or not _KEY.fullmatch(data["key"]):
+    """An item as the browser lists it (its row's data and meta read by the checked reader), or None for
+    a note or an attachment."""
+    data = _field(item, "data", OBJECT)
+    kind = _field(data, "itemType", TEXT)
+    if kind in _NOT_ITEMS:
         return None
-    title = next((t for t in (_text(data.get(f), TITLE_CHARS) for f in ("title", "caseName", "subject", "nameOfAct"))
-                  if t), None)
-    date = meta.get("parsedDate")
-    return {"key": data["key"], "title": title, "creators": _text(meta.get("creatorSummary"), CREATORS_CHARS),
-            "year": int(date[:4]) if isinstance(date, str) and re.match(r"[0-9]{4}", date) else None,
-            "type": data["itemType"] if isinstance(data.get("itemType"), str) and len(data["itemType"]) <= 40 else None}
+    meta = _field(item, "meta", OBJECT, optional=True) or {}
+    title = next((t for t in (_text(_field(data, f, TEXT, optional=True), TITLE_CHARS)
+                              for f in ("title", "caseName", "subject", "nameOfAct")) if t), None)
+    date = _field(meta, "parsedDate", TEXT, optional=True)
+    return {"key": data["key"], "title": title,
+            "creators": _text(_field(meta, "creatorSummary", TEXT, optional=True), CREATORS_CHARS),
+            "year": int(date[:4]) if date and re.match(r"[0-9]{4}", date) else None,
+            "type": kind if len(kind) <= 40 else None}
 
 
 @router.get("/api/zotero/items")
@@ -319,13 +352,14 @@ async def items(request: Request, library: str = "", collection: str | None = No
     if answer is NOT_FOUND:
         raise _refused(404, "not_found", "No such Zotero library or collection")
     try:
-        rows = _objects(answer)
+        _rows(answer)
+        listed = [row for row in map(_row, answer) if row]
     except Unreachable as unreachable:
         raise _refused(502, unreachable.code, "Zotero could not be read") from None
     total = headers.get("total-results", "")
     total = int(total) if re.fullmatch(r"[0-9]{1,9}", total) else None
-    more = total > start + PAGE if total is not None else len(rows) == PAGE
-    return {"items": [row for row in map(_row, rows) if row], "total": total, "next": start + PAGE if more else None}
+    more = total > start + PAGE if total is not None else len(answer) == PAGE
+    return {"items": listed, "total": total, "next": start + PAGE if more else None}
 
 
 # Importing
@@ -366,21 +400,27 @@ async def import_zotero(project_id: str, body: ZoteroImport, request: Request):
     return {"run_id": await state["harness"].record_background(1, admit)}
 
 
-def read_attachment(text, fs_type=None):
+def read_attachment(text, fs_type=None, mounts=None):
     """(the PDF's bytes, None) or (None, why not) for the file URL Zotero named for an attachment.
     Only a file on this Mac's own disk is read, and no link is ever followed: a file: URL with no host,
     whose path (with no "." or ".." in it) is opened from / one folder at a time, each relative to the
     folder opened before it and never by name again, refusing a symbolic link at any step (pdf_link: an
     attachment reached through one imports with its details only; a Finder alias is a file, not a PDF). Before any of
-    it is opened, a path into one of macOS's automounted network folders is refused, and a file named
+    it is opened, a path at or under any mount point of the Mac's mount table (read with getfsstat and
+    MNT_NOWAIT, which mounts nothing; an autofs trigger, a direct-map one included, is listed) whose type
+    is not one of LOCAL_FILE_SYSTEMS is refused by its name (pdf_on_network; a table that cannot be read
+    refuses every path: pdf_unreadable), and a file named
     like a database (zotero.sqlite and its kin); each folder opened, / first, is checked on its own
     descriptor to be on one of LOCAL_FILE_SYSTEMS and not a cloud placeholder before anything in it is
     opened (any other type, autofs included, or one that cannot be read, is refused); the file
     is opened read-only and without waiting (a FIFO), then checked on its descriptor: a regular file on
     this Mac's disk, its contents here, of at most MAX_FILE_BYTES (at most one byte more is read), that
     starts as a PDF (only its first 5 bytes are read from one that does not). Nothing is written.
-    fs_type(fd), the file system type of an open descriptor, is for tests."""
-    fs_type = fs_type or _file_system_type
+    fs_type(fd), the file system type of an open descriptor, and mounts(), the mount table as [(mount
+    point, type)], are for tests. ponytail: a trigger mounted between the table's reading and the open is
+    not seen by name (the per-descriptor check still refuses what is below it once opened); it needs an
+    administrator to run automount meanwhile."""
+    fs_type, mounts = fs_type or _file_system_type, mounts or _mount_table
     if not isinstance(text, str):
         return None, "pdf_missing"
     try:
@@ -398,12 +438,13 @@ def read_attachment(text, fs_type=None):
     names = [name for name in path.split("/") if name]
     if not path.startswith("/") or "\x00" in path or not names or {".", ".."} & set(names):
         return None, "pdf_not_local"
-    lowered = [name.lower() for name in names]
-    if lowered[:3] == ["system", "volumes", "data"]:  # the firmlinked spelling of / on macOS
-        lowered = lowered[3:]
-    if lowered[:1] and lowered[0] in _AUTOMOUNTS:  # never opened: opening it would mount a share
+    try:
+        table = mounts()
+    except OSError:  # the Mac's mounts cannot be told: nothing is opened
+        return None, "pdf_unreadable"
+    if table is not None and _on_other_mount(names, table):  # never opened: opening it could mount a share
         return None, "pdf_on_network"
-    if lowered[-1].endswith(_DATABASES):
+    if names[-1].lower().endswith(_DATABASES):
         return None, "pdf_not_a_pdf"  # never Zotero's database or its kin
     try:
         folder = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
@@ -460,6 +501,46 @@ def read_attachment(text, fs_type=None):
     return bytes(data), None
 
 
+def _spelled(names):
+    """A path's names as compared with mount points: lower case (APFS's default ignores case), and
+    without the data volume's firmlinked prefix, so both of its spellings are one path."""
+    lowered = [name.lower() for name in names]
+    return lowered[3:] if lowered[:3] == _FIRMLINK else lowered
+
+
+def _on_other_mount(names, table):
+    """Whether a path is at or under any mount point whose file system is not one of LOCAL_FILE_SYSTEMS."""
+    path = _spelled(names)
+    for point, kind in table:
+        if kind not in LOCAL_FILE_SYSTEMS:
+            at = _spelled([name for name in point.split("/") if name])
+            if path[:len(at)] == at:
+                return True
+    return False
+
+
+def _mount_table():
+    """The Mac's mount table, [(mount point, file system type)], from getfsstat(MNT_NOWAIT); None off
+    macOS (no table is checked there). OSError when it cannot be read."""
+    if sys.platform != "darwin":
+        return None
+    libc = ctypes.CDLL(None, use_errno=True)
+    getfsstat = libc["getfsstat$INODE64"] if platform.machine() == "x86_64" else libc.getfsstat
+    getfsstat.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    for _ in range(3):  # a mount added between the count and the reading: read again
+        count = getfsstat(None, 0, MNT_NOWAIT)
+        if count < 0:
+            raise OSError(ctypes.get_errno(), "getfsstat failed")
+        table = (_StatFS * (count + 1))()
+        read = getfsstat(table, ctypes.sizeof(table), MNT_NOWAIT)
+        if read < 0:
+            raise OSError(ctypes.get_errno(), "getfsstat failed")
+        if read <= count:
+            return [(os.fsdecode(table[i].f_mntonname), table[i].f_fstypename.decode(errors="replace"))
+                    for i in range(read)]
+    raise OSError(errno.EAGAIN, "the mount table kept changing")
+
+
 def _open_problem(error, name, folder):
     """Why a step of the walk could not be opened: a link (ELOOP under O_NOFOLLOW, or a link where a
     folder was opened, looked at without following it), nothing there, or anything else."""
@@ -502,10 +583,13 @@ def _file_system_type(fd):
 def _pdf_child(children):
     """The item's PDF attachment's key: a stored file before a linked one, then the earliest added."""
     found = []
-    for data in (child["data"] for child in _objects(children)):  # any other shape: zotero_unavailable
-        if data.get("itemType") == "attachment" and data.get("contentType") == "application/pdf" \
-                and data.get("linkMode") in _LINKS:
-            found.append((data["linkMode"] == "linked_file", str(data.get("dateAdded") or ""), data["key"]))
+    for data in _rows(children):  # each read by the checked reader: any other shape fails the import
+        kind = _field(data, "itemType", TEXT)
+        content = _field(data, "contentType", TEXT, optional=True)
+        link = _field(data, "linkMode", TEXT, optional=True)
+        added = _field(data, "dateAdded", TEXT, optional=True) or ""
+        if kind == "attachment" and content == "application/pdf" and link in _LINKS:
+            found.append((link == "linked_file", added, data["key"]))
     return min(found)[2] if found else None
 
 
@@ -513,14 +597,11 @@ def _record(item):
     """(the item's CSL JSON as S1-14 keeps a record, or None without a visible title; how many of its
     values were left out as not what their field takes). Its DOI is kept only when the DOI field is,
     whole, a DOI (S1-14's rule); its arXiv ID only from Zotero's archiveID (_archive_id)."""
-    csl = item.get("csljson")
-    if not isinstance(csl, dict):  # an answer of another shape (null, a list): no record to go by
-        raise Unreachable("zotero_unavailable")
+    csl = _field(item, "csljson", OBJECT)  # its fields: S1-14's reader's
     found = next(reference_files._csl_json(json.dumps([csl]), lambda: None), None)
     if found is None:
         return None, 0
-    data = item.get("data") if isinstance(item.get("data"), dict) else {}
-    if (arxiv := _archive_id(data.get("archiveID"))) is not None:
+    if (arxiv := _archive_id(_field(item["data"], "archiveID", TEXT, optional=True))) is not None:
         found["arxiv"] = arxiv  # kept as S1-14 keeps a BibTeX eprint, so identifier() reads it
     return reference_files._finish(found)
 
@@ -548,10 +629,10 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
     item, _ = await _read(client, f"/api/{library}/items/{key}?format=json&include=data,csljson", server_id, RETRIES)
     if item is NOT_FOUND:  # 404: gone since it was browsed
         return None
-    if not (isinstance(item, dict) and isinstance(item.get("data"), dict) and item["data"].get("key") == key):
+    data = _field(_as(item, OBJECT), "data", OBJECT)
+    if _key(data) != key:
         raise Unreachable("zotero_unavailable")  # not the item asked for: no answer to go by
-    data = item["data"]
-    if data.get("itemType") in _NOT_ITEMS or data.get("deleted"):
+    if _field(data, "itemType", TEXT) in _NOT_ITEMS or _field(data, "deleted", (FLAG, INTEGER), optional=True):
         return None
     csl, dropped = _record(item)
     children, _ = await _read(client, f"/api/{library}/items/{key}/children?format=json", server_id, RETRIES)
@@ -564,9 +645,15 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
     # (zotero_unavailable) before the item is written or done, so a resume or a new import reads it again.
     url, _ = await _read(client, f"/api/{library}/items/{child}/file/view/url", server_id, RETRIES, none=(400, 404))
     try:
-        text = None if url is NOT_FOUND else url.decode("utf-8")
+        text = None if url is NOT_FOUND else url.decode("utf-8").strip()
     except UnicodeDecodeError:
         raise Unreachable("zotero_unavailable") from None
+    # Its answer is text: a URL, or "false" for an attachment with no file (Zotero's getLocalFileURL). Any
+    # other answer (null, {}, nothing) is no answer to go by, never "no file".
+    if text == "false":
+        text = None
+    elif text is not None and not _URL_START.match(text):
+        raise Unreachable("zotero_unavailable")
     def read_and_store():  # run to its end (Harness.work), so nothing of it outlasts the run's record
         data, why = read_attachment(text)
         if data is None or active.cancel_requested.is_set():
