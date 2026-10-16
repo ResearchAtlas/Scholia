@@ -25,11 +25,12 @@ file URL. Zotero's local API serves no file bytes: it names the file on disk (a 
 reads that local file itself (read_attachment), only when it is on this Mac's own disk, reached through
 no link, a regular PDF of at most extraction.MAX_FILE_BYTES; otherwise the item is imported with its
 details only, and the reason recorded. Every answer of Zotero's is checked for its shape before it is
-used; one of another shape fails the import (zotero_unavailable), never read as an empty answer. The record is read with S1-14's CSL JSON reader and bounds (backend/reference_files.py),
-so its identifier follows S1-14's rule: a DOI only from the record's DOI field, whole, else an arXiv ID
-only from Zotero's archiveID field when it is, whole, "arXiv:" and an ID (Harold, 2026-10-17); never
-from a URL or `number`. Each item is written in its own transaction, while the run is running, not revoked
-and not cancelled:
+used; one of another shape fails the import (zotero_unavailable), never read as an empty answer. The
+record is read with S1-14's CSL JSON reader and bounds (backend/reference_files.py), so its identifier
+follows S1-14's rule: a DOI only from the record's DOI field, whole, else an arXiv ID only from Zotero's
+archiveID field when it is, whole, "arXiv:" and an ID (Harold, 2026-10-17); never from a URL or
+`number`. Each item is written in its own transaction, while the run is running, not revoked and not
+cancelled:
 - an item already imported into the project (keyed by library and item key, `source_key`
   "<library>/items/<KEY>") is updated: its details replaced by the record when they changed and the
   researcher has not edited them, and a PDF that is none of its files becomes its next version;
@@ -149,11 +150,11 @@ async def _get(client, path, server_id=None):
         raise Unreachable("zotero_unavailable") from None
 
 
-async def _read(client, path, server_id=None, retries=()):
+async def _read(client, path, server_id=None, retries=(), none=(404,)):
     """The body of a 200 answer, parsed as JSON when it is JSON (text otherwise), and its headers; a
-    404 is None. Unreachable otherwise: 403 api_off, 412 zotero_changed (another Zotero than the one
-    browsed), anything else unavailable. retries: delays to try again after when Zotero gave no answer
-    or failed (5xx)."""
+    status in none (404: no such item) is None. Unreachable otherwise: 403 api_off, 412 zotero_changed
+    (another Zotero than the one browsed), anything else unavailable. retries: delays to try again after
+    when Zotero gave no answer or failed (5xx)."""
     for delay in (*retries, None):
         try:
             status, headers, body = await _get(client, path, server_id)
@@ -168,7 +169,7 @@ async def _read(client, path, server_id=None, retries=()):
                 return json.loads(body), headers
             except (ValueError, RecursionError):
                 raise Unreachable("zotero_unavailable") from None
-        if status == 404:
+        if status in none:
             return None, headers
         if status == 403:
             raise Unreachable("zotero_api_off")
@@ -262,6 +263,8 @@ async def collections(request: Request, library: str = ""):
     found = []
     for page in range(COLLECTION_PAGES):
         answer, headers = await _browse(state, f"/api/{library}/collections?format=json&limit=100&start={page * 100}")
+        if answer is None:
+            raise _refused(404, "not_found", "No such Zotero library")
         try:
             rows = _objects(answer)
         except Unreachable as unreachable:
@@ -353,8 +356,8 @@ def read_attachment(text, fs_type=None):
     """(the PDF's bytes, None) or (None, why not) for the file URL Zotero named for an attachment.
     Only a file on this Mac's own disk is read, and no link is ever followed: a file: URL with no host,
     whose path (with no "." or ".." in it) is opened from / one folder at a time, each relative to the
-    folder opened before it and never by name again, refusing a link at any step (pdf_link: an
-    attachment reached through an alias or a symbolic link imports with its details only). Before any of
+    folder opened before it and never by name again, refusing a symbolic link at any step (pdf_link: an
+    attachment reached through one imports with its details only; a Finder alias is a file, not a PDF). Before any of
     it is opened, a path into one of macOS's automounted network folders is refused, and a file named
     like a database (zotero.sqlite and its kin); each folder opened is checked, on its own descriptor,
     not to be on a network file system or a cloud placeholder before the next is opened in it; the file
@@ -399,7 +402,11 @@ def read_attachment(text, fs_type=None):
                 return None, _open_problem(error, name, folder)
             os.close(folder)
             folder = inner
-            if (problem := _place(os.fstat(folder), fs_type(folder))) is not None:
+            try:
+                problem = _place(os.fstat(folder), fs_type(folder))
+            except OSError:
+                return None, "pdf_unreadable"
+            if problem is not None:
                 return None, problem
         try:  # O_NONBLOCK: a FIFO never waits for a writer; O_NOFOLLOW: a link here is refused
             fd = os.open(names[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=folder)
@@ -411,7 +418,7 @@ def read_attachment(text, fs_type=None):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             return None, "pdf_not_a_file"
-        if (problem := _place(info, fs_type(fd))) is not None:
+        if (problem := _place(info, fs_type(fd))) is not None:  # an OSError here is pdf_unreadable (below)
             return None, problem
         if info.st_size > extraction.MAX_FILE_BYTES:
             return None, "pdf_too_large"
@@ -526,16 +533,15 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
     child = _pdf_child(children if children is not None else [])  # a 404: none
     if child is None:
         return csl, dropped, None, None
-    try:
-        url, _ = await _read(client, f"/api/{library}/items/{child}/file/view/url", server_id, RETRIES)
-    except Unreachable as unreachable:
-        if unreachable.code != "zotero_unavailable":  # a 400 for a file it no longer has: no file
-            raise
-        url = None
+    # Zotero's own answers that the attachment has no file: 400 (not a file attachment), 404 (no such
+    # attachment), or a 200 with no file URL ("false"), each read as pdf_missing. Any other failure (no
+    # answer after the tries, a redirect, an answer past the bound) is no answer: the import stops
+    # (zotero_unavailable) before the item is written or done, so a resume or a new import reads it again.
+    url, _ = await _read(client, f"/api/{library}/items/{child}/file/view/url", server_id, RETRIES, none=(400, 404))
     try:
         text = url.decode("utf-8") if url is not None else None
     except UnicodeDecodeError:
-        text = None
+        raise Unreachable("zotero_unavailable") from None
     def read_and_store():  # run to its end (Harness.work), so nothing of it outlasts the run's record
         data, why = read_attachment(text)
         if data is None or active.cancel_requested.is_set():
@@ -642,6 +648,8 @@ def _commit(conn, ids, harness, active, project_id, inputs, key, fetched):
             batch = recorded(conn, project_id, "lookup", {
                 "material_ids": [material], "versions": {material: version}, "origin": None, "batch": "zotero",
                 "open": True, "touched": time.time(), "import_run": run_id})  # open while the import runs
+    if step["outcome"] in ("imported", "updated"):  # the project changed: it comes first in the list, as other imports do
+        conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
     _event(conn, run_id, "step_finished", step)
     conn.execute("UPDATE runs SET inputs = json_set(json_insert(inputs, '$.done[#]', ?), '$.batch', ?) WHERE id = ?",
                  (key, batch, run_id))

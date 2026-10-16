@@ -780,3 +780,80 @@ async def test_an_import_has_one_lookup_batch_and_one_question_however_long_it_t
         [ask] = await asks_of(client, project)
         assert ask["params"]["identifiers"] == 3 and ask["params"]["batch"] == "zotero"
         assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(1,)]
+
+
+# GitHub connector threads on PR 33
+
+
+@pytest.mark.parametrize("failure", ["unanswered", "redirect", "over the bound"])
+async def test_a_failed_file_url_request_stops_the_import_and_never_loses_the_pdf(tmp_path, failure, monkeypatch):
+    import httpx
+    mock = library(tmp_path)
+    attachment = f"items/{KEYS[1][:7]}Z/file/view/url"
+    real = mock.__call__
+
+    async def failing(request):
+        if attachment in request.url.path:
+            mock.requests.append(("GET", request.url.raw_path.decode(), {}))
+            if failure == "unanswered":
+                return httpx.Response(503)
+            if failure == "redirect":
+                return httpx.Response(302, headers={"Location": "file:///etc/passwd"})
+            return httpx.Response(200, content=b"x" * (zotero.MAX_ANSWER + 1))
+        return await real(request)
+
+    monkeypatch.setattr(mock, "__call__", failing)
+    async with started(tmp_path / "data", MockProvider(zotero=failing, scholarly=MockScholarly())) as client:
+        project = await project_of(client)
+        run = await start(client, project, KEYS[1:2])
+        row = await run_finished(client, run)
+        assert (row["status"], row["result"]["reason"]) == ("failed", "zotero_unavailable")
+        assert await rows(client, "SELECT count(*) FROM materials") == [(0,)]
+        (inputs,) = (await rows(client, "SELECT inputs FROM runs WHERE id = ?", run))[0]
+        assert json.loads(inputs)["done"] == []  # read again by the next import
+
+
+@pytest.mark.parametrize("answer", [400, 404, "false"])
+async def test_zoteros_own_no_file_answers_import_the_details_with_their_reason(tmp_path, answer):
+    mock = library(tmp_path)
+    mock.files["users/0", KEYS[1][:7] + "Z"] = answer
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        row = await imported(client, project, KEYS[1:2])
+        assert (row["status"], row["result"]["imported"], row["result"]["pdf"]) == ("succeeded", 1, {"pdf_missing": 1})
+
+
+async def test_an_import_that_changes_the_project_brings_it_first_in_the_list(tmp_path):
+    mock = library(tmp_path, pdfs=False)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        other = await project_of(client, "Later")
+        assert (await client.get("/api/projects")).json()["projects"][1]["id"] == other
+        [(before,)] = await rows(client, "SELECT updated_at FROM projects WHERE id = ?", project)
+        await imported(client, project, KEYS[:1])
+        [(after,)] = await rows(client, "SELECT updated_at FROM projects WHERE id = ?", project)
+        assert after > before and (await client.get("/api/projects")).json()["projects"][1]["id"] == project
+        await imported(client, project, KEYS[:1])  # nothing changed: the project keeps its place
+        assert await rows(client, "SELECT updated_at FROM projects WHERE id = ?", project) == [(after,)]
+
+
+# Internal review 3
+
+
+async def test_a_record_without_an_identifier_is_looked_up_by_its_attached_files_doi(tmp_path):
+    import base64
+    from test_reference_import import ris
+    records = MockScholarly(openalex={DOI: openalex_work(DOI, "Resolved From the File")})
+    async with started(tmp_path / "data", MockProvider(scholarly=records)) as client:
+        project = await project_of(client)
+        await imported_references(client, project, ris(("A Record Without a DOI", "PY  - 2020\n")))
+        [paper] = (await listing(client, project))["materials"]
+        response = await client.post(f"/api/projects/{project}/materials", json={
+            "files": [{"name": "attach.md", "data": base64.b64encode(f"# Attached\n\nDOI: {DOI}\n".encode()).decode()}],
+            "material_id": paper["id"], "replaces": paper["version"]["id"]})
+        assert response.status_code == 201
+        await background_idle(client, 30)
+        steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events e JOIN runs r ON r.id = e.run_id"
+                                                         " WHERE r.workflow = 'lookup' AND e.type = 'step_finished'")]
+        assert (steps[-1]["identifier"], steps[-1]["outcome"]) == (f"doi:{DOI}", "resolved")
+        assert ("api.openalex.org", f"/works/doi:{DOI}") in [(h, p) for h, p, _ in records.requests]

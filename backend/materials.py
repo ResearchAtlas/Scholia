@@ -737,25 +737,24 @@ def _identifiers(conn, project_id, materials, versions):
 
 def _current(conn, pairs, identifier=None):
     """Of [(material id, version id)], those whose version is still its material's current one and, given
-    the identifier a lookup is for, whose record still gives it (_gives)."""
+    the identifier a lookup is for, that still give it (_gives)."""
     return [(m, v) for m, v in pairs if conn.execute(
         "SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1", (v, m)).fetchone()
-        and (identifier is None or _gives(conn, m, identifier))]
+        and (identifier is None or _gives(conn, m, v, identifier))]
 
 
-def _gives(conn, material, identifier):
-    """Whether a paper still gives the identifier a lookup was made for. A reference file's or a Zotero
-    paper's comes from its record (_identifiers), which a re-import (S1-15) or a merge can change while
-    its file stays: a lookup for the identifier it had then sends and applies nothing. A paper whose
-    identifier comes from its file's text is bound by its version (_current)."""
-    row = conn.execute("SELECT source, csl, checked_by, lookup_filled FROM materials WHERE id = ?",
-                       (material,)).fetchone()
-    if row is None or row[0] not in _RECORDED or row[2] == "researcher":
-        return row is not None
-    record = json.loads(row[1] or "{}")
-    for key in json.loads(row[3] or "[]"):  # a lookup's fields are not the record's
-        record.pop(key, None)
-    return reference_files.identifier(record) == tuple(identifier)
+def _gives(conn, material, version, identifier):
+    """Whether a paper still gives the identifier a lookup was made for, worked out as the lookup worked
+    it out (_identifiers: a reference file's or a Zotero paper's record, else its file's text). A record
+    a re-import (S1-15) or a merge changed while the file stayed may give another identifier, or none:
+    a lookup for the one it had then sends and applies nothing. A paper whose details the researcher
+    edited is bound by its version alone, as before: no import or merge changes its details, and _apply
+    keeps what they say (its retraction check only for the DOI they carry)."""
+    row = conn.execute("SELECT project_id, checked_by FROM materials WHERE id = ?", (material,)).fetchone()
+    if row is not None and row[1] == "researcher":
+        return True
+    found = row and _identifiers(conn, row[0], [material], {material: version}).get(material)
+    return bool(found) and tuple(found[1] or ()) == tuple(identifier)
 
 
 async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
@@ -824,7 +823,7 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
         if row is None:
             continue
         # S1-15: a record that gives another identifier now is not this lookup's to fill
-        mine, result = (found, outcome) if row[1] and _gives(conn, material, (scheme, value)) else (None, "replaced")
+        mine, result = (found, outcome) if row[1] and _gives(conn, material, version, (scheme, value)) else (None, "replaced")
         filled = _fill_imported(conn, material, mine) if mine is not None else None  # S1-14: its record stays
         if mine is not None:
             if row[0] != "researcher" and filled is None:  # what the researcher edited stays
