@@ -78,7 +78,8 @@ DOCS = [("d1", "Coral bleaching", "Coral reefs bleach when ocean temperatures ri
         ("d2", "Wheat yields", "Drought lowers wheat yields across dry farming regions."),
         ("d3", "Bird migration", "Songbirds migrate at night using the stars for direction."),
         ("d4", "Same text", "Drought lowers wheat yields across dry farming regions."),
-        ("d5", "", "")]
+        ("d5", "", ""),
+        ("d6", "Coral bleaching", "Coral reefs bleach when ocean temperatures rise for weeks.")]  # d1 again
 QUERIES = [("q1", "coral reefs bleach ocean temperatures", {"d1": 2}),
            ("q2", "drought wheat yields", {"d2": 1, "d4": 1, "d3": 0}),
            ("q3", "songbirds migrate stars", {"d3": 1, "d5": 1})]
@@ -295,14 +296,15 @@ async def test_a_full_run_builds_through_the_app_scores_each_benchmark_apart_and
     assert "combined" not in json.dumps(results)
 
     beir = results["benchmarks"]["scifact"]
-    assert beir["documents"] == 5 and beir["documents_empty"] == 1 and beir["documents_sharing_a_file"] == 1
+    # d2 and d4 share their text but not their title: two papers; d6 repeats d1's title and text: one file
+    assert beir["documents"] == 6 and beir["documents_empty"] == 1 and beir["documents_sharing_a_file"] == 1
     assert beir["keys"] is None and beir["query_language"] == beir["document_language"] == "en"
     hybrid = beir["arms"]["hybrid"]
     assert hybrid["complete"] and hybrid["fallbacks"] == {}
     assert hybrid["metrics"]["ndcg@10"]["n"] == 3 and hybrid["metrics"]["ndcg@10"]["mean"] > 0.8
     assert beir["relevant_documents_not_indexed"] == 1  # d5 has no title or text: judged, never searchable
     assert beir["arms"]["keyword_only"]["minus_hybrid"]["ndcg@10"]["n"] == 3
-    assert beir["build"]["passages"] == 3 and beir["build"]["passage_chars"]["n"] == 3
+    assert beir["build"]["passages"] == 8 and beir["build"]["passage_chars"]["n"] == 8  # a title and a text each
     assert beir["commit"] == {"sha": "test", "modified": False} and beir["started_at"] <= beir["finished_at"]
 
     qasper = results["benchmarks"]["qasper"]
@@ -526,6 +528,7 @@ def test_the_committed_baseline_is_a_finished_full_run_of_all_five_with_ids_only
     baseline = tier1.load_manifest(ROOT / "evals" / "baseline" / "tier1-baseline.json")
     assert baseline["status"] == "finished" and baseline["gaps"] == [] and baseline["level"] == "full"
     assert baseline["like_for_like"] and baseline["model_settings"] == manifest["model_settings"]
+    assert baseline["manifest_rules_sha256"] == tier1.rules_sha256(manifest)
     assert set(baseline["benchmarks"]) == set(manifest["benchmarks"])
     for name, bench in baseline["benchmarks"].items():
         assert (bench["keys"] is not None) == manifest["benchmarks"][name]["ids_committable"], name
@@ -533,33 +536,6 @@ def test_the_committed_baseline_is_a_finished_full_run_of_all_five_with_ids_only
         assert bench["query_language"] == bench["document_language"] == "en"
     one = {**baseline, "benchmarks": {"nfcorpus": baseline["benchmarks"]["nfcorpus"]}}  # one, to be quick
     assert all(line.startswith(("nfcorpus", "  ")) for line in tier1.compare(manifest, one, one))
-
-
-def test_a_run_under_this_manifest_is_like_for_like_with_the_baseline_and_a_changed_rule_is_not():
-    """The subset changed after the baseline (Harold, 2026-10-17): only `levels` did, so a run under this
-    manifest pairs with the baseline as like for like; any change to pins, rules or metrics does not."""
-    manifest = tier1.load_manifest()
-    baseline = tier1.load_manifest(ROOT / "evals" / "baseline" / "tier1-baseline.json")
-    assert manifest["rules_unchanged_since"]["manifest_sha256"] == baseline["manifest_sha256"]
-    assert "manifest_rules_sha256" not in baseline  # it predates the rules hash
-    baseline = {**baseline, "benchmarks": {"scifact": baseline["benchmarks"]["scifact"]}}  # one, to be quick
-    run = {**baseline, "manifest_sha256": "a newer file", "manifest_rules_sha256": tier1.rules_sha256(manifest)}
-    assert not [line for line in tier1.compare(manifest, baseline, run) if line.startswith("NOT LIKE FOR LIKE")]
-    changed = {**manifest, "bootstrap": {**manifest["bootstrap"], "seed": 1}}
-    other = {**run, "manifest_rules_sha256": tier1.rules_sha256(changed)}
-    assert "NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's" in \
-        tier1.compare(manifest, baseline, other)
-    assert tier1.rules_sha256({**manifest, "levels": {}}) == tier1.rules_sha256(manifest)
-    # The recorded rules are this manifest's: change its pins, rules or metrics and this fails, so updating
-    # rules_unchanged_since is a deliberate step; and a run under a changed manifest no longer pairs as like.
-    assert manifest["rules_unchanged_since"]["rules_sha256"] == tier1.rules_sha256(manifest)
-    wider = {**manifest, "search_limit": manifest["search_limit"] + 1}
-    later = {**run, "manifest_rules_sha256": tier1.rules_sha256(wider)}
-    assert "NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's" in \
-        tier1.compare(wider, baseline, later)
-    # An earlier file whose whole manifest is not the one recorded is judged by that hash: it differs.
-    older = {k: v for k, v in run.items() if k != "manifest_rules_sha256"}
-    assert tier1.rules_of(manifest, older) == "a newer file" != tier1.rules_of(manifest, baseline)
 
 
 def test_the_committed_subset_reference_is_a_finished_subset_run_under_this_manifests_rules():
@@ -647,3 +623,14 @@ def test_out_says_incomplete_before_any_input_is_checked_and_an_unreadable_set_f
     finally:
         qrels.chmod(0o644)
     assert json.loads(out.read_text())["reason"].startswith("refused: PermissionError")
+
+
+def test_a_documents_file_carries_its_title_so_only_identical_documents_share_one():
+    same_text = tier1.document_file("Wheat yields", "Drought lowers yields."), \
+        tier1.document_file("Same text", "Drought lowers yields.")
+    assert same_text[0][1] == b"# Wheat yields\n\nDrought lowers yields.\n" and same_text[0][1] != same_text[1][1]
+    assert tier1.document_file("Wheat yields", "Drought lowers yields.") == same_text[0]  # identical: one file
+    assert tier1.document_file("Only a title", "") == ("Only a title.md", b"# Only a title\n")
+    assert tier1.document_file("", "Only text.") == ("Untitled.md", b"Only text.\n")
+    assert tier1.document_file("", "") is None
+    assert b"d1" not in tier1.document_file("Coral bleaching", "Coral reefs bleach.")[1]  # no id in the file

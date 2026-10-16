@@ -150,9 +150,13 @@ def file_name(title):
 
 
 def document_file(title, text):
-    """One document as a Markdown file of its text (its title when it has none); None when both are empty."""
-    body = clean(text) or clean(title)
-    return (file_name(title), (body + "\n").encode()) if body else None
+    """One document as a Markdown file, as a paper's own Markdown carries it: its title as a heading, then
+    its text; None when both are empty. Documents whose titles differ are so different files, so different
+    materials (the app keeps one material for a file a project already has); only documents whose title
+    and text are both the same share one, and with it their passages (see build_documents)."""
+    heading = clean(title).lstrip("#").strip()
+    parts = [f"# {heading}"] * bool(heading) + [clean(text)] * bool(clean(text))
+    return (file_name(title), ("\n\n".join(parts) + "\n").encode()) if parts else None
 
 
 # QASPER evidence (ticket 72 E1; the manifest's rules)
@@ -449,8 +453,9 @@ async def build_qasper(client, state, install, papers, limit):
 
 
 async def build_documents(client, state, install, docs, name):
-    """One project of one material per document; {material id: [document ids]} (documents with the
-    same file share a material)."""
+    """One project of one material per document; {material id: [document ids]}. Documents with the same
+    title and text have the same file, which the app keeps as one material: one document for retrieval,
+    whose ids are credited at consecutive ranks in corpus order (as a retriever ranks identical documents)."""
     began = time.perf_counter()
     project = await new_project(client, name)
     files, kept = [], []
@@ -740,21 +745,14 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
 
 def rules_sha256(manifest):
     """The SHA-256 of what makes two runs like for like: the manifest without its levels (which runs
-    which queries; compare pairs queries by key or order) and without rules_unchanged_since."""
-    kept = {k: v for k, v in manifest.items() if k not in ("levels", "rules_unchanged_since")}
+    which queries; compare pairs queries by key or order)."""
+    kept = {k: v for k, v in manifest.items() if k != "levels"}
     return hashlib.sha256(json.dumps(kept, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def rules_of(manifest, results):
-    """A results file's rules hash: recorded since the subset changed; for an earlier file, the rules hash
-    rules_unchanged_since records for the whole-manifest hash it names (fixed there, so a later change of
-    pins, rules or metrics still differs from it), else that whole-manifest hash (so it differs)."""
-    if results.get("manifest_rules_sha256"):
-        return results["manifest_rules_sha256"]
-    since = manifest.get("rules_unchanged_since") or {}
-    if results.get("manifest_sha256") and results.get("manifest_sha256") == since.get("manifest_sha256"):
-        return since.get("rules_sha256")
-    return results.get("manifest_sha256")
+def rules_of(results):
+    """A results file's rules hash, or for a file without one, its whole manifest's hash (so it differs)."""
+    return results.get("manifest_rules_sha256") or results.get("manifest_sha256")
 
 
 def compare(manifest, baseline, current):
@@ -767,7 +765,7 @@ def compare(manifest, baseline, current):
     lines = []
     if not current.get("like_for_like") or current.get("model_settings") != baseline.get("model_settings"):
         lines.append("NOT LIKE FOR LIKE: the model settings differ from the baseline's or the manifest's")
-    if rules_of(manifest, current) != rules_of(manifest, baseline):
+    if rules_of(current) != rules_of(baseline):
         lines.append("NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's")
     if current.get("bootstrap") != baseline.get("bootstrap"):
         lines.append("the bootstrap settings differ from the baseline's; the intervals below use the manifest's")

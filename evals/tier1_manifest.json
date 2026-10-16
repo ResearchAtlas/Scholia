@@ -112,7 +112,8 @@
       "primary": "ndcg@10",
       "resample": "query",
       "rules": {
-        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material: its file named by the title (so the material's title, which prefixes the index text, is the document's title), its text the document's text (its title when the text is empty); the app reads it into passages by section 7.1. A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); documents with identical files share their passages and are ranked together; a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do"
+        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material, as a paper's Markdown carries it: its title as a heading, then its text (the title alone when the text is empty), the file named by the title (so the material's title, which prefixes the index text, is the document's title; no id reaches the file); the app reads it into passages by section 7.1 (the heading is a title passage). Documents whose title and text are both the same are the same file, which the app keeps as one material (one material per file in a project): they are one document for retrieval, their ids credited at consecutive ranks in corpus order, as a retriever ranks identical documents (documents_sharing_a_file counts them). A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do",
+        "identical_documents": "0 documents share a file with an earlier one (0 groups of identical title and text), counted from the pinned files with this rule"
       }
     },
     "nfcorpus": {
@@ -167,7 +168,8 @@
       "primary": "ndcg@10",
       "resample": "query",
       "rules": {
-        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material: its file named by the title (so the material's title, which prefixes the index text, is the document's title), its text the document's text (its title when the text is empty); the app reads it into passages by section 7.1. A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); documents with identical files share their passages and are ranked together; a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do"
+        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material, as a paper's Markdown carries it: its title as a heading, then its text (the title alone when the text is empty), the file named by the title (so the material's title, which prefixes the index text, is the document's title; no id reaches the file); the app reads it into passages by section 7.1 (the heading is a title passage). Documents whose title and text are both the same are the same file, which the app keeps as one material (one material per file in a project): they are one document for retrieval, their ids credited at consecutive ranks in corpus order, as a retriever ranks identical documents (documents_sharing_a_file counts them). A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do",
+        "identical_documents": "40 documents share a file with an earlier one (40 groups of identical title and text), counted from the pinned files with this rule"
       }
     },
     "scidocs": {
@@ -222,7 +224,8 @@
       "primary": "ndcg@10",
       "resample": "query",
       "rules": {
-        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material: its file named by the title (so the material's title, which prefixes the index text, is the document's title), its text the document's text (its title when the text is empty); the app reads it into passages by section 7.1. A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); documents with identical files share their passages and are ranked together; a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do"
+        "documents": "each corpus document (BEIR's _id, title, text) becomes one Markdown material, as a paper's Markdown carries it: its title as a heading, then its text (the title alone when the text is empty), the file named by the title (so the material's title, which prefixes the index text, is the document's title; no id reaches the file); the app reads it into passages by section 7.1 (the heading is a title passage). Documents whose title and text are both the same are the same file, which the app keeps as one material (one material per file in a project): they are one document for retrieval, their ids credited at consecutive ranks in corpus order, as a retriever ranks identical documents (documents_sharing_a_file counts them). A document is ranked by its best passage (MaxP) in the top 50 passages search returns (MAX_LIMIT); a document whose id equals the query's id is dropped from its ranking (BEIR's evaluate does the same); judgments of grade 0 are not relevant; nDCG uses linear gain, as trec_eval and so BEIR do",
+        "identical_documents": "1 documents share a file with an earlier one (1 groups of identical title and text), counted from the pinned files with this rule"
       }
     },
     "litsearch": {
@@ -308,8 +311,9 @@
       "primary": "recall@5 (specific)",
       "resample": "query",
       "rules": {
-        "documents": "each corpus_clean document becomes one Markdown material, its file named by the title and its text the abstract (titles and abstracts only, as LitSearch's main results use), ranked by its best passage as for the BEIR sets; specific questions are those with specificity 1, broad those with 0",
-        "metric": "LitSearch's paper (Ajith et al., 2024, section 3.1 and table 3) reports recall@20 for broad questions and recall@5 and recall@20 for specific ones, and headlines recall@5 on specific questions; recall@k is the share of a question's gold papers in the top k"
+        "documents": "each corpus_clean document becomes one Markdown material as for the BEIR sets: its title as a heading, then its abstract (titles and abstracts only, as LitSearch's main results use), named by the title; documents whose title and abstract are both the same are one material, their ids at consecutive ranks; ranked by its best passage as for the BEIR sets; specific questions are those with specificity 1, broad those with 0",
+        "metric": "LitSearch's paper (Ajith et al., 2024, section 3.1 and table 3) reports recall@20 for broad questions and recall@5 and recall@20 for specific ones, and headlines recall@5 on specific questions; recall@k is the share of a question's gold papers in the top k",
+        "identical_documents": "330 documents share a file with an earlier one (281 groups of identical title and text), counted from the pinned files with this rule"
       }
     }
   },
@@ -432,12 +436,6 @@
         "litsearch": "all queries"
       }
     }
-  },
-  "rules_unchanged_since": {
-    "commit": "dbed9f1efadd6dac93d1993e0242737da48e1292",
-    "manifest_sha256": "c6e9de905ef1e76be27f88c7ad109c44a79fdf44449c76a02accd980229cd8eb",
-    "rules_sha256": "692683fd214a613156d526db343a76807ca5418d3be73bf1bd85659aecb37dfa",
-    "changed": "only `levels` (the small subset, Harold 2026-10-17) and this record: a results file whose manifest_sha256 is the one above was run under the pins, rules, metrics and settings whose rules_sha256 is recorded here (evals/tier1.py rules_of); a test fails when this manifest's rules no longer have that hash"
   },
   "arms": {
     "hybrid": "backend.search.search as the app runs it: BM25 50 and dense 50 concurrently, RRF k 60, within [retrieval] hybrid_ms; a query that falls back to keyword-only at the deadline is scored as the app returned it, counted and marked, and the hybrid metrics are also given without such queries; a fallback for any other reason, an index not ready or partial meaning-search coverage leaves the arm unscored, its queries marked",
