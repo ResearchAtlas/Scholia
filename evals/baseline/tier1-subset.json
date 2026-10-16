@@ -4,10 +4,10 @@
  "benchmarks_asked": [
   "qasper"
  ],
- "manifest_sha256": "76a75368d30c3bd38d3afbd311fca277d8eacbb00b6aedf44fcbbd3afd57a9d6",
- "manifest_rules_sha256": "692683fd214a613156d526db343a76807ca5418d3be73bf1bd85659aecb37dfa",
+ "manifest_sha256": "55aaefba3f0dafc3b3dc46f284c1a9632695973f73dfcbb4d86bc97adac158ef",
+ "manifest_rules_sha256": "fe0d5570dcca17dea14f8688ef94a8d87c2a4b563cb7436a6236b612cae8c7c0",
  "commit": {
-  "sha": "bc88c7cdfb6a52fa6d194e40b9ac157e17a33d34",
+  "sha": "bba313fa576675df103f8639b78458df13581604",
   "modified": false
  },
  "machine": {
@@ -18,11 +18,11 @@
   "python": "3.13.14"
  },
  "reference_machine": "Apple M5, 24 GB, macOS 27.0.1 (ticket 70)",
- "started_at": "2026-10-17T00:37:26+0800",
+ "started_at": "2026-10-17T07:28:32+0800",
  "load_average_start": [
-  15.90576171875,
-  8.04248046875,
-  5.70068359375
+  2.56396484375,
+  2.65234375,
+  3.10302734375
  ],
  "arms": [
   "keyword_only",
@@ -38,7 +38,7 @@
  "benchmarks": {
   "qasper": {
    "build": {
-    "seconds": 457.0,
+    "seconds": 271.7,
     "passages": 5884,
     "passages_refused": 0,
     "passage_chars": {
@@ -50,11 +50,11 @@
     },
     "passages_over_2000_chars": 0,
     "readings_not_succeeded": 0,
-    "index_bytes": 434326280,
-    "read_and_keyword_seconds": 11.2,
-    "model_import_seconds": 1.9,
-    "embedding_seconds": 443.8,
-    "embedded_per_second": 13.2
+    "index_bytes": 434112136,
+    "read_and_keyword_seconds": 6.8,
+    "model_import_seconds": 0.5,
+    "embedding_seconds": 264.5,
+    "embedded_per_second": 22.1
    },
    "papers": 100,
    "exclusions": {
@@ -738,10 +738,10 @@
      "fallback_queries": [],
      "search_seconds": {
       "n": 328,
-      "median": 0.0057,
-      "p95": 0.01,
-      "min": 0.0009,
-      "max": 0.0137
+      "median": 0.0048,
+      "p95": 0.0076,
+      "min": 0.0008,
+      "max": 0.0097
      },
      "ranking_digests": [
       "22af7309f28aa139",
@@ -2124,10 +2124,10 @@
      "fallback_queries": [],
      "search_seconds": {
       "n": 328,
-      "median": 0.0405,
-      "p95": 0.0521,
-      "min": 0.0192,
-      "max": 0.0799
+      "median": 0.0323,
+      "p95": 0.0414,
+      "min": 0.0181,
+      "max": 0.072
      },
      "ranking_digests": [
       "e3970c75f307c3b8",
@@ -2280,7 +2280,7 @@
       "41faaea301cfc53d",
       "f8a73842d3b659f4",
       "d0e8117adbd71fa6",
-      "28eb5d89e18b716e",
+      "6ec60ec79218c080",
       "70ce5dd147f5fe6b",
       "9dbc2a0430bfc78d",
       "1fa97a9a1d1e6632",
@@ -3482,13 +3482,13 @@
    "query_language": "en",
    "document_language": "en",
    "commit": {
-    "sha": "bc88c7cdfb6a52fa6d194e40b9ac157e17a33d34",
+    "sha": "bba313fa576675df103f8639b78458df13581604",
     "modified": false
    },
-   "started_at": "2026-10-17T00:37:26+0800",
-   "finished_at": "2026-10-17T00:45:20+0800",
+   "started_at": "2026-10-17T07:28:32+0800",
+   "finished_at": "2026-10-17T07:33:17+0800",
    "helper_sockets": [
-    "127.0.0.1:51816 (LISTEN)"
+    "127.0.0.1:61315 (LISTEN)"
    ],
    "not_loopback_sockets": []
   }
@@ -3533,11 +3533,11 @@
  },
  "like_for_like": true,
  "gaps": [],
- "seconds": 474.4,
+ "seconds": 285.2,
  "load_average_end": [
-  4.55908203125,
-  7.81201171875,
-  6.93994140625
+  3.12744140625,
+  3.0126953125,
+  3.130859375
  ],
- "finished_at": "2026-10-17T00:45:20+0800"
+ "finished_at": "2026-10-17T07:33:17+0800"
 }
