@@ -1,21 +1,21 @@
 // i18n: migrated
 // The app: the first-run setup, then the window's three columns. The language follows the
 // [ui] language setting ("system" follows the system), and light or dark follows the system.
-// A language other than English is drawn once its catalog has loaded (i18n languageSwitch): until
-// then the window shows nothing, or stays in the language it was in; one that cannot load shows
-// as a part that could not load, with Try again. Until the setting is read, the loading state is
-// in the system's language; what follows it waits for the setting's language to be drawn.
+// The window is drawn in a language once its catalog has loaded (i18n languageSwitch), and only
+// the setting's language is loaded (the system's when the setting cannot be read): until then the
+// window shows nothing. One that cannot load says so in that language (NOT_LOADED), with Try again
+// and Use English, which sets the language to English. A change in Settings loads its catalog
+// before it is saved, so the window changes language at once.
 // A data folder Scholia will not open, or a damaged database, shows its own screen; health is
 // read first, since a limited app serves little else.
 import { useCallback, useEffect, useState } from 'react';
-import { LanguageContext, languageSwitch, resolveLanguage, useT } from './i18n/index.js';
-import { ApiError, get } from './api.js';
+import { LanguageContext, NOT_LOADED, languageSwitch, resolveLanguage, useT } from './i18n/index.js';
+import { ApiError, get, saveSettings } from './api.js';
 import { errorText } from './text.js';
 import { FirstRun } from './components/FirstRun.jsx';
 import { Shell } from './components/Shell.jsx';
 import { DataFolderScreen } from './components/DataFolderScreen.jsx';
 import { DamagedDatabaseScreen } from './components/Backups.jsx';
-import { LoadState } from './components/fields.jsx';
 import { Button } from '@/components/ui/button';
 
 function useSystemTheme() {
@@ -31,30 +31,34 @@ function useSystemTheme() {
 export function App() {
   useSystemTheme();
   const [state, setState] = useState({ phase: 'loading' });
-  const [shown, setShown] = useState({ language: null, failed: false });
-  const [setLanguage] = useState(() => languageSwitch(setShown));
+  const [shown, setShown] = useState({ language: null, failed: null });
+  const [languages] = useState(() => languageSwitch(setShown));
   const { language } = shown;
-
-  useEffect(() => {
-    setLanguage(resolveLanguage('system', navigator.language));
-  }, [setLanguage]);
 
   const load = useCallback(async () => {
     try {
       const health = await get('/api/health');
       if (health.data_folder_problem || health.database_damaged) {
         const settings = await get('/api/settings').catch(() => null); // a limited app may not serve it
-        await setLanguage(resolveLanguage(settings?.values?.ui?.language ?? 'system', navigator.language));
+        await languages.want(resolveLanguage(settings?.values?.ui?.language ?? 'system', navigator.language));
         setState({ phase: health.data_folder_problem ? 'dataFolder' : 'damaged', health });
         return;
       }
       const [setup, settings] = await Promise.all([get('/api/setup'), get('/api/settings')]);
-      await setLanguage(resolveLanguage(settings.values?.ui?.language ?? 'system', navigator.language));
+      await languages.want(resolveLanguage(settings.values?.ui?.language ?? 'system', navigator.language));
       setState({ phase: setup.needed ? 'setup' : 'ready', health, settings });
     } catch (error) {
+      await languages.fallback(resolveLanguage('system', navigator.language)); // the setting was not read
       setState({ phase: 'error', code: error instanceof ApiError ? error.code : 'internal' });
     }
-  }, [setLanguage]);
+  }, [languages]);
+
+  // Use English, on the screen of a language that could not load: the setting becomes English,
+  // and English is drawn even if it could not be saved, since the researcher chose it.
+  const chooseEnglish = async () => {
+    await saveSettings({ 'ui.language': 'en' }).catch(() => null);
+    await languages.want('en');
+  };
 
   useEffect(() => {
     load();
@@ -74,15 +78,7 @@ export function App() {
     if (language) document.documentElement.lang = language;
   }, [language]);
 
-  if (shown.failed) {
-    return (
-      <LanguageContext.Provider value={language ?? 'en'}>
-        <div className="grid h-full place-items-center p-6">
-          <div className="max-w-sm"><LoadState problem="part_not_loaded" onRetry={() => window.location.reload()} /></div>
-        </div>
-      </LanguageContext.Provider>
-    );
-  }
+  if (shown.failed) return <LanguageNotLoaded language={shown.failed} onEnglish={chooseEnglish} />;
   if (!language) return null;
   return (
     <LanguageContext.Provider value={language}>
@@ -92,7 +88,7 @@ export function App() {
       {state.phase === 'damaged' && <DamagedDatabaseScreen onRestored={load} />}
       {state.phase === 'setup' && <FirstRun onDone={load} />}
       {state.phase === 'ready' && <Shell health={state.health} settings={state.settings}
-        onLanguage={(setting) => setLanguage(resolveLanguage(setting, navigator.language))} />}
+        onLanguage={(setting) => languages.want(resolveLanguage(setting, navigator.language))} />}
     </LanguageContext.Provider>
   );
 }
@@ -113,6 +109,24 @@ function Failure({ code, onRetry }) {
       <div className="max-w-sm text-center" role="alert">
         <p className="text-sm">{errorText(t, code)}</p>
         <Button className="mt-4" variant="outline" onClick={onRetry}>{t('common.retry')}</Button>
+      </div>
+    </div>
+  );
+}
+
+// A language whose catalog could not be loaded, said in that language from the few strings kept
+// with the window (NOT_LOADED), since its catalog is what could not load. Try again reloads the
+// window, as for the other parts that could not load.
+function LanguageNotLoaded({ language, onEnglish }) {
+  const text = NOT_LOADED[language];
+  return (
+    <div className="grid h-full place-items-center p-6" lang={language}>
+      <div role="alert" className="max-w-sm space-y-3 rounded-md bg-destructive/10 px-3 py-3 text-sm text-destructive">
+        <p>{text.message}</p>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={() => window.location.reload()}>{text.retry}</Button>
+          <Button variant="outline" size="sm" onClick={onEnglish}>{text.english}</Button>
+        </div>
       </div>
     </div>
   );

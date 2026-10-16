@@ -4,7 +4,7 @@
 // the project's in its own; keys live in the credential store (section 4.4).
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, X } from 'lucide-react';
-import { LANGUAGES, LanguageContext, useT } from '../i18n/index.js';
+import { LANGUAGES, LanguageContext, loadLanguage, resolveLanguage, useT } from '../i18n/index.js';
 import { ApiError, get, patch, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText, money } from '../text.js';
@@ -89,7 +89,16 @@ function General({ onLanguage, projectId }) {
           <Segmented label={t('settings.language')} value={values.ui.language}
             options={[{ value: 'system', label: t('settings.languageSystem') },
               ...LANGUAGES.map((code) => ({ value: code, label: t(`language.${code}`) }))]}
-            onChange={async (value) => { if (await personal.save({ 'ui.language': value })) onLanguage(value); }} />
+            onChange={async (value) => {
+              // The language's catalog loads first; the setting is saved only once the window can be
+              // drawn in it, and one that cannot load leaves the setting and the window as they were.
+              setProblem(null);
+              if (!await loadLanguage(resolveLanguage(value, navigator.language)).then(() => true, () => false)) {
+                setProblem('language_not_loaded');
+                return;
+              }
+              if (await personal.save({ 'ui.language': value })) onLanguage(value);
+            }} />
         </div>
       </Field>
       <Field label={t('settings.followUp')} hint={t('settings.followUpHint')}>

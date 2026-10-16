@@ -28,21 +28,38 @@ export function loadLanguage(language) {
 // The language the window is drawn in, following the language asked for, want(language): at once
 // when its catalog is here, else once it has loaded, so nothing shows in another language meanwhile;
 // the last language asked for wins. show({ language, failed }) is told each change: language is the
-// one drawn (null before any), and failed whether the catalog of the language asked for could not
-// be loaded, which the window shows as a part that could not load. want returns a promise that
-// settles, never rejecting, once show has been told (or a later language was asked for meanwhile),
-// so what is drawn next waits for it.
+// one drawn (null before any), and failed the language asked for whose catalog could not be loaded
+// (else null), which the window shows as a part that could not load (NOT_LOADED). want returns a
+// promise that settles, never rejecting, once show has been told (or a later language was asked for
+// meanwhile), so what is drawn next waits for it. fallback(language) wants a language only if none
+// has been asked for: the system's, when the setting could not be read.
 export function languageSwitch(show, load = loadLanguage) {
   let wanted = null;
   let drawn = null;
-  const draw = (language) => { drawn = language; show({ language, failed: false }); };
-  return function want(language) {
+  const draw = (language) => { drawn = language; show({ language, failed: null }); };
+  const want = (language) => {
     wanted = language;
     if (languageLoaded(language)) return Promise.resolve(draw(language));
     return load(language).then(() => { if (wanted === language) draw(language); },
-      () => { if (wanted === language) show({ language: drawn, failed: true }); });
+      () => { if (wanted === language) show({ language: drawn, failed: language }); });
   };
+  return { want, fallback: (language) => (wanted === null ? want(language) : Promise.resolve()) };
 }
+
+// What the window says when a language's catalog could not be loaded, in that language: kept here,
+// in the script loaded at start, since the catalog that would say it is what could not load.
+export const NOT_LOADED = {
+  en: {
+    message: 'Scholia could not load this interface language. Try again reloads the window; Use English sets the interface language to English.',
+    retry: 'Try again',
+    english: 'Use English',
+  },
+  'zh-CN': {
+    message: 'Scholia 未能加载中文界面。点“重试”会重新载入窗口；点“使用英文”会把界面语言设为英文。',
+    retry: '重试',
+    english: '使用英文',
+  },
+};
 
 // The [ui] language setting is "system", "en" or "zh-CN". "system" follows the
 // OS locale: any Chinese locale maps to zh-CN, every other locale to English.
