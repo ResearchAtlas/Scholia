@@ -2398,3 +2398,48 @@ async def test_damage_found_while_a_rebuild_is_under_way_asks_for_no_second_one(
         await asyncio.to_thread(index._damaged)
         assert asked == [] and not index.damaged
         index.building = False
+
+
+@pytest.mark.asyncio
+async def test_a_damage_report_made_on_a_file_since_replaced_leaves_its_healthy_replacement_alone(tmp_path, monkeypatch):
+    """Finding 66: a read's connection fails on a damaged file; before its report reaches _damaged (after admission
+    ends), the file is replaced by a rebuild that finishes. The late report is about the file that is gone: the
+    healthy replacement (fresh, no read of it yet) stays usable, and no retry is armed."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        while not index._readers.empty():
+            index._readers.get_nowait().close()
+        with open(index.path, "r+b") as file:  # SQLite's header string, overwritten
+            file.write(b"not a database!!")
+        real, paused, resume, outcome = SearchIndex._damaged, threading.Event(), threading.Event(), []
+
+        def damaged(self, *args):
+            if threading.current_thread() is reader:  # the read's report, held until the file is replaced
+                paused.set()
+                resume.wait(20)
+            return real(self, *args)
+        monkeypatch.setattr(SearchIndex, "_damaged", damaged)
+
+        def read():
+            try:
+                index.keyword(project, "wage", 5)
+            except Exception as error:
+                outcome.append(error)
+        reader = threading.Thread(target=read)
+        reader.start()
+        assert await asyncio.to_thread(paused.wait, 20)
+        index.rebuilt = None  # no run reads the replacement meanwhile: it stays fresh (no read of it has succeeded)
+        await asyncio.to_thread(index._damaged)  # another report (say a pass's): the file is replaced, rebuilt
+        await until_rebuilt(index)
+        assert index._fresh and index.path.exists()
+        inode = os.stat(index.path).st_ino
+        resume.set()
+        await asyncio.to_thread(reader.join, 20)
+        assert outcome and isinstance(outcome[0], search_index.Unavailable)
+        assert not index.unusable and not index.building and not index.damaged  # the replacement left alone
+        assert index._rebuild_retry is None and os.stat(index.path).st_ino == inode
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)

@@ -379,9 +379,9 @@ class SearchIndex:
                     failed = damaged = True
             if not failed:
                 self._reading += 1
-        if failed:  # after the lock (_damaged takes it)
+        if failed:  # after the lock (_damaged takes it): reported for the file this read was admitted to
             if damaged:
-                self._damaged()
+                self._damaged(generation)
             raise Unavailable()
         try:
             try:
@@ -394,7 +394,7 @@ class SearchIndex:
             except LOCKED:
                 raise
             except apsw.Error:  # a damaged page, a missing table (an emptied file, a virtual table's backing table)
-                self._damaged()
+                self._damaged(generation)
                 raise
             finally:
                 with self._lock:  # once the index closes, kept for close() to close (and know if that fails)
@@ -675,12 +675,16 @@ class SearchIndex:
         self.building = False
         return True
 
-    def _damaged(self):
+    def _damaged(self, generation=None):
         """A read or a pass found the file damaged: it is replaced and rebuilt in the writer, once, and its
         vectors are wanted again (self.rebuilt), as when a launch rebuilds it. A file this process rebuilt that no
         read has yet succeeded on is not rebuilt again at once: the index is unusable, its file discarded, and the
-        rebuild tried later (_rebuild_later, its delay doubling while it keeps failing so), as after a failed one."""
+        rebuild tried later (_rebuild_later, its delay doubling while it keeps failing so), as after a failed one.
+        A read gives the generation of the file it was admitted to: once that file has been replaced or removed
+        (_close_readers counts each), its report is about a file that is gone, and does nothing."""
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return
             if self.damaged or self.closed or (self.building and not self.unusable):  # a rebuild asked for or under
                 return  # way, not failed, makes a new file anyway (one that failed, its retry waiting, is asked again)
             self.damaged = self.building = True  # no read admitted from here (the rebuild sets it too)
