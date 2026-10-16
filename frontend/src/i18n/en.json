@@ -1021,14 +1021,14 @@
   "library.source.zotero.not_found": "From Zotero: no record was found for its DOI",
   "library.source.zotero.unavailable": "From Zotero: the lookup got no answer, so details may be missing",
   "library.source.zotero.refused": "From Zotero: this project's protection did not allow the lookup",
-  "library.reason.pdf_missing": "Zotero names no PDF file for it on this Mac, so only its details were imported.",
-  "library.reason.pdf_not_local": "Its PDF is not on this Mac (Zotero names a file elsewhere), so only its details were imported.",
-  "library.reason.pdf_on_network": "Its PDF is on a network drive, which Scholia does not read, so only its details were imported.",
-  "library.reason.pdf_not_downloaded": "Its PDF is in cloud storage and not downloaded to this Mac, so only its details were imported. Download it, then import the item again.",
-  "library.reason.pdf_not_a_file": "What Zotero names as its PDF is not a file, so only its details were imported.",
-  "library.reason.pdf_too_large": "Its PDF is larger than Scholia reads (100 MB), so only its details were imported.",
-  "library.reason.pdf_not_a_pdf": "What Zotero names as its PDF is not a PDF, so only its details were imported.",
-  "library.reason.pdf_unreadable": "Its PDF could not be read, so only its details were imported.",
+  "library.reason.pdf_missing": "Zotero names no PDF file for it on this Mac.",
+  "library.reason.pdf_not_local": "Its PDF is not on this Mac (Zotero names a file elsewhere).",
+  "library.reason.pdf_on_network": "Its PDF is on a network drive, which Scholia does not read.",
+  "library.reason.pdf_not_downloaded": "Its PDF is in cloud storage and not downloaded to this Mac. Download it, then import the item again.",
+  "library.reason.pdf_not_a_file": "What Zotero names as its PDF is not a file.",
+  "library.reason.pdf_too_large": "Its PDF is larger than Scholia reads (100 MB).",
+  "library.reason.pdf_not_a_pdf": "What Zotero names as its PDF is not a PDF.",
+  "library.reason.pdf_unreadable": "Its PDF could not be read.",
   "errors.zotero_off": "Zotero is turned off in Scholia. Turn it on in Settings, General.",
   "errors.zotero_not_running": "Zotero is not running. Open Zotero, then try again.",
   "errors.zotero_api_off": "Zotero's local API is off. In Zotero, open Settings, then Advanced, and turn on “Allow other applications on this computer to communicate with Zotero”.",
@@ -1110,9 +1110,9 @@
     "other": "{count} items were skipped: they have no title."
   },
   "zotero.report.kept": "Items imported before it stopped stay in the Library.",
-  "library.reason.pdf_link": "Its PDF is reached through a symbolic link, which Scholia does not follow, so only its details were imported.",
+  "library.reason.pdf_link": "Its PDF is reached through a symbolic link, which Scholia does not follow.",
   "zotero.report.pdfKept": {
-    "one": "{count} PDF could not be read this time: its paper keeps the file it had.",
-    "other": "{count} PDFs could not be read this time: their papers keep the files they had."
+    "one": "{count} PDF could not be read this time: {reason} Its paper keeps the file it had.",
+    "other": "{count} PDFs could not be read this time: {reason} Their papers keep the files they had."
   }
 }

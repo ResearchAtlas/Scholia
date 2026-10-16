@@ -97,9 +97,18 @@ test('the Local only question for a Zotero import names both identifiers it may 
 });
 
 test('a PDF not read again is reported as kept, never as details only', () => {
-  const parts = reportParts({ imported: 0, updated: 0, unchanged: 1, pdf: {}, pdf_kept: { pdf_missing: 1 } });
-  assert.deepEqual(parts.map(([key]) => key), ['zotero.report.imported', 'zotero.report.unchanged', 'zotero.report.pdfKept']);
-  for (const catalog of [en, zh]) assert.doesNotMatch(makeT(catalog)('zotero.report.pdfKept', { count: 1 }), /zotero\.|\{/);
+  const parts = reportParts({ imported: 0, updated: 0, unchanged: 3, pdf: {}, pdf_kept: { pdf_missing: 1, pdf_on_network: 2 } });
+  assert.deepEqual(parts.map(([key]) => key), ['zotero.report.imported', 'zotero.report.unchanged', 'zotero.report.pdfKept',
+    'zotero.report.pdfKept']);
+  for (const catalog of [en, zh]) {
+    const t = makeT(catalog);
+    const said = parts.slice(2).map(([key, params]) => t(key, { ...params, reason: t(params.reason) }));
+    assert.ok(said[0].includes(t('library.reason.pdf_missing')) && said[1].includes(t('library.reason.pdf_on_network')), said);
+    assert.notEqual(said[0], said[1]); // each reason said apart
+    for (const text of said) assert.doesNotMatch(text, /zotero\.|library\.|\{/);
+    assert.doesNotMatch(t('library.reason.pdf_on_network'), /details/); // a reason only: right for a kept file too
+  }
+  assert.match(source('ZoteroBrowser.jsx'), /reason: t\(params\.reason\)/);
 });
 
 test('items chosen under one Zotero are not sent to another', () => {

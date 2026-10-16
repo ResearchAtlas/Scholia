@@ -1,6 +1,7 @@
 // Zotero's library in the interface (slice-1 spec F3c, S11; S1-15): the browser's requests, its
 // collection tree, the selection's bound, and what an import's report says (backend/zotero.py).
 import { get, post } from './api.js';
+import { reasonKey } from './library.js';
 
 export const MAX_ITEMS = 100; // per import (backend/zotero.py MAX_ITEMS)
 
@@ -71,7 +72,6 @@ export function reportParts(summary) {
   if (!summary) return [];
   if (summary.imported === undefined) return [['zotero.report.kept', {}]];
   const notRead = Object.values(summary.pdf ?? {}).reduce((sum, n) => sum + n, 0);
-  const kept = Object.values(summary.pdf_kept ?? {}).reduce((sum, n) => sum + n, 0); // its paper keeps its file
   return [
     ['zotero.report.imported', { count: summary.imported ?? 0 }],
     summary.updated && ['zotero.report.updated', { count: summary.updated }],
@@ -80,7 +80,8 @@ export function reportParts(summary) {
     summary.waiting && ['zotero.report.waiting', { count: summary.waiting }],
     summary.already && ['zotero.report.already', { count: summary.already }],
     notRead && ['zotero.report.pdfNotRead', { count: notRead }],
-    kept && ['zotero.report.pdfKept', { count: kept }],
+    // by reason, each said (its paper keeps the file it had): a reason param is a catalog key, translated where shown
+    ...Object.entries(summary.pdf_kept ?? {}).map(([reason, count]) => ['zotero.report.pdfKept', { count, reason: reasonKey(reason) }]),
     summary.not_found && ['zotero.report.notFound', { count: summary.not_found }],
     summary.no_title && ['zotero.report.noTitle', { count: summary.no_title }],
     summary.left_out && ['references.leftOut', { count: summary.left_out }],

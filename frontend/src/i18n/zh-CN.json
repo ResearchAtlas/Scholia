@@ -1001,14 +1001,14 @@
   "library.source.zotero.not_found": "来自 Zotero：没有找到其 DOI 的记录",
   "library.source.zotero.unavailable": "来自 Zotero：查询没有得到回应，信息可能不完整",
   "library.source.zotero.refused": "来自 Zotero：本项目的保护级别不允许查询",
-  "library.reason.pdf_missing": "Zotero 没有给出它在本机上的 PDF 文件，因此只导入了它的信息。",
-  "library.reason.pdf_not_local": "它的 PDF 不在本机上（Zotero 给出的文件在其他位置），因此只导入了它的信息。",
-  "library.reason.pdf_on_network": "它的 PDF 在网络驱动器上，Scholia 不读取这类文件，因此只导入了它的信息。",
-  "library.reason.pdf_not_downloaded": "它的 PDF 在云存储中，尚未下载到本机，因此只导入了它的信息。请先下载，再重新导入该条目。",
-  "library.reason.pdf_not_a_file": "Zotero 给出的 PDF 不是文件，因此只导入了它的信息。",
-  "library.reason.pdf_too_large": "它的 PDF 超过了 Scholia 可读取的大小（100 MB），因此只导入了它的信息。",
-  "library.reason.pdf_not_a_pdf": "Zotero 给出的 PDF 实际上不是 PDF，因此只导入了它的信息。",
-  "library.reason.pdf_unreadable": "无法读取它的 PDF，因此只导入了它的信息。",
+  "library.reason.pdf_missing": "Zotero 没有给出它在本机上的 PDF 文件。",
+  "library.reason.pdf_not_local": "它的 PDF 不在本机上（Zotero 给出的文件在其他位置）。",
+  "library.reason.pdf_on_network": "它的 PDF 在网络驱动器上，Scholia 不读取这类文件。",
+  "library.reason.pdf_not_downloaded": "它的 PDF 在云存储中，尚未下载到本机。请先下载，再重新导入该条目。",
+  "library.reason.pdf_not_a_file": "Zotero 给出的 PDF 不是文件。",
+  "library.reason.pdf_too_large": "它的 PDF 超过了 Scholia 可读取的大小（100 MB）。",
+  "library.reason.pdf_not_a_pdf": "Zotero 给出的 PDF 实际上不是 PDF。",
+  "library.reason.pdf_unreadable": "无法读取它的 PDF。",
   "errors.zotero_off": "Scholia 中的 Zotero 已关闭。请在“设置”的“通用”中开启。",
   "errors.zotero_not_running": "Zotero 没有运行。请打开 Zotero 后重试。",
   "errors.zotero_api_off": "Zotero 的本地 API 已关闭。请在 Zotero 中打开“设置”，进入“高级”，开启“允许此计算机上的其他应用程序与 Zotero 通信”。",
@@ -1078,8 +1078,8 @@
     "other": "跳过了 {count} 个条目：没有标题。"
   },
   "zotero.report.kept": "停止之前已导入的条目保留在文献库中。",
-  "library.reason.pdf_link": "它的 PDF 要经过符号链接才能找到，Scholia 不会跟随这类链接，因此只导入了它的信息。",
+  "library.reason.pdf_link": "它的 PDF 要经过符号链接才能找到，Scholia 不会跟随这类链接。",
   "zotero.report.pdfKept": {
-    "other": "{count} 个 PDF 这次无法读取：对应文献保留原有文件。"
+    "other": "{count} 个 PDF 这次无法读取：{reason}对应文献保留原有文件。"
   }
 }

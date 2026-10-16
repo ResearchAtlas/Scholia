@@ -197,7 +197,8 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
         {report && (
           <div role="status" className="grid gap-1 rounded-md bg-muted px-3 py-2 text-sm" data-testid="zotero-report">
             {(report.problem || report.key) && <p className="text-destructive">{report.problem ? errorText(t, report.problem) : t(report.key)}</p>}
-            {report.parts.map(([key, params]) => <p key={key}>{t(key, params)}</p>)}
+            {report.parts.map(([key, params], i) => (
+              <p key={`${key}-${i}`}>{t(key, { ...params, ...(params.reason ? { reason: t(params.reason) } : {}) })}</p>))}
           </div>
         )}
         <DialogFooter className="items-center gap-2 sm:justify-between">
