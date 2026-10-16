@@ -399,7 +399,9 @@ async def test_two_imports_of_one_file_at_once_never_both_create_its_papers(tmp_
 
 @pytest.mark.parametrize("theirs, ours, matched", [
     (f"DO  - {DOI}\n", f"DO  - {DOI.upper()}\n", "doi"),
-    (f"DO  - {DOI}\n", f"DO  - doi:{DOI}\n", "title"),  # a DOI field is the DOI alone: this one is left out
+    (f"DO  - {DOI}\n", f"DO  - doi:{DOI}\n", "doi"),  # one of the approved prefixes (Harold, 2026-10-17)
+    (f"DO  - {DOI}\n", f"DO  - https://doi.org/{DOI.upper()}\n", "doi"),
+    (f"DO  - {DOI}\n", f"DO  - doi.org/{DOI}\n", "title"),  # no other: this one is left out
     ("PY  - 2020\n", "PY  - 2020\n", "title"),
     ("", "", "title"),  # neither has a year: the title alone
 ])

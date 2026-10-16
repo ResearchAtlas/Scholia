@@ -240,8 +240,20 @@ def test_a_doi_is_its_fields_own_text_whole(data, doi):
     "@misc{k, title={T}, doi={10.5555/example\ngarbage}}",
     # anything around it but spaces, tabs and line ends; no prefix, no escape, no other script (finding 13)
     json.dumps([{"title": "T", "DOI": "10.5555/example."}]),
-    json.dumps([{"title": "T", "DOI": "https://doi.org/10.5555/example"}]),
-    json.dumps([{"title": "T", "DOI": "doi:10.5555/example"}]),
+    # prefixes not among the four approved (Harold, 2026-10-17), or one followed by anything not a DOI
+    json.dumps([{"title": "T", "DOI": "https://doi.org.evil/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "doi.org/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "http://dx.doi.org/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://www.doi.org/10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/10.5555/example junk"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/ 10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org//10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/doi:10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "https://doi.org/10.5555/example."}]),
+    json.dumps([{"title": "T", "DOI": "doi\u0131:10.5555/example"}]),  # a dotless i is no "doi:"
+    json.dumps([{"title": "T", "DOI": "doi\u00a0:10.5555/example"}]),
+    json.dumps([{"title": "T", "DOI": "urn:doi:10.5555/example"}]),
+    r"@misc{k, title={T}, doi={https://doi.org/10.1000/ab\_c}}",
     json.dumps([{"title": "T", "DOI": "\u000010.5555/example"}]),
     json.dumps([{"title": "T", "DOI": "10.5555/example\u001f"}]),
     "TY  - JOUR\nTI  - T\nDO  - 10.5555/example\x1f\nER  - \n",
@@ -274,6 +286,20 @@ def test_a_url_holding_a_control_character_is_left_out_and_counted(c):
 def test_an_endnote_tag_needs_its_space():
     [record], skipped, _ = parse("%0 Journal Article\n%T T\n%R10.5555/abc\n")
     assert "DOI" not in record and record["title"] == "T %R10.5555/abc" and skipped == {}  # text of the title
+
+
+@pytest.mark.parametrize("prefix", ["https://doi.org/", "http://doi.org/", "https://dx.doi.org/", "doi:", "doi: ",
+                                    "DOI:\t", "HTTPS://DOI.ORG/", "Https://Dx.Doi.Org/"])
+@pytest.mark.parametrize("form", [
+    lambda doi: f"TY  - JOUR\nTI  - T\nDO  - {doi}\nER  - \n",  # RIS
+    lambda doi: f"%0 Journal Article\n%T T\n%R {doi}\n",  # EndNote
+    lambda doi: "{Reference Type}: Journal Article\n{Title}: T\n{DOI}: " + doi + "\n",  # NoteExpress
+    lambda doi: "@misc{k, title={T}, doi={" + doi + "}}",  # BibTeX
+    lambda doi: json.dumps([{"title": "T", "DOI": doi}]),  # CSL JSON
+])
+def test_a_doi_after_one_of_the_four_approved_prefixes_is_that_doi(prefix, form):
+    [record], skipped, _ = parse(form(prefix + "10.5555/Example"))
+    assert (record["DOI"], rf.identifier(record), skipped) == ("10.5555/example", ("doi", "10.5555/example"), {})
 
 
 @pytest.mark.parametrize("eprint, arxiv", [("2101.00001", "2101.00001"), ("2101.00001v2", "2101.00001v2"),

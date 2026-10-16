@@ -27,7 +27,9 @@ or eprinttype arXiv), kept as `arxiv`; never from a URL or a number. Its value i
 for that field, before any parser's or our own change (the field's line as written, a BibTeX value
 inside its outer delimiters, a JSON string), with only spaces, tabs and line ends taken from its ends,
 on one line (a field continued on the next is refused), and it must be, whole, an ASCII DOI starting
-"10." (_DOI_WHOLE) or an arXiv ID with an optional version (_ARXIV_WHOLE). A URL is kept, as display
+"10." (_DOI_WHOLE; after one of four prefixes, if it has one: https://doi.org/, http://doi.org/,
+https://dx.doi.org/ or doi:, Harold 2026-10-17) or an arXiv ID with an optional version (_ARXIV_WHOLE).
+A URL is kept, as display
 only, when it is, whole, http or https, a host name with an optional port 1 to 65535, and a path
 (_URL_WHOLE). Any other value of these fields is left out and counted (invalid_field).
 
@@ -79,6 +81,7 @@ _TYPE = re.compile(r"[a-z]{1,30}(?:-[a-z]{1,30}){0,3}")  # a CSL type name, as b
 _YEAR = re.compile(r"(?<!\d)(1\d{3}|2[01]\d{2}|2200)(?!\d)")  # the details form's years, 1000 to 2200
 # The identifiers and URLs a record keeps, each the whole value (ASCII: a digit is 0 to 9, a letter a to z).
 _DOI_WHOLE = re.compile(r"10\.[0-9]{4,9}/[-._;()/:A-Za-z0-9]*[A-Za-z0-9)]", re.ASCII)  # never ending in punctuation
+_DOI_PREFIX = re.compile(r"https?://doi\.org/|https://dx\.doi\.org/|doi:[ \t]*", re.IGNORECASE | re.ASCII)
 _ARXIV_WHOLE = re.compile(rf"(?:{ARXIV.pattern})(?-i:v[0-9]+)?", re.IGNORECASE | re.ASCII)
 _ARXIV_VERSION = re.compile(r"v[0-9]+$")
 _URL_WHOLE = re.compile(r"https?://((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63})"
@@ -707,10 +710,15 @@ def _url(values):
 
 
 def _doi(value):
-    """(The DOI a value is, whole, in lower case, or None; 1 when a value was given and is not one.)"""
+    """(The DOI a value is, whole, in lower case, or None; 1 when a value was given and is not one.) Of the
+    prefixes a DOI is written with, these only are taken off first (Harold, 2026-10-17): https://doi.org/,
+    http://doi.org/, https://dx.doi.org/ and doi: (any case; doi: with spaces or tabs after it); what
+    follows is checked whole, as without one."""
     doi = _whole(value)
     if doi is None:
         return None, 0
+    if doi is not _UNREADABLE and (prefix := _DOI_PREFIX.match(doi)):
+        doi = doi[prefix.end():]
     if doi is _UNREADABLE or len(doi) > DOI_CHARS or not _DOI_WHOLE.fullmatch(doi) or {".", ".."} & set(doi.split("/")) \
             or not _balanced(doi):
         return None, 1  # a dot segment: a URL holding it would name another path once resolved
