@@ -6,7 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { LANGUAGES, NOT_LOADED, languageLoaded, languageSwitch, loadLanguage, makeT } from '../src/i18n/index.js';
+import { LANGUAGES, NOT_LOADED, languageChooser, languageLoaded, languageSwitch, loadLanguage, makeT } from '../src/i18n/index.js';
 import { NotLoaded } from '../src/parts.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
@@ -148,9 +148,14 @@ test('the screen of a language that cannot load speaks that language, from strin
   assert.doesNotMatch(app, /LanguageContext\.Provider value=\{language \?\? 'en'\}/);
 });
 
-test('Use English saves the setting as English (once more if that did not take), then draws English', () => {
+test('Use English saves the setting as English (once more if that did not take), draws English, and says if it was not saved', () => {
   const app = source('App.jsx');
-  assert.match(app, /const chooseEnglish = async \(\) => \{\n\s*const save = \(\) => saveSettings\(\{ 'ui\.language': 'en' \}\)\.catch\(\(\) => null\);\n\s*if \(!await save\(\)\) await save\(\);\n\s*await languages\.want\('en'\);\n\s*\};/);
+  assert.match(app, /const saveEnglish = async \(\) => \{\n\s*const save = \(\) => saveSettings\(\{ 'ui\.language': 'en' \}\)\.catch\(\(\) => null\);\n\s*setEnglishUnsaved\(!\(await save\(\) \|\| await save\(\)\)\);\n\s*\};/);
+  assert.match(app, /const chooseEnglish = async \(\) => \{\n\s*await saveEnglish\(\);\n\s*await languages\.want\('en'\);\n\s*\};/);
+  // over the window, in the language drawn (English), with Try again saving once more
+  assert.match(app, /<LanguageContext\.Provider value=\{language\}>\n\s*\{englishUnsaved && <EnglishNotSaved onRetry=\{saveEnglish\} \/>\}/);
+  assert.match(app, /\{t\('errors\.english_not_saved'\)\}<\/p>\n\s*<Button[^>]*onClick=\{onRetry\}>\{t\('common\.retry'\)\}<\/Button>/);
+  assert.match(en['errors.english_not_saved'], /could not be saved[\s\S]*Try again saves it once more/);
 });
 
 test('at launch only the setting\'s language is asked for, the system\'s only when the setting is not read', () => {
@@ -169,16 +174,61 @@ test('at launch only the setting\'s language is asked for, the system\'s only wh
   assert.doesNotMatch(app, /useEffect\(\(\) => \{\n\s*(setLanguage|languages\.want)\(/);
 });
 
-test('a change in Settings loads the language first and saves it only once loaded; a failure says so and saves nothing', () => {
+// Settings' choices, as Settings makes them (languageChooser), each recorded in calls.
+function chooser() {
+  const { load, loads } = pending();
+  const calls = [];
+  const choose = languageChooser({ load, systemLocale: 'en-US' });
+  const pick = (value, saved = true) => choose(value, {
+    save: async (choice) => { calls.push(['save', choice]); return saved; },
+    draw: (choice) => calls.push(['draw', choice]),
+    failed: () => calls.push(['failed', value]),
+  });
+  return { pick, loads, calls };
+}
+
+test('in Settings an earlier language choice still loading saves and draws nothing once a later one is made', async () => {
+  const { pick, loads, calls } = chooser();
+  const chinese = pick('zh-CN'); // Chinese loads
+  const system = pick('system'); // then System (English here) while it does
+  assert.deepEqual(loads.map((entry) => entry.language), ['zh-CN', 'en']);
+  assert.deepEqual(calls, []); // nothing saved before its catalog has loaded
+  loads[1].resolve();
+  await system;
+  loads[0].resolve();
+  await chinese;
+  assert.deepEqual(calls, [['save', 'system'], ['draw', 'system']]);
+
+  const failing = chooser();
+  const first = failing.pick('zh-CN');
+  const second = failing.pick('en');
+  failing.loads[0].reject(new NotLoaded('refused')); // the earlier one's failure is not the latest: not said
+  failing.loads[1].resolve();
+  await Promise.all([first, second]);
+  assert.deepEqual(failing.calls, [['save', 'en'], ['draw', 'en']]);
+});
+
+test('in Settings a language that cannot load saves nothing and says so; a save refused draws nothing', async () => {
+  const { pick, loads, calls } = chooser();
+  const choice = pick('zh-CN');
+  loads[0].reject(new NotLoaded('refused'));
+  await choice;
+  assert.deepEqual(calls, [['failed', 'zh-CN']]);
+
+  const refused = chooser();
+  const unsaved = refused.pick('zh-CN', false);
+  refused.loads[0].resolve();
+  await unsaved;
+  assert.deepEqual(refused.calls, [['save', 'zh-CN']]);
+});
+
+test('Settings chooses the language through languageChooser, and a failed one shows Try again, which reloads the window', () => {
   const settings = source('components/Settings.jsx');
-  const change = settings.match(/onChange=\{async \(value\) => \{\n[\s\S]*?\n\s*\}\} \/>/)?.[0] ?? '';
-  const loads = change.indexOf('await loadLanguage(resolveLanguage(value, navigator.language))');
-  const fails = change.indexOf("setProblem('language_not_loaded');\n");
-  const returns = change.indexOf('return;', fails);
-  const saves = change.indexOf("await personal.save({ 'ui.language': value })");
-  assert.ok(loads > 0 && loads < fails && fails < returns && returns < saves, change);
-  assert.match(change, /\) onLanguage\(value\);/);
-  assert.ok(en['errors.language_not_loaded'] && !HAN.test(en['errors.language_not_loaded']));
-  assert.match(zhCN['errors.language_not_loaded'], HAN);
-  assert.match(en['errors.language_not_loaded'], /Reload the window/); // a load that failed stays failed until then
+  assert.match(settings, /const \[chooser\] = useState\(\(\) => languageChooser\(\)\);/);
+  assert.match(settings, /chooser\(value, \{ save: \(choice\) => personal\.save\(\{ 'ui\.language': choice \}\), draw: onLanguage,\n\s*failed: \(\) => setLanguageFailed\(true\) \}\);/);
+  assert.match(settings, /onChange=\{chooseLanguage\} \/>\n\s*\{languageFailed && <div className="mt-3"><LoadState problem="language_not_loaded" onRetry=\{\(\) => window\.location\.reload\(\)\} \/><\/div>\}/);
+  assert.doesNotMatch(settings, /loadLanguage|personal\.save\(\{ 'ui\.language': value \}\)/); // no other way to the setting
+  assert.match(en['errors.language_not_loaded'], /was not changed\. Try again reloads the window\.$/); // names the button
+  assert.match(zhCN['errors.language_not_loaded'], /未更改。点“重试”会重新载入窗口。$/);
+  assert.equal(en['common.retry'], 'Try again');
 });

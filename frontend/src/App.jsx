@@ -57,10 +57,15 @@ export function App() {
 
   // Use English, on the screen of a language that could not load: the setting becomes English
   // (saved once more if the settings changed meanwhile or the save failed), and English is drawn
-  // even if it could not be saved, since the researcher chose it.
-  const chooseEnglish = async () => {
+  // even if it could not be saved, since the researcher chose it; the window then says it was not
+  // saved, with Try again, which saves it again.
+  const [englishUnsaved, setEnglishUnsaved] = useState(false);
+  const saveEnglish = async () => {
     const save = () => saveSettings({ 'ui.language': 'en' }).catch(() => null);
-    if (!await save()) await save();
+    setEnglishUnsaved(!(await save() || await save()));
+  };
+  const chooseEnglish = async () => {
+    await saveEnglish();
     await languages.want('en');
   };
 
@@ -86,6 +91,7 @@ export function App() {
   if (!language) return null;
   return (
     <LanguageContext.Provider value={language}>
+      {englishUnsaved && <EnglishNotSaved onRetry={saveEnglish} />}
       {state.phase === 'loading' && <Splash />}
       {state.phase === 'error' && <Failure code={state.code} onRetry={load} />}
       {state.phase === 'dataFolder' && <DataFolderScreen health={state.health} />}
@@ -114,6 +120,18 @@ function Failure({ code, onRetry }) {
         <p className="text-sm">{errorText(t, code)}</p>
         <Button className="mt-4" variant="outline" onClick={onRetry}>{t('common.retry')}</Button>
       </div>
+    </div>
+  );
+}
+
+// English chosen on that screen but not saved as the setting: said over the window, which keeps its
+// layout, with Try again.
+function EnglishNotSaved({ onRetry }) {
+  const t = useT();
+  return (
+    <div role="alert" className="fixed inset-x-4 bottom-4 z-50 mx-auto flex max-w-lg items-center gap-3 rounded-md border bg-background px-3 py-3 text-sm text-destructive shadow-md">
+      <p className="flex-1">{t('errors.english_not_saved')}</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>{t('common.retry')}</Button>
     </div>
   );
 }

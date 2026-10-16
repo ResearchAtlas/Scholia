@@ -46,6 +46,22 @@ export function languageSwitch(show, load = loadLanguage) {
   return { want, fallback: (language) => (wanted === null ? want(language) : Promise.resolve()) };
 }
 
+// Choices of the language setting in Settings, choose(value, { save, draw, failed }): the
+// language's catalog loads first, then the setting is saved and the window drawn in it, but only if
+// it is still the latest choice once loaded, so an earlier choice still loading saves and draws
+// nothing. A catalog that cannot load saves nothing and is told (failed), if still the latest choice.
+export function languageChooser({ load = loadLanguage, systemLocale = globalThis.navigator?.language } = {}) {
+  let latest = null;
+  return async function choose(value, { save, draw, failed }) {
+    const choice = {};
+    latest = choice;
+    const loaded = await load(resolveLanguage(value, systemLocale)).then(() => true, () => false);
+    if (latest !== choice) return;
+    if (!loaded) return failed();
+    if (await save(value)) draw(value);
+  };
+}
+
 // What the window says when a language's catalog could not be loaded, in that language: kept here,
 // in the script loaded at start, since the catalog that would say it is what could not load.
 export const NOT_LOADED = {
