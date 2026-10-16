@@ -545,12 +545,13 @@ def gaps(results):
 
 
 def paired(bench, boot, mine, other, groups, specific, chosen_pairs=None):
-    """mine minus other, query by query (positions in chosen_pairs: (mine's, other's), default the same),
-    with the paired percentile interval; whole groups resampled when groups repeat (QASPER's papers)."""
+    """mine minus other, query by query (positions in chosen_pairs: (mine's, other's); None: the same
+    positions; empty: no pairs, so no difference), with the paired percentile interval; whole groups
+    resampled when groups repeat (QASPER's papers)."""
     out = {}
     for spec in bench["metrics"]:
         name = spec["name"]
-        pairs = chosen_pairs or [(i, i) for i in range(len(mine[name]))]
+        pairs = [(i, i) for i in range(len(mine[name]))] if chosen_pairs is None else chosen_pairs
         allowed = set(_selected(spec, specific))
         kept = [(i, j) for i, j in pairs if i in allowed and mine[name][i] is not None and other[name][j] is not None]
         diffs = [mine[name][i] - other[name][j] for i, j in kept]
@@ -785,6 +786,12 @@ def compare(manifest, baseline, current):
         else:
             lines.append(f"{name}: its queries differ from the baseline's; not compared")
             continue
+        if not pairs:
+            lines.append(f"{name}: no query in common with the baseline; not compared")
+            continue
+        if name not in manifest["benchmarks"]:
+            lines.append(f"{name}: not in this manifest; not compared")
+            continue
         groups = run_bench["groups"] or list(range(run_bench["queries"]))
         specific = run_bench["specific"] or [None] * run_bench["queries"]
         bench = manifest["benchmarks"][name]
@@ -796,8 +803,13 @@ def compare(manifest, baseline, current):
             same = sum(1 for i, j in pairs if entry["ranking_digests"][i] == base["ranking_digests"][j])
             lines.append(f"{name} {arm}: {len(pairs)} queries paired, rankings identical for {same}; fallbacks "
                          f"{entry['fallbacks'] or 'none'}")
-            for metric, result in paired(bench, manifest["bootstrap"], entry["scores"], base["scores"], groups,
-                                         specific, pairs).items():
+            # Only the metrics both files scored; any other is said, not compared (the rules check above says
+            # NOT LIKE FOR LIKE when the manifest's metrics changed).
+            shared = [s for s in bench["metrics"] if s["name"] in entry["scores"] and s["name"] in base["scores"]]
+            lines += [f"  {s['name']}: not in {'the baseline' if s['name'] in entry['scores'] else 'this run'}; "
+                      "not compared" for s in bench["metrics"] if s not in shared]
+            for metric, result in paired({**bench, "metrics": shared}, manifest["bootstrap"], entry["scores"],
+                                         base["scores"], groups, specific, pairs).items():
                 low, high = result["interval"] or (None, None)
                 flag = "  DROP: investigate and record a disposition" if high is not None and high < 0 else ""
                 lines.append(f"  {metric}: difference {result['difference']:+.4f} [{low:+.4f}, {high:+.4f}] "
@@ -888,12 +900,15 @@ def main(argv=None):
     names = args.benchmarks or level
     if unknown := [n for n in names if n not in level]:
         parser.error(f"not in the {args.level} level: {unknown}")
+    # Whatever was at --out says incomplete from here on, before any input is checked.
+    write_atomic(args.out, {"status": "incomplete", "reason": "checking the inputs", "level": args.level})
     try:
         files = verify(manifest, args.sets, names)
         check_models(manifest, args.helper, args.model)
-    except Refused as refused:
-        write_atomic(args.out, {"status": "incomplete", "reason": f"refused: {refused}", "level": args.level})
-        sys.exit(f"refused: {refused}")
+    except (Refused, OSError) as refused:  # a file missing or unreadable is refused like one that differs
+        reason = str(refused) if isinstance(refused, Refused) else f"{type(refused).__name__}: {refused}"
+        write_atomic(args.out, {"status": "incomplete", "reason": f"refused: {reason}", "level": args.level})
+        sys.exit(f"refused: {reason}")
 
     async def main_task():
         task = asyncio.current_task()

@@ -570,3 +570,47 @@ def test_the_committed_subset_reference_is_a_finished_subset_run_under_this_mani
     assert list(reference["benchmarks"]) == ["qasper"] and reference["benchmarks"]["qasper"]["papers"] == 100
     assert all(entry["complete"] and entry["metrics"] for entry in reference["benchmarks"]["qasper"]["arms"].values())
     assert not [line for line in tier1.compare(manifest, reference, reference) if line.startswith("NOT LIKE")]
+
+
+
+def _finished(bench):
+    return {"status": "finished", "like_for_like": True, "model_settings": {}, "machine": {}, "bootstrap": {},
+            "manifest_rules_sha256": "r", "benchmarks": {"scifact": bench}}
+
+
+def test_runs_with_no_query_in_common_are_not_paired_and_flag_nothing():
+    scores = {"hybrid": {"scores": {"ndcg@10": [0.9]}, "ranking_digests": ["a"], "fallbacks": {}}}
+    base = {"queries": 1, "keys": ["q1"], "order_sha256": "o1", "groups": None, "specific": None, "arms": scores}
+    run = {**base, "keys": ["q2"], "order_sha256": "o2",
+           "arms": {"hybrid": {**scores["hybrid"], "scores": {"ndcg@10": [0.0]}}}}
+    manifest = {"benchmarks": {"scifact": {"metrics": [{"name": "ndcg@10", "kind": "ndcg", "k": 10}]}},
+                "bootstrap": {"resamples": 50, "seed": 1, "level": 0.95}}
+    lines = tier1.compare(manifest, _finished(base), _finished(run))
+    assert lines == ["scifact: no query in common with the baseline; not compared"]
+    assert tier1.paired(manifest["benchmarks"]["scifact"], manifest["bootstrap"], {"ndcg@10": [0.0]},
+                        {"ndcg@10": [0.9]}, [0], [None], [])["ndcg@10"] == {"difference": None, "n": 0, "interval": None}
+
+
+def test_a_metric_one_file_lacks_is_said_and_skipped_with_the_warning_kept():
+    digests = {"ranking_digests": ["a", "b"], "fallbacks": {}}
+    base = {"queries": 2, "keys": None, "order_sha256": "o", "groups": None, "specific": None,
+            "arms": {"hybrid": {"scores": {"ndcg@10": [0.5, 0.5]}, **digests}}}
+    run = {**base, "arms": {"hybrid": {"scores": {"ndcg@10": [0.5, 0.5], "recall@10": [1.0, 1.0]}, **digests}}}
+    manifest = {"benchmarks": {"scifact": {"metrics": [{"name": "ndcg@10", "kind": "ndcg", "k": 10},
+                                                       {"name": "recall@10", "kind": "recall", "k": 10}]}},
+                "bootstrap": {"resamples": 50, "seed": 1, "level": 0.95}}
+    lines = tier1.compare(manifest, _finished(base), {**_finished(run), "manifest_rules_sha256": "other"})
+    assert lines[0] == "NOT LIKE FOR LIKE: the manifest's pins, rules or metrics differ from the baseline's"
+    assert "  recall@10: not in the baseline; not compared" in lines
+    assert any(line.startswith("  ndcg@10: difference +0.0000") for line in lines)
+
+
+def test_a_missing_model_is_refused_and_an_earlier_finished_file_at_out_says_incomplete(tmp_path, monkeypatch):
+    out = tmp_path / "out.json"
+    out.write_text(json.dumps({"status": "finished"}))
+    monkeypatch.setattr(tier1, "verify", lambda *args: {})
+    with pytest.raises(SystemExit, match="refused: FileNotFoundError"):
+        tier1.main(["run", "--level", "full", "--benchmarks", "scifact", "--sets", str(tmp_path), "--helper",
+                    str(tmp_path / "llama-server"), "--model", str(tmp_path / "missing.gguf"), "--out", str(out)])
+    written = json.loads(out.read_text())
+    assert written["status"] == "incomplete" and written["reason"].startswith("refused: FileNotFoundError")
