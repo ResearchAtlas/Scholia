@@ -560,3 +560,13 @@ def test_a_run_under_this_manifest_is_like_for_like_with_the_baseline_and_a_chan
     # An earlier file whose whole manifest is not the one recorded is judged by that hash: it differs.
     older = {k: v for k, v in run.items() if k != "manifest_rules_sha256"}
     assert tier1.rules_of(manifest, older) == "a newer file" != tier1.rules_of(manifest, baseline)
+
+
+def test_the_committed_subset_reference_is_a_finished_subset_run_under_this_manifests_rules():
+    manifest = tier1.load_manifest()
+    reference = tier1.load_manifest(ROOT / "evals" / "baseline" / "tier1-subset.json")
+    assert reference["status"] == "finished" and reference["gaps"] == [] and reference["level"] == "subset"
+    assert reference["manifest_rules_sha256"] == tier1.rules_sha256(manifest) and reference["like_for_like"]
+    assert list(reference["benchmarks"]) == ["qasper"] and reference["benchmarks"]["qasper"]["papers"] == 100
+    assert all(entry["complete"] and entry["metrics"] for entry in reference["benchmarks"]["qasper"]["arms"].values())
+    assert not [line for line in tier1.compare(manifest, reference, reference) if line.startswith("NOT LIKE")]

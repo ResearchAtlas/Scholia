@@ -9,7 +9,7 @@ Tier 1 measures Scholia's own search on five public benchmarks, each reported on
 - `tier1.py`: the runner. It builds each benchmark through the app's own API and reader (section 7.1 cuts the passages, one document or paper per material, under its own title), imports the search model once the files are read so the app's index runs embed them, searches with `backend.search.search` as the app runs it (the `hybrid` arm) and with dense search unavailable (the `keyword_only` reference arm), scores, and writes one results file atomically when the run ends. Arms are plain named functions in `ARMS`.
 - `metrics.py`: recall@k, nDCG@k, MRR@k, the passage-to-document collapse (a document at its best passage's rank) and the paired percentile bootstrap, in the standard library.
 - `tier1_manifest.json`: the pins. Each set's official source, license as its authors state it, archive hashes, and the size and SHA-256 of every file the runner reads; the small fixed subset; the model settings a run must match to be like for like; the QASPER rules (evidence to passages, annotators, exclusions); and ticket 72's rule E, word for word, with each benchmark's own metric and the bootstrap's count and seed.
-- `baseline/`: the committed baseline, a full tier 1 run on the reference Mac, as JSON with a Markdown summary (`tier1-baseline.*`), and the small subset's two recorded runs beside it (`tier1-subset.md`).
+- `baseline/`: the committed baseline, a full tier 1 run on the reference Mac, as JSON with a Markdown summary (`tier1-baseline.*`), and the small subset's reference run with the record of its two runs beside it (`tier1-subset.*`).
 - `litsearch_to_jsonl.py`: a one-off preparation step (below).
 
 The runner never downloads anything and refuses a file whose size or SHA-256 differs from its pin. The sets are prepared once, outside git, under the M2 charter's section 6, each in its own folder with a `PROVENANCE.md`; the folder names are the manifest's `folder` values. Benchmark text never enters git: results carry scores, counts and hashes, and query ids only for QASPER and SciFact, whose licenses allow them.
@@ -25,11 +25,13 @@ The script checks the parquet files' SHA-256 before converting; the manifest pin
 Commands run from the repository root. `<sets>` is the folder holding the prepared sets; `<bundle>` a built `Scholia.app` whose `llama-server` matches its SHA-256 manifest; `<model>` the pinned `Qwen3-Embedding-0.6B-Q8_0.gguf`.
 
 1. **Every PR** runs its tests: `uv run pytest -q` (this runner's tests use synthetic data and the test-owned stand-in helper).
-2. **A PR that touches retrieval** also runs the small fixed subset on the reference Mac (100 QASPER test papers drawn with a recorded seed and listed by id in the manifest, all their questions; about 10 minutes), then compares it with the baseline, whose questions it pairs by id:
+2. **A PR that touches retrieval** also runs the small fixed subset on the reference Mac (100 QASPER test papers drawn with a recorded seed and listed by id in the manifest, all their questions; about 8 to 11 minutes), then compares it with the subset's reference run, built from the same papers:
 
        sandbox-exec -f tests/loopback-only.sb uv run --no-sync python -I evals/tier1.py run --level subset \
            --sets <sets> --helper <bundle>/Contents/MacOS/llama-server --model <model> --out subset.json
-       uv run --no-sync python -I evals/tier1.py compare evals/baseline/tier1-baseline.json subset.json
+       uv run --no-sync python -I evals/tier1.py compare evals/baseline/tier1-subset.json subset.json
+
+   Compared with the full baseline instead (its questions pair by id), the keyword rankings differ even with nothing changed: the index's BM25 statistics cover every passage in it, so 100 papers and 416 rank some passages differently (`tier1-subset.md`).
 
 3. **A change to a model, the parser, the passages or the pipeline**, and the preview gate, run all of tier 1 (`--level full`, the same command; SciFact, NFCorpus, SCIDOCS and LitSearch run only here), then `compare`.
 
