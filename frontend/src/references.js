@@ -8,6 +8,7 @@ import { readFile } from './library.js';
 // CNKI and NoteExpress. The backend reads a file's format from its content, never its name.
 export const REFERENCE_ACCEPT = '.ris,.bib,.bibtex,.json,.enw,.txt,.net';
 export const MAX_REFERENCE_BYTES = 10 * 1024 * 1024; // backend/reference_files.py MAX_BYTES
+export const RECORD_LINES = 1000; // backend/reference_files.py RECORD_LINES: the lines read of one record
 
 // Imports one reference file into a project: resolves to the backend's report once it has committed,
 // or throws an ApiError (one larger than the backend reads is refused here, unsent).
@@ -20,9 +21,11 @@ export async function importReferences(projectId, file) {
 // What an import's report says, as [catalog key, params] pairs: the papers imported, the duplicates
 // waiting for an answer, those already in the project with nothing to add, the records skipped, and
 // the values left out of the records kept (invalid_field: a year, DOI, URL or arXiv ID that is not one;
-// unsupported_macro: a BibTeX value given by an @string macro or joined with #, which is not read).
+// unsupported_macro: a BibTeX value given by an @string macro or joined with #, which is not read;
+// past_record_bound: a field of a RIS, EndNote or NoteExpress record longer than the 1,000 lines read).
 export function reportParts(report) {
-  const { invalid_field: leftOut = 0, unsupported_macro: macros = 0, ...records } = report.skipped ?? {};
+  const { invalid_field: leftOut = 0, unsupported_macro: macros = 0, past_record_bound: past = 0, ...records } =
+    report.skipped ?? {};
   const skipped = Object.values(records).reduce((sum, n) => sum + n, 0);
   return [
     ['references.imported', { count: report.imported.length }],
@@ -31,6 +34,7 @@ export function reportParts(report) {
     skipped && ['references.skipped', { count: skipped }],
     leftOut && ['references.leftOut', { count: leftOut }],
     macros && ['references.unsupportedMacro', { count: macros }],
+    past && ['references.pastBound', { count: past, lines: RECORD_LINES }],
   ].filter(Boolean);
 }
 

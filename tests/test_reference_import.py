@@ -399,7 +399,9 @@ async def test_two_imports_of_one_file_at_once_never_both_create_its_papers(tmp_
 
 @pytest.mark.parametrize("theirs, ours, matched", [
     (f"DO  - {DOI}\n", f"DO  - {DOI.upper()}\n", "doi"),
-    (f"DO  - {DOI}\n", f"DO  - doi:{DOI}\n", "title"),  # a DOI field is the DOI alone: this one is left out
+    (f"DO  - {DOI}\n", f"DO  - doi:{DOI}\n", "doi"),  # one of the approved prefixes (Harold, 2026-10-17)
+    (f"DO  - {DOI}\n", f"DO  - https://doi.org/{DOI.upper()}\n", "doi"),
+    (f"DO  - {DOI}\n", f"DO  - doi.org/{DOI}\n", "title"),  # no other: this one is left out
     ("PY  - 2020\n", "PY  - 2020\n", "title"),
     ("", "", "title"),  # neither has a year: the title alone
 ])
@@ -924,3 +926,207 @@ async def test_each_lookups_fill_joins_the_fields_a_lookup_filled(tmp_path):
         assert await asyncio.to_thread(client.state["db"].write, fill({"volume": "3"})) == ["volume"]
         assert await asyncio.to_thread(client.state["db"].write, fill({"volume": "4", "page": "5"})) == ["page"]
         assert await lookup_filled(client, paper) == ["page", "volume"]  # the first fill's stays with the second's
+
+
+# The S1-14 follow-up (the connector's threads on PR 28)
+
+
+async def test_an_empty_reference_file_holds_no_records(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        response = await post(client, project, b"")
+        assert (response.status_code, response.json()["code"]) == (400, "no_records")  # the parser's, not the request's
+
+
+async def test_base64_longer_than_the_largest_file_read_is_refused_before_it_is_decoded(tmp_path, monkeypatch):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        calls = []
+        real = base64.b64decode
+        monkeypatch.setattr(references.base64, "b64decode", lambda data, **kw: calls.append(len(data)) or real(data, **kw))
+        data = "A" * (references._ENCODED + 4)  # valid base64, a little more than MAX_BYTES once decoded
+        response = await client.post(f"/api/projects/{project}/materials/import-references",
+                                     json={"name": "big.ris", "data": data})
+        assert (response.status_code, response.json()["code"]) == (413, "reference_file_too_large")
+        assert calls == []  # never decoded in the app's process
+        within = base64.b64encode(b"x" * reference_files.MAX_BYTES).decode()
+        assert len(within) <= references._ENCODED  # the largest file read still reaches the parser
+
+
+async def test_a_merge_that_gives_a_paper_its_doi_looks_it_up(tmp_path):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "Its Work", retracted=True)})) as client:
+        project = await project_of(client)
+        [paper] = (await imported(client, project, ris(("Without A DOI", "PY  - 2020\n"))))["imported"]
+        second = await imported(client, project, ris(("Without A DOI", f"PY  - 2020\nDO  - {DOI}\n")))
+        assert second["lookup_run_id"] is None and second["imported"] == []
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        [(run,)] = await rows(client, "SELECT id FROM runs WHERE workflow = 'lookup' AND project_id = ?", project)
+        assert (await run_finished(client, run))["status"] == "succeeded"
+        found = (await client.get(f"/api/materials/{paper}")).json()
+        assert (found["csl"]["DOI"], found["retraction"]) == (DOI, "retracted")  # looked up and checked
+
+
+@pytest.mark.parametrize("protection", ["lock", "local_only"])
+async def test_a_merges_lookup_keeps_the_projects_protection(tmp_path, protection):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "Its Work")})) as client:
+        project = await project_of(client, level="local_only" if protection == "local_only" else "normal")
+        await imported(client, project, ris(("Without A DOI", "PY  - 2020\n")))
+        if protection == "lock":
+            assert (await client.post(f"/api/projects/{project}/review-lock", json={"locked": True})).status_code == 200
+        await imported(client, project, ris(("Without A DOI", f"PY  - 2020\nDO  - {DOI}\n")))
+        [ask] = await merge_asks(client, project)
+        sent = len(client.provider.scholarly.requests)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        lookups = await rows(client, "SELECT id FROM runs WHERE workflow = 'lookup' AND project_id = ?", project)
+        if protection == "lock":
+            assert lookups == []  # a review-locked project never looks one up
+        else:
+            [question] = await asks_of(client, project, kind="identifier_lookup")  # asked first, as the import's
+            assert question["params"].get("batch") == "reference_file"
+        assert len(client.provider.scholarly.requests) == sent
+
+
+async def test_a_merge_whose_paper_changed_meanwhile_applies_nothing(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        paper, ask = await with_duplicate(client, project)  # a record of the paper's DOI, with an abstract
+        moved = await client.patch(f"/api/materials/{paper}", json={"doi": "10.5555/another.work"})
+        assert moved.status_code == 200
+        [ask] = await merge_asks(client, project)  # its question stands (asked under the same policy)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        run = await run_finished(client, ask["run_id"])
+        assert (run["status"], run["result"]) == ("failed", {"reason": "no_longer_duplicate"})
+        assert "abstract" not in (await client.get(f"/api/materials/{paper}")).json()["csl"]
+
+
+async def test_the_merges_recheck_is_the_duplicate_checks_own_rule(tmp_path):
+    def paper(title, year=None, doi=None):
+        return {**({"title": title} if title else {}), **({"issued": {"date-parts": [[year]]}} if year else {}),
+                **({"DOI": doi} if doi else {})}
+
+    records = [paper("Wages"), paper("Wages", 2020), paper("WAGES!", 2020), paper("Wages", 2021), paper(None, 2020),
+               paper("Other", 2020, DOI), paper("Wages", 2020, DOI), paper("Wages", 2020, DOI.upper()),
+               paper("Wages", 2020, "10.5555/other")]
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+
+        def check(conn):  # each paper alone in the project, as Duplicates reads it from the database
+            for existing in records:
+                conn.execute("DELETE FROM material_versions")
+                conn.execute("DELETE FROM materials")
+                references.new_material(conn, project, {"title": "x", **existing})
+                conn.execute("UPDATE materials SET csl = ?", (json.dumps(existing),))
+                for record in records:
+                    found = references.Duplicates(conn, project).find(record) is not None
+                    assert references._matches(existing, record) == found, (existing, record)
+            raise LookupError  # roll it all back
+
+        with pytest.raises(LookupError):
+            await asyncio.to_thread(client.state["db"].write, check)
+
+
+async def test_a_merge_into_a_paper_not_from_a_reference_file_looks_nothing_up(tmp_path):
+    from types import SimpleNamespace
+
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await imported(client, project, ris(("From A File", "PY  - 2020\n"))))["imported"]
+        record = {"type": "article", "title": "From A File", "issued": {"date-parts": [[2020]]}, "DOI": DOI}
+        active = SimpleNamespace(follows=[])
+
+        def merge(conn):
+            conn.execute("UPDATE materials SET source = 'upload' WHERE id = ?", (paper,))  # as an upload's paper is
+            references._answered(conn, project, paper, record, "merge", client.state["harness"], active)
+
+        await asyncio.to_thread(client.state["db"].write, merge)
+        assert active.follows == [] and await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(0,)]
+        assert (await client.get(f"/api/materials/{paper}")).json()["csl"]["DOI"] == DOI  # merged, as details
+
+
+async def test_a_merge_that_gives_a_paper_its_arxiv_id_looks_it_up(tmp_path):
+    feed = MockScholarly(arxiv={"2401.05555": "A Preprint"})
+    async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
+        project = await project_of(client)
+        await imported(client, project, b"@misc{k, title={A Preprint}, year={2024}}", "a.bib")
+        await imported(client, project, b"@misc{k, title={A Preprint}, year={2024}, eprint={2401.05555},"
+                                        b" archivePrefix={arXiv}}", "b.bib")
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        [(run,)] = await rows(client, "SELECT id FROM runs WHERE workflow = 'lookup' AND project_id = ?", project)
+        assert (await run_finished(client, run))["status"] == "succeeded"
+        assert [(host, path) for host, path, _ in feed.requests] == [
+            ("export.arxiv.org", "/api/query?id_list=2401.05555&max_results=1")]
+
+
+@pytest.mark.parametrize("case", ["had_a_doi", "edited"])
+async def test_a_merge_that_leaves_the_lookups_identifier_as_it_was_looks_nothing_up(tmp_path, case):
+    # recheck 2 of PR 35: an arXiv ID added to a paper with a DOI leaves the DOI the lookup's identifier, looked
+    # up already: nothing is asked again; and the researcher's details are never looked up
+    feed = MockScholarly(arxiv={"2401.05555": "A Preprint"}, openalex={DOI: openalex_work(DOI, "A Preprint")})
+    async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
+        project = await project_of(client)
+        doi = f", doi={{{DOI}}}" if case == "had_a_doi" else ""
+        first = await imported(client, project, f"@misc{{k, title={{A Preprint}}, year={{2024}}{doi}}}".encode(), "a.bib")
+        [paper] = first["imported"]
+        if first["lookup_run_id"]:
+            await run_finished(client, first["lookup_run_id"])
+        if case == "edited":
+            assert (await client.patch(f"/api/materials/{paper}", json={"title": "A Preprint"})).status_code == 200
+        before = await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup' AND project_id = ?", project)
+        sent = len(feed.requests)
+        await imported(client, project, f"@misc{{k, title={{A Preprint}}, year={{2024}}, eprint={{2401.05555}},"
+                                        f" archivePrefix={{arXiv}}{doi}}}".encode(), "b.bib")
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        assert (await run_finished(client, ask["run_id"]))["status"] == "succeeded"
+        assert "arxiv" in (await client.get(f"/api/materials/{paper}")).json()["csl"]  # merged, as its details
+        await background_idle(client)
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup' AND project_id = ?",
+                          project) == before
+        assert feed.requests[sent:] == []  # neither the old DOI again nor the arXiv ID
+
+
+@pytest.mark.parametrize("given, path, services", [
+    (b"eprint={2401.05555}, archivePrefix={arXiv}", "/api/query?id_list=2401.05555&max_results=1", ["arxiv"]),
+    (f"doi={{{DOI}}}".encode(), f"/works/doi:{DOI}", ["crossref", "openalex"]),
+])
+async def test_a_merge_giving_a_paper_with_no_identifier_one_asks_for_that_one(tmp_path, given, path, services):
+    feed = MockScholarly(arxiv={"2401.05555": "A Preprint"}, openalex={DOI: openalex_work(DOI, "A Preprint")})
+    async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
+        project = await project_of(client, level="local_only")
+        await imported(client, project, b"@misc{k, title={A Preprint}, year={2024}}", "a.bib")
+        await imported(client, project, b"@misc{k, title={A Preprint}, year={2024}, " + given + b"}", "b.bib")
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        [question] = await asks_of(client, project, kind="identifier_lookup")
+        assert question["params"]["services"] == services  # Local only names the services this identifier goes to
+        assert (await answer(client, question, "lookup")).status_code == 200
+        await run_finished(client, question["run_id"])
+        assert [p for _, p, _ in feed.requests] == [path]
+
+
+async def test_a_merge_that_gives_an_arxiv_papers_its_doi_looks_the_doi_up(tmp_path):
+    # review 1 of PR 35: the paper had an arXiv ID (looked up); the DOI a merge adds changes the identifier its lookup takes
+    feed = MockScholarly(arxiv={"2401.05555": "A Preprint"}, openalex={DOI: openalex_work(DOI, "A Preprint", retracted=True)})
+    async with started(tmp_path / "data", MockProvider(scholarly=feed)) as client:
+        project = await project_of(client)
+        first = await imported(client, project, b"@misc{k, title={A Preprint}, year={2024}, eprint={2401.05555},"
+                                                b" archivePrefix={arXiv}}", "a.bib")
+        [paper] = first["imported"]
+        await run_finished(client, first["lookup_run_id"])
+        await imported(client, project, ris(("A Preprint", f"PY  - 2024\nDO  - {DOI}\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        runs = await rows(client, "SELECT id FROM runs WHERE workflow = 'lookup' AND project_id = ? ORDER BY started_at",
+                          project)
+        assert len(runs) == 2 and (await run_finished(client, runs[1][0]))["status"] == "succeeded"
+        assert [p for _, p, _ in feed.requests] == [  # the arXiv ID at import, then the DOI the merge gave
+            "/api/query?id_list=2401.05555&max_results=1", f"/works/doi:{DOI}"]
+        found = (await client.get(f"/api/materials/{paper}")).json()
+        assert (found["csl"]["DOI"], found["retraction"]) == (DOI, "retracted")

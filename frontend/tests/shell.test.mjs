@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeT } from '../src/i18n/index.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
 import { DEFAULTS, LIMITS, columns, fromSettings, panelShareAt, toSettings } from '../src/layout.js';
 import { imageAsLink, safeHref } from '../src/links.js';
 import { SESSION_KEY, takeSession } from '../src/session.js';
@@ -10,6 +10,8 @@ import { errorText, money, visible } from '../src/text.js';
 import { apply, send, subscribe, unsavedAnswer } from '../src/live.js';
 import { packageRoot, record } from '../licenses.mjs';
 import { saveSettings } from '../src/api.js';
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 const open = (width, extra = {}) => columns({ width, ...DEFAULTS, panelOpen: false, ...extra });
 
