@@ -32,3 +32,7 @@ frontend/.vite/
 *.sqlite3-wal
 *.sqlite3-shm
 *.log
+
+# Gold sets: field 1's files (Harold's library) and everything generated from whole papers
+evals/local/
+evals/out/

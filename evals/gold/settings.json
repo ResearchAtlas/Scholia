@@ -1,0 +1,47 @@
+{
+ "about": "The gold sets' named settings (S1-36), read only by evals/gold.py. The numbers marked pending are readings that wait for Harold's study-design decisions; changing one is a change to this file, not to the code.",
+ "governed_by": "slice-1 spec section 14 and tickets 17, 22, 70 and 72 at docs commit 0d911523fbb6af53e06113d3f5034346e33123e1",
+ "pending": ["questions", "pairs", "field2_papers", "review", "sample", "judge.flagged_verdicts"],
+ "questions": {
+  "count": 100,
+  "query_languages": {"en": 50, "zh-CN": 50},
+  "unanswerable": {"en": 9, "zh-CN": 9},
+  "multi_paper": {"en": 10, "zh-CN": 10}
+ },
+ "pairs": {
+  "count": 100,
+  "sentence_languages": {"en": 50, "zh-CN": 50},
+  "drafted_categories": {"supported": 34, "partly": 33, "unsupported": 33}
+ },
+ "field2_papers": {
+  "count": {"min": 20, "max": 30},
+  "primary_categories": ["cs.CL", "cs.AI"],
+  "submitted": {"from": "2026-01-01", "to": "2026-09-30"}
+ },
+ "review": {
+  "show_drafted_category": false,
+  "pair_order": "shuffled",
+  "order_seed": 36
+ },
+ "sample": {
+  "fraction": 0.2,
+  "seed": 3620,
+  "strata": {
+   "questions": ["query_language", "answerable", "multi_paper"],
+   "pairs": ["sentence_language", "drafted_category"]
+  }
+ },
+ "judge": {
+  "flagged_verdicts": ["unsupported"],
+  "unsupported_flagged_at_least": 0.8,
+  "supported_flagged_at_most": 0.2
+ },
+ "qasper": {
+  "folder": "qasper-v0.3",
+  "files": [
+   {"path": "extracted/qasper-train-v0.3.json", "size": 31969387, "sha256": "9458bfe76074a8fa8d1685af02bcc73537aa6d338ad20591dfaff1946bc88bf4"},
+   {"path": "extracted/qasper-dev-v0.3.json", "size": 11398686, "sha256": "2ae7ee62a65b1c4225791c70de80c2aad4e8998cf1fd4f09a53103db4f21af93"},
+   {"path": "extracted/qasper-test-v0.3.json", "size": 18078957, "sha256": "6e29ad410e6e39aa1936017fb965b30a20eb2e7751997f55b97c9d281aa884e5"}
+  ]
+ }
+}
