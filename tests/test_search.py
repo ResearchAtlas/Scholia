@@ -2047,6 +2047,42 @@ async def test_an_index_run_whose_terminal_write_fails_once_is_started_again_and
         assert (ended["status"], ended["rebuild"]) == ("succeeded", True)
 
 
+async def test_an_index_run_started_again_after_its_terminal_write_fails_never_reads_interrupted_meanwhile(
+        tmp_path, monkeypatch):
+    """Connector thread 4300055389 (finding 69): an index run whose terminal write fails once is started again, and it
+    stays held across that restart: a poll in the handoff (its old hold released) reads it running, not interrupted,
+    so the interface's follow of the asked-for Rebuild goes on."""
+    from backend.runs import Harness, Registry, derived_status
+    real, real_release, failed, seen = Harness._finish_local, Registry.release, [], []
+    async with app(tmp_path, batch=1) as client:
+        project = await project_of(client)
+        client.remote.hold, client.remote.free = asyncio.Event(), 1
+        await added(client, project, WAGES)
+        await asyncio.wait_for(client.remote.reached.wait(), 10)
+        [run] = await _running_index_runs(client, project)
+        assert (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"] == run  # marked
+
+        def failing_once(self, conn, active, status, cancel_reason, summary, effect=None):
+            if active.run_id == run and not failed:
+                failed.append(True)
+                raise OSError("the disk is full")
+            return real(self, conn, active, status, cancel_reason, summary, effect)
+
+        def release(self, active):  # each moment after the failed run's hold is released, as a poll would read it
+            real_release(self, active)
+            if active.run_id == run and failed and not seen:
+                seen.append(derived_status("running", run, self))
+        monkeypatch.setattr(Harness, "_finish_local", failing_once)
+        monkeypatch.setattr(Registry, "release", release)
+        client.remote.hold.set()
+        deadline = asyncio.get_running_loop().time() + 20
+        while (await rows(client, "SELECT status FROM runs WHERE id = ?", run)) != [("succeeded",)]:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.05)
+        assert failed and seen == ["running"]  # held across the restart: never interrupted
+        [rerun] = [r["run_id"] for r in await runs_of(client, "index", project) if r["run_id"] != run]
+        assert (await run_finished(client, rerun))["status"] == "succeeded"
+
 async def test_a_request_cancelled_after_its_commit_still_starts_the_run_it_was_answered_with(tmp_path):
     """Threads 4283764003 and 4296864820: a request (as a Rebuild's, a Retry's or a trigger's) whose caller is
     cancelled after its transaction commits: the run it was answered with, held by no process, is started all the
