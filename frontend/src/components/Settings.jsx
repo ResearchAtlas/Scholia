@@ -4,7 +4,7 @@
 // the project's in its own; keys live in the credential store (section 4.4).
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, X } from 'lucide-react';
-import { LANGUAGES, LanguageContext, useT } from '../i18n/index.js';
+import { LANGUAGES, LanguageContext, resolveLanguage, useT } from '../i18n/index.js';
 import { ApiError, get, patch, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText, money } from '../text.js';
@@ -77,6 +77,10 @@ function General({ onLanguage, projectId }) {
   const t = useT();
   const personal = useSettingsFile();
   const [problem, setProblem] = useState(null);
+  // The window's language is decided at launch (App.jsx): a change is saved, and applies when the
+  // window reloads (Reload now). The choice shown is the saved setting; a save that fails says so
+  // (Problem) and changes nothing.
+  const drawn = useContext(LanguageContext);
   const values = personal.values;
   if (!values) return <LoadState problem={personal.problem} onRetry={personal.reload} />;
   return (
@@ -90,6 +94,12 @@ function General({ onLanguage, projectId }) {
             options={[{ value: 'system', label: t('settings.languageSystem') },
               ...LANGUAGES.map((code) => ({ value: code, label: t(`language.${code}`) }))]}
             onChange={async (value) => { if (await personal.save({ 'ui.language': value })) onLanguage(value); }} />
+          {resolveLanguage(values.ui.language, navigator.language) !== drawn && (
+            <div role="status" className="mt-3 flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+              <p>{t('settings.languageOnReload')}</p>
+              <Button variant="outline" size="sm" onClick={() => window.location.reload()}>{t('settings.reloadNow')}</Button>
+            </div>
+          )}
         </div>
       </Field>
       <Field label={t('settings.followUp')} hint={t('settings.followUpHint')}>
