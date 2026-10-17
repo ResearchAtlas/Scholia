@@ -53,6 +53,7 @@ import os
 import queue
 import re
 import threading
+import time
 import unicodedata
 from pathlib import Path
 
@@ -302,6 +303,7 @@ class SearchIndex:
         self._owed = False
         self.unusable = False  # a whole rebuild failed: its partial file is neither read nor written (Unavailable)
         self._rebuild_retry, self._rebuild_failures = None, 0  # the same, for a whole rebuild
+        self._gave_up_at = None  # when (time.time()) the index last became unusable, its retry armed (retry_rebuild)
         # This process rebuilt the file and no read of it has succeeded yet: damage found now makes the index unusable
         # (its retry later) rather than rebuilding it again at once (_damaged), so a file that keeps failing never loops.
         self._fresh = False
@@ -605,6 +607,7 @@ class SearchIndex:
 
     def _give_up(self):
         """In the writer: the file discarded and the index left unusable, another whole rebuild armed for later."""
+        self._gave_up_at = time.time()
         try:
             self._discard()
         finally:  # whatever the discard meets, a retry is armed
@@ -615,9 +618,9 @@ class SearchIndex:
         a time, none once the index is closed (close cancels it)."""
         def again():
             with self._lock:
-                self._rebuild_retry = None
-                if self.closed:
+                if self._rebuild_retry is not timer or self.closed:  # taken meanwhile (retry_rebuild, a success)
                     return
+                self._rebuild_retry = None
             try:
                 self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
             except RuntimeError:  # the writer stopped meanwhile (closing)
@@ -631,6 +634,23 @@ class SearchIndex:
             timer.daemon = True
             self._rebuild_retry = timer  # held before it starts, so close() always finds it to cancel
             timer.start()
+
+    def retry_rebuild(self, asked_at):
+        """The whole rebuild an unusable index waits for, now, its retry cancelled, for an index run asked for
+        (asked_at, seconds since the epoch) after the index became unusable: a Rebuild, a Retry, a paper added.
+        Not for one asked before, as the runs a rebuild's success asks for are, so a file damaged again after each
+        rebuild still waits its retry (no loop). Returns whether it asked for the rebuild."""
+        with self._lock:
+            timer = self._rebuild_retry
+            if self.closed or not self.unusable or timer is None or self._gave_up_at is None or asked_at < self._gave_up_at:
+                return False
+            self._rebuild_retry = None
+        timer.cancel()
+        try:
+            self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
+        except RuntimeError:  # the writer stopped meanwhile (closing)
+            return False
+        return True
 
     def _rebuild_all(self):
         """Replace the file with a new one built from the main database's current readings, project by

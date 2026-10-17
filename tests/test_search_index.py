@@ -2446,6 +2446,31 @@ async def test_a_damage_report_made_on_a_file_since_replaced_leaves_its_healthy_
 
 
 @pytest.mark.asyncio
+async def test_a_rebuild_asked_while_the_index_is_unusable_rebuilds_it_now_not_at_its_retry(tmp_path, monkeypatch):
+    """Finding 67: the index unusable (a rebuilt file damaged again: discarded, its retry armed far off). A Rebuild
+    asked now starts an index run, which asks for the whole rebuild at once, its retry cancelled; search is answered
+    again without waiting for the timer. A run asked before the index became unusable (as the runs a rebuild's success
+    asks for) does not: it waits its retry, so a file damaged again after each rebuild never loops."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        with index._lock:  # as _damaged leaves a rebuilt file found damaged again
+            index.damaged = index.building = index.unusable = True
+        await asyncio.to_thread(lambda: index._writer.submit(index._give_up).result())
+        timer = index._rebuild_retry
+        assert timer is not None and not index.path.exists()
+        assert index.retry_rebuild(index._gave_up_at - 1) is False and index._rebuild_retry is timer  # asked before
+        response = await client.post(f"/api/projects/{project}/index/rebuild")
+        assert response.status_code == 202
+        await _until(lambda: not index.unusable and not index.building, timeout=20)
+        assert timer.finished.is_set() and index._rebuild_retry is None  # its retry cancelled, not waited for
+        assert index.path.exists() and await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
 async def test_an_index_file_another_connection_holds_at_launch_is_not_replaced(tmp_path):
     """Finding 68: opening the index while another connection holds its file (exclusive locking) fails BusyError after
     the busy timeout, and the file is not replaced: the same file, its bytes unchanged (search is unavailable for that
