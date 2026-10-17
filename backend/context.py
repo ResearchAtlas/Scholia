@@ -23,8 +23,10 @@ MIN_OUTPUT = 1024  # the smallest output limit a step has
 MESSAGE_FRAMING = 8  # tokens a message's role and template take, counted generously
 REPLY_FRAMING = 8  # the template tokens that open the reply
 EVIDENCE_FLOOR = 2000  # a pipeline needing evidence refuses under this unless its evidence fits whole (F15)
-LETTERS_PER_TOKEN = 3  # ponytail: fixed ratios for runs of ASCII letters; calibrate on recorded counts
-WORD_LETTERS = 12  # a run longer than a word counts each letter after these
+# Pairs of lower-case letters that cl100k_base or o200k_base has no token for (read from their
+# vocabularies): two such letters can stay apart as one token each, as no other pair can (count).
+UNMERGED = frozenset("bq fj fz gj gk gq hj jg jv jw jx jy jz kq kx kz lq mz nq oq qf qg qj qk qo qv qy qz rj tj tq uq"
+                     " vq vz wq wv wz xg xh xj xk xq xu xv xw yf yj yq yv zg zj zq zr zv".split())
 
 # The sections after the system rules, in the order the request holds them, with their labels.
 LABELS = {
@@ -57,13 +59,15 @@ class Request:
 
 
 def count(text: str) -> int:
-    """Tokens in text, never fewer than a provider counts (section 8, Counting). Each non-ASCII
-    character counts as its UTF-8 bytes (Han three), the most a byte-level or byte-fallback
-    tokenizer gives it (a lone surrogate three); each ASCII digit, punctuation mark or whitespace
-    character one, but a single space before a letter, which joins the word after it. A run of ASCII
-    letters shaped like a word (lower case, or capitalized) counts one token for every
-    LETTERS_PER_TOKEN of its first WORD_LETTERS letters and one for each letter after them; any
-    other run (mixed or upper case, as in identifiers, sequences or encoded text) one per letter."""
+    """Tokens in text, never fewer than a byte-level BPE tokenizer such as cl100k_base or o200k_base
+    gives it, however the text is made (section 8, Counting: "must never count fewer").
+
+    Each non-ASCII character counts as its UTF-8 bytes (Han three), the most such a tokenizer gives
+    it, a lone surrogate included; each ASCII digit, punctuation mark or whitespace character one, but
+    a space just before an ASCII letter, which goes with the letters after it. A run of ASCII letters
+    in mixed or upper case counts one per letter. A run in lower case, or capitalized, counts the
+    most tokens the tokenizer can leave it in (_word): a text split into parts never counts more
+    tokens than its parts, so counting each part on its own is never less."""
     tokens = run = 0
     start = 0
     for index, char in enumerate(text):
@@ -73,19 +77,34 @@ def count(text: str) -> int:
             run += 1
             continue
         if run:
-            tokens += _letters(text[start:start + run])
+            tokens += _letters(text[start:start + run], text[start - 1:start] == " ")
             run = 0
         if not char.isascii():
             tokens += len(char.encode("utf-8", "surrogatepass"))
-        elif char != " " or text[index - 1:index] == " " or not text[index + 1:index + 2].isalpha():
+        elif char != " " or not (text[index + 1:index + 2].isascii() and text[index + 1:index + 2].isalpha()):
             tokens += 1
-    return tokens + (_letters(text[start:start + run]) if run else 0)
+    return tokens + (_letters(text[start:start + run], text[start - 1:start] == " ") if run else 0)
 
 
-def _letters(run):
-    if run.islower() or (run[0].isupper() and run[1:].islower()):
-        return -(-min(len(run), WORD_LETTERS) // LETTERS_PER_TOKEN) + max(0, len(run) - WORD_LETTERS)
-    return len(run)
+def _letters(run, spaced):
+    if not (run.islower() or (run[0].isupper() and run[1:].islower())):
+        return len(run) + spaced
+    return _word((" " if spaced else "") + run.lower(), capital=spaced + 1 if run[0].isupper() else None)
+
+
+def _word(symbols, capital=None):
+    """The most tokens BPE can leave symbols in. Merging stops only when no two neighboring tokens
+    join into one in the vocabulary, and every pair of a space and a letter, and every lower-case
+    pair but UNMERGED, is a token in both vocabularies: so no two one-letter tokens stay side by side
+    unless their pair is in UNMERGED (or is a capital and the letter after it, at index capital). The
+    largest count under that rule, with every other token at least two symbols long, bounds it."""
+    alone, joined = 1, float("-inf")  # the most tokens up to here, ending with a one-symbol or a longer token
+    before = (float("-inf"), float("-inf"))  # the same, one symbol back
+    for i in range(1, len(symbols)):
+        apart = i == capital or (symbols[i - 1] != " " and symbols[i - 1] + symbols[i] in UNMERGED)
+        before, (alone, joined) = (alone, joined), (
+            1 + max(joined, alone if apart else float("-inf")), 1 + max(*before) if i > 1 else 1)
+    return int(max(alone, joined))
 
 
 def output_limit(window: int, setting: int) -> int:

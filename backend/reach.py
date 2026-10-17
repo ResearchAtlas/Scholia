@@ -64,11 +64,14 @@ def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -
     for endpoint in found:
         if not _prices(endpoint["pricing"]):  # a rate that is no price (OpenRouter's -1 for a variable-priced
             return Reach((), None, UNKNOWN_RATES, "route_unpriced")  # router, a non-finite value): never $0
+        # A prompt or completion rate it does not publish is taken at the unknown-price rate; every rate it
+        # does publish, and the refusal of a charge nothing here can bound, still apply.
+        pricing = dict(endpoint["pricing"])
+        for key, fallback in (("prompt", UNKNOWN_RATES["input"]), ("completion", UNKNOWN_RATES["output"])):
+            if pricing.get(key) in (None, ""):
+                pricing[key] = repr(fallback)
         try:
-            price = endpoint_pricing.price_endpoint(None, endpoint)
-        except endpoint_pricing.EndpointPricingError:  # publishes no prompt or completion price
-            price = {"unaccounted_nonzero_price_keys": [], "max_input_per_token": UNKNOWN_RATES["input"],
-                     "max_output_per_token": UNKNOWN_RATES["output"], "per_request_usd": 0.0}
+            price = endpoint_pricing.price_endpoint(None, {**endpoint, "pricing": pricing})
         except (TypeError, ValueError):  # an unreadable rate is no evidence that it is low
             return Reach((), None, UNKNOWN_RATES, "route_unpriced")
         if price["unaccounted_nonzero_price_keys"]:

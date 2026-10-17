@@ -10,6 +10,8 @@ charter's model-route rule 3). Model calls go to a test-owned mock.
 import asyncio
 import json
 import math
+import random
+import string
 from pathlib import Path
 
 import httpx
@@ -120,11 +122,11 @@ def test_small_sections_drop_their_lowest_ranked_records_whole():
 def test_a_pipeline_needing_evidence_refuses_when_too_little_room_is_left_unless_it_fits_whole():
     # Final review F15: under 2,000 tokens left for evidence, evidence that does not fit whole refuses;
     # a short abstract that fits is used as it is.
-    crowded = {"agents_md": [ENGLISH * 60]}
+    crowded = {"agents_md": [ENGLISH * 15]}
     with pytest.raises(context.OverWindow) as over:
         build(4096, sections={**crowded, "research_evidence": [ENGLISH * 30] * 4}, needs_evidence=True)
     assert over.value.code == "evidence_over_window"
-    abstract = "Abstract. " + ENGLISH * 3  # about 100 tokens
+    abstract = "Abstract. " + ENGLISH * 3  # under 200 tokens as counted
     request = build(4096, sections={**crowded, "research_evidence": [abstract]}, needs_evidence=True)
     assert abstract in request.messages[0]["content"]
     assert build(4096, sections={**crowded, "research_evidence": [ENGLISH * 30] * 4}).cuts  # no pipeline: cut
@@ -137,17 +139,67 @@ def test_counting_is_conservative_for_latin_and_han_text(text, at_least):
     assert context.count(text) >= at_least
 
 
-def test_dense_letters_and_spaced_digits_count_as_a_tokenizer_splits_them():
-    # Found by the internal review against cl100k and o200k: 2,000 letters of a DNA sequence, a
-    # protein or random mixed-case text take 940 to 1,310 tokens; 1,000 spaced single digits 1,999.
-    import random
-    rng = random.Random(7)
-    for alphabet in ("ACGT", "acgt", "ACDEFGHIKLMNPQRSTVWY", "abcdefghijklmnopqrstuvwxyz",
-                     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"):
-        assert context.count("".join(rng.choice(alphabet) for _ in range(2000))) >= 1310, alphabet
-    assert context.count(" ".join(str(rng.randrange(10)) for _ in range(1000))) >= 1999
+# Adversarial texts, each from its own seeded generator, and the most tokens cl100k_base or o200k_base
+# gives each: measured with their vocabularies and pre-tokenizers on this Mac (the vocabularies VS Code
+# ships; nothing downloaded), as the external review asked (S1-19 part A, A1).
+_UNMERGED = sorted(context.UNMERGED)
+_L = string.ascii_lowercase
+
+
+def _words(rng, k, lo, hi, sep=" ", cap=False):
+    out = ("".join(rng.choice(_L) for _ in range(rng.randint(lo, hi))) for _ in range(k))
+    return sep.join(w.capitalize() if cap else w for w in out)
+
+
+def _pick(seed, choices, n, sep=""):
+    rng = random.Random(seed)
+    return sep.join(rng.choice(choices) for _ in range(n))
+
+
+def _adversarial():
+    def r(seed):
+        return random.Random(seed)
+    return {
+        "qzx x2000": " ".join(["qzx"] * 2000),
+        "short random lowercase": _words(r(1), 3000, 1, 6),
+        "short random lowercase by line": _words(r(2), 3000, 1, 4, "\n"),
+        "capitalized random": _words(r(3), 2000, 2, 8, cap=True),
+        "unmerged pairs chained": _pick(4, _UNMERGED, 2000, ""),
+        "unmerged pairs spaced": _pick(5, _UNMERGED, 2000, " "),
+        "long random lowercase": _pick(6, _L, 6000, ""),
+        "random mixed case": _pick(7, string.ascii_letters, 6000, ""),
+        "random upper case": _pick(8, string.ascii_uppercase, 6000, ""),
+        "digits spaced": _pick(9, "0123456789", 3000, " "),
+        "punctuation runs": _pick(10, string.punctuation, 6000, ""),
+        "punctuation and letters": _pick(11, string.punctuation + _L, 6000, ""),
+        "mixed scripts": _pick(12, ["q", "z", "é", "ж", "队", "😀", " ", "ß", "\u0301", "ا", "1", "."], 6000),
+        "printable ASCII": _pick(13, string.printable, 6000, ""),
+        "base64-like": _pick(14, string.ascii_letters + string.digits + "+/=", 6000, ""),
+    }
+
+
+MEASURED = {
+    "qzx x2000": 4000, "short random lowercase": 6389, "short random lowercase by line": 7656,
+    "capitalized random": 6073, "unmerged pairs chained": 2710, "unmerged pairs spaced": 3460,
+    "long random lowercase": 3224, "random mixed case": 3979, "random upper case": 3573, "digits spaced": 5999,
+    "punctuation runs": 3969, "punctuation and letters": 4172, "mixed scripts": 5992, "printable ASCII": 4625,
+    "base64-like": 4311,
+}
+
+
+@pytest.mark.parametrize("name", list(MEASURED))
+def test_counting_is_never_below_cl100k_or_o200k_on_adversarial_text(name):
+    # Short random lower-case runs (2,000 "qzx" are 4,000 tokens), letter pairs neither vocabulary
+    # joins, digits, punctuation runs, mixed scripts and encoded text.
+    assert context.count(_adversarial()[name]) >= MEASURED[name]
+
+
+def test_the_letter_bound_follows_what_bpe_can_leave():
+    # No two one-letter tokens stay side by side unless their pair is never joined: "qz" is not a
+    # token, so " qzx" can be three; "the" can be two at most; a mixed-case run counts each letter.
+    assert (context.count(" qzx"), context.count("the"), context.count("aBcD")) == (3, 2, 4)
+    assert context.count("bq" * 10) == 15  # "b" and "q" may stay apart; "q" and "b" join
     assert context.count("half \ud800 pair") >= 7  # a lone surrogate counts, rather than failing
-    assert context.count("The cohort was followed for ten years.") < 38  # prose stays near its size
 
 
 RECORDED = Path(__file__).parent / "fixtures" / "recorded_usage.json"

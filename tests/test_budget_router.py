@@ -92,7 +92,30 @@ def test_overrides_count_as_price_and_an_unaccounted_one_refuses():
     assert (price["max_input_per_token"], price["per_request_usd"]) == (0.000003, 0.03)
     odd = endpoint_pricing.price_endpoint("u", {"tag": "t", "pricing": {
         "prompt": "0.000001", "completion": "0.000002", "overrides": [{"threshold": 1000, "surcharge": "0.5"}]}})
-    assert odd["unaccounted_nonzero_price_keys"] == ["overrides.0.surcharge"]
+    assert odd["unaccounted_nonzero_price_keys"] == ["overrides.0.surcharge", "overrides.0.threshold"]
+
+
+@pytest.mark.parametrize("overrides", [{"surcharge": 1}, "0.5", ["0.5"], {"min_prompt_tokens": "272000"}, {"flag": True}])
+def test_an_override_that_is_not_a_known_rate_or_condition_refuses_the_route(overrides):
+    # The external review's A3: only named conditions are conditions; with zero base rates, an unknown
+    # charge must not leave a $0 estimate.
+    from backend import reach
+    endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [],
+                "pricing": {"prompt": "0", "completion": "0", "overrides": overrides}}
+    assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced"
+
+
+def test_a_missing_token_rate_keeps_every_rate_the_endpoint_publishes():
+    # The external review's A2: a missing prompt (or completion) rate takes the unknown-price rate, and
+    # the endpoint's other charges and the refusal of an unknown one still apply.
+    from backend import reach
+    endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [],
+                "pricing": {"completion": "0.1", "request": "1"}}
+    found = reach.reach(OPENROUTER, {}, [endpoint])
+    assert found.problem is None
+    assert found.rates == {"input": budget_router.UNKNOWN_RATES["input"], "output": 0.1, "request": 1.0}
+    endpoint["pricing"]["new_fee"] = "2"
+    assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced"
 
 
 def test_what_a_request_can_reach():

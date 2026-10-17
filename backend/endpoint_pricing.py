@@ -65,30 +65,38 @@ def _is_nonzero_rate(value):
         return True
 
 
+# The conditions an override may name: token counts past which its rates apply. Its shape is not
+# documented, so only these are read as conditions (Scholia); any other key, or a value of another
+# shape, makes the endpoint's pricing unaccounted, and no estimate is made from it.
+_CONDITION_KEYS = frozenset({"min_prompt_tokens", "max_prompt_tokens", "min_context_tokens", "max_context_tokens"})
+
+
 def _override_rates(value, path="overrides"):
-    """({price key: [rates]}, [unaccounted keys]) from `pricing.overrides`, whose rates apply under
-    conditions, such as prompts past a length. Its shape is not documented, so it is read
-    conservatively (Scholia): every price key found at any depth counts as a rate that may apply; a
-    whole number or a flag is taken for a condition; any other non-zero value under a key that is not a
-    price is unaccounted, so no bound is computed from it."""
+    """({price key: [rates]}, [unaccounted paths]) from `pricing.overrides`, whose rates apply under
+    conditions, such as prompts past a length. Read conservatively (Scholia): every price key found at
+    any depth counts as a rate that may apply; a key in _CONDITION_KEYS is a condition when its value is
+    a whole number; anything else that is not zero or empty (another key, a bare value, a list of
+    values) is unaccounted."""
+    if not isinstance(value, (dict, list)):
+        return {}, [path] if _is_nonzero_rate(value) or isinstance(value, bool) else []
     rates, unaccounted = {}, []
-    items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
-    for key, item in items:
+    for key, item in (value.items() if isinstance(value, dict) else enumerate(value)):
         name = key if isinstance(key, str) else None
         if isinstance(item, (dict, list)):
             found, missing = _override_rates(item, f"{path}.{key}")
             for k, v in found.items():
                 rates.setdefault(k, []).extend(v)
             unaccounted += missing
+        elif name in _CONDITION_KEYS:
+            if type(item) is not int or item < 0:
+                unaccounted.append(f"{path}.{key}")
         elif name is not None and _is_accounted_price_key(name) and name not in _NON_PRICE_KEYS | {"overrides"}:
             if _is_nonzero_rate(item):
                 try:
                     rates.setdefault(name, []).append(float(item))
                 except (TypeError, ValueError):
                     unaccounted.append(f"{path}.{key}")
-        elif isinstance(item, (bool, int)) or not _is_nonzero_rate(item):
-            continue  # a condition (a token count, a flag), or nothing
-        else:
+        elif isinstance(item, bool) or _is_nonzero_rate(item):
             unaccounted.append(f"{path}.{key}")
     return rates, unaccounted
 
