@@ -489,6 +489,8 @@ class SearchIndex:
                 wanted = True
             self._purge()
             return wanted, False
+        except LOCKED:  # held by another connection: not replaced (the open fails; search is unavailable)
+            raise
         except apsw.Error as error:  # a file SQLite cannot use (damaged, not a database): replaced
             log.warning("the search index could not be used (%s); it is rebuilt", type(error).__name__)
             return False, True

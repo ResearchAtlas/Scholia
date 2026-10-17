@@ -2443,3 +2443,33 @@ async def test_a_damage_report_made_on_a_file_since_replaced_leaves_its_healthy_
         assert not index.unusable and not index.building and not index.damaged  # the replacement left alone
         assert index._rebuild_retry is None and os.stat(index.path).st_ino == inode
         assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
+async def test_an_index_file_another_connection_holds_at_launch_is_not_replaced(tmp_path):
+    """Finding 68: opening the index while another connection holds its file (exclusive locking) fails BusyError after
+    the busy timeout, and the file is not replaced: the same file, its bytes unchanged (search is unavailable for that
+    launch, open_index's failure)."""
+    from backend.db import Database
+    db = await asyncio.to_thread(Database, tmp_path / "data")
+    index = SearchIndex(tmp_path / "data", db, {"model": "m"})
+    _, rebuild = await asyncio.to_thread(index.open)
+    if rebuild is not None:
+        await asyncio.wrap_future(rebuild)
+    await asyncio.to_thread(index.close)
+    inode, before = os.stat(index.path).st_ino, index.path.read_bytes()
+    holder = search_index.apsw.Connection(str(index.path))
+    again = SearchIndex(tmp_path / "data", db, {"model": "m"})
+    try:
+        holder.execute("PRAGMA locking_mode = EXCLUSIVE")
+        holder.execute("BEGIN EXCLUSIVE")
+        holder.execute("UPDATE index_meta SET value = value WHERE key = 'state'")
+        with pytest.raises(search_index.apsw.BusyError):
+            await asyncio.to_thread(again.open)
+        assert not again.building and os.stat(again.path).st_ino == inode
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+        await asyncio.to_thread(again.close)
+        await asyncio.to_thread(db.close)
+    assert os.stat(index.path).st_ino == inode and index.path.read_bytes() == before
