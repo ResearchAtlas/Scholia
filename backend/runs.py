@@ -316,8 +316,8 @@ class Harness:
         # work began; S1-17: a project's index run, asked for again while it ran, runs once more).
         self.endings = {}
         self._tasks = set()  # detached tasks, kept referenced until they finish
-        # Index runs a kick started again after they were left running unheld (a terminal write that failed): once
-        # each, so a failure that lasts never makes a loop of them (the next trigger, Retry or launch takes it then)
+        # Index runs started again (handed over, _background) after a terminal write that failed: once each, so a
+        # failure that lasts never makes a loop of them (the next trigger, Retry or launch takes it then)
         self._started_again = set()
         # Orders settings saves with the budget reads of call admission: a lowered budget either
         # lands before a call reads it or after that call was admitted.

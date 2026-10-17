@@ -303,7 +303,9 @@ class SearchIndex:
         self._owed = False
         self.unusable = False  # a whole rebuild failed: its partial file is neither read nor written (Unavailable)
         self._rebuild_retry, self._rebuild_failures = None, 0  # the same, for a whole rebuild
-        self._gave_up_at = None  # when (time.time()) the index last became unusable, its retry armed (retry_rebuild)
+        # When (time.time()) the index last gave up (_give_up: its file discarded, its retry about to be armed), for
+        # retry_rebuild; a run asked between a fresh file's damage and its give-up waits that retry (the next Retry works).
+        self._gave_up_at = None
         # This process rebuilt the file and no read of it has succeeded yet: damage found now makes the index unusable
         # (its retry later) rather than rebuilding it again at once (_damaged), so a file that keeps failing never loops.
         self._fresh = False
@@ -639,7 +641,9 @@ class SearchIndex:
         """The whole rebuild an unusable index waits for, now, its retry cancelled, for an index run asked for
         (asked_at, seconds since the epoch) after the index became unusable: a Rebuild, a Retry, a paper added.
         Not for one asked before, as the runs a rebuild's success asks for are, so a file damaged again after each
-        rebuild still waits its retry (no loop). Returns whether it asked for the rebuild."""
+        rebuild still waits its retry (no loop). A rerun recorded as a run ends after the give-up (an automatic mark
+        on it included) counts as asked since: one early rebuild, not a loop (a mark needs a read that succeeded, which
+        ends the file's freshness). Returns whether it asked for the rebuild."""
         with self._lock:
             timer = self._rebuild_retry
             if self.closed or not self.unusable or timer is None or self._gave_up_at is None or asked_at < self._gave_up_at:
