@@ -198,8 +198,8 @@ def check_papers(doc, field, settings):
         where = f"paper {paper.get('id', i) if isinstance(paper, dict) else i}"
         common = ("id", "title", "file", "size", "sha256", "document_language")
         if field == 2:
-            required = common + ("authors", "primary_category", "submitted", "abstract_url", "pdf_url", "license",
-                                 "license_page", "license_checked")
+            required = common + ("authors", "primary_category", "submitted", "topic", "abstract_url", "pdf_url",
+                                 "license", "license_page", "license_checked")
         else:
             required = common
         found = _keys(where, paper, required, ("authors", "note"))
@@ -226,6 +226,7 @@ def check_papers(doc, field, settings):
             problems.append(f"{where}: authors missing")
         if paper["document_language"] != "en":
             problems.append(f"{where}: field 2's papers are English")
+        problems += _text(f"{where} topic", paper["topic"])
         if paper["primary_category"] not in criteria["primary_categories"]:
             problems.append(f"{where}: primary category {paper['primary_category']!r} is not one of "
                             f"{criteria['primary_categories']}")
@@ -595,9 +596,14 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=reading_app, set
         report = {"status": "finished", "field": field, "papers_sha256": papers_sha256, "papers": len(papers),
                   "sets": {}, "labels": {}, "samples": {}, "differences": [], "moved": [], "resolved": False}
         if field == 2 and not problems:
-            span = settings["field2_papers"]["count"]
-            if not span["min"] <= len(papers) <= span["max"]:
-                report["differences"].append(f"{len(papers)} papers, target {span['min']} to {span['max']}")
+            target = settings["field2_papers"]
+            groups = len({p["topic"] for p in papers.values()})
+            report["topic_groups"] = groups
+            if len(papers) != target["count"]:
+                report["differences"].append(f"{len(papers)} papers, target {target['count']}")
+            if not target["topic_groups"]["min"] <= groups <= target["topic_groups"]["max"]:
+                report["differences"].append(f"{groups} topic groups, target {target['topic_groups']['min']} to "
+                                             f"{target['topic_groups']['max']}")
         if qasper is not None and not problems:
             taken = qasper_ids(qasper, settings)
             problems += [f"paper {pid}: a QASPER paper (left out of field 2)" for pid in papers
@@ -887,17 +893,36 @@ class Review:
         self.notices = []
         if self.path.with_name(self.path.name + ".part").exists():
             self.notices.append("cut_off")  # a save cut off before its rename: the labels file is as last saved
-        if self.path.exists():
-            try:
-                labels = read_json(self.path)
-            except (OSError, ValueError) as error:
-                raise Refused(f"{self.path.name} cannot be read ({type(error).__name__}); it is left as it is") from None
-            if problems := check_labels(labels, self.set, rater):
-                raise Refused(f"{self.path.name}: " + "; ".join(problems[:5]) + "; it is left as it is")
-            self.labels = labels["labels"]
-        else:
-            self.labels = {}
+        self.labels = self.read_labels()
         self.set_sha256 = sha256_of(folder / f"{kind}.json")
+
+    def read_labels(self):
+        """The labels file as it is now (another page on the same file may have saved since); a file that
+        cannot be read, or is not this set's and rater's, is refused and left as it is."""
+        if not self.path.exists():
+            return {}
+        try:
+            labels = read_json(self.path)
+        except (OSError, ValueError) as error:
+            raise Refused(f"{self.path.name} cannot be read ({type(error).__name__}); it is left as it is") from None
+        if problems := check_labels(labels, self.set, self.rater):
+            raise Refused(f"{self.path.name}: " + "; ".join(problems[:5]) + "; it is left as it is")
+        return labels["labels"]
+
+    @contextlib.contextmanager
+    def file_lock(self):
+        """This page's lock, and the labels file's for every process: two pages on one file never lose a save.
+        The lock file beside it is owner-only and ignored by git."""
+        import fcntl
+        if not self.path.parent.exists():
+            self.path.parent.mkdir(mode=0o700, parents=True)
+        with self.lock:
+            fd = os.open(self.path.with_name(f".{self.path.name}.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                os.close(fd)
 
     def shown(self, item):
         if self.kind == "pairs":
@@ -921,7 +946,8 @@ class Review:
         return sum(1 for i in self.order if label_state(self.items[i], self.labels.get(i)) == "done")
 
     def data(self):
-        with self.lock:
+        with self.file_lock():
+            self.labels = self.read_labels()
             return {"kind": self.kind, "field": self.field, "set": self.set["id"], "rater": self.rater,
                     "sample": self.sample is not None, "notices": self.notices,
                     "papers": {pid: p["title"] for pid, p in self.papers.items()},
@@ -999,7 +1025,8 @@ class Review:
             label = self.label_of(item, body["label"])
         except ValueError as error:
             return 400, {"code": str(error)}
-        with self.lock:
+        with self.file_lock():
+            self.labels = self.read_labels()
             current = self.labels.get(item["id"])
             if body["base"] != (current["revision"] if current else 0):
                 return 409, {"code": "changed_elsewhere", "label": self.shown_label(item["id"])}
@@ -1063,7 +1090,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(401, {"code": "session_required"})
         review = server.review
         if self.command == "GET" and path == "/api/data":
-            return self._send(200, review.data())
+            try:
+                return self._send(200, review.data())
+            except Refused:  # the labels file was changed to something unreadable meanwhile: left as it is
+                return self._send(500, {"code": "labels_unreadable"})
         if self.command == "GET" and path == "/api/passages":
             found = review.paper_passages((parse_qs(urlsplit(self.path).query).get("paper") or [""])[0])
             return self._send(200, {"passages": found}) if found is not None else self._send(404, {"code": "not_found"})
@@ -1075,7 +1105,10 @@ class _Handler(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(length))
             except ValueError:
                 return self._send(400, {"code": "label_invalid"})
-            return self._send(*review.save(body))
+            try:
+                return self._send(*review.save(body))
+            except Refused:
+                return self._send(500, {"code": "labels_unreadable"})
         return self._send(404, {"code": "not_found"})
 
 

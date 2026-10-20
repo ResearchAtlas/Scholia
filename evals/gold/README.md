@@ -1,0 +1,69 @@
+# Gold sets (tiers 2 and 3)
+
+The gold sets measure Scholia's retrieval on papers of two research fields, and its support judge on labeled citation pairs (slice 1 section 14; tickets 17, 22, 70 and 72). They are built by `evals/gold.py` (S1-36). Every set here is a draft until a rater has reviewed it.
+
+- **Field 2** (AI and NLP): recent arXiv cs.CL and cs.AI papers whose specific version is licensed CC BY 4.0 or CC0 1.0, leaving out QASPER's papers. Its files are public and live in `field2/`.
+- **Field 1** (social science, English and Chinese papers): Harold's own papers. Its files never enter this repository. They stay in a folder given with `--folder`, outside the repository or under the git-ignored `evals/local/`, and are written owner-only.
+
+## Held out and provisional
+
+Tier 2 is held out, questions and provisional labels alike. Tuning uses tier 1 and made-up development cases only, and the candidate order and acceptance rules are frozen before any tier 2 result is examined. No module but `evals/gold.py` reads this folder; a static test checks that. Chinese development cases elsewhere in the repository are made up, never drawn from these drafts.
+
+Every drafted item is provisional. A rater's labels make it gold. The corrected set (`gold.py apply`) keeps an unlabeled item, or one changed since it was labeled, marked `provisional: true`, and tier 2 never counts it.
+
+## What a field's folder holds
+
+- `papers.json`: the paper list. For field 2, each paper version records its arXiv id with version, title, authors, primary category, submission date, topic group, abstract page and PDF address, the license read from that version's own abstract page and when, and the PDF's size and SHA-256. The list also records the selection criteria and seed, and the extractor version the locators were drafted against. The PDFs stay out of git: commands read them from a prepared folder and refuse a file whose size or SHA-256 differs. Nothing is ever downloaded by these commands.
+- `questions.json`: each question has its text, its query language and document language, whether it is answerable, and for an answerable one a short answer and its evidence. Evidence is a list of items. Each item is the passages that make up one span: one passage, or the consecutive passages of a split paragraph. An item is found when any of its passages is retrieved, as in tier 1.
+- `pairs.json`: each citation pair has a sentence, its language, the cited passage and the category it was drafted as (supported, partly supported or unsupported). No judge verdict is stored.
+- `sample-questions.json`, `sample-pairs.json`: the second rater's sample.
+- `labels/<set id>.<rater>.json`: one rater's labels, written by the review page.
+
+A locator names the paper, the passage's ordinal in the app's own reading (section 7.1), its page, kind and section, and quotes the passage whole. Character ranges are not part of a locator. Reference passages are never evidence. In field 2 every quote carries its attribution (authors, title, arXiv id with version) and that paper version's license (CC BY 4.0 or CC0 1.0). A pair's sentence is written in new words. The check refuses a sentence that shares more than 40 letters and digits in a row with its passage.
+
+## The settings
+
+`settings.json` holds the study-design numbers as data, as Harold approved them on 2026-10-20:
+- Papers: 24 papers in 4 to 6 topic groups.
+- Questions: 100, of which 50 are in English and 50 in Simplified Chinese about the English papers. Of these, 18 are unanswerable (9 per language) and 20 span several papers (10 per language).
+- Citation pairs: 100, about 34 drafted supported, 33 partly supported and 33 unsupported. Their sentences are 50 English and 50 Chinese, and the unsupported ones are near misses.
+- The review page: pairs come in a seeded shuffled order, and the page hides the drafted category and any judge verdict.
+- The second rater's sample: a seeded 20% of each set, stratified by language and by drafted category (pairs) or answerable and multi-paper (questions).
+
+The check reports where a set's mix differs from these targets; it refuses only what breaks a rule.
+
+Which judge verdicts count as flagging a pair (`judge.flagged_verdicts`, now `unsupported` only) is not decided yet.
+
+## Commands
+
+Run from the repository root. `--folder` is required for field 1.
+
+    uv run --no-sync python -I evals/gold.py check --field 2 [--pdfs <prepared PDFs> --qasper <qasper-v0.3>]
+    sandbox-exec -f tests/loopback-only.sb uv run --no-sync python -I evals/gold.py passages --field 2 --pdfs <prepared PDFs>
+    uv run --no-sync python -I evals/gold.py review --field 2 --set questions --rater harold [--lang zh-CN]
+    uv run --no-sync python -I evals/gold.py sample --field 2 --set pairs
+    uv run --no-sync python -I evals/gold.py review --field 2 --set pairs --rater <colleague> --sample
+    uv run --no-sync python -I evals/gold.py agreement --field 2 --set pairs --raters harold <colleague>
+    uv run --no-sync python -I evals/gold.py apply --field 2 --set questions --rater harold
+
+- `check` checks the paper list, each set, each labels file and each sample, and reports the mix. With the PDFs, it reads every paper through the app and confirms every locator against that reading. Field 2's check with the PDFs also checks the papers against QASPER v0.3's three splits. When the extractor's version has changed since drafting, it reports each locator whose passage moved and refuses a quote that matches nothing. It never rewrites a set.
+- `passages` writes the drafter's worksheet: every paper's passages as the app reads them, with what a locator needs. It runs the app as the desktop does: a temporary data folder, an in-memory credential store, a review-locked project, so nothing is looked up. The worksheet and the check's report hold whole papers' text, so they go to the git-ignored `evals/out/` (field 1: `<folder>/out/`). They say `incomplete` until finished.
+- `review` serves one set's review page on 127.0.0.1 and prints its address with this launch's secret.
+  - Questions: Harold keeps, edits or drops each one, and confirms or changes its evidence, shown with its text, page and section and chosen from the paper's passages.
+  - Pairs: he marks each one supported, partly supported or unsupported.
+  - Each decision is written to the labels file before the page says it is saved, so work can stop and resume.
+  - A label for an item that changed since is shown again.
+  - The page loads nothing remote and logs nothing.
+  - `--sample` serves only the sampled items, for the second rater, from their own labels file.
+  - Field 1's sample holds Harold's papers' text, so its page is written only with `--colleague`, on Harold's decision.
+- `sample` draws the second rater's sample once.
+- `agreement` reports, on the items both raters labeled:
+  - for pairs: percent agreement, Cohen's kappa over the three categories, and the confusion table;
+  - for questions: agreement on keep or drop and on answerable, and on evidence (the same items, and the overlap of the passages chosen).
+- `apply` writes the corrected set from the drafts and one rater's labels.
+
+Field 2's labels files may be committed when Harold chooses. Field 1's never leave its folder.
+
+## Tiers 2 and 3
+
+Tier 2 (`evals/retrieval_gold` in section 14) is recall@8 on the answerable questions of a corrected set, with English and Chinese questions reported separately and the document language beside them. `gold.tier2_queries` and `gold.tier2_scores` shape a corrected set into the queries `evals/tier1.py` runs and score them by tier 1's item rule. Tier 3 scores the support judge against the labeled pairs (`gold.judge_scores`). Both run at the preview's gate, never on the drafts in M2. The judge and the answer model are paid, so only their scoring is built here, tested on synthetic inputs.

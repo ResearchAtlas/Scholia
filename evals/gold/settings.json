@@ -1,7 +1,7 @@
 {
- "about": "The gold sets' named settings (S1-36), read only by evals/gold.py. The numbers marked pending are readings that wait for Harold's study-design decisions; changing one is a change to this file, not to the code.",
- "governed_by": "slice-1 spec section 14 and tickets 17, 22, 70 and 72 at docs commit 0d911523fbb6af53e06113d3f5034346e33123e1",
- "pending": ["questions", "pairs", "field2_papers", "review", "sample", "judge.flagged_verdicts"],
+ "about": "The gold sets' named settings (S1-36), read only by evals/gold.py: the study-design readings Harold approved on 2026-10-20 (S1-36 scope notes, readings 2, 4, 11, 12, 19 and 20), kept as data so a later decision changes this file, not the code. judge.flagged_verdicts is not decided: which verdicts count as the judge flagging a pair is a question for Harold.",
+ "governed_by": "slice-1 spec section 14 and tickets 17, 22, 70 and 72 at docs commit 0d911523fbb6af53e06113d3f5034346e33123e1; Harold's decisions of 2026-10-20 (status.md)",
+ "pending": ["judge.flagged_verdicts"],
  "questions": {
   "count": 100,
   "query_languages": {"en": 50, "zh-CN": 50},
@@ -14,7 +14,8 @@
   "drafted_categories": {"supported": 34, "partly": 33, "unsupported": 33}
  },
  "field2_papers": {
-  "count": {"min": 20, "max": 30},
+  "count": 24,
+  "topic_groups": {"min": 4, "max": 6},
   "primary_categories": ["cs.CL", "cs.AI"],
   "submitted": {"from": "2026-01-01", "to": "2026-09-30"}
  },

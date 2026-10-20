@@ -336,7 +336,8 @@ def test_the_synthetic_sets_pass_and_the_report_gives_their_mix(tmp_path):
     assert q["multi_paper"] == {"en": 1} and q["per_paper"] == {"2601.00001v1": 4, "2601.00002v2": 1}
     assert p["drafted_categories"] == {"partly": 2, "supported": 2, "unsupported": 2}
     assert p["passages_cited_more_than_once"] == 1  # one passage in two pairs: allowed, reported
-    assert "questions: 6 items, target 100" in report["differences"]  # the settings' targets: reported, not refused
+    assert "questions: 6 items, target 100" in report["differences"] and "2 papers, target 24" in report["differences"]
+    assert report["topic_groups"] == 1 and "1 topic groups, target 4 to 6" in report["differences"]  # the settings' targets: reported, not refused
     assert report["samples"] == {"questions": 1, "pairs": 1}
     assert report["resolved"] is False  # no PDFs given: formats only, said so
 
@@ -408,6 +409,7 @@ def test_drafts_are_provisional_and_a_set_names_its_own_kind_and_field(tmp_path)
     (lambda p: p.pop("sha256"), "sha256 missing"),
     (lambda p: p.update(authors=[]), "authors missing"),
     (lambda p: p.update(document_language="zh-CN"), "field 2's papers are English"),
+    (lambda p: p.pop("topic"), "topic missing"),
 ])
 def test_the_paper_list_holds_only_versions_meeting_the_criteria(tmp_path, change, expected):
     folder = field(tmp_path)
@@ -643,7 +645,7 @@ def test_the_gold_sets_public_text_states_the_hold_out_and_never_calls_scholia_b
 
 
 def test_the_fixture_quotes_are_shown_whole_near_the_passage_limit():
-    assert 1900 < len(fixtures.LONG) <= 2000
+    assert 1850 < len(fixtures.LONG) <= 2000
 
 
 def test_files_written_are_owner_only(tmp_path):

@@ -58,7 +58,7 @@ def paper_record(field, pid, title, language):
     record = {"id": pid, "title": title, "file": f"{pid}.pdf", "size": len(data),
               "sha256": hashlib.sha256(data).hexdigest(), "document_language": language}
     if field == 2:
-        record.update(authors=["A. Synthetic", "B. Example"], primary_category="cs.CL", submitted="2026-02-03",
+        record.update(authors=["A. Synthetic", "B. Example"], primary_category="cs.CL", submitted="2026-02-03", topic="retrieval",
                       abstract_url=f"https://arxiv.org/abs/{pid}", pdf_url=f"https://arxiv.org/pdf/{pid}",
                       license=gold.LICENSES[0], license_page=f"https://arxiv.org/abs/{pid}", license_checked="2026-10-17")
     return record
