@@ -99,7 +99,10 @@ test('Settings, a paper\'s page and the Markdown renderer load only through Part
     .filter((source) => LATER.includes(source) || (source === 'react-markdown' && name !== 'markdown.js'))
     .map((source) => `${name} imports ${source}`)), []);
   assert.deepEqual(Object.entries(found).flatMap(([name, { dynamic }]) => dynamic.map((source) => `${name} ${source}`)),
-    LATER.map((source) => `components/Parts.jsx ${source}`));
+    [...LATER.map((source) => `components/Parts.jsx ${source}`), 'i18n/index.js i18n/zh-CN.json']);
+  // The Chinese catalog is a part of its own, loaded by i18n/index.js only when it is the window's language.
+  assert.deepEqual(Object.entries(found).filter(([, { static: sources }]) => sources.includes('i18n/zh-CN.json')), []);
+  assert.ok(found['i18n/index.js'].static.includes('i18n/en.json'));
   assert.ok(found['markdown.js'].static.includes('react-markdown'));
   for (const name of ['Shell.jsx', 'Library.jsx', 'ConversationView.jsx']) {
     assert.ok(found[`components/${name}`].static.includes('components/Parts.jsx'), name);

@@ -4,12 +4,14 @@ import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
   typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, MAX_LIST_HEIGHT, withFocus,
   detailsSource, latestLookup, pageImage, pageFailedKey, ocrPages } from '../src/library.js';
-import { makeT } from '../src/i18n/index.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
 import { deletePath } from '../src/backups.js';
 import { getBlob } from '../src/api.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zh from '../src/i18n/zh-CN.json' with { type: 'json' };
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 test('only the formats Scholia reads are sent; the rest are named', () => {
   for (const name of ['a.pdf', 'B.PDF', 'c.docx', 'd.html', 'e.htm', 'f.md', 'g.markdown', 'h.tex']) assert.ok(supported(name), name);
@@ -780,6 +782,7 @@ test('Details counts a reading\'s scanned pages: read by text recognition, or wa
     assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 1 }), t('library.ocrRead', { count: 1 }));
     assert.equal(ocrPages(t, { status: 'ocr_needed', ocr_pages: 2 }), t('library.ocrWaiting', { count: 2 }));
   }
+  assert.match(ocrPages(makeT('zh-CN'), { status: 'complete', ocr_pages: 1 }), /\p{Script=Han}/u); // Chinese, not English
   const t = makeT('en');
   assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 1 }), '1 page read');  // beside its term, Text recognition
   assert.equal(ocrPages(t, { status: 'complete', ocr_pages: 3 }), '3 pages read');

@@ -7,8 +7,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
-import { makeT } from '../src/i18n/index.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
 import { fieldKey, indexCounts, indexReason, offerOutcome, onFieldKey, paperIndexed, queryOf, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 const t = makeT('en');
 

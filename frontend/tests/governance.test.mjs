@@ -6,7 +6,9 @@ import { HOLDS, SUGGESTED_HOLDS, holdsBody, holdsOf, moveTargets, tightens } fro
 import { ApiError, confirmedChange } from '../src/api.js';
 import { forgetModels, keptModels, loadModels } from '../src/settings.js';
 import { auditDetail, auditEvent } from '../src/audit.js';
-import { makeT } from '../src/i18n/index.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 test('the three answers set the level, and the review answer the lock and its venue', () => {
   assert.deepEqual(HOLDS, ['own', 'private', 'review']);

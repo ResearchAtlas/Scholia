@@ -14,8 +14,13 @@ gets. It never imports the database, the server or the window.
 Every bound holds before a value is worked on: the file's size (MAX_BYTES), its records
 (MAX_RECORDS; more refuse the whole file), each field's characters (a value is cut before it is
 cleaned, and kept at most to its field's bound; a BibTeX value longer than four times its bound skips
-its record instead, as its LaTeX could read as far less), a field's continuation lines, and the authors
-and keywords of a record. A record keeps only what CSL names here (KEYS); what a record points to is
+its record instead, as its LaTeX could read as far less), a field's continuation lines, a record's
+lines (RECORD_LINES: the fields after them are left out and counted, past_record_bound), and the authors
+and keywords of a record; every BibTeX block it yields, read or not, counts toward MAX_RECORDS. A
+delimiter after an odd run of backslashes (\\", \\{, \\}) is text in a BibTeX value; a BibTeX record whose
+fields bibtexparser split otherwise than our reading accounts for (_agrees: a part closed elsewhere or not
+at all, a backslash, comma or = outside the parts, a field name no field has) is refused, unreadable,
+never kept without the fields the split may have lost. A record keeps only what CSL names here (KEYS); what a record points to is
 never read: file attachments (RIS L1, L2 and L4, EndNote %>, BibTeX file) are not kept, and a URL is
 display only, never fetched. A BibTeX field given twice is read as its first.
 
@@ -25,9 +30,12 @@ or eprinttype arXiv), kept as `arxiv`; never from a URL or a number. Its value i
 for that field, before any parser's or our own change (the field's line as written, a BibTeX value
 inside its outer delimiters, a JSON string), with only spaces, tabs and line ends taken from its ends,
 on one line (a field continued on the next is refused), and it must be, whole, an ASCII DOI starting
-"10." (_DOI_WHOLE) or an arXiv ID with an optional version (_ARXIV_WHOLE). A URL is kept, as display
-only, when it is, whole, http or https, a host name with an optional port 1 to 65535, and a path
-(_URL_WHOLE). Any other value of these fields is left out and counted (invalid_field).
+"10." (_DOI_WHOLE; after one of four prefixes, if it has one: https://doi.org/, http://doi.org/,
+https://dx.doi.org/ or doi:, Harold 2026-10-17, the URLs' scheme and host and "doi:" in any case, as a
+URL's are, and doi: with spaces or tabs after it, as an export writes "DOI: 10.…"; what follows is checked
+whole all the same) or an arXiv ID with an optional version (_ARXIV_WHOLE).
+A URL is kept, as display only, when it is, whole, http or https, a host name with an optional port 1
+to 65535, and a path (_URL_WHOLE). Any other value of these fields is left out and counted (invalid_field).
 
 Names are kept as the file gives them: "Family, Given" splits at its comma (BibTeX's by its name parts,
 split on the text as written so a braced group is one name), and any other name, a Han-script one
@@ -67,7 +75,9 @@ ARXIV_CHARS = 40  # an arXiv ID with its version, at most
 BEAT_EVERY = 500  # records or lines between two beats
 PARSER = ("references", "1")  # what the child names when it is ready (backend/reading.py)
 FORMATS = ("ris", "bibtex", "csl_json", "noteexpress", "endnote")
-SKIPPED = ("no_title", "unreadable", "invalid_field", "unsupported_macro")  # records, records; a kept record's values
+# Records (no_title, unreadable), then values left out: not what their field takes (invalid_field), a BibTeX
+# macro (unsupported_macro), a field of a RIS, EndNote or NoteExpress record past RECORD_LINES (past_record_bound).
+SKIPPED = ("no_title", "unreadable", "invalid_field", "unsupported_macro", "past_record_bound")
 KEYS = {"type", "title", "author", "issued", "container-title", "volume", "issue", "page", "publisher", "DOI",
         "URL", "ISBN", "ISSN", "language", "abstract", "keyword", "number", "arxiv"}
 _SHORT = ("volume", "issue", "page", "publisher", "ISBN", "ISSN", "language", "number")
@@ -75,6 +85,7 @@ _TYPE = re.compile(r"[a-z]{1,30}(?:-[a-z]{1,30}){0,3}")  # a CSL type name, as b
 _YEAR = re.compile(r"(?<!\d)(1\d{3}|2[01]\d{2}|2200)(?!\d)")  # the details form's years, 1000 to 2200
 # The identifiers and URLs a record keeps, each the whole value (ASCII: a digit is 0 to 9, a letter a to z).
 _DOI_WHOLE = re.compile(r"10\.[0-9]{4,9}/[-._;()/:A-Za-z0-9]*[A-Za-z0-9)]", re.ASCII)  # never ending in punctuation
+_DOI_PREFIX = re.compile(r"https?://doi\.org/|https://dx\.doi\.org/|doi:[ \t]*", re.IGNORECASE | re.ASCII)
 _ARXIV_WHOLE = re.compile(rf"(?:{ARXIV.pattern})(?-i:v[0-9]+)?", re.IGNORECASE | re.ASCII)
 _ARXIV_VERSION = re.compile(r"v[0-9]+$")
 _URL_WHOLE = re.compile(r"https?://((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63})"
@@ -121,11 +132,13 @@ def parse(data, beat=lambda: None):
     for done, record in enumerate(reader(text if kind == "csl_json" else lined, beat), start=1):
         if done % BEAT_EVERY == 0:
             beat()
-        csl, dropped = (None, 0) if record is None else _finish(record)
-        if record is not None and record.get("macros"):  # BibTeX: values given as macros or by #, left out,
-            skipped["unsupported_macro"] = skipped.get("unsupported_macro", 0) + record["macros"]  # kept or not
+        refused = record is None or bool(record.get("refused"))  # a block or a record it could not read
+        for key, reason in (("macros", "unsupported_macro"), ("past_bound", "past_record_bound")):
+            if record is not None and record.get(key):  # values left out, whether the record is kept or not
+                skipped[reason] = skipped.get(reason, 0) + record[key]
+        csl, dropped = (None, 0) if refused else _finish(record)
         if csl is None:
-            reason = "unreadable" if record is None else "no_title"
+            reason = "unreadable" if refused else "no_title"
             skipped[reason] = skipped.get(reason, 0) + 1
             continue
         if dropped:
@@ -189,19 +202,25 @@ def _lines(text, beat):
         yield line.rstrip("\n")
 
 
+class _Lines(list):
+    """A record's lines, and how many of its fields past RECORD_LINES were left out (past)."""
+    past = 0
+
+
 def _records(lines, starts, tagged, ends=lambda line: False):
     """Each record's lines, one record at a time: from a line starts() says begins one to the next such
     line, or to a line ends() says closes it. A record takes a line tagged() takes (a field) only while
     it holds fewer than RECORD_LINES lines, and each field at most CONTINUATION_LINES lines after its first, of
     CONTINUATION_CHARS characters together (the line that passes them is cut, never left out whole, so a
     field that went on still shows it did: a DOI with text after it is no DOI); a blank line adds nothing
-    and is left out; a field left out takes its lines with it. Lines outside a record are left out."""
+    and is left out; a field left out takes its lines with it, and is counted (the record's `past`). Lines
+    outside a record are left out."""
     record, after, chars = None, 0, 0
     for line in lines:
         if starts(line):
             if record:
                 yield record
-            record, after, chars = [line], 0, 0
+            record, after, chars = _Lines([line]), 0, 0
         elif record is None:
             continue
         elif ends(line):
@@ -211,6 +230,8 @@ def _records(lines, starts, tagged, ends=lambda line: False):
             kept = len(record) < RECORD_LINES
             if kept:
                 record.append(line)
+            else:
+                record.past += 1
             after, chars = (0, 0) if kept else (CONTINUATION_LINES, CONTINUATION_CHARS)
         elif not line.strip():
             continue
@@ -235,13 +256,14 @@ def _ris(text, beat):
     for lines in _records(_lines(text, beat), lambda line: line[:5] == "TY  -" and tag.match(line) is not None,
                           tag.match, lambda line: line[:5] == "ER  -" and tag.match(line) is not None):
         raw = _raw_fields(lines, lambda line: (line[:2], line[6:]) if tag.match(line) else None, ("DO", "UR"))
+        past = lines.past
         lines = [f" {line}" if loose.match(line) and not tag.match(line) else line for line in lines]
         try:  # one record at a time, closed here whether or not the file closed it
             entry = next(iter(parser.parse_lines(iter([*lines, "ER  - "]))), None)
         except Exception:  # a record it could not take apart: its type alone, never its text, is known here
             entry = None
         if entry is None:
-            yield None
+            yield {"refused": True, "past_bound": past}
             continue
         kind = _first(entry.get("type_of_reference")) or ""
         start, end = _first(entry.get("start_page")), _first(entry.get("end_page"))
@@ -260,7 +282,7 @@ def _ris(text, beat):
             ("ISBN" if kind.strip().upper() in _BOOKS else "ISSN"): _first(entry.get("issn")),
             "language": _first(entry.get("language")),
             "abstract": _first(entry.get("abstract")) or _first(entry.get("notes_abstract")),
-            "keyword": _list(entry.get("keywords")),
+            "keyword": _list(entry.get("keywords")), "past_bound": past,
         }
 
 
@@ -308,8 +330,9 @@ def _bibtex(text, beat):
     beat()
     # Macros (the module's note): none is read. A month name is one only in a file whose text names no @string.
     months, people = not _STRING_ANYWHERE.search(text), {}
-    _counted(sum(isinstance(block, Entry) or isinstance(getattr(block, "ignore_error_block", None), Entry)
-                 for block in library.blocks))
+    # Every record it yields counts toward the bound: entries, and blocks it could not read (not @string ones).
+    _counted(sum(isinstance(block, Entry) or isinstance(block, ParsingFailedBlock)
+                 and not isinstance(getattr(block, "ignore_error_block", None), String) for block in library.blocks))
 
     def plain(raw):
         """A field's text when its value is one braced or quoted literal, a number, or a month name; None for
@@ -360,7 +383,7 @@ def _bibtex(text, beat):
         """How many of an entry's fields, every one of them, are macros or # concatenations: each left out."""
         count = 0
         for field in entry.fields:
-            if isinstance(field.value, str) and (raw := field.value.strip()):
+            if isinstance(field.value, str) and (raw := field.value.strip()) and _agrees(raw):
                 try:
                     parts = _parts(raw)
                 except _Refused:  # words without # between them, a literal then a word: no one literal either
@@ -403,6 +426,10 @@ def _bibtex(text, beat):
             fields.setdefault(field.key.lower(), field)
         kind = entry.entry_type.lower()
         try:
+            if "\\" in (entry.key or "") or not all(  # a backslash in the cite key hides a comma or an = from the split
+                    _FIELD_KEY.fullmatch(field.key) and (not isinstance(field.value, str) or _agrees(field.value.strip()))
+                    for field in entry.fields):
+                raise _Refused  # where our reading and the parser's split differ, fields may be missing
             archive = (value(fields, "archiveprefix", "eprinttype") or "").strip().lower()
             number = value(fields, "number")
             record = {
@@ -425,8 +452,8 @@ def _bibtex(text, beat):
                 "number": number if kind != "article" else None,
                 "macros": macros(entry),
             }
-        except _Refused:  # a value it cannot read as written: the record is skipped, never read wrong
-            record = None
+        except _Refused:  # a value it cannot read as written: the record is skipped, never read wrong; its
+            record = {"refused": True, "macros": macros(entry)}  # macros are counted all the same
         yield record
 
 
@@ -440,11 +467,26 @@ _STRING_ANYWHERE = re.compile(r"@\s*string", re.IGNORECASE)
 _DELIMITERS = re.compile(r'[{}"]')
 
 
-def _closing(value, start):
-    """Where the brace or quote opening value at start closes (braces inside it balanced), or None."""
+def _escaped(value, at, start=-1):
+    """Whether the character at `at` follows an odd run of backslashes (after start): TeX's escape."""
+    run, before = 0, at - 1
+    while before > start and value[before] == "\\":
+        run, before = run + 1, before - 1
+    return run % 2 == 1
+
+
+def _closing(value, start, parsers=False):
+    """Where the brace or quote opening value at start closes (braces inside it balanced), or None. A
+    delimiter after an odd run of backslashes is escaped (TeX's \\{, \\} and \\"), so it neither opens,
+    closes nor ends anything; after an even run (\\\\, an escaped backslash) it is a delimiter. parsers:
+    bibtexparser's rule instead, which splits a block into its fields: any backslash before a delimiter
+    hides it."""
     depth, at = 0, start + 1
     while found := _DELIMITERS.search(value, at):
         at = found.end()
+        if (found.start() - 1 > start and value[found.start() - 1] == "\\") if parsers \
+                else _escaped(value, found.start(), start):
+            continue
         if found.group() == "{":
             depth += 1
         elif found.group() == "}":
@@ -454,6 +496,32 @@ def _closing(value, start):
         elif depth == 0 and value[start] == '"':
             return found.start()
     return None
+
+
+def _agrees(raw):
+    """Whether a BibTeX value, as bibtexparser split the block into fields, is all accounted for by our
+    reading: each braced or quoted part closes, and where bibtexparser closed it (its rule: any backslash
+    just before a delimiter hides it; ours: an odd run does, \\\\{ being an escaped backslash then a brace),
+    and outside them no backslash, comma or = (a backslash hides a comma or an = from bibtexparser's split,
+    and a comma or an = there means one value ran into the next field). Otherwise the parser may have
+    ended the value, or the entry, elsewhere than BibTeX does, and fields after it may be lost: its record
+    is refused (unreadable) rather than kept without them."""
+    at = 0
+    while (at := _SPACES.match(raw, at).end()) < len(raw):
+        if raw[at] in '{"':
+            end = _closing(raw, at)
+            if end is None or end != _closing(raw, at, parsers=True):
+                return False
+            at = end + 1
+        elif raw[at] in "\\,=":
+            return False
+        else:
+            at += max(1, len(_OUTSIDE.match(raw, at).group()))
+    return True
+
+
+_OUTSIDE = re.compile(r'[^\s{}"\\,=]*')  # a value's text between its delimited parts
+_FIELD_KEY = re.compile(r"[^\s{}\"#%'(),=\\]+")  # a field's name as BibTeX takes one
 
 
 def _parts(raw):
@@ -489,6 +557,8 @@ def _split_top(value):
     as written (a braced group is one keyword), before its LaTeX is read."""
     found, start, depth = [], 0, 0
     for mark in _KEYWORD_MARKS.finditer(value):
+        if mark.group() in "{}" and _escaped(value, mark.start()):  # \{ and \} are text
+            continue
         if mark.group() == "{":
             depth += 1
         elif mark.group() == "}":
@@ -571,11 +641,11 @@ def _tagged(text, start, line, beat, written=()):
                 fields[-1][1].append(row.strip())
         # identifiers and URLs: the field's line as written, and one line only (_raw_fields)
         yield [(tag, (parts[0] if len(parts) == 1 else _UNREADABLE) if tag in written else " ".join(parts))
-               for tag, parts in fields]
+               for tag, parts in fields], lines.past
 
 
 def _endnote(text, beat):
-    for fields in _tagged(text, "0", r"^%(\S)(?: (.*))?$", beat, written=("R", "U")):  # a tag needs its space
+    for fields, past in _tagged(text, "0", r"^%(\S)(?: (.*))?$", beat, written=("R", "U")):  # a tag needs its space
         one, dois = {}, []
         for tag, value in fields:
             if tag in ("A", "K", "U"):
@@ -590,12 +660,12 @@ def _endnote(text, beat):
             "issued": one.get("D"), "container-title": one.get("J") or one.get("B"), "volume": one.get("V"),
             "issue": one.get("N"), "page": one.get("P"), "publisher": one.get("I"), "DOI": _one(dois),
             "URL": one.get("U", []), ("ISBN" if _NAMED_TYPES.get(kind) in ("book", "chapter") else "ISSN"): one.get("@"),
-            "language": one.get("G"), "abstract": one.get("X"), "keyword": one.get("K", []),
+            "language": one.get("G"), "abstract": one.get("X"), "keyword": one.get("K", []), "past_bound": past,
         }
 
 
 def _noteexpress(text, beat):
-    for fields in _tagged(text, "Reference Type", r"^\{([^{}\n]{1,40})\}[ \t]*:[ \t]?(.*)$", beat,
+    for fields, past in _tagged(text, "Reference Type", r"^\{([^{}\n]{1,40})\}[ \t]*:[ \t]?(.*)$", beat,
                           written=("DOI", "URL")):
         one, given = {}, {"DOI": [], "URL": []}
         for tag, value in fields:
@@ -614,7 +684,7 @@ def _noteexpress(text, beat):
             "publisher": one.get("Publisher"), "DOI": _one(given["DOI"]), "URL": given["URL"],
             ("ISBN" if _NAMED_TYPES.get(kind) in ("book", "chapter") else "ISSN"): one.get("ISBN/ISSN"),
             "language": one.get("Language"), "abstract": one.get("Abstract"),
-            "keyword": re.split(r"[;；,，]", one.get("Keywords") or ""),
+            "keyword": re.split(r"[;；,，]", one.get("Keywords") or ""), "past_bound": past,
         }
 
 
@@ -677,10 +747,15 @@ def _url(values):
 
 
 def _doi(value):
-    """(The DOI a value is, whole, in lower case, or None; 1 when a value was given and is not one.)"""
+    """(The DOI a value is, whole, in lower case, or None; 1 when a value was given and is not one.) Of the
+    prefixes a DOI is written with, these only are taken off first (Harold, 2026-10-17): https://doi.org/,
+    http://doi.org/, https://dx.doi.org/ and doi: (any case; doi: with spaces or tabs after it); what
+    follows is checked whole, as without one."""
     doi = _whole(value)
     if doi is None:
         return None, 0
+    if doi is not _UNREADABLE and (prefix := _DOI_PREFIX.match(doi)):
+        doi = doi[prefix.end():]
     if doi is _UNREADABLE or len(doi) > DOI_CHARS or not _DOI_WHOLE.fullmatch(doi) or {".", ".."} & set(doi.split("/")) \
             or not _balanced(doi):
         return None, 1  # a dot segment: a URL holding it would name another path once resolved

@@ -196,9 +196,11 @@
   "dataFolder.synced": "数据文件夹位于会同步到云端的文件夹或网络驱动器中，数据库可能因此损坏。",
   "dataFolder.unsafe": "这台 Mac 上的其他账户可以更改数据文件夹中的内容，因此 Scholia 不会打开它。",
   "dataFolder.where": "数据文件夹",
+  "errors.no_longer_duplicate": "问题等待期间这篇文献已有改动，不再与该记录重复，因此没有合并。",
   "errors.internal": "出了点问题，请重试。",
   "errors.unreachable": "Scholia 的引擎没有响应。请关闭 Scholia 后重新打开。",
   "errors.part_not_loaded": "Scholia 的这部分界面未能加载。点“重试”会重新载入窗口。",
+  "errors.english_not_saved": "此窗口已使用英文，但未能将其保存为界面语言，因此下次打开 Scholia 时仍会使用已保存的语言。点“重试”会再保存一次。",
   "errors.active_run": "这个对话仍在处理中。请等待，或停止它。",
   "errors.empty_message": "请先输入消息。",
   "errors.message_too_long": "这条消息太长了。",
@@ -417,6 +419,9 @@
   "references.unsupportedMacro": {
     "other": "有 {count} 个 BibTeX 字段值未导入：Scholia 不展开 @string 缩写或用 # 连接的值。"
   },
+  "references.pastBound": {
+    "other": "有 {count} 个字段未导入：所在记录超过 Scholia 对一条记录读取的前 {lines} 行。"
+  },
   "references.leftOut": {
     "other": "有 {count} 项信息未导入：不是有效的年份、DOI、网址或 arXiv 编号。"
   },
@@ -462,6 +467,8 @@
   "settings.from.project": "本项目单独设置",
   "settings.language": "语言",
   "settings.languageSystem": "跟随系统",
+  "settings.languageOnReload": "界面语言将在窗口重新载入后更改。",
+  "settings.reloadNow": "立即重新载入",
   "language.en": "English",
   "language.zh-CN": "中文",
   "settings.followUp": "Scholia 工作时发送的新消息",
