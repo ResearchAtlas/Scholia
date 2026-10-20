@@ -41,7 +41,9 @@ its database (Database.closing), its timers cancelled and its writer drained. Ev
 reads the file, applies the queue and removes every row of a passage the main database no longer grants,
 then truncates the WAL (_purge): what a close that failed, or a crash, left of a deletion is gone before
 the first read (fail closed). A close that fails holds file replacement off for the rest of the process
-(backend.db.close_failed).
+(backend.db.close_failed). A file another connection holds (writing, or under exclusive locking) is never removed
+or replaced: an open that would replace it fails (search is unavailable for that launch), and a rebuild while the
+app runs fails, leaving the index unavailable until its retry finds the file let go.
 Nothing here logs text, a title, a query or a path.
 """
 
@@ -124,7 +126,7 @@ class _Stopped(Exception):
 class Unavailable(Exception):
     """Nothing is read from the file now: a whole rebuild of it is asked for or under way (the old file is never
     read unpurged, nor a partial one), or one failed (nothing is read from or written to the partial file until
-    one succeeds; it is tried again, SearchIndex._rebuild_later), or a file this process rebuilt was found damaged
+    one succeeds; it is tried again, SearchIndex._arm_retry), or a file this process rebuilt was found damaged
     again before any read of it succeeded (the same, SearchIndex._damaged)."""
 
 
@@ -365,7 +367,8 @@ class SearchIndex:
         rebuilds nothing. Admitted, given its connection (an idle one, or a new one to the file as it is then), and that
         connection given back to the idle ones, all under _lock: so a file that replaces this one, or its removal, waits
         for the reads admitted before (_quiet), and no read admitted before reaches a file made after; close() refuses
-        later reads, waits for these, then closes what they gave back. No connection to the file is opened otherwise."""
+        later reads, waits for these, then closes what they gave back. No other connection to the file is opened but the
+        writer's (its own, and the lock it takes to remove the file, _held_off, while no read is admitted)."""
         with self._lock:
             if self.closed:
                 raise DatabaseClosedError("the search index is closed")
@@ -630,8 +633,8 @@ class SearchIndex:
 
     def _remove_file(self):
         """The file and its WAL and shared-memory files removed, the file locked exclusively meanwhile (no other
-        connection in a transaction on it): a file another connection holds is never removed, so never replaced
-        (LOCKED, after the busy timeout). One SQLite cannot open or lock otherwise (damaged, not a database) has no
+        connection writing to it, or holding it under exclusive locking; in WAL mode a connection only reading is not
+        held off): a file another connection holds is never removed, so never replaced (LOCKED, after the busy timeout). One SQLite cannot open or lock otherwise (damaged, not a database) has no
         transaction to hold off: it goes all the same. The lock is let go before any new file is made."""
         with self._held_off():
             for suffix in ("", "-wal", "-shm"):
@@ -639,6 +642,8 @@ class SearchIndex:
 
     @contextlib.contextmanager
     def _held_off(self):
+        """The file locked exclusively (BEGIN EXCLUSIVE, on a connection of the writer's, opened when no read is
+        admitted: after _quiet, at an open, or as the index closes) for the body; LOCKED raised if another holds it."""
         conn = None
         if self.path.exists():
             try:
@@ -662,20 +667,20 @@ class SearchIndex:
         asked for now if an index run asked for one meanwhile (retry_rebuild), once."""
         try:
             self._discard()
-        finally:  # whatever the discard meets, a rebuild is asked for, now or later
-            with self._lock:
+        finally:  # whatever the discard meets, a rebuild is asked for, now or later: decided and armed in one
+            with self._lock:  # lock section, so a request meanwhile finds the retry armed, or is the one served now
                 asked, self._asked = self._asked and not self.closed, False
+                if not asked:
+                    self._arm_retry()
             if asked:
                 try:
                     self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
                 except RuntimeError:  # the writer stopped meanwhile (closing)
                     pass
-            else:
-                self._rebuild_later()
 
-    def _rebuild_later(self):
+    def _arm_retry(self):
         """Another whole rebuild after a delay that doubles with each failure in a row (RETRY_SECONDS), one at
-        a time, none once the index is closed (close cancels it)."""
+        a time, none once the index is closed (close cancels it). Called under _lock."""
         def again():
             with self._lock:
                 if self._rebuild_retry is not timer or self.closed:  # taken meanwhile (retry_rebuild, a success)
@@ -685,15 +690,14 @@ class SearchIndex:
                 self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
             except RuntimeError:  # the writer stopped meanwhile (closing)
                 pass
-        with self._lock:
-            if self.closed or self._rebuild_retry is not None:
-                return
-            delay = min(RETRY_SECONDS[0] * 2 ** self._rebuild_failures, RETRY_SECONDS[1])
-            self._rebuild_failures += 1
-            timer = threading.Timer(delay, again)
-            timer.daemon = True
-            self._rebuild_retry = timer  # held before it starts, so close() always finds it to cancel
-            timer.start()
+        if self.closed or self._rebuild_retry is not None:
+            return
+        delay = min(RETRY_SECONDS[0] * 2 ** self._rebuild_failures, RETRY_SECONDS[1])
+        self._rebuild_failures += 1
+        timer = threading.Timer(delay, again)
+        timer.daemon = True
+        self._rebuild_retry = timer  # held before it starts, so close() always finds it to cancel
+        timer.start()
 
     def retry_rebuild(self, asked_at):
         """For an index run asked for (asked_at, seconds since the epoch) since the index became unusable (a Rebuild,
@@ -770,7 +774,7 @@ class SearchIndex:
         """A read or a pass found the file damaged: it is replaced and rebuilt in the writer, once, and its
         vectors are wanted again (self.rebuilt), as when a launch rebuilds it. A file this process rebuilt that no
         read has yet succeeded on is not rebuilt again at once: the index is unusable, its file discarded, and the
-        rebuild tried later (_rebuild_later, its delay doubling while it keeps failing so), as after a failed one.
+        rebuild tried later (_arm_retry, its delay doubling while it keeps failing so), as after a failed one.
         A read gives the generation of the file it was admitted to: once that file has been replaced or removed
         (_close_readers counts each), its report is about a file that is gone, and does nothing."""
         with self._lock:
