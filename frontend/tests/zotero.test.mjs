@@ -144,7 +144,7 @@ test('after Check again, a group or collection Zotero no longer lists is left be
   assert.match(browser, /if \(ready && libraryIn\(library, status\.libraries\) !== library\) \{\s*setLibrary\(libraryIn\(library, status\.libraries\)\);\s*setCollection\(null\);\s*setChosen\(\[\]\);/);
   assert.match(browser, /else if \(collectionIn\(collection, collections\) !== collection\) \{\s*setCollection\(null\);/);
   // Check again refreshes the collections too, and a chosen collection's items wait for its list
-  assert.match(browser, /setStatus\(null\);\s*setCollections\(null\);/);
+  assert.match(browser, /setStatus\(null\);\s*setCollections\(null\);[^\n]*\n\s*setPage\(null\);/);
   assert.match(browser, /const confirming = collection !== null && collections === null;/);
   assert.match(browser, /if \(!ready \|\| confirming\) return undefined;/);
   assert.match(browser, /\}, \[ready, library, collection, confirming\]\);/);

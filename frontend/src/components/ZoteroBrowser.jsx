@@ -38,6 +38,7 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
   const check = useCallback(async () => {
     setStatus(null);
     setCollections(null); // refreshed with the status: a collection chosen is kept only if the new list has it
+    setPage(null); // and its items, so no further page is asked of a collection that may be gone
     setProblem(null);
     try {
       setStatus(await zoteroStatus());

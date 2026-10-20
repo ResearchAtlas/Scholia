@@ -804,7 +804,8 @@ def test_a_sentinel_whose_child_is_ended_by_its_pid_before_it_stops_is_found_lef
     command = [sys.executable, "-c", "import os, signal, time\n"
                "pid = os.fork()\n"
                "if pid == 0:\n"
-               "    time.sleep(0.3); os.kill(os.getpid(), signal.SIGSTOP); os._exit(0)\n"
+               "    while os.getppid() != 1: time.sleep(0.01)\n"  # its child gone, then it stops
+               "    os.kill(os.getpid(), signal.SIGSTOP); os._exit(0)\n"
                "print(pid, flush=True); time.sleep(30)\n"]
     with allow_command(*command):
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, process_group=0)
