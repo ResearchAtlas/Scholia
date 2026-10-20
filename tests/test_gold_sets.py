@@ -452,17 +452,21 @@ def test_the_labels_format_refuses_another_set_or_rater_and_a_missing_field(tmp_
     good = {"set": doc["id"], "kind": "pairs", "field": 2, "rater": "harold", "set_sha256": "x",
             "labels": {"p01": {"item_sha256": gold.item_sha256(doc["items"][0]), "revision": 1, "saved_at": "t",
                                "category": "supported"}}}
-    assert gold.check_labels(good, doc, "harold") == []
-    assert "they are rater 'harold''s" in gold.check_labels(good, doc, "lee")[0]
-    assert "not this set's" in gold.check_labels({**good, "set": "field2-questions"}, doc)[0]
+    assert gold.check_labels(good, doc, {}, "harold") == []
+    assert "they are rater 'harold''s" in gold.check_labels(good, doc, {}, "lee")[0]
+    assert "not this set's" in gold.check_labels({**good, "set": "field2-questions"}, doc, {})[0]
     broken = copy.deepcopy(good)
     del broken["labels"]["p01"]["saved_at"]
-    assert gold.check_labels(broken, doc) == ["label p01: saved_at missing"]
+    assert gold.check_labels(broken, doc, {}) == ["label p01: saved_at missing"]
     broken["labels"]["p01"].update(saved_at="t", category="maybe")
-    assert gold.check_labels(broken, doc) == ["label p01: category 'maybe'"]
+    assert gold.check_labels(broken, doc, {}) == ["label p01: category 'maybe'"]
 
 
 # Labels, the corrected set, the sample and the agreement
+
+
+def papers_by_id(folder):
+    return {p["id"]: p for p in json.loads((folder / "papers.json").read_text())["papers"]}
 
 
 def labels_for(doc, rater, decisions):
@@ -480,7 +484,8 @@ def test_the_corrected_set_applies_done_labels_and_keeps_the_rest_provisional(tm
         "q04": {"decision": "edit", "answerable": False}, "q05": {"decision": "keep"}})
     labels["labels"]["q05"]["item_sha256"] = "an older version of the item"
     labels["labels"]["gone"] = {"item_sha256": "x", "revision": 1, "saved_at": "t", "decision": "keep"}
-    corrected = gold.apply(doc, labels)
+    papers = papers_by_id(folder)
+    corrected = gold.apply(doc, labels, papers)
     by_id = {i["id"]: i for i in corrected["items"]}
     assert corrected["counts"] == {"labeled": 3, "dropped": 1, "changed": 1, "provisional": 1, "orphaned": 1}
     assert "q02" not in by_id and by_id["q01"]["provisional"] is False and by_id["q01"]["text"] == doc["items"][0]["text"]
@@ -488,8 +493,8 @@ def test_the_corrected_set_applies_done_labels_and_keeps_the_rest_provisional(tm
     assert by_id["q04"]["answerable"] is False and by_id["q04"]["evidence"] == [] and "short_answer" not in by_id["q04"]
     assert by_id["q05"]["provisional"] is True and by_id["q06"]["provisional"] is True  # changed, and not labeled
     every_drop = labels_for(doc, "harold", {i["id"]: {"decision": "drop"} for i in doc["items"]})
-    assert gold.apply(doc, every_drop)["items"] == [] and gold.apply(doc, every_drop)["counts"]["dropped"] == 6
-    nothing = gold.apply(doc, labels_for(doc, "harold", {}))
+    assert gold.apply(doc, every_drop, papers)["items"] == [] and gold.apply(doc, every_drop, papers)["counts"]["dropped"] == 6
+    nothing = gold.apply(doc, labels_for(doc, "harold", {}), papers)
     assert nothing["counts"]["provisional"] == 6 and all(i["provisional"] for i in nothing["items"])
 
 
@@ -559,7 +564,8 @@ async def test_tier_two_takes_a_corrected_sets_gold_answerable_questions_in_tier
     doc = json.loads((folder / "questions.json").read_text())
     with pytest.raises(tier1.Refused, match="never the drafts"):
         gold.tier2_queries(doc, {}, "p")
-    corrected = gold.apply(doc, labels_for(doc, "harold", {"q1": {"decision": "keep"}, "q3": {"decision": "keep"}}))
+    corrected = gold.apply(doc, labels_for(doc, "harold", {"q1": {"decision": "keep"}, "q3": {"decision": "keep"}}),
+                           papers_by_id(folder))
     papers = json.loads((folder / "papers.json").read_text())["papers"]
     async with opener()(tmp_path / "data") as (client, state):
         read, project = await gold.read_papers(client, state, papers, pdfs)
@@ -716,3 +722,22 @@ def test_apply_and_agreement_take_only_a_plainly_named_rater(tmp_path):
     for argv in (["apply", "--rater", "../../x"], ["agreement", "--raters", "harold", "../x"]):
         with pytest.raises(SystemExit, match="rater"):
             gold.main([argv[0], "--field", "2", "--folder", str(folder), "--set", "pairs", *argv[1:]])
+
+
+@pytest.mark.asyncio
+async def test_the_check_resolves_evidence_a_rater_chose_as_it_resolves_drafted_evidence(tmp_path, qasper_pins):
+    folder, pdfs, sheet = await drafted(tmp_path)
+    qasper = qasper_folder(tmp_path)
+    pin_qasper(qasper_pins, qasper)
+    doc = json.loads((folder / "questions.json").read_text())
+    papers = papers_by_id(folder)
+    good = from_sheet(sheet, papers, 2, "2601.00011v1", "Keyword")
+    labels = labels_for(doc, "harold", {"q1": {"decision": "edit", "evidence": [[good]]}})
+    (folder / "labels").mkdir()
+    write(folder / "labels" / "t-questions.harold.json", labels)
+    assert (await gold.check(2, folder, pdfs, qasper, opener()))["problems"] == []
+    labels["labels"]["q1"]["evidence"] = [[{**good, "quote": "A paragraph this paper never had."}]]
+    write(folder / "labels" / "t-questions.harold.json", labels)
+    report = await gold.check(2, folder, pdfs, qasper, opener())
+    assert report["problems"] == ["t-questions.harold.json: question q1 evidence item 1: the quote is not passage 2 "
+                                  "of 2601.00011v1"]

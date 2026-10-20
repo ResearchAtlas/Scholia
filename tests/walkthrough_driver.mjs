@@ -1526,15 +1526,23 @@ async function goldPages(ctx) {
       await page.keyboard.press('e');
       await page.getByLabel(G('edit.text'), { exact: true }).fill('Which method found more evidence, and did reranking help?');
       await page.getByRole('button', { name: G('edit.removeItem', { n: 2 }) }).click();
-      await page.getByLabel(G('edit.paper'), { exact: true }).selectOption('2601.00002v2');
+      await page.getByLabel(G('edit.filter'), { exact: true }).fill('paraphrased');
       await page.waitForTimeout(400);
+      // Paper B's passages are held back while A's are still shown: the passage clicked is A's, saved as A's.
+      const slow = async (route) => { await new Promise((r) => setTimeout(r, 1500)); await route.continue(); };
+      await page.route('**/api/passages?paper=2601.00002v2', slow);
+      const shownA = page.getByRole('button', { name: G('edit.addThis') });
+      await page.getByLabel(G('edit.paper'), { exact: true }).selectOption('2601.00002v2');
+      await shownA.click();
+      await page.waitForTimeout(2000);
+      await page.unroute('**/api/passages?paper=2601.00002v2', slow);
+      check("the passage added while another paper loaded is the paper it was shown under",
+        await page.locator('.edit .evidence').nth(1).getByText('paraphrased', { exact: false }).count() === 1);
+      await page.getByLabel(G('edit.filter'), { exact: true }).fill('');
+      await page.waitForTimeout(600);
       check('a passage holding markup is shown as text: no script ran and no image was made',
         await page.evaluate(() => window.hostile === undefined && document.querySelectorAll('img').length === 0)
         && await page.getByText('<script>window.hostile = 1</script>', { exact: false }).count() === 1);
-      await page.getByLabel(G('edit.paper'), { exact: true }).selectOption('2601.00001v1');
-      await page.getByLabel(G('edit.filter'), { exact: true }).fill('paraphrased');
-      await page.waitForTimeout(400);
-      await page.getByRole('button', { name: G('edit.addThis') }).click();
       check('every control on the page has a label', await unlabeledControls() === 0);
       await page.getByRole('button', { name: G('edit.save') }).scrollIntoViewIfNeeded();
     });
@@ -1547,11 +1555,15 @@ async function goldPages(ctx) {
       check('edited: its text and its evidence (item 2 removed, a passage added) read back from the labels file',
         saved.q02?.decision === 'edit' && /^Which method found more evidence/.test(saved.q02.text)
         && saved.q02.evidence?.length === 2 && saved.q02.evidence[0][0].quote.startsWith('Table 1.')
-        && saved.q02.evidence[1][0].quote.includes('paraphrased'));
+        && saved.q02.evidence[1][0].paper === '2601.00001v1' && saved.q02.evidence[1][0].quote.includes('paraphrased'));
       check('dropped by its key', saved.q03?.decision === 'drop');
       check('the progress says three done', await page.locator('#progress').textContent() === G('progress', { done: 3, total: 6 }));
       await page.keyboard.press('ArrowLeft'); await page.keyboard.press('ArrowLeft');
       check('the edited question shows as edited', await page.getByText(G('q.label.edit')).count() === 1);
+      await page.keyboard.press('k');  // Keep on an edited question keeps the edit it shows
+      await status().getByText(G('status.saved', { n: 2 })).waitFor();
+      check('Keep after the edit kept the edit, read back from the labels file', labels('questions').q02?.decision === 'edit'
+        && /^Which method found more evidence/.test(labels('questions').q02.text) && labels('questions').q02.revision === 2);
       isolated();
     });
 

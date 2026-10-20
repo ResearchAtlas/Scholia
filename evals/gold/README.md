@@ -69,6 +69,9 @@ Run from the repository root. `--folder` is required for field 1.
   - Questions: Harold keeps, edits or drops each one, and confirms or changes its evidence, shown with its text, page and section and chosen from the paper's passages.
   - Pairs: he marks each one supported, partly supported or unsupported.
   - Each decision is written to the labels file before the page says it is saved, so work can stop and resume.
+  - Keep on an edited question keeps the edit as shown. Going back to the draft is its own action (Revert). An edit that names only some fields builds on the saved edit, so nothing saved is dropped.
+  - Each passage chosen in the picker goes back with a key the server gave it, so a passage is never saved under another paper.
+  - A labels file is checked as the drafts are: the question each label leaves must pass every draft rule, its locators included. `check` with the PDFs also resolves a rater's chosen evidence, and `apply` refuses labels that fail.
   - A label for an item that changed since is shown again.
   - The page loads nothing remote and logs nothing.
   - `--sample` serves only the sampled items, for the second rater, from their own labels file.

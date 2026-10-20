@@ -72,7 +72,10 @@
   "error.session_required": "This page's address has expired. Open the address the command printed.",
   "notice.cut_off": "An earlier save was cut off before it finished. The labels file is as it was last saved.",
   "load.failed": "The page could not load its items. Open the address the command printed, with its #session part.",
-  "edit.discard": "Leave this question? Your unsaved edit will be lost."
+  "edit.discard": "Leave this question? Your unsaved edit will be lost.",
+  "q.keepEdited": "Keep as edited",
+  "q.revert": "Revert to the drafted question",
+  "error.keep_would_revert": "This question was edited. Keep keeps the edit; to go back to the draft, choose Revert."
  },
  "zh-CN": {
   "page.title": "标准集审阅",
@@ -147,6 +150,9 @@
   "error.session_required": "此页面的地址已失效。请打开命令输出的地址。",
   "notice.cut_off": "之前的一次保存在完成前被中断。标注文件保持上次保存时的状态。",
   "load.failed": "页面无法载入条目。请打开命令输出的地址，包括其中的 #session 部分。",
-  "edit.discard": "要离开这个问题吗？尚未保存的编辑将会丢失。"
+  "edit.discard": "要离开这个问题吗？尚未保存的编辑将会丢失。",
+  "q.keepEdited": "按编辑保留",
+  "q.revert": "恢复为草稿中的问题",
+  "error.keep_would_revert": "此问题已被编辑。“保留”会保留编辑；如需恢复草稿，请选择“恢复”。"
  }
 }

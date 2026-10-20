@@ -105,11 +105,27 @@
       body.push(el('p', { class: 'unanswerable', text: t('q.unanswerable') }));
     }
     if (label?.state === 'done') body.push(el('p', { class: 'label', text: t(`q.label.${label.decision}`) }));
+    const edited = label?.state === 'done' && label.decision === 'edit';
     body.push(el('div', { class: 'actions' },
-      el('button', { type: 'button', 'aria-keyshortcuts': 'K', text: t('q.keep'), on: { click: () => decide({ decision: 'keep' }) } }),
+      el('button', { type: 'button', 'aria-keyshortcuts': 'K', text: edited ? t('q.keepEdited') : t('q.keep'), on: { click: keepShown } }),
       el('button', { type: 'button', 'aria-keyshortcuts': 'E', text: t('q.edit'), on: { click: startEdit } }),
-      el('button', { type: 'button', 'aria-keyshortcuts': 'D', text: t('q.drop'), on: { click: () => decide({ decision: 'drop' }) } })));
+      el('button', { type: 'button', 'aria-keyshortcuts': 'D', text: t('q.drop'), on: { click: () => decide({ decision: 'drop' }) } }),
+      edited ? el('button', { type: 'button', text: t('q.revert'), on: { click: () => decide({ decision: 'keep' }, { revert: true }) } }) : null));
     return body;
+  }
+
+  // A passage as the page sends it back: its paper, ordinal and the key the server gave it, so that a
+  // passage is never saved under another paper.
+  const choice = (loc) => ({ paper: loc.paper, ordinal: loc.ordinal, key: loc.key });
+
+  // Keep keeps what the page shows: after an edit, the edit as saved (going back to the draft is Revert).
+  function keepShown() {
+    const label = data.labels[item().id];
+    if (!(label?.state === 'done' && label.decision === 'edit')) { decide({ decision: 'keep' }); return; }
+    const again = { decision: 'edit' };
+    for (const name of ['text', 'short_answer', 'answerable']) if (name in label) again[name] = label[name];
+    if ('evidence' in label) again.evidence = label.evidence.map((ev) => ev.map(choice));
+    decide(again);
   }
 
   function startEdit() {
@@ -171,15 +187,17 @@
     box.append(el('label', { for: 'pickPaper', text: t('edit.paper') }), paper, el('label', { for: 'pickFilter', text: t('edit.filter') }),
       filter, el('label', { for: 'pickTarget', text: t('edit.addTo') }), target, results);
     async function fill() {
-      const all = await passagesOf(editing.paper);
+      const from = editing.paper;  // each result is bound to the paper it was loaded for
+      const all = await passagesOf(from);
+      if (!editing || editing.paper !== from) return;  // another paper was chosen meanwhile: this load is stale
       const wanted = editing.filter.trim().toLowerCase();
       const found = all.filter((p) => !wanted || p.text.toLowerCase().includes(wanted));
       const shown = found.slice(0, 50);
       results.replaceChildren(...(found.length ? [] : [el('li', { text: t('edit.noMatches') })]),
         ...(found.length > shown.length ? [el('li', { class: 'meta', text: t('edit.shownOf', { shown: shown.length, total: found.length }) })] : []),
-        ...shown.map((p) => el('li', {}, passageView({ ...p, paper: editing.paper }, question.document_language),
+        ...shown.map((p) => el('li', {}, passageView({ ...p, paper: from }, question.document_language),
           el('button', { type: 'button', text: t('edit.addThis'), on: { click: () => {
-            const loc = { paper: editing.paper, ordinal: p.ordinal, page: p.page, kind: p.kind, section_path: p.section_path, quote: p.text };
+            const loc = { paper: from, ordinal: p.ordinal, page: p.page, kind: p.kind, section_path: p.section_path, quote: p.text, key: p.key };
             if (editing.target === 'new' || !editing.evidence[Number(editing.target)]) editing.evidence.push([loc]);
             else editing.evidence[Number(editing.target)].push(loc);
             render();
@@ -197,14 +215,14 @@
     if (editing.answerable !== before.answerable) label.answerable = editing.answerable;
     if (editing.answerable && editing.short_answer !== (before.short_answer ?? '')) label.short_answer = editing.short_answer;
     if (editing.answerable && key(editing.evidence) !== key(before.evidence)) {
-      label.evidence = editing.evidence.map((ev) => ev.map((loc) => ({ paper: loc.paper, ordinal: loc.ordinal })));
+      label.evidence = editing.evidence.map((ev) => ev.map(choice));
     }
     if (Object.keys(label).length === 1) { setStatus(t('error.edit_needs_a_change')); return; }
     const saved = data.labels[item().id];  // an edit of an edit carries the earlier edit's other fields
     if (saved?.state === 'done' && saved.decision === 'edit') {
       for (const name of ['text', 'short_answer', 'answerable', 'evidence']) {
         if (name in saved && !(name in label)) label[name] = name === 'evidence'
-          ? saved.evidence.map((ev) => ev.map((loc) => ({ paper: loc.paper, ordinal: loc.ordinal }))) : saved[name];
+          ? saved.evidence.map((ev) => ev.map(choice)) : saved[name];
       }
       if (label.answerable === false) { delete label.short_answer; delete label.evidence; }
     }
@@ -247,8 +265,8 @@
 
   let saving = false;  // one save at a time: a second key press while one is on its way is ignored
 
-  function decide(label) {
-    send({ item: item().id, base: data.labels[item().id]?.revision ?? 0, label });
+  function decide(label, extra = {}) {
+    send({ item: item().id, base: data.labels[item().id]?.revision ?? 0, label, ...extra });
   }
 
   async function send(request) {
@@ -276,8 +294,7 @@
     } else if (answer.status === 409) {
       pending = null;
       data.labels[request.item] = answer.body.label;
-      editing = null;
-      render();
+      if (!editing) render();  // an open edit stays as typed: saving it again is a deliberate choice
       setStatus(t('status.conflict', { n }));
     } else if (answer.status === 400 || answer.status === 413) {
       pending = null;
@@ -299,7 +316,7 @@
     const actions = data.kind === 'pairs'
       ? { 1: () => decide({ category: 'supported' }), 2: () => decide({ category: 'partly' }), 3: () => decide({ category: 'unsupported' }) }
       : editing ? { escape: () => { editing = null; render(); } }
-        : { k: () => decide({ decision: 'keep' }), e: startEdit, d: () => decide({ decision: 'drop' }) };
+        : { k: keepShown, e: startEdit, d: () => decide({ decision: 'drop' }) };
     const move = { arrowleft: () => go(index - 1), arrowright: () => go(index + 1) };
     const action = actions[key] ?? (editing ? null : move[key]);
     if (action) { event.preventDefault(); action(); }

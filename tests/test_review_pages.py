@@ -4,6 +4,7 @@ Each test registers the server's port with the network block, which refuses ever
 Lifecycle cases first: a save that fails, a save cut off, a labels file that is not this set's.
 """
 
+import asyncio
 import contextlib
 import http.client
 import json
@@ -73,6 +74,12 @@ def pages():
     yield open_page
     for page in opened:
         page.close()
+
+
+def pick(page, paper, ordinal):
+    """A passage as the page sends it back when chosen in the picker: with the key the server gave it."""
+    found = next(p for p in page.get(f"/api/passages?paper={paper}")[1]["passages"] if p["ordinal"] == ordinal)
+    return {"paper": paper, "ordinal": ordinal, "key": found["key"]}
 
 
 def field(tmp_path, number=2, sample=False):
@@ -237,8 +244,7 @@ def test_questions_are_kept_edited_or_dropped_and_their_evidence_confirmed_or_ch
     assert page.save("q03", {"decision": "drop"})[0] == 200
     status, answer = page.save("q04", {"decision": "edit", "text": "  长段落主要讨论了什么？ ", "short_answer": "检索深度"})
     assert status == 200 and answer["label"]["text"] == "长段落主要讨论了什么？"  # trimmed, as typed text is
-    picked = [[{"paper": "2601.00001v1", "ordinal": 4}], [{"paper": "2601.00002v2", "ordinal": 1},
-                                                         {"paper": "2601.00002v2", "ordinal": 2}]]
+    picked = [[pick(page, "2601.00001v1", 4)], [pick(page, "2601.00002v2", 1), pick(page, "2601.00002v2", 2)]]
     status, answer = page.save("q02", {"decision": "edit", "evidence": picked[:1]})
     assert status == 200 and answer["done"] == 4
     labels = json.loads(labels_file(folder, "questions").read_text())["labels"]
@@ -246,7 +252,8 @@ def test_questions_are_kept_edited_or_dropped_and_their_evidence_confirmed_or_ch
     loc = labels["q02"]["evidence"][0][0]
     assert loc["quote"].startswith("Table 1.") and loc["license"] == gold.LICENSES[0] and loc["attribution"]
     assert (folder / "questions.json").read_bytes() == before  # the drafts are never rewritten
-    corrected = gold.apply(json.loads(before), json.loads(labels_file(folder, "questions").read_text()))
+    corrected = gold.apply(json.loads(before), json.loads(labels_file(folder, "questions").read_text()),
+                           page.review.papers)
     assert corrected["counts"] == {"labeled": 3, "dropped": 1, "changed": 0, "provisional": 2, "orphaned": 0}
 
 
@@ -286,9 +293,12 @@ def test_an_edit_at_the_length_bound_and_a_question_made_answerable_are_saved(tm
     page = pages(field(tmp_path), "questions")
     assert page.save("q01", {"decision": "edit", "text": "W" * 999 + "?"})[0] == 200
     status, answer = page.save("q03", {"decision": "edit", "answerable": True, "short_answer": "Not said",
-                                       "evidence": [[{"paper": "2601.00002v2", "ordinal": 0}]]})
+                                       "evidence": [[pick(page, "2601.00002v2", 0)]]})
     assert status == 200 and answer["label"]["answerable"] is True
-    assert page.save("q03", {"decision": "edit", "answerable": True}) == (400, {"code": "answerable_needs_answer_and_evidence"})
+    # An edit builds on the saved one: what it does not name stays as saved
+    status, answer = page.save("q03", {"decision": "edit", "text": "What hardware ran the synthetic experiments?"})
+    assert status == 200 and answer["label"]["short_answer"] == "Not said" and len(answer["label"]["evidence"]) == 1
+    assert page.save("q05", {"decision": "edit", "answerable": True}) == (400, {"code": "answerable_needs_answer_and_evidence"})
 
 
 # Stop and resume; two windows; changed items
@@ -335,7 +345,7 @@ def test_a_label_for_an_item_changed_since_is_shown_again_and_never_applied(tmp_
     labels = json.loads(labels_file(folder, "pairs").read_text())
     labels["labels"]["p06"] = {**labels["labels"]["p01"]}
     labels_file(folder, "pairs").write_text(json.dumps(labels))
-    corrected = gold.apply(doc, labels)
+    corrected = gold.apply(doc, labels, {p["id"]: p for p in json.loads((folder / "papers.json").read_text())["papers"]})
     assert corrected["counts"]["changed"] == 1 and corrected["counts"]["orphaned"] == 1
     assert next(i for i in corrected["items"] if i["id"] == "p01")["provisional"] is True
 
@@ -459,3 +469,74 @@ def test_a_lock_that_cannot_be_taken_says_not_saved(tmp_path, pages, monkeypatch
     status, payload, _ = page.request("POST", "/api/label", {"item": "p01", "base": 0, "label": {"category": "partly"}})
     assert status == 500 and json.loads(payload) == {"code": "not_saved"}
     assert page.get("/api/data")[0] == 500
+
+
+# Sol review 1's findings, rebuilt as tests
+
+
+def test_a_passage_picked_under_one_paper_is_never_saved_as_another_papers(tmp_path, pages):
+    folder = field(tmp_path)
+    page = pages(folder, "questions")
+    a = pick(page, "2601.00001v1", 1)  # shown while paper A's passages were loaded
+    stale = {**a, "paper": "2601.00002v2"}  # the paper selector moved to B before the click
+    assert page.save("q01", {"decision": "edit", "evidence": [[stale]]}) == (400, {"code": "evidence_invalid"})
+    assert page.save("q01", {"decision": "edit", "evidence": [[{"paper": "2601.00001v1", "ordinal": 1}]]}) == \
+        (400, {"code": "evidence_invalid"})  # a choice without the key it was shown with
+    assert not labels_file(folder, "questions").exists()
+    status, answer = page.save("q01", {"decision": "edit", "evidence": [[a]]})
+    assert status == 200 and answer["label"]["evidence"][0][0]["paper"] == "2601.00001v1"
+    assert answer["label"]["evidence"][0][0]["quote"].startswith("We compare dense and keyword retrieval")
+
+
+def test_keep_after_an_edit_keeps_the_edit_and_going_back_to_the_draft_is_explicit(tmp_path, pages):
+    folder = field(tmp_path)
+    page = pages(folder, "questions")
+    assert page.save("q01", {"decision": "edit", "text": "How many synthetic questions did dense retrieval find evidence for, of 100?"})[0] == 200
+    assert page.save("q01", {"decision": "keep"}) == (400, {"code": "keep_would_revert"})
+    saved = json.loads(labels_file(folder, "questions").read_text())["labels"]["q01"]
+    assert saved["decision"] == "edit" and saved["text"].endswith("of 100?")
+    # The page's Keep re-sends the edit it shows: still an edit, nothing lost
+    shown = page.get("/api/data")[1]["labels"]["q01"]
+    status, answer = page.save("q01", {"decision": "edit", "text": shown["text"]})
+    assert status == 200 and answer["label"]["decision"] == "edit" and answer["label"]["text"] == shown["text"]
+    # Revert is its own action, and apply then gives the draft
+    status, payload, _ = page.request("POST", "/api/label", {"item": "q01", "base": answer["label"]["revision"],
+                                                             "label": {"decision": "keep"}, "revert": True})
+    assert status == 200 and json.loads(payload)["label"]["decision"] == "keep"
+    labels = json.loads(labels_file(folder, "questions").read_text())
+    drafted = json.loads((folder / "questions.json").read_text())
+    corrected = gold.apply(drafted, labels, page.review.papers)
+    assert next(i for i in corrected["items"] if i["id"] == "q01")["text"] == drafted["items"][0]["text"]
+    assert page.request("POST", "/api/label", {"item": "q02", "base": 0, "label": {"decision": "keep"},
+                                               "revert": "yes"})[0] == 400
+
+
+def test_a_label_file_whose_edits_break_the_rules_opens_no_page_and_never_becomes_gold(tmp_path):
+    folder = field(tmp_path)
+    doc = json.loads((folder / "questions.json").read_text())
+    q01 = doc["items"][0]
+    path = labels_file(folder, "questions")
+    path.parent.mkdir()
+    bad = {"set": doc["id"], "kind": "questions", "field": 2, "rater": "harold", "set_sha256": "x", "labels": {
+        "q01": {"item_sha256": gold.item_sha256(q01), "revision": 1, "saved_at": "t", "decision": "edit",
+                "answerable": True, "evidence": []}}}
+    path.write_text(json.dumps(bad))
+    with pytest.raises(gold.Refused, match="an answerable question has evidence"):
+        gold.Review(2, folder, "questions", "harold")
+    papers = {p["id"]: p for p in json.loads((folder / "papers.json").read_text())["papers"]}
+    with pytest.raises(gold.Refused, match="do not pass their check"):
+        gold.apply(doc, bad, papers)
+    with pytest.raises(SystemExit, match="an answerable question has evidence"):
+        gold.main(["apply", "--field", "2", "--folder", str(folder), "--set", "questions", "--rater", "harold"])
+    report = asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
+    assert any("label q01: question q01: an answerable question has evidence" in p for p in report["problems"])
+    for label, expected in (({"decision": "keep", "text": "x"}, "an edit names what it changes"),
+                            ({"decision": "edit"}, "an edit names what it changes"),
+                            ({"decision": "edit", "text": "繁體字問題"}, "marked en but holds Chinese characters"),
+                            ({"decision": "edit", "evidence": [[{**q01["evidence"][0][0], "license": "x"}]]},
+                             "license is not its paper version's")):
+        bad["labels"]["q01"] = {"item_sha256": gold.item_sha256(q01), "revision": 1, "saved_at": "t", **label}
+        assert any(expected in p for p in gold.check_labels(bad, doc, papers)), label
+    # A label for an item changed since is not applied, so its content is checked at its next save
+    bad["labels"]["q01"] = {"item_sha256": "older", "revision": 1, "saved_at": "t", "decision": "edit", "evidence": []}
+    assert gold.check_labels(bad, doc, papers) == []

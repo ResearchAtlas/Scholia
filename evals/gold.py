@@ -133,6 +133,12 @@ def sha256_of(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def passage_key(text):
+    """A short digest of a passage's letters and digits: the page sends it back with each passage it picks,
+    so a choice that pairs one paper with another paper's passage is refused, never saved."""
+    return hashlib.sha256(_key(text).encode()).hexdigest()[:16]
+
+
 def item_sha256(item):
     return hashlib.sha256(json.dumps(item, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
@@ -372,8 +378,14 @@ def check_set(doc, kind, field, papers):
     return problems
 
 
-def check_labels(doc, set_doc, rater=None):
-    """A labels file's problems (L1): its header names this set and rater; each label's fields."""
+EDITS = ("text", "short_answer", "answerable", "evidence")  # what a question's edit may change
+
+
+def check_labels(doc, set_doc, papers, rater=None):
+    """A labels file's problems (L1): its header names this set and rater; each label's fields; and each
+    label for an item as it now is (one that will be applied) leaves a question that passes every rule a
+    draft passes, its locators included. A label for an item changed since is not applied, so not checked
+    here: the page shows the item again, and its next save is checked."""
     problems = _keys("labels", doc, ("set", "kind", "field", "rater", "set_sha256", "labels"), ("sample",))
     if problems:
         return problems
@@ -383,16 +395,24 @@ def check_labels(doc, set_doc, rater=None):
         return [f"labels: they are rater {doc['rater']!r}'s, not {rater!r}'s"]
     if not isinstance(doc["labels"], dict):
         return ["labels: labels is not an object"]
+    items = {i["id"]: i for i in set_doc["items"]}
     for item, label in doc["labels"].items():
         if set_doc["kind"] == "pairs":
             problems += _keys(f"label {item}", label, ("item_sha256", "revision", "saved_at", "category"))
             if isinstance(label, dict) and label.get("category") not in CATEGORIES:
                 problems.append(f"label {item}: category {label.get('category')!r}")
         else:
-            problems += _keys(f"label {item}", label, ("item_sha256", "revision", "saved_at", "decision"),
-                              ("text", "short_answer", "answerable", "evidence"))
-            if isinstance(label, dict) and label.get("decision") not in DECISIONS:
-                problems.append(f"label {item}: decision {label.get('decision')!r}")
+            found = _keys(f"label {item}", label, ("item_sha256", "revision", "saved_at", "decision"), EDITS)
+            if not found and label["decision"] not in DECISIONS:
+                found.append(f"label {item}: decision {label['decision']!r}")
+            if not found and (label["decision"] == "edit") != any(k in label for k in EDITS):
+                found.append(f"label {item}: an edit names what it changes; keep and drop change nothing")
+            drafted = items.get(item)
+            if not found and drafted is not None and label_state(drafted, label) == "done":
+                made = labeled(drafted, label)
+                if made is not None:
+                    found += [f"label {item}: {p}" for p in check_question(made, set_doc["field"], papers)]
+            problems += found
         if isinstance(label, dict) and not (isinstance(label.get("revision"), int) and label["revision"] >= 1):
             problems.append(f"label {item}: revision is not a count")
     return problems
@@ -612,6 +632,7 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
             raise Refused("field 2's check with the PDFs also needs --qasper (QASPER's papers are left out)")
         problems = check_papers(doc, field, settings)
         papers = {p["id"]: p for p in doc["papers"]} if not problems else {}
+        edited = defaultdict(list)  # (labels file, the item as its label leaves it), for edited evidence
         report = {"status": "finished", "field": field, "papers_sha256": papers_sha256, "papers": len(papers),
                   "sets": {}, "labels": {}, "samples": {}, "differences": [], "moved": [], "resolved": False}
         if field == 2 and not problems:
@@ -638,10 +659,13 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
             items = {i["id"]: i for i in set_doc["items"]}
             for path in sorted((folder / "labels").glob(f"{set_doc['id']}.*.json")):
                 labels = read_json(path)
-                found = check_labels(labels, set_doc)
+                found = check_labels(labels, set_doc, papers)
                 problems += [f"{path.name}: {p}" for p in found]
                 if not found:
                     report["labels"][path.name] = label_counts(items, labels)
+                    edited[kind] += [(path.name, made) for i, label in labels["labels"].items()
+                                     if i in items and label_state(items[i], label) == "done" and "evidence" in label
+                                     and (made := labeled(items[i], label)) is not None]
             if (folder / f"sample-{kind}.json").is_file():
                 sample = read_json(folder / f"sample-{kind}.json")
                 if sample.get("set") != set_doc["id"] or not set(sample.get("items", [])) <= set(items):
@@ -658,6 +682,10 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
                 found, moved = resolve(kind, set_doc["items"], read, doc["extractor"])
                 problems += found
                 report["moved"] += moved
+            for name, made in edited["questions"]:  # evidence a rater chose resolves as drafted evidence does
+                found, moved = resolve("questions", [made], read, doc["extractor"])
+                problems += [f"{name}: {p}" for p in found]
+                report["moved"] += [f"{name}: {m}" for m in moved]
             extractors = sorted({tuple(r["extractor"]) for r in read.values() if r["extractor"]})
             if extractors != [(doc["extractor"]["name"], doc["extractor"]["version"])]:
                 report["extractor_now"] = [list(e) for e in extractors]
@@ -714,10 +742,13 @@ def labeled(item, label):
     return out
 
 
-def apply(set_doc, labels):
+def apply(set_doc, labels, papers):
     """The corrected set (L5): each item a label is done for, as the label leaves it (dropped items out),
     `provisional: false`; every other item as drafted, `provisional: true`, never counted as gold; labels
-    of items no longer in the set kept out and counted."""
+    of items no longer in the set kept out and counted. Labels that do not pass check_labels are refused
+    whole: nothing invalid becomes gold."""
+    if problems := check_labels(labels, set_doc, papers):
+        raise Refused("the labels do not pass their check: " + "; ".join(problems[:5]))
     items, out = [], {"labeled": 0, "dropped": 0, "changed": 0, "provisional": 0}
     for item in set_doc["items"]:
         label = labels["labels"].get(item["id"])
@@ -869,6 +900,10 @@ def judge_scores(labels, verdicts, settings=None):
 # The review page
 
 
+def keyed(evidence):
+    return [[{**loc, "key": passage_key(loc["quote"])} for loc in ev] for ev in evidence]
+
+
 class Review:
     """One review page: a set's items as the page shows them (for pairs, never the drafted category or a
     judge's verdict), one rater's labels file and the saves to it."""
@@ -930,7 +965,7 @@ class Review:
             labels = read_json(self.path)
         except (OSError, ValueError) as error:
             raise Refused(f"{self.path.name} cannot be read ({type(error).__name__}); it is left as it is") from None
-        if problems := check_labels(labels, self.set, self.rater):
+        if problems := check_labels(labels, self.set, self.papers, self.rater):
             raise Refused(f"{self.path.name}: " + "; ".join(problems[:5]) + "; it is left as it is")
         return labels["labels"]
 
@@ -957,15 +992,18 @@ class Review:
             if self.show_category:
                 out["drafted_category"] = item["drafted_category"]
             return out
-        return {k: item[k] for k in ("id", "text", "query_language", "document_language", "answerable", "short_answer",
-                                     "evidence") if k in item}
+        out = {k: item[k] for k in ("id", "text", "query_language", "document_language", "answerable", "short_answer")
+               if k in item}
+        return {**out, "evidence": keyed(item["evidence"])}
 
     def shown_label(self, item_id):
         label = self.labels.get(item_id)
         if label is None:
             return None
-        return {**{k: v for k, v in label.items() if k != "item_sha256"},
-                "state": label_state(self.items[item_id], label)}
+        out = {k: v for k, v in label.items() if k != "item_sha256"}
+        if "evidence" in out:
+            out["evidence"] = keyed(out["evidence"])
+        return {**out, "state": label_state(self.items[item_id], label)}
 
     def done(self):
         return sum(1 for i in self.order if label_state(self.items[i], self.labels.get(i)) == "done")
@@ -983,15 +1021,16 @@ class Review:
     def paper_passages(self, paper):
         if paper not in self.passages:
             return None
-        return [{k: p[k] for k in ("ordinal", "page", "kind", "section_path", "text")} for p in self.passages[paper].values()]
+        return [{**{k: p[k] for k in ("ordinal", "page", "kind", "section_path", "text")}, "key": passage_key(p["text"])}
+                for p in self.passages[paper].values()]
 
     def locator(self, choice):
         """The locator of a passage the rater chose: a usable passage of a listed paper, from the worksheet."""
-        if not (isinstance(choice, dict) and set(choice) == {"paper", "ordinal"}):
+        if not (isinstance(choice, dict) and set(choice) == {"paper", "ordinal", "key"}):
             raise ValueError("evidence_invalid")
         found = self.passages.get(choice["paper"], {}).get(choice["ordinal"])
-        if found is None or isinstance(choice["ordinal"], bool):
-            raise ValueError("evidence_invalid")
+        if found is None or isinstance(choice["ordinal"], bool) or choice["key"] != passage_key(found["text"]):
+            raise ValueError("evidence_invalid")  # not that paper's passage as the page was shown it
         loc = {"paper": choice["paper"], "ordinal": found["ordinal"], "page": found["page"], "kind": found["kind"],
                "section_path": found["section_path"], "quote": found["text"]}
         if self.field == 2:
@@ -1033,6 +1072,9 @@ class Review:
                     and all(isinstance(ev, list) and 0 < len(ev) <= 10 for ev in chosen)):
                 raise ValueError("evidence_invalid")
             label["evidence"] = [[self.locator(c) for c in ev] for ev in chosen]
+        if label.get("answerable") is False:  # an unanswerable question keeps no answer and no evidence
+            label.pop("short_answer", None)
+            label.pop("evidence", None)
         made = labeled(item, label)
         if made is not None and (problems := check_question(made, self.field, self.papers)):
             raise ValueError("text_language" if any("marked" in p for p in problems) else
@@ -1042,19 +1084,32 @@ class Review:
     def save(self, body):
         """(status, answer) for a save: written to the labels file (whole, owner-only) before it is
         answered as saved; refused when it carries an older revision of the item's label than the file's."""
-        if not (isinstance(body, dict) and set(body) == {"item", "base", "label"} and body["item"] in self.order
-                and isinstance(body["base"], int) and not isinstance(body["base"], bool)):
+        if not (isinstance(body, dict) and set(body) - {"revert"} == {"item", "base", "label"}
+                and body["item"] in self.order and isinstance(body["base"], int) and not isinstance(body["base"], bool)
+                and isinstance(body.get("revert", False), bool)):
             return 400, {"code": "label_invalid"}
         item = self.items[body["item"]]
-        try:
-            label = self.label_of(item, body["label"])
-        except ValueError as error:
-            return 400, {"code": str(error)}
         with self.file_lock():
             self.labels = self.read_labels()
             current = self.labels.get(item["id"])
             if body["base"] != (current["revision"] if current else 0):
                 return 409, {"code": "changed_elsewhere", "label": self.shown_label(item["id"])}
+            given = body["label"]
+            edited = (current is not None and label_state(item, current) == "done" and current.get("decision") == "edit")
+            if edited and isinstance(given, dict) and given.get("decision") == "keep" and not body.get("revert"):
+                # Keep after an edit keeps the edit (the page shows it); going back to the draft is its own action
+                return 400, {"code": "keep_would_revert"}
+            if edited and isinstance(given, dict) and given.get("decision") == "edit":
+                # An edit builds on the saved one: what it does not name stays as saved, never silently dropped
+                given = {**{k: current[k] for k in EDITS if k in current and k != "evidence"},
+                         **({"evidence": [[{"paper": loc["paper"], "ordinal": loc["ordinal"],
+                                            "key": passage_key(loc["quote"])} for loc in ev]
+                                          for ev in current["evidence"]]} if "evidence" in current else {}),
+                         **given}
+            try:
+                label = self.label_of(item, given)
+            except ValueError as error:
+                return 400, {"code": str(error)}
             entry = {**label, "item_sha256": item_sha256(item), "revision": body["base"] + 1,
                      "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
             labels = {**self.labels, item["id"]: entry}
@@ -1210,7 +1265,8 @@ def main(argv=None):
             with contextlib.suppress(KeyboardInterrupt):
                 server.serve_forever()
         else:
-            _, _, sets = load_field(args.field, folder)
+            papers_doc, _, sets = load_field(args.field, folder)
+            papers = {p["id"]: p for p in papers_doc["papers"]}
             if args.set not in sets:
                 raise Refused(f"{args.set}.json is not drafted yet")
             set_doc = sets[args.set]
@@ -1227,14 +1283,14 @@ def main(argv=None):
                 def labels_of(rater):
                     path = folder / "labels" / f"{set_doc['id']}.{rater}.json"
                     labels = read_json(path)
-                    if problems := check_labels(labels, set_doc, rater):
+                    if problems := check_labels(labels, set_doc, papers, rater):
                         raise Refused(f"{path.name}: " + "; ".join(problems[:5]))
                     return labels
                 if args.command == "agreement":
                     print(json.dumps(agreement(set_doc, *map(labels_of, args.raters)), ensure_ascii=False, indent=1))
                 else:
                     out = outputs(folder) / f"{set_doc['id']}.corrected.{args.rater}.json"
-                    corrected = apply(set_doc, labels_of(args.rater))
+                    corrected = apply(set_doc, labels_of(args.rater), papers)
                     write_json(out, corrected)
                     print(f"{out}: {corrected['counts']}")
     except (Refused, OSError, ValueError) as refused:
