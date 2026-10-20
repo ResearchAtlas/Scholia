@@ -315,6 +315,10 @@ UNSENT_WORKFLOWS = ("extract", "full_backup", "project_export", "index")
 # its question is asked again under the project's new policy.
 UNSENT_WORKFLOWS += ("merge",)
 
+# S1-15: importing from Zotero's local API sends nothing off this Mac (the gate allows Zotero at every
+# level and in a review-locked project); the lookup it records is revoked like any other.
+UNSENT_WORKFLOWS += ("zotero_import",)
+
 
 def revoke_running(conn, project_id):
     """Revoke every running run of the project that may send something, in the caller's transaction

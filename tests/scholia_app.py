@@ -9,6 +9,7 @@ request ever leaves the process. Keys live in `FakeKeyring`, never the Keychain.
 import asyncio
 import contextlib
 import json
+import pathlib
 
 import httpx
 
@@ -44,8 +45,9 @@ class MockProvider:
     zero-retention endpoints those in `zero_retention`: an id (one endpoint tagged "example"
     with a 128K window) or a listing row of its own; both are empty by default."""
 
-    def __init__(self, *replies, cost=0.002, catalog=(), zero_retention=(), scholarly=None):
+    def __init__(self, *replies, cost=0.002, catalog=(), zero_retention=(), scholarly=None, zotero=None):
         self.scholarly = scholarly if scholarly is not None else MockScholarly()  # OpenAlex, Crossref and arXiv
+        self.zotero = zotero if zotero is not None else MockZotero(state="not_running")  # S1-15
         self.catalog = list(catalog)
         self.zero_retention = list(zero_retention)
         self.replies = list(replies)
@@ -64,6 +66,8 @@ class MockProvider:
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         if request.url.host in MockScholarly.HOSTS:
             return streamed(await self.scholarly(request))
+        if (request.url.host, request.url.port) == MockZotero.ORIGIN:  # S1-15
+            return streamed(await self.zotero(request))
         body = json.loads(request.content) if request.content else None
         self.requests.append((request.method, request.url.path, body))
         self.headers.append(request.headers)
@@ -165,6 +169,106 @@ class MockScholarly:
     @property
     def hosts(self):
         return [host for host, _, _ in self.requests]
+
+
+class MockZotero:
+    """A test-owned stand-in for Zotero's local API (S1-15), behind the gate's mock transport, holding
+    made-up items only, never a real library. state: ready, api_off (403), old (404: Zotero before 7),
+    not_running (no connection). Each request is kept in `requests` as (method, raw path and query,
+    headers). `answers` holds answers given first, before any route: a status, a callable of the
+    request (async or not) giving a response, or None (that request answered as usual). `hold`, when
+    set to an asyncio.Event, keeps requests waiting until it is set, after `started` is set. Files are named by `files` (the attachment's file
+    URL text, or a status), as Zotero's file/view/url answers."""
+
+    ORIGIN = ("127.0.0.1", 23119)
+
+    def __init__(self, state="ready", server_id=None, groups=()):
+        self.state, self.server_id, self.groups = state, server_id, list(groups)
+        self.collections, self.items, self.files = {}, {}, {}  # by library; by (library, key); by (library, key)
+        self.requests, self.answers, self.hold, self.started, self.held = [], [], None, asyncio.Event(), None
+
+    def item(self, key, title, *, library="users/0", doi=None, collections=(), pdf=None, linked=False,
+             item_type="journalArticle", year=2024, extra=None):
+        """Add an item; pdf, a path, becomes its PDF attachment (key: the item's with its last letter Z)."""
+        csl = {"id": f"http://zotero.org/users/local/test/items/{key}", "type": "article-journal", "title": title,
+               "author": [{"family": "Example", "given": "Ana"}], "issued": {"date-parts": [[year]]},
+               **({"DOI": doi} if doi is not None else {}), **(extra or {})}
+        children = []
+        if pdf is not None:
+            attachment = key[:7] + "Z"
+            children.append({"key": attachment, "data": {"key": attachment, "itemType": "attachment",
+                                                         "contentType": "application/pdf", "parentItem": key,
+                                                         "linkMode": "linked_file" if linked else "imported_file",
+                                                         "dateAdded": "2024-01-01T00:00:00Z"}})
+            self.files[library, attachment] = pdf if isinstance(pdf, (int, str)) else pathlib.Path(pdf).as_uri()
+        self.items[library, key] = {"key": key, "data": {"key": key, "itemType": item_type, "title": title,
+                                                         "collections": list(collections)},
+                                    "meta": {"creatorSummary": "Example", "parsedDate": f"{year}-01-01"},
+                                    "csljson": csl, "children": children}
+        return self.items[library, key]
+
+    def _answer(self, status, body=None, total=None):
+        headers = {"Zotero-API-Version": "3", **({"Zotero-Server-ID": self.server_id} if self.server_id else {}),
+                   **({"Total-Results": str(total)} if total is not None else {})}
+        if isinstance(body, str):
+            return httpx.Response(status, text=body, headers=headers)
+        return httpx.Response(status, json=body, headers=headers) if body is not None else \
+            httpx.Response(status, text="Not found" if status == 404 else "", headers=headers)
+
+    async def __call__(self, request):
+        self.requests.append((request.method, request.url.raw_path.decode(), dict(request.headers)))
+        if self.hold is not None and (self.held is None or self.held in request.url.raw_path.decode()):
+            self.started.set()
+            await self.hold.wait()
+        if self.state == "not_running":
+            raise httpx.ConnectError("connection refused", request=request)
+        answer = self.answers.pop(0) if self.answers else None  # None: answered as Zotero would
+        if isinstance(answer, int):
+            return self._answer(answer)
+        if answer is not None:
+            answer = answer(request)
+            return await answer if asyncio.iscoroutine(answer) else answer
+        if self.state == "api_off":
+            return httpx.Response(403, text="Local API is not enabled")
+        if self.state == "old":
+            return httpx.Response(404, text="No endpoint found")
+        sent = request.headers.get("zotero-server-id")
+        if sent is not None and sent != self.server_id:
+            return self._answer(412, "Zotero-Server-ID does not match this server")
+        path, params = request.url.path, request.url.params
+        if path == "/api/users/0/groups":
+            return self._answer(200, [{"id": number, "data": {"id": number, "name": name}} for number, name in self.groups])
+        parts = path.removeprefix("/api/").split("/")
+        library, rest = "/".join(parts[:2]), parts[2:]
+        start, limit = int(params.get("start", 0)), int(params.get("limit", 1000))
+        if rest == ["collections"]:
+            found = self.collections.get(library, [])
+            return self._answer(200, [{"key": c["key"], "data": {"key": c["key"], "name": c["name"],
+                                                                 "parentCollection": c.get("parent") or False}}
+                                      for c in found[start:start + limit]], len(found))
+        if rest[-2:] == ["items", "top"]:
+            collection = rest[1] if rest[0] == "collections" else None
+            found = [i for (lib, _), i in self.items.items() if lib == library
+                     and (collection is None or collection in i["data"]["collections"])]
+            return self._answer(200, [{k: i[k] for k in ("key", "data", "meta")} for i in found[start:start + limit]],
+                                len(found))
+        if len(rest) >= 2 and rest[0] == "items":
+            item = self.items.get((library, rest[1]))
+            if rest[2:] == ["file", "view", "url"]:
+                named = self.files.get((library, rest[1]))
+                return self._answer(named) if isinstance(named, int) else \
+                    self._answer(200, named) if named is not None else self._answer(404)
+            if item is None:
+                return self._answer(404)
+            if rest[2:] == ["children"]:
+                return self._answer(200, item["children"])
+            if rest[2:] == []:
+                return self._answer(200, {"key": item["key"], "data": item["data"], "csljson": item["csljson"]})
+        return self._answer(404)
+
+    @property
+    def paths(self):
+        return [path for _, path, _ in self.requests]
 
 
 def openalex_work(doi, title, *, authors=("A. Researcher",), year=2024, venue="Journal of Synthetic Studies",

@@ -135,6 +135,7 @@ class Kind(StrEnum):
     LOCAL_HELPER = "local_helper"
     LOCAL_PROVIDER = "local_provider"
     MODEL_DOWNLOAD = "model_download"
+    ZOTERO = "zotero_local_api"  # S1-15: see the Zotero block below
 
 
 OPENROUTER = ("https", "openrouter.ai", 443)
@@ -240,6 +241,7 @@ class _Scope:
     approved: bool
     admit: Callable | None = field(default=None, compare=False, repr=False)  # see OutboundGate.client
     provider: str | None = None  # see OutboundGate.client
+    zotero: bool = False  # S1-15: a client for Zotero's local API only (see the Zotero block)
     # Redirect hops this client may still take: one-time token -> (origin, path and query as sent).
     hops: dict = field(default_factory=dict, compare=False, repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
@@ -395,7 +397,8 @@ class OutboundGate:
                     loop.call_soon_threadsafe(self._end, project_id)
 
     def client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
-               admit: Callable | None = None, provider: str | None = None, **options) -> httpx.Client:
+               admit: Callable | None = None, provider: str | None = None, zotero: bool = False,
+               **options) -> httpx.Client:
         """A client for one project's requests.
 
         candidate_id names the candidate whose open-access link this client may
@@ -404,20 +407,23 @@ class OutboundGate:
         given, is called in the decision transaction of every request the policy
         allows; anything but True refuses it as "revoked". provider names the configured
         provider a model call goes through: a Private request to OpenRouter is checked against
-        that provider's catalog and its own confirmation of the key (none without it). options are
+        that provider's catalog and its own confirmation of the key (none without it). zotero makes a
+        client for Zotero's local API, which reaches nothing else (S1-15, the Zotero block). options are
         limited to base_url, follow_redirects, headers, max_redirects and timeout.
         Proxy and certificate settings in the environment are ignored: TLS uses
         certifi's CA bundle.
         """
-        transport = _Transport(self, _Scope(_project_id(project_id), candidate_id, approved, admit, provider=provider),
+        transport = _Transport(self, _Scope(_project_id(project_id), candidate_id, approved, admit, provider=provider,
+                                            zotero=zotero),
                                self._transport or httpx.HTTPTransport(trust_env=False))
         return httpx.Client(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
     def async_client(self, project_id: str, *, candidate_id: str | None = None, approved: bool = False,
-                     admit: Callable | None = None, provider: str | None = None, **options) -> httpx.AsyncClient:
+                     admit: Callable | None = None, provider: str | None = None, zotero: bool = False,
+                     **options) -> httpx.AsyncClient:
         """The async form of client()."""
         transport = _AsyncTransport(self, _Scope(_project_id(project_id), candidate_id, approved, admit,
-                                                 provider=provider),
+                                                 provider=provider, zotero=zotero),
                                     self._transport or httpx.AsyncHTTPTransport(trust_env=False))
         return httpx.AsyncClient(transport=transport, trust_env=False, cookies=_no_cookies(), **_checked(options))
 
@@ -462,7 +468,8 @@ class OutboundGate:
         # (not for the helper, the app's own child).
         owned = None
         if self._local_listener is not None and target is not None and target[0] == "http" \
-                and _is_this_host(target[1]) and target in providers and target not in helpers:
+                and _is_this_host(target[1]) and (target in providers or (scope.zotero and target == ZOTERO)) \
+                and target not in helpers:
             try:
                 owned = bool(self._local_listener(target[1], target[2]))
             except Exception:  # unknown counts as not ours
@@ -481,7 +488,7 @@ class OutboundGate:
             elif error is not None:
                 reason = "gate_inputs_unavailable"
             else:
-                kind = _classify(target, providers, helpers, link, hop)
+                kind = _classify(target, providers, helpers, link, hop, scope.zotero)
                 # An open-access fetch is bound to the candidate's exact link, as sent;
                 # other URLs on its origin only as redirects followed from it.
                 bound = hop or (link is not None and target == _origin(link) and request.url.raw_path == link.raw_path)
@@ -492,10 +499,11 @@ class OutboundGate:
                     except Exception as caught:  # recorded as a refusal, and chained to it
                         error, kind, problem = caught, None, "gate_inputs_unavailable"
                 reason = "gate_inputs_unavailable" if error is not None else \
+                    _zotero_policy(request, public_problem) if kind is Kind.ZOTERO and level is not None else \
                     _policy(conn, level, kind, target, scope, problem, public_problem, bound)
                 if reason is None and not addressed:
                     reason = "host_mismatch"
-                if reason is None and kind is Kind.LOCAL_PROVIDER and owned is False:
+                if reason is None and kind in (Kind.LOCAL_PROVIDER, Kind.ZOTERO) and owned is False:
                     reason = "local_server_not_yours"
                 if reason is None and scope.admit is not None:
                     try:
@@ -797,9 +805,11 @@ def _shown(conn, target, kind, link, providers, helpers):
     return "unknown"
 
 
-def _classify(target, providers, helpers, link, hop):
+def _classify(target, providers, helpers, link, hop, zotero=False):
     if target is None:
         return None
+    if zotero or target == ZOTERO:  # S1-15: a Zotero client reaches Zotero only, and only a Zotero client does
+        return Kind.ZOTERO if zotero and target == ZOTERO else None
     if _is_this_host(target[1]):
         # Loopback is only transport: just the helpers and configured providers
         # count, at their exact origins, never a candidate's link.
@@ -1016,3 +1026,38 @@ def _record(conn, request, scope, level, kind, destination, reason):
             "approved": scope.approved is True,
         })),
     )
+
+# S1-15: Zotero's local API (slice-1 spec F3c and section 10; ticket 71; ticket 19's Zotero client).
+# A destination kind of its own, reached only by a client made for it (zotero=True), which reaches
+# nothing else: Zotero's default origin exactly (ponytail: one fixed origin, no port setting; a
+# setting if researchers move Zotero's port), at every level and in a review-locked project, since
+# nothing leaves this Mac. Read only, enforced here: a GET with no body and no credential, whose path
+# and query as sent are, whole, one of the calls Scholia's Zotero browser and import make
+# (_ZOTERO_CALLS); never local/authorize, an upload, a file's bytes (/file and /file/view redirect to
+# the file on disk) or any write. Zotero's plain-HTTP port gets a request only while a process of this
+# account listens there (listener_is_ours, as for local providers). A redirect from it is never
+# followed: one to another origin, file:// included, is refused and audited (cross_origin_redirect),
+# and backend/zotero.py makes its clients without following any. A file URL Zotero names is never
+# fetched: backend/zotero.py reads that local file itself, under its own rules.
+ZOTERO = ("http", "127.0.0.1", 23119)
+_LIBRARY = rb"(?:users/0|groups/[1-9][0-9]{0,9})"
+_KEY = rb"[A-Z0-9]{8}"
+_PAGE = rb"&start=[0-9]{1,6}"
+_ZOTERO_CALLS = re.compile(rb"/api/(?:" + rb"|".join((
+    rb"users/0/groups\?format=json",  # status and libraries
+    _LIBRARY + rb"/collections\?format=json&limit=100" + _PAGE,
+    _LIBRARY + rb"/(?:collections/" + _KEY + rb"/)?items/top\?format=json&limit=50" + _PAGE,
+    _LIBRARY + rb"/items/" + _KEY + rb"\?format=json&include=data,csljson",  # an item and its CSL JSON
+    _LIBRARY + rb"/items/" + _KEY + rb"/children\?format=json",
+    _LIBRARY + rb"/items/" + _KEY + rb"/file/view/url",  # the attachment's file URL, as text
+)) + rb")")
+
+
+def _zotero_policy(request, public_problem):
+    """None to allow a request to Zotero's local API, or why not: a fetch with no body or credential
+    (public_problem) that is a GET of one allowlisted call, at every level."""
+    if public_problem:
+        return public_problem
+    if request.method != "GET" or not _ZOTERO_CALLS.fullmatch(request.url.raw_path):
+        return "zotero_call_not_allowed"
+    return None

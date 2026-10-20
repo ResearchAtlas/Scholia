@@ -5,19 +5,27 @@ import { get, post } from './api.js';
 const POLL_MS = 700;
 
 // The run's row in the background-run list once it has ended; onProgress(row) is called with each
-// row read while it runs. A failed read is tried again at the next turn.
-export async function followRun(runId, onProgress = () => {}, wait = (ms) => new Promise((r) => setTimeout(r, ms))) {
-  for (;;) {
-    let row = null;
+// row read while it runs. A failed read is tried again at the next turn. A run the list no longer has
+// (its project deleted since, which deletes its runs) has ended: it reads as stopped because its
+// project changed. alive() false (what follows it went away) stops following: null.
+export const GONE = { status: 'cancelled', cancel_reason: 'revoked', result: null };
+
+export async function followRun(runId, onProgress = () => {}, wait = (ms) => new Promise((r) => setTimeout(r, ms)),
+  alive = () => true) {
+  while (alive()) {
+    let read = null;
     try {
-      [row] = (await get(`/api/activity?run_id=${encodeURIComponent(runId)}`)).runs;
+      read = (await get(`/api/activity?run_id=${encodeURIComponent(runId)}`)).runs;
     } catch {
-      row = null;
+      read = null;
     }
+    const row = read?.[0];
+    if (read && !row) return { ...GONE, run_id: runId };
     if (row && row.status !== 'running') return row;
     if (row) onProgress(row);
     await wait(POLL_MS);
   }
+  return null;
 }
 
 export const cancelRun = (runId) => post(`/api/runs/${encodeURIComponent(runId)}/cancel`);
