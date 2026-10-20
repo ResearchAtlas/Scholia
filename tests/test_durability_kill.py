@@ -67,7 +67,7 @@ def listing(request):  # the model catalog and endpoint listing a turn's admissi
     elif path.endswith("/endpoints/zdr"):
         body = {"data": []}
     elif path.endswith("/endpoints"):
-        body = {"data": {"endpoints": [{"tag": "example", "context_length": 128000,
+        body = {"data": {"endpoints": [{"tag": "example", "context_length": 128000, "supported_parameters": ["max_tokens"],
                                         "pricing": {"prompt": "0.000001", "completion": "0.000005"}}]}}
     else:
         return None

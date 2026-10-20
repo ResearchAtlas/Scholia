@@ -311,7 +311,8 @@ def check_backend() -> dict:
     listings = {  # what a turn's admission reads first: the catalog and the model's endpoints
         "/models": {"data": [{"id": "google/gemini-3.1-pro-preview", "context_length": 131072, "pricing": prices}]},
         "/endpoints/zdr": {"data": []},
-        "/endpoints": {"data": {"endpoints": [{"tag": "self-test", "context_length": 131072, "pricing": prices}]}},
+        "/endpoints": {"data": {"endpoints": [{"tag": "self-test", "context_length": 131072, "pricing": prices,
+                                               "supported_parameters": ["max_tokens"]}]}},
     }
 
     async def provider(request):
