@@ -13,8 +13,8 @@ for the walkthrough to add. Materials are read as the app reads them, each in a 
 scanned pages are read by this Mac's own OCR engine (Vision), whose first recognition of a page with
 dark ink fails once, so the walkthrough shows a failed reading and its retry (S1-20); and two
 synthetic files are stopped at the reading's ceilings, one taking memory without end and one
-silent past the time ceiling (lowered here to STEP_SECONDS), as crafted files would be. The local
-model helper's search model is a synthetic file with a pin
+silent past the time ceiling (lowered here to STEP_SECONDS, printed as "step ceiling"), as crafted
+files would be. The local model helper's search model is a synthetic file with a pin
 of its own, served by a test-owned download source (each source redirecting to the file host
 it uses, the file sent slowly so a download can be watched and cancelled), and written to an
 "offline" folder for the import flow, whose path is printed. The helper binary is a test-owned
@@ -318,7 +318,9 @@ def main(argv=None):
     child = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), "walkthrough",
              tempfile.mkdtemp(prefix="scholia-walkthrough-reading-")]
     reading.command = lambda: child
-    reading.STEP_SECONDS = 5.0  # the silent file is stopped in seconds; the app's ceiling is longer
+    # The silent file is stopped in 20 s rather than the app's 60; a healthy reading's child on a loaded Mac
+    # (two test suites running) has gone 5 s without a word, so the ceiling stays well above that.
+    reading.STEP_SECONDS = 20.0
     provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]],  # half have zero retention
                                  scholarly=RECORDS)
     provider.replies = [synthetic] * 1000
@@ -355,6 +357,7 @@ def main(argv=None):
     print(f"zotero state: {zotero_control}", flush=True)
     print(f"model file: {offline}", flush=True)
     print(f"helper control: {provider.control}", flush=True)
+    print(f"step ceiling: {reading.STEP_SECONDS:g}", flush=True)
     print(f"open: {origin}/" + ("" if args.dev else f"#session={session}"), flush=True)
     server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", log_level="warning"))
     with network_guard.allow_command(*child):  # the reading child alone, by its whole command

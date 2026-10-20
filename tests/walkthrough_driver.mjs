@@ -147,6 +147,7 @@ async function startServer(dir) {
   return { child, pid, origin: url.origin, session: url.hash.replace('#session=', ''), dataFolder: lines['data folder'],
            materials: lines.materials, modelFile: lines['model file'], helperControl: lines['helper control'], log,
            zoteroState: lines['zotero state'],  // S1-15
+           stepCeiling: Number(lines['step ceiling']),  // the harness's time ceiling, in seconds
            stderr: () => stderr, exit: () => exit };
 }
 
@@ -1447,6 +1448,10 @@ async function ceilings(ctx) {
       [runs[reason]] = (await get(`/api/activity?run_id=${paper.reading.run_id}`)).body.runs;
       check('its reading failed with that reason, and Retry applies', runs[reason]?.status === 'failed'
         && runs[reason].result?.reason === reason && runs[reason].retryable === true);
+      if (reason === 'step_limit' && C.stepCeiling) {  // stopped by the ceiling: its reading lasted at least that long
+        check(`its reading ran the time ceiling's ${C.stepCeiling} s`, Date.parse(runs[reason].finished_at)
+          - Date.parse(runs[reason].started_at) >= C.stepCeiling * 1000);
+      }
       await row(title).locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
     });
   }
@@ -2266,6 +2271,7 @@ async function run(combo, build, outRoot) {
                 dataFolder: server?.dataFolder, modelFile: server?.modelFile, requestLog: server?.log,
                 helperControl: server?.helperControl,
                 zoteroState: server?.zoteroState,  // S1-15
+                stepCeiling: server?.stepCeiling,
                 question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
     const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
     const step = async (name, body, before) => {
