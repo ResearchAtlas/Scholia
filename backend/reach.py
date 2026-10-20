@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 from backend import endpoint_pricing
 from backend.budget_router import UNKNOWN_RATES
+from backend.openrouter_client import COMPRESSION_WINDOW
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,10 @@ def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -
         found = [e for e in found if e["tag"] in usable]
         if {e["tag"] for e in found} != usable:  # an endpoint it may reach is not described
             return Reach((), None, UNKNOWN_RATES, "route_unverified")
+        # Section 6.4: a Private request reaches no endpoint whose window is 8,192 tokens or less,
+        # where OpenRouter compresses by default, by the endpoint listing's own report too.
+        if any(not e["context_length"] or e["context_length"] <= COMPRESSION_WINDOW for e in found):
+            return Reach((), None, UNKNOWN_RATES, "route_unsupported")
     if pin is not None:
         found = [e for e in found if _related(e["tag"], pin)]
         if [e["tag"] for e in found] != [pin]:  # a base slug names several endpoints, or none

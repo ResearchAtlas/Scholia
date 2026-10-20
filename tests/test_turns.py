@@ -1057,3 +1057,24 @@ async def test_an_openrouter_model_with_no_published_price_is_refused_before_any
                                     json={"content": "hi", "model": "x/unpriced"})
         assert (refused.status_code, refused.json()["code"]) == (400, "route_unpriced")
         assert provider.chats == [] and (await counts(client))["runs"] == 0
+
+
+async def test_an_endpoint_that_does_not_take_the_output_limit_is_not_used(tmp_path):
+    # External review a2 and charter section 10 rule 2: the output limit is a parameter every request
+    # relies on, so it is required of the endpoint (provider.require_parameters) and a model whose
+    # endpoints do not list it is refused before anything is written.
+    from backend import budget_router
+    model = budget_router.MODEL_TIERS["mid"][0]
+    provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 128000,
+                                                "supported_parameters": ["temperature"]}]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
+        assert provider.chats == [] and (await counts(client))["runs"] == 0
+        provider.endpoints[model][0]["supported_parameters"] = ["max_tokens", "temperature"]
+        from backend import openrouter_client
+        openrouter_client.clear_cache()
+        assert (await send(client, conversation))[-1]["status"] == "succeeded"
+        [body] = provider.answers
+        assert body["max_tokens"] == 8000 and body["provider"] == {"require_parameters": True}

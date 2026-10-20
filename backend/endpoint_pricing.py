@@ -37,10 +37,12 @@ _TOKEN_PRICE_KEYS = frozenset({"prompt", "completion", "internal_reasoning"})
 # tripping the fail-closed guard (or, worse, being dropped from a ceiling).
 _CACHE_KEY_PREFIXES = ("input_cache_write", "input_cache_read")
 _PER_REQUEST_PRICE_KEYS = frozenset({"request", "web_search"})
-# Cannot apply: the probe sends one short text message and attaches no plugin, so no
-# image/audio/video units are ever billed (see reasoning_probe._post).
+# Cannot apply: every request Scholia sends holds text only (its messages are strings the context
+# assembler builds) and attaches no plugin, so no image, audio or video input is ever billed. An
+# image_output rate could apply to a model that answers with images, so it is not in this list: a
+# non-zero one is unaccounted and refuses the estimate (Scholia, S1-19a).
 _INAPPLICABLE_PRICE_KEYS = frozenset({
-    "image", "image_output", "audio", "input_audio_cache", "video",
+    "image", "audio", "input_audio_cache", "video",
 })
 # Not a charge: `discount` reduces cost. `overrides` holds other rates, such as long-context ones
 # (Scholia; the M2 charter's model-route rule 6): see _override_rates.
@@ -167,7 +169,7 @@ def price_endpoint(url, endpoint):
         found += [rate for key, values in overrides.items() if key in keys for rate in values]
         return max(found or [0.0])
 
-    cache_writes = {key for key in [*pricing, *overrides] if key.startswith("input_cache_write")}
+    caching = {key for key in [*pricing, *overrides] if key.startswith(_CACHE_KEY_PREFIXES)}  # reads and writes
 
     return {
         "source": url,
@@ -193,8 +195,9 @@ def price_endpoint(url, endpoint):
         # Flat charges that land once per call regardless of token counts.
         "per_request_usd": highest({"request"}) + highest({"web_search"}),
         # The most a prompt token or an output token can cost here (Scholia): the prompt at its own
-        # rate, a cache write's or a long-context override's; output at the completion or reasoning rate.
-        "max_input_per_token": highest({"prompt"} | cache_writes),
+        # rate, a cache write's or read's, or a long-context override's; output at the completion or
+        # reasoning rate. Every other accepted key is a per-request charge, inapplicable or a discount.
+        "max_input_per_token": highest({"prompt"} | caching),
         "max_output_per_token": highest({"completion", "internal_reasoning"}),
         # Non-zero published rates this module cannot map to a probe call. Non-empty
         # means NO sound bound can be computed -- callers must refuse, not guess.

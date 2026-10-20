@@ -63,7 +63,7 @@ async def test_every_private_request_to_openrouter_carries_zdr_and_no_plugins_or
         await background_idle(client)  # the title run goes the same way
         assert len(provider.chats) == 2
         for body, headers in zip(provider.chats, provider.chat_headers):
-            assert body["provider"] == {"zdr": True, "only": ["example"]}
+            assert body["provider"] == {"zdr": True, "only": ["example"], "require_parameters": True}
             assert headers.get_list("x-openrouter-cache") == ["false"]  # response caching off
             assert not {"plugins", "tools", "reasoning", "web_search_options"} & body.keys()
         decisions = await rows(client, "SELECT data ->> 'decision', data ->> 'sensitivity' FROM audit_log"
@@ -84,7 +84,7 @@ async def test_a_private_request_reaches_no_endpoint_where_openrouter_compresses
         assert {m["id"]: (m["allowed"], m["refusal"]) for m in listing["models"]} == {
             ZDR_MODEL: (True, None), SMALL_MODEL: (False, "private_route_not_allowed")}
         assert (await send(client, conversation, model=ZDR_MODEL))[-1]["status"] == "succeeded"
-        assert provider.answers[0]["provider"] == {"zdr": True, "only": ["large"], "ignore": ["small"]}
+        assert provider.answers[0]["provider"] == {"zdr": True, "only": ["large"], "ignore": ["small"], "require_parameters": True}
         refused = await client.post(f"/api/conversations/{conversation}/message/stream",
                                     json={"content": "SECRET-INTERVIEW", "model": SMALL_MODEL})
         assert (refused.status_code, refused.json()["code"]) == (403, "private_route_not_allowed")
@@ -431,3 +431,15 @@ async def test_a_private_request_that_requires_its_parameters_still_passes_the_g
         assert body["provider"] == {"zdr": True, "only": ["example"], "require_parameters": True}
         assert body["reasoning"] == {"effort": "high"}
         await background_idle(client)
+
+
+async def test_a_private_turn_is_refused_when_the_endpoint_listing_reports_a_compressing_window(tmp_path):
+    # External review a2: the zero-retention listing reports 128K, the model's endpoint listing 8,192.
+    provider = provider_for_private()
+    provider.endpoints[ZDR_MODEL] = [{"tag": "example", "context_length": 8192}]
+    async with started(tmp_path / "data", provider) as client:
+        _, conversation = await private_conversation(client)
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "SECRET-INTERVIEW", "model": ZDR_MODEL})
+        assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
+        assert provider.chats == []

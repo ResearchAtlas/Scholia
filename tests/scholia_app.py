@@ -49,7 +49,7 @@ class MockProvider:
     row of its own; none by default. Any other provider's listing holds the ids in `local`. A
     model's endpoint listing (/models/{id}/endpoints) is
     `endpoints[id]` when set, else its zero-retention rows, else one endpoint tagged "example"
-    with a 128K window; a row that names no pricing publishes PRICING, as every listed model does."""
+    with a 128K window; a row that names no pricing or parameters publishes PRICING and takes PARAMETERS."""
 
     def __init__(self, *replies, cost=0.002, catalog=None, zero_retention=(), scholarly=None, endpoints=None):
         self.scholarly = scholarly if scholarly is not None else MockScholarly()  # OpenAlex, Crossref and arXiv
@@ -106,7 +106,8 @@ class MockProvider:
         rows = self.endpoints.get(model) or [
             row for row in self.zero_retention if isinstance(row, dict) and row.get("model_id") == model]
         rows = rows or [{"tag": "example", "context_length": 128000, "supported_parameters": PARAMETERS}]
-        return [{"pricing": PRICING, **row} for row in rows]  # a row that names its pricing keeps it
+        # A row that names its pricing or parameters keeps them.
+        return [{"pricing": PRICING, "supported_parameters": PARAMETERS, **row} for row in rows]
 
     @property
     def chat_headers(self):

@@ -131,7 +131,8 @@ def structure_problems(sources):
 
 
 def _sources():
-    return {path.name: path.read_text() for path in MODULES if path.parent.name == "backend"}
+    """Every module under backend/, nested packages included, by its path there ("db/database.py")."""
+    return {str(path.relative_to(ROOT / "backend")): path.read_text() for path in MODULES}
 
 
 def test_the_dispatch_path_keeps_its_structure():
@@ -155,6 +156,16 @@ def test_the_structure_check_finds_the_reviewers_two_bypasses():
     problems = structure_problems(sources)
     assert any("outside a gate's admit callback" in p for p in problems) and any("_call does not send" in p
                                                                                  for p in problems)
+    # A role helper in a nested package that posts to the model endpoint itself (external review a2).
+    planted = {**_sources(), "roles/judge.py": (
+        "async def judge(gate, project, provider, body):\n"
+        "    async with gate.async_client(project) as client:\n"
+        '        return await client.post(provider.base_url + "/chat/completions", json=body)\n')}
+    assert any(problem.startswith("roles/judge.py") for problem in structure_problems(planted))
+
+
+def test_every_backend_module_is_checked():
+    assert "db/database.py" in _sources() and len(_sources()) == len(MODULES)
 
 
 def test_only_the_dispatch_path_calls_the_provider_adapter():

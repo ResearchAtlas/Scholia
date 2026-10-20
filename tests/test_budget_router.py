@@ -174,3 +174,46 @@ def test_a_flag_where_a_rate_should_be_refuses():
         endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [],
                     "pricing": {"prompt": flag, "completion": flag}}
         assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced", flag
+
+
+@pytest.mark.parametrize("pricing", [
+    {"prompt": "0", "completion": "0", "input_cache_read": "0.01"},
+    {"prompt": "0", "completion": "0", "overrides": [{"min_prompt_tokens": 1000, "input_cache_read": "0.01"}]},
+    {"prompt": "0", "completion": "0", "input_cache_read_5m": "0.01"},
+])
+def test_a_cache_read_rate_counts_toward_the_input_rate(pricing):
+    # External review a2: every input-side charge the reader accepts is in the highest input rate,
+    # at the base level and inside overrides, so no estimate comes out at $0.
+    from backend import reach
+    endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": ["max_tokens"], "pricing": pricing}
+    assert reach.reach(OPENROUTER, {}, [endpoint]).rates["input"] == 0.01
+
+
+def test_every_accepted_price_key_is_counted_or_refuses():
+    # The sweep: a non-zero rate under each key the reader knows either raises the estimate or refuses.
+    from backend import reach
+    base = {"prompt": "0", "completion": "0"}
+    counted = {"prompt": "input", "input_cache_write": "input", "input_cache_write_1h": "input",
+               "input_cache_read": "input", "completion": "output", "internal_reasoning": "output",
+               "request": "request", "web_search": "request"}
+    for key, side in counted.items():
+        endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [], "pricing": {**base, key: "0.5"}}
+        assert reach.reach(OPENROUTER, {}, [endpoint]).rates[side] >= 0.5, key
+    # Inapplicable to text-only requests: image, audio and video input. An image output rate refuses.
+    for key, problem in (("image", None), ("audio", None), ("input_audio_cache", None), ("video", None),
+                         ("image_output", "route_unpriced"), ("something_new", "route_unpriced")):
+        endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [], "pricing": {**base, key: "0.5"}}
+        assert reach.reach(OPENROUTER, {}, [endpoint]).problem == problem, key
+
+
+def test_a_private_request_never_reaches_an_endpoint_the_listing_reports_at_8192_or_less():
+    # External review a2: the zero-retention listing said 131,072; the model's endpoint listing says
+    # 8,192 (or nothing). Section 6.4 holds by the listing's own report as well.
+    from backend import reach
+    row = {"zdr_endpoints": {"usable": ["example"], "small": []}}
+    for window in (8192, 4096, None):
+        listing = [{"tag": "example", "context_length": window, "supported_parameters": ["max_tokens"],
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]
+        assert reach.reach(OPENROUTER, row, listing, zero_retention=True).problem == "route_unsupported", window
+    listing[0]["context_length"] = 8193
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True).problem is None

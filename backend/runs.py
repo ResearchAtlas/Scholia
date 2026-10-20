@@ -887,12 +887,13 @@ class Harness:
             async with self.gate.async_client(await self._general()) as client:
                 listing = await openrouter_client.endpoints(client, route.provider, route.model)
         reasoning, pin = openrouter.resolve_model_reasoning(route, effort, model_entry=row, zdr_enabled=zero_retention)
-        found = reach.reach(route.provider, row, listing, zero_retention=zero_retention, pin=pin,
-                            needs=("reasoning",) if reasoning else ())
+        # The output limit is always relied on, so every endpoint must take max_tokens (rule 2).
+        needs = ("max_tokens", "reasoning") if reasoning else ("max_tokens",)
+        found = reach.reach(route.provider, row, listing, zero_retention=zero_retention, pin=pin, needs=needs)
         if reasoning and found.problem == "route_unsupported":
             # Its reasoning record does not name exactly the endpoints it would reach (rule 1): sent without.
             effort = None
-            found = reach.reach(route.provider, row, listing, zero_retention=zero_retention)
+            found = reach.reach(route.provider, row, listing, zero_retention=zero_retention, needs=("max_tokens",))
         if found.problem == "route_unverified":  # read the listing again next time, not an hour later
             openrouter_client.forget_endpoints(route.provider, route.model)
         if found.problem:

@@ -4,7 +4,7 @@
 # of read from the legacy configuration; every HTTP attempt is reported with its usage;
 # errors are classified completely and returned, never logged with their bodies; and
 # reasoning is sent only for a model whose capability record says how. S1-19: a request
-# that relies on reasoning requires it (provider.require_parameters); a refusal or a
+# requires the output limit and any reasoning it sends (provider.require_parameters); a refusal or a
 # provider's policy block is its own outcome; a reply of tool calls alone is an answer;
 # attempts keep the cache counts the provider reports.
 """The provider adapter: one chat completion against a model route.
@@ -223,9 +223,9 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
     if pin and route.provider.is_openrouter:
         provider["order"] = [pin]
         provider["allow_fallbacks"] = False
-    if reasoning and route.provider.is_openrouter:
-        # A parameter the request relies on: an endpoint that would ignore it is not used, and with
-        # none left the request fails rather than running without it (model-route rule 2).
+    if (reasoning or max_tokens is not None) and route.provider.is_openrouter:
+        # Parameters the request relies on (the output limit, reasoning): an endpoint that would ignore
+        # one is not used, and with none left the request fails rather than run without it (rule 2).
         provider["require_parameters"] = True
     if provider:
         payload["provider"] = provider
