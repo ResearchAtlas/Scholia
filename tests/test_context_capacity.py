@@ -284,11 +284,12 @@ async def test_an_endpoint_that_reports_no_window_needs_a_setting_which_never_ra
     provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 8192}, {"tag": "b"}]})
     async with started(tmp_path / "data", provider) as client:
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
-        refused = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "hi", "model": model})  # chosen: Auto would pass over it
         assert (refused.status_code, refused.json()["code"]) == (400, "model_window")
         current = (await client.get("/api/settings")).json()
         await client.put("/api/settings", json={"hash": current["hash"],
                                                 "updates": {"providers.openrouter.default_window": 131072}})
-        await send(client, conversation, "hi")
+        await send(client, conversation, "hi", model=model)
         [body] = provider.answers
         assert body["max_tokens"] == 2048  # a quarter of 8,192
