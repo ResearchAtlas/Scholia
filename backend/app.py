@@ -36,7 +36,7 @@ from backend import references  # S1-14: reference file import and the merge con
 from backend import local_helper
 from backend import search  # S1-17: the search index, index runs and the search model's offer
 from backend import zotero  # S1-15: Zotero's library, read only
-from backend.db import ContentStore, Database, DatabaseClosedError, delete, new_id, utc_now
+from backend.db import ContentStore, Database, DatabaseCloseError, DatabaseClosedError, delete, new_id, utc_now
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
@@ -354,9 +354,12 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
             if state.get("harness") is not None:
                 await state["harness"].shutdown()
-            if state.get("index") is not None:  # S1-17: its writer stops before the database closes
-                await asyncio.to_thread(state.pop("index").close)
-            await asyncio.to_thread(db.close)
+            # A close that fails is logged by it; the next launch's index open purges what it left
+            if state.get("index") is not None:  # S1-17: closed by its database's close, once no write can commit
+                with contextlib.suppress(DatabaseCloseError):
+                    await asyncio.to_thread(state.pop("index").db.close)
+            with contextlib.suppress(DatabaseCloseError):
+                await asyncio.to_thread(db.close)
             state.clear()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -433,7 +436,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     async def health():
         why = backups.limited(state)
         return {"ok": True, "version": APP_VERSION, "data_folder": str(data_dir),
-                **({"database_damaged": why[1]} if why else {})}
+                **({"database_damaged": why[1], "limited": why[0]} if why else {})}
 
     async def provider_list():
         configured = providers.configured(data_dir, include_off=True)

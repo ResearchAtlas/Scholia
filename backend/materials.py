@@ -1448,17 +1448,20 @@ async def retry_run(run_id: str, request: Request):
     interrupted: a new run from the old one's inputs (see _retry). A Local only lookup asks again.
     A version read again whose lookup concluded unread gets a lookup once the reading commits
     (_serve). Once per run: the old run records its retry in the same transaction, and a later
-    retry of it (a second press) gets that same run. An old run left running in the record, held by
+    retry of it (a second press) gets that same run, started if it is recorded running and no process
+    holds it (its first start lost). An old run left running in the record, held by
     no process (it reads interrupted), is retired (Registry.retire), so no kick holds it from then on,
     and recorded interrupted, so no launch starts it again; one a kick has held again meanwhile is
-    running, and is not tried again. An index run with a rerun pending (its id given out, S1-17) is
-    retired before the Retry holds that id, so its end never records that run meanwhile; one still held
-    is running (refused), its end recording that run."""
+    running, and is not tried again. An index run's retry is a request for its project's run (S1-17),
+    made once the old run is recorded interrupted: the run running, if one does, runs again after it,
+    and its id is the answer; one no process holds (a failed terminal write left it running) is started
+    then, as for any request (search._started)."""
     state = _state(request)
 
     def again(conn, ids):
         row = conn.execute("SELECT json_extract(inputs, '$.retried_by') FROM runs WHERE id = ?", (run_id,)).fetchone()
-        if row is not None and row[0] is not None:
+        if row is not None and row[0] is not None:  # tried again already: that run, started if no process holds it
+            answered.append(row[0])
             return row[0], []
         registry = state["harness"].registry
         retry, refusal = _retry(conn, run_id, registry)
@@ -1469,54 +1472,33 @@ async def retry_run(run_id: str, request: Request):
             if registry.closed:  # or the app is closing: its resume starts the run again
                 raise _refused(503, "shutting_down", "The app is closing")
             raise _refused(409, "not_retryable", "This run is running")
+        if left_running:  # retired: no kick holds it here from now on, and the record says it ended
+            _event(conn, run_id, "run_finished", {"status": "interrupted"})
+            conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
+                         (utc_now(), run_id))
         project_id, workflow, inputs = retry
 
         def insert(conn, project, inputs):
             conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
                          (ids[0], project, workflow, json.dumps(inputs)))
             return ids[0]
-        # An index run's retry is a request for its project's run (S1-17): the one running, if one does, runs
-        # again. The run left pending after it (an interface follows its id) is the one this records (pending).
-        retried = search.request_run(conn, registry, project_id, insert, bool(inputs.get("rebuild")),
-                                     run_id=ids[0] if pending else None) if workflow == "index" \
+        retried = search.request_run(conn, project_id, insert, bool(inputs.get("rebuild"))) if workflow == "index" \
             else insert(conn, project_id, inputs)
-        if workflow == "index" and not pending:  # S1-17: a rerun it left pending that this did not hold (it was
-            # held when this looked, and ended unrecorded since): its id, given out, ends, superseded by this run
-            left = json.loads(conn.execute("SELECT json_extract(inputs, '$.again') FROM runs WHERE id = ?",
-                                           (run_id,)).fetchone()[0] or "null")
-            if left:
-                search._close_pending(conn, project_id, left["run_id"], "superseded", left.get("rebuild"))
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.retried_by', ?) WHERE id = ?",
                      (retried, run_id))
-        if left_running:  # retired: no kick holds it here from now on, and the record says it ended
-            _event(conn, run_id, "run_finished", {"status": "interrupted"})
-            conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
-                         (utc_now(), run_id))
-        return retried, started(conn, ids[0])
+        if retried != ids[0]:  # the project's run an index request answered with, not recorded here
+            answered.append(retried)
+        return retried, [ids[0]] if retried == ids[0] else []
 
-    def started(conn, held):
-        # The id held here starts only if its run was recorded here. One that only marks the project's
-        # running run to run once more (S1-17) is released, inside this transaction, and is held when that
-        # run ends.
-        return [held] if _running(conn, held) else []
+    registry, answered = state["harness"].registry, []
 
-    def left_pending(conn):  # S1-17: the id of the run an index run left pending, when none has it yet
-        row = conn.execute("SELECT json_extract(inputs, '$.again.run_id') FROM runs WHERE id = ? AND workflow = 'index'"
-                           " AND json_extract(inputs, '$.retried_by') IS NULL", (run_id,)).fetchone()
-        unused = row and row[0] and conn.execute("SELECT 1 FROM runs WHERE id = ?", (row[0],)).fetchone() is None
-        return [row[0]] if unused else []
-    # One Retry at a time: a second press reads what the first wrote (its run), never the pending id the first
-    # holds (S1-17), whichever write would reach the database first.
-    async with state.setdefault("retry_lock", asyncio.Lock()):
-        registry = state["harness"].registry
-        pending = await asyncio.to_thread(state["db"].read, left_pending)
-        try:
-            if pending:  # S1-17: the run it was pending after must never end (recording it) while this holds its id
-                # retired, it is never held again; held, it runs: refused
-                pending = await asyncio.to_thread(state["db"].read, left_pending) if registry.retire(run_id) else []
-            return {"run_id": await state["harness"].record_background(1, again, ids=pending)}
-        except BaseException:
-            # A Retry refused or failed leaves the run as it was, for a kick or a resume to start again. One whose
-            # retry committed is never started again whatever this undoes (retried_by, its record interrupted).
-            registry.unretire(run_id)
-            raise
+    async def started(retried):  # once the Retry has committed, whatever becomes of its request (record_background)
+        if answered:  # a run it did not record, which no process may hold (a failed terminal write left it running)
+            await search._started(state["harness"], retried)
+    try:
+        return {"run_id": await state["harness"].record_background(1, again, committed=started)}
+    except BaseException:
+        # A Retry refused or failed leaves the run as it was, for a kick or a resume to start again. One whose
+        # retry committed is never started again whatever this undoes (retried_by, its record interrupted).
+        registry.unretire(run_id)
+        raise

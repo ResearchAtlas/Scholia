@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -63,6 +63,46 @@ class DatabaseClosedError(RuntimeError):
     """The database is closed or closing: nothing more is read or written through it."""
 
 
+class DatabaseCloseError(RuntimeError):
+    """Closing the database failed: what it closes may still be open. From then on nothing in this process
+    replaces the data folder's files (close_failed)."""
+
+
+# Set by the first close (of a database or of what reads it, the search index) that fails, and never cleared:
+# what that close left open may still be open, so for the rest of this process no restore, its undoing or a
+# launch's undoing replaces files (backend/backups.py), and the app says to restart it.
+_close_failed = threading.Event()
+
+
+def close_failed():
+    """Whether any close in this process has failed (see _close_failed)."""
+    return _close_failed.is_set()
+
+
+def note_close_failed():
+    """Record that a close failed (see _close_failed); for what closes with a database (the search index)."""
+    _close_failed.set()
+
+
+def close_connection(conn):
+    """Close a database connection (sqlite3 or APSW, of the main database or the search index): every one is
+    closed through here. A close that fails sets close_failed() at once, whoever catches its error, and raises."""
+    try:
+        conn.close()
+    except BaseException:
+        _close_failed.set()
+        raise
+
+
+@contextmanager
+def closing_connection(conn):
+    """conn, closed through close_connection as the block ends (the with form of it)."""
+    try:
+        yield conn
+    finally:
+        close_connection(conn)
+
+
 class DatabaseDamagedError(RuntimeError):
     """An integrity check failed. Writing stops and the file is left as it is."""
 
@@ -95,12 +135,16 @@ class Database:
         self.backups_dir = self.data_dir / "backups"
         self._damaged = None  # why writing stopped, once an integrity check fails
         self.on_damage = None  # called once, from the thread whose check found the database damaged
-        self.closing = []  # called as close() starts: what reads this database closes first (S1-17: the search index)
+        self.closing = []  # called by close() once its writes are refused and drained, before it reads no more (S1-17: the search index)
         self._local = threading.local()
         self._readers = []
         self._readers_lock = threading.Lock()
-        self._closed = False  # set when close() starts, under _readers_lock; later reads and writes are refused
+        self._closed = False  # set by close() once its hooks have run, under _readers_lock; later reads and writes are refused
         self._held = False  # set by hold_writes(), under _readers_lock: later writes are refused
+        self._closing = False  # set as close() starts, under _readers_lock: later writes are refused (never released)
+        self._closer = None  # the thread of the close() that closes it
+        self._shut = threading.Event()  # set once that close() has finished: any other close() waits for it
+        self._close_error = None  # what made that close() fail, if it did: raised to every other close() too
         self._reads = 0  # reads in progress, which close() waits for
         self._reads_done = threading.Condition(self._readers_lock)
         self._backup_lock = threading.Lock()
@@ -113,7 +157,7 @@ class Database:
             # empty one to it on every open), so they are owner-only too.
             _create_private(self.path)
         except FileExistsError:  # refuse another app's, a newer or a damaged file before anything writes to it
-            _open_checked(self.path, "quick_check", latest=len(migrations)).close()
+            close_connection(_open_checked(self.path, "quick_check", latest=len(migrations)))
         self._writer = ThreadPoolExecutor(1, thread_name_prefix="scholia-db-writer")
         try:
             self._writer_ident = self._writer.submit(self._open_writer, migrations).result()
@@ -137,7 +181,7 @@ class Database:
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("write() cannot be called from inside a write")
         with self._readers_lock:  # admitted and queued in one step, so never queued behind close() or a hold
-            if self._closed or self._held:
+            if self._closed or self._held or self._closing:
                 raise DatabaseClosedError("the database is closed")
             future = self._writer.submit(self._transaction, fn)
         return future.result()
@@ -186,7 +230,8 @@ class Database:
 
     @property
     def closed(self):
-        """Whether close() has started. A backup in progress stops at its next check."""
+        """Whether close() has closed what reads this database and is closing it. A backup in progress stops at its
+        next check."""
         return self._closed
 
     @property
@@ -260,7 +305,7 @@ class Database:
             try:
                 info = self._copy(source, Path(target))
             finally:
-                source.close()
+                close_connection(source)
         self._retry_truncation()
         return info
 
@@ -288,32 +333,81 @@ class Database:
         (DatabaseClosedError); reads in progress finish first, and a write already
         submitted runs before the writer connection closes. So work still running when
         the app stops gets an error, never a connection closed under it. A backup in
-        progress is stopped, and waited for up to STOP_SECONDS. What reads this database
-        (closing: the search index) is closed first, its work drained."""
+        progress is stopped, and waited for up to STOP_SECONDS. First writes are refused and those already
+        admitted commit (as hold_writes does); then what reads this database (closing: the search index) is
+        closed, its work drained, so it sees every write that will ever commit (a deletion's queued removals).
+        The first close() closes it, and one called while it runs, or after, waits for it to finish (but one
+        called from inside it, by a hook, returns at once). Fail closed: whatever fails (the drain, a hook, a read
+        connection, a backup still running after STOP_SECONDS, the writer), every other step is still tried and
+        the writer thread stopped, close_failed() holds for the rest of the process, and every close() raises
+        DatabaseCloseError, so a failed close never reads as done (the index's next open purges what it left).
+        Never call close() from inside read(): the close waits for that read."""
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
             raise RuntimeError("close() cannot be called from inside a write")
-        for close in list(self.closing):  # each closes once, its work drained while this database still reads
-            try:
-                close()
-            except Exception as error:
-                log.warning("closing what reads the database failed (%s)", type(error).__name__)
         with self._readers_lock:
-            if self._closed:  # closed already, or closing in another thread
-                return
-            self._closed = True  # a backup's progress handler and step checks see this and stop
-            while self._reads:
-                self._reads_done.wait()
-            readers, self._readers = self._readers, []
-        for conn in readers:
-            conn.close()
-        if self._backup_lock.acquire(timeout=STOP_SECONDS):
-            self._backup_lock.release()
-        else:
-            log.warning("a backup did not stop within %s s of closing", STOP_SECONDS)
-        self._writer.submit(self._close_writer).result()
-        self._writer.shutdown()
-        self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
+            owner = not self._closing  # the first close() closes; any other waits for it
+            self._closing = True
+            if owner:
+                self._closer = threading.get_ident()
+        if not owner:
+            if threading.get_ident() != self._closer:  # but one from inside that close (a hook) returns at once
+                self._shut.wait()
+                if self._close_error is not None:
+                    raise DatabaseCloseError("closing the database failed") from self._close_error
+            return
+        failures = []  # every step is tried whatever failed before; the first failure is the close's
+
+        def attempt(step):
+            try:
+                step()
+            except BaseException as failure:
+                failures.append(failure)
+        try:  # everything from here signals its end (_shut), and a failure reaches every close()
+
+            def drain():
+                with self._readers_lock:
+                    drained = None if self._closed else self._writer.submit(lambda: None)  # behind every write admitted
+                if drained is not None:
+                    drained.result()
+            attempt(drain)
+            for close in list(self.closing):  # each closes once, its work drained while this database still reads
+                attempt(close)
+
+            def readers():
+                with self._readers_lock:
+                    self._closed = True  # a backup's progress handler and step checks see this and stop
+                    while self._reads:
+                        self._reads_done.wait()
+                    readers, self._readers = self._readers, []
+                for conn in readers:
+                    attempt(lambda conn=conn: close_connection(conn))
+            attempt(readers)
+
+            def stopped():
+                with self._readers_lock:
+                    self._closed = True
+                if not self._backup_lock.acquire(timeout=STOP_SECONDS):
+                    raise TimeoutError(f"a backup did not stop within {STOP_SECONDS} s of closing")
+                self._backup_lock.release()
+            attempt(stopped)
+            attempt(lambda: self._writer.submit(self._close_writer).result())
+        finally:
+            try:
+                attempt(self._writer.shutdown)
+            finally:
+                if failures:
+                    _close_failed.set()
+                self._writer_ident = None  # a later thread may get its id; it must be told the database is closed
+                self._close_error = failures[0] if failures else None
+                self._closer = None  # from here a close() on that thread too waits, and is told of a failure
+                self._shut.set()
+        if failures:
+            for failure in failures:
+                log.warning("closing the database failed (%s)", type(failure).__name__)
+            if not isinstance(failures[0], Exception):  # an interruption stays one
+                raise failures[0]
+            raise DatabaseCloseError("closing the database failed") from failures[0]
 
     # Writer thread
 
@@ -390,7 +484,7 @@ class Database:
         if self._damaged:
             # Closing the last connection would checkpoint the WAL into the damaged file.
             self._conn.setconfig(sqlite3.SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, True)
-        self._conn.close()
+        close_connection(self._conn)
 
     # Backups
 
@@ -418,7 +512,7 @@ class Database:
                 shutil.rmtree(published or tmp, ignore_errors=True)
                 raise
         finally:
-            source.close()
+            close_connection(source)
         self._apply_retention(keep=generation)
         return generation
 
@@ -465,11 +559,13 @@ class Database:
             except sqlite3.OperationalError:
                 self._raise_if_closed()
                 raise
-            with closing(check):
+            try:
                 schema_version = check.execute("PRAGMA user_version").fetchone()[0]
                 has_projects = check.execute("SELECT 1 FROM sqlite_schema WHERE name = 'projects'").fetchone()
                 projects = {project_id for (project_id,) in check.execute("SELECT id FROM projects")} \
                     if has_projects else set()  # before migration 0001
+            finally:
+                close_connection(check)
             self._raise_if_closed()
             _copy_settings(self.data_dir, target, projects)
             if _file_state(self.data_dir) == before:
@@ -526,7 +622,7 @@ def _connect(path, *, readonly=False, check_same_thread=True):
         for pragma in _PRAGMAS:
             conn.execute(f"PRAGMA {pragma}")
     except BaseException:
-        conn.close()
+        close_connection(conn)
         raise
     return conn
 
@@ -576,7 +672,7 @@ def _open_checked(path, check, latest=None, stop=None):
         return conn
     except BaseException as error:
         if conn is not None:
-            conn.close()
+            close_connection(conn)
         if _is_damage(error):
             raise DatabaseDamagedError(f"{check} failed: {error}") from error
         raise
@@ -625,7 +721,7 @@ def _check_identity(uri, latest):
         raise DatabaseDamagedError(f"the file cannot be read as a database: {error}") from error
     finally:
         if conn is not None:
-            conn.close()
+            close_connection(conn)
 
 
 def _usable_state(conn, latest):

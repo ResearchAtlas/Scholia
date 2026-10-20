@@ -748,6 +748,186 @@ def test_a_write_admitted_before_close_runs_before_the_writer_closes(tmp_path, m
         assert audit_events(reopened) == [("kept",)]
 
 
+def test_close_lets_admitted_writes_commit_and_refuses_the_rest_before_closing_what_reads_it(tmp_path):
+    """S1-17 recheck 6, finding 35: close() first refuses later writes and waits for those admitted to commit
+    (as hold_writes does), then closes what reads this database (closing: the search index), which so sees
+    every write that will ever commit (a deletion's queued removals), on every path that closes it: shutdown,
+    a restore going ahead or abandoned, a damaged database. It can still read then; it cannot write."""
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    entered, go, hooked, seen = threading.Event(), threading.Event(), threading.Event(), []
+
+    def held(conn):  # admitted, its commit waiting
+        add_audit_row(conn)
+        entered.set()
+        go.wait(10)
+
+    def hook():
+        events = audit_events(db)
+        hooked.set()
+        try:
+            db.write(add_audit_row)
+            seen.append((events, "written"))
+        except DatabaseClosedError:
+            seen.append((events, "refused"))
+    db.closing.append(hook)
+    writer = threading.Thread(target=db.write, args=(held,))
+    writer.start()
+    assert entered.wait(5)
+    closer = threading.Thread(target=db.close)
+    closer.start()
+    deadline = time.monotonic() + 10  # until close refuses writes, or (were they not refused first) runs its hook
+    while not (getattr(db, "_closing", False) or hooked.is_set()) and time.monotonic() < deadline:
+        time.sleep(0.002)
+    go.set()
+    writer.join(5)
+    closer.join(5)
+    assert not closer.is_alive() and seen == [([("kept",)], "refused")]
+
+
+def test_a_close_while_another_runs_returns_only_once_that_one_has_finished(tmp_path):
+    """PR 29 review 1, finding 2: a close() called while another is held inside a hook (the search index draining)
+    returns only once that close has finished: the hook done, then the database closed. A close() a hook calls,
+    from inside that close, returns at once rather than waiting for itself."""
+    from backend.db import DatabaseClosedError
+    db = Database(tmp_path / "data")
+    entered, go, order = threading.Event(), threading.Event(), []
+
+    def hook():
+        entered.set()
+        db.close()  # from inside the close: returns at once
+        go.wait(10)
+        order.append("hook done")
+    db.closing.append(hook)
+    first = threading.Thread(target=db.close)
+    first.start()
+    assert entered.wait(5)
+
+    def second():
+        db.close()
+        order.append(("second returned", db._writer_ident is None))
+    later = threading.Thread(target=second)
+    later.start()
+    later.join(0.5)  # its chance to return early
+    go.set()
+    first.join(5)
+    later.join(5)
+    assert not first.is_alive() and not later.is_alive()
+    assert order == ["hook done", ("second returned", True)]
+    with pytest.raises(DatabaseClosedError):
+        db.read(lambda conn: None)
+
+
+
+@pytest.mark.parametrize("failing", ["drain", "writer"])
+def test_a_close_that_fails_stops_the_writer_and_every_close_says_it_failed(tmp_path, monkeypatch, failing):
+    """PR 29 recheck 2, findings 1 and 2: a close that fails, as it queues its drain of the writes or as it closes
+    the writer connection, still tries every other step (the hooks run, the writer connection is closed after a
+    failed drain) and stops the writer thread, and signals its end: another close then raises too, from another
+    thread or the same one (never reads as done), rather than waiting for ever or returning as if the database
+    were closed."""
+    db = Database(tmp_path / "data")
+    real_submit = db._writer.submit
+    hooked, writer_closes, real_close_writer = [], [], db._close_writer
+    db.closing.append(lambda: hooked.append(True))
+    if failing == "drain":
+        def close_writer():
+            writer_closes.append(True)
+            real_close_writer()
+        monkeypatch.setattr(db, "_close_writer", close_writer)
+        def submit(fn, *args):
+            if fn is not close_writer:  # the drain's empty job
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+            return real_submit(fn, *args)
+        monkeypatch.setattr(db._writer, "submit", submit)
+    else:
+        def close_writer():
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(db, "_close_writer", close_writer)
+    with pytest.raises((RuntimeError, sqlite3.OperationalError)):
+        db.close()
+    outcome = []
+
+    def again():
+        try:
+            db.close()
+            outcome.append("returned")
+        except RuntimeError:
+            outcome.append("raised")
+    later = threading.Thread(target=again, daemon=True)
+    later.start()
+    later.join(5)
+    again()  # on the thread whose close failed
+    assert outcome == ["raised", "raised"] and hooked == [True] and db.closed and db._writer._shutdown
+    if failing == "drain":  # the writer connection was closed all the same
+        assert writer_closes == [True]
+
+
+def test_a_hook_that_raises_beyond_exception_still_closes_the_writer_and_fails_every_close(tmp_path):
+    """Recheck of 3fb92ba, N3: a closing hook that raises a BaseException (not an Exception, so not only logged) is
+    the close's failure: the writer connection is still closed and the thread stopped, and a later close raises."""
+    class Stop(BaseException):
+        pass
+
+    def hook():
+        raise Stop()
+    db = Database(tmp_path / "data")
+    db.closing.append(hook)
+    with pytest.raises(Stop):
+        db.close()
+    with pytest.raises(RuntimeError):
+        db.close()
+    assert db.closed and db._writer._shutdown and db._writer_ident is None
+
+
+@pytest.mark.parametrize("failing", [None, "drain", "hook", "reader", "backup", "writer"])
+def test_a_close_that_fails_anywhere_holds_file_replacement_off_for_the_process(tmp_path, monkeypatch, failing):
+    """PR 29 rechecks 3 and 4, findings 43, 45, 48 and 51, failing closed (Harold, 2026-10-15): whatever step of a
+    close fails (the drain, a hook's ordinary error, a read connection, a backup still running after STOP_SECONDS,
+    the writer), every close raises DatabaseCloseError and close_failed() holds for the rest of the process (no
+    file is replaced: backend/backups.py); a close whose every step succeeds leaves it unset."""
+    from backend.db import DatabaseCloseError, close_failed
+    db = Database(tmp_path / "data")
+    if failing == "drain":
+        real_submit = db._writer.submit
+
+        def submit(fn, *args):
+            if getattr(fn, "__name__", "") == "<lambda>":  # the drain's empty job
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+            return real_submit(fn, *args)
+        monkeypatch.setattr(db._writer, "submit", submit)
+    elif failing == "hook":
+        def hook():
+            raise OSError("the index could not be closed")
+        db.closing.append(hook)
+    elif failing == "reader":
+        class Failing:
+            def close(self):
+                raise sqlite3.OperationalError("disk I/O error")
+        db._readers.append(Failing())
+    elif failing == "backup":
+        monkeypatch.setattr(database_module, "STOP_SECONDS", 0.1)
+        db._backup_lock.acquire()  # a backup that does not stop
+    elif failing == "writer":
+        def close_writer():
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(db, "_close_writer", close_writer)
+    try:
+        if failing is None:
+            db.close()
+            db.close()
+        else:
+            for _ in range(2):  # the closer, then a later close: both told
+                with pytest.raises(DatabaseCloseError):
+                    db.close()
+    finally:
+        if failing == "backup":
+            db._backup_lock.release()
+    assert close_failed() == (failing is not None) and db.closed and db._writer._shutdown
+    with Database(tmp_path / "data") as again:  # a new database in the same process: the flag holds all the same
+        pass
+    assert close_failed() == (failing is not None)
+
 # Backups while the app is open
 
 
@@ -970,3 +1150,32 @@ def test_a_closed_database_says_so_even_to_a_thread_given_its_writers_id(tmp_pat
     monkeypatch.setattr(database_module.threading, "get_ident", lambda: writer)  # thread ids are reused
     with pytest.raises(DatabaseClosedError):
         db.write(add_audit_row)
+
+
+@pytest.mark.parametrize("taking", ["snapshot", "backup"])
+def test_a_backup_source_whose_close_fails_sets_the_flag_at_once(tmp_path, monkeypatch, taking):
+    """PR 29 recheck 5, finding 3: the separate source connection a snapshot or a backup reads, its close failing,
+    sets close_failed() at that moment (that connection is no reader the database's close would find)."""
+    from backend.db import close_failed
+    db = Database(tmp_path / "data")
+    real = database_module._open_checked
+
+    class Failing:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def close(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    def opened(path, check, latest=None, stop=None):
+        conn = real(path, check, latest=latest, stop=stop)
+        return Failing(conn) if check == "integrity_check" else conn
+    monkeypatch.setattr(database_module, "_open_checked", opened)
+    with pytest.raises(sqlite3.OperationalError):
+        db.snapshot(tmp_path / "copy") if taking == "snapshot" else db.backup()
+    assert close_failed()
+    monkeypatch.setattr(database_module, "_open_checked", real)
+    db.close()
