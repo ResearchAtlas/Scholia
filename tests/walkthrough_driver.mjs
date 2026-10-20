@@ -146,6 +146,7 @@ async function startServer(dir) {
   }
   return { child, pid, origin: url.origin, session: url.hash.replace('#session=', ''), dataFolder: lines['data folder'],
            materials: lines.materials, modelFile: lines['model file'], helperControl: lines['helper control'], log,
+           zoteroState: lines['zotero state'],  // S1-15
            stderr: () => stderr, exit: () => exit };
 }
 
@@ -1620,6 +1621,150 @@ async function references(ctx) {
   });
 }
 
+// S1-15: the Zotero browser (tests/walkthrough.py's test-owned Zotero, made-up items): Add, then Zotero
+// with Zotero's local API off says how to turn it on; once on, its libraries, collections and items; four
+// items chosen and imported, with their PDFs read (one named on a network share: details only, with its
+// reason), the report from the finished run; a re-import after Zotero changed one item's title and PDF.
+async function zotero(ctx) {
+  const { page, L, P, C, step, check, get } = ctx;
+  const { dialog: settings, openSettings } = navigation(ctx);
+  const panel = () => page.getByRole('complementary', { name: L('panel.library') });
+  const browser = () => page.getByRole('dialog', { name: L('zotero.title') });
+  const projectId = (await get('/api/projects')).body.projects.find((p) => p.name === C.project).id;
+  const listing = async () => (await get(`/api/projects/${projectId}/materials`)).body;
+  const zoteroRequests = () => readFileSync(join(C.out, 'requests.jsonl'), 'utf8').split('\n').filter(Boolean)
+    .map((l) => JSON.parse(l)).filter((r) => r.host === 'zotero');
+  const plural = (key, count) => { const forms = L(key); return (count === 1 && forms.one ? forms.one : forms.other).replace('{count}', String(count)); };
+  const state = (text) => writeFileSync(C.zoteroState, text);
+  const until = async (test, what) => {
+    for (let i = 0; i < 300; i += 1) {
+      const listed = await listing();
+      if (test(listed)) return listed;
+      await page.waitForTimeout(200);
+    }
+    throw new Error(`${what}: not in time`);
+  };
+  // The allowlist (backend/outbound_gate.py _ZOTERO_CALLS), as the request log keeps each request's target.
+  const LIB = '(?:users/0|groups/[1-9][0-9]{0,9})';
+  const KEY = '[A-Z0-9]{8}';
+  const ALLOWED = new RegExp(`^/api/(?:users/0/groups\\?format=json|${LIB}/collections\\?format=json&limit=100&start=[0-9]{1,6}`
+    + `|${LIB}/(?:collections/${KEY}/)?items/top\\?format=json&limit=50&start=[0-9]{1,6}`
+    + `|${LIB}/items/${KEY}\\?format=json&include=data,csljson|${LIB}/items/${KEY}/children\\?format=json`
+    + `|${LIB}/items/${KEY}/file/view/url)$`);
+  const chosen = { 'Minimum Wages in Synthetic Towns': 'ZWAGE001', 'A Synthetic Working Paper Without a File': 'ZMETA003',
+    'A Report Kept on a Network Share (synthetic)': 'ZNAS0004', '合成数据中的工资与就业': 'ZHAN0005' };
+  const openBrowser = async () => {  // from the Library panel of the project S1-14's flow left current
+    if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+    const back = panel().getByRole('button', { name: L('paper.back'), exact: true });
+    if (await back.count()) { await back.click(); await page.waitForTimeout(500); }
+    await panel().getByRole('button', { name: L('library.add'), exact: true }).click(); await page.waitForTimeout(400);
+    await page.getByRole('menuitem', { name: L('library.addMenu.zotero'), exact: true }).click();
+    await browser().waitFor(); await page.waitForTimeout(800);
+  };
+
+  await step('45-zotero-off', async () => {
+    await openBrowser();
+    await browser().getByText(L('zotero.status.api_off'), { exact: true }).waitFor({ timeout: 15000 });
+    check('it says Zotero\'s local API is off and how to turn it on',
+      await browser().getByText(L('zotero.howToTurnOn'), { exact: true }).count() === 1);
+    check('the status read back says api_off', (await get('/api/zotero/status')).body.state === 'api_off');
+    check('Import is not offered', await browser().getByRole('button', { name: plural('zotero.import', 0), exact: true }).isDisabled());
+    check('only the status request reached Zotero', zoteroRequests().length > 0
+      && zoteroRequests().every((r) => r.method === 'GET' && r.target === '/api/users/0/groups?format=json'));
+  });
+
+  await step('46-zotero-browser', async () => {
+    state('ready');
+    await browser().getByRole('button', { name: L('zotero.checkAgain'), exact: true }).click();
+    await browser().getByText(L('zotero.status.ready'), { exact: true }).waitFor({ timeout: 15000 });
+    await browser().getByRole('button', { name: 'Linked files', exact: true }).waitFor({ timeout: 15000 });
+    const libraries = await browser().getByLabel(L('zotero.library'), { exact: true }).locator('option').allTextContents();
+    check('its libraries are listed', libraries.join('|') === [L('zotero.myLibrary'), 'Synthetic Lab', '合成课题组'].join('|'));
+    check('its collections are listed, one inside another', await browser().getByRole('button', { name: 'Wage studies', exact: true }).count() === 1);
+    await browser().getByText('Minimum Wages in Synthetic Towns', { exact: true }).waitFor();
+    check('its items are listed with checkboxes', await browser().getByRole('checkbox').count() === 6);
+    const status = (await get('/api/zotero/status')).body;
+    check('the status read back says ready, with the server ID', status.state === 'ready' && status.server_id === 'walkthrough-zotero');
+  });
+
+  await step('47-zotero-selected', async () => {
+    await browser().getByRole('button', { name: 'Wage studies', exact: true }).click();
+    await browser().getByText(plural('zotero.itemCount', 4), { exact: true }).waitFor();
+    for (const title of Object.keys(chosen)) await browser().getByRole('checkbox', { name: title }).check();
+    check('the chosen count says four', await browser().getByText(plural('zotero.chosen', 4), { exact: true }).count() === 1);
+    check('Import offers the four', await browser().getByRole('button', { name: plural('zotero.import', 4), exact: true }).isEnabled());
+  });
+
+  await step('48-zotero-imported', async () => {
+    const before = (await listing()).materials.length;
+    await browser().getByRole('button', { name: plural('zotero.import', 4), exact: true }).click();
+    const report = browser().getByTestId('zotero-report');
+    await report.waitFor({ timeout: 60000 });
+    check('the report says four imported, and one PDF not read', await report.getByText(plural('zotero.report.imported', 4), { exact: true }).count() === 1
+      && await report.getByText(plural('zotero.report.pdfNotRead', 1), { exact: true }).count() === 1);
+    const run = (await get('/api/activity')).body.runs.find((r) => r.workflow === 'zotero_import');
+    check('the report is the finished run\'s record', run?.status === 'succeeded' && run.result.imported === 4
+      && run.result.pdf.pdf_not_local === 1 && run.retryable === false);
+    const listed = await until((l) => l.materials.filter((m) => m.source === 'zotero').length === 4
+      && l.materials.every((m) => m.state !== 'reading' && m.lookup?.status !== 'running'), 'the imported papers read and looked up');
+    const by = Object.fromEntries(listed.materials.filter((m) => m.source === 'zotero').map((m) => [m.title, m]));
+    check('one paper per item, keyed by library and item', listed.materials.length === before + 4
+      && Object.entries(chosen).every(([title, key]) => by[title]?.source_key === `users/0/items/${key}`));
+    check('the PDFs were read to Ready as full text', ['Minimum Wages in Synthetic Towns', '合成数据中的工资与就业']
+      .every((t) => by[t].state === 'ready' && by[t].evidence_type === 'full_text' && by[t].extraction?.passages > 0));
+    check('the item without a file has its details only, Ready', by['A Synthetic Working Paper Without a File'].state === 'ready'
+      && by['A Synthetic Working Paper Without a File'].version.media_type === null);
+    const share = by['A Report Kept on a Network Share (synthetic)'];
+    check('the PDF on a share was not read, and says why', share.state === 'needs_attention' && share.reason === 'pdf_not_local');
+    check('the DOI\'s record completed the Zotero record', by['Minimum Wages in Synthetic Towns'].resolved_at
+      && by['Minimum Wages in Synthetic Towns'].csl['container-title'] === 'Journal of Synthetic Towns'
+      && by['Minimum Wages in Synthetic Towns'].title === 'Minimum Wages in Synthetic Towns');
+    const requests = zoteroRequests();
+    check('Zotero got only allowlisted GETs: no authorize, no file bytes', requests.every((r) => r.method === 'GET' && ALLOWED.test(r.target))
+      && !requests.some((r) => /authorize|\/file(\/view)?$/.test(r.target)));
+    const audited = (await get(`/api/audit?project_id=${projectId}`)).body.entries
+      .filter((e) => e.event === 'outbound' && e.data.destination === 'http://127.0.0.1:23119');
+    check('each request is audited as Zotero\'s local API', audited.length > 0
+      && audited.every((e) => e.data.kind === 'zotero_local_api' && e.data.decision === 'allow'));
+    await browser().getByRole('button', { name: L('zotero.done'), exact: true }).click(); await page.waitForTimeout(800);
+    const row = panel().getByRole('listitem').filter({ has: page.getByRole('button', { name: 'A Report Kept on a Network Share (synthetic)', exact: true }) });
+    await row.scrollIntoViewIfNeeded();
+    await row.locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
+    check('its Details say it is from Zotero, and why its PDF was not read',
+      await row.getByText(L('library.source.fromZotero'), { exact: true }).count() === 1
+      && await row.getByText(L('library.reason.pdf_not_local'), { exact: false }).count() >= 1);
+  });
+
+  await step('49-zotero-reimport', async () => {
+    state('changed');
+    await openBrowser();
+    await browser().getByText(L('zotero.status.ready'), { exact: true }).waitFor({ timeout: 15000 });
+    await browser().getByRole('checkbox', { name: '合成数据中的工资与就业（修订版）' }).check();
+    await browser().getByRole('button', { name: plural('zotero.import', 1), exact: true }).click();
+    const report = browser().getByTestId('zotero-report');
+    await report.waitFor({ timeout: 60000 });
+    check('the report says one updated with a new version of its PDF', await report.getByText(plural('zotero.report.updated', 1), { exact: true }).count() === 1
+      && await report.getByText(plural('zotero.report.versions', 1), { exact: true }).count() === 1);
+    const listed = await until((l) => l.materials.some((m) => m.source_key === 'users/0/items/ZHAN0005' && m.state === 'ready'
+      && m.version?.seq === 1), 'the re-imported paper read');
+    const paper = listed.materials.find((m) => m.source_key === 'users/0/items/ZHAN0005');
+    check('the same paper, retitled, its new PDF its next version', paper.title === '合成数据中的工资与就业（修订版）'
+      && listed.materials.filter((m) => m.source_key === 'users/0/items/ZHAN0005').length === 1);
+    const versions = (await get(`/api/materials/${paper.id}/versions`)).body.versions;
+    check('its versions read back: the first and the new current one', versions.map((v) => `${v.seq}:${v.is_current}`).join() === '0:false,1:true');
+    await browser().getByRole('button', { name: L('zotero.done'), exact: true }).click(); await page.waitForTimeout(600);
+    await openSettings('settings.page.advanced');
+    await settings().getByRole('heading', { name: L('settings.backgroundRuns') }).scrollIntoViewIfNeeded(); await page.waitForTimeout(1500);
+    const rows = settings().getByRole('listitem').filter({ hasText: L('settings.workflowZotero') });
+    check('the background-run list shows the imports, with no Retry', await rows.count() >= 2
+      && await rows.first().getByRole('button', { name: L('runs.retry'), exact: true }).count() === 0);
+    const runs = (await get('/api/activity')).body.runs.filter((r) => r.workflow === 'zotero_import');
+    check('read back from the list: both imports succeeded', runs.length === 2 && runs.every((r) => r.status === 'succeeded'));
+    await rows.first().scrollIntoViewIfNeeded();
+  });
+  await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+}
+
 // The parts of the window loaded when first opened (frontend/src/parts.js), on a window just loaded:
 // Escape while Settings loads closes it, and Settings opened from the keyboard lands focus in its
 // dialog; a part whose script is refused once by the browser says so where it would show, with Try
@@ -2093,6 +2238,7 @@ async function run(combo, build, outRoot) {
                 localProject: combo.lang === 'en' ? 'Interview transcripts (synthetic, Local only)' : '访谈记录（合成数据，仅本机）',
                 dataFolder: server?.dataFolder, modelFile: server?.modelFile, requestLog: server?.log,
                 helperControl: server?.helperControl,
+                zoteroState: server?.zoteroState,  // S1-15
                 question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
     const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
     const step = async (name, body, before) => {
@@ -2120,6 +2266,7 @@ async function run(combo, build, outRoot) {
     if (C.materials) await s120(ctx);  // S1-20: OCR of a scanned page; it sets up its own project and panel
     if (C.materials) await ceilings(ctx);  // a reading stopped at its memory ceiling and at its time ceiling
     if (C.materials) await references(ctx);  // S1-14: a reference file's import, its merges, a Local only import, Attach
+    if (C.zoteroState) await zotero(ctx);  // S1-15: the Zotero browser, an import and a re-import
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);

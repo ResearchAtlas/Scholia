@@ -181,11 +181,11 @@ async def add_files(project_id: str, body: Upload, request: Request):
             used.append(run)
             conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
                          (run, project, workflow, json.dumps(inputs)))
+            return run
 
         locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()[0]
         added, looked_up = [], {}  # looked_up: {material id: the version its lookup is for}
         for name, sha256, kind in stored:
-            replaced = None
             if body.material_id is not None:
                 material = body.material_id
                 # Only the version current when the file was chosen is replaced: a slower, earlier
@@ -193,14 +193,6 @@ async def add_files(project_id: str, body: Upload, request: Request):
                 if conn.execute("SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1",
                                 (body.replaces, material)).fetchone() is None:
                     raise _refused(409, "replaced_meanwhile", "The paper's file was replaced meanwhile")
-                (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM material_versions WHERE material_id = ?",
-                                      (material,)).fetchone()
-                replaced = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
-                                        " content_files c ON c.sha256 = v.file_sha256 WHERE v.material_id = ?"
-                                        " AND v.is_current = 1", (material,)).fetchone()
-                conn.execute("UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material,))
-                conn.execute("UPDATE materials SET evidence_type = 'full_text', updated_at = ? WHERE id = ?",
-                             (utc_now(), material))  # a file read from now on: a reference file's paper has its text
             else:
                 same = conn.execute(
                     "SELECT m.id FROM materials m JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
@@ -208,30 +200,11 @@ async def add_files(project_id: str, body: Upload, request: Request):
                 if same is not None:
                     added.append({"id": same[0], "existing": True})
                     continue
-                material, seq = new_id(), 0
+                material = new_id()
                 title = name.rsplit(".", 1)[0].strip() or name
                 conn.execute("INSERT INTO materials (id, project_id, title, source, evidence_type, proposed_by)"
                              " VALUES (?, ?, ?, 'upload', 'full_text', 'researcher')", (material, project_id, title[:500]))
-            version = new_id()
-            conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
-                         " VALUES (?, ?, ?, ?, 1, ?)", (version, material, seq, sha256, kind))
-            extractor, extractor_version = extraction.extractor_of(kind)
-            shared = conn.execute(
-                f"SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ? AND extractor_version = ?"
-                f" AND status IN {_SHARED}", (sha256, extractor, extractor_version)).fetchone()
-            run, indexed = None, False
-            if shared is not None:  # read already, for another project or version: shared, not read again
-                if indexed := _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
-                    search.queued(conn, harness, project_id, origin, recorded)
-            else:
-                run = next(ids)
-                used.append(run)
-                conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background',"
-                             " 'extract', ?)", (run, project_id, json.dumps({"material_ids": [material],
-                                                                             "version_id": version, "origin": origin})))
-            if replaced is not None and replaced[1] in extraction.EXTRACTORS:  # its old file's readings, unless read still
-                if _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0]) and not indexed:
-                    search.removed(conn, harness, project_id, recorded)  # its index run takes those removals now
+            version, run = add_version(conn, harness, project_id, material, sha256, kind, origin, recorded)
             added.append({"id": material, "existing": False, "version_id": version, "run_id": run})
             looked_up[material] = version
         lookup_run = None  # a review-locked project never looks identifiers up
@@ -250,6 +223,82 @@ async def add_files(project_id: str, body: Upload, request: Request):
     # The runs start with the commit (record_background): none is ever running in the record and not held.
     # Each file may take two (its reading, and an index run for its old file's removals).
     return await harness.record_background(2 * len(stored) + 2, record)
+
+
+def add_version(conn, harness, project_id, material, sha256, kind, origin, recorded):
+    """A material's next version (its first when it has none), in the caller's transaction: the
+    version, current from now on; its earlier versions no longer current, and its evidence full text
+    once a file replaces another version (a reference file's paper has its text); and for a file, its
+    reading: one already made of it (by another project or version) is shared and its passages queued
+    for the project's index with an index run (search.queued, which offers the search model at the
+    project's first material, shown where origin says), else a reading run. A replaced file's
+    readings that no current version reads leave the index. sha256 None (and kind None) is a version
+    with no file, which has no reading. record(conn, project, workflow, inputs) records a run that
+    starts with the commit and returns its id. Returns (version id, its reading run's id or None).
+    Shared by adding files, a reference file's import (backend/references.py) and Zotero's
+    (backend/zotero.py)."""
+    (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM material_versions WHERE material_id = ?",
+                          (material,)).fetchone()
+    replaced = None
+    if seq:
+        replaced = conn.execute(f"SELECT v.file_sha256, {_VERSION_TYPE} FROM material_versions v LEFT JOIN"
+                                " content_files c ON c.sha256 = v.file_sha256 WHERE v.material_id = ?"
+                                " AND v.is_current = 1", (material,)).fetchone()
+        conn.execute("UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material,))
+        if sha256 is not None:
+            conn.execute("UPDATE materials SET evidence_type = 'full_text', updated_at = ? WHERE id = ?",
+                         (utc_now(), material))  # a file read from now on: a reference file's paper has its text
+            _forget_file_lookup(conn, material)
+    version = new_id()
+    conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
+                 " VALUES (?, ?, ?, ?, 1, ?)", (version, material, seq, sha256, kind))
+    if sha256 is None:
+        return version, None
+    extractor, extractor_version = extraction.extractor_of(kind)
+    shared = conn.execute(
+        f"SELECT id FROM extractions WHERE file_sha256 = ? AND extractor = ? AND extractor_version = ?"
+        f" AND status IN {_SHARED}", (sha256, extractor, extractor_version)).fetchone()
+    run, indexed = None, False
+    if shared is not None:  # read already, for another project or version: shared, not read again
+        if indexed := _queue_adds(conn, shared[0], project_id):  # a reading with passages: indexed, offered for
+            search.queued(conn, harness, project_id, origin, recorded)
+    else:
+        run = recorded(conn, project_id, "extract", {"material_ids": [material], "version_id": version,
+                                                     "origin": origin})
+    if replaced is not None and replaced[1] in extraction.EXTRACTORS:  # its old file's readings, unless read still
+        if _unread_out(conn, project_id, replaced[0], extraction.EXTRACTORS[replaced[1]][0]) and not indexed:
+            search.removed(conn, harness, project_id, recorded)  # its index run takes those removals now
+    return version, run
+
+
+def _forget_file_lookup(conn, material):
+    """A paper given another file, in add_version's transaction: when its identifier came from its old
+    file's text (an upload's always; a reference file's or a Zotero paper's when its record gives none),
+    what that file's lookup gave it goes, with its resolution and retraction check, so the new file's
+    lookup starts afresh and no paper mixes two works' details: an upload's looked-up details (its title
+    stays, until a lookup gives another), a recorded paper's lookup-filled fields (S1-14's lookup_filled).
+    A paper whose details the researcher edited keeps them, and one whose record gives its identifier
+    keeps its lookup's results, which are about that identifier."""
+    row = conn.execute("SELECT source, csl, checked_by, lookup_filled FROM materials WHERE id = ?", (material,)).fetchone()
+    if row is None or row[2] == "researcher":
+        return
+    source, csl, checked_by, filled = row
+    if source in _RECORDED:
+        record = json.loads(csl or "{}")
+        for key in json.loads(filled or "[]"):  # a lookup's fields are not the record's
+            record.pop(key, None)
+        if reference_files.identifier(record) is not None:
+            return
+        conn.execute("UPDATE materials SET csl = ?, lookup_filled = NULL, source_key = CASE source WHEN 'zotero'"
+                     " THEN source_key END, resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL"
+                     " WHERE id = ?", (json.dumps(record), material))
+    elif checked_by == "lookup":
+        conn.execute("UPDATE materials SET csl = NULL, checked_by = NULL, checked_at = NULL, source_key = NULL,"
+                     " resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL WHERE id = ?",
+                     (material,))
+    else:  # an upload no lookup completed: only what a retraction check said goes
+        conn.execute("UPDATE materials SET resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL"
+                     " WHERE id = ?", (material,))
 
 
 def _add_to_batch(conn, project_id, run_id, looked_up, more, registry):
@@ -560,6 +609,11 @@ async def _look_up(harness, active, project_id, inputs, pace):
     def close_if_idle(conn):  # in its transaction, so an addition that comes meanwhile keeps it open
         row = conn.execute("SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
         now = json.loads(row[0]) if row and row[0] else {}
+        # A Zotero import's batch (S1-15) closes with its import, however long it takes: never idle while it runs.
+        if now.get("open") and now.get("import_run") and _running(conn, now["import_run"]):
+            now["touched"] = time.time()  # looked at again once the idle time has passed once more
+            conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(now), run_id))
+            return now
         if now.get("open") and time.time() - now.get("touched", 0) > BATCH_IDLE_SECONDS:
             del now["open"], now["touched"]
             conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(now), run_id))
@@ -615,23 +669,27 @@ async def _look_up(harness, active, project_id, inputs, pace):
     approved = False
     if level == "local_only":
         approved = await _approval(read, write, run_id, project_id, inputs, distinct, wanted)
-    resolved, missed, asking, stale = 0, [], [[]], []  # asking[0]: the papers the identifier in hand is for
+    # asking: the identifier in hand and the papers it is for
+    resolved, missed, asking, stale = 0, [], [None, []], []
 
     def admit(conn):
         """The gate's check of each request, in the transaction that decides it (after the source's turn,
         before every attempt): the run may still send, and at least one of its papers still has the file
-        the identifier came from. A replaced one is refused, so its identifier is never sent."""
+        the identifier came from, and the record it came from still gives it (S1-15). A replaced one is
+        refused, so its identifier is never sent."""
         if not may_dispatch(conn, run_id):
             return False
-        if not _current(conn, asking[0]):
+        if not _current(conn, asking[1], asking[0]):
             stale.append(True)
             return False
         return True
 
     async with harness.gate.async_client(project_id, approved=approved, admit=admit) as client:
         for done, (scheme, value) in enumerate(distinct, start=1):
-            mine = asking[0] = [(m, version) for m, (version, found, _) in wanted.items() if found == (scheme, value)]
-            if not await read(lambda conn: _current(conn, mine)):  # every paper it was for has another file now
+            mine = asking[1] = [(m, version) for m, (version, found, _) in wanted.items() if found == (scheme, value)]
+            asking[0] = (scheme, value)
+            if not await read(lambda conn: _current(conn, mine, (scheme, value))):  # every paper it was for has
+                # another file now, or a record that gives another identifier
                 found, outcome = None, "replaced"
             else:
                 try:
@@ -690,7 +748,7 @@ def _identifiers(conn, project_id, materials, versions):
         # A reference file's paper is identified by its record (S1-14), whatever file it has since, unless
         # the researcher edited its details: an identifier they typed is not the record's, so then only a
         # file's text gives one. A version with no file has nothing to read: it is read, giving none.
-        record = json.loads(row[4] or "{}") if row[3] == "reference_file" and row[5] != "researcher" else None
+        record = json.loads(row[4] or "{}") if row[3] in _RECORDED and row[5] != "researcher" else None
         for key in json.loads(row[6] or "[]") if record else ():  # a lookup's fields (arXiv's DOI, say) are not the record's
             record.pop(key, None)
         if record and (given := reference_files.identifier(record)):
@@ -708,10 +766,26 @@ def _identifiers(conn, project_id, materials, versions):
     return found
 
 
-def _current(conn, pairs):
-    """Of [(material id, version id)], those whose version is still its material's current one."""
+def _current(conn, pairs, identifier=None):
+    """Of [(material id, version id)], those whose version is still its material's current one and, given
+    the identifier a lookup is for, that still give it (_gives)."""
     return [(m, v) for m, v in pairs if conn.execute(
-        "SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1", (v, m)).fetchone()]
+        "SELECT 1 FROM material_versions WHERE id = ? AND material_id = ? AND is_current = 1", (v, m)).fetchone()
+        and (identifier is None or _gives(conn, m, v, identifier))]
+
+
+def _gives(conn, material, version, identifier):
+    """Whether a paper still gives the identifier a lookup was made for, worked out as the lookup worked
+    it out (_identifiers: a reference file's or a Zotero paper's record, else its file's text). A record
+    a re-import (S1-15) or a merge changed while the file stayed may give another identifier, or none:
+    a lookup for the one it had then sends and applies nothing. A paper whose details the researcher
+    edited is bound by its version alone, as before: no import or merge changes its details, and _apply
+    keeps what they say (its retraction check only for the DOI they carry)."""
+    row = conn.execute("SELECT project_id, checked_by FROM materials WHERE id = ?", (material,)).fetchone()
+    if row is not None and row[1] == "researcher":
+        return True
+    found = row and _identifiers(conn, row[0], [material], {material: version}).get(material)
+    return bool(found) and tuple(found[1] or ()) == tuple(identifier)
 
 
 async def _approval(read, write, run_id, project_id, inputs, distinct, wanted):
@@ -779,7 +853,8 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
                            (version, material, project_id)).fetchone()
         if row is None:
             continue
-        mine, result = (found, outcome) if row[1] else (None, "replaced")
+        # S1-15: a record that gives another identifier now is not this lookup's to fill
+        mine, result = (found, outcome) if row[1] and _gives(conn, material, version, (scheme, value)) else (None, "replaced")
         filled = _fill_imported(conn, material, mine) if mine is not None else None  # S1-14: its record stays
         if mine is not None:
             if row[0] != "researcher" and filled is None:  # what the researcher edited stays
@@ -813,7 +888,7 @@ def _fill_imported(conn, material, found):
 
     row = conn.execute("SELECT source, csl, checked_by, title, lookup_filled FROM materials WHERE id = ?",
                        (material,)).fetchone()
-    if row is None or row[0] != "reference_file":
+    if row is None or row[0] not in _RECORDED:
         return None
     if row[2] == "researcher":
         return []
@@ -822,10 +897,17 @@ def _fill_imported(conn, material, found):
     csl.update(added)
     now = utc_now()
     filled = sorted(set(json.loads(row[4] or "[]")) | set(added))
-    conn.execute("UPDATE materials SET csl = ?, title = ?, source_key = ?, resolved_at = ?, updated_at = ?,"
-                 " lookup_filled = ? WHERE id = ?", (json.dumps(csl), added.get("title", row[3]), found.source_key, now,
-                                                     now, json.dumps(filled) if filled else None, material))
+    # A Zotero paper's source_key is its Zotero library and item, which its re-import finds it by (S1-15).
+    conn.execute("UPDATE materials SET csl = ?, title = ?, source_key = CASE source WHEN 'zotero' THEN source_key"
+                 " ELSE ? END, resolved_at = ?, updated_at = ?, lookup_filled = ? WHERE id = ?",
+                 (json.dumps(csl), added.get("title", row[3]), found.source_key, now, now,
+                  json.dumps(filled) if filled else None, material))
     return sorted(added)
+
+
+# Papers whose details are their own record, which a lookup only completes: a reference file's (S1-14)
+# and a Zotero item's (S1-15).
+_RECORDED = ("reference_file", "zotero")
 
 
 def _kept_on_move(conn, material, csl):
@@ -833,7 +915,7 @@ def _kept_on_move(conn, material, csl):
     form shows; a reference file's paper also keeps every other field but those a lookup filled
     (lookup_filled, which the change clears; S1-14)."""
     row = conn.execute("SELECT source, lookup_filled FROM materials WHERE id = ?", (material,)).fetchone()
-    if row is None or row[0] != "reference_file":
+    if row is None or row[0] not in _RECORDED:
         return {key: value for key, value in csl.items() if key in _FORM_FIELDS}
     filled = set(json.loads(row[1] or "[]"))
     return {key: value for key, value in csl.items() if key in _FORM_FIELDS or key not in filled}
@@ -876,8 +958,9 @@ def _describe(conn, row, registry):
                        (version,)).fetchone() if version else None
     status = run and derived_status(run[1], run[0], registry)  # as the background-run list reads it
     state, reason, progress = "ready", None, None
-    if sha256 is None:
-        pass  # metadata only
+    if sha256 is None:  # metadata only; a Zotero paper whose PDF could not be read says why (S1-15)
+        if source == "zotero" and (why := _attachment_problem(conn, material)) is not None:
+            state, reason = "needs_attention", why
     elif run is not None and status == "running":
         state = "reading"
         active = registry.runs.get(run[0])
@@ -1009,7 +1092,9 @@ async def change_material(material_id: str, body: MaterialChange, request: Reque
             csl.pop("DOI", None) if doi is None else csl.__setitem__("DOI", doi)
         now = utc_now()
         conn.execute("UPDATE materials SET title = ?, csl = ?, checked_by = 'researcher', checked_at = ?, updated_at = ?"
-                     + (", source_key = NULL, resolved_at = NULL, retraction = 'unknown', retraction_checked_at = NULL,"
+                     # A Zotero paper keeps its source_key, its Zotero library and item, which re-imports find it by (S1-15).
+                     + (", source_key = CASE source WHEN 'zotero' THEN source_key END, resolved_at = NULL,"
+                        " retraction = 'unknown', retraction_checked_at = NULL,"
                         " lookup_filled = NULL" if moved else "") + " WHERE id = ?", (title, json.dumps(csl), now, now, material_id))
         used = []
 
@@ -1253,12 +1338,28 @@ def _earlier(conn, sha256, kind):
 
 
 def _other(conn, run_id, workflow, status):
-    """Another module's run in the background-run list: S1-14's merge (backend/references.py)."""
+    """Another module's run in the background-run list: S1-14's merge (backend/references.py), S1-15's
+    Zotero import (backend/zotero.py)."""
+    if workflow == "zotero_import":
+        from backend import zotero  # it builds on this module
+
+        return zotero.run_details(conn, run_id)
     if workflow != "merge":
         return {}
     from backend import references  # it builds on this module
 
     return references.run_details(conn, run_id, status)
+
+
+def _attachment_problem(conn, material):
+    """Why a Zotero paper has no file, as its latest import recorded it (a PDF it could not read:
+    pdf_not_local, pdf_too_large, ...), or None (S1-15). ponytail: a scan of the paper's import
+    events; an index on them if imports run into the thousands."""
+    row = conn.execute("SELECT json_extract(e.data, '$.pdf') FROM run_events e JOIN runs r ON r.id = e.run_id"
+                       " WHERE r.workflow = 'zotero_import' AND e.type = 'step_finished'"
+                       " AND json_extract(e.data, '$.material_id') = ? ORDER BY e.rowid DESC LIMIT 1",
+                       (material,)).fetchone()
+    return row[0] if row else None
 
 
 def _unreadable(conn, version_id, registry):

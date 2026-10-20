@@ -79,6 +79,27 @@ export function Paper(props) {
   );
 }
 
+// S1-15: the Zotero browser, a dialog loaded when first opened and kept, as Settings is.
+const LazyZotero = part(() => import('./ZoteroBrowser.jsx'), 'ZoteroBrowser');
+
+export function ZoteroBrowser(props) {
+  const t = useT();
+  const [opened, setOpened] = useState(false);
+  if (props.open && !opened) setOpened(true);
+  if (!opened) return null;
+  const failed = (
+    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogTitle>{t('zotero.title')}</DialogTitle>
+        <DialogDescription className="sr-only">{t('zotero.description')}</DialogDescription>
+        <Unavailable />
+      </DialogContent>
+    </Dialog>
+  );
+  const loading = props.open ? <SettingsLoading onOpenChange={props.onOpenChange} /> : null;
+  return <Boundary fallback={loading} failed={failed}><LazyZotero {...props} /></Boundary>;
+}
+
 // An answer's Markdown. Once the renderer has loaded or failed (markdownReady), that is drawn at once.
 export function Markdown(props) {
   const Loaded = markdown.loaded();

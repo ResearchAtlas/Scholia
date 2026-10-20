@@ -153,6 +153,7 @@ export function detailsSource(t, material, project, date) {
     return t('library.source.lookedUp', { source: t(`ask.service.${service}`), date: date(material.resolved_at) });
   }
   if (material.source === 'reference_file') return referenceSource(t, material, project, date, service); // S1-14
+  if (material.source === 'zotero') return zoteroSource(t, material, project, date); // S1-15
   const lookup = material.lookup;
   if (!lookup) return t(project?.review_lock ? 'library.source.locked' : 'library.source.fromFile');
   if (lookup.status === 'running') return t(lookup.waiting ? 'library.source.waiting' : 'library.source.lookingUp');
@@ -175,6 +176,21 @@ function referenceSource(t, material, project, date, service) {
   return t(REFERENCE_OUTCOMES.includes(lookup.outcome) ? `library.source.reference.${lookup.outcome}` : 'library.source.fromReferenceFile');
 }
 
+// Where a Zotero paper's details come from (S1-15): its Zotero record, completed by the service its
+// lookup found it in (which fills only what the record lacked; its key stays the Zotero item's, so the
+// service is the lookup's), or with what its latest lookup did.
+function zoteroSource(t, material, project, date) {
+  const lookup = material.lookup;
+  const service = Object.values(SERVICES).includes(lookup?.source) ? lookup.source : null;
+  if (service && material.resolved_at) {
+    return t('library.source.zoteroCompletedFrom', { source: t(`ask.service.${service}`), date: date(material.resolved_at) });
+  }
+  if (!lookup) return t(project?.review_lock ? 'library.source.zoteroLocked' : 'library.source.fromZotero');
+  if (lookup.status === 'running') return t(lookup.waiting ? 'library.source.waiting' : 'library.source.lookingUp');
+  if (lookup.status === 'cancelled') return t(cancelledKey(lookup));
+  return t(REFERENCE_OUTCOMES.includes(lookup.outcome) ? `library.source.zotero.${lookup.outcome}` : 'library.source.fromZotero');
+}
+
 // What a paper's latest lookup did, as text, beside details that came from elsewhere (an edit or an
 // earlier lookup's record), or beside the file's when it ended with no outcome for the paper (failed,
 // with its recorded reason, or interrupted); null when the details say it already, or when it has
@@ -192,7 +208,10 @@ export function latestLookup(t, material) {
 }
 
 const REASONS = new Set(['ocr_waiting', 'no_text', 'not_read', 'stopped', 'time_limit', 'unreadable_file',
-  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'memory_limit', 'step_limit']);
+  'encrypted_file', 'file_missing', 'interrupted', 'not_found', 'outdated', 'ocr_failed', 'memory_limit', 'step_limit',
+  // S1-15: a Zotero paper whose PDF could not be read (backend/zotero.py read_attachment)
+  'pdf_missing', 'pdf_not_local', 'pdf_on_network', 'pdf_not_downloaded', 'pdf_not_a_file', 'pdf_too_large',
+  'pdf_not_a_pdf', 'pdf_unreadable', 'pdf_link']);
 
 // A reading's scanned pages under Details: read by text recognition, or waiting for it where no OCR
 // engine read them (status ocr_needed); null when it has none.
