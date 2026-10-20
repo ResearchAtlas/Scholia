@@ -594,6 +594,19 @@ class Harness:
             raise AdmissionError(403, "key_not_confirmed", "Confirm the key's OpenRouter data settings first")
         route = providers.Route(provider_config, plan.model)
         problem, facts = await self._route_facts(route, key, table, zero_retention=zero_retention, effort=effort)
+        tried = {plan.model}
+        while problem and chosen == budget_router.AUTO:
+            # Auto passes over a model its endpoints cannot serve (unpriced, unread, too small) to the next
+            # it would take; with none left, the first model's problem is named.
+            following = plan_among(lambda m: m not in tried and policy.problem(provider_config, m, key) is None)
+            if following.model is None:
+                break
+            tried.add(following.model)
+            candidate = providers.Route(provider_config, following.model)
+            found, found_facts = await self._route_facts(candidate, key, table, zero_retention=zero_retention,
+                                                         effort=effort)
+            if not found:
+                plan, route, problem, facts = following, candidate, None, found_facts
         if problem:
             raise AdmissionError(400, problem, _REFUSED[problem])
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)

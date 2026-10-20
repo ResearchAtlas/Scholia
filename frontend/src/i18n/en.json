@@ -740,7 +740,7 @@
   "providers.price": "Price",
   "providers.pricePerMillion": "{input} in, {output} out, per million tokens",
   "providers.priceUnknown": "Not published; estimated cautiously",
-  "providers.priceUnpublished": "Not listed for the model as a whole. Scholia reads each endpoint's price before it uses the model, and does not use it where none is published",
+  "providers.priceUnpublished": "Not listed for the model as a whole. Scholia reads each endpoint's price before it uses the model, and does not use the model if any endpoint it could reach has none",
   "providers.window": "Window",
   "subagents.models": "Models for subagents",
   "subagents.modelsHint": "Up to five, in order of preference. The agent picks from this list for each task, then falls back to the first, then to the conversation's model. Models this project's level does not allow are skipped.",

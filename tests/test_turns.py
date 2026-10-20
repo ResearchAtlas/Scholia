@@ -1041,7 +1041,8 @@ async def test_an_answer_cut_at_its_output_limit_is_saved_and_marked_cut_in_its_
 @pytest.mark.parametrize("model", ["x/unpriced", None])  # a chosen model, and Auto
 async def test_an_openrouter_model_is_refused_as_unpriced_only_when_its_endpoints_publish_no_price(tmp_path, model):
     # Harold, 2026-10-20, and the connector's finding on PR 37: the catalog's aggregate price may be
-    # missing while every endpoint publishes one; the endpoints decide. An endpoint without a price refuses.
+    # missing while every endpoint publishes one; the endpoints decide. An endpoint without a price
+    # refuses a chosen model; Auto passes over it to the next model it would take.
     import httpx
     from backend import budget_router, openrouter_client
 
@@ -1051,20 +1052,26 @@ async def test_an_openrouter_model_is_refused_as_unpriced_only_when_its_endpoint
                 return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000} for m in self.catalog]})
             return await super().__call__(request)
 
-    chosen = model or budget_router.MODEL_TIERS["mid"][0]
+    first = model or budget_router.MODEL_TIERS["mid"][0]
     provider = Unpriced(catalog=["x/unpriced", *budget_router.RECOMMENDED])
     async with started(tmp_path / "data", provider) as client:
         current = (await client.get("/api/settings")).json()
         await client.put("/api/settings", json={"hash": current["hash"], "updates": {"providers.openrouter.models": "all"}})
         conversation = await new_conversation(client, title="t")
-        body = {"content": "hi", **({"model": model} if model else {})}
-        assert (await send(client, conversation, **({"model": model} if model else {})))[-1]["status"] == "succeeded"
-        assert provider.answers[-1]["model"] == chosen  # priced by its endpoints, used
-        provider.endpoints[chosen] = [{"tag": "example", "context_length": 128000, "pricing": {}}]
+        options = {"model": model} if model else {}
+        assert (await send(client, conversation, **options))[-1]["status"] == "succeeded"
+        assert provider.answers[-1]["model"] == first  # priced by its endpoints, used
+        provider.endpoints[first] = [{"tag": "example", "context_length": 128000, "pricing": {}}]
         openrouter_client.clear_cache()
-        refused = await client.post(f"/api/conversations/{conversation}/message/stream", json=body)
-        assert (refused.status_code, refused.json()["code"]) == (400, "route_unpriced")
-        assert len(provider.answers) == 1
+        if model:
+            before = await counts(client)
+            refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                        json={"content": "hi", "model": model})
+            assert (refused.status_code, refused.json()["code"]) == (400, "route_unpriced")
+            assert len(provider.answers) == 1 and await counts(client) == before  # nothing written or sent
+        else:
+            assert (await send(client, conversation))[-1]["status"] == "succeeded"
+            assert provider.answers[-1]["model"] == budget_router.MODEL_TIERS["mid"][1]  # Auto passed over it
 
 
 
@@ -1078,7 +1085,8 @@ async def test_an_endpoint_that_does_not_take_the_output_limit_is_not_used(tmp_p
                                                 "supported_parameters": ["temperature"]}]})
     async with started(tmp_path / "data", provider) as client:
         conversation = await new_conversation(client, title="t")
-        refused = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi"})
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "hi", "model": model})  # chosen: Auto would pass over it
         assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
         assert provider.chats == [] and (await counts(client))["runs"] == 0
         provider.endpoints[model][0]["supported_parameters"] = ["max_tokens", "temperature"]
@@ -1102,7 +1110,7 @@ async def test_a_model_whose_reasoning_record_is_dropped_still_needs_the_output_
     async with started(tmp_path / "data", provider) as client:
         conversation = await new_conversation(client, title="t")
         refused = await client.post(f"/api/conversations/{conversation}/message/stream",
-                                    json={"content": "hi", "effort": "high"})
+                                    json={"content": "hi", "effort": "high", "model": model})
         assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
         assert provider.chats == []
 

@@ -720,7 +720,7 @@
   "providers.price": "价格",
   "providers.pricePerMillion": "每百万 token：输入 {input}，输出 {output}",
   "providers.priceUnknown": "未公布；按保守方式估算",
-  "providers.priceUnpublished": "未列出该模型的整体价格。Scholia 在使用该模型前会读取各端点的价格，未公布价格的端点不予使用",
+  "providers.priceUnpublished": "未列出该模型的整体价格。Scholia 在使用该模型前会读取各端点的价格，只要有可能用到的端点未公布价格，就不使用该模型",
   "providers.window": "窗口",
   "subagents.models": "子代理使用的模型",
   "subagents.modelsHint": "最多五个，按偏好排序。代理为每个任务从此列表中挑选，否则使用第一个，再否则使用对话的模型。本项目级别不允许的模型会被跳过。",
