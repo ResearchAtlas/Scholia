@@ -105,17 +105,20 @@ def test_an_override_that_is_not_a_known_rate_or_condition_refuses_the_route(ove
     assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced"
 
 
-def test_a_missing_token_rate_keeps_every_rate_the_endpoint_publishes():
-    # The external review's A2: a missing prompt (or completion) rate takes the unknown-price rate, and
-    # the endpoint's other charges and the refusal of an unknown one still apply.
+def test_every_published_rate_counts_and_a_missing_or_unknown_one_refuses():
+    # The external review's A2, with Harold's answer (2026-10-20): a missing prompt or completion rate
+    # refuses the route; the endpoint's other published charges count, and an unknown one refuses.
     from backend import reach
     endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [],
-                "pricing": {"completion": "0.1", "request": "1"}}
+                "pricing": {"prompt": "0.000002", "completion": "0.1", "request": "1"}}
     found = reach.reach(OPENROUTER, {}, [endpoint])
-    assert found.problem is None
-    assert found.rates == {"input": budget_router.UNKNOWN_RATES["input"], "output": 0.1, "request": 1.0}
+    assert (found.problem, found.rates) == (None, {"input": 0.000002, "output": 0.1, "request": 1.0})
     endpoint["pricing"]["new_fee"] = "2"
     assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced"
+    del endpoint["pricing"]["prompt"], endpoint["pricing"]["new_fee"]
+    assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced"
+    # A provider without per-endpoint prices (an OpenAI-compatible server) keeps the unknown-price rates.
+    assert reach.reach(GENERIC, {"context_length": 8192}, None).rates == budget_router.UNKNOWN_RATES
 
 
 def test_what_a_request_can_reach():
@@ -124,11 +127,16 @@ def test_what_a_request_can_reach():
                 "pricing": {"prompt": "0.000001", "completion": "0.000004"}},
                {"tag": "a/turbo", "context_length": 32768, "supported_parameters": [],
                 "pricing": {"prompt": "0.000003", "completion": "0.000002"}},
-               {"tag": "b", "context_length": 65536, "supported_parameters": ["reasoning"], "pricing": {}}]
+               {"tag": "b", "context_length": 65536, "supported_parameters": ["reasoning"],
+                "pricing": {"prompt": "0.000002", "completion": "0.000005"}}]
     found = reach.reach(OPENROUTER, {}, listing)
-    # Every endpoint: the smallest window; the highest rates, an unpriced endpoint at the unknown-price rates.
+    # Every endpoint: the smallest window; the highest rates any of them publishes.
     assert (found.tags, found.window, found.problem) == (("a", "a/turbo", "b"), 32768, None)
     assert found.rates == {"input": 0.000003, "output": 0.000005, "request": 0.0}
+    # An endpoint that publishes no prompt or completion rate is not estimated (Harold, 2026-10-20).
+    for pricing in ({}, {"prompt": "0.000001"}, {"completion": "0.000001", "request": "0.01"}):
+        assert reach.reach(OPENROUTER, {}, [*listing, {**listing[2], "tag": "c", "pricing": pricing}]).problem \
+            == "route_unpriced", pricing
     # Rule 1: a parameter the request relies on narrows it to the endpoints that list it.
     assert reach.reach(OPENROUTER, {}, listing, needs=("reasoning",)).tags == ("a", "b")
     # A pin must name exactly one endpoint: a base slug that reaches a variant too is refused.

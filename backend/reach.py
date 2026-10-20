@@ -7,7 +7,9 @@ request that needs a parameter only those that list it (provider.require_paramet
 window is the smallest among them, a parameter is supported only when each lists it, and an
 estimate takes the highest rate among them, from OpenRouter's per-endpoint listing
 (openrouter_client.endpoints, priced by endpoint_pricing). A provider without such a listing (an
-OpenAI-compatible server) is its one endpoint: its model row says what it has.
+OpenAI-compatible server) is its one endpoint: its model row says what it has, and it publishes
+no price in a known unit, so its estimate takes the unknown-price rates. On OpenRouter an
+endpoint that publishes no prompt or completion rate is not estimated: the route is refused.
 """
 
 import math
@@ -64,14 +66,10 @@ def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -
     for endpoint in found:
         if not _prices(endpoint["pricing"]):  # a rate that is no price (OpenRouter's -1 for a variable-priced
             return Reach((), None, UNKNOWN_RATES, "route_unpriced")  # router, a non-finite value): never $0
-        # A prompt or completion rate it does not publish is taken at the unknown-price rate; every rate it
-        # does publish, and the refusal of a charge nothing here can bound, still apply.
-        pricing = dict(endpoint["pricing"])
-        for key, fallback in (("prompt", UNKNOWN_RATES["input"]), ("completion", UNKNOWN_RATES["output"])):
-            if pricing.get(key) in (None, ""):
-                pricing[key] = repr(fallback)
         try:
-            price = endpoint_pricing.price_endpoint(None, {**endpoint, "pricing": pricing})
+            price = endpoint_pricing.price_endpoint(None, endpoint)
+        except endpoint_pricing.EndpointPricingError:  # no published prompt or completion rate: no guess
+            return Reach((), None, UNKNOWN_RATES, "route_unpriced")  # (Harold, 2026-10-20)
         except (TypeError, ValueError):  # an unreadable rate is no evidence that it is low
             return Reach((), None, UNKNOWN_RATES, "route_unpriced")
         if price["unaccounted_nonzero_price_keys"]:

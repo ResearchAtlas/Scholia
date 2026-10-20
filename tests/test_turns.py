@@ -1021,3 +1021,39 @@ async def test_a_blank_model_is_refused_in_a_request_and_passed_over_in_settings
         assert (await send(client, conversation, "hello"))[-1]["status"] == "succeeded"
         assert client.provider.answers[-1]["model"].strip() == client.provider.answers[-1]["model"] != ""
         await background_idle(client)
+
+
+async def test_an_answer_cut_at_its_output_limit_is_saved_and_marked_cut_in_its_trace(tmp_path):
+    # Harold, 2026-10-20: saved as succeeded, marked cut in the answer and in the step's trace.
+    provider = MockProvider((200, {"choices": [{"message": {"content": "Half an ans"}, "finish_reason": "length"}],
+                                   "usage": {"cost": 0.001}}))
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "succeeded"
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert (turn["status"], turn["answer"]) == ("succeeded", {"text": "Half an ans", "cut": True})
+        [(finished,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'",
+                                   turn["run_id"])
+        assert json.loads(finished)["cut"] == "output_limit"
+
+
+async def test_an_openrouter_model_with_no_published_price_is_refused_before_anything_is_written(tmp_path):
+    # Harold, 2026-10-20: never estimated; the model picker's Auto passes over it, and a chosen one is refused.
+    import httpx
+
+    class Unpriced(MockProvider):  # its catalog lists models with no price
+        async def __call__(self, request):
+            if request.url.path.endswith("/models") and request.url.host == "openrouter.ai":
+                return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000} for m in self.catalog]})
+            return await super().__call__(request)
+
+    provider = Unpriced(catalog=["x/unpriced"])
+    async with started(tmp_path / "data", provider) as client:
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {"providers.openrouter.models": "all"}})
+        conversation = await new_conversation(client, title="t")
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "hi", "model": "x/unpriced"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "route_unpriced")
+        assert provider.chats == [] and (await counts(client))["runs"] == 0

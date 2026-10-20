@@ -11,7 +11,7 @@ import pytest
 from backend import budget_router, openrouter_client, providers
 from backend.db import new_id
 from backend.providers import MIN_WINDOW, Provider
-from scholia_app import MockProvider, background_idle, send, started
+from scholia_app import PRICING, MockProvider, background_idle, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -21,7 +21,7 @@ RECOMMENDED = sorted(budget_router.RECOMMENDED)
 
 
 class CatalogProvider(MockProvider):
-    """A MockProvider whose model listing holds `rows`."""
+    """A MockProvider whose model listing holds `rows`, each publishing PRICING unless it names its own."""
 
     def __init__(self, rows):
         super().__init__()
@@ -30,7 +30,7 @@ class CatalogProvider(MockProvider):
     async def __call__(self, request):
         if request.url.path.endswith("/models"):
             self.requests.append((request.method, request.url.path, None))
-            return httpx.Response(200, json={"data": self.rows})
+            return httpx.Response(200, json={"data": [{"pricing": PRICING, **row} for row in self.rows]})
         return await super().__call__(request)
 
 

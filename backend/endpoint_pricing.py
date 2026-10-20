@@ -66,8 +66,8 @@ def _is_nonzero_rate(value):
 
 
 # The conditions an override may name: token counts past which its rates apply. Its shape is not
-# documented, so only these are read as conditions (Scholia); any other key, or a value of another
-# shape, makes the endpoint's pricing unaccounted, and no estimate is made from it.
+# documented, so only these are read as conditions (Scholia; Harold, 2026-10-20); any other key, or a
+# value of another shape, makes the endpoint's pricing unaccounted, and no estimate is made from it.
 _CONDITION_KEYS = frozenset({"min_prompt_tokens", "max_prompt_tokens", "min_context_tokens", "max_context_tokens"})
 
 

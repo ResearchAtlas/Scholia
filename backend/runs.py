@@ -87,7 +87,7 @@ def _unusable(table, provider, model) -> str | None:
     it (Recommended, All or Pick) or its catalog, once read, no longer lists it; model_window when
     its window is not usable (slice-1 spec section 8: needed, or under 4,096); catalog_unread when
     its provider's catalog has not been read, so its window is unknown (an OpenRouter model's
-    always, another's unless a setting gives it). Before a call, the window every endpoint it can
+    always, another's unless a setting gives it); route_unpriced when OpenRouter lists no price for it. Before a call, the window every endpoint it can
     reach accepts is checked too (Harness._route_facts)."""
     if not providers.offered(table, provider, model, budget_router.RECOMMENDED):
         return "model_not_offered"
@@ -97,6 +97,8 @@ def _unusable(table, provider, model) -> str | None:
         return "model_not_offered"
     if row is None and provider.is_openrouter:
         return "catalog_unread"
+    if row is not None and provider.is_openrouter and row.get("pricing_source") != "provider":
+        return "route_unpriced"  # OpenRouter publishes no price for it: never estimated (Harold, 2026-10-20)
     if providers.window(table, model, (row or {}).get("context_length"))["status"] == "ok":
         return None
     return "model_window" if row is not None else "catalog_unread"
@@ -704,7 +706,8 @@ class Harness:
                     emit({"type": "error", "code": code})
                 emit({"type": "run_finished", **final})
                 return
-            answer = {"text": result.content, **({"reasoning": result.reasoning} if result.reasoning else {})}
+            answer = {"text": result.content, **({"reasoning": result.reasoning} if result.reasoning else {}),
+                      **({"cut": True} if result.cut else {})}  # saved, and marked as stopped at its output limit
             try:
                 final = await self._write(lambda conn: self._commit_answer(conn, claim, answer, ctx))
             except _Cancelled:  # the Stop came first: no answer is published
@@ -931,7 +934,8 @@ class Harness:
                 # The catalog row the route's facts were read from, so the request is the one they
                 # describe; a Private call is limited to the endpoints it lists, as the gate checks.
                 model_entry=facts["row"])
-            finished = {"step": call.step, "outcome": result.error_kind or "ok"}
+            finished = {"step": call.step, "outcome": result.error_kind or "ok",
+                        **({"cut": "output_limit"} if result.cut else {})}  # stopped at its output limit
             if output is not None and result.ok:
                 finished["output"] = output(result)
 

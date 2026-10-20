@@ -235,6 +235,15 @@ async def test_a_refusal_or_a_policy_block_is_its_own_outcome_with_its_cost_and_
     assert result.attempts[0].record()["outcome"] == kind
 
 
+async def test_an_answer_stopped_at_its_output_limit_is_an_answer_marked_cut():
+    client, _ = client_for(httpx.Response(200, json={"choices": [{"message": {"content": "Half an ans"},
+                                                                  "finish_reason": "length"}]}),
+                           ok("Whole."))
+    cut = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)
+    whole = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)
+    assert (cut.ok, cut.content, cut.cut, whole.cut) == (True, "Half an ans", True, False)
+
+
 async def test_a_reply_of_tool_calls_alone_is_an_answer_with_its_calls():
     calls = [{"id": "call_1", "type": "function", "function": {"name": "search_passages", "arguments": "{}"}}]
     client, _ = client_for(httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": calls}}]}))

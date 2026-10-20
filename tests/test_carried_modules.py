@@ -69,11 +69,13 @@ class _Streamed(httpx.AsyncByteStream):  # an answer as a server's arrives, read
 def listing(request):  # the model catalog and endpoint listing a turn's admission reads; None for a chat
     path = request.url.path
     if path.endswith("/models"):
-        body = {"data": [{"id": "google/gemini-3.1-pro-preview", "context_length": 128000}]}
+        body = {"data": [{"id": "google/gemini-3.1-pro-preview", "context_length": 128000,
+                          "pricing": {"prompt": "0.000001", "completion": "0.000005"}}]}
     elif path.endswith("/endpoints/zdr"):
         body = {"data": []}
     elif path.endswith("/endpoints"):
-        body = {"data": {"endpoints": [{"tag": "example", "context_length": 128000}]}}
+        body = {"data": {"endpoints": [{"tag": "example", "context_length": 128000,
+                                        "pricing": {"prompt": "0.000001", "completion": "0.000005"}}]}}
     else:
         return None
     return httpx.Response(200, stream=_Streamed(json.dumps(body).encode()))

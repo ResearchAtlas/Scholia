@@ -277,6 +277,7 @@ function Turn({ turn, onContinue }) {
       {turn.status === 'running' && <Working />}
       {turn.answer?.text && <Answer text={turn.answer.text} />}
       {turn.answer && !turn.result_saved && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
+      {turn.answer?.cut && <p className="text-xs text-muted-foreground">{t('turn.cut')}</p>}
       {(note || cost || onContinue) && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground">
           {note && <span className={cn(turn.status === 'failed' && 'text-destructive')}>{note}</span>}

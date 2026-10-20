@@ -120,6 +120,7 @@ class ModelResult:
     error_kind: str | None  # None when the answer is usable
     attempts: list = field(default_factory=list)
     tool_calls: list = field(default_factory=list)  # as the provider sent them; with or without content
+    cut: bool = False  # the answer stopped at the request's output limit (finish_reason "length")
 
     @property
     def ok(self) -> bool:
@@ -311,7 +312,8 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         attempts.append(Attempt("ok", response.status_code, _ms(started), usage, retention=sent[-1] if sent else None))
         if len(attempts) > 1 and "reasoning" not in payload:
             _remember_no_reasoning(route, key)
-        return ModelResult(content, reasoning, None, attempts, tool_calls)
+        return ModelResult(content, reasoning, None, attempts, tool_calls,
+                           cut=_choice(body).get("finish_reason") == "length")
 
 
 def _count(value):

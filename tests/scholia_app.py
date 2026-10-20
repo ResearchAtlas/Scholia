@@ -18,6 +18,7 @@ from backend.db import new_id as _new_id
 
 ORIGIN = "http://127.0.0.1:8765"
 PARAMETERS = ["max_tokens", "temperature", "reasoning", "include_reasoning", "tools", "tool_choice"]
+PRICING = {"prompt": "0.000001", "completion": "0.000005"}  # USD per token, as OpenRouter publishes them
 HEADERS = {"X-Scholia-Client": "local"}
 KEY = "sk-or-test-not-a-real-key"
 
@@ -48,7 +49,7 @@ class MockProvider:
     row of its own; none by default. Any other provider's listing holds the ids in `local`. A
     model's endpoint listing (/models/{id}/endpoints) is
     `endpoints[id]` when set, else its zero-retention rows, else one endpoint tagged "example"
-    with a 128K window and no published price."""
+    with a 128K window; a row that names no pricing publishes PRICING, as every listed model does."""
 
     def __init__(self, *replies, cost=0.002, catalog=None, zero_retention=(), scholarly=None, endpoints=None):
         self.scholarly = scholarly if scholarly is not None else MockScholarly()  # OpenAlex, Crossref and arXiv
@@ -80,7 +81,8 @@ class MockProvider:
             await self.hold.wait()
         if request.url.path.endswith("/models"):
             models = self.catalog if request.url.host == "openrouter.ai" else self.local
-            return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000} for m in models]})
+            return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000, "pricing": PRICING}
+                                                      for m in models]})
         if request.url.path.endswith("/endpoints") and "/models/" in request.url.path:
             model = request.url.path.split("/models/", 1)[1].removesuffix("/endpoints")
             return httpx.Response(200, json={"data": {"id": model, "endpoints": self.listing(model)}})
@@ -101,10 +103,10 @@ class MockProvider:
         return httpx.Response(status, json=payload)
 
     def listing(self, model):
-        if model in self.endpoints:
-            return self.endpoints[model]
-        rows = [row for row in self.zero_retention if isinstance(row, dict) and row.get("model_id") == model]
-        return rows or [{"tag": "example", "context_length": 128000, "supported_parameters": PARAMETERS}]
+        rows = self.endpoints.get(model) or [
+            row for row in self.zero_retention if isinstance(row, dict) and row.get("model_id") == model]
+        rows = rows or [{"tag": "example", "context_length": 128000, "supported_parameters": PARAMETERS}]
+        return [{"pricing": PRICING, **row} for row in rows]  # a row that names its pricing keeps it
 
     @property
     def chat_headers(self):
