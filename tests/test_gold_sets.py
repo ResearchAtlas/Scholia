@@ -752,3 +752,27 @@ async def test_the_check_resolves_evidence_a_rater_chose_as_it_resolves_drafted_
     report = await gold.check(2, folder, pdfs, qasper, opener())
     assert report["problems"] == ["t-questions.harold.json: question q1 evidence item 1: the quote is not passage 2 "
                                   "of 2601.00011v1"]
+
+
+def test_field_one_is_refused_inside_any_git_work_tree_but_its_evals_local(tmp_path):
+    repo, worktree, plain = tmp_path / "repo", tmp_path / "wt", tmp_path / "plain"
+    (repo / ".git").mkdir(parents=True)
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")  # a worktree's .git is a file
+    for inside in (repo / "evals" / "field1-private", repo / "notes" / "new", worktree / "evals" / "f1", repo):
+        with pytest.raises(tier1.Refused, match="inside the repository"):
+            gold.field_folder(1, inside)
+    assert gold.field_folder(1, repo / "evals" / "local" / "harold") == (repo / "evals" / "local" / "harold").resolve()
+    assert gold.field_folder(1, worktree / "evals" / "local") == (worktree / "evals" / "local").resolve()
+    assert gold.field_folder(1, plain / "harold") == (plain / "harold").resolve()
+
+
+def test_from_a_worktree_the_main_checkout_is_refused_too():
+    git = ROOT / ".git"
+    if not git.is_file():
+        pytest.skip("this checkout is not a git worktree")
+    gitdir = Path(git.read_text().split(":", 1)[1].strip())  # <main>/.git/worktrees/<name>
+    main = gitdir.parents[2]
+    with pytest.raises(tier1.Refused, match="inside the repository"):
+        gold.field_folder(1, main / "evals" / "field1-private")
+    assert gold.field_folder(1, main / "evals" / "local" / "x") == (main / "evals" / "local" / "x").resolve()

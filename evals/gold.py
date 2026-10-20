@@ -99,10 +99,24 @@ def field_folder(field, folder=None):
 
 
 def private_path(field, path):
+    """A field's path, resolved; for field 1, refused anywhere inside a git work tree (this checkout, the main
+    checkout or any other worktree, or any other repository) except under that tree's evals/local/, which
+    this repository's .gitignore ignores."""
     path = Path(path).resolve()
-    if field == 1 and path.is_relative_to(ROOT) and not path.is_relative_to(LOCAL):
-        raise Refused(f"{path} is inside the repository: field 1's files stay outside it or under evals/local/")
+    if field == 1 and (top := work_tree(path)) is not None and not path.is_relative_to(top / "evals" / "local"):
+        raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside it "
+                      "or under its evals/local/")
     return path
+
+
+def work_tree(path):
+    """The top of the git work tree holding path (the nearest folder above it with a .git folder, or the
+    .git file a worktree has), or None. The path need not exist yet.
+    ponytail: by the .git entry, as git finds it by default; GIT_DIR and GIT_WORK_TREE settings are not read."""
+    for folder in (path, *path.parents):
+        if (folder / ".git").exists():
+            return folder
+    return None
 
 
 def outputs(folder):
