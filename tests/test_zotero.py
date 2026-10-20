@@ -1202,3 +1202,23 @@ async def test_optional_values_zotero_leaves_out_are_read_as_absent(tmp_path):
         assert [i["creators"] for i in listed if i["key"] == KEYS[2]] == [None]
         row = await imported(client, project, KEYS[:1])
         assert (row["status"], row["result"]["imported"], row["result"]["pdf"]) == ("succeeded", 1, {})
+
+
+# The S1-14 follow-up's reading (3), after its merge: a merge into a Zotero paper queues no lookup
+
+
+async def test_a_reference_files_merge_into_a_zotero_paper_queues_no_lookup(tmp_path):
+    mock = MockZotero()
+    mock.item("NODO2222", "A Zotero Paper Without a DOI", year=2020)
+    async with started(tmp_path / "data", provider(mock, openalex={DOI: openalex_work(DOI, "Resolved")})) as client:
+        project = await project_of(client)
+        await imported(client, project, ["NODO2222"])
+        await imported_references(client, project, ris(("A Zotero Paper Without a DOI", f"PY  - 2020\nDO  - {DOI}\n")))
+        [ask] = await merge_asks(client, project)
+        assert (await answer(client, ask, "merge")).status_code == 200
+        await run_finished(client, ask["run_id"])
+        await background_idle(client, 30)
+        [paper] = (await listing(client, project))["materials"]
+        assert (paper["source"], paper["csl"]["DOI"]) == ("zotero", DOI)  # merged into the Zotero paper
+        assert await rows(client, "SELECT count(*) FROM runs WHERE workflow = 'lookup'") == [(0,)]
+        assert client.provider.scholarly.requests == []
