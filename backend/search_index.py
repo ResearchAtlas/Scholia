@@ -46,6 +46,7 @@ Nothing here logs text, a title, a query or a path.
 """
 
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import logging
@@ -78,6 +79,7 @@ MAX_TERMS = 64  # a query's distinct tokens, at most
 # row to at most 60 s (each kind counted apart); a success sets it back to 1 s (for a whole rebuild, the first
 # successful read of the file it made: one damaged again before any is not a success).
 RETRY_SECONDS = (1, 60)
+BUSY_MS = 5000  # how long a connection waits for a lock another holds before BusyError
 STOP_EVERY = 1000  # rows between a project rebuild's looks at whether its run was stopped
 # Han characters: CJK unified ideographs, extension A, the compatibility ideographs and extensions B on.
 _HAN = "㐀-䶿一-鿿豈-﫿\U00020000-\U0003134f"
@@ -223,7 +225,7 @@ def connect(path, create=False):
     may it make the file; the index makes it owner-only first (_create), so no connection ever makes it."""
     flags = apsw.SQLITE_OPEN_READWRITE | (apsw.SQLITE_OPEN_CREATE if create else 0)
     conn = apsw.Connection(str(path), flags=flags)
-    conn.set_busy_timeout(5000)
+    conn.set_busy_timeout(BUSY_MS)
     # The schema read first: a file another connection holds is BusyError here (not damage), where the
     # tokenizer's registration would say NoFTS5Error; a damaged one fails here or there.
     conn.execute("SELECT count(*) FROM sqlite_schema").fetchall()
@@ -303,9 +305,10 @@ class SearchIndex:
         self._owed = False
         self.unusable = False  # a whole rebuild failed: its partial file is neither read nor written (Unavailable)
         self._rebuild_retry, self._rebuild_failures = None, 0  # the same, for a whole rebuild
-        # When (time.time()) the index last gave up (_give_up: its file discarded, its retry about to be armed), for
-        # retry_rebuild; a run asked between a fresh file's damage and its give-up waits that retry (the next Retry works).
-        self._gave_up_at = None
+        # When (time.time()) the index last became unusable (a whole rebuild failed, or a rebuilt file was found
+        # damaged again), and whether an index run asked since wants a whole rebuild no retry is armed for yet (the
+        # give-up's cleanup, or a retry's rebuild under way): retry_rebuild.
+        self._down_since, self._asked = None, False
         # This process rebuilt the file and no read of it has succeeded yet: damage found now makes the index unusable
         # (its retry later) rather than rebuilding it again at once (_damaged), so a file that keeps failing never loops.
         self._fresh = False
@@ -463,6 +466,22 @@ class SearchIndex:
             pass
 
     def _open(self):
+        """(whether its vectors are wanted again, whether the file is to be replaced). A file to be replaced (stale,
+        of another database, damaged) that another connection holds is not: the open fails (LOCKED, after the busy
+        timeout), and search is unavailable for this launch, as for a file held when it opens, or as it is purged."""
+        try:
+            wanted, rebuild = self._examine()
+            if rebuild:
+                with self._held_off():
+                    pass
+            return wanted, rebuild
+        except LOCKED:  # its connection closed now, so the index's close writes nothing to the held file
+            if self._conn is not None:
+                conn, self._conn = self._conn, None
+                close_connection(conn)
+            raise
+
+    def _examine(self):
         if self.closed:
             return False, False
         self._create()
@@ -564,9 +583,12 @@ class SearchIndex:
                     return
             except Exception as error:
                 log.error("rebuilding the search index failed (%s); it is tried again", type(error).__name__)
+                with self._lock:
+                    self._down_since = time.time()
                 self._give_up()
                 return
             with self._lock:  # the failures in a row are counted until a read of the new file succeeds (_read)
+                self._asked, self._down_since = False, None  # ready: what a run asked meanwhile is done
                 if self._rebuild_retry is not None:
                     self._rebuild_retry.cancel()
                     self._rebuild_retry = None
@@ -596,8 +618,7 @@ class SearchIndex:
             close_connection(self._conn)
             self._conn = None
         steps = [close_conn] if self._conn is not None else []
-        steps += [self._close_readers, *(lambda suffix=suffix: Path(f"{self.path}{suffix}").unlink(missing_ok=True)
-                                         for suffix in ("", "-wal", "-shm"))]
+        steps += [self._close_readers, self._remove_file]
         failed = None
         for step in steps:
             try:
@@ -607,13 +628,50 @@ class SearchIndex:
         if failed is not None:
             raise failed
 
+    def _remove_file(self):
+        """The file and its WAL and shared-memory files removed, the file locked exclusively meanwhile (no other
+        connection in a transaction on it): a file another connection holds is never removed, so never replaced
+        (LOCKED, after the busy timeout). One SQLite cannot open or lock otherwise (damaged, not a database) has no
+        transaction to hold off: it goes all the same. The lock is let go before any new file is made."""
+        with self._held_off():
+            for suffix in ("", "-wal", "-shm"):
+                Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def _held_off(self):
+        conn = None
+        if self.path.exists():
+            try:
+                conn = apsw.Connection(str(self.path), flags=apsw.SQLITE_OPEN_READWRITE)
+                conn.set_busy_timeout(BUSY_MS)
+                conn.execute("BEGIN EXCLUSIVE")
+            except apsw.Error as error:
+                if conn is not None:
+                    close_connection(conn)
+                    conn = None
+                if isinstance(error, LOCKED):
+                    raise
+        try:
+            yield
+        finally:
+            if conn is not None:
+                close_connection(conn)  # its file gone: nothing of a new one is touched
+
     def _give_up(self):
-        """In the writer: the file discarded and the index left unusable, another whole rebuild armed for later."""
-        self._gave_up_at = time.time()
+        """In the writer: the file discarded and the index left unusable, another whole rebuild armed for later, or
+        asked for now if an index run asked for one meanwhile (retry_rebuild), once."""
         try:
             self._discard()
-        finally:  # whatever the discard meets, a retry is armed
-            self._rebuild_later()
+        finally:  # whatever the discard meets, a rebuild is asked for, now or later
+            with self._lock:
+                asked, self._asked = self._asked and not self.closed, False
+            if asked:
+                try:
+                    self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
+                except RuntimeError:  # the writer stopped meanwhile (closing)
+                    pass
+            else:
+                self._rebuild_later()
 
     def _rebuild_later(self):
         """Another whole rebuild after a delay that doubles with each failure in a row (RETRY_SECONDS), one at
@@ -638,16 +696,24 @@ class SearchIndex:
             timer.start()
 
     def retry_rebuild(self, asked_at):
-        """The whole rebuild an unusable index waits for, now, its retry cancelled, for an index run asked for
-        (asked_at, seconds since the epoch) after the index became unusable: a Rebuild, a Retry, a paper added.
-        Not for one asked before, as the runs a rebuild's success asks for are, so a file damaged again after each
-        rebuild still waits its retry (no loop). A rerun recorded as a run ends after the give-up (an automatic mark
-        on it included) counts as asked since: one early rebuild, not a loop (a mark needs a read that succeeded, which
-        ends the file's freshness). Returns whether it asked for the rebuild."""
+        """For an index run asked for (asked_at, seconds since the epoch) since the index became unusable (a Rebuild,
+        a Retry, a paper added), the whole rebuild it waits for: at once if its retry is armed (the retry cancelled);
+        else kept, while the give-up cleans up or a retry's rebuild is under way, and asked for once as that cleanup
+        ends, or as that rebuild fails (_give_up); a rebuild that succeeds serves it. A run asked while the index is
+        only building (its first rebuild under way) is served by that rebuild, or by its retry. Not for a run asked before,
+        as the runs a rebuild's success asks for are, so a file damaged again after each rebuild still waits its retry
+        (no loop). A rerun recorded as a run ends after that (an automatic mark on it included) counts as asked since:
+        one early rebuild, not a loop (a mark needs a read that succeeded, which ends the file's freshness). Returns
+        whether it asked for a rebuild, or kept the request."""
         with self._lock:
             timer = self._rebuild_retry
-            if self.closed or not self.unusable or timer is None or self._gave_up_at is None or asked_at < self._gave_up_at:
+            # A run's record keeps its time to the millisecond (truncated): within 2 ms counts as since.
+            if self.closed or not self.unusable or self._down_since is None \
+                    or asked_at + 0.002 < self._down_since:
                 return False
+            if timer is None:  # the give-up's cleanup, or a retry's rebuild under way: asked for as that ends
+                self._asked = True
+                return True
             self._rebuild_retry = None
         timer.cancel()
         try:
@@ -675,8 +741,7 @@ class SearchIndex:
             close_connection(self._conn)  # a failure sets close_failed() at once, whatever a retry then does
             self._conn = None
         self._close_readers()
-        for suffix in ("", "-wal", "-shm"):
-            Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+        self._remove_file()  # never a file another connection holds
         self._create()
         self._conn, self.vectors = self._connect()
         self._conn.execute("PRAGMA journal_mode = WAL")
@@ -716,7 +781,7 @@ class SearchIndex:
             self.damaged = self.building = True  # no read admitted from here (the rebuild sets it too)
             again = self._fresh
             if again:
-                self.unusable = True
+                self.unusable, self._down_since = True, time.time()
         if again:
             log.error("the search index rebuilt by this process is damaged again; it is tried again later")
             try:

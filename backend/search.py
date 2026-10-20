@@ -403,7 +403,7 @@ async def _index_run(state, harness, active, project_id, inputs):
     index, db, run_id = state.get("index"), harness.db, active.run_id
     if index is None:
         raise RunOutcome("failed", "index_unavailable")
-    if index.unusable:  # its whole rebuild failed, or a rebuilt file was damaged again: a run asked since retries it now
+    if index.unusable:  # its whole rebuild failed, or a rebuilt file was damaged again: a run asked since retries it
         asked = await asyncio.to_thread(db.read, lambda conn: conn.execute(
             "SELECT (julianday(started_at) - 2440587.5) * 86400 FROM runs WHERE id = ?", (run_id,)).fetchone())
         if asked is not None:
