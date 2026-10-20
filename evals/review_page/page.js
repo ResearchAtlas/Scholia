@@ -40,7 +40,7 @@
 
   let data = null;
   let index = 0;
-  const edits = {};  // each question's open edit form, by item id: a response only ever touches its own item's
+  const edits = Object.create(null);  // each question's open edit form, by item id: a response touches only its own
   let pending = null;  // the last save not answered as saved, for Try again
   const passageCache = {};
 
@@ -158,10 +158,13 @@
 
   function editBody(question, ed) {
     const form = el('form', { class: 'edit', on: { submit: (event) => { event.preventDefault(); saveEdit(question, ed); } } });
-    if (ed.showSaved) {  // after a conflict: the question as saved elsewhere, above the rater's open edit
+    if (ed.showSaved) {  // after a conflict: the label as saved elsewhere (a drop included), above the rater's open edit
       const saved = effective(question);
+      const label = data.labels[question.id];
       form.append(el('section', { class: 'saved-elsewhere', 'aria-label': t('edit.savedElsewhere') },
-        el('h3', { text: t('edit.savedElsewhere') }), el('p', { lang: question.query_language, text: saved.text }),
+        el('h3', { text: t('edit.savedElsewhere') }),
+        label ? el('p', { class: 'label', text: label.state === 'done' ? t(`q.label.${label.decision}`) : t('state.changed') }) : null,
+        el('p', { lang: question.query_language, text: saved.text }),
         saved.answerable ? el('p', { lang: question.query_language, text: `${t('q.shortAnswer')}: ${saved.short_answer}` })
           : el('p', { text: t('q.unanswerable') }),
         ...(saved.answerable ? saved.evidence.map((ev, n) => el('div', { class: 'evidence' },
@@ -196,7 +199,8 @@
     const paper = el('select', { id: 'pickPaper', on: { change: (event) => { ed.paper = event.target.value; fill(); } } },
       ...Object.entries(data.papers).map(([id, title]) => el('option', { value: id, text: title })));
     paper.value = ed.paper;
-    const filter = el('input', { id: 'pickFilter', type: 'search', on: { input: (event) => { ed.filter = event.target.value; fill(); } } });
+    const filter = el('input', { id: 'pickFilter', type: 'search', on: { input: (event) => { ed.filter = event.target.value; fill(); },
+                                                                         keydown: (event) => { if (event.key === 'Enter') event.preventDefault(); } } });
     filter.value = ed.filter;
     const target = el('select', { id: 'pickTarget', on: { change: (event) => { ed.target = event.target.value; } } },
       el('option', { value: 'new', text: t('edit.newItem') }),
@@ -226,8 +230,10 @@
     return box;
   }
 
+  const asShown = (ed) => ({ text: ed.text, answerable: ed.answerable, short_answer: ed.short_answer, evidence: ed.evidence });
+
   function saveEdit(question, ed) {
-    decide(whole({ ...question, text: ed.text, answerable: ed.answerable, short_answer: ed.short_answer, evidence: ed.evidence }));
+    decide(whole({ ...question, ...asShown(ed) }));
   }
 
   function pairBody(pair) {
@@ -256,6 +262,12 @@
     renderList();
   }
 
+  function refreshCounts() {
+    $('progress').textContent = t('progress', { done: data.done, total: data.total });
+    $('nextOpen').disabled = firstOpen() === -1;
+    renderList();
+  }
+
   function go(i) {  // an open edit stays with its question, to come back to
     if (i < 0 || i >= data.items.length) return;
     index = i;
@@ -270,7 +282,7 @@
   }
 
   async function send(request) {
-    if (saving) return;
+    if (saving) { setStatus(t('status.wait')); return; }
     saving = true;
     try { await save(request); } finally { saving = false; }
   }
@@ -287,20 +299,23 @@
       pending = null;
       data.labels[request.item] = answer.body.label;
       data.done = answer.body.done;
-      delete edits[request.item];
+      // The item's open edit closes only when it is what was saved: one opened or changed since stays open.
+      const ed = edits[request.item];
+      const question = data.items.find((it) => it.id === request.item);
+      if (ed && JSON.stringify(whole({ ...question, ...asShown(ed) })) === JSON.stringify(request.label)) delete edits[request.item];
       const wasHere = here();  // the rater may have moved to another question while it was saving
-      if (wasHere) {
+      if (wasHere && !edits[request.item]) {
         const next = firstOpen(index + 1);
         if (next !== -1) index = next;
       }
-      render();
-      if (wasHere) $('itemHeading').focus();
+      if (wasHere) { render(); $('itemHeading').focus(); } else { refreshCounts(); }  // another form is left as typed
       setStatus(t('status.saved', { n }));
     } else if (answer.status === 409) {
       pending = null;
       data.labels[request.item] = answer.body.label;
+      if (Number.isInteger(answer.body.done)) data.done = answer.body.done;
       if (edits[request.item]) edits[request.item].showSaved = true;  // kept as typed, with the saved one above it
-      render();
+      if (here()) render(); else refreshCounts();
       setStatus(edits[request.item] ? t('status.conflictEditing', { n }) : t('status.conflict', { n }));
     } else if (answer.status === 400 || answer.status === 413) {
       pending = null;
@@ -315,14 +330,15 @@
   document.addEventListener('keydown', (event) => {
     if (!data || event.altKey || event.ctrlKey || event.metaKey) return;
     const ed = data.kind === 'questions' ? edits[item().id] : null;
+    if (event.isComposing) return;  // a key that belongs to an input method (Chinese typing) is never a command
     if (event.target.closest('input, textarea, select')) {
-      if (event.key === 'Escape' && ed) { delete edits[item().id]; render(); $('itemHeading').focus(); }
+      if (event.key === 'Escape' && ed && window.confirm(t('edit.cancelAsk'))) { delete edits[item().id]; render(); $('itemHeading').focus(); }
       return;
     }
     const key = event.key.toLowerCase();
     const actions = data.kind === 'pairs'
       ? { 1: () => decide({ category: 'supported' }), 2: () => decide({ category: 'partly' }), 3: () => decide({ category: 'unsupported' }) }
-      : ed ? { escape: () => { delete edits[item().id]; render(); } }
+      : ed ? { escape: () => { if (window.confirm(t('edit.cancelAsk'))) { delete edits[item().id]; render(); } } }
         : { k: keepShown, e: startEdit, d: dropShown };
     const move = { arrowleft: () => go(index - 1), arrowright: () => go(index + 1) };
     const action = actions[key] ?? move[key];

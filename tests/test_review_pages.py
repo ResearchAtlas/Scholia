@@ -569,6 +569,8 @@ def test_an_edit_repeating_another_questions_text_is_refused_naming_the_rule(tmp
         gold.Review(2, folder, "questions", "harold")
     with pytest.raises(gold.Refused, match="have the same text"):
         gold.apply(drafted, labels, page.review.papers)
+    with pytest.raises(SystemExit, match="have the same text"):
+        gold.main(["agreement", "--field", "2", "--folder", str(folder), "--set", "questions", "--raters", "harold", "lee"])
     report = asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
     assert any("as labeled, questions: q01, q02 have the same text" in p for p in report["problems"])
 
@@ -654,3 +656,25 @@ def test_a_malformed_labels_file_is_refused_naming_the_label_never_a_crash(tmp_p
         gold.Review(2, folder, "questions", "harold")
     report = asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
     assert any(p.startswith("field2-questions.harold.json: label q01") for p in report["problems"])
+
+
+def test_a_conflict_answers_with_the_saved_label_and_the_count_done(tmp_path, pages):
+    folder = field(tmp_path)
+    one, two = pages(folder, "questions"), pages(folder, "questions")
+    assert one.save("q03", {"decision": "drop"}, base=0)[0] == 200
+    status, answer = two.send("q03", base=0)
+    assert status == 409 and answer["label"]["decision"] == "drop" and answer["done"] == 1
+
+
+def test_malformed_choices_revisions_and_lengths_are_refused_never_a_dead_request(tmp_path, pages):
+    folder = field(tmp_path)
+    page = pages(folder, "questions")
+    good = pick(page, "2601.00001v1", 1)
+    for choice in ({**good, "paper": ["2601.00001v1"]}, {**good, "ordinal": [1]}, {**good, "key": 5}):
+        assert page.send("q01", evidence=[[choice]]) == (400, {"code": "evidence_invalid"})
+    status, payload, _ = page.request("POST", "/api/label", raw=b"{}", length="²")  # a digit int() refuses
+    assert status == 411 and json.loads(payload)["code"] == "length_required"
+    doc = json.loads((folder / "pairs.json").read_text())
+    labels = {"set": doc["id"], "kind": "pairs", "field": 2, "rater": "harold", "set_sha256": "x", "labels": {
+        "p01": {"item_sha256": gold.item_sha256(doc["items"][0]), "revision": True, "saved_at": "t", "category": "partly"}}}
+    assert gold.check_labels(labels, doc, page.review.papers) == ["label p01: revision is not a count"]

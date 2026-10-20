@@ -417,12 +417,12 @@ def label_problems(item_id, label, kind, field, papers):
         if found:
             return found
         found += [] if label["category"] in CATEGORIES else [f"{where}: category {label['category']!r}"]
-        return found + ([] if isinstance(label["revision"], int) and label["revision"] >= 1
+        return found + ([] if is_count(label["revision"])
                         else [f"{where}: revision is not a count"])
     found = _keys(where, label, ("item_sha256", "revision", "saved_at", "decision"), CONTENT)
     if found:
         return found
-    if not (isinstance(label["revision"], int) and label["revision"] >= 1):
+    if not is_count(label["revision"]):
         found.append(f"{where}: revision is not a count")
     if label["decision"] not in DECISIONS:
         return found + [f"{where}: decision {label['decision']!r}"]
@@ -437,6 +437,10 @@ def label_problems(item_id, label, kind, field, papers):
     if not (isinstance(label["evidence"], list) and all(isinstance(ev, list) and ev for ev in label["evidence"])):
         return found + [f"{where}: evidence is not a list of evidence items"]
     return found + [p for ev in label["evidence"] for loc in ev for p in check_locator(f"{where} evidence", loc, field, papers)]
+
+
+def is_count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 def effective_items(set_doc, labels):
@@ -1069,7 +1073,8 @@ class Review:
 
     def locator(self, choice):
         """The locator of a passage the rater chose: a usable passage of a listed paper, from the worksheet."""
-        if not (isinstance(choice, dict) and set(choice) == {"paper", "ordinal", "key"}):
+        if not (isinstance(choice, dict) and set(choice) == {"paper", "ordinal", "key"} and isinstance(choice["paper"], str)
+                and isinstance(choice["ordinal"], int) and isinstance(choice["key"], str)):
             raise ValueError("evidence_invalid")
         found = self.passages.get(choice["paper"], {}).get(choice["ordinal"])
         if found is None or isinstance(choice["ordinal"], bool) or choice["key"] != passage_key(choice["paper"], found["ordinal"], found["text"]):
@@ -1134,7 +1139,7 @@ class Review:
             self.labels = self.read_labels()
             current = self.labels.get(item["id"])
             if body["base"] != (current["revision"] if current else 0):
-                return 409, {"code": "changed_elsewhere", "label": self.shown_label(item["id"])}
+                return 409, {"code": "changed_elsewhere", "label": self.shown_label(item["id"]), "done": self.done()}
             try:
                 label = self.label_of(item, body["label"])
             except ValueError as error:
@@ -1220,7 +1225,10 @@ class _Handler(BaseHTTPRequestHandler):
             found = review.paper_passages((parse_qs(urlsplit(self.path).query).get("paper") or [""])[0])
             return self._send(200, {"passages": found}) if found is not None else self._send(404, {"code": "not_found"})
         if self.command == "POST" and path == "/api/label":
-            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._send(411, {"code": "length_required"})
             if length > MAX_BODY:
                 return self._send(413, {"code": "request_too_large"})
             try:

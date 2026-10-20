@@ -1578,7 +1578,6 @@ async function goldPages(ctx) {
       check("q04's answer left q05's open edit as typed", await heading().textContent() === G('item.heading', { n: 5, total: 6 })
         && await page.getByLabel(G('edit.text'), { exact: true }).inputValue() === '长段落主要讨论了检索深度吗？');
       check('q04 was kept, read back from the labels file', labels('questions').q04?.decision === 'keep');
-      await page.keyboard.press('Escape');
       isolated();
     });
 

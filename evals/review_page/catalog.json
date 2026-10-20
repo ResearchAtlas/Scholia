@@ -77,7 +77,9 @@
   "status.conflictEditing": "Item {n} is not saved: it was saved in another window. Your edit is kept below, with the question as saved shown above it; save again to replace the saved question with yours.",
   "edit.savedElsewhere": "As saved now",
   "error.duplicate_text": "Another question already has this text. Change it so that each question is asked once.",
-  "error.unanswerable_has_no_answer": "An unanswerable question has no short answer and no evidence."
+  "error.unanswerable_has_no_answer": "An unanswerable question has no short answer and no evidence.",
+  "edit.cancelAsk": "Close this edit? What you typed in it will be lost.",
+  "status.wait": "A save is still on its way. Try again in a moment."
  },
  "zh-CN": {
   "page.title": "标准集审阅",
@@ -157,6 +159,8 @@
   "status.conflictEditing": "第 {n} 项未保存：它已在另一个窗口中保存。你的编辑保留在下方，已保存的问题显示在其上方；再次保存将用你的版本替换已保存的问题。",
   "edit.savedElsewhere": "当前已保存的版本",
   "error.duplicate_text": "已有另一个问题使用相同的文本。请修改，使每个问题只出现一次。",
-  "error.unanswerable_has_no_answer": "无法回答的问题没有简短回答，也没有证据。"
+  "error.unanswerable_has_no_answer": "无法回答的问题没有简短回答，也没有证据。",
+  "edit.cancelAsk": "要关闭这个编辑吗？其中输入的内容将会丢失。",
+  "status.wait": "仍有一次保存正在进行。请稍后再试。"
  }
 }
