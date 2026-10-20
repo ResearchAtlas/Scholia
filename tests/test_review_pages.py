@@ -678,3 +678,31 @@ def test_malformed_choices_revisions_and_lengths_are_refused_never_a_dead_reques
     labels = {"set": doc["id"], "kind": "pairs", "field": 2, "rater": "harold", "set_sha256": "x", "labels": {
         "p01": {"item_sha256": gold.item_sha256(doc["items"][0]), "revision": True, "saved_at": "t", "category": "partly"}}}
     assert gold.check_labels(labels, doc, page.review.papers) == ["label p01: revision is not a count"]
+
+
+def test_every_id_keyed_lookup_in_the_page_has_no_inherited_keys():
+    # An id such as 'constructor' passes the id rules, so no lookup keyed by one may be a plain object.
+    script = (PAGE / "page.js").read_text()
+    assert not re.search(r"=\s*\{\s*\}\s*;", script)  # no plain-object cache or map
+    for name in ("passageCache = new Map()", "edits = Object.create(null)", "strings = Object.create(null)",
+                 "data.papers = Object.assign(Object.create(null)", "data.labels = Object.assign(Object.create(null)"):
+        assert name in script, name
+
+
+def test_a_paper_named_constructor_is_served_like_any_other(tmp_path, pages):
+    folder = field(tmp_path, 1)
+    papers = json.loads((folder / "papers.json").read_text())
+    papers["papers"][0]["id"] = "constructor"
+    for name in ("questions", "pairs"):
+        doc = json.loads((folder / f"{name}.json").read_text())
+        text = json.dumps(doc).replace('"p-wages"', '"constructor"')
+        (folder / f"{name}.json").write_text(text)
+    (folder / "papers.json").write_text(json.dumps(papers))
+    sheet = json.loads((gold.outputs(folder) / "worksheet.json").read_text())
+    sheet["papers"] = {("constructor" if k == "p-wages" else k): v for k, v in sheet["papers"].items()}
+    sheet["papers_sha256"] = gold.sha256_of(folder / "papers.json")
+    gold.write_json(gold.outputs(folder) / "worksheet.json", sheet)
+    page = pages(folder, "questions", number=1)
+    assert "constructor" in page.get("/api/data")[1]["papers"]
+    assert page.get("/api/passages?paper=constructor")[0] == 200
+    assert page.send("q01", evidence=[[pick(page, "constructor", 1)]])[0] == 200

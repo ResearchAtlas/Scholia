@@ -16,7 +16,7 @@
   } catch { /* nothing kept */ }
   lang = lang === 'zh-CN' ? 'zh-CN' : 'en';
 
-  let strings = {};
+  let strings = Object.create(null);
   const t = (key, vars = {}) => (strings[key] ?? key).replace(/\{(\w+)\}/g, (all, name) => (name in vars ? String(vars[name]) : all));
   const $ = (id) => document.getElementById(id);
   const el = (tag, attrs = {}, ...children) => {
@@ -42,7 +42,7 @@
   let index = 0;
   const edits = Object.create(null);  // each question's open edit form, by item id: a response touches only its own
   let pending = null;  // the last save not answered as saved, for Try again
-  const passageCache = {};
+  const passageCache = new Map();  // by paper id; every id-keyed lookup here has no inherited keys (an id may be 'constructor')
 
   const item = () => data.items[index];
   const stateOf = (id) => data.labels[id]?.state ?? 'open';
@@ -149,11 +149,11 @@
   }
 
   async function passagesOf(paper) {
-    if (!passageCache[paper]) {
+    if (!passageCache.has(paper)) {
       const answer = await api(`/api/passages?paper=${encodeURIComponent(paper)}`);
-      passageCache[paper] = answer.status === 200 ? answer.body.passages : [];
+      passageCache.set(paper, answer.status === 200 ? answer.body.passages : []);
     }
-    return passageCache[paper];
+    return passageCache.get(paper);
   }
 
   function editBody(question, ed) {
@@ -346,13 +346,15 @@
   });
 
   async function start() {
-    try { strings = (await (await fetch('catalog.json')).json())[lang]; } catch { strings = {}; }
+    try { strings = Object.assign(Object.create(null), (await (await fetch('catalog.json')).json())[lang]); } catch { /* ids shown */ }
     document.documentElement.lang = lang;
     for (const e of document.querySelectorAll('[data-i18n]')) e.textContent = t(e.dataset.i18n);
     for (const e of document.querySelectorAll('[data-i18n-aria]')) e.setAttribute('aria-label', t(e.dataset.i18nAria));
     const answer = await api('/api/data').catch(() => ({ status: 0 }));
     if (answer.status !== 200) { $('title').textContent = t('load.failed'); $('card').hidden = true; return; }
     data = answer.body;
+    data.papers = Object.assign(Object.create(null), data.papers);  // keyed by paper and item ids: nothing inherited
+    data.labels = Object.assign(Object.create(null), data.labels);
     const title = t(`title.${data.kind}`, { field: data.field });
     $('title').textContent = data.sample ? t('title.sample', { title }) : title;
     document.title = `${$('title').textContent} · ${t('page.title')}`;
