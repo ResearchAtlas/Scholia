@@ -215,7 +215,7 @@ async def test_a_private_title_run_resumed_after_a_restart_reads_the_catalog_fir
     provider = MockProvider(catalog=[MODEL], zero_retention=[MODEL])
     async with started(data, provider, keyring=keyring, setup=False) as client:
         await background_idle(client)
-        assert [body["provider"] for body in provider.titles] == [{"zdr": True, "only": ["example"]}]
+        assert [body["provider"] for body in provider.titles] == [{"zdr": True, "only": ["example"], "require_parameters": True}]
         assert await rows(client, "SELECT status FROM runs WHERE workflow = 'title'") == [("succeeded",)]
 
 

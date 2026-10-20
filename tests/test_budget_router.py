@@ -1,4 +1,5 @@
-"""The run plan and the pre-send estimate (budget_router.py), and per-endpoint prices (endpoint_pricing.py)."""
+"""The run plan and the pre-send estimate (budget_router.py), per-endpoint prices (endpoint_pricing.py) and what a
+request can reach (reach.py)."""
 
 import httpx
 import pytest
@@ -24,23 +25,20 @@ def test_task_signal(query, has_files, signal):
 
 
 def test_auto_takes_the_balanced_tier_on_openrouter_and_needs_a_model_elsewhere():
-    plan = budget_router.create_run_plan("hi", "auto", lambda m: Route(OPENROUTER, m))
+    plan = budget_router.create_run_plan("hi", "auto")
     assert (plan.model, plan.policy_reason, plan.model_tier) == (budget_router.MODEL_TIERS["mid"][0], "auto_mid_tier", "mid")
-    assert plan.predicted_cost > 0
-    plan = budget_router.create_run_plan("hi", "auto", lambda m: Route(GENERIC, m), is_openrouter=False)
-    assert (plan.model, plan.policy_reason, plan.predicted_cost) == (None, "model_needed", 0.0)
-    plan = budget_router.create_run_plan("hi", "llama", lambda m: Route(GENERIC, m), is_openrouter=False)
+    assert plan.predicted_cost is None  # estimated once the answer step's request is built
+    plan = budget_router.create_run_plan("hi", "auto", is_openrouter=False)
+    assert (plan.model, plan.policy_reason) == (None, "model_needed")
+    plan = budget_router.create_run_plan("hi", "llama", is_openrouter=False)
     assert (plan.model, plan.policy_reason) == ("llama", "chosen_model")
 
 
-def test_estimates_are_conservative_and_grow_with_effort_and_mode():
-    route = Route(OPENROUTER, "unpriced/model")  # unknown price: $1 in, $5 out per million
-    quick = budget_router.estimate_message_cost("quick", route, "minimal")
-    assert quick == pytest.approx((2000 * 1 + 500 * 5) / 1e6)
-    assert budget_router.estimate_message_cost("standard", route) > quick  # no effort counts as medium
-    assert budget_router.estimate_message_cost("standard", route, "high") > budget_router.estimate_message_cost(
-        "standard", route, "low")
-    assert budget_router.estimate_title_cost(route) == pytest.approx((600 + 40 * 5) / 1e6)
+def test_an_estimate_counts_the_request_and_its_whole_output_limit_at_the_given_rates():
+    rates = {"input": 2e-6, "output": 1e-5, "request": 0.004}
+    assert budget_router.request_cost(rates, 1000, 8000) == pytest.approx(1000 * 2e-6 + 8000 * 1e-5 + 0.004)
+    # Unpriced: $1 in and $5 out per million, never $0.
+    assert budget_router.request_cost(budget_router.UNKNOWN_RATES, 2000, 1024) == pytest.approx((2000 + 1024 * 5) / 1e6)
 
 
 @pytest.mark.parametrize("usage, expected", [
@@ -51,7 +49,7 @@ def test_estimates_are_conservative_and_grow_with_effort_and_mode():
     ({}, None),
 ])
 def test_cost_from_reported_tokens(usage, expected):
-    assert budget_router.cost_from_usage(Route(OPENROUTER, "unpriced/model"), usage) == expected
+    assert budget_router.cost_from_usage(budget_router.UNKNOWN_RATES, usage) == expected
 
 
 ENDPOINTS = {"data": {"endpoints": [
@@ -79,3 +77,198 @@ async def test_a_pinned_endpoint_is_priced_exactly_by_its_tag():
     odd = await endpoint_pricing.fetch_endpoint_pricing(client, OPENROUTER, "m", "odd")
     assert odd["unaccounted_nonzero_price_keys"] == ["new_fee"]  # never silently dropped
     assert endpoint_pricing.normalize_provider_name("Google Vertex") == endpoint_pricing.normalize_provider_name("google-vertex")
+
+
+def test_overrides_count_as_price_and_an_unaccounted_one_refuses():
+    # Model-route rule 6: pricing.overrides holds rates such as long-context ones; the highest applies.
+    long_context = {"prompt": "0.00000125", "completion": "0.00001",
+                    "overrides": [{"min_prompt_tokens": 272000, "prompt": "0.0000025", "completion": "0.000015"}]}
+    price = endpoint_pricing.price_endpoint("u", {"tag": "t", "pricing": long_context})
+    assert (price["max_input_per_token"], price["max_output_per_token"]) == (0.0000025, 0.000015)
+    assert price["unaccounted_nonzero_price_keys"] == []
+    cached = {"prompt": "0.000001", "completion": "0.000002", "input_cache_write": "0.00000125", "request": "0.01",
+              "overrides": {"long": {"input_cache_write_1h": "0.000003", "web_search": "0.02"}}}
+    price = endpoint_pricing.price_endpoint("u", {"tag": "t", "pricing": cached})
+    assert (price["max_input_per_token"], price["per_request_usd"]) == (0.000003, 0.03)
+    odd = endpoint_pricing.price_endpoint("u", {"tag": "t", "pricing": {
+        "prompt": "0.000001", "completion": "0.000002", "overrides": [{"threshold": 1000, "surcharge": "0.5"}]}})
+    assert odd["unaccounted_nonzero_price_keys"] == ["overrides.0.surcharge", "overrides.0.threshold"]
+
+
+@pytest.mark.parametrize("overrides", [{"surcharge": 1}, "0.5", ["0.5"], {"min_prompt_tokens": "272000"}, {"flag": True}])
+def test_an_override_that_is_not_a_known_rate_or_condition_refuses_the_route(overrides):
+    # The external review's A3: only named conditions are conditions; with zero base rates, an unknown
+    # charge must not leave a $0 estimate.
+    from backend import reach
+    endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [],
+                "pricing": {"prompt": "0", "completion": "0", "overrides": overrides}}
+    assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced"
+
+
+def test_every_published_rate_counts_and_a_missing_or_unknown_one_refuses():
+    # The external review's A2, with Harold's answer (2026-10-20): a missing prompt or completion rate
+    # refuses the route; the endpoint's other published charges count, and an unknown one refuses.
+    from backend import reach
+    endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [],
+                "pricing": {"prompt": "0.000002", "completion": "0.1", "request": "1"}}
+    found = reach.reach(OPENROUTER, {}, [endpoint])
+    assert (found.problem, found.rates) == (None, {"input": 0.000002, "output": 0.1, "request": 1.0})
+    endpoint["pricing"]["new_fee"] = "2"
+    assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced"
+    del endpoint["pricing"]["prompt"], endpoint["pricing"]["new_fee"]
+    assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced"
+    # A provider without per-endpoint prices (an OpenAI-compatible server) keeps the unknown-price rates.
+    assert reach.reach(GENERIC, {"context_length": 8192}, None).rates == budget_router.UNKNOWN_RATES
+
+
+def test_what_a_request_can_reach():
+    from backend import reach
+    listing = [{"tag": "a", "context_length": 131072, "supported_parameters": ["reasoning"],
+                "pricing": {"prompt": "0.000001", "completion": "0.000004"}},
+               {"tag": "a/turbo", "context_length": 32768, "supported_parameters": [],
+                "pricing": {"prompt": "0.000003", "completion": "0.000002"}},
+               {"tag": "b", "context_length": 65536, "supported_parameters": ["reasoning"],
+                "pricing": {"prompt": "0.000002", "completion": "0.000005"}}]
+    found = reach.reach(OPENROUTER, {}, listing)
+    # Every endpoint: the smallest window; the highest rates any of them publishes.
+    assert (found.tags, found.window, found.problem) == (("a", "a/turbo", "b"), 32768, None)
+    assert found.rates == {"input": 0.000003, "output": 0.000005, "request": 0.0}
+    # An endpoint that publishes no prompt or completion rate is not estimated (Harold, 2026-10-20).
+    for pricing in ({}, {"prompt": "0.000001"}, {"completion": "0.000001", "request": "0.01"}):
+        assert reach.reach(OPENROUTER, {}, [*listing, {**listing[2], "tag": "c", "pricing": pricing}]).problem \
+            == "route_unpriced", pricing
+    # Rule 1: a parameter the request relies on narrows it to the endpoints that list it.
+    assert reach.reach(OPENROUTER, {}, listing, needs=("reasoning",)).tags == ("a", "b")
+    # A pin must name exactly one endpoint: a base slug that reaches a variant too is refused.
+    assert reach.reach(OPENROUTER, {}, listing, pin="b").tags == ("b",)
+    assert reach.reach(OPENROUTER, {}, listing, pin="a").problem == "route_unsupported"
+    # Private: only the zero-retention endpoints it is limited to, and the variants a base slug reaches.
+    row = {"zdr_endpoints": {"usable": ["a"], "small": []}}
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True).tags == ("a", "a/turbo")
+    assert reach.reach(OPENROUTER, {"zdr_endpoints": {"usable": ["c"]}}, listing,
+                       zero_retention=True).problem == "route_unverified"
+    assert reach.reach(OPENROUTER, {}, None).problem == "route_unverified"  # no listing read
+    assert reach.reach(OPENROUTER, {}, [{**listing[0], "pricing": {"prompt": "0", "completion": "0",
+                                                                   "new_fee": "1"}}]).problem == "route_unpriced"
+    assert reach.reach(GENERIC, {"context_length": 8192}, None) == reach.Reach((), 8192, budget_router.UNKNOWN_RATES)
+    # A rate that is no price (-1 for a variable-priced router, or not finite) refuses: never $0.
+    for bad in ("-1", "nan", "inf"):
+        for pricing in ({"prompt": bad, "completion": "0.000001"},
+                        {"prompt": bad, "completion": bad, "request": "0", "input_cache_write": "0"},  # zeros beside it
+                        {"prompt": "0.000001", "completion": "0.000002", "overrides": [{"completion": bad}]}):
+            assert reach.reach(OPENROUTER, {}, [{**listing[0], "pricing": pricing}]).problem == "route_unpriced", pricing
+    # An endpoint that reports no window leaves the smallest reported one as the report, which a
+    # setting may lower but never raise; the smallest completion limit listed caps the output.
+    unreported = [{**listing[0], "context_length": None}, {**listing[1], "max_completion_tokens": 4096},
+                  {**listing[2], "max_completion_tokens": 16384}]
+    found = reach.reach(OPENROUTER, {}, unreported)
+    assert (found.window, found.output, found.unreported) == (32768, 4096, True)  # a setting must also be made
+    from backend import providers
+    assert providers.window({"default_window": 131072}, "m", found.window)["in_use"] == 32768
+
+
+def test_a_flag_where_a_rate_should_be_refuses():
+    # Internal review a3 (P3-1): JSON true or false is no price, as the catalog's own reader holds.
+    from backend import reach
+    for flag in (True, False):
+        endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [],
+                    "pricing": {"prompt": flag, "completion": flag}}
+        assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced", flag
+
+
+@pytest.mark.parametrize("pricing", [
+    {"prompt": "0", "completion": "0", "input_cache_read": "0.01"},
+    {"prompt": "0", "completion": "0", "overrides": [{"min_prompt_tokens": 1000, "input_cache_read": "0.01"}]},
+    {"prompt": "0", "completion": "0", "input_cache_read_5m": "0.01"},
+])
+def test_a_cache_read_rate_counts_toward_the_input_rate(pricing):
+    # External review a2: every input-side charge the reader accepts is in the highest input rate,
+    # at the base level and inside overrides, so no estimate comes out at $0.
+    from backend import reach
+    endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": ["max_tokens"], "pricing": pricing}
+    assert reach.reach(OPENROUTER, {}, [endpoint]).rates["input"] == 0.01
+
+
+def test_every_accepted_price_key_is_counted_or_refuses():
+    # The sweep: a non-zero rate under each key the reader knows either raises the estimate or refuses.
+    from backend import reach
+    base = {"prompt": "0", "completion": "0"}
+    counted = {"prompt": "input", "input_cache_write": "input", "input_cache_write_1h": "input",
+               "input_cache_read": "input", "completion": "output", "internal_reasoning": "output",
+               "request": "request", "web_search": "request"}
+    from backend import endpoint_pricing
+    inapplicable = {"image", "audio", "input_audio_cache", "video"}
+    # Tied to the reader's own list: a key added there must be placed here too (review a4, P3-3).
+    assert {k for k in counted if not k.startswith("input_cache")} | inapplicable | {"discount", "overrides"} \
+        == endpoint_pricing._ACCOUNTED_PRICE_KEYS
+    assert endpoint_pricing._CACHE_KEY_PREFIXES == ("input_cache_write", "input_cache_read")
+    for key, side in counted.items():
+        endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [], "pricing": {**base, key: "0.5"}}
+        assert reach.reach(OPENROUTER, {}, [endpoint]).rates[side] >= 0.5, key
+    # Inapplicable to text-only requests: image, audio and video input. An image output rate refuses.
+    for key, problem in (("image", None), ("audio", None), ("input_audio_cache", None), ("video", None),
+                         ("image_output", "route_unpriced"), ("something_new", "route_unpriced")):
+        endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [], "pricing": {**base, key: "0.5"}}
+        assert reach.reach(OPENROUTER, {}, [endpoint]).problem == problem, key
+
+
+def test_a_private_request_never_reaches_an_endpoint_the_listing_reports_at_8192_or_less():
+    # External review a2: the zero-retention listing said 131,072; the model's endpoint listing says
+    # 8,192 (or nothing). Section 6.4 holds by the listing's own report as well.
+    from backend import reach
+    row = {"zdr_endpoints": {"usable": ["example"], "small": []}}
+    for window in (8192, 4096, None):
+        listing = [{"tag": "example", "context_length": window, "supported_parameters": ["max_tokens"],
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"}}]
+        assert reach.reach(OPENROUTER, row, listing, zero_retention=True).problem == "route_unsupported", window
+    listing[0]["context_length"] = 8193
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True).problem is None
+    # A variant of a usable base slug is reachable through it: its window counts too (review a4, P3-1).
+    variant = {**listing[0], "tag": "example/turbo", "context_length": 4096}
+    assert reach.reach(OPENROUTER, row, [*listing, variant], zero_retention=True).problem == "route_unsupported"
+
+
+
+def _variant_case(**variant):
+    from backend.openrouter import routing
+    row = {"zdr_endpoints": {"usable": ["example"], "small": []}}
+    base = {"tag": "example", "context_length": 131072, "max_completion_tokens": 16384,
+            "supported_parameters": ["max_tokens"], "pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+    listing = [base, {**base, "tag": "example/turbo", **variant}]
+    return row, listing, routing(row, zdr_enabled=True, require=True)
+
+
+def test_the_bounds_and_the_routing_sent_come_from_one_set_of_endpoints():
+    # External review a3 (A9): the routing a request sends (provider.only ["example"]) reaches the
+    # variant "example/turbo", so the variant's smaller window, smaller completion limit or higher price
+    # changes the request's bound, or a variant that cannot be bounded refuses the route.
+    from backend import reach
+    row, listing, routing = _variant_case()
+    assert routing["only"] == ["example"] and [e["tag"] for e in reach.reachable(listing, routing, ("max_tokens",))] \
+        == ["example", "example/turbo"]
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).tags == (
+        "example", "example/turbo")
+    for variant, field, expected in (({"context_length": 16384}, "window", 16384),
+                                     ({"max_completion_tokens": 1024}, "output", 1024)):
+        row, listing, _ = _variant_case(**variant)
+        assert getattr(reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)),
+                       field) == expected, variant
+    row, listing, _ = _variant_case(pricing={"prompt": "0.00003", "completion": "0.00006"})
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).rates == {
+        "input": 0.00003, "output": 0.00006, "request": 0.0}
+    for variant in ({"context_length": 8192}, {"context_length": None}, {"pricing": {}}):
+        row, listing, _ = _variant_case(**variant)
+        assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).problem \
+            in ("route_unsupported", "route_unpriced"), variant
+    # Private's 8,192 rule is checked before parameters narrow the set (review a5, P2-1): a small variant
+    # whose listing does not say it takes max_tokens still refuses.
+    for parameters in ([], None):
+        row, listing, _ = _variant_case(context_length=4096, supported_parameters=parameters)
+        assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).problem \
+            == "route_unsupported", parameters
+    # A variant that does not take a required parameter is excluded by require_parameters, as the bound is.
+    row, listing, routing = _variant_case(supported_parameters=[], context_length=16384)
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).window == 131072
+    # An ignored tag (a small endpoint) and its variants are reached by neither the routing nor the bound.
+    assert reach.reachable([{"tag": "s/x"}, {"tag": "big"}], {"zdr": True, "only": ["big", "s"], "ignore": ["s"]}) \
+        == [{"tag": "big"}]

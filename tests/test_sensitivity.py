@@ -245,7 +245,7 @@ async def test_continue_after_a_tightening_builds_its_turn_under_the_current_pol
         stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
                                                  json={"content": "Where were we?", "model": ZDR_MODEL}))
         await wait_for(lambda: provider.answers)
-        assert "provider" not in provider.answers[0]  # sent under Normal
+        assert "zdr" not in provider.answers[0]["provider"]  # sent under Normal
         await set_level(client, project, "private")
         revoked = events(await stream)[0]["run_id"]
         release.set()
@@ -255,7 +255,7 @@ async def test_continue_after_a_tightening_builds_its_turn_under_the_current_pol
         assert (await confirm_key(client)).status_code == 200
         continued = events(await client.post(f"/api/runs/{revoked}/continue", json={"model": ZDR_MODEL}))
         assert continued[-1]["status"] == "succeeded"
-        assert provider.answers[-1]["provider"] == {"zdr": True, "only": ["example"]}
+        assert provider.answers[-1]["provider"] == {"zdr": True, "only": ["example"], "require_parameters": True}
         assert [m["content"] for m in provider.answers[-1]["messages"][1:]] == ["Where were we?"]  # no recorded step reused
         turns = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert [(t["status"], t["cancel_reason"], t["continues"]) for t in turns] == [
@@ -472,7 +472,7 @@ async def test_a_revocation_that_begins_as_a_request_enters_the_transport_finds_
         request = revocation_requests(client, project, conversation)[change]
 
         def dispatched(*args):
-            if not order:
+            if not order and args[0].url.path.endswith("/chat/completions"):  # not the catalog's reads
                 loop.create_task(request())
                 loop.call_soon(time.sleep, 0.3)  # the loop is held up while the revocation commits
             real_dispatched(*args)
@@ -897,3 +897,31 @@ async def test_a_catalog_request_decided_before_a_restore_never_enters_the_trans
         go.set()
         await asyncio.wait({refresh}, timeout=5)
         assert refresh.done() and order == []
+
+
+@pytest.mark.parametrize("change", ["private", "local_only", "conversation_deleted", "project_deleted"])
+async def test_a_change_between_building_the_request_and_its_dispatch_sends_nothing(tmp_path, change):
+    # Lifecycle (S1-19, L3 and L4): a turn's request is built at admission, from the conversation and
+    # the project's instructions. A tightening or a deletion before its call is dispatched stops it:
+    # nothing is sent, and its reservation is released (or goes with its project).
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await new_project(client)
+        conversation = await new_conversation(client, project)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "a request built for a Normal project")
+        assert claim.context["request"].messages[-1]["content"] == "a request built for a Normal project"
+        if change in ("private", "local_only"):
+            assert (await set_level(client, project, change)).status_code == 200
+        elif change == "conversation_deleted":
+            assert (await client.delete(f"/api/conversations/{conversation}")).status_code in (200, 204)
+        else:
+            assert (await client.delete(f"/api/projects/{project}")).status_code in (200, 204)
+        [event async for event in harness.events(claim)]  # a revoked claim ends without starting
+        assert provider.chats == []
+        await background_idle(client)
+        record = await rows(client, "SELECT status, cancel_reason FROM runs WHERE id = ?", claim.run_id)
+        assert record == ([] if change == "project_deleted" or change == "conversation_deleted"
+                          else [("cancelled", "revoked")])
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'"
+                                  " OR settled_usd IS NOT NULL") == [(0,)]

@@ -7,7 +7,7 @@ import { post, stream } from './api.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
-const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), for this window
+const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut }, for this window
 const listeners = new Set();
 
 function set(conversationId, turn, eventType) {
@@ -25,7 +25,7 @@ export function subscribe(listener) {
 export function apply(turn, event) {
   switch (event.type) {
     case 'run_started': return { ...turn, runId: event.run_id };
-    case 'chat_response': return { ...turn, answer: event.content, resultSaved: event.result_saved };
+    case 'chat_response': return { ...turn, answer: event.content, resultSaved: event.result_saved, ...(event.cut ? { cut: true } : {}) };
     case 'error': return { ...turn, error: event.code };
     case 'limit_reached': return { ...turn, limit: true };
     case 'run_finished': return { ...turn, done: true };
@@ -44,7 +44,9 @@ export function send(conversationId, path, body, text) {
   return new Promise((admitted, refused) => {
     stream(path, body, (event) => {
       turn = apply(turn, event);
-      if (event.type === 'chat_response' && event.result_saved === false && turn.runId) unsaved.set(turn.runId, event.content);
+      if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
+        unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut) });
+      }
       set(conversationId, turn, event.type);
       if (turn.runId) admitted();
     }, abort.signal).catch((error) => {
