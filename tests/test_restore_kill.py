@@ -964,3 +964,50 @@ async def test_a_purge_that_cannot_remove_a_copy_in_staging_says_so(tmp_path, mo
         [(record,)] = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
             "SELECT data FROM audit_log WHERE event = 'backup_purge'").fetchall())
         assert json.loads(record)["staging_left"] == 1
+
+
+async def test_a_replayed_restore_whose_database_fails_to_close_is_not_put_back_at_launch(tmp_path, monkeypatch):
+    """Failing closed (PR 29 finding 47): the replayed, restored database cannot run, and its close fails: the
+    launch does not put the previous files back over it; the app is limited and the journal kept, so a later
+    launch finishes it."""
+    from backend.db import Database
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+    failing_recovery(monkeypatch, 1)
+
+    def close_writer(self):
+        raise OSError("disk I/O error")
+    put_back, real_back = [], backups_module._back
+    monkeypatch.setattr(Database, "_close_writer", close_writer)
+    monkeypatch.setattr(backups_module, "_back", lambda *args, **kwargs: put_back.append(args) or real_back(*args, **kwargs))
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "restart_required"  # outranks restore_interrupted
+    assert put_back == [] and (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_a_replay_that_ran_but_could_not_commit_and_whose_close_fails_is_not_put_back(tmp_path, monkeypatch):
+    """Review 4, F5: the replayed, restored database starts, its journal cannot be committed, and stopping it
+    (_stop) finds its close failing: the launch does not put the previous files back over it; the app is limited
+    and the journal kept."""
+    from backend.db import Database
+    data = tmp_path / "data"
+    backup, kept, later = await prepare(data)
+    await asyncio.to_thread(run_child, data, "forward", backup)
+
+    def commit(*args):
+        raise OSError("disk I/O error")
+    put_back, closes, real_back = [], [], backups_module._back
+    real_close_writer = Database._close_writer
+
+    def close_writer(self):
+        closes.append(self)
+        if len(closes) == 1:  # the restored database's, as _stop closes it
+            raise OSError("disk I/O error")
+        return real_close_writer(self)
+    monkeypatch.setattr(backups_module, "_commit_journal", commit)
+    monkeypatch.setattr(Database, "_close_writer", close_writer)
+    monkeypatch.setattr(backups_module, "_back", lambda *args, **kwargs: put_back.append(args) or real_back(*args, **kwargs))
+    async with started(data, setup=False) as client:
+        assert (await client.get("/api/projects")).json()["code"] == "restart_required"  # outranks restore_interrupted
+    assert closes and put_back == [] and (data / "backups" / backups_module.JOURNAL).exists()
