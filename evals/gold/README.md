@@ -21,6 +21,23 @@ Every drafted item is provisional. A rater's labels make it gold. The corrected 
 
 A locator names the paper, the passage's ordinal in the app's own reading (section 7.1), its page, kind and section, and quotes the passage whole. Character ranges are not part of a locator. Reference passages are never evidence. In field 2 every quote carries its attribution (authors, title, arXiv id with version) and that paper version's license (CC BY 4.0 or CC0 1.0). A pair's sentence is written in new words. The check refuses a sentence that shares more than 40 letters and digits in a row with its passage.
 
+## Field 2's drafts
+
+`field2/` holds the paper list and the drafts. The drafts are 100 questions and 100 citation pairs, as `settings.json` asks.
+- **The papers.** 24 arXiv paper versions, six in each of four topic groups: retrieval-augmented generation; citation and attribution in LLM answers; long-context evaluation; hallucination detection.
+  - The long-context group's query also returned method papers that test on long-context benchmarks, and the draw kept them.
+  - They were prepared on 2026-10-20 under the M2 charter's section 6, from arXiv itself. Each group's candidates were filtered by primary category, first-submission date, QASPER and language, then drawn with the group's recorded seed.
+  - **Recorded limits.**
+    - Each license rests on that exact version's own abstract page alone. arXiv's API returns no license field, so no second source could confirm it; arXiv's license help page says a license is chosen per version.
+    - Each group's candidates were also filtered by a title pattern, to keep the group coherent.
+    - The retrieval-augmented generation group drew from the 200 most recent of 1,525 listing results.
+  - `papers.json` records the criteria, queries, patterns and seeds.
+- **The drafting.** Claude drafted the questions and pairs in its own session from the passage worksheet (`gold.py passages`). No tool called a model.
+  - Each answerable question's evidence is the passages that answer it, and every quote is a whole passage of the app's own reading. The check confirmed every locator against the pinned PDFs.
+  - Each unanswerable question was checked by searching every paper's passages for its subject. No retrieval was run over the drafted questions, because they are held out.
+  - Pair sentences are written in new words. Unsupported pairs are near misses: a wrong number, a reversed finding, an overclaim. Partly supported pairs join a supported claim to one the passage does not make.
+- **The samples.** The second rater's samples (`sample-*.json`) were drawn once, before any labeling.
+
 ## The settings
 
 `settings.json` holds the study-design numbers as data, as Harold approved them on 2026-10-20:

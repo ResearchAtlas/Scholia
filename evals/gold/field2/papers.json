@@ -1,0 +1,604 @@
+{
+ "field": 2,
+ "note": "Field 2's papers (S1-36), prepared 2026-10-20 under the M2 charter's section 6 from arXiv, its official source; the PDFs stay out of git. Each license rests on that exact version's own abstract page alone: arXiv's API returns no license field, so no second source could confirm it (arXiv's license help page says licenses are chosen per version). Each group's candidates were also filtered by a title pattern, to keep the group coherent. The retrieval-augmented generation group drew from the 200 most recent of 1,525 listing results.",
+ "criteria": {
+  "primary_categories": [
+   "cs.CL",
+   "cs.AI"
+  ],
+  "first_submitted": {
+   "from": "2026-01-01",
+   "to": "2026-09-30"
+  },
+  "licenses": [
+   "http://creativecommons.org/licenses/by/4.0/",
+   "http://creativecommons.org/publicdomain/zero/1.0/"
+  ],
+  "license_source": "the chosen version's own abstract page, the latest version at check time",
+  "excluded": "QASPER v0.3's papers (train, dev and test splits), by arXiv id without version",
+  "other_filters": "English text with a text layer; title and abstract at least 97% ASCII; not withdrawn; a paper in one group only",
+  "draw": "per group, the filtered candidates sorted by arXiv id, shuffled with the group's seed, checked in that order until six passed",
+  "groups": {
+   "Retrieval-augmented generation": {
+    "query": "abs:\"retrieval-augmented generation\", the 200 most recent of 1,525 results",
+    "title_pattern": "(?i)\\bRAG\\b|retriev",
+    "seed": 20261001
+   },
+   "Citation and attribution in LLM answers": {
+    "query": "abs:citation AND abs:\"large language models\"",
+    "title_pattern": "(?i)citation|\\bcit(e|ed|ing)\\b|attribut",
+    "seed": 20261002
+   },
+   "Long-context evaluation": {
+    "query": "abs:long-context AND abs:benchmark (it also returns method papers tested on long-context benchmarks)",
+    "title_pattern": "(?i)long[- ]context|long[- ]document",
+    "seed": 20261003
+   },
+   "Hallucination detection": {
+    "query": "abs:\"hallucination detection\"",
+    "title_pattern": "(?i)hallucinat",
+    "seed": 20261004
+   }
+  }
+ },
+ "seed": 20261001,
+ "extractor": {
+  "name": "pdf",
+  "version": "pdf-3+pypdfium2-5.14.0+vision-3"
+ },
+ "papers": [
+  {
+   "id": "2602.15871v1",
+   "title": "CheckIfExist: Detecting Citation Hallucinations in the Era of AI-Generated Content",
+   "authors": [
+    "Diletta Abbonato"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-01-27",
+   "topic": "Citation and attribution in LLM answers",
+   "abstract_url": "https://arxiv.org/abs/2602.15871v1",
+   "pdf_url": "https://arxiv.org/pdf/2602.15871v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2602.15871v1",
+   "license_checked": "2026-10-20",
+   "file": "2602.15871v1.pdf",
+   "size": 173528,
+   "sha256": "7485479be3cbbc31532eeb704ed6004e9955146d1b40fa6dbaef8e69c86aaf38",
+   "document_language": "en"
+  },
+  {
+   "id": "2603.03299v1",
+   "title": "How LLMs Cite and Why It Matters: A Cross-Model Audit of Reference Fabrication in AI-Assisted Academic Writing and Methods to Detect Phantom Citations",
+   "authors": [
+    "MZ Naser"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-02-07",
+   "topic": "Citation and attribution in LLM answers",
+   "abstract_url": "https://arxiv.org/abs/2603.03299v1",
+   "pdf_url": "https://arxiv.org/pdf/2603.03299v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2603.03299v1",
+   "license_checked": "2026-10-20",
+   "file": "2603.03299v1.pdf",
+   "size": 1068999,
+   "sha256": "651f72d795862878fe13c06a3afa54f64f91d6c155470e1c09f899de04e1314d",
+   "document_language": "en"
+  },
+  {
+   "id": "2603.05308v4",
+   "title": "Med-V1: Small Language Models for Zero-shot and Scalable Biomedical Evidence Attribution",
+   "authors": [
+    "Qiao Jin",
+    "Yin Fang",
+    "Lauren He",
+    "Yifan Yang",
+    "Guangzhi Xiong",
+    "Zhizheng Wang",
+    "Nicholas Wan",
+    "Joey Chan",
+    "Donald C. Comeau",
+    "Robert Leaman",
+    "Charalampos S. Floudas",
+    "Aidong Zhang",
+    "Michael F. Chiang",
+    "Yifan Peng",
+    "Zhiyong Lu"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-03-05",
+   "topic": "Citation and attribution in LLM answers",
+   "abstract_url": "https://arxiv.org/abs/2603.05308v4",
+   "pdf_url": "https://arxiv.org/pdf/2603.05308v4",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2603.05308v4",
+   "license_checked": "2026-10-20",
+   "file": "2603.05308v4.pdf",
+   "size": 1378396,
+   "sha256": "5edec5271bfb17c778248f780b47f4ec28ae0ffcb2c68518014571681ce2077d",
+   "document_language": "en"
+  },
+  {
+   "id": "2605.14790v1",
+   "title": "Graphs of Research: Citation Evolution Graphs as Supervision for Research Idea Generation",
+   "authors": [
+    "Songyang Gao",
+    "Yinghui Xia",
+    "Siyi Liu",
+    "Hui Xiong"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-05-14",
+   "topic": "Citation and attribution in LLM answers",
+   "abstract_url": "https://arxiv.org/abs/2605.14790v1",
+   "pdf_url": "https://arxiv.org/pdf/2605.14790v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2605.14790v1",
+   "license_checked": "2026-10-20",
+   "file": "2605.14790v1.pdf",
+   "size": 9992736,
+   "sha256": "365ad96bc08c4a263d9d1fd2f283e729b8a313c90a5fb28b13266dca0c350210",
+   "document_language": "en"
+  },
+  {
+   "id": "2605.29742v2",
+   "title": "Citation-Closure Retrieval and Per-Rule Attribution for Real-World Regulatory Compliance Question Answering",
+   "authors": [
+    "Yeong-Joon Ju",
+    "Seong-Whan Lee"
+   ],
+   "primary_category": "cs.AI",
+   "submitted": "2026-05-28",
+   "topic": "Citation and attribution in LLM answers",
+   "abstract_url": "https://arxiv.org/abs/2605.29742v2",
+   "pdf_url": "https://arxiv.org/pdf/2605.29742v2",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2605.29742v2",
+   "license_checked": "2026-10-20",
+   "file": "2605.29742v2.pdf",
+   "size": 2105087,
+   "sha256": "f72410205d48d0c3871b7d9a68c6023c0d4edc863f8c9ebafa644c51dfa80f12",
+   "document_language": "en"
+  },
+  {
+   "id": "2609.15964v2",
+   "title": "Verifiable by Construction: Claim-Level Evaluation of Verbatim Citation in Clinical Question Answering",
+   "authors": [
+    "Jiashuo Zhang",
+    "Yuling Chen",
+    "Yvonne Commodore-Mensah",
+    "Michael Oberst"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-09-14",
+   "topic": "Citation and attribution in LLM answers",
+   "abstract_url": "https://arxiv.org/abs/2609.15964v2",
+   "pdf_url": "https://arxiv.org/pdf/2609.15964v2",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2609.15964v2",
+   "license_checked": "2026-10-20",
+   "file": "2609.15964v2.pdf",
+   "size": 1046992,
+   "sha256": "26ae31fa90206958cc9d6c1266e9a36ae81ce816da1ec6a0e30be41999880815",
+   "document_language": "en"
+  },
+  {
+   "id": "2601.03052v1",
+   "title": "Detecting Hallucinations in Retrieval-Augmented Generation via Semantic-level Internal Reasoning Graph",
+   "authors": [
+    "Jianpeng Hu",
+    "Yanzeng Li",
+    "Jialun Zhong",
+    "Wenfa Qi",
+    "Lei Zou"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-01-06",
+   "topic": "Hallucination detection",
+   "abstract_url": "https://arxiv.org/abs/2601.03052v1",
+   "pdf_url": "https://arxiv.org/pdf/2601.03052v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2601.03052v1",
+   "license_checked": "2026-10-20",
+   "file": "2601.03052v1.pdf",
+   "size": 1495601,
+   "sha256": "2ad510040c57b5f6dafb6eb08ea53ca5d6f514080e81bc8a07b8efa53ec2f92e",
+   "document_language": "en"
+  },
+  {
+   "id": "2605.11330v1",
+   "title": "Rethinking Evaluation for LLM Hallucination Detection: A Desiderata, A New RAG-based Benchmark, New Insights",
+   "authors": [
+    "Wenbo Chen",
+    "Veena Padmanabhan",
+    "Tootiya Giyahchi",
+    "Elaine Wong",
+    "Leman Akoglu"
+   ],
+   "primary_category": "cs.AI",
+   "submitted": "2026-05-11",
+   "topic": "Hallucination detection",
+   "abstract_url": "https://arxiv.org/abs/2605.11330v1",
+   "pdf_url": "https://arxiv.org/pdf/2605.11330v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2605.11330v1",
+   "license_checked": "2026-10-20",
+   "file": "2605.11330v1.pdf",
+   "size": 4081788,
+   "sha256": "741165337694678192a471a790db8694d165825d43def7975ddce6d6e1a091e7",
+   "document_language": "en"
+  },
+  {
+   "id": "2605.29055v2",
+   "title": "Hallucination Mitigation with Agentic AI, Nested Learning, and AI Sustainability via Semantic Caching",
+   "authors": [
+    "Diego Gosmar",
+    "Deborah A. Dahl"
+   ],
+   "primary_category": "cs.AI",
+   "submitted": "2026-05-27",
+   "topic": "Hallucination detection",
+   "abstract_url": "https://arxiv.org/abs/2605.29055v2",
+   "pdf_url": "https://arxiv.org/pdf/2605.29055v2",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2605.29055v2",
+   "license_checked": "2026-10-20",
+   "file": "2605.29055v2.pdf",
+   "size": 3131123,
+   "sha256": "29dda7fb223d093c5ee613a09f8e31946f1d6a909152354f701df92b30d50fdb",
+   "document_language": "en"
+  },
+  {
+   "id": "2606.29809v2",
+   "title": "How Far Can You Get Without a GPU? A Systematic Benchmark of Lightweight Hallucination Detection Across Question Answering, Dialogue, and Summarisation",
+   "authors": [
+    "Kriti Faujdar",
+    "Smit Kadvani"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-06-29",
+   "topic": "Hallucination detection",
+   "abstract_url": "https://arxiv.org/abs/2606.29809v2",
+   "pdf_url": "https://arxiv.org/pdf/2606.29809v2",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2606.29809v2",
+   "license_checked": "2026-10-20",
+   "file": "2606.29809v2.pdf",
+   "size": 593647,
+   "sha256": "2951401a1542bcda94f38d5e431076f7ba03ac585dfd823bf08f557bf7fcaebf",
+   "document_language": "en"
+  },
+  {
+   "id": "2609.00581v2",
+   "title": "Enoki: Efficient Multi-Level Hallucination Detection",
+   "authors": [
+    "Elisei Rykov",
+    "Timur Ionov",
+    "Nikolay Ivanov",
+    "Maksim Savkin",
+    "Maksim Makarenko",
+    "Alexander Panchenko",
+    "Vasily Konovalov",
+    "Julia Belikova"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-09-01",
+   "topic": "Hallucination detection",
+   "abstract_url": "https://arxiv.org/abs/2609.00581v2",
+   "pdf_url": "https://arxiv.org/pdf/2609.00581v2",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2609.00581v2",
+   "license_checked": "2026-10-20",
+   "file": "2609.00581v2.pdf",
+   "size": 2942344,
+   "sha256": "ba1a9add27a5c9fe1035307ba481ad447ecadc575a90a05a0c2abbba4c985b3d",
+   "document_language": "en"
+  },
+  {
+   "id": "2609.11244v1",
+   "title": "OmniHallu: Unified Hallucination Detection for Cross-Modal Comprehension and Generation in Multimodal Large Language Models",
+   "authors": [
+    "Jianjiang Yang",
+    "Peihang Li",
+    "Shanqing Xu",
+    "Mengchen Qian",
+    "Lu Zhang",
+    "Meng Luo"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-09-10",
+   "topic": "Hallucination detection",
+   "abstract_url": "https://arxiv.org/abs/2609.11244v1",
+   "pdf_url": "https://arxiv.org/pdf/2609.11244v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2609.11244v1",
+   "license_checked": "2026-10-20",
+   "file": "2609.11244v1.pdf",
+   "size": 4439214,
+   "sha256": "fc459da1e8da0a76f9cfe8e26d212d4fc46ecf7a7d790765ecd03123edfdd8bf",
+   "document_language": "en"
+  },
+  {
+   "id": "2607.08284v1",
+   "title": "Understanding Axes of Difficulty For Long Context Tasks Via PredicateLongBench",
+   "authors": [
+    "Siddhartha Jain",
+    "Ameya Velingker"
+   ],
+   "primary_category": "cs.AI",
+   "submitted": "2026-07-09",
+   "topic": "Long-context evaluation",
+   "abstract_url": "https://arxiv.org/abs/2607.08284v1",
+   "pdf_url": "https://arxiv.org/pdf/2607.08284v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2607.08284v1",
+   "license_checked": "2026-10-20",
+   "file": "2607.08284v1.pdf",
+   "size": 578497,
+   "sha256": "91cf285ae0f29e2cdc794d5287398b3124d220a16749dade2537d282344100da",
+   "document_language": "en"
+  },
+  {
+   "id": "2607.16716v1",
+   "title": "RECON: Benchmarking Agent Memory for Compositional Reasoning over Long Contexts",
+   "authors": [
+    "Mihir Shriniwas Arya"
+   ],
+   "primary_category": "cs.AI",
+   "submitted": "2026-07-18",
+   "topic": "Long-context evaluation",
+   "abstract_url": "https://arxiv.org/abs/2607.16716v1",
+   "pdf_url": "https://arxiv.org/pdf/2607.16716v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2607.16716v1",
+   "license_checked": "2026-10-20",
+   "file": "2607.16716v1.pdf",
+   "size": 1389838,
+   "sha256": "2355a481c25a6c7447c34a9b9060200b19f8d5cb320b995c101fdc64bbf72949",
+   "document_language": "en"
+  },
+  {
+   "id": "2607.25291v2",
+   "title": "CoSA: Accelerating Long-Context Inference via Proxy-Kernel Co-Designed Sparse Attention",
+   "authors": [
+    "Yufei Xue",
+    "Lin Niu",
+    "Hong Liu",
+    "Siran Liu",
+    "Hanyong Shao",
+    "Wei Liu",
+    "Guanghua Yu",
+    "Jianchen Zhu",
+    "Jun Zhang"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-07-28",
+   "topic": "Long-context evaluation",
+   "abstract_url": "https://arxiv.org/abs/2607.25291v2",
+   "pdf_url": "https://arxiv.org/pdf/2607.25291v2",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2607.25291v2",
+   "license_checked": "2026-10-20",
+   "file": "2607.25291v2.pdf",
+   "size": 1988523,
+   "sha256": "cff381bf591b13b8eb80ec7ddf8dbc9d0a42ca03f29771c37fde3986ecd982af",
+   "document_language": "en"
+  },
+  {
+   "id": "2608.03048v1",
+   "title": "PI-Mem: Pushing Long-Context Reasoning to 3.6M Tokens with Parallel-Iterative Memory",
+   "authors": [
+    "Dawei Liu",
+    "Haixu Song",
+    "Shuang Cheng",
+    "Shijie Wang",
+    "Haozheng Hou",
+    "Kaifeng Liu",
+    "Ermo Hua",
+    "Zhonghang Yuan",
+    "Zhijie Zhong",
+    "Yuchen Fan",
+    "Biqing Qi",
+    "Bowen Zhou"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-08-04",
+   "topic": "Long-context evaluation",
+   "abstract_url": "https://arxiv.org/abs/2608.03048v1",
+   "pdf_url": "https://arxiv.org/pdf/2608.03048v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2608.03048v1",
+   "license_checked": "2026-10-20",
+   "file": "2608.03048v1.pdf",
+   "size": 1136413,
+   "sha256": "97e1a33b6517bd2ae247aea7da8edbe2effb0ea4098c00965cde6777be8cd6db",
+   "document_language": "en"
+  },
+  {
+   "id": "2608.09412v1",
+   "title": "KVDiagnosis: A Diagnostic Benchmark for KV-Cache Compression in Long-Context Language Models",
+   "authors": [
+    "Chen Qiu",
+    "Ziwu Liu",
+    "Chao Fei",
+    "Guozhong Li",
+    "Panos Kalnis"
+   ],
+   "primary_category": "cs.AI",
+   "submitted": "2026-08-10",
+   "topic": "Long-context evaluation",
+   "abstract_url": "https://arxiv.org/abs/2608.09412v1",
+   "pdf_url": "https://arxiv.org/pdf/2608.09412v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2608.09412v1",
+   "license_checked": "2026-10-20",
+   "file": "2608.09412v1.pdf",
+   "size": 887379,
+   "sha256": "cc0ac0481af2517066281f2809a3d7ff227e4bfd7368a6a9252c528367aec4a1",
+   "document_language": "en"
+  },
+  {
+   "id": "2608.15962v1",
+   "title": "SEER: Long-Context Reasoning via Selective Visual-Text Compression",
+   "authors": [
+    "Jiawei Xu",
+    "Zhilin Zhai",
+    "Jinrui Fang",
+    "Ruohan Xu",
+    "Mingfei Lu",
+    "Yi Zhang",
+    "Guanchu Wang",
+    "Tianlong Chen",
+    "Ying Ding"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-08-16",
+   "topic": "Long-context evaluation",
+   "abstract_url": "https://arxiv.org/abs/2608.15962v1",
+   "pdf_url": "https://arxiv.org/pdf/2608.15962v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2608.15962v1",
+   "license_checked": "2026-10-20",
+   "file": "2608.15962v1.pdf",
+   "size": 539409,
+   "sha256": "36bfc952f06fd8aa27ae7745924715711c88ae68979fbd74a0bfeab58cec6651",
+   "document_language": "en"
+  },
+  {
+   "id": "2608.21750v1",
+   "title": "FCPRAG: Fusion-Controller Parametric Retrieval-Augmented Generation for Stable Multi-Passage LoRA Injection",
+   "authors": [
+    "Jinchang Zhu",
+    "Jindong Li",
+    "Yi Ding",
+    "Xiaojian Nie",
+    "Rong Fu",
+    "Shuangyong Song",
+    "Haowei He",
+    "Menglin Yang"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-08-22",
+   "topic": "Retrieval-augmented generation",
+   "abstract_url": "https://arxiv.org/abs/2608.21750v1",
+   "pdf_url": "https://arxiv.org/pdf/2608.21750v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2608.21750v1",
+   "license_checked": "2026-10-20",
+   "file": "2608.21750v1.pdf",
+   "size": 12022690,
+   "sha256": "0a86995ba9c8050c8d1a05fb68f42c899293289395c3093cb12d567f7d902ddc",
+   "document_language": "en"
+  },
+  {
+   "id": "2608.22479v2",
+   "title": "GTA-RAG: Graph-Trajectory-Augmented Reinforcement Learning for Multi-Turn Retrieval-Augmented Reasoning",
+   "authors": [
+    "Jun Chen",
+    "Yongchao Liu",
+    "Pengyu Qiu",
+    "Jiajun Zheng",
+    "Juelu Zhang",
+    "Yujie Zeng",
+    "Qin Zhang",
+    "Ziyue Qiao",
+    "Xiao Luo"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-08-23",
+   "topic": "Retrieval-augmented generation",
+   "abstract_url": "https://arxiv.org/abs/2608.22479v2",
+   "pdf_url": "https://arxiv.org/pdf/2608.22479v2",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2608.22479v2",
+   "license_checked": "2026-10-20",
+   "file": "2608.22479v2.pdf",
+   "size": 937694,
+   "sha256": "8873ddcf9b26321c7d08e4df540a83dea91b957258df3f8236133c09d61cad23",
+   "document_language": "en"
+  },
+  {
+   "id": "2609.06391v1",
+   "title": "Building Trustworthy Graph-Agentic RAG for Social Good: Architectures, Failure Propagation, and Assurance by Construction",
+   "authors": [
+    "Vijay Bommireddy",
+    "Raviteja Bommireddy"
+   ],
+   "primary_category": "cs.AI",
+   "submitted": "2026-09-06",
+   "topic": "Retrieval-augmented generation",
+   "abstract_url": "https://arxiv.org/abs/2609.06391v1",
+   "pdf_url": "https://arxiv.org/pdf/2609.06391v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2609.06391v1",
+   "license_checked": "2026-10-20",
+   "file": "2609.06391v1.pdf",
+   "size": 1905638,
+   "sha256": "2eab694c65e6675804c08c8f8671b819e6a2a0d6f8e287d1fb6f997ec07861c7",
+   "document_language": "en"
+  },
+  {
+   "id": "2609.23880v1",
+   "title": "Q-TIE: A Lightweight and Generalizable Re-ranking Framework for Temporal Information Retrieval",
+   "authors": [
+    "Soyeon Kim",
+    "Hyunjin Kim",
+    "JinYeong Bak",
+    "Steven Euijong Whang"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-09-20",
+   "topic": "Retrieval-augmented generation",
+   "abstract_url": "https://arxiv.org/abs/2609.23880v1",
+   "pdf_url": "https://arxiv.org/pdf/2609.23880v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2609.23880v1",
+   "license_checked": "2026-10-20",
+   "file": "2609.23880v1.pdf",
+   "size": 1034437,
+   "sha256": "9ade3b7f187e29c4722352749b59c50e2a4565c6047ba23a29479c845da40e47",
+   "document_language": "en"
+  },
+  {
+   "id": "2609.28048v1",
+   "title": "TEMPS: Temporal Sentence Embeddings for Temporal Information Retrieval",
+   "authors": [
+    "Mourad Hassani",
+    "Julien Romero",
+    "Amel Bouzeghoub",
+    "Christian Jacquelinet"
+   ],
+   "primary_category": "cs.CL",
+   "submitted": "2026-09-23",
+   "topic": "Retrieval-augmented generation",
+   "abstract_url": "https://arxiv.org/abs/2609.28048v1",
+   "pdf_url": "https://arxiv.org/pdf/2609.28048v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2609.28048v1",
+   "license_checked": "2026-10-20",
+   "file": "2609.28048v1.pdf",
+   "size": 1609111,
+   "sha256": "6a2d8c9835e25bde03627ecb4de5543d0344d067c3c74bd71046d0eb24b54659",
+   "document_language": "en"
+  },
+  {
+   "id": "2609.34776v1",
+   "title": "Page-Aware Retrieval-Augmented Generation for EvalLLM 2026: A Five-Variant Study on French PDFs",
+   "authors": [
+    "Abdelhak kelious"
+   ],
+   "primary_category": "cs.AI",
+   "submitted": "2026-09-28",
+   "topic": "Retrieval-augmented generation",
+   "abstract_url": "https://arxiv.org/abs/2609.34776v1",
+   "pdf_url": "https://arxiv.org/pdf/2609.34776v1",
+   "license": "http://creativecommons.org/licenses/by/4.0/",
+   "license_page": "https://arxiv.org/abs/2609.34776v1",
+   "license_checked": "2026-10-20",
+   "file": "2609.34776v1.pdf",
+   "size": 260016,
+   "sha256": "a829c371b6191a6c42e21e0f3080ab06fb895596cb9c3b92c3ff0bd68e758db7",
+   "document_language": "en"
+  }
+ ]
+}

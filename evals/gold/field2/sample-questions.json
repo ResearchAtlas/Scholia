@@ -1,0 +1,59 @@
+{
+ "set": "field2-questions",
+ "kind": "questions",
+ "fraction": 0.2,
+ "seed": 3620,
+ "strata": [
+  "query_language",
+  "answerable",
+  "multi_paper"
+ ],
+ "drawn": {
+  "en|False|False": {
+   "items": 9,
+   "drawn": 2
+  },
+  "en|True|False": {
+   "items": 31,
+   "drawn": 6
+  },
+  "en|True|True": {
+   "items": 10,
+   "drawn": 2
+  },
+  "zh-CN|False|False": {
+   "items": 9,
+   "drawn": 2
+  },
+  "zh-CN|True|False": {
+   "items": 31,
+   "drawn": 6
+  },
+  "zh-CN|True|True": {
+   "items": 10,
+   "drawn": 2
+  }
+ },
+ "items": [
+  "q006",
+  "q009",
+  "q025",
+  "q035",
+  "q043",
+  "q047",
+  "q050",
+  "q051",
+  "q052",
+  "q059",
+  "q074",
+  "q076",
+  "q077",
+  "q079",
+  "q081",
+  "q085",
+  "q093",
+  "q095",
+  "q097",
+  "q100"
+ ]
+}

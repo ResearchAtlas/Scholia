@@ -653,3 +653,19 @@ def test_files_written_are_owner_only(tmp_path):
     gold.write_json(path, {"a": 1})
     assert stat.S_IMODE(path.stat().st_mode) == 0o600 and stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert os.listdir(path.parent) == ["x.json"]
+
+
+def test_the_committed_field_two_drafts_pass_their_checks_and_meet_the_settings():
+    settings = gold.load_settings()
+    papers = json.loads((gold.FIELD2 / "papers.json").read_text())
+    assert gold.check_papers(papers, 2, settings) == []
+    assert len(papers["papers"]) == settings["field2_papers"]["count"]
+    assert len({p["topic"] for p in papers["papers"]}) == 4
+    by_id = {p["id"]: p for p in papers["papers"]}
+    for kind in gold.SETS:
+        doc = json.loads((gold.FIELD2 / f"{kind}.json").read_text())
+        assert gold.check_set(doc, kind, 2, by_id) == []
+        assert gold.differences(kind, gold.mix(kind, doc["items"]), settings) == []
+        sample = json.loads((gold.FIELD2 / f"sample-{kind}.json").read_text())
+        assert sample == gold.draw(doc, settings) and len(sample["items"]) == 20
+    assert not (gold.FIELD2 / "labels").exists()  # nothing is labeled in M2

@@ -1,0 +1,2442 @@
+{
+ "id": "field2-questions",
+ "kind": "questions",
+ "field": 2,
+ "provisional": true,
+ "note": "Drafted by Claude (S1-36, 2026-10-20) from the app's reading of the papers listed in papers.json; no model was called by any tool. Provisional until a rater's labels make an item gold. Held out: never used for tuning.",
+ "items": [
+  {
+   "id": "q001",
+   "text": "How many instances does Med-V1's synthetic training set MedFact-Synth contain, and what is its label distribution?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "1.5 million: 38.3% agreement, 36.4% neutral and 25.3% contradiction",
+   "evidence": [
+    [
+     {
+      "paper": "2603.05308v4",
+      "ordinal": 17,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2603.05308v4 [cs.CL] 23 Sep 2026",
+       "2 Results"
+      ],
+      "quote": "Overall, MedFact-Synth contains 1.5 million instances with a reasonably balanced label distribution: 38.3% (strong and partial) agreement, 36.4% neutral, and 25.3% (strong and partial) contradiction (Figure 2b). This balance ensures that Med-V1",
+      "attribution": "Qiao Jin, Yin Fang, Lauren He, Yifan Yang, Guangzhi Xiong, Zhizheng Wang, Nicholas Wan, Joey Chan, Donald C. Comeau, Robert Leaman, Charalampos S. Floudas, Aidong Zhang, Michael F. Chiang, Yifan Peng, Zhiyong Lu. Med-V1: Small Language Models for Zero-shot and Scalable Biomedical Evidence Attribution. arXiv:2603.05308v4",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q002",
+   "text": "当模型在 PredicateLongBench 上答错时，它输出序列第一个词的准确率是多少？这说明了什么？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "所有模型都是 0%，说明问题在于定位正确的序列，而不是复述它",
+   "evidence": [
+    [
+     {
+      "paper": "2607.08284v1",
+      "ordinal": 103,
+      "page": 8,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.08284v1 [cs.AI] 9 Jul 2026",
+       "4 Results"
+      ],
+      "quote": "A plausible failure case for a model is that it is able to locate a sequence correctly but is then unable to fully reproduce it. To test this theory, we compute the accuracy of the first word for the sequence outputted by the model in the cases where the model is wrong. The accuracy is 0% across all models, suggesting that the model is struggling with locating the correct sequence rather than reproducing it.",
+      "attribution": "Siddhartha Jain, Ameya Velingker. Understanding Axes of Difficulty For Long Context Tasks Via PredicateLongBench. arXiv:2607.08284v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q003",
+   "text": "On which datasets does FCPRAG report its largest F1 gains over the baselines, and how large are they?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Up to 4.65% on 2WikiMultiHopQA and 7.55% on CWQ",
+   "evidence": [
+    [
+     {
+      "paper": "2608.21750v1",
+      "ordinal": 4,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "Parametric retrieval-augmented generation (PRAG) injects retrieved evidence into a large language model (LLM) through passage￾specific LoRA adapters, reducing reliance on long in-context prompts. When multiple pas￾sages are retrieved for the same query, how￾ever, evidence-level fusion becomes a bottle￾neck: equal-weight merging can amplify weak or conflicting evidence, and translating retrieval signals into fusion weights often requires frag￾ile global tuning. We propose FCPRAG, a fusion-controlled parametric RAG framework that adds a lightweight controller for retrieval￾conditioned, sample-level adapter fusion. The controller predicts per-passage fusion scores together with sample-level calibration signals, including a mixing gate and an adaptive temper￾ature, enabling fusion that stays selective under informative retrieval signals and conservative under uncertainty. FCPRAG is trained with merge-aware supervision derived from each adapter’s marginal contribution within a multi￾adapter merge, using training data only. We further show that a single dataset-level tem￾perature is suboptimal under heteroscedastic retrieval uncertainty, motivating sample-level adaptation. Experiments on HotpotQA, 2Wiki￾MultiHopQA, PopQA, and ComplexWebQues￾tions (CWQ) across three LLM backbones show that FCPRAG consistently improves F1 over standard RAG and parametric RAG base￾lines, with gains of up to 4.65% on 2WikiMul￾tiHopQA and 7.55% on CWQ, while also re￾ducing tuning cost and improving robustness under retrieval perturbations.",
+      "attribution": "Jinchang Zhu, Jindong Li, Yi Ding, Xiaojian Nie, Rong Fu, Shuangyong Song, Haowei He, Menglin Yang. FCPRAG: Fusion-Controller Parametric Retrieval-Augmented Generation for Stable Multi-Passage LoRA Injection. arXiv:2608.21750v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q004",
+   "text": "Q-TIE 用乘积式（Product-of-Experts）聚合语义和时间分数有什么效果？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "类似“与”运算：只有两个分数都高时文档才排在前面，避免语义相似度掩盖时间不符",
+   "evidence": [
+    [
+     {
+      "paper": "2609.23880v1",
+      "ordinal": 62,
+      "page": 5,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.23880v1 [cs.CL] 20 Sep 2026"
+      ],
+      "quote": "Effect. The multiplicative form in Eq. 2 imposes an AND-like aggregation: a document ranks highly only when both experts agree, since a near-zero Stemp sharply penalizes the final score with a large negative log term. In contrast, standard sum-based fusion in prior TIR (Gade et al., 2025) behaves OR-like: a high semantic score alone can override a clear temporal mismatch, allowing temporally invalid documents to rank highly. In §4, we empir￾ically confirm this contrast and the advantage of PoE for TIR, where both signals must hold.",
+      "attribution": "Soyeon Kim, Hyunjin Kim, JinYeong Bak, Steven Euijong Whang. Q-TIE: A Lightweight and Generalizable Re-ranking Framework for Temporal Information Retrieval. arXiv:2609.23880v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q005",
+   "text": "In the clinical verbatim citation study, what share of claims did the best systems support with exact substantiating evidence?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Around 75% (for example gpt-5.4)",
+   "evidence": [
+    [
+     {
+      "paper": "2609.15964v2",
+      "ordinal": 9,
+      "page": 1,
+      "kind": "paragraph",
+      "section_path": [
+       "Verifiable by Construction: Claim-Level Evaluation of Verbatim Citation in Clinical Question Answering",
+       "1 Introduction"
+      ],
+      "quote": "We report our findings in Section 4, where we observe that no model consistently achieves this goal, with the best￾performing systems (e.g., gpt-5.4) supporting around 75% of claims with exact substantiating evidence. More notably, our",
+      "attribution": "Jiashuo Zhang, Yuling Chen, Yvonne Commodore-Mensah, Michael Oberst. Verifiable by Construction: Claim-Level Evaluation of Verbatim Citation in Clinical Question Answering. arXiv:2609.15964v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q006",
+   "text": "Why do all detectors perform near chance on summarisation in the CPU-only hallucination benchmark?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Largely because of single-pass truncation; a larger premise budget or sentence-level chunk aggregation recovers much of the performance",
+   "evidence": [
+    [
+     {
+      "paper": "2606.29809v2",
+      "ordinal": 11,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2606.29809v2 [cs.CL] 2 Oct 2026"
+      ],
+      "quote": "• A diagnosis of the summarisation failure. Ev￾ery method performs near chance there, but two controlled follow-ups show this is driven largely by single-pass truncation: enlarging the premise budget and switching to sentence￾level chunk aggregation both recover substan￾tial performance without extra hardware, the latter at a substantial increase in CPU infer￾ence.",
+      "attribution": "Kriti Faujdar, Smit Kadvani. How Far Can You Get Without a GPU? A Systematic Benchmark of Lightweight Hallucination Detection Across Question Answering, Dialogue, and Summarisation. arXiv:2606.29809v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q007",
+   "text": "GTA-RAG 的检索接口如何把图检索和稠密检索的结果合并？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "取稠密检索的前 Kd 个段落，与图检索结果合并后去重返回",
+   "evidence": [
+    [
+     {
+      "paper": "2608.22479v2",
+      "ordinal": 52,
+      "page": 4,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.22479v2 [cs.CL] 30 Aug 2026"
+      ],
+      "quote": "query q, we additionally obtain the top-Kd passage results Rd(q) from a dense retriever and return the deduplicated combination of both sources:",
+      "attribution": "Jun Chen, Yongchao Liu, Pengyu Qiu, Jiajun Zheng, Juelu Zhang, Yujie Zeng, Qin Zhang, Ziyue Qiao, Xiao Luo. GTA-RAG: Graph-Trajectory-Augmented Reinforcement Learning for Multi-Turn Retrieval-Augmented Reasoning. arXiv:2608.22479v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     },
+     {
+      "paper": "2608.22479v2",
+      "ordinal": 53,
+      "page": 4,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.22479v2 [cs.CL] 30 Aug 2026"
+      ],
+      "quote": "R(q) = Dedup (Rg(q) ∪ Rd(q)). (9) Thus, the policy only needs to formulate a search query, while the retrieval interface consistently pro￾vides evidence enhanced by graph reasoning and dense passage matching.",
+      "attribution": "Jun Chen, Yongchao Liu, Pengyu Qiu, Jiajun Zheng, Juelu Zhang, Yujie Zeng, Qin Zhang, Ziyue Qiao, Xiao Luo. GTA-RAG: Graph-Trajectory-Augmented Reinforcement Learning for Multi-Turn Retrieval-Augmented Reasoning. arXiv:2608.22479v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q008",
+   "text": "What needle-in-a-haystack accuracy does SEER report?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q009",
+   "text": "GTA-RAG 构建的实体-文档图中有哪三类边？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "文档-实体边、抽取三元组的关系边，以及嵌入相似度超过阈值的实体之间的同义边",
+   "evidence": [
+    [
+     {
+      "paper": "2608.22479v2",
+      "ordinal": 46,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.22479v2 [cs.CL] 30 Aug 2026"
+      ],
+      "quote": "where VD contains document nodes and VE con￾tains entity nodes. We add three types of edges: (1) a document–entity edge (di , e) if entity e is ex￾tracted from di ; (2) a relation edge (eh, et) for each extracted triple; and (3) a synonymy edge between two entities whose embedding cosine similarity ex￾ceeds a threshold δ. The synonymy edges reduce graph fragmentation caused by surface-form varia￾tions. Graph retrieval. Given a search query q, we embed q and all extracted triples and score each triple by cosine similarity:",
+      "attribution": "Jun Chen, Yongchao Liu, Pengyu Qiu, Jiajun Zheng, Juelu Zhang, Yujie Zeng, Qin Zhang, Ziyue Qiao, Xiao Luo. GTA-RAG: Graph-Trajectory-Augmented Reinforcement Learning for Multi-Turn Retrieval-Augmented Reasoning. arXiv:2608.22479v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q010",
+   "text": "FCPRAG 的融合控制器相对于主干大模型增加了多少可训练参数？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "不到 1%",
+   "evidence": [
+    [
+     {
+      "paper": "2608.21750v1",
+      "ordinal": 19,
+      "page": 2,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "• FCPRAG architecture. We introduce a learned Fusion Controller for PRAG-family inference that performs retrieval-conditioned, sample-level LoRA fusion and calibration, adding < 1% trainable parameters relative to the backbone LLM.",
+      "attribution": "Jinchang Zhu, Jindong Li, Yi Ding, Xiaojian Nie, Rong Fu, Shuangyong Song, Haowei He, Menglin Yang. FCPRAG: Fusion-Controller Parametric Retrieval-Augmented Generation for Stable Multi-Passage LoRA Injection. arXiv:2608.21750v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q011",
+   "text": "连续记忆系统（CMS）做语义缓存查找时使用的余弦相似度阈值是多少？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "0.87",
+   "evidence": [
+    [
+     {
+      "paper": "2605.29055v2",
+      "ordinal": 46,
+      "page": 4,
+      "kind": "caption",
+      "section_path": [
+       "arXiv:2605.29055v2 [cs.AI] 12 Aug 2026",
+       "3 Related Work"
+      ],
+      "quote": "Figure 2: Agent–CMS pairing. Each pipeline agent is equipped with a Continuum Memory System comprising Medium-Term Memory (MTM, LRU eviction) for recently seen prompts and Long-Term Memory (LTM, LFU eviction) for frequently recurring patterns. Periodic consolida￾tion promotes hot MTM entries to LTM; semantic cache lookups use cosine similarity threshold τ = 0.87.",
+      "attribution": "Diego Gosmar, Deborah A. Dahl. Hallucination Mitigation with Agentic AI, Nested Learning, and AI Sustainability via Semantic Caching. arXiv:2605.29055v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q012",
+   "text": "PredicateLongBench 中典型的任务要求模型做什么？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "在由空格分隔的单词长列表中，找出满足某类谓词约束的最长连续子序列",
+   "evidence": [
+    [
+     {
+      "paper": "2607.08284v1",
+      "ordinal": 21,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.08284v1 [cs.AI] 9 Jul 2026",
+       "2 Related Works"
+      ],
+      "quote": "The general setup is to provide a long context window that consists of a space separated list of words. A typical task in our benchmark asks a model to identify the longest contiguous subsequence of words subject to constraints, chosen from some predicate class.",
+      "attribution": "Siddhartha Jain, Ameya Velingker. Understanding Axes of Difficulty For Long Context Tasks Via PredicateLongBench. arXiv:2607.08284v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q013",
+   "text": "CheckIfExist 工具是用哪些网页技术构建的？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "用 React 和 TypeScript 构建的网页应用",
+   "evidence": [
+    [
+     {
+      "paper": "2602.15871v1",
+      "ordinal": 14,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2602.15871v1 [cs.CL] 27 Jan 2026",
+       "3 System Architecture"
+      ],
+      "quote": "The proposed system is implemented as a web-based application using React with TypeScript, ensuring cross-platform compatibility and eliminating installation barriers. The application architecture separates concerns into four primary modules: an input preprocessing service for LaTeX command filtering, a BibTeX parsing service for structured input processing, a multi-source search service implementing the cascading verification logic, and a presentation layer for result visualization and export functionality. The tool implements a cascading validation architecture that queries three complementary schol￾arly databases. CrossRef serves as the primary source, providing access to metadata for over 140 mil￾lion scholarly works registered through the Digital Object Identifier system and representing the most comprehensive source of standardized bibliographic metadata from thousands of publishers worldwide (Hendricks et al., 2020). Semantic Scholar, maintained by the Allen Institute for AI, functions as a fallback source indexing over 200 million academic papers with enhanced metadata including author disambiguation and citation context (Ammar et al., 2018). OpenAlex completes the validation cascade as a fully open scholarly metadata source aggregating data from CrossRef, PubMed, ORCID, arXiv, and other repositories, providing comprehensive coverage particularly for open-access and non-English pub￾lications (Priem et al., 2022; Céspedes et al., 2025). This multi-source approach addresses a fundamental limitation of single-database validation: no individual scholarly database achieves complete coverage of the academic literature. CrossRef excels for DOI-registered works but may lack coverage of preprints, regional journals, or older publications; Semantic Scholar provides strong coverage of computer science and biomedical literature with enhanced disambiguation features;",
+      "attribution": "Diletta Abbonato. CheckIfExist: Detecting Citation Hallucinations in the Era of AI-Generated Content. arXiv:2602.15871v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q014",
+   "text": "Med-V1 and the clinical verbatim citation study both work with medical sources: which sources does each draw on?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Med-V1 samples one million articles from the PubMed 2025 baseline; the clinical study uses four AHA and ADA practice guidelines",
+   "evidence": [
+    [
+     {
+      "paper": "2603.05308v4",
+      "ordinal": 12,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2603.05308v4 [cs.CL] 23 Sep 2026",
+       "2 Results"
+      ],
+      "quote": "Phase I: Synthetic data generation and model training. In the first phase, we construct MedFact-Synth, a large-scale synthetic training set including 1.5 million instances. Each instance contains: a synthetic claim to be verified, a source article serving as evidence, a rationale explaining the verification, and a 5-point Likert-scale verdict, ranging from strong contradiction (-2) and partial contradiction (-1) to neutral (0), partial agreement (+1), and strong agreement (+2). To build this dataset, we begin by sampling one million articles from the PubMed 2025 baseline [35]. For each article, GPT-4o-mini [36] is prompted to generate two claims: one that the article may support and one that it may refute. To collect diverse claim-article pairs for verification, we use MedCPT [37] to retrieve the top 10 most relevant PubMed articles for each claim. A panel of frontier LLMs then verifies each pair, generating both rationales and verdicts via a voting-based mechanism. Then, we utilize MedFact-Synth to fine-tune Med-V1, which is a three-billion-parameter (3B) small LLM available in two variants: Med-V1-L3B, initialized from Llama-3.2-3B-Instruct [27] and Med-V1-Q3B, initialized from Qwen2.5-3B-Instruct [28]. The quality of MedFact-Synth is examined in the next section, and technical details of the dataset construction and training process are described in the Methods section.",
+      "attribution": "Qiao Jin, Yin Fang, Lauren He, Yifan Yang, Guangzhi Xiong, Zhizheng Wang, Nicholas Wan, Joey Chan, Donald C. Comeau, Robert Leaman, Charalampos S. Floudas, Aidong Zhang, Michael F. Chiang, Yifan Peng, Zhiyong Lu. Med-V1: Small Language Models for Zero-shot and Scalable Biomedical Evidence Attribution. arXiv:2603.05308v4",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2609.15964v2",
+      "ordinal": 40,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.15964v2 [cs.CL] 17 Sep 2026",
+       "3 Methods"
+      ],
+      "quote": "Guideline Corpus. To develop our task, we start from a corpus of four clinical practice guidelines from the American Heart Association (AHA) and the American Diabetes Association (ADA): the 2019 AHA guideline on the primary prevention of cardiovascular disease (Arnett et al., 2019), the 2025 AHA guideline on high blood pressure (Jones et al., 2025), the 2026 AHA guideline on blood cholesterol (Blumenthal et al., 2026), and the 2026 ADA Standards of Care in Diabetes (American Diabetes Association Professional Practice Committee, 2026), which together cover the principal modifiable risk factors for atherosclerotic cardiovascular disease. Appendix A.1 provides more detail on how this corpus is preprocessed for later re￾trieval.",
+      "attribution": "Jiashuo Zhang, Yuling Chen, Yvonne Commodore-Mensah, Michael Oberst. Verifiable by Construction: Claim-Level Evaluation of Verbatim Citation in Clinical Question Answering. arXiv:2609.15964v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q015",
+   "text": "What penalties does CheckIfExist apply to a reference's confidence score for title and author mismatches?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Minus 20 for a title mismatch and minus 20 for an author mismatch",
+   "evidence": [
+    [
+     {
+      "paper": "2602.15871v1",
+      "ordinal": 67,
+      "page": 6,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2602.15871v1 [cs.CL] 27 Jan 2026",
+       "3 System Architecture"
+      ],
+      "quote": "where βms ∈ [0, 10] represents the bonus awarded when author information is validated across mul￾tiple databases. Additional penalties are applied for detected issues: title mismatches (−20), author mismatches (−20), journal discrepancies (−10 to −20), and each detected fake author (−10 to −20).2",
+      "attribution": "Diletta Abbonato. CheckIfExist: Detecting Citation Hallucinations in the Era of AI-Generated Content. arXiv:2602.15871v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q016",
+   "text": "PI-Mem 和 SEER 各自主要与哪个基线比较，提升了多少？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "PI-Mem 在 360 万词元的 HotpotQA 上比 MemAgent 高 6.25 和 7.81 个绝对点；SEER 在 LongBench 上比 Glyph-9B 高 2.33 个点",
+   "evidence": [
+    [
+     {
+      "paper": "2608.03048v1",
+      "ordinal": 29,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "Introduction"
+      ],
+      "quote": "Experiments with Qwen3.5-35B-A3B and Qwen2.5-7B demonstrate the effectiveness and efficiency of PI-Mem. On HotpotQA (HQA) at 3.6M tokens, PI-Mem improves over MemAgent by +6.25 and +7.81 absolute points and delivers inference speedups of 6.1× and 2.1×, respectively.",
+      "attribution": "Dawei Liu, Haixu Song, Shuang Cheng, Shijie Wang, Haozheng Hou, Kaifeng Liu, Ermo Hua, Zhonghang Yuan, Zhijie Zhong, Yuchen Fan, Biqing Qi, Bowen Zhou. PI-Mem: Pushing Long-Context Reasoning to 3.6M Tokens with Parallel-Iterative Memory. arXiv:2608.03048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2608.15962v1",
+      "ordinal": 24,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.15962v1 [cs.CL] 16 Aug 2026"
+      ],
+      "quote": "• On LongBench, SEER achieves 51.11% average accuracy, improving over Glyph￾9B by 2.33 points through selective text retrieval, with large gains on extraction￾intensive tasks (+8.75 on Qasper, +19.17 on MultiFieldQA-Zh). Under our reported setup, SEER is 3.49 points above Qwen3-8B.",
+      "attribution": "Jiawei Xu, Zhilin Zhai, Jinrui Fang, Ruohan Xu, Mingfei Lu, Yi Zhang, Guanchu Wang, Tianlong Chen, Ying Ding. SEER: Long-Context Reasoning via Selective Visual-Text Compression. arXiv:2608.15962v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q017",
+   "text": "图智能体 RAG 综述提出的“构建即保障”蓝图由哪五种接口契约组成？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "证据、检索、推理、委托和结果五种契约",
+   "evidence": [
+    [
+     {
+      "paper": "2609.06391v1",
+      "ordinal": 17,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.06391v1 [cs.AI] 6 Sep 2026"
+      ],
+      "quote": "3. an assurance-by-construction blueprint built from five interface contracts evidence, retrieval, reasoning, delegation, and outcome with preventive, detective, and recovery responsibilities",
+      "attribution": "Vijay Bommireddy, Raviteja Bommireddy. Building Trustworthy Graph-Agentic RAG for Social Good: Architectures, Failure Propagation, and Assurance by Construction. arXiv:2609.06391v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q018",
+   "text": "TRIVIA+ 满足作者提出的七条理想性质中的几条？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "全部七条",
+   "evidence": [
+    [
+     {
+      "paper": "2605.11330v1",
+      "ordinal": 18,
+      "page": 3,
+      "kind": "caption",
+      "section_path": [
+       "arXiv:2605.11330v1 [cs.AI] 11 May 2026"
+      ],
+      "quote": "Table 1: Comparison of HDBs w.r.t. desirable desiderata (Sec. 2). Proposed TRIVIA+ exhibits all seven properties; with (i) organic generations, (ii) human-verified labels (for evaluation), (iii) four sets of realistic label noise (for training), on (iv) RAG-based long-context tasks (knowledge-intensive, hard-to-annotate), with (v) both extrinsic and intrinsic hallucinations, from (vi) multiple modern LLMs and (vii) multiple domains. None of the existing HDBs fully meets the desiderata. RAG-based HDBs are few, and are highlighted in red. Those marked with × do not make LLM generations available. Symbol ? denotes that it is unclear whether the dataset spans multiple domains.",
+      "attribution": "Wenbo Chen, Veena Padmanabhan, Tootiya Giyahchi, Elaine Wong, Leman Akoglu. Rethinking Evaluation for LLM Hallucination Detection: A Desiderata, A New RAG-based Benchmark, New Insights. arXiv:2605.11330v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q019",
+   "text": "KVDiagnosis 和 CoSA 的实验分别使用哪个主干模型？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "两者都使用 Qwen3-8B",
+   "evidence": [
+    [
+     {
+      "paper": "2608.09412v1",
+      "ordinal": 23,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.09412v1 [cs.AI] 10 Aug 2026"
+      ],
+      "quote": "On Qwen3-8B across four evidence-aware workloads [40], the benchmark contains 59 800 supported compressed runs over 2600 sources and 12 520 method–setting C→W rows. Under fixed diag￾nostic rules, 63.2% have low or partial measured/projected support coverage. High measured/projected coverage with strong likeli￾hood drift is rare (19 rows), whereas 2,126 rows show drift under structural position addressability, which does not measure repre￾sentation fidelity. Methods with comparable aggregate quality can nevertheless fail on different source sets.",
+      "attribution": "Chen Qiu, Ziwu Liu, Chao Fei, Guozhong Li, Panos Kalnis. KVDiagnosis: A Diagnostic Benchmark for KV-Cache Compression in Long-Context Language Models. arXiv:2608.09412v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2607.25291v2",
+      "ordinal": 17,
+      "page": 1,
+      "kind": "caption",
+      "section_path": [
+       "CoSA: Accelerating Long-Context Inference via Proxy-Kernel Co-Designed Sparse Attention",
+       "1 Introduction"
+      ],
+      "quote": "Figure 1: Performance and budget of mainstream sparse at￾tention methods on LongBench-v2 with Qwen3-8B.",
+      "attribution": "Yufei Xue, Lin Niu, Hong Liu, Siran Liu, Hanyong Shao, Wei Liu, Guanghua Yu, Jianchen Zhu, Jun Zhang. CoSA: Accelerating Long-Context Inference via Proxy-Kernel Co-Designed Sparse Attention. arXiv:2607.25291v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q020",
+   "text": "What recall@8 does Q-TIE reach on TimeQA?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q021",
+   "text": "SEER 的推理流程包括哪三个步骤？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "通过视觉扫描选出与查询相关的图像，取回这些图像对应的原文，再结合视觉内容和取回的文本推理出答案",
+   "evidence": [
+    [
+     {
+      "paper": "2608.15962v1",
+      "ordinal": 21,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.15962v1 [cs.CL] 16 Aug 2026"
+      ],
+      "quote": "(1) select query-relevant images through vi￾sual scanning, (2) retrieve the corresponding source text (available from the rendering process), and (3) reason over both visual context and retrieved text to generate the an￾swer. By learning which images require precise textual information, SEER aims to balance the efficiency of visual compression with precision where needed. Our contributions are summarized as follows:",
+      "attribution": "Jiawei Xu, Zhilin Zhai, Jinrui Fang, Ruohan Xu, Mingfei Lu, Yi Zhang, Guanchu Wang, Tianlong Chen, Ying Ding. SEER: Long-Context Reasoning via Selective Visual-Text Compression. arXiv:2608.15962v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q022",
+   "text": "Which four hallucination types does OmniHallu define across modalities?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Object, attribute, relation and event",
+   "evidence": [
+    [
+     {
+      "paper": "2609.11244v1",
+      "ordinal": 33,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.11244v1 [cs.CL] 10 Sep 2026"
+      ],
+      "quote": "Hallucination Taxonomy. We define four types applicable across all modalities: (1) Object: non￾existent entities introduced; (2) Attribute: misrep￾resented properties such as color, size, or timbre; (3) Relation: incorrectly stated spatial, temporal, or causal relationships; (4) Event: misrepresented event-level details, including temporal ordering er￾rors or fabricated actions. Each type manifests across all six tasks, enabling direct cross-modal comparison (§6).",
+      "attribution": "Jianjiang Yang, Peihang Li, Shanqing Xu, Mengchen Qian, Lu Zhang, Meng Luo. OmniHallu: Unified Hallucination Detection for Cross-Modal Comprehension and Generation in Multimodal Large Language Models. arXiv:2609.11244v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q023",
+   "text": "How many supported compressed runs and failure rows does KVDiagnosis contain on Qwen3-8B?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "59,800 compressed runs over 2,600 sources and 12,520 method–setting C→W failure rows",
+   "evidence": [
+    [
+     {
+      "paper": "2608.09412v1",
+      "ordinal": 23,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.09412v1 [cs.AI] 10 Aug 2026"
+      ],
+      "quote": "On Qwen3-8B across four evidence-aware workloads [40], the benchmark contains 59 800 supported compressed runs over 2600 sources and 12 520 method–setting C→W rows. Under fixed diag￾nostic rules, 63.2% have low or partial measured/projected support coverage. High measured/projected coverage with strong likeli￾hood drift is rare (19 rows), whereas 2,126 rows show drift under structural position addressability, which does not measure repre￾sentation fidelity. Methods with comparable aggregate quality can nevertheless fail on different source sets.",
+      "attribution": "Chen Qiu, Ziwu Liu, Chao Fei, Guozhong Li, Panos Kalnis. KVDiagnosis: A Diagnostic Benchmark for KV-Cache Compression in Long-Context Language Models. arXiv:2608.09412v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q024",
+   "text": "How many parseable citations did the unprompted control condition produce in the reference fabrication audit?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "None: zero across all ten models and 3,030 unprompted responses",
+   "evidence": [
+    [
+     {
+      "paper": "2603.03299v1",
+      "ordinal": 28,
+      "page": 6,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "6 The parsing pipeline extracted 69,557 citation instances from the 15,150 responses. The unprompted condition produced zero parseable citations across all ten models and all 3,030 unprompted responses, a result we return to in Section 4.",
+      "attribution": "MZ Naser. How LLMs Cite and Why It Matters: A Cross-Model Audit of Reference Fabrication in AI-Assisted Academic Writing and Methods to Detect Phantom Citations. arXiv:2603.03299v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q025",
+   "text": "CheckIfExist 在批量检查时以多大的间隔逐条处理参考文献？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "每条间隔 800 毫秒",
+   "evidence": [
+    [
+     {
+      "paper": "2602.15871v1",
+      "ordinal": 72,
+      "page": 7,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2602.15871v1 [cs.CL] 27 Jan 2026",
+       "4 Features and Usage"
+      ],
+      "quote": "The system processes entries sequentially with rate limiting (800ms intervals) to comply with API usage policies, with real-time status updates for each reference.",
+      "attribution": "Diletta Abbonato. CheckIfExist: Detecting Citation Hallucinations in the Era of AI-Generated Content. arXiv:2602.15871v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q026",
+   "text": "At 3.6M tokens on HotpotQA, how much does PI-Mem improve over MemAgent, and how much faster is its inference?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "+6.25 and +7.81 absolute points with Qwen3.5-35B-A3B and Qwen2.5-7B, with 6.1× and 2.1× speedups",
+   "evidence": [
+    [
+     {
+      "paper": "2608.03048v1",
+      "ordinal": 29,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "Introduction"
+      ],
+      "quote": "Experiments with Qwen3.5-35B-A3B and Qwen2.5-7B demonstrate the effectiveness and efficiency of PI-Mem. On HotpotQA (HQA) at 3.6M tokens, PI-Mem improves over MemAgent by +6.25 and +7.81 absolute points and delivers inference speedups of 6.1× and 2.1×, respectively.",
+      "attribution": "Dawei Liu, Haixu Song, Shuang Cheng, Shijie Wang, Haozheng Hou, Kaifeng Liu, Ermo Hua, Zhonghang Yuan, Zhijie Zhong, Yuchen Fan, Biqing Qi, Bowen Zhou. PI-Mem: Pushing Long-Context Reasoning to 3.6M Tokens with Parallel-Iterative Memory. arXiv:2608.03048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q027",
+   "text": "On RAG-based hallucination detection benchmarks, how did a simple LLM-as-a-Judge compare with supervised and fine-tuned detectors in the TRIVIA+ study?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "It performed competitively, contrary to earlier reports",
+   "evidence": [
+    [
+     {
+      "paper": "2605.11330v1",
+      "ordinal": 8,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2605.11330v1 [cs.AI] 11 May 2026"
+      ],
+      "quote": "• Empirical Findings: Experiments on RAG￾based HDBs find that (1) hallucination prevails in grounded tasks and current detectors leave ample room to ceiling performance, (2) while supervised and fine-tuned models can be effec￾tive, the simple LLM-as-a-Judge performs com￾petitively, in contrast to reports in past literature (Niu et al., 2024), and (3) sample-dependent (as opposed to random) label noise hinders detec￾tion significantly.",
+      "attribution": "Wenbo Chen, Veena Padmanabhan, Tootiya Giyahchi, Elaine Wong, Leman Akoglu. Rethinking Evaluation for LLM Hallucination Detection: A Desiderata, A New RAG-based Benchmark, New Insights. arXiv:2605.11330v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q028",
+   "text": "How many GPU hours did training GTA-RAG's retrieval policy take?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q029",
+   "text": "Which policy optimization method and reward does GTA-RAG use to train its retrieval policy?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Group Relative Policy Optimization (GRPO) with a trajectory-guided reward for accurate answers and acquiring the target evidence documents",
+   "evidence": [
+    [
+     {
+      "paper": "2608.22479v2",
+      "ordinal": 3,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "For complex multi-hop questions, multi￾turn retrieval-augmented reasoning extends RAG into an iterative process that repeatedly searches for and integrates evidence across documents. However, existing reinforcement￾learning (RL) approaches for agentic RAG are typically optimized with final-answer re￾wards, which provide sparse supervision and overlook whether the model actually retrieves the required evidence chain. We present GTA￾RAG, a graph-trajectory-augmented RL frame￾work for multi-turn retrieval-augmented rea￾soning. From an entity–document graph, we sample connected document paths, synthesize multi-hop QA trajectories, and validate them with the deployed retriever to obtain executable trajectory-level supervision. We then optimize the retrieval policy with Group Relative Policy Optimization (GRPO) and a trajectory-guided reward that encourages both accurate answers and acquisition of target evidence documents, followed by answer-reward training on natu￾ral QA instances. Experiments on three multi￾hop and two simple QA benchmarks show that GTA-RAG consistently outperforms RL￾based RAG baselines with both Qwen2.5-3B and Qwen2.5-7B backbones, while substan￾tially improving evidence-chain coverage. Our code is available at https://github.com/ cjcj46262/GTA-RAG.",
+      "attribution": "Jun Chen, Yongchao Liu, Pengyu Qiu, Jiajun Zheng, Juelu Zhang, Yujie Zeng, Qin Zhang, Ziyue Qiao, Xiao Luo. GTA-RAG: Graph-Trajectory-Augmented Reinforcement Learning for Multi-Turn Retrieval-Augmented Reasoning. arXiv:2608.22479v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q030",
+   "text": "Which two papers in this set report results on HotpotQA, and what do they report?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "FCPRAG improves F1 on HotpotQA and 2WikiMultiHopQA across three backbones; PI-Mem beats MemAgent on HotpotQA at 3.6M tokens by 6.25 and 7.81 points",
+   "evidence": [
+    [
+     {
+      "paper": "2608.21750v1",
+      "ordinal": 24,
+      "page": 3,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "• Empirical gains and key ablations. On Hot￾potQA (Yang et al., 2018) and 2WikiMulti￾HopQA (Ho et al., 2020), FCPRAG improves F1 across three LLM backbones (Llama￾3.2-1B (Touvron et al., 2023), Qwen2.5- 1.5B (Qwen et al., 2025), Llama-3-8B (Tou￾vron et al., 2023)) and achieves the best Avg.",
+      "attribution": "Jinchang Zhu, Jindong Li, Yi Ding, Xiaojian Nie, Rong Fu, Shuangyong Song, Haowei He, Menglin Yang. FCPRAG: Fusion-Controller Parametric Retrieval-Augmented Generation for Stable Multi-Passage LoRA Injection. arXiv:2608.21750v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2608.03048v1",
+      "ordinal": 29,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "Introduction"
+      ],
+      "quote": "Experiments with Qwen3.5-35B-A3B and Qwen2.5-7B demonstrate the effectiveness and efficiency of PI-Mem. On HotpotQA (HQA) at 3.6M tokens, PI-Mem improves over MemAgent by +6.25 and +7.81 absolute points and delivers inference speedups of 6.1× and 2.1×, respectively.",
+      "attribution": "Dawei Liu, Haixu Song, Shuang Cheng, Shijie Wang, Haozheng Hou, Kaifeng Liu, Ermo Hua, Zhonghang Yuan, Zhijie Zhong, Yuchen Fan, Biqing Qi, Bowen Zhou. PI-Mem: Pushing Long-Context Reasoning to 3.6M Tokens with Parallel-Iterative Memory. arXiv:2608.03048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q031",
+   "text": "临床逐字引用研究使用了哪四部临床指南作为语料？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "2019 年 AHA 心血管病一级预防指南、2025 年 AHA 高血压指南、2026 年 AHA 血胆固醇指南和 2026 年 ADA 糖尿病诊疗标准",
+   "evidence": [
+    [
+     {
+      "paper": "2609.15964v2",
+      "ordinal": 40,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.15964v2 [cs.CL] 17 Sep 2026",
+       "3 Methods"
+      ],
+      "quote": "Guideline Corpus. To develop our task, we start from a corpus of four clinical practice guidelines from the American Heart Association (AHA) and the American Diabetes Association (ADA): the 2019 AHA guideline on the primary prevention of cardiovascular disease (Arnett et al., 2019), the 2025 AHA guideline on high blood pressure (Jones et al., 2025), the 2026 AHA guideline on blood cholesterol (Blumenthal et al., 2026), and the 2026 ADA Standards of Care in Diabetes (American Diabetes Association Professional Practice Committee, 2026), which together cover the principal modifiable risk factors for atherosclerotic cardiovascular disease. Appendix A.1 provides more detail on how this corpus is preprocessed for later re￾trieval.",
+      "attribution": "Jiashuo Zhang, Yuling Chen, Yvonne Commodore-Mensah, Michael Oberst. Verifiable by Construction: Claim-Level Evaluation of Verbatim Citation in Clinical Question Answering. arXiv:2609.15964v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q032",
+   "text": "法语 PDF 页面检索研究所用的挑战数据集采用什么许可证？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q033",
+   "text": "无 GPU 幻觉检测基准和 SIRG 分别在哪些数据集上评估？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "前者使用 HaluEval 的问答、对话和摘要三个任务；SIRG 使用 RAGTruth 和 Dolly-15k",
+   "evidence": [
+    [
+     {
+      "paper": "2606.29809v2",
+      "ordinal": 16,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2606.29809v2 [cs.CL] 2 Oct 2026"
+      ],
+      "quote": "HaluEval (Li et al., 2023) provides 10,000 sam￾ples for each of three tasks: QA, dialogue, and summarisation. To build hallucinated candidates, the authors prompt ChatGPT for plausible but in￾correct content. Prior work has mostly reported QA results alone. We provide a systematic comparison of lightweight methods across all three tasks under a common calibration protocol.",
+      "attribution": "Kriti Faujdar, Smit Kadvani. How Far Can You Get Without a GPU? A Systematic Benchmark of Lightweight Hallucination Detection Across Question Answering, Dialogue, and Summarisation. arXiv:2606.29809v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2601.03052v1",
+      "ordinal": 126,
+      "page": 6,
+      "kind": "paragraph",
+      "section_path": [
+       "Internal Reasoning Graph R7 (3) = 𝑓(𝑥) R3←6 (1,2) R2←5",
+       "4 Experiments"
+      ],
+      "quote": "We conducted experiments using RAGTruth (Niu et al., 2024) and Dolly-15k (Conover et al., 2023).",
+      "attribution": "Jianpeng Hu, Yanzeng Li, Jialun Zhong, Wenfa Qi, Lei Zou. Detecting Hallucinations in Retrieval-Augmented Generation via Semantic-level Internal Reasoning Graph. arXiv:2601.03052v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q034",
+   "text": "TRIVIA+ 和 OmniHallu-Bench 的评测标签分别是如何得到的？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "两者的评测标签都经过人工验证：TRIVIA+ 用人工核验的测试标签，OmniHallu-Bench 带有断言级人工标注",
+   "evidence": [
+    [
+     {
+      "paper": "2605.11330v1",
+      "ordinal": 18,
+      "page": 3,
+      "kind": "caption",
+      "section_path": [
+       "arXiv:2605.11330v1 [cs.AI] 11 May 2026"
+      ],
+      "quote": "Table 1: Comparison of HDBs w.r.t. desirable desiderata (Sec. 2). Proposed TRIVIA+ exhibits all seven properties; with (i) organic generations, (ii) human-verified labels (for evaluation), (iii) four sets of realistic label noise (for training), on (iv) RAG-based long-context tasks (knowledge-intensive, hard-to-annotate), with (v) both extrinsic and intrinsic hallucinations, from (vi) multiple modern LLMs and (vii) multiple domains. None of the existing HDBs fully meets the desiderata. RAG-based HDBs are few, and are highlighted in red. Those marked with × do not make LLM generations available. Symbol ? denotes that it is unclear whether the dataset spans multiple domains.",
+      "attribution": "Wenbo Chen, Veena Padmanabhan, Tootiya Giyahchi, Elaine Wong, Leman Akoglu. Rethinking Evaluation for LLM Hallucination Detection: A Desiderata, A New RAG-based Benchmark, New Insights. arXiv:2605.11330v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2609.11244v1",
+      "ordinal": 16,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.11244v1 [cs.CL] 10 Sep 2026"
+      ],
+      "quote": "• OmniHallu-Bench: A 10,000-sample bench￾mark with claim-level human annotations spanning six cross-modal tasks (I2T, V2T, A2T, T2I, T2V, T2A) across four modalities.",
+      "attribution": "Jianjiang Yang, Peihang Li, Shanqing Xu, Mengchen Qian, Lu Zhang, Meng Luo. OmniHallu: Unified Hallucination Detection for Cross-Modal Comprehension and Generation in Multimodal Large Language Models. arXiv:2609.11244v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q035",
+   "text": "How many queries does Q-TIE's newly built temporal intent extraction dataset contain, and how are they split?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "2,300 queries, split 80/20 into train and test",
+   "evidence": [
+    [
+     {
+      "paper": "2609.23880v1",
+      "ordinal": 28,
+      "page": 4,
+      "kind": "caption",
+      "section_path": [
+       "arXiv:2609.23880v1 [cs.CL] 20 Sep 2026"
+      ],
+      "quote": "Table 1: Query distribution across 13 Allen relations in newly constructed TIE dataset. We show sample counts and example queries for each type. The total of 2,300 queries are split into train and test sets with an 80/20 ratio.",
+      "attribution": "Soyeon Kim, Hyunjin Kim, JinYeong Bak, Steven Euijong Whang. Q-TIE: A Lightweight and Generalizable Re-ranking Framework for Temporal Information Retrieval. arXiv:2609.23880v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q036",
+   "text": "GTA-RAG 和 Enoki 都用到了开放信息抽取，两者各自用它做什么？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "GTA-RAG 用 OpenIE 模型从文档中抽取事实三元组来构建实体-文档图；Enoki 抽取锚定在文本上的关系事实，用于核验并定位幻觉片段",
+   "evidence": [
+    [
+     {
+      "paper": "2608.22479v2",
+      "ordinal": 40,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.22479v2 [cs.CL] 30 Aug 2026"
+      ],
+      "quote": "3.2 Graph Knowledge Base and Retrieval Entity–document graph construction. Starting from each document di ∈ D, we apply an OpenIE model to extract factual triples",
+      "attribution": "Jun Chen, Yongchao Liu, Pengyu Qiu, Jiajun Zheng, Juelu Zhang, Yujie Zeng, Qin Zhang, Ziyue Qiao, Xiao Luo. GTA-RAG: Graph-Trajectory-Augmented Reinforcement Learning for Multi-Turn Retrieval-Augmented Reasoning. arXiv:2608.22479v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2609.00581v2",
+      "ordinal": 1,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "Ensuring factuality remains a critical challenge for deploying LLMs in high-stakes settings. Ex￾isting hallucination detectors usually operate at a single level: claim-level methods provide in￾terpretable factual units, while span-level meth￾ods localize unsupported text. Bridging these views is costly, as LLM-heavy pipelines require multiple decomposition and verification calls, and modular systems need additional claim￾to-span alignment. We propose ENOKI1 , an Open Information Extraction framework for multi-level hallucination detection. ENOKI ex￾tracts text-anchored relational facts, verifies them against evidence, and projects unsup￾ported facts back to hallucinated spans. This shared representation enables claim-level veri￾fication and span-level localization without re￾quiring separate alignment. ENOKI supports LLM-based, encoder-based, and rule-based ex￾traction regimes, balancing accuracy and infer￾ence cost through a common interface. Exper￾iments show that ENOKI remains competitive with strong claim-level systems while using fewer resources and achieves superior perfor￾mance on fine-grained span- and entity-level localization. We also release ENOKIQA, a dual￾granularity dataset with aligned claim-level verification and span-level localization anno￾tations.",
+      "attribution": "Elisei Rykov, Timur Ionov, Nikolay Ivanov, Maksim Savkin, Maksim Makarenko, Alexander Panchenko, Vasily Konovalov, Julia Belikova. Enoki: Efficient Multi-Level Hallucination Detection. arXiv:2609.00581v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q037",
+   "text": "How many questions do the French PDF page-retrieval study and the clinical verbatim citation study each evaluate on?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "595 challenge questions in the French study; 222 synthetic clinical queries in the clinical study",
+   "evidence": [
+    [
+     {
+      "paper": "2609.34776v1",
+      "ordinal": 27,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "3 Evaluation"
+      ],
+      "quote": "We evaluate the five runs on the 595 questions in the supplied challenge test file. Each output contains an answer and a variable-length list of cited document pages. The official report gives seven metrics. MRR@10, Recall@10, Top1, and nDCG@10 primarily measure page retrieval and ranking; LLMaaJ, QBERT, and QPARA Albert concern answer quality. Their exact scoring implementations are not specified in the supplied manuscript, so we retain the official metric names and reported scores without redefining them.",
+      "attribution": "Abdelhak kelious. Page-Aware Retrieval-Augmented Generation for EvalLLM 2026: A Five-Variant Study on French PDFs. arXiv:2609.34776v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2609.15964v2",
+      "ordinal": 29,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.15964v2 [cs.CL] 17 Sep 2026"
+      ],
+      "quote": "• Using this framework, we compare twelve mainstream LLMs from five vendors on a dataset of 222 synthetic clinical queries designed to be answerable from a set of four clinical guidelines, and derive insights into drivers of relative model performance.",
+      "attribution": "Jiashuo Zhang, Yuling Chen, Yvonne Commodore-Mensah, Michael Oberst. Verifiable by Construction: Claim-Level Evaluation of Verbatim Citation in Clinical Question Answering. arXiv:2609.15964v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q038",
+   "text": "What attention and end-to-end prefilling speedups does CoSA report at a 128K context length?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "4.93× attention speedup and 2.53× end-to-end prefilling speedup, with negligible degradation",
+   "evidence": [
+    [
+     {
+      "paper": "2607.25291v2",
+      "ordinal": 25,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.25291v2 [cs.CL] 7 Aug 2026"
+      ],
+      "quote": "• We conduct extensive experiments on mainstream LLM backbones and benchmarks, demonstrating superior ac￾curacy at lower budgets. For example, CoSA delivers a 4.93× attention speedup and 2.53× end-to-end prefilling speedup at a 128K context length with negligible perfor￾mance degradation.",
+      "attribution": "Yufei Xue, Lin Niu, Hong Liu, Siran Liu, Hanyong Shao, Wei Liu, Guanghua Yu, Jianchen Zhu, Jun Zhang. CoSA: Accelerating Long-Context Inference via Proxy-Kernel Co-Designed Sparse Attention. arXiv:2607.25291v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q039",
+   "text": "Q-TIE 的时间意图抽取模型是在哪个主干模型上微调的？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Qwen3-0.6B，用 LoRA 微调",
+   "evidence": [
+    [
+     {
+      "paper": "2609.23880v1",
+      "ordinal": 48,
+      "page": 5,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.23880v1 [cs.CL] 20 Sep 2026"
+      ],
+      "quote": "3.1.2 TIE Model Training Building on the constructed dataset, we train a ded￾icated TIE model that learns to map diverse tempo￾ral queries to their temporal windows (Table 2). We instantiate the TIE model by fine-tuning Qwen3- 0.6B (Yang et al., 2025), chosen to balance extrac￾tion accuracy with inference efficiency. We train on the constructed dataset with Low-Rank Adaptation (LoRA) (Hu et al., 2022) for parameter-efficient training; see training prompts and hyperparameters in §A.2. Despite its compact size (0.6B), experi￾ments in §4 demonstrate that the trained TIE model achieves comparable TIE performance to much larger 7B–9B models, confirming the effectiveness of our targeted supervision with the constructed dataset. Ablations across model families and sizes (§D.3) show that scaling the backbone up to 8B yields only marginal gains, supporting the 0.6B backbone as a favorable cost-performance choice.",
+      "attribution": "Soyeon Kim, Hyunjin Kim, JinYeong Bak, Steven Euijong Whang. Q-TIE: A Lightweight and Generalizable Re-ranking Framework for Temporal Information Retrieval. arXiv:2609.23880v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q040",
+   "text": "在无 GPU 的幻觉检测基准中，集成方法在三个任务上选定的权重 α 分别是多少？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "问答 0.4，对话 0.9，摘要 0.3",
+   "evidence": [
+    [
+     {
+      "paper": "2606.29809v2",
+      "ordinal": 31,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2606.29809v2 [cs.CL] 2 Oct 2026"
+      ],
+      "quote": "The selected weights are α = 0.4 (QA), α = 0.9 (dialogue), and α = 0.3 (summarisation). These weights already show that dialogue relies almost entirely on the NLI signal, while QA benefits from a more balanced mix. Orientation is fixed in ad￾vance for every detector; the calibrated threshold sets only the operating point and cannot reverse the direction of a score.",
+      "attribution": "Kriti Faujdar, Smit Kadvani. How Far Can You Get Without a GPU? A Systematic Benchmark of Lightweight Hallucination Detection Across Question Answering, Dialogue, and Summarisation. arXiv:2606.29809v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q041",
+   "text": "KVDiagnosis 的失败标签的标注者间一致性是多少？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q042",
+   "text": "How many of RECON's case files are written in Chinese?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q043",
+   "text": "Med-V1 在中文医学文献上的准确率是多少？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q044",
+   "text": "What accuracy do state-of-the-art long-document QA systems reach on TimeQA, according to the TEMPS paper, and how does that compare with humans?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "46%, against 87% for humans",
+   "evidence": [
+    [
+     {
+      "paper": "2609.28048v1",
+      "ordinal": 30,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "Temporal Constraints Contextual Information"
+      ],
+      "quote": "state-of-the-art long-document QA systems reach 46% accuracy on TimeQA against 87% for hu￾mans (Chen et al., 2021), and generative LLMs show the same weakness (Song et al., 2025). This stems from two factors. First, the corpora used to pretrain these encoders underrepresent explicit tem￾poral expressions and rely on coarse-grained times￾tamps, leaving models ill-equipped for questions involving sequence, overlap, and duration (Wang et al., 2023). Second, the embedding spaces of dense retrievers are static snapshots: they encode knowledge available at training time but cannot adapt to evolving timelines (Sojitra et al., 2024) or reason about time-dependent constraints. The result is temporally brittle retrieval that matches on semantics while missing time-sensitive relation￾ships, returning temporally incorrect documents.",
+      "attribution": "Mourad Hassani, Julien Romero, Amel Bouzeghoub, Christian Jacquelinet. TEMPS: Temporal Sentence Embeddings for Temporal Information Retrieval. arXiv:2609.28048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q045",
+   "text": "SIRG 使用的 RAGTruth Llama-7B 部分包含多少个幻觉样本和正常样本？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "510 个幻觉样本和 479 个正常样本",
+   "evidence": [
+    [
+     {
+      "paper": "2601.03052v1",
+      "ordinal": 127,
+      "page": 6,
+      "kind": "paragraph",
+      "section_path": [
+       "Internal Reasoning Graph R7 (3) = 𝑓(𝑥) R3←6 (1,2) R2←5",
+       "4 Experiments"
+      ],
+      "quote": "RAGTruth is a manually annotated RAG sample set generated by various LLMs. The Llama-7B part we used contains 510 hallucination samples and 479 normal samples, while the Llama-13B part contains 399 hallucination samples and 590 nor￾mal samples. Dolly-15k is a large model question￾answering dataset covering multiple scenarios. We only used the closed question-answering scenar￾ios oriented towards the RAG framework and fil￾tered out samples with empty contexts. Consistent with Hu et al. (2024), GPT-4 is used to compare model outputs with standard answers to annotate the dataset.",
+      "attribution": "Jianpeng Hu, Yanzeng Li, Jialun Zhong, Wenfa Qi, Lei Zou. Detecting Hallucinations in Retrieval-Augmented Generation via Semantic-level Internal Reasoning Graph. arXiv:2601.03052v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q046",
+   "text": "How many models does each of the two citation studies compare: the cross-model audit of reference fabrication, and the clinical verbatim citation evaluation?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "The audit compares 10 commercially deployed models; the clinical study compares twelve LLMs from five vendors",
+   "evidence": [
+    [
+     {
+      "paper": "2603.03299v1",
+      "ordinal": 11,
+      "page": 2,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "This paper addresses these gaps through extensive experiments. In particular, we evaluate 10 commercially deployed language models across 4 academic domains, 2 temporal framings, 3 independent replications per prompt, and an unprompted control condition. The resulting dataset comprises 69,557 citation instances, of which 40,529 are verified against a three-source resolution pipeline spanning CrossRef, OpenAlex, and Semantic Scholar. Our experimental design produces six contributions that helps bridge the gap within the current evidence base, in which we: 1) quantify hallucination rates across ten models from seven providers, 2) demonstrate that temporal framing substantially modulates fabrication, 3) establish through the unprompted control that no model spontaneously produces formal citations, 4) characterize systematic bibliometric biases in the citations that models do produce, including amplification of open-access works, high-citation papers, and a narrow set of publishers, 5) propose and validate two practical verification heuristics, multi-model consensus and within-prompt repetition, that reduce hallucination rates, and 6) track generational and capacity-scaling trajectories within model families.",
+      "attribution": "MZ Naser. How LLMs Cite and Why It Matters: A Cross-Model Audit of Reference Fabrication in AI-Assisted Academic Writing and Methods to Detect Phantom Citations. arXiv:2603.03299v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2609.15964v2",
+      "ordinal": 29,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.15964v2 [cs.CL] 17 Sep 2026"
+      ],
+      "quote": "• Using this framework, we compare twelve mainstream LLMs from five vendors on a dataset of 222 synthetic clinical queries designed to be answerable from a set of four clinical guidelines, and derive insights into drivers of relative model performance.",
+      "attribution": "Jiashuo Zhang, Yuling Chen, Yvonne Commodore-Mensah, Michael Oberst. Verifiable by Construction: Claim-Level Evaluation of Verbatim Citation in Clinical Question Answering. arXiv:2609.15964v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q047",
+   "text": "On the TS-Retriever benchmark, how much does TEMPS lift R@1 over the prior temporal state of the art?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "From 19.92 to 25.39",
+   "evidence": [
+    [
+     {
+      "paper": "2609.28048v1",
+      "ordinal": 5,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "The temporal score itself is the Gaussian-KL inclusion measure from distributional embed￾dings; what TEMPS adds is the grounding and the moment-matched supervision. On three temporal benchmarks, TEMPS improves MRR for every semantic backbone tested and, on TS￾Retriever, lifts R@1 from 19.92 to 25.39 over the prior temporal state of the art.",
+      "attribution": "Mourad Hassani, Julien Romero, Amel Bouzeghoub, Christian Jacquelinet. TEMPS: Temporal Sentence Embeddings for Temporal Information Retrieval. arXiv:2609.28048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q048",
+   "text": "OmniHallu-Bench 的音频样本涵盖哪几种语言？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q049",
+   "text": "The French PDF RAG study and Q-TIE both add a re-ranking stage: what does each re-rank with?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "The French study reorders 25 candidates with BAAI/bge-reranker-v2-m3; Q-TIE combines a temporal relevance score from its Qwen3-0.6B TIE model with semantic relevance by a product of experts",
+   "evidence": [
+    [
+     {
+      "paper": "2609.34776v1",
+      "ordinal": 25,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.34776v1 [cs.AI] 28 Sep 2026"
+      ],
+      "quote": "where an absent candidate contributes zero. BM25 and dense retrieval each take up to 60 candidates; the reranking variants reorder 25 candidates using BAAI/bge-reranker-v2-m3. Variant E also decomposes the question into short subqueries before retrieval. This description follows the reported setup; implementation details such as subquery count and the precise aggregation of chunk scores into page scores are unavailable in the supplied manuscript.",
+      "attribution": "Abdelhak kelious. Page-Aware Retrieval-Augmented Generation for EvalLLM 2026: A Five-Variant Study on French PDFs. arXiv:2609.34776v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2609.23880v1",
+      "ordinal": 13,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.23880v1 [cs.CL] 20 Sep 2026"
+      ],
+      "quote": "To address this limitation, we propose Q-TIE, a new temporal re-ranking framework with Query￾based Temporal Intent Extraction. Instead of rely￾ing on predefined rules, Q-TIE introduces a learned task – Temporal Intent Extraction (TIE) – that maps each timeframe required in a query to a unified representation, ⟨tstart, tend⟩. As illustrated in Fig. 1, this learned task allows Q-TIE to flexibly recognize diverse temporal expressions beyond fixed rules, while explicitly enforcing temporal constraints by separating the temporal signal. To train a dedicated TIE model, we newly construct a dataset covering 13 temporal query types with diverse linguistic ex￾pressions. The trained TIE model extracts temporal intent from queries to compute temporal relevance scores, which is then integrated with semantic rele￾vance scores via a Product-of-Experts (PoE) formu￾lation (Hinton, 2002). Unlike standard sum-based aggregation (Gade et al., 2025), PoE requires both scores to be high through multiplicative fusion, ef￾fectively preventing high semantic similarity from overshadowing temporal invalidity. We also design Q-TIE as a lightweight frame￾work to enable practical RAG deployments. The TIE model is built on a 0.6B-parameter language model, yet achieving TIE performance compara￾ble to much larger models (e.g., Gemma3-12B) and general neural re-rankers (e.g., Qwen3 re￾rankers) at substantially lower inference cost. This efficiency makes Q-TIE a cost-effective alterna￾tive for modern RAG pipelines, which often incur multiple retrieval calls for improved RAG perfor￾mances (Asai et al., 2024; Yan et al., 2024). Experiments show that Q-TIE substantially re￾duces performance gaps across diverse tempo￾ral query types, outperforming both temporal re￾trievers and temporal re-rankers. Further analysis demonstrates Q-TIE’s compatibility with existing RAG strategies such as query rewriting (Qian et al., 2024), showing its potential to extend coverage to more complex temporal queries.",
+      "attribution": "Soyeon Kim, Hyunjin Kim, JinYeong Bak, Steven Euijong Whang. Q-TIE: A Lightweight and Generalizable Re-ranking Framework for Temporal Information Retrieval. arXiv:2609.23880v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q050",
+   "text": "CoSA 的 OSK 内核如何实现第二阶段的稀疏计算？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "根据计算顺序掩码跳过任意顺序的页面，并在内核中对 softmax 统计量做跳过",
+   "evidence": [
+    [
+     {
+      "paper": "2607.25291v2",
+      "ordinal": 24,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.25291v2 [cs.CL] 7 Aug 2026"
+      ],
+      "quote": "• We design OSK, an optimized kernel that echoes KAP by physically jumping over any-order pages based on the computation-order mask. It performs an in-kernel skip on softmax statistics, which carries out the second-stage sparse computation.",
+      "attribution": "Yufei Xue, Lin Niu, Hong Liu, Siran Liu, Hanyong Shao, Wei Liu, Guanghua Yu, Jianchen Zhu, Jun Zhang. CoSA: Accelerating Long-Context Inference via Proxy-Kernel Co-Designed Sparse Attention. arXiv:2607.25291v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q051",
+   "text": "How many Korean regulatory documents does RegOps-Bench's corpus hold, and from how many seed FAQs is it built?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "12 Korean R&D regulatory documents covering 56 seed FAQs from an IITP FAQ document",
+   "evidence": [
+    [
+     {
+      "paper": "2605.29742v2",
+      "ordinal": 23,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2605.29742v2 [cs.AI] 31 Aug 2026"
+      ],
+      "quote": "3.1 Operational Knowledge Graph (OKG) Corpus. To anchor the benchmark in real-world compliance scenarios, we curated a corpus of 12 Korean R&D regulatory documents covering the scope of 56 seed FAQs from an official FAQ docu￾ment1 of the Institute of Information & Communi￾cations Technology Planning & Evaluation (IITP).",
+      "attribution": "Yeong-Joon Ju, Seong-Whan Lee. Citation-Closure Retrieval and Per-Rule Attribution for Real-World Regulatory Compliance Question Answering. arXiv:2605.29742v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q052",
+   "text": "How large are the two new long-context resources RECON and KVDiagnosis?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "RECON has 1,604 questions over 24 case files; KVDiagnosis has 59,800 compressed runs over 2,600 sources",
+   "evidence": [
+    [
+     {
+      "paper": "2607.16716v1",
+      "ordinal": 17,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.16716v1 [cs.AI] 18 Jul 2026"
+      ],
+      "quote": "• The RECON benchmark: 1,604 questions across 24 case files (50K–100K tokens) in three domains, with six task types over evolv￾ing rather than static evidence. Human valida￾tion reports κ = 0.69 on 200 questions.",
+      "attribution": "Mihir Shriniwas Arya. RECON: Benchmarking Agent Memory for Compositional Reasoning over Long Contexts. arXiv:2607.16716v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2608.09412v1",
+      "ordinal": 23,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.09412v1 [cs.AI] 10 Aug 2026"
+      ],
+      "quote": "On Qwen3-8B across four evidence-aware workloads [40], the benchmark contains 59 800 supported compressed runs over 2600 sources and 12 520 method–setting C→W rows. Under fixed diag￾nostic rules, 63.2% have low or partial measured/projected support coverage. High measured/projected coverage with strong likeli￾hood drift is rare (19 rows), whereas 2,126 rows show drift under structural position addressability, which does not measure repre￾sentation fidelity. Methods with comparable aggregate quality can nevertheless fail on different source sets.",
+      "attribution": "Chen Qiu, Ziwu Liu, Chao Fei, Guozhong Li, Panos Kalnis. KVDiagnosis: A Diagnostic Benchmark for KV-Cache Compression in Long-Context Language Models. arXiv:2608.09412v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q053",
+   "text": "How many samples does OmniHallu-Bench contain, and which six cross-modal tasks does it span?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "10,000 human-verified samples across I2T, V2T, A2T, T2I, T2V and T2A",
+   "evidence": [
+    [
+     {
+      "paper": "2609.11244v1",
+      "ordinal": 16,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.11244v1 [cs.CL] 10 Sep 2026"
+      ],
+      "quote": "• OmniHallu-Bench: A 10,000-sample bench￾mark with claim-level human annotations spanning six cross-modal tasks (I2T, V2T, A2T, T2I, T2V, T2A) across four modalities.",
+      "attribution": "Jianjiang Yang, Peihang Li, Shanqing Xu, Mengchen Qian, Lu Zhang, Meng Luo. OmniHallu: Unified Hallucination Detection for Cross-Modal Comprehension and Generation in Multimodal Large Language Models. arXiv:2609.11244v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q054",
+   "text": "在 100 个人工裁定的样本中，MedFact-Synth 的标签与人工共识完全一致的有多少个？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "74 个（三位标注者各自为 54、57 和 69 个）",
+   "evidence": [
+    [
+     {
+      "paper": "2603.05308v4",
+      "ordinal": 38,
+      "page": 3,
+      "kind": "caption",
+      "section_path": [
+       "+ a b"
+      ],
+      "quote": "Figure 2d shows the confusion matrices comparing each annotator and the MedFact-Synth labels with the human consensus labels. The MedFact-Synth label exactly matches the human consensus label in 74 of 100 instances, compared with 54, 57, and 69 instances for the three individual annotators. As a complementary analysis, when the five-point scores are grouped as negative (−2/−1), neutral (0), and positive (+1/+2), the MedFact-Synth label agrees with the human consensus in 87 of 100 instances, compared with 73, 75, and 78 instances for the three individual annotators.",
+      "attribution": "Qiao Jin, Yin Fang, Lauren He, Yifan Yang, Guangzhi Xiong, Zhizheng Wang, Nicholas Wan, Joey Chan, Donald C. Comeau, Robert Leaman, Charalampos S. Floudas, Aidong Zhang, Michael F. Chiang, Yifan Peng, Zhiyong Lu. Med-V1: Small Language Models for Zero-shot and Scalable Biomedical Evidence Attribution. arXiv:2603.05308v4",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q055",
+   "text": "On HaluEval question answering, what F1 and AUC-ROC does the similarity-NLI ensemble reach in the CPU-only hallucination detection benchmark?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "F1 0.792 and AUC-ROC 0.873",
+   "evidence": [
+    [
+     {
+      "paper": "2606.29809v2",
+      "ordinal": 35,
+      "page": 3,
+      "kind": "caption",
+      "section_path": [
+       "arXiv:2606.29809v2 [cs.CL] 2 Oct 2026"
+      ],
+      "quote": "Table 2 reports all methods across all tasks. Fig￾ure 1 shows the task-dependent pattern. Question answering. QA is the easiest task. The ensemble is strongest on accuracy (.803), recall (.766), F1 (.792), and AUC-ROC (.873). It beats the best standalone method by about 6 points on F1 and about 5 points on AUC-ROC. NLI reaches the highest precision (.865) but low recall (.625), a conservative operating point. BERTScore (.821 AUC) edges ROUGE-L (.817) and clearly beats se￾mantic similarity (.736). Contextual token overlap is therefore a stronger signal than sentence-level cosine similarity. The ensemble’s gain shows that the similarity and NLI signals complement each other.",
+      "attribution": "Kriti Faujdar, Smit Kadvani. How Far Can You Get Without a GPU? A Systematic Benchmark of Lightweight Hallucination Detection Across Question Answering, Dialogue, and Summarisation. arXiv:2606.29809v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q056",
+   "text": "在嵌套学习幻觉缓解流水线中，语义缓存承担了多少比例的模型调用？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "47.7%",
+   "evidence": [
+    [
+     {
+      "paper": "2605.29055v2",
+      "ordinal": 4,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Hallucination Mitigation with Agentic AI, Nested Learning, and AI Sustainability via Semantic Caching",
+       "Abstract"
+      ],
+      "quote": "A three-stage pipeline orchestrated via the Open Floor Protocol is evaluated with five KPIs, four of which score the response and are aggregated into a Total Hallucination Score. The score improves end to end by 6.1% of its attainable range, but an exact decomposition attributes 83.5% of that to one dimension, Explicit Contextualization, while Factual Claim Density — the dimension closest to unsupported content — stays flat; by step, 97.7% arrives at the first review stage. The fifth indicator, observability, is reported separately rather than summed in, because it registers the presence of an OFP annotation channel rather than a property of the response: it rises 147% at the review stage, the only stage carrying explicit hallucination markers, and falls back at the final stage, which does not propagate the channel. Three annotators independently labelled every final-stage response on the 93 stress prompts, and judged that in 10 of the 93 (10.8%, 95% CI 5.9–18.7) the pipeline’s final answer still presents the invented item as real, at α = 0.586, below the conventional threshold; Explicit Contextualization tracks those labels monotonically. Re-scoring all 930 outputs with Llama 3.1, Gemma 4 and Qwen 3 judges under a common instrument confirms the gain, and ranks the cross-family judges above the original evaluator against the human labels (ρ = −0.772 against −0.477). Semantic caching serves 47.7% of model calls. A nominally multi-dimensional reliability score is therefore one-dimensional here, and only that dimension has external support.",
+      "attribution": "Diego Gosmar, Deborah A. Dahl. Hallucination Mitigation with Agentic AI, Nested Learning, and AI Sustainability via Semantic Caching. arXiv:2605.29055v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q057",
+   "text": "Graphs of Research 把每篇论文的引用图剪枝到多大的预算，为什么这样选？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "K = min(30, max(12, ⌈0.15|R(v)|⌉))，使中位数长度的序列化提示能放进 Qwen2.5-7B-Instruct-1M 的 16k 词元训练上下文",
+   "evidence": [
+    [
+     {
+      "paper": "2605.14790v1",
+      "ordinal": 34,
+      "page": 5,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2605.14790v1 [cs.CL] 14 May 2026",
+       "3 Method"
+      ],
+      "quote": "DAG construction. We prune Gv to a budget K = min 30, max(12, ⌈0.15 |R(v)|⌉) \u0001 , chosen so the median serialized prompt fits inside the 16k-token training context of Qwen2.5-7B-Instruct-1M. Pruning runs in two passes. Pass 1 ranks each candidate r by",
+      "attribution": "Songyang Gao, Yinghui Xia, Siyi Liu, Hui Xiong. Graphs of Research: Citation Evolution Graphs as Supervision for Research Idea Generation. arXiv:2605.14790v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q058",
+   "text": "CoSA and SEER both report long-context results on a LongBench benchmark: which version does each use, and with what main model?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "CoSA reports LongBench-v2 with Qwen3-8B; SEER reports LongBench average accuracy, compared with Glyph-9B and Qwen3-8B",
+   "evidence": [
+    [
+     {
+      "paper": "2607.25291v2",
+      "ordinal": 17,
+      "page": 1,
+      "kind": "caption",
+      "section_path": [
+       "CoSA: Accelerating Long-Context Inference via Proxy-Kernel Co-Designed Sparse Attention",
+       "1 Introduction"
+      ],
+      "quote": "Figure 1: Performance and budget of mainstream sparse at￾tention methods on LongBench-v2 with Qwen3-8B.",
+      "attribution": "Yufei Xue, Lin Niu, Hong Liu, Siran Liu, Hanyong Shao, Wei Liu, Guanghua Yu, Jianchen Zhu, Jun Zhang. CoSA: Accelerating Long-Context Inference via Proxy-Kernel Co-Designed Sparse Attention. arXiv:2607.25291v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2608.15962v1",
+      "ordinal": 24,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.15962v1 [cs.CL] 16 Aug 2026"
+      ],
+      "quote": "• On LongBench, SEER achieves 51.11% average accuracy, improving over Glyph￾9B by 2.33 points through selective text retrieval, with large gains on extraction￾intensive tasks (+8.75 on Qasper, +19.17 on MultiFieldQA-Zh). Under our reported setup, SEER is 3.49 points above Qwen3-8B.",
+      "attribution": "Jiawei Xu, Zhilin Zhai, Jinrui Fang, Ruohan Xu, Mingfei Lu, Yi Zhang, Guanchu Wang, Tianlong Chen, Ying Ding. SEER: Long-Context Reasoning via Selective Visual-Text Compression. arXiv:2608.15962v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q059",
+   "text": "KVDiagnosis 的分类体系涵盖多少种 KV 缓存压缩方法，分为几个机制族，其中有多少个经过验证的实现？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "25 种方法，五个机制族，八个经过验证的实现",
+   "evidence": [
+    [
+     {
+      "paper": "2608.09412v1",
+      "ordinal": 25,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.09412v1 [cs.AI] 10 Aug 2026"
+      ],
+      "quote": "• Mechanism coverage. We synthesize a representative 25- method taxonomy and a clear mapping from five mechanism families to eight verified implementations and the diagnos￾tics each supports. • Evaluation on all sources. We pair every source in each fixed split with FullCache, select failures separately for each method–setting, and link outputs and run metadata to valid cache, likelihood, attention, and decoding measurements without changing the evaluated source set. • Paired empirical resource. We construct 59 800 supported compressed runs and 12 520 failure rows across four work￾loads, validate the diagnostics against C→C controls, and test low-EAR failures with a targeted repair.",
+      "attribution": "Chen Qiu, Ziwu Liu, Chao Fei, Guozhong Li, Panos Kalnis. KVDiagnosis: A Diagnostic Benchmark for KV-Cache Compression in Long-Context Language Models. arXiv:2608.09412v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q060",
+   "text": "What hallucination rate did the cross-model citation audit report for Google's Gemini models?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q061",
+   "text": "In PredicateLongBench's multi-list decoy variant, which model scored best and with what accuracy?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Gemini 3.1 high at 10%, with Opus 4.6 at 1% and GPT 5.4 at 2%",
+   "evidence": [
+    [
+     {
+      "paper": "2607.08284v1",
+      "ordinal": 94,
+      "page": 8,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.08284v1 [cs.AI] 9 Jul 2026",
+       "4 Results"
+      ],
+      "quote": "We construct another decoy variant for the lexicographic sequence retrieval task. In this variant we split our list of words into 20 lists and for every list boundary, we ensure that the suffix of the list and the prefix of the next list form a lexicographically sorted sequence of length 5. However we task the model with retrieving a sequence wholly contained in a single list. The results are in Table 2. As with the previous decoy, we see a drastic drop in performance with this decoy as well. The best performing model is Gemini 3.1 high, which obtains 10%, while Opus 4.6 and GPT 5.4 are at 1% and 2%, respectively, and open-source models are further behind at 0%.",
+      "attribution": "Siddhartha Jain, Ameya Velingker. Understanding Axes of Difficulty For Long Context Tasks Via PredicateLongBench. arXiv:2607.08284v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q062",
+   "text": "RECON 的人工验证在多少道题上进行，一致性 κ 是多少？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "200 道题，κ = 0.69",
+   "evidence": [
+    [
+     {
+      "paper": "2607.16716v1",
+      "ordinal": 17,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.16716v1 [cs.AI] 18 Jul 2026"
+      ],
+      "quote": "• The RECON benchmark: 1,604 questions across 24 case files (50K–100K tokens) in three domains, with six task types over evolv￾ing rather than static evidence. Human valida￾tion reports κ = 0.69 on 200 questions.",
+      "attribution": "Mihir Shriniwas Arya. RECON: Benchmarking Agent Memory for Compositional Reasoning over Long Contexts. arXiv:2607.16716v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q063",
+   "text": "OmniHallu 和 Enoki 分别在什么粒度上检测幻觉？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "OmniHallu 采用断言级（claim-level）检测；Enoki 同时做断言级验证和片段级（span-level）定位",
+   "evidence": [
+    [
+     {
+      "paper": "2609.11244v1",
+      "ordinal": 16,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.11244v1 [cs.CL] 10 Sep 2026"
+      ],
+      "quote": "• OmniHallu-Bench: A 10,000-sample bench￾mark with claim-level human annotations spanning six cross-modal tasks (I2T, V2T, A2T, T2I, T2V, T2A) across four modalities.",
+      "attribution": "Jianjiang Yang, Peihang Li, Shanqing Xu, Mengchen Qian, Lu Zhang, Meng Luo. OmniHallu: Unified Hallucination Detection for Cross-Modal Comprehension and Generation in Multimodal Large Language Models. arXiv:2609.11244v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2609.00581v2",
+      "ordinal": 1,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "Ensuring factuality remains a critical challenge for deploying LLMs in high-stakes settings. Ex￾isting hallucination detectors usually operate at a single level: claim-level methods provide in￾terpretable factual units, while span-level meth￾ods localize unsupported text. Bridging these views is costly, as LLM-heavy pipelines require multiple decomposition and verification calls, and modular systems need additional claim￾to-span alignment. We propose ENOKI1 , an Open Information Extraction framework for multi-level hallucination detection. ENOKI ex￾tracts text-anchored relational facts, verifies them against evidence, and projects unsup￾ported facts back to hallucinated spans. This shared representation enables claim-level veri￾fication and span-level localization without re￾quiring separate alignment. ENOKI supports LLM-based, encoder-based, and rule-based ex￾traction regimes, balancing accuracy and infer￾ence cost through a common interface. Exper￾iments show that ENOKI remains competitive with strong claim-level systems while using fewer resources and achieves superior perfor￾mance on fine-grained span- and entity-level localization. We also release ENOKIQA, a dual￾granularity dataset with aligned claim-level verification and span-level localization anno￾tations.",
+      "attribution": "Elisei Rykov, Timur Ionov, Nikolay Ivanov, Maksim Savkin, Maksim Makarenko, Alexander Panchenko, Vasily Konovalov, Julia Belikova. Enoki: Efficient Multi-Level Hallucination Detection. arXiv:2609.00581v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q064",
+   "text": "TEMPS 在中文时间检索基准上的表现如何？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q065",
+   "text": "What MMLU score does GTA-RAG report?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q066",
+   "text": "PI-Mem and GTA-RAG both train with reinforcement learning: what does each reward beyond a correct answer?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "PI-Mem adds a turn-efficiency reward against redundant turns; GTA-RAG uses a trajectory-guided reward for retrieving the target evidence documents",
+   "evidence": [
+    [
+     {
+      "paper": "2608.03048v1",
+      "ordinal": 32,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "Introduction"
+      ],
+      "quote": "• We optimize the workflow end-to-end with RL to improve long-context performance and introduce a turn-efficiency reward that discourages redundant turns.",
+      "attribution": "Dawei Liu, Haixu Song, Shuang Cheng, Shijie Wang, Haozheng Hou, Kaifeng Liu, Ermo Hua, Zhonghang Yuan, Zhijie Zhong, Yuchen Fan, Biqing Qi, Bowen Zhou. PI-Mem: Pushing Long-Context Reasoning to 3.6M Tokens with Parallel-Iterative Memory. arXiv:2608.03048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2608.22479v2",
+      "ordinal": 3,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "For complex multi-hop questions, multi￾turn retrieval-augmented reasoning extends RAG into an iterative process that repeatedly searches for and integrates evidence across documents. However, existing reinforcement￾learning (RL) approaches for agentic RAG are typically optimized with final-answer re￾wards, which provide sparse supervision and overlook whether the model actually retrieves the required evidence chain. We present GTA￾RAG, a graph-trajectory-augmented RL frame￾work for multi-turn retrieval-augmented rea￾soning. From an entity–document graph, we sample connected document paths, synthesize multi-hop QA trajectories, and validate them with the deployed retriever to obtain executable trajectory-level supervision. We then optimize the retrieval policy with Group Relative Policy Optimization (GRPO) and a trajectory-guided reward that encourages both accurate answers and acquisition of target evidence documents, followed by answer-reward training on natu￾ral QA instances. Experiments on three multi￾hop and two simple QA benchmarks show that GTA-RAG consistently outperforms RL￾based RAG baselines with both Qwen2.5-3B and Qwen2.5-7B backbones, while substan￾tially improving evidence-chain coverage. Our code is available at https://github.com/ cjcj46262/GTA-RAG.",
+      "attribution": "Jun Chen, Yongchao Liu, Pengyu Qiu, Jiajun Zheng, Juelu Zhang, Yujie Zeng, Qin Zhang, Ziyue Qiao, Xiao Luo. GTA-RAG: Graph-Trajectory-Augmented Reinforcement Learning for Multi-Turn Retrieval-Augmented Reasoning. arXiv:2608.22479v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q067",
+   "text": "训练 FCPRAG 的段落 LoRA 适配器总共用了多少 GPU 小时？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q068",
+   "text": "In the cross-model audit of reference fabrication, which models had the lowest and highest hallucination rates?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "GPT-5-mini at 11.4% and haiku-4.5 at 56.8%",
+   "evidence": [
+    [
+     {
+      "paper": "2603.03299v1",
+      "ordinal": 36,
+      "page": 7,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "4.1 Hallucination rates by model Across the ten models, hallucination rates range from 11.4% (GPT-5-mini) to 56.8% (haiku-4.5), a fivefold variation. Table 1 presents the full model rankings with bootstrap confidence intervals, total citations generated, and the number verified as real.",
+      "attribution": "MZ Naser. How LLMs Cite and Why It Matters: A Cross-Model Audit of Reference Fabrication in AI-Assisted Academic Writing and Methods to Detect Phantom Citations. arXiv:2603.03299v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q069",
+   "text": "In SIRG, what happens to recall and precision on correct samples when α is set to 0.4?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Recall for correct samples reaches 100% while precision drops to 72.86%",
+   "evidence": [
+    [
+     {
+      "paper": "2601.03052v1",
+      "ordinal": 178,
+      "page": 8,
+      "kind": "paragraph",
+      "section_path": [
+       "Internal Reasoning Graph R7 (3) = 𝑓(𝑥) R3←6 (1,2) R2←5",
+       "4 Experiments"
+      ],
+      "quote": "As the value of α increases, the detection strategy becomes increasingly lenient, so the pass rate for correct samples rises. When α = 0.4, the recall for correct samples reaches 100%, but the preci￾sion decreases to 72.86%. Although adjusting α greatly impacts recall and precision, it has a rel￾atively weak effect on the F1 score. In different scenarios, we can dynamically adjust α based on the desired pass rate for correct samples.",
+      "attribution": "Jianpeng Hu, Yanzeng Li, Jialun Zhong, Wenfa Qi, Lei Zou. Detecting Hallucinations in Retrieval-Augmented Generation via Semantic-level Internal Reasoning Graph. arXiv:2601.03052v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q070",
+   "text": "When does the graph-agentic RAG survey count a system as graph-agentic?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "When graph elements are material evidence for the answer and an observation during execution can change a later graph operation, retrieval, verification, delegation or tool call",
+   "evidence": [
+    [
+     {
+      "paper": "2609.06391v1",
+      "ordinal": 26,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.06391v1 [cs.AI] 6 Sep 2026",
+       "3 From Graph Retrieval to Graph-Agentic Systems"
+      ],
+      "quote": "We therefore use an operational boundary: a system is graph-agentic when (i) nodes, edges, paths, or graph summaries are material evidence for the answer, and (ii) an observation made during execution can change a subsequent graph operation, retrieval, verification step, delegation, or tool call. This definition excludes graphs used only for visualization and fixed pipelines whose control flow cannot respond to evidence. It also avoids presenting flat RAG, GraphRAG, and agentic RAG as rungs on a maturity ladder. Each can be the right design for a different information problem.",
+      "attribution": "Vijay Bommireddy, Raviteja Bommireddy. Building Trustworthy Graph-Agentic RAG for Social Good: Architectures, Failure Propagation, and Assurance by Construction. arXiv:2609.06391v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q071",
+   "text": "What publication window did the graph-agentic RAG survey cover in its literature review?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "January 2020 through 29 August 2026",
+   "evidence": [
+    [
+     {
+      "paper": "2609.06391v1",
+      "ordinal": 24,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.06391v1 [cs.AI] 6 Sep 2026",
+       "2 Scope and evidence discipline"
+      ],
+      "quote": "We reviewed work published or posted from January 2020 through 29 August 2026, with earlier foundational studies added through citation chaining when directly relevant to governance or human oversight. Searches combined terms for RAG, graphs, knowledge graphs, agents, planning, and orchestration with provenance, freshness, robustness, poisoning, privacy, fairness, oversight, and contestability. We included systems with a graph or retrieval substrate, generation component, and enough control detail to identify adaptive decisions, together with assurance work directly relevant to the resulting failure surfaces. We excluded visualization-only graphs, graph-embedding work without retrieval and generation, duplicate reports, and fixed pipelines labelled as agents. Primary proceedings and publisher records were used to verify bibliographic identity and publication status; an evidence ledger records the claims supported by each source. Because tasks, graphs, models, metrics, and hardware differ substantially, we compare reported mechanisms and evaluation scope rather than pool scores or rank architectures.",
+      "attribution": "Vijay Bommireddy, Raviteja Bommireddy. Building Trustworthy Graph-Agentic RAG for Social Good: Architectures, Failure Propagation, and Assurance by Construction. arXiv:2609.06391v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q072",
+   "text": "TEMPS 和 Q-TIE 都研究时间信息检索：两者各自的训练数据是如何得到的？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "TEMPS 通过把时间表达落到区间并做矩匹配，自动生成 6000 万条训练元组；Q-TIE 新建了覆盖 13 种 Allen 关系的 2,300 条查询数据集",
+   "evidence": [
+    [
+     {
+      "paper": "2609.28048v1",
+      "ordinal": 34,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "Temporal Constraints Contextual Information"
+      ],
+      "quote": "• We show this compatibility can be trained at scale without manual labeling: a pipeline grounds temporal language to intervals and moment-matches them into directional Gaus￾sian targets, yielding 60M training tuples. • We propose a new framework called TEMPS (Temporal Embedding Model for Precise Search) that combines frozen semantic retriev￾ers with fine-grained temporal reasoning at a minimal cost. It repurposes established Gaussian-KL inclusion machinery for tempo-",
+      "attribution": "Mourad Hassani, Julien Romero, Amel Bouzeghoub, Christian Jacquelinet. TEMPS: Temporal Sentence Embeddings for Temporal Information Retrieval. arXiv:2609.28048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2609.23880v1",
+      "ordinal": 28,
+      "page": 4,
+      "kind": "caption",
+      "section_path": [
+       "arXiv:2609.23880v1 [cs.CL] 20 Sep 2026"
+      ],
+      "quote": "Table 1: Query distribution across 13 Allen relations in newly constructed TIE dataset. We show sample counts and example queries for each type. The total of 2,300 queries are split into train and test sets with an 80/20 ratio.",
+      "attribution": "Soyeon Kim, Hyunjin Kim, JinYeong Bak, Steven Euijong Whang. Q-TIE: A Lightweight and Generalizable Re-ranking Framework for Temporal Information Retrieval. arXiv:2609.23880v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q073",
+   "text": "EnokiQA 的开发集和测试集各有多少条标注样本，覆盖几个生成模型？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "各 1,995 条，均衡覆盖七个生成模型，每个模型 285 条",
+   "evidence": [
+    [
+     {
+      "paper": "2609.00581v2",
+      "ordinal": 74,
+      "page": 5,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.00581v2 [cs.CL] 4 Sep 2026"
+      ],
+      "quote": "Splits. ENOKIQA contains train, development, and test splits. The train split has 19,594 unla￾beled examples and preserves the natural distribu￾tion over generator models and Wikipedia popular￾ity tiers. The development and test splits contain 1,995 labeled examples each. Both are balanced across seven generator models, with 285 examples per model; development is additionally stratified to match the test distribution over generator model and popularity tier.",
+      "attribution": "Elisei Rykov, Timur Ionov, Nikolay Ivanov, Maksim Savkin, Maksim Makarenko, Alexander Panchenko, Vasily Konovalov, Julia Belikova. Enoki: Efficient Multi-Level Hallucination Detection. arXiv:2609.00581v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q074",
+   "text": "PI-Mem 在强化学习训练中引入了什么奖励来减少多余的轮次？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "轮次效率奖励（turn-efficiency reward）",
+   "evidence": [
+    [
+     {
+      "paper": "2608.03048v1",
+      "ordinal": 32,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "Introduction"
+      ],
+      "quote": "• We optimize the workflow end-to-end with RL to improve long-context performance and introduce a turn-efficiency reward that discourages redundant turns.",
+      "attribution": "Dawei Liu, Haixu Song, Shuang Cheng, Shijie Wang, Haozheng Hou, Kaifeng Liu, Ermo Hua, Zhonghang Yuan, Zhijie Zhong, Yuchen Fan, Biqing Qi, Bowen Zhou. PI-Mem: Pushing Long-Context Reasoning to 3.6M Tokens with Parallel-Iterative Memory. arXiv:2608.03048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q075",
+   "text": "Against adjudicated human labels, what sentence-level and span-level F1 did EnokiQA's automatic annotation pipeline reach?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "0.867 at sentence level and 0.569 at span level",
+   "evidence": [
+    [
+     {
+      "paper": "2609.00581v2",
+      "ordinal": 83,
+      "page": 6,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.00581v2 [cs.CL] 4 Sep 2026"
+      ],
+      "quote": "Against adjudicated human labels, the automatic pipeline achieved sentence-level F1 = 0.867 and span-level F1 = 0.569, consistent with the diffi￾culty of long-form span annotation and comparable to prior work (Vazquez et al., 2025).",
+      "attribution": "Elisei Rykov, Timur Ionov, Nikolay Ivanov, Maksim Savkin, Maksim Makarenko, Alexander Panchenko, Vasily Konovalov, Julia Belikova. Enoki: Efficient Multi-Level Hallucination Detection. arXiv:2609.00581v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q076",
+   "text": "Med-V1 and Graphs of Research both fine-tune open models: which base models does each start from?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Med-V1 starts from Llama-3.2-3B-Instruct and Qwen2.5-3B-Instruct; GoR-SFT trains Qwen2.5-7B-Instruct-1M",
+   "evidence": [
+    [
+     {
+      "paper": "2603.05308v4",
+      "ordinal": 12,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2603.05308v4 [cs.CL] 23 Sep 2026",
+       "2 Results"
+      ],
+      "quote": "Phase I: Synthetic data generation and model training. In the first phase, we construct MedFact-Synth, a large-scale synthetic training set including 1.5 million instances. Each instance contains: a synthetic claim to be verified, a source article serving as evidence, a rationale explaining the verification, and a 5-point Likert-scale verdict, ranging from strong contradiction (-2) and partial contradiction (-1) to neutral (0), partial agreement (+1), and strong agreement (+2). To build this dataset, we begin by sampling one million articles from the PubMed 2025 baseline [35]. For each article, GPT-4o-mini [36] is prompted to generate two claims: one that the article may support and one that it may refute. To collect diverse claim-article pairs for verification, we use MedCPT [37] to retrieve the top 10 most relevant PubMed articles for each claim. A panel of frontier LLMs then verifies each pair, generating both rationales and verdicts via a voting-based mechanism. Then, we utilize MedFact-Synth to fine-tune Med-V1, which is a three-billion-parameter (3B) small LLM available in two variants: Med-V1-L3B, initialized from Llama-3.2-3B-Instruct [27] and Med-V1-Q3B, initialized from Qwen2.5-3B-Instruct [28]. The quality of MedFact-Synth is examined in the next section, and technical details of the dataset construction and training process are described in the Methods section.",
+      "attribution": "Qiao Jin, Yin Fang, Lauren He, Yifan Yang, Guangzhi Xiong, Zhizheng Wang, Nicholas Wan, Joey Chan, Donald C. Comeau, Robert Leaman, Charalampos S. Floudas, Aidong Zhang, Michael F. Chiang, Yifan Peng, Zhiyong Lu. Med-V1: Small Language Models for Zero-shot and Scalable Biomedical Evidence Attribution. arXiv:2603.05308v4",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2605.14790v1",
+      "ordinal": 42,
+      "page": 5,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2605.14790v1 [cs.CL] 14 May 2026",
+       "3 Method"
+      ],
+      "quote": "We train Qwen2.5-7B-Instruct-1M [34] on a structured-text serialization of the annotated subgraph Gv from §3.1 to predict the seed paper’s five-field idea, calling the resulting model GoR-SFT.",
+      "attribution": "Songyang Gao, Yinghui Xia, Siyi Liu, Hui Xiong. Graphs of Research: Citation Evolution Graphs as Supervision for Research Idea Generation. arXiv:2605.14790v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q077",
+   "text": "What precision does CheckIfExist reach on a test set of known fabricated references?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q078",
+   "text": "Which three domains do RECON's case files cover, and how long is each case?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Criminal, medical and financial; each case is 50k to 100k tokens",
+   "evidence": [
+    [
+     {
+      "paper": "2607.16716v1",
+      "ordinal": 5,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "RECON spans 24 case files and 1,604 questions across three domains (criminal, medical, and financial), with each case ranging from 50k to 100k tokens and fully deterministic ground truth. It tests agents on six memory-intensive tasks, illustrated in Figure 1.",
+      "attribution": "Mihir Shriniwas Arya. RECON: Benchmarking Agent Memory for Compositional Reasoning over Long Contexts. arXiv:2607.16716v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q079",
+   "text": "CheckIfExist 和跨模型引用伪造审计分别查询哪些学术数据库来核验引用？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "两者都查询 CrossRef、Semantic Scholar 和 OpenAlex",
+   "evidence": [
+    [
+     {
+      "paper": "2602.15871v1",
+      "ordinal": 10,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2602.15871v1 [cs.CL] 27 Jan 2026"
+      ],
+      "quote": "The tool presented in this paper addresses precisely this gap: it provides instant verification of reference authenticity through real-time queries to multiple scholarly databases—CrossRef, Semantic Scholar, and OpenAlex—returning validation results within seconds rather than requiring researchers to interrupt their work for manual database searches or navigate paywall barriers.",
+      "attribution": "Diletta Abbonato. CheckIfExist: Detecting Citation Hallucinations in the Era of AI-Generated Content. arXiv:2602.15871v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2603.03299v1",
+      "ordinal": 11,
+      "page": 2,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "This paper addresses these gaps through extensive experiments. In particular, we evaluate 10 commercially deployed language models across 4 academic domains, 2 temporal framings, 3 independent replications per prompt, and an unprompted control condition. The resulting dataset comprises 69,557 citation instances, of which 40,529 are verified against a three-source resolution pipeline spanning CrossRef, OpenAlex, and Semantic Scholar. Our experimental design produces six contributions that helps bridge the gap within the current evidence base, in which we: 1) quantify hallucination rates across ten models from seven providers, 2) demonstrate that temporal framing substantially modulates fabrication, 3) establish through the unprompted control that no model spontaneously produces formal citations, 4) characterize systematic bibliometric biases in the citations that models do produce, including amplification of open-access works, high-citation papers, and a narrow set of publishers, 5) propose and validate two practical verification heuristics, multi-model consensus and within-prompt repetition, that reduce hallucination rates, and 6) track generational and capacity-scaling trajectories within model families.",
+      "attribution": "MZ Naser. How LLMs Cite and Why It Matters: A Cross-Model Audit of Reference Fabrication in AI-Assisted Academic Writing and Methods to Detect Phantom Citations. arXiv:2603.03299v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q080",
+   "text": "RECON 和 PredicateLongBench 的任务和标准答案分别是如何构造的？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "RECON 用六层生成器把每个案例构造成溯源图，所有标准答案由代码推导；PredicateLongBench 在单词列表上设置算法简单的约束任务，要求找出满足谓词的最长连续子序列",
+   "evidence": [
+    [
+     {
+      "paper": "2607.16716v1",
+      "ordinal": 18,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.16716v1 [cs.AI] 18 Jul 2026"
+      ],
+      "quote": "• A deterministic generation pipeline: a six￾layer generator builds each case as a prove￾nance graph with explicit invalidations and counterfactuals, with all ground-truth answers derived in code, not by an LLM. • An empirical study of long-context LLMs, RAG variants, and memory-augmented agents on RECON, analyzing performance across task categories and identifying open challenges. We release the dataset, generator, and evaluation harness.",
+      "attribution": "Mihir Shriniwas Arya. RECON: Benchmarking Agent Memory for Compositional Reasoning over Long Contexts. arXiv:2607.16716v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2607.08284v1",
+      "ordinal": 21,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2607.08284v1 [cs.AI] 9 Jul 2026",
+       "2 Related Works"
+      ],
+      "quote": "The general setup is to provide a long context window that consists of a space separated list of words. A typical task in our benchmark asks a model to identify the longest contiguous subsequence of words subject to constraints, chosen from some predicate class.",
+      "attribution": "Siddhartha Jain, Ameya Velingker. Understanding Axes of Difficulty For Long Context Tasks Via PredicateLongBench. arXiv:2607.08284v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q081",
+   "text": "GTA-RAG 和 FCPRAG 分别使用了哪些大模型主干？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "GTA-RAG 使用 Qwen2.5-3B 和 Qwen2.5-7B；FCPRAG 使用 Llama-3.2-1B、Qwen2.5-1.5B 和 Llama-3-8B",
+   "evidence": [
+    [
+     {
+      "paper": "2608.22479v2",
+      "ordinal": 12,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.22479v2 [cs.CL] 30 Aug 2026"
+      ],
+      "quote": "Experiments on both multi-hop and simple QA benchmarks show that GTA-RAG consistently outperforms prior RL-based RAG systems under both Qwen2.5-3B and Qwen2.5-7B backbones.",
+      "attribution": "Jun Chen, Yongchao Liu, Pengyu Qiu, Jiajun Zheng, Juelu Zhang, Yujie Zeng, Qin Zhang, Ziyue Qiao, Xiao Luo. GTA-RAG: Graph-Trajectory-Augmented Reinforcement Learning for Multi-Turn Retrieval-Augmented Reasoning. arXiv:2608.22479v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2608.21750v1",
+      "ordinal": 24,
+      "page": 3,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "• Empirical gains and key ablations. On Hot￾potQA (Yang et al., 2018) and 2WikiMulti￾HopQA (Ho et al., 2020), FCPRAG improves F1 across three LLM backbones (Llama￾3.2-1B (Touvron et al., 2023), Qwen2.5- 1.5B (Qwen et al., 2025), Llama-3-8B (Tou￾vron et al., 2023)) and achieves the best Avg.",
+      "attribution": "Jinchang Zhu, Jindong Li, Yi Ding, Xiaojian Nie, Rong Fu, Shuangyong Song, Haowei He, Menglin Yang. FCPRAG: Fusion-Controller Parametric Retrieval-Augmented Generation for Stable Multi-Passage LoRA Injection. arXiv:2608.21750v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q082",
+   "text": "OmniHallu 用 GRPO 对齐的紧凑验证器把昂贵的专家调用减少了多少？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "66%，性能损失很小",
+   "evidence": [
+    [
+     {
+      "paper": "2609.11244v1",
+      "ordinal": 18,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2609.11244v1 [cs.CL] 10 Sep 2026"
+      ],
+      "quote": "• Preference-optimized verifier: A compact trainable verifier aligned via GRPO that re￾duces expensive expert calls by 66% with min￾imal performance loss.",
+      "attribution": "Jianjiang Yang, Peihang Li, Shanqing Xu, Mengchen Qian, Lu Zhang, Meng Luo. OmniHallu: Unified Hallucination Detection for Cross-Modal Comprehension and Generation in Multimodal Large Language Models. arXiv:2609.11244v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q083",
+   "text": "在法语 PDF 页面检索研究中，完整变体 E 的运行时间是多少分钟，比 BM25 基线多出多少？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "101.1 分钟，比基线的 70.3 分钟多约 43.8%",
+   "evidence": [
+    [
+     {
+      "paper": "2609.34776v1",
+      "ordinal": 45,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "4 Results and analysis",
+       "4.3 Runtime and a partial energy estimate"
+      ],
+      "quote": "Variant E takes 101.1 minutes versus 70.3 minutes for A, an increase of approximately 43.8% (Table 4). For context, the source manuscript estimates client energy as E = P t using a constant client power of 15W, and associated emissions using 50 g CO2e/kWh. These assumptions do not cover remote model inference, embedding computation, or any server-side reranking; the emissions are therefore a partial client-side proxy, not a full carbon footprint. D adds only 0.8 minutes over C in these measured runs, whereas E adds 22.8 minutes over D. No variance or repeated-run measurements were supplied.",
+      "attribution": "Abdelhak kelious. Page-Aware Retrieval-Augmented Generation for EvalLLM 2026: A Five-Variant Study on French PDFs. arXiv:2609.34776v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q084",
+   "text": "How many prompts make up the hybrid benchmark of the nested-learning hallucination mitigation pipeline, and of what kinds?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "310 prompts: 217 realistic epistemic-uncertainty prompts and 93 fabrication-induction stress tests",
+   "evidence": [
+    [
+     {
+      "paper": "2605.29055v2",
+      "ordinal": 3,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Hallucination Mitigation with Agentic AI, Nested Learning, and AI Sustainability via Semantic Caching",
+       "Abstract"
+      ],
+      "quote": "This paper describes an approach to hallucination detection and mitigation through a HOPE-inspired Nested Learning architecture with Continuum Memory Systems (CMS) and semantic similarity caching, tested on a hybrid benchmark of 310 prompts: 217 realistic epistemic-uncertainty prompts and 93 fabrication-induction stress tests.",
+      "attribution": "Diego Gosmar, Deborah A. Dahl. Hallucination Mitigation with Agentic AI, Nested Learning, and AI Sustainability via Semantic Caching. arXiv:2605.29055v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q085",
+   "text": "CoSA 在 AMD GPU 上能获得多大的注意力加速？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q086",
+   "text": "How much energy, in kWh, did PI-Mem's reinforcement learning training consume?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q087",
+   "text": "在这项跨模型引用伪造审计中，引用匹配置信分达到多少才算“确认”匹配？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "至少在一个来源上达到 80 分；65 到 79 分为“可能”匹配",
+   "evidence": [
+    [
+     {
+      "paper": "2603.03299v1",
+      "ordinal": 30,
+      "page": 6,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "The matching procedure assigns a confidence score on a 0-to-100 scale based on a generic process that accounts for title similarity (weighted at 0.6), author overlap (0.2), and year agreement (0.2). Title similarity is computed using token-level Jaccard distance after lowercasing and removing punctuation, a simple measure that is robust to minor paraphrasing and word-order variation. Author overlap compares the set of parsed last names against the metadata record, accommodating partial matches for multi-author papers, where models may list only the first author or only the first two authors. In our pipeline, citations with a score of 80 or higher on at least one source are classified as \"confirmed\" matches. Those scoring between 65 and 79 are classified as \"probable\" matches. All remaining citations are classified as hallucinated.",
+      "attribution": "MZ Naser. How LLMs Cite and Why It Matters: A Cross-Model Audit of Reference Fabrication in AI-Assisted Academic Writing and Methods to Detect Phantom Citations. arXiv:2603.03299v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q088",
+   "text": "在引用审计的人工复核中，被判为幻觉的 75 条引用里有多少条其实是真实的？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "8 条，约 10.7%",
+   "evidence": [
+    [
+     {
+      "paper": "2603.03299v1",
+      "ordinal": 33,
+      "page": 6,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "The validation yielded the following results: among the 75 confirmed matches, all 75 were verified as real (100% precision). Among the 75 probable matches, 71 were verified as genuine (95.2%). Among the 75 hallucinated citations, 8 were found to be real (10.7%), indicating that the pipeline's false-negative rate at the confirmed threshold is low but nonzero. These results support the use of the confirmed threshold (score ≥ 80) as the primary analysis target, with the inclusive threshold (score ≥ 65) reserved for sensitivity analysis. The 10.7% recovery rate among the hallucinated stratum suggests that the confirmed-only rates reported throughout this paper are conservative estimates of true hallucination.",
+      "attribution": "MZ Naser. How LLMs Cite and Why It Matters: A Cross-Model Audit of Reference Fabrication in AI-Assisted Academic Writing and Methods to Detect Phantom Citations. arXiv:2603.03299v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q089",
+   "text": "RegOps-Bench 在日本法规上的评测结果如何？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q090",
+   "text": "RegOps-Bench 用哪个大模型把 56 条种子 FAQ 扩充成多少道问题？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "用 Gemini-3-flash 扩充成 231 道有专家依据的问题",
+   "evidence": [
+    [
+     {
+      "paper": "2605.29742v2",
+      "ordinal": 43,
+      "page": 4,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2605.29742v2 [cs.AI] 31 Aug 2026"
+      ],
+      "quote": "Axis-Decoupled Augmentation via LLM. To ensure the benchmark comprehensively evaluates the structural complexity defined in our design principles, we expand the 56 seed FAQs into a final set of 231 expert-grounded questions using a high-capacity LLM (Gemini-3-flash (Google Deep￾Mind, 2025)). Our augmentation follows an axis￾decoupling principle with two distinct axes:",
+      "attribution": "Yeong-Joon Ju, Seong-Whan Lee. Citation-Closure Retrieval and Per-Rule Attribution for Real-World Regulatory Compliance Question Answering. arXiv:2605.29742v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q091",
+   "text": "TEMPS 的弱监督流程在没有人工标注的情况下生成了多少条训练元组？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "6000 万条",
+   "evidence": [
+    [
+     {
+      "paper": "2609.28048v1",
+      "ordinal": 34,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "Temporal Constraints Contextual Information"
+      ],
+      "quote": "• We show this compatibility can be trained at scale without manual labeling: a pipeline grounds temporal language to intervals and moment-matches them into directional Gaus￾sian targets, yielding 60M training tuples. • We propose a new framework called TEMPS (Temporal Embedding Model for Precise Search) that combines frozen semantic retriev￾ers with fine-grained temporal reasoning at a minimal cost. It repurposes established Gaussian-KL inclusion machinery for tempo-",
+      "attribution": "Mourad Hassani, Julien Romero, Amel Bouzeghoub, Christian Jacquelinet. TEMPS: Temporal Sentence Embeddings for Temporal Information Retrieval. arXiv:2609.28048v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q092",
+   "text": "What average accuracy does SEER reach on LongBench, and by how much does it beat Glyph-9B?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "51.11%, 2.33 points above Glyph-9B",
+   "evidence": [
+    [
+     {
+      "paper": "2608.15962v1",
+      "ordinal": 24,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2608.15962v1 [cs.CL] 16 Aug 2026"
+      ],
+      "quote": "• On LongBench, SEER achieves 51.11% average accuracy, improving over Glyph￾9B by 2.33 points through selective text retrieval, with large gains on extraction￾intensive tasks (+8.75 on Qasper, +19.17 on MultiFieldQA-Zh). Under our reported setup, SEER is 3.49 points above Qwen3-8B.",
+      "attribution": "Jiawei Xu, Zhilin Zhai, Jinrui Fang, Ruohan Xu, Mingfei Lu, Yi Zhang, Guanchu Wang, Tianlong Chen, Ying Ding. SEER: Long-Context Reasoning via Selective Visual-Text Compression. arXiv:2608.15962v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q093",
+   "text": "What share of the research ideas generated by GoR-SFT were later accepted at a conference?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q094",
+   "text": "How does the page-aware French PDF RAG study split long pages before indexing them?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Into 220-word chunks with 40 words of overlap, each keeping its page identifier",
+   "evidence": [
+    [
+     {
+      "paper": "2609.34776v1",
+      "ordinal": 3,
+      "page": 1,
+      "kind": "paragraph",
+      "section_path": [
+       "2 System",
+       "2.1 Page-preserving indexing"
+      ],
+      "quote": "We extract PDF text page by page with PyMuPDF. Each page has a document name, page number, and extracted text. Long pages are divided into 220-word chunks with 40 words of overlap; every chunk retains its parent page identifier. BM25 indexes the chunks, while the dense variants embed them with intfloat/multilingual-e5-large [13]. Figure 1 shows the shared processing stages.",
+      "attribution": "Abdelhak kelious. Page-Aware Retrieval-Augmented Generation for EvalLLM 2026: A Five-Variant Study on French PDFs. arXiv:2609.34776v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q095",
+   "text": "What average accuracy does Med-V1-L3B reach compared with its Llama-3B base model?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "0.728 versus 0.511, 42.5% higher",
+   "evidence": [
+    [
+     {
+      "paper": "2603.05308v4",
+      "ordinal": 51,
+      "page": 5,
+      "kind": "paragraph",
+      "section_path": [
+       "a b c d"
+      ],
+      "quote": "With training on MedFact-Synth, Med-V1 significantly improves over the base 3B-parameter models. On average, Med-V1- L3B achieves 42.5% higher accuracy than Llama-3B (0.728 vs. 0.511), and Med-V1-Q3B achieves 42.0% higher accuracy than Qwen-3B (0.732 vs. 0.515). These gains are consistent across all datasets and for both the Llama- and Qwen-based variants (27.0% to 71.3% relative performance improvements), demonstrating that the training pipeline is effective regardless of the underlying architecture. Overall, these results show that Med-V1 substantially narrows the performance gap between lightweight and frontier LLMs on biomedical evidence attribution, even though it is trained entirely on synthetic data and evaluated strictly in a zero-shot setting.",
+      "attribution": "Qiao Jin, Yin Fang, Lauren He, Yifan Yang, Guangzhi Xiong, Zhizheng Wang, Nicholas Wan, Joey Chan, Donald C. Comeau, Robert Leaman, Charalampos S. Floudas, Aidong Zhang, Michael F. Chiang, Yifan Peng, Zhiyong Lu. Med-V1: Small Language Models for Zero-shot and Scalable Biomedical Evidence Attribution. arXiv:2603.05308v4",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q096",
+   "text": "无 GPU 的幻觉检测基准在德语数据上的表现如何？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": false,
+   "evidence": []
+  },
+  {
+   "id": "q097",
+   "text": "How many authority tiers do the RegOps-Bench documents span, and what role do the Science & Technology Basic Act documents play?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "Five tiers, from statute to manual; the three S&T Basic Act documents serve as distractors",
+   "evidence": [
+    [
+     {
+      "paper": "2605.29742v2",
+      "ordinal": 34,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2605.29742v2 [cs.AI] 31 Aug 2026"
+      ],
+      "quote": "These documents span five authority tiers (1: statute – 5: manual), from statutory acts down to oper￾ational manuals (Table 1). The seven in-domain documents form a largely self-contained delega￾tion network. While certain high-level mandates inevitably delegate to external authorities, cross￾document references, including all FAQ lineages, are mostly resolved within this set, where each lower tier procedurizes the open-textured mandates of the tier above it. A single compliance answer therefore requires composing a statutory obliga￾tion with its decree-level conditions and notice￾level numeric thresholds. Two auxiliary VAT docu￾ments cover the tax-side cross-references recurring in cost-eligibility questions. The remaining three Science & Technology Basic Act documents serve as distractors, sharing lexical overlap with the in￾domain corpus but remaining legally out of scope. OKG Construction. We construct the OKG via deterministic rule extraction. By leveraging the for￾mulaic citation patterns of legislation, this design effectively mitigates the generative hallucinations inherent in LLM-based indexing and provides de￾terministic edge typing—a prerequisite for eval￾uating closure. Furthermore, this approach elimi￾nates heavy LLM computational overhead, making the index highly sustainable and easily updatable under frequent regulatory amendments. Each arti￾cle (조) forms a node carrying its authority tier. Inter-article relations are typed into six classes: PART_OF (hierarchy), REFERENCES (citation), the DELEGATES_TO/SPECIFIES pair (downward del-",
+      "attribution": "Yeong-Joon Ju, Seong-Whan Lee. Citation-Closure Retrieval and Per-Rule Attribution for Real-World Regulatory Compliance Question Answering. arXiv:2605.29742v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q098",
+   "text": "Both the nested-learning hallucination pipeline and SIRG rely on Llama models: which ones does each use?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "The pipeline runs all four agents on Llama 3.1; SIRG uses the Llama-7B and Llama-13B parts of RAGTruth",
+   "evidence": [
+    [
+     {
+      "paper": "2605.29055v2",
+      "ordinal": 11,
+      "page": 2,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2605.29055v2 [cs.AI] 12 Aug 2026",
+       "2 Architecture Overview"
+      ],
+      "quote": "LLM backbone per agent All four agents run on Llama 3.1 (llama3.1:latest) via Ollama, differentiated by inference parameters and system prompts. The FrontEndAgent (1st stage, temp=1.0, top-p=0.99, ctx=8192) is deliberately configured as a weak, high-stochasticity gen￾2",
+      "attribution": "Diego Gosmar, Deborah A. Dahl. Hallucination Mitigation with Agentic AI, Nested Learning, and AI Sustainability via Semantic Caching. arXiv:2605.29055v2",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ],
+    [
+     {
+      "paper": "2601.03052v1",
+      "ordinal": 127,
+      "page": 6,
+      "kind": "paragraph",
+      "section_path": [
+       "Internal Reasoning Graph R7 (3) = 𝑓(𝑥) R3←6 (1,2) R2←5",
+       "4 Experiments"
+      ],
+      "quote": "RAGTruth is a manually annotated RAG sample set generated by various LLMs. The Llama-7B part we used contains 510 hallucination samples and 479 normal samples, while the Llama-13B part contains 399 hallucination samples and 590 nor￾mal samples. Dolly-15k is a large model question￾answering dataset covering multiple scenarios. We only used the closed question-answering scenar￾ios oriented towards the RAG framework and fil￾tered out samples with empty contexts. Consistent with Hu et al. (2024), GPT-4 is used to compare model outputs with standard answers to annotate the dataset.",
+      "attribution": "Jianpeng Hu, Yanzeng Li, Jialun Zhong, Wenfa Qi, Lei Zou. Detecting Hallucinations in Retrieval-Augmented Generation via Semantic-level Internal Reasoning Graph. arXiv:2601.03052v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q099",
+   "text": "In RECON's chain reconstruction task, how many evidence hops must an agent locate and order?",
+   "query_language": "en",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "5 to 15",
+   "evidence": [
+    [
+     {
+      "paper": "2607.16716v1",
+      "ordinal": 6,
+      "page": 1,
+      "kind": "abstract",
+      "section_path": [
+       "Abstract"
+      ],
+      "quote": "1. Chain Reconstruction: locate and causally order 5–15 evidence hops scattered across the document.",
+      "attribution": "Mihir Shriniwas Arya. RECON: Benchmarking Agent Memory for Compositional Reasoning over Long Contexts. arXiv:2607.16716v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  },
+  {
+   "id": "q100",
+   "text": "Graphs of Research 的训练集包含多少篇论文，来自哪些会议？",
+   "query_language": "zh-CN",
+   "document_language": "en",
+   "answerable": true,
+   "short_answer": "498 篇训练论文，来自 2020 到 2024 年的 NeurIPS、ICLR、CVPR、ICML 和 ACL",
+   "evidence": [
+    [
+     {
+      "paper": "2605.14790v1",
+      "ordinal": 14,
+      "page": 3,
+      "kind": "paragraph",
+      "section_path": [
+       "arXiv:2605.14790v1 [cs.CL] 14 May 2026"
+      ],
+      "quote": "• Automated citation-graph extraction pipeline. We construct an automated pipeline that builds citation subgraphs, edge-feature annotations, and structured five-field idea targets for 498 training papers from NeurIPS, ICLR, CVPR, ICML, and ACL between 2020 and 2024, with a 50-paper in-domain validation set and a leak-free 50-seed test set drawn from 2025 papers (Section 4.2). • Experimental validity. Extensive experimental results demonstrate that GoR-SFT improves the quality of generated ideas, confirming that injecting citation-evolution graph structure into the supervision pipeline is a simple yet effective recipe for steering LLM-based idea generation toward higher-quality, more innovative outcomes (Section 4.3).",
+      "attribution": "Songyang Gao, Yinghui Xia, Siyi Liu, Hui Xiong. Graphs of Research: Citation Evolution Graphs as Supervision for Research Idea Generation. arXiv:2605.14790v1",
+      "license": "http://creativecommons.org/licenses/by/4.0/"
+     }
+    ]
+   ]
+  }
+ ]
+}
