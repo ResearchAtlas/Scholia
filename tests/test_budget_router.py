@@ -165,3 +165,12 @@ def test_what_a_request_can_reach():
     assert (found.window, found.output, found.unreported) == (32768, 4096, True)  # a setting must also be made
     from backend import providers
     assert providers.window({"default_window": 131072}, "m", found.window)["in_use"] == 32768
+
+
+def test_a_flag_where_a_rate_should_be_refuses():
+    # Internal review a3 (P3-1): JSON true or false is no price, as the catalog's own reader holds.
+    from backend import reach
+    for flag in (True, False):
+        endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [],
+                    "pricing": {"prompt": flag, "completion": flag}}
+        assert reach.reach(OPENROUTER, {}, [endpoint]).problem == "route_unpriced", flag

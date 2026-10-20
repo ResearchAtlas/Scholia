@@ -132,6 +132,8 @@ def price_endpoint(url, endpoint):
 
     def rate(key):
         value = pricing.get(key)
+        if isinstance(value, bool):  # a flag is no rate (Scholia)
+            raise EndpointPricingError(f"endpoint {endpoint.get('tag')!r} publishes {key} as a flag")
         return float(value) if value not in (None, "") else None
 
     prompt_rate = rate("prompt")

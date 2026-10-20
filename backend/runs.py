@@ -109,7 +109,7 @@ _REFUSED = {  # an admission refusal's English text, by code; the interface show
     "model_window": "That model has no usable window; set one in Settings",
     "catalog_unread": "The provider's model list could not be read; try again or set a window",
     "route_unverified": "The model's endpoints could not be read from the provider; try again",
-    "route_unpriced": "The model's endpoints publish a charge Scholia cannot estimate",
+    "route_unpriced": "The model's price is not published, or it lists a charge Scholia cannot estimate",
     "route_unsupported": "No endpoint of that model accepts this request",
     "message_over_window": "The message is too large for this model's window",
     "instructions_over_window": "The project's instructions are too large for this model's window",

@@ -66,8 +66,9 @@ def count(text: str) -> int:
     it, a lone surrogate included; each ASCII digit, punctuation mark or whitespace character one, but
     a space just before an ASCII letter, which goes with the letters after it. A run of ASCII letters
     in mixed or upper case counts one per letter. A run in lower case, or capitalized, counts the
-    most tokens the tokenizer can leave it in (_word): a text split into parts never counts more
-    tokens than its parts, so counting each part on its own is never less."""
+    most tokens the tokenizer can leave it in (_word). Each part is counted on its own: the bound for a
+    whole run is never above the sum of the bounds for its parts, since a split the rule in _word
+    allows for the whole is allowed for each part."""
     tokens = run = 0
     start = 0
     for index, char in enumerate(text):

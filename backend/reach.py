@@ -88,7 +88,9 @@ def _prices(value):
         return all(_prices(v) for v in value.values())
     if isinstance(value, list):
         return all(_prices(v) for v in value)
-    if isinstance(value, bool) or value in (None, ""):
+    if isinstance(value, bool):  # a flag where a rate should be: no price
+        return False
+    if value in (None, ""):
         return True
     try:
         number = float(value)

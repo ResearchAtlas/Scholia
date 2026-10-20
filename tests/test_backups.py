@@ -1488,3 +1488,14 @@ async def test_a_file_that_appears_at_a_backups_name_meanwhile_is_never_replaced
     with zipfile.ZipFile(path) as archive:
         assert archive.read("a.txt") == b"x" and mode(path) == 0o600
     assert sorted(p.name for p in destination.iterdir()) == sorted([audited[0].name, path.name])  # no temporary left
+
+
+@pytest.mark.parametrize("language", ["en", "zh-CN"])
+async def test_an_exported_answer_cut_at_its_output_limit_says_so(language):
+    # Harold, 2026-10-20: an answer cut at its output limit is marked cut; the export keeps the mark.
+    from backend import i18n
+    conversation = {"title": "t", "turns": [{"author": "researcher", "started_at": "2026-10-20T00:00:00Z",
+                                             "message": {"text": "q"}, "answer": {"text": "Half an ans", "cut": True},
+                                             "status": "succeeded"}]}
+    written = backups_module._conversation_markdown(conversation, language).decode()
+    assert f"*{i18n.render('export.cut', language)}*" in written
