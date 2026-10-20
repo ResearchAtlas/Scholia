@@ -7,9 +7,16 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { appendPage, chosenFor, collectionTree, MAX_ITEMS, reportParts, statusKey } from '../src/zotero.js';
 import { detailsSource, reasonKey } from '../src/library.js';
-import { makeT } from '../src/i18n/index.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zh from '../src/i18n/zh-CN.json' with { type: 'json' };
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
+
+test('the Chinese iterations below read the Chinese catalog, not English', () => {
+  assert.equal(makeT('zh-CN')('zotero.title'), zh['zotero.title']);
+  assert.notEqual(makeT('zh-CN')('zotero.title'), en['zotero.title']);
+});
 
 const source = (name) => readFileSync(fileURLToPath(new URL(`../src/components/${name}`, import.meta.url)), 'utf8');
 const date = (value) => value.slice(0, 10);
@@ -39,8 +46,8 @@ test('the status and the report are said in each supported interface language', 
     'references.leftOut']);
   assert.deepEqual(reportParts(null), []);
   assert.deepEqual(reportParts({ reason: 'zotero_not_running' }), [['zotero.report.kept', {}]]); // no counts it does not hold
-  for (const catalog of [en, zh]) {
-    const t = makeT(catalog);
+  for (const language of ['en', 'zh-CN']) {
+    const t = makeT(language);
     for (const state of ['checking', 'ready', 'off', 'not_running', 'api_off', 'not_yours', 'unsupported', 'error']) {
       const key = statusKey(state === 'checking' ? null : { state });
       assert.notEqual(t(key), key, key);
@@ -51,8 +58,8 @@ test('the status and the report are said in each supported interface language', 
 });
 
 test('a Zotero paper says where its details came from and why its PDF was not read', () => {
-  for (const catalog of [en, zh]) {
-    const t = makeT(catalog);
+  for (const language of ['en', 'zh-CN']) {
+    const t = makeT(language);
     const paper = { source: 'zotero', source_key: 'users/0/items/ABCD2345', lookup: null };
     assert.equal(detailsSource(t, paper, {}, date), t('library.source.fromZotero'));
     assert.equal(detailsSource(t, paper, { review_lock: true }, date), t('library.source.zoteroLocked'));
@@ -100,8 +107,8 @@ test('a PDF not read again is reported as kept, never as details only', () => {
   const parts = reportParts({ imported: 0, updated: 0, unchanged: 3, pdf: {}, pdf_kept: { pdf_missing: 1, pdf_on_network: 2 } });
   assert.deepEqual(parts.map(([key]) => key), ['zotero.report.imported', 'zotero.report.unchanged', 'zotero.report.pdfKept',
     'zotero.report.pdfKept']);
-  for (const catalog of [en, zh]) {
-    const t = makeT(catalog);
+  for (const language of ['en', 'zh-CN']) {
+    const t = makeT(language);
     const said = parts.slice(2).map(([key, params]) => t(key, { ...params, reason: t(params.reason) }));
     assert.ok(said[0].includes(t('library.reason.pdf_missing')) && said[1].includes(t('library.reason.pdf_on_network')), said);
     assert.notEqual(said[0], said[1]); // each reason said apart
