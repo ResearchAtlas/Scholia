@@ -33,7 +33,6 @@ import shutil
 import sqlite3
 import threading
 import uuid
-from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -44,10 +43,10 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 from backend import APP_VERSION, i18n
-from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseClosedError, DatabaseDamagedError,
-                        ForeignDatabaseError, NewerDatabaseError, utc_now)
+from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, DatabaseClosedError,
+                        DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
 from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
-    list_generations
+    closing_connection, list_generations
 from backend.db.migrations import MIGRATIONS
 from backend.runs import RunOutcome, _through
 from backend.settings import known_only, write_private
@@ -146,7 +145,10 @@ def _limit(state, code, reason):
 def limited(state):
     """(code, why) when only LIMITED is served, else None: the app was limited (_limit), or the
     database it runs on found itself damaged since it opened (the full check of a backup, at
-    launch, while idle or asked for), which stops its writes."""
+    launch, while idle or asked for), which stops its writes. A close that failed in this process
+    (close_failed) outranks them all: restart_required, until the app is opened again."""
+    if close_failed():
+        return "restart_required", "A close failed in this process; open Scholia again"
     if "damaged" in state:
         return state.get("damaged_code", "database_damaged"), state["damaged"]
     db = state.get("db")
@@ -227,7 +229,10 @@ async def lifespan(app):
             if state.get("harness") is not None:
                 await state["harness"].shutdown()
             if state.get("db") is not None:
-                await asyncio.to_thread(state["db"].close)
+                try:
+                    await asyncio.to_thread(state["db"].close)
+                except DatabaseCloseError:  # logged by the close; close_failed() holds, and the next open purges the index
+                    pass
 
 
 router = APIRouter(lifespan=lifespan, route_class=_Route)
@@ -568,7 +573,7 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
     try:
         with _backup_errors():
             info = db.snapshot(staging / "copy")
-        with closing(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro", uri=True)) as copy:
+        with closing_connection(sqlite3.connect((staging / "copy" / DB_NAME).as_uri() + "?mode=ro", uri=True)) as copy:
             sensitive, projects = copy.execute(
                 f"SELECT count(*) FILTER (WHERE sensitivity IN {SENSITIVE}), count(*) FROM projects").fetchone()
             # Only the files the copy's records refer to: one of a project deleted moments ago, which
@@ -624,6 +629,8 @@ async def restore(body: Restore, request: Request):
     # A committed one only waits for its audit rows, which the new restore carries with its own.
     if pending and "damaged" not in state:
         raise BackupError(409, "restore_interrupted", "Open Scholia again to finish the last restore")
+    if close_failed():  # what that close left may be open: nothing replaces files until a restart
+        raise BackupError(409, "restart_required", "Close Scholia and open it again before restoring a backup")
     async with state["restore_lock"]:
         return await _to_end(_restore(state, body))
 
@@ -686,8 +693,12 @@ async def _replace(state, body, staging, purges):
                 raise BackupError(500, "restore_failed", "The backup could not be put in place; nothing was changed") \
                     from error
             raise
-        if db is not None and not db.closed:
-            await asyncio.to_thread(db.close)
+        if db is not None:
+            with contextlib.suppress(DatabaseCloseError):  # logged by the close; close_failed() then holds
+                await asyncio.to_thread(db.close)
+        if close_failed():  # nothing is replaced after a close that failed: the app stops here until a restart
+            _limit(state, "restart_required", "Close Scholia and open it again; nothing was changed")
+            raise BackupError(409, "restart_required", "Close Scholia and open it again before restoring a backup")
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         aside = data_dir / "backups" / DAMAGED / stamp if damaged else staging / "replaced"
         restored = None
@@ -784,7 +795,7 @@ async def start_background(state):
 
 async def _stop(state, db):
     """Stop the app started on db, before it served anything: its harness, then the database. A
-    failure is logged; what follows (putting the previous state back) goes on."""
+    failure is logged (a failed close holds file replacement off: close_failed)."""
     try:
         if state.get("db") is db and state.get("harness") is not None:
             await state["harness"].shutdown()
@@ -816,8 +827,9 @@ async def _roll_back(state, restored, damaged, restore_id):
     """After a failed restore: close what it opened, put the previous files back as its journal
     says (however far the swap got; nothing moved if its journal, restore_id's, was never written,
     and an earlier restore's journal is left as it is), and run on the previous database again
-    unless it was damaged. Returns False when the files could not be put back: then nothing is
-    started on them, the journal says what remains, and the next launch finishes putting it back."""
+    unless it was damaged. Returns False when the files could not be put back (a close in this process
+    failed, close_failed, included): then nothing is started on them, the journal says what remains, and the
+    next launch finishes putting it back."""
     data_dir = state["data_dir"]
     if restored is not None:
         try:
@@ -843,7 +855,10 @@ async def _roll_back(state, restored, damaged, restore_id):
             log.error("the previous database could not be started again after a failed restore (%s)",
                       type(error).__name__)
             if previous is not None:
-                await asyncio.to_thread(previous.close)
+                try:
+                    await asyncio.to_thread(previous.close)
+                except DatabaseCloseError:  # logged by the close; the app is limited all the same
+                    pass
             damaged_now = isinstance(error, DatabaseDamagedError)
             _limit(state, "database_damaged" if damaged_now else "database_unavailable",
                    "The database could not be opened again after a failed restore; restore a backup")
@@ -853,8 +868,18 @@ async def _roll_back(state, restored, damaged, restore_id):
     return True
 
 
+class ReplacementRefused(RuntimeError):
+    """A close in this process failed (close_failed): no file is replaced until the app restarts."""
+
+
+def _refuse_after_a_failed_close():
+    if close_failed():
+        raise ReplacementRefused("a close failed in this process; restart the app before files are replaced")
+
+
 def _back_from_journal(data_dir, audit=False):
-    """Put the previous state back as the journal says; audit as for _back."""
+    """Put the previous state back as the journal says; audit as for _back. Refused after a failed close."""
+    _refuse_after_a_failed_close()
     return _back(data_dir, json.loads((data_dir / "backups" / JOURNAL).read_bytes()), audit)
 
 
@@ -872,7 +897,7 @@ def _stage(data_dir, body, staging):
         raise BackupError(409, "newer_schema", str(error)) from None
     except (ForeignDatabaseError, DatabaseDamagedError, sqlite3.DatabaseError):
         raise BackupError(400, "backup_damaged", "The backup's database is damaged or not Scholia's") from None
-    with closing(check):
+    with closing_connection(check):
         if check.execute("SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)").fetchone()[0]:
             raise BackupError(400, "backup_damaged", "The backup's database is empty")
 
@@ -960,8 +985,9 @@ def _put_in_place(data_dir, staged, aside, restore_id, audits=()):
     _back puts back what was moved, from the journal. restore_id names the journal; audits are
     an earlier restore's rows still to write, which it carries. Returns the journal: the caller
     commits it (_commit_journal) once the restored app has started, and ends it once its audit
-    rows are written.
+    rows are written. Refused after a failed close in this process (close_failed), before anything moves.
     """
+    _refuse_after_a_failed_close()
     _mkdir_private(aside.parent)
     _mkdir_private(aside)
     _sync_tree(staged)
@@ -1135,6 +1161,7 @@ def finish_interrupted_restore(data_dir) -> dict | None:
     path = data_dir / "backups" / JOURNAL
     if not path.is_file():
         return None
+    _refuse_after_a_failed_close()  # it runs first in a new process, where none has failed: said, not assumed
     journal = json.loads(path.read_bytes())
     for key in ("staged", "aside"):
         folder = PurePosixPath(journal[key])

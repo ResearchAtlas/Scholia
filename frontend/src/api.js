@@ -28,7 +28,7 @@ export function headers(json) {
 
 // The app became limited (a database found damaged, or a restore that could not finish or be
 // undone): the window is told, and the app checks its health and offers the restore (App.jsx).
-const LIMITED = new Set(['database_damaged', 'restore_interrupted', 'database_unavailable']);
+const LIMITED = new Set(['database_damaged', 'restore_interrupted', 'database_unavailable', 'restart_required']);
 
 function failure(status, code) {
   // by code, whatever the status: a backup that first finds the damage answers 409 database_damaged

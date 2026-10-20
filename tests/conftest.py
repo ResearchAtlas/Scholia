@@ -45,3 +45,12 @@ def reading_stub(monkeypatch):
             return command
 
         yield use
+
+
+@pytest.fixture(autouse=True)
+def _close_failed_cleared():
+    """A failed close holds file replacement off for the rest of its process (backend.db.close_failed), never
+    cleared but by a restart: each test is its own app, so it is cleared after each, as a restart would."""
+    yield
+    from backend.db import database
+    database._close_failed.clear()
