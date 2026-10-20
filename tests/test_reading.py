@@ -579,18 +579,29 @@ def end_group(app, reader):
 
 def seen(child):
     """The reading child and its sentinel (its group: the child starts no other process) as the test saw
-    them: each one's pid and start time, of those there."""
+    them: each one's pid and start time, of those there. The child's pid is recorded for conftest's check
+    that its group is left with no stopped process (a stand-in app's child is not in this process's LIVE)."""
+    reading.LIVE.started.append(child)
     return [(pid, tuple(info.start)) for pid in (child, *reading._children(child)) if (info := reading._info(pid))]
 
 
 def end_reader(reader):
     """A failed check's cleanup: end each process the test saw, one by one, only while it is still that
-    process (the same start time); a pid taken by another process since is left alone."""
+    process (the same start time); a pid taken by another process since is left alone. Then the child's
+    group, while the child is still that process or no process has its pid (a group's id is its first
+    member's pid, which no other process can take while the group lasts): a sentinel made after the test
+    saw the child, and not yet stopped when the child was ended, would otherwise stop for good."""
     for pid, start in reader or ():
         info = reading._info(pid)
         if info is not None and tuple(info.start) == start:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
+    if reader and reader[0][0] in reading.LIVE.started:  # the child, first in what seen() saw
+        child, start = reader[0]
+        info = reading._info(child)
+        if info is None or tuple(info.start) == start:
+            with contextlib.suppress(ProcessLookupError, PermissionError):  # EPERM: a group of zombies only
+                os.killpg(child, signal.SIGKILL)
 
 
 # Child failures: each fails the reading cleanly, writes nothing, and Retry reads the file
@@ -756,12 +767,15 @@ def record(status=reading._SSTOP, ppid=1, pgid=1, flags=0):
 
 def test_a_failed_checks_cleanup_ends_only_the_processes_it_saw(monkeypatch):
     """end_reader: the child and its sentinel the test saw, each while it is still that process; never a
-    pid taken by a process started since, nor one gone; the sentinel even once the child is gone."""
+    pid taken by a process started since, nor one gone; the sentinel even once the child is gone; and the
+    child's group while the child is still that process or no process has its pid."""
     ended, records = [], {5: record(pgid=5), 6: record(ppid=5, pgid=5)}
     records[5].start[0], records[6].start[0] = 100, 101
+    monkeypatch.setattr(reading, "LIVE", type(reading.LIVE)())  # pid 5 is no child of this run's
     monkeypatch.setattr(reading, "_info", records.get)
     monkeypatch.setattr(reading, "_children", lambda pid: [6])
     monkeypatch.setattr(os, "kill", lambda pid, sig: ended.append(pid))
+    monkeypatch.setattr(os, "killpg", lambda group, sig: ended.append(-group))
     reader = seen(5)
     records[5].start[0] = 200  # the child's pid taken by a process started since
     del records[6]  # the sentinel gone
@@ -772,9 +786,50 @@ def test_a_failed_checks_cleanup_ends_only_the_processes_it_saw(monkeypatch):
     records[6].start[0] = 101  # the sentinel left behind, its child gone
     end_reader(reader)
     assert ended == [6]
-    records[5].start[0] = 100  # the child itself still there
+    records[5].start[0] = 100  # the child itself still there: its group too
     end_reader(reader)
-    assert ended == [6, 5, 6]
+    assert ended == [6, 5, 6, -5]
+    del records[5], records[6]  # no process has the child's pid: its group, if any is left, is the child's
+    end_reader(reader)
+    assert ended == [6, 5, 6, -5, -5]
+
+
+def test_a_sentinel_whose_child_is_ended_by_its_pid_before_it_stops_is_found_left_stopped():
+    """How a stopped process outlives a reading (state T, its parent launchd): its child ended by the
+    child's own pid, not its group, after making its sentinel and before the sentinel stopped, leaves a
+    group orphaned with no stopped member, which the kernel never signals; the sentinel then stops for
+    good. conftest's check finds it by the child's pid, its group's id."""
+    from conftest import _stopped_left
+
+    command = [sys.executable, "-c", "import os, signal, time\n"
+               "pid = os.fork()\n"
+               "if pid == 0:\n"
+               "    time.sleep(0.3); os.kill(os.getpid(), signal.SIGSTOP); os._exit(0)\n"
+               "print(pid, flush=True); time.sleep(30)\n"]
+    with allow_command(*command):
+        child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, process_group=0)
+    reading.LIVE.started.append(child.pid)  # conftest's check ends it if this test does not
+    stand_in = start = None
+    try:
+        stand_in = int(child.stdout.readline())
+        start = tuple(reading._info(stand_in).start)
+        child.kill()  # by its pid, before its stand-in sentinel has stopped
+        child.wait()
+        deadline = time.monotonic() + 5
+        while not _stopped_left({child.pid}) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _stopped_left({child.pid}) == [stand_in]
+    finally:
+        if start is not None and (info := reading._info(stand_in)) is not None and tuple(info.start) == start:
+            os.kill(stand_in, signal.SIGKILL)  # by its pid, while it is still that process; launchd reaps it
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        child.stdout.close()
+    deadline = time.monotonic() + 5
+    while _stopped_left({child.pid}) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _stopped_left({child.pid}) == []
 
 
 def test_a_sentinel_is_its_childs_stopped_child_in_its_group(monkeypatch):
