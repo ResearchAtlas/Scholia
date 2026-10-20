@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { LanguageContext, makeT, resolveLanguage, useT } from '../src/i18n/index.js';
+import { LanguageContext, loadLanguage, makeT, resolveLanguage, useT } from '../src/i18n/index.js';
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 test('t returns the string for the language', () => {
   assert.equal(makeT('en')('sidebar.projects'), 'Projects');

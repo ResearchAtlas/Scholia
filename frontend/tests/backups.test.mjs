@@ -7,11 +7,13 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
-import { makeT } from '../src/i18n/index.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
 import { deletePath, deletionNotices, fileSize, folderPicker, needsPassphrase, restoreBody, restoreNotes }
   from '../src/backups.js';
 import { errorText } from '../src/text.js';
 import { get, post } from '../src/api.js';
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 test('a deletion asks for the backups and the trace only when chosen', () => {
   assert.equal(deletePath('conversation', 'c1'), '/api/conversations/c1');
@@ -84,6 +86,8 @@ test('every new error code reads in each language, never as the backend\'s messa
     const t = makeT(language);
     for (const code of codes) assert.notEqual(errorText(t, code), t('errors.internal'), `${language}: ${code}`);
   }
+  for (const code of codes) assert.match(errorText(makeT('zh-CN'), code), /\p{Script=Han}/u, code); // Chinese, not English
+  assert.equal(errorText(makeT('zh-CN'), 'disk_full'), zhCN['errors.disk_full']);
 });
 
 test('the backup and export descriptions say what is left out of their settings files', () => {
