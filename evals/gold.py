@@ -369,27 +369,27 @@ def check_set(doc, kind, field, papers):
     if not isinstance(doc["items"], list):
         return problems + [f"{kind}.json: items is not a list"]
     check = check_question if kind == "questions" else check_pair
-    ids, texts = Counter(), Counter()
+    ids, texts = Counter(), defaultdict(list)
     for item in doc["items"]:
         problems += check(item, field, papers)
         if isinstance(item, dict):
             if not ID.fullmatch(str(item.get("id"))):
                 problems.append(f"{kind} item {item.get('id')!r}: id is not a plain name")
             ids[item.get("id")] += 1
-            texts[_key(str(item.get("text") or item.get("sentence") or ""))] += 1
+            texts[_key(str(item.get("text") or item.get("sentence") or ""))].append(str(item.get("id")))
     problems += [f"{kind}: id {i!r} is used {n} times" for i, n in ids.items() if n > 1]
-    problems += [f"{kind}: {n} items have the same text" for t, n in texts.items() if t and n > 1]
+    problems += [f"{kind}: {', '.join(same)} have the same text" for t, same in texts.items() if t and len(same) > 1]
     return problems
 
 
-EDITS = ("text", "short_answer", "answerable", "evidence")  # what a question's edit may change
+CONTENT = ("text", "short_answer", "answerable", "evidence")  # a question's whole content, as an edit stores it
 
 
 def check_labels(doc, set_doc, papers, rater=None):
-    """A labels file's problems (L1): its header names this set and rater; each label's fields; and each
-    label for an item as it now is (one that will be applied) leaves a question that passes every rule a
-    draft passes, its locators included. A label for an item changed since is not applied, so not checked
-    here: the page shows the item again, and its next save is checked."""
+    """A labels file's problems (L1, L7): its header names this set and rater; each label's fields and types
+    (a question's edit holds the whole question, its locators checked as a draft's); and the set as the labels
+    leave it (effective_items) passes every rule the drafts pass, set-wide ones (repeated ids or text)
+    included. The page's saves, `check`, `apply` and `agreement` all use this one check."""
     problems = _keys("labels", doc, ("set", "kind", "field", "rater", "set_sha256", "labels"), ("sample",))
     if problems:
         return problems
@@ -399,48 +399,67 @@ def check_labels(doc, set_doc, papers, rater=None):
         return [f"labels: they are rater {doc['rater']!r}'s, not {rater!r}'s"]
     if not isinstance(doc["labels"], dict):
         return ["labels: labels is not an object"]
-    items = {i["id"]: i for i in set_doc["items"]}
     for item, label in doc["labels"].items():
-        if set_doc["kind"] == "pairs":
-            problems += _keys(f"label {item}", label, ("item_sha256", "revision", "saved_at", "category"))
-            if isinstance(label, dict) and label.get("category") not in CATEGORIES:
-                problems.append(f"label {item}: category {label.get('category')!r}")
-        else:
-            found = _keys(f"label {item}", label, ("item_sha256", "revision", "saved_at", "decision"), EDITS)
-            if not found:
-                try:
-                    found = label_content_problems(item, label, items.get(item), set_doc["field"], papers)
-                except Exception as error:  # noqa: BLE001 a hand-edited file of any shape is refused, never a crash
-                    found = [f"label {item}: malformed ({type(error).__name__})"]
-            problems += found
-        if isinstance(label, dict) and not (isinstance(label.get("revision"), int) and label["revision"] >= 1):
-            problems.append(f"label {item}: revision is not a count")
-    return problems
+        try:
+            problems += label_problems(item, label, set_doc["kind"], set_doc["field"], papers)
+        except Exception as error:  # noqa: BLE001 a hand-edited file of any shape is refused, never a crash
+            problems.append(f"label {item}: malformed ({type(error).__name__})")
+    return problems or set_problems(set_doc, doc["labels"], papers)
 
 
-def label_content_problems(item_id, label, drafted, field, papers):
-    """A question label's content problems: its decision; each field it changes, of the right type, its
-    evidence locators each checked as a draft's are (whatever the item's state, since the page shows them);
-    and for an item as it now is (one the label will be applied to), the question it leaves must pass every
-    rule a draft passes."""
+def label_problems(item_id, label, kind, field, papers):
+    """One label's fields and types. A pair's label is its category. A question's is keep or drop, holding
+    no content, or an edit holding the whole question as the rater left it (text, answerable, evidence, and a
+    short answer when answerable), each of its locators checked as a draft's."""
     where = f"label {item_id}"
+    if kind == "pairs":
+        found = _keys(where, label, ("item_sha256", "revision", "saved_at", "category"))
+        if found:
+            return found
+        found += [] if label["category"] in CATEGORIES else [f"{where}: category {label['category']!r}"]
+        return found + ([] if isinstance(label["revision"], int) and label["revision"] >= 1
+                        else [f"{where}: revision is not a count"])
+    found = _keys(where, label, ("item_sha256", "revision", "saved_at", "decision"), CONTENT)
+    if found:
+        return found
+    if not (isinstance(label["revision"], int) and label["revision"] >= 1):
+        found.append(f"{where}: revision is not a count")
     if label["decision"] not in DECISIONS:
-        return [f"{where}: decision {label['decision']!r}"]
-    if (label["decision"] == "edit") != any(k in label for k in EDITS):
-        return [f"{where}: an edit names what it changes; keep and drop change nothing"]
-    found = [f"{where}: {name} is not text" for name in ("text", "short_answer")
-             if name in label and not isinstance(label[name], str)]
-    if "answerable" in label and not isinstance(label["answerable"], bool):
+        return found + [f"{where}: decision {label['decision']!r}"]
+    if label["decision"] != "edit":
+        return found + ([f"{where}: keep and drop hold no content"] if any(k in label for k in CONTENT) else [])
+    if missing := [k for k in ("text", "answerable", "evidence") if k not in label]:
+        return found + [f"{where}: an edit holds the whole question; {', '.join(missing)} missing"]
+    found += [f"{where}: {name} is not text" for name in ("text", "short_answer")
+              if name in label and not isinstance(label[name], str)]
+    if not isinstance(label["answerable"], bool):
         found.append(f"{where}: answerable is not true or false")
-    if "evidence" in label:
-        if not (isinstance(label["evidence"], list) and all(isinstance(ev, list) and ev for ev in label["evidence"])):
-            return found + [f"{where}: evidence is not a list of evidence items"]
-        found += [p for ev in label["evidence"] for loc in ev for p in check_locator(f"{where} evidence", loc, field, papers)]
-    if not found and drafted is not None and label_state(drafted, label) == "done":
-        made = labeled(drafted, label)
-        if made is not None:
-            found += [f"{where}: {p}" for p in check_question(made, field, papers)]
-    return found
+    if not (isinstance(label["evidence"], list) and all(isinstance(ev, list) and ev for ev in label["evidence"])):
+        return found + [f"{where}: evidence is not a list of evidence items"]
+    return found + [p for ev in label["evidence"] for loc in ev for p in check_locator(f"{where} evidence", loc, field, papers)]
+
+
+def effective_items(set_doc, labels):
+    """The set's items as the labels leave them: an item whose label is done for it as that label leaves it
+    (a dropped one out), every other item as drafted (a label for an item changed since is never applied)."""
+    out = []
+    for item in set_doc["items"]:
+        label = labels.get(item["id"])
+        if label_state(item, label) != "done":
+            out.append(item)
+        elif (made := labeled(item, label)) is not None:
+            out.append({k: v for k, v in made.items() if k != "label"})
+    return out
+
+
+def set_problems(set_doc, labels, papers):
+    """The rules the drafts pass, applied to the set as the labels leave it: every item, and the set-wide
+    rules (no repeated id or text)."""
+    try:
+        effective = {**set_doc, "provisional": True, "items": effective_items(set_doc, labels)}
+        return [f"as labeled, {p}" for p in check_set(effective, set_doc["kind"], set_doc["field"], papers)]
+    except Exception as error:  # noqa: BLE001 never a crash on a malformed file
+        return [f"as labeled: malformed ({type(error).__name__})"]
 
 
 def mix(kind, items):
@@ -755,16 +774,15 @@ def label_counts(items, labels):
 
 
 def labeled(item, label):
-    """The item as a rater's label leaves it: None when dropped."""
+    """The item as a rater's label leaves it: None when dropped; a question's edit replaces the question's
+    whole content with the label's (nothing is taken from the draft)."""
     if "category" in label:
         return {**item, "label": label["category"]}
     if label["decision"] == "drop":
         return None
-    out = {**item, **{k: label[k] for k in ("text", "short_answer", "answerable", "evidence") if k in label}}
-    if not out["answerable"]:
-        out.pop("short_answer", None)
-        out["evidence"] = []
-    return out
+    if label["decision"] == "keep":
+        return dict(item)
+    return {**{k: v for k, v in item.items() if k not in CONTENT}, **{k: label[k] for k in CONTENT if k in label}}
 
 
 def apply(set_doc, labels, papers):
@@ -925,26 +943,6 @@ def judge_scores(labels, verdicts, settings=None):
 # The review page
 
 
-def kept_as_sent(sent, label):
-    """Whether every field a request names ends up in the label as sent: typed text as trimmed (visible),
-    answerable as given, evidence as the same passages in the same items."""
-    from backend.settings import visible
-    if not isinstance(sent, dict) or sent.get("decision") != "edit":
-        return True
-    for name in EDITS:
-        if name not in sent:
-            continue
-        if name not in label:
-            return False
-        if name == "evidence":
-            if [[(c.get("paper"), c.get("ordinal")) for c in ev] for ev in sent[name]] != \
-                    [[(loc["paper"], loc["ordinal"]) for loc in ev] for ev in label[name]]:
-                return False
-        elif label[name] != (visible(sent[name]) if name in ("text", "short_answer") else sent[name]):
-            return False
-    return True
-
-
 def keyed(evidence):
     return [[{**loc, "key": passage_key(loc["paper"], loc["ordinal"], loc["quote"])} for loc in ev] for ev in evidence]
 
@@ -1084,7 +1082,10 @@ class Review:
         return loc
 
     def label_of(self, item, given):
-        """The label a request gives, checked: (fields to store) or ValueError(code)."""
+        """The label a request gives, checked for its shape: (fields to store) or ValueError(code). A question
+        is sent whole, as the page shows it (text, answerable, evidence, and a short answer when answerable),
+        or dropped; it is stored as keep when it is the draft as drafted, else as an edit holding it whole.
+        Whether it passes the drafts' rules is checked with the whole set (save)."""
         from backend.settings import visible
         if not isinstance(given, dict):
             raise ValueError("label_invalid")
@@ -1092,48 +1093,41 @@ class Review:
             if set(given) != {"category"} or given["category"] not in CATEGORIES:
                 raise ValueError("label_invalid")
             return {"category": given["category"]}
-        if given.get("decision") not in DECISIONS or not set(given) <= {"decision", "text", "short_answer",
-                                                                          "answerable", "evidence"}:
+        if given.get("decision") == "drop" and set(given) == {"decision"}:
+            return {"decision": "drop"}
+        if not (given.get("decision") == "keep"
+                and {"decision", "text", "answerable", "evidence"} <= set(given) <= {"decision", *CONTENT}):
             raise ValueError("label_invalid")
-        edits = {k: v for k, v in given.items() if k != "decision"}
-        if (given["decision"] == "edit") != bool(edits):
-            raise ValueError("edit_needs_a_change" if given["decision"] == "edit" else "label_invalid")
-        label = {"decision": given["decision"]}
+        content = {}
         for name in ("text", "short_answer"):
-            if name in edits:
-                text = visible(edits[name]) if isinstance(edits[name], str) else None
+            if name in given:
+                text = visible(given[name]) if isinstance(given[name], str) else None
                 if text is None:
                     raise ValueError("text_blank")
                 if len(text) > TEXT_BOUND[name]:
                     raise ValueError("text_too_long")
-                label[name] = text
-        if "answerable" in edits:
-            if not isinstance(edits["answerable"], bool):
-                raise ValueError("label_invalid")
-            label["answerable"] = edits["answerable"]
-        if "evidence" in edits:
-            chosen = edits["evidence"]
-            if not (isinstance(chosen, list) and len(chosen) <= 30
-                    and all(isinstance(ev, list) and 0 < len(ev) <= 10 for ev in chosen)):
-                raise ValueError("evidence_invalid")
-            label["evidence"] = [[self.locator(c) for c in ev] for ev in chosen]
-        if not label.get("answerable", item["answerable"]):
-            # The question this label leaves is unanswerable (said here, or drafted so): it keeps no answer and
-            # no evidence, so a request naming either is then refused as not kept (kept_as_sent).
-            label.pop("short_answer", None)
-            label.pop("evidence", None)
-        made = labeled(item, label)
-        if made is not None and (problems := check_question(made, self.field, self.papers)):
-            raise ValueError("text_language" if any("marked" in p for p in problems) else
-                             "answerable_needs_answer_and_evidence" if made["answerable"] else "label_invalid")
-        return label
+                content[name] = text
+        if not isinstance(given["answerable"], bool):
+            raise ValueError("label_invalid")
+        content["answerable"] = given["answerable"]
+        chosen = given["evidence"]
+        if not (isinstance(chosen, list) and len(chosen) <= 30
+                and all(isinstance(ev, list) and 0 < len(ev) <= 10 for ev in chosen)):
+            raise ValueError("evidence_invalid")
+        content["evidence"] = [[self.locator(c) for c in ev] for ev in chosen]
+
+        def plain(question):
+            return ({k: question[k] for k in ("text", "short_answer", "answerable") if k in question},
+                    [[(loc["paper"], loc["ordinal"]) for loc in ev] for ev in question["evidence"]])
+        return {"decision": "keep"} if plain(content) == plain(item) else {"decision": "edit", **content}
 
     def save(self, body):
-        """(status, answer) for a save: written to the labels file (whole, owner-only) before it is
-        answered as saved; refused when it carries an older revision of the item's label than the file's."""
-        if not (isinstance(body, dict) and set(body) - {"revert"} == {"item", "base", "label"}
-                and body["item"] in self.order and isinstance(body["base"], int) and not isinstance(body["base"], bool)
-                and isinstance(body.get("revert", False), bool)):
+        """(status, answer) for a save: written to the labels file (whole, owner-only) before it is answered as
+        saved. Refused, with nothing written: a request carrying another revision of the item's label than the
+        file's (409, with the label as saved), and one that would leave the set breaking a rule the drafts
+        pass (400, naming the rule)."""
+        if not (isinstance(body, dict) and set(body) == {"item", "base", "label"} and body["item"] in self.order
+                and isinstance(body["base"], int) and not isinstance(body["base"], bool)):
             return 400, {"code": "label_invalid"}
         item = self.items[body["item"]]
         with self.file_lock():
@@ -1141,30 +1135,15 @@ class Review:
             current = self.labels.get(item["id"])
             if body["base"] != (current["revision"] if current else 0):
                 return 409, {"code": "changed_elsewhere", "label": self.shown_label(item["id"])}
-            given = body["label"]
-            edited = (current is not None and label_state(item, current) == "done" and current.get("decision") == "edit")
-            if edited and isinstance(given, dict) and given.get("decision") == "keep" and not body.get("revert"):
-                # Keep after an edit keeps the edit (the page shows it); going back to the draft is its own action
-                return 400, {"code": "keep_would_revert"}
-            if edited and isinstance(given, dict) and given.get("decision") == "edit":
-                # An edit builds on the saved one: what it does not name stays as saved, never silently dropped
-                given = {**{k: current[k] for k in EDITS if k in current and k != "evidence"},
-                         **({"evidence": [[{"paper": loc["paper"], "ordinal": loc["ordinal"],
-                                            "key": passage_key(loc["paper"], loc["ordinal"], loc["quote"])}
-                                           for loc in ev]
-                                          for ev in current["evidence"]]} if "evidence" in current else {}),
-                         **given}
             try:
-                label = self.label_of(item, given)
+                label = self.label_of(item, body["label"])
             except ValueError as error:
                 return 400, {"code": str(error)}
-            if not kept_as_sent(body["label"], label):
-                # The record would not hold a change the rater made (another window made the question
-                # unanswerable, so its answer and evidence would go): not saved, and the page is told why.
-                return 409, {"code": "change_not_kept", "label": self.shown_label(item["id"])}
             entry = {**label, "item_sha256": item_sha256(item), "revision": body["base"] + 1,
                      "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
             labels = {**self.labels, item["id"]: entry}
+            if problems := set_problems(self.set, labels, self.papers):
+                return 400, {"code": rule_code(problems[0]), "problem": problems[0]}
             doc = {"set": self.set["id"], "kind": self.kind, "field": self.field, "rater": self.rater,
                    "set_sha256": self.set_sha256, **({"sample": True} if self.sample else {}),
                    "labels": dict(sorted(labels.items()))}
@@ -1174,6 +1153,17 @@ class Review:
                 return 500, {"code": "not_saved"}
             self.labels = labels
             return 200, {"label": self.shown_label(item["id"]), "done": self.done()}
+
+
+def rule_code(problem):
+    """The page's code for the first rule a save would break (its catalog says it in the rater's language)."""
+    for marker, code in (("have the same text", "duplicate_text"), ("marked", "text_language"),
+                         ("an answerable question has", "answerable_needs_answer_and_evidence"),
+                         ("an unanswerable question has no", "unanswerable_has_no_answer"),
+                         ("longer than", "text_too_long"), ("empty or not text", "text_blank")):
+        if marker in problem:
+            return code
+    return "evidence_invalid" if "evidence" in problem else "label_invalid"
 
 
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",

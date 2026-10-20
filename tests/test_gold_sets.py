@@ -352,7 +352,7 @@ def test_the_synthetic_sets_pass_and_the_report_gives_their_mix(tmp_path):
     ("questions", lambda items: items[3].update(text="長段落討論了什麼？"), "question q04: marked zh-CN (Simplified) but holds"),
     ("questions", lambda items: items[0].update(query_language="fr"), "question q01: language 'fr' is not one of"),
     ("questions", lambda items: items[1].update(id="q01"), "questions: id 'q01' is used 2 times"),
-    ("questions", lambda items: items[1].update(text=items[0]["text"].upper()), "questions: 2 items have the same text"),
+    ("questions", lambda items: items[1].update(text=items[0]["text"].upper()), "questions: q01, q02 have the same text"),
     ("questions", lambda items: items[0]["evidence"][0][0].update(kind="reference"), "a reference passage is never evidence"),
     ("questions", lambda items: items[0]["evidence"][0][0].update(char_start=3), "char_start is not a field of this format"),
     ("questions", lambda items: items[0]["evidence"][0][0].pop("attribution"), "question q01 evidence item 1: attribution missing"),
@@ -449,17 +449,18 @@ def test_field_one_refuses_a_folder_inside_the_repository_but_evals_local(where)
 def test_the_labels_format_refuses_another_set_or_rater_and_a_missing_field(tmp_path):
     folder = field(tmp_path)
     doc = json.loads((folder / "pairs.json").read_text())
+    papers = {p["id"]: p for p in json.loads((folder / "papers.json").read_text())["papers"]}
     good = {"set": doc["id"], "kind": "pairs", "field": 2, "rater": "harold", "set_sha256": "x",
             "labels": {"p01": {"item_sha256": gold.item_sha256(doc["items"][0]), "revision": 1, "saved_at": "t",
                                "category": "supported"}}}
-    assert gold.check_labels(good, doc, {}, "harold") == []
-    assert "they are rater 'harold''s" in gold.check_labels(good, doc, {}, "lee")[0]
-    assert "not this set's" in gold.check_labels({**good, "set": "field2-questions"}, doc, {})[0]
+    assert gold.check_labels(good, doc, papers, "harold") == []
+    assert "they are rater 'harold''s" in gold.check_labels(good, doc, papers, "lee")[0]
+    assert "not this set's" in gold.check_labels({**good, "set": "field2-questions"}, doc, papers)[0]
     broken = copy.deepcopy(good)
     del broken["labels"]["p01"]["saved_at"]
-    assert gold.check_labels(broken, doc, {}) == ["label p01: saved_at missing"]
+    assert gold.check_labels(broken, doc, papers) == ["label p01: saved_at missing"]
     broken["labels"]["p01"].update(saved_at="t", category="maybe")
-    assert gold.check_labels(broken, doc, {}) == ["label p01: category 'maybe'"]
+    assert gold.check_labels(broken, doc, papers) == ["label p01: category 'maybe'"]
 
 
 # Labels, the corrected set, the sample and the agreement
@@ -467,6 +468,16 @@ def test_the_labels_format_refuses_another_set_or_rater_and_a_missing_field(tmp_
 
 def papers_by_id(folder):
     return {p["id"]: p for p in json.loads((folder / "papers.json").read_text())["papers"]}
+
+
+def edit(item, **changes):
+    """A question's edit label as the page stores it: the whole question, as the rater left it."""
+    out = {"decision": "edit", **{k: item[k] for k in ("text", "short_answer", "answerable", "evidence") if k in item},
+           **changes}
+    if not out["answerable"]:
+        out.pop("short_answer", None)
+        out["evidence"] = []
+    return out
 
 
 def labels_for(doc, rater, decisions):
@@ -480,8 +491,8 @@ def test_the_corrected_set_applies_done_labels_and_keeps_the_rest_provisional(tm
     doc = json.loads((folder / "questions.json").read_text())
     labels = labels_for(doc, "harold", {
         "q01": {"decision": "keep"}, "q02": {"decision": "drop"},
-        "q03": {"decision": "edit", "answerable": True, "short_answer": "Not said", "evidence": doc["items"][0]["evidence"]},
-        "q04": {"decision": "edit", "answerable": False}, "q05": {"decision": "keep"}})
+        "q03": edit(doc["items"][2], answerable=True, short_answer="Not said", evidence=doc["items"][0]["evidence"]),
+        "q04": edit(doc["items"][3], answerable=False), "q05": {"decision": "keep"}})
     labels["labels"]["q05"]["item_sha256"] = "an older version of the item"
     labels["labels"]["gone"] = {"item_sha256": "x", "revision": 1, "saved_at": "t", "decision": "keep"}
     papers = papers_by_id(folder)
@@ -546,8 +557,8 @@ def test_question_agreement_covers_keep_or_drop_answerable_and_evidence(tmp_path
     first = labels_for(doc, "harold", {"q01": {"decision": "keep"}, "q02": {"decision": "keep"},
                                        "q03": {"decision": "drop"}, "q04": {"decision": "keep"}})
     second = labels_for(doc, "lee", {"q01": {"decision": "keep"},
-                                     "q02": {"decision": "edit", "evidence": doc["items"][1]["evidence"][:1]},
-                                     "q03": {"decision": "keep"}, "q04": {"decision": "edit", "answerable": False}})
+                                     "q02": edit(doc["items"][1], evidence=doc["items"][1]["evidence"][:1]),
+                                     "q03": {"decision": "keep"}, "q04": edit(doc["items"][3], answerable=False)})
     out = gold.agreement(doc, first, second)
     assert out["kept"]["both_labeled"] == 4 and out["kept"]["percent_agreement"] == 75.0
     assert out["answerable"]["both_labeled"] == 3 and out["answerable"]["percent_agreement"] == round(200 / 3, 2)
@@ -732,7 +743,7 @@ async def test_the_check_resolves_evidence_a_rater_chose_as_it_resolves_drafted_
     doc = json.loads((folder / "questions.json").read_text())
     papers = papers_by_id(folder)
     good = from_sheet(sheet, papers, 2, "2601.00011v1", "Keyword")
-    labels = labels_for(doc, "harold", {"q1": {"decision": "edit", "evidence": [[good]]}})
+    labels = labels_for(doc, "harold", {"q1": edit(doc["items"][0], evidence=[[good]])})
     (folder / "labels").mkdir()
     write(folder / "labels" / "t-questions.harold.json", labels)
     assert (await gold.check(2, folder, pdfs, qasper, opener()))["problems"] == []

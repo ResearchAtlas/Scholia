@@ -1565,6 +1565,20 @@ async function goldPages(ctx) {
       await status().getByText(G('status.saved', { n: 2 })).waitFor();
       check('Keep after the edit kept the edit, read back from the labels file', labels('questions').q02?.decision === 'edit'
         && /^Which method found more evidence/.test(labels('questions').q02.text) && labels('questions').q02.revision === 2);
+      // A save's answer touches only its own question: q04's Keep is held back while q05's edit is opened and typed in.
+      const held = async (route) => { await new Promise((r) => setTimeout(r, 1500)); await route.continue(); };
+      await page.route('**/api/label', held);
+      check('the next open question is q04', await heading().textContent() === G('item.heading', { n: 4, total: 6 }));
+      await page.keyboard.press('k');
+      await page.keyboard.press('ArrowRight');
+      await page.keyboard.press('e');
+      await page.getByLabel(G('edit.text'), { exact: true }).fill('长段落主要讨论了检索深度吗？');
+      await status().getByText(G('status.saved', { n: 4 })).waitFor();
+      await page.unroute('**/api/label', held);
+      check("q04's answer left q05's open edit as typed", await heading().textContent() === G('item.heading', { n: 5, total: 6 })
+        && await page.getByLabel(G('edit.text'), { exact: true }).inputValue() === '长段落主要讨论了检索深度吗？');
+      check('q04 was kept, read back from the labels file', labels('questions').q04?.decision === 'keep');
+      await page.keyboard.press('Escape');
       isolated();
     });
 
