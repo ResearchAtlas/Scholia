@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { appendPage, chosenFor, collectionTree, MAX_ITEMS, reportParts, statusKey } from '../src/zotero.js';
+import { appendPage, chosenFor, collectionIn, collectionTree, libraryIn, MAX_ITEMS, reportParts, statusKey } from '../src/zotero.js';
 import { detailsSource, reasonKey } from '../src/library.js';
 import { loadLanguage, makeT } from '../src/i18n/index.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
@@ -124,4 +124,28 @@ test('items chosen under one Zotero are not sent to another', () => {
   assert.deepEqual(chosenFor(['AAAA2222'], null, undefined), ['AAAA2222']); // a Zotero sending no id, both times
   assert.deepEqual(chosenFor(['AAAA2222'], null, 'server-b'), []);
   assert.match(source('ZoteroBrowser.jsx'), /setChosen\(\(keys\) => chosenFor\(keys, under, status\.server_id\)\)/);
+});
+
+test('after Check again, a group or collection Zotero no longer lists is left before any request goes to it', () => {
+  const mine = { id: 'users/0', name: null };
+  const group = (n) => ({ id: `groups/${n}`, name: `Group ${n}` });
+  assert.equal(libraryIn('groups/4711', [mine, group(4711)]), 'groups/4711'); // still listed: kept
+  assert.equal(libraryIn('groups/4711', [mine, group(99)]), 'users/0'); // gone: My Library
+  assert.equal(libraryIn('groups/4711', [group(99), group(5)]), 'groups/99'); // no My Library listed: the first
+  assert.equal(libraryIn('groups/4711', []), 'groups/4711'); // nothing listed (not ready): left as it is
+  assert.equal(libraryIn('groups/4711', undefined), 'groups/4711');
+  const collections = [{ key: 'COL00001', name: 'Kept', parent: null }];
+  assert.equal(collectionIn('COL00001', collections), 'COL00001');
+  assert.equal(collectionIn('COL00002', collections), null); // gone: all items
+  assert.equal(collectionIn('COL00002', null), 'COL00002'); // the list is still loading: kept until it says
+  assert.equal(collectionIn(null, collections), null);
+  const browser = source('ZoteroBrowser.jsx');
+  // left while rendering (so no effect sends a request for it), with the items chosen in the library left
+  assert.match(browser, /if \(ready && libraryIn\(library, status\.libraries\) !== library\) \{\s*setLibrary\(libraryIn\(library, status\.libraries\)\);\s*setCollection\(null\);\s*setChosen\(\[\]\);/);
+  assert.match(browser, /else if \(collectionIn\(collection, collections\) !== collection\) \{\s*setCollection\(null\);/);
+  // Check again refreshes the collections too, and a chosen collection's items wait for its list
+  assert.match(browser, /setStatus\(null\);\s*setCollections\(null\);/);
+  assert.match(browser, /const confirming = collection !== null && collections === null;/);
+  assert.match(browser, /if \(!ready \|\| confirming\) return undefined;/);
+  assert.match(browser, /\}, \[ready, library, collection, confirming\]\);/);
 });

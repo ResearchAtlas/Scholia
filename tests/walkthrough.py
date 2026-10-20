@@ -32,8 +32,9 @@ JSON line each.
 
 S1-15: a test-owned Zotero (scholia_app.MockZotero) answers at Zotero's address behind the same transport,
 with made-up libraries, collections and items, whose PDFs are synthetic files in the materials folder.
-It reads its state from the file named by "zotero state": not_running, api_off, ready, or changed (ready,
-with one item's title and PDF changed since, for the re-import). Its requests go to the request log too,
+It reads its state from the file named by "zotero state": not_running, api_off, ready, changed (ready,
+with one item's title and PDF changed since, for the re-import), or pruned (ready, with the group "Synthetic
+Lab" and the collection "Linked files" gone since). Its requests go to the request log too,
 with their query ("target").
 
 tests/walkthrough_driver.mjs drives the rendered walkthrough against this server.
@@ -199,19 +200,23 @@ ZOTERO_ITEMS = {
 class WalkthroughZotero(MockZotero):
     """The walkthrough's Zotero: its state read from the control file at each request (see the module)."""
 
+    GROUPS = [(4711, "Synthetic Lab"), (4712, "合成课题组")]
+    COLLECTIONS = [{"key": "WAGECOL1", "name": "Wage studies"}, {"key": "LINKCOL2", "name": "Linked files", "parent": "WAGECOL1"}]
+
     def __init__(self, control, materials):
-        super().__init__(server_id="walkthrough-zotero", groups=[(4711, "Synthetic Lab"), (4712, "合成课题组")])
+        super().__init__(server_id="walkthrough-zotero", groups=self.GROUPS)
         # the folder by its own path: Scholia follows no link to an attachment (/var is one on macOS)
         self.control, self.materials = control, materials.resolve()
-        self.collections["users/0"] = [{"key": "WAGECOL1", "name": "Wage studies"},
-                                       {"key": "LINKCOL2", "name": "Linked files", "parent": "WAGECOL1"}]
+        self.collections["users/0"] = self.COLLECTIONS
         for key, (title, doi, pdf, linked, collection) in ZOTERO_ITEMS.items():
             path = pdf if pdf is None or pdf.startswith("file:") else self.materials / pdf
             self.item(key, title, doi=doi, pdf=path, linked=linked, collections=[collection] if collection else [])
 
     async def __call__(self, request):
         state = self.control.read_text().strip() if self.control.exists() else "not_running"
-        self.state = "ready" if state == "changed" else state
+        self.state = "ready" if state in ("changed", "pruned") else state
+        self.groups = self.GROUPS[1:] if state == "pruned" else self.GROUPS
+        self.collections["users/0"] = self.COLLECTIONS[:1] if state == "pruned" else self.COLLECTIONS
         if state == "changed":  # the Chinese item retitled in Zotero, its PDF replaced by a revised one
             item = self.items["users/0", "ZHAN0005"]
             item["data"]["title"] = item["csljson"]["title"] = ZOTERO_PDFS["zotero-hanzi-revised.pdf"][0]
