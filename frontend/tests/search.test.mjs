@@ -7,8 +7,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
-import { makeT } from '../src/i18n/index.js';
-import { fieldKey, indexCounts, indexReason, offerOutcome, onFieldKey, paperIndexed, queryOf, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
+import { fieldKey, indexCounts, indexReason, offerOutcome, onFieldKey, paperIndexed, queryOf, rebuildAfter, runCounts, runReason, searchNote, whereIs } from '../src/search.js';
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 const t = makeT('en');
 
@@ -190,4 +192,23 @@ test("an index run is its project's: the list says what it did in counts, and wh
   const settings = readFileSync(fileURLToPath(new URL('../src/components/Settings.jsx', import.meta.url)), 'utf8');
   assert.match(settings, /run\.workflow === 'index' && run\.rebuild \? t\('settings\.workflowIndexRebuild'\)/);
   assert.match(settings, /t\(\.\.\.runCounts\(run\)\)/);
+});
+
+test('a Rebuild asked while another index run ran follows that run, then the rebuild its end records', () => {
+  const during = { run_id: 'r1', rebuild_pending: true };
+  const next = { run: { run_id: 'r2', status: 'running', rebuild: true }, last_rebuild: { run_id: 'r2', status: 'running', after: 'r1' } };
+  assert.equal(rebuildAfter(during, { status: 'succeeded' }, next), 'r2');
+  assert.equal(rebuildAfter(during, { status: 'failed' }, next), 'r2'); // a run that fails still runs its rerun
+  assert.equal(rebuildAfter(during, { status: 'cancelled' }, next), null); // Cancel drops the rerun (R29)
+  // PR 29 finding 53: the rebuild ended before the interface looked, and an ordinary rerun runs now: still that rebuild
+  assert.equal(rebuildAfter(during, { status: 'succeeded' }, { run: { run_id: 'r3', status: 'running', rebuild: false },
+    last_rebuild: { run_id: 'r2', status: 'succeeded', after: 'r1' } }), 'r2');
+  // an older rebuild, recorded after another run (that run's end recorded none: interrupted), is not it
+  assert.equal(rebuildAfter(during, { status: 'interrupted' }, { run: { run_id: 'r1', rebuild: false },
+    last_rebuild: { run_id: 'r0', status: 'succeeded', after: 'rx' } }), null);
+  assert.equal(rebuildAfter({ run_id: 'r2', rebuild_pending: false }, { status: 'succeeded' }, next), null);
+  for (const catalog of [en, zhCN]) assert.ok('search.rebuildAfterRun' in catalog);
+  const component = readFileSync(fileURLToPath(new URL('../src/components/SearchIndex.jsx', import.meta.url)), 'utf8');
+  assert.match(component, /rebuildAfter\(started, ended, await indexStatus\(project\.id, started\.run_id\)/);
+  assert.match(component, /index\.run\?\.rebuild_pending && \(/);
 });

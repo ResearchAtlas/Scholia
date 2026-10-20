@@ -1499,3 +1499,96 @@ async def test_an_exported_answer_cut_at_its_output_limit_says_so(language):
                                              "status": "succeeded"}]}
     written = backups_module._conversation_markdown(conversation, language).decode()
     assert f"*{i18n.render('export.cut', language)}*" in written
+
+
+# Failing closed (Harold, 2026-10-15, as simplified): one failed close holds file replacement off for the rest of the
+# process (PR 29 findings 47 and 49)
+
+
+async def test_a_restore_whose_running_database_fails_to_close_puts_nothing_in_place(tmp_path, monkeypatch):
+    """The running database's close fails as a restore is about to put the backup in place: nothing is moved, the
+    restore says to restart the app, and the app is limited; a second restore is refused the same way."""
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        project = await new_project(client)
+        db = client.state["db"]
+
+        def failing():
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(db, "_close_writer", failing)
+        real_put, put = backups_module._put_in_place, []
+
+        def put_in_place(*args):
+            put.append(args)
+            return real_put(*args)
+        monkeypatch.setattr(backups_module, "_put_in_place", put_in_place)
+        for _ in range(2):
+            response = await client.post("/api/backups/restore", json={"generation": backup})
+            assert (response.status_code, response.json()["code"]) == (409, "restart_required")
+        assert put == [] and (data / "projects" / project / "config.toml").is_file()
+        assert not (data / "backups" / backups_module.JOURNAL).exists()
+        assert (await client.get("/api/projects")).json()["code"] == "restart_required"  # limited: restart
+        assert (await client.get("/api/health")).json()["limited"] == "restart_required"  # the window's restart screen
+
+
+async def test_a_failed_restore_whose_restored_database_fails_to_close_puts_nothing_back_nor_in_place(tmp_path,
+                                                                                                        monkeypatch):
+    """Findings 47 and 49: the restored database cannot start, and its close fails. The previous files are not put
+    back over it (the journal stays, for the next launch to finish), and a second Restore, though the failed
+    database was forgotten (_stop, _forget), is refused before anything moves: the app says to restart."""
+    from backend.runs import Harness
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        await new_project(client)
+        original = client.state["db"]
+        real_recover, recovered = Harness.recover, []
+
+        async def failing_once(self, kick=True):
+            recovered.append(self)
+            if len(recovered) == 1:
+                raise RuntimeError("recovery failed")
+            await real_recover(self, kick)
+        real_close_writer = Database._close_writer
+
+        def close_writer(self):
+            if self is not original:  # the restored database's
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_close_writer(self)
+        moved = []
+        real_back, real_put = backups_module._back, backups_module._put_in_place
+        monkeypatch.setattr(Harness, "recover", failing_once)
+        monkeypatch.setattr(Database, "_close_writer", close_writer)
+        monkeypatch.setattr(backups_module, "_back", lambda *args, **kwargs: moved.append("back") or real_back(*args, **kwargs))
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (500, "restore_interrupted")
+        assert moved == [] and (data / "backups" / backups_module.JOURNAL).exists()
+        # recheck 5, finding 5: the failed close outranks the interrupted restore, so the window says to restart
+        assert (await client.get("/api/health")).json()["limited"] == "restart_required"
+        monkeypatch.setattr(backups_module, "_put_in_place", lambda *args: moved.append("put") or real_put(*args))
+        again = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (again.status_code, again.json()["code"]) == (409, "restart_required") and moved == []
+
+
+
+async def test_after_a_failed_close_a_restore_is_refused_before_it_stops_anything_and_no_swap_can_run(tmp_path):
+    """Review 6, P3-5: once a close in this process failed, a restore is refused at once (nothing stopped, the app
+    runs on), and the swap functions themselves refuse before anything moves, whichever caller reaches them."""
+    from backend.db import database
+    data = tmp_path / "data"
+    async with started(data) as client:
+        backup = (await client.post("/api/backups")).json()["id"]
+        project = await new_project(client)
+        database._close_failed.set()  # as a close that failed earlier in this process leaves it
+        response = await client.post("/api/backups/restore", json={"generation": backup})
+        assert (response.status_code, response.json()["code"]) == (409, "restart_required")
+        assert not client.state["harness"].registry.closed  # nothing was stopped
+        assert (await client.get("/api/health")).json()["limited"] == "restart_required"  # the window: open it again
+        staged = data / "backups" / ".staged-test"
+        staged.mkdir(parents=True)
+        with pytest.raises(backups_module.ReplacementRefused):
+            backups_module._put_in_place(data, staged, data / "backups" / ".aside-test", "id")
+        with pytest.raises(backups_module.ReplacementRefused):
+            backups_module._back_from_journal(data)
+        assert not (data / "backups" / ".aside-test").exists() and not (data / "backups" / backups_module.JOURNAL).exists()

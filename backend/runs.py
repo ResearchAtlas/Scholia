@@ -330,6 +330,9 @@ class Harness:
         # work began; S1-17: a project's index run, asked for again while it ran, runs once more).
         self.endings = {}
         self._tasks = set()  # detached tasks, kept referenced until they finish
+        # Index runs a kick started again after they were left running unheld (a terminal write that failed): once
+        # each, so a failure that lasts never makes a loop of them (the next trigger, Retry or launch takes it then)
+        self._started_again = set()
         # Orders settings saves with the budget reads of call admission: a lowered budget either
         # lands before a call reads it or after that call was admitted.
         self.settings_lock = asyncio.Lock()
@@ -974,6 +977,19 @@ class Harness:
             if active is not None:
                 active.task = asyncio.create_task(self._background(active))
 
+    async def start_again(self, run_id):
+        """Start the one background run run_id if it is recorded running, not tried again (retried_by) and held by no
+        process here (left so by a terminal write that failed), as a kick would start it, but this run only."""
+        if self.registry.closed:
+            return
+        if await self._read(lambda conn: conn.execute(
+                "SELECT 1 FROM runs WHERE id = ? AND kind = 'background' AND status = 'running'"
+                " AND json_extract(inputs, '$.retried_by') IS NULL", (run_id,)).fetchone()) is None:
+            return
+        active = self.registry.add_background(run_id)
+        if active is not None:
+            active.task = asyncio.create_task(self._background(active))
+
     async def _ended(self, active, write):
         """Await a background run's terminal write; once it has committed, the run is known finished
         here (Registry.finished), before it is released. A write that raises marks nothing."""
@@ -983,6 +999,7 @@ class Harness:
 
     async def _background(self, active: ActiveRun) -> None:
         active.started = True
+        index_run = False  # S1-17's index run: started again once if it is left running (see finally)
         try:
             if active.cancel_requested.is_set():  # stopped before it began
                 raise asyncio.CancelledError()
@@ -999,6 +1016,7 @@ class Harness:
                     lambda conn: self._finish_background(conn, active, "cancelled", None, inputs)))
                 return
             if workflow in self.workflows:  # it returns once its terminal record has committed
+                index_run = workflow == "index"
                 await self._ended(active, self._local(active, project_id, workflow, inputs))
                 return
             inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
@@ -1044,6 +1062,15 @@ class Harness:
             # running in the record: left for the next start, or by a terminal write that raised, which
             # reads interrupted from here on. At no moment does a finished run read interrupted.
             self.registry.release(active)
+            if (index_run and active.run_id not in self.registry.finished and not active.cancel_requested.is_set()
+                    and not self.registry.closed and active.run_id not in self._started_again):
+                # An index run left running in its record, held by no process (its terminal write failed) is started
+                # again in this session, once, and only it (start_again), so what it was asked to do (a rerun marked
+                # on it included) is never left waiting for an unrelated trigger or the next launch. Other runs keep
+                # their own rules (a reading so left reads interrupted, with Retry; a model call's run waits for the
+                # next start); a turn's end still kicks them all, as before.
+                self._started_again.add(active.run_id)
+                self._detach(self.start_again(active.run_id))
             if active.follows:  # recorded mid-run by writes that committed (a run with no row ends at its start)
                 if self.registry.closed:
                     for held in active.follows:
@@ -1144,17 +1171,19 @@ class Harness:
         active.task = asyncio.create_task(self._background(active))
         return run_id
 
-    async def record_background(self, count, write, ids=()):
+    async def record_background(self, count, write, committed=None):
         """Record new background runs in one transaction and start them. write(conn, ids) gets count
-        run ids (ids, chosen before, then fresh ones), records the runs it needs under some of them, and
-        returns (result, the ids it
+        fresh run ids, records the runs it needs under some of them, and returns (result, the ids it
         used). Each id is held in the registry before the transaction commits, and the runs recorded
         start as soon as it has, so no read ever finds one running in the record and not held here
-        (which reads as interrupted). The ids it did not use are released inside the transaction, so no
-        later one finds them held (record_in, recording a run under an id chosen before). Returns the
-        result; a cancellation of the caller waits for the transaction (see _through), starts the runs,
-        and is raised after."""
-        actives = [self.registry.add_background(run_id) for run_id in [*ids, *(new_id() for _ in range(count - len(ids)))]]
+        (which reads as interrupted). The ids it did not use are released inside the transaction.
+        committed(result), if given, is a coroutine run once the transaction has committed, whatever
+        happens to the caller after (a detached task: S1-17's start of a run a request was answered
+        with); it is awaited unless the caller was cancelled, and an error it raises then reaches the
+        caller after the commit (unawaited, after a cancellation, it is logged by asyncio). Returns the
+        result; a cancellation of the caller waits for the transaction (see _through), starts the runs and
+        committed, and is raised after."""
+        actives = [self.registry.add_background(new_id()) for _ in range(count)]
         if None in actives:
             for active in actives:
                 if active is not None:
@@ -1175,8 +1204,11 @@ class Harness:
         for active in actives:
             if active.run_id in used:
                 active.task = asyncio.create_task(self._background(active))
+        after = self._detach(committed(result)) if committed is not None else None
         if cancelled:
             raise asyncio.CancelledError()
+        if after is not None:
+            await asyncio.shield(after)
         return result
 
     async def work(self, active, fn):
@@ -1192,17 +1224,17 @@ class Harness:
             raise
         return result
 
-    def record_in(self, conn, active, project_id, workflow, inputs, run_id=None):
+    def record_in(self, conn, active, project_id, workflow, inputs):
         """Record a background run of the project in local work's terminal transaction (from its
         effect, on the writer thread): held here from before that transaction commits, as
         record_background holds its runs, and started by _local once it has (released if it did
         not), so no read finds it running in the record and not held. While the app is closing it is
         recorded unheld, and starts at the next launch."""
-        held = self.registry.add_background(run_id or new_id())
+        held = self.registry.add_background(new_id())
         if held is not None:
             active.follows.append(held)
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', ?, ?)",
-                     (held.run_id if held is not None else run_id or new_id(), project_id, workflow, json.dumps(inputs)))
+                     (held.run_id if held is not None else new_id(), project_id, workflow, json.dumps(inputs)))
 
     async def _local(self, active, project_id, workflow, inputs):
         try:

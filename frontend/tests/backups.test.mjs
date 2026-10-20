@@ -7,11 +7,13 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
-import { makeT } from '../src/i18n/index.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
 import { deletePath, deletionNotices, fileSize, folderPicker, needsPassphrase, restoreBody, restoreNotes }
   from '../src/backups.js';
 import { errorText } from '../src/text.js';
 import { get, post } from '../src/api.js';
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 test('a deletion asks for the backups and the trace only when chosen', () => {
   assert.equal(deletePath('conversation', 'c1'), '/api/conversations/c1');
@@ -79,11 +81,13 @@ test('every new error code reads in each language, never as the backend\'s messa
     'newer_schema', 'restore_failed', 'safety_copy_failed', 'data_folder_problem', 'data_folder_synced',
     'data_folder_not_empty', 'data_folder_not_found', 'data_folder_unsafe', 'data_folder_invalid',
     'restore_interrupted', 'restoring', 'work_running', 'data_folder_foreign', 'data_folder_newer',
-    'data_folder_unchecked', 'data_folder_not_writable'];
+    'data_folder_unchecked', 'data_folder_not_writable', 'restart_required'];
   for (const language of ['en', 'zh-CN']) {
     const t = makeT(language);
     for (const code of codes) assert.notEqual(errorText(t, code), t('errors.internal'), `${language}: ${code}`);
   }
+  for (const code of codes) assert.match(errorText(makeT('zh-CN'), code), /\p{Script=Han}/u, code); // Chinese, not English
+  assert.equal(errorText(makeT('zh-CN'), 'disk_full'), zhCN['errors.disk_full']);
 });
 
 test('the backup and export descriptions say what is left out of their settings files', () => {
@@ -115,5 +119,15 @@ test('a request that finds the app limited tells the window, so it can offer the
   await assert.rejects(get('/api/projects'));
   answer = { status: 409, code: 'database_damaged' }; // Back up now, whose check found the damage first
   await assert.rejects(post('/api/backups'));
-  assert.deepEqual(seen, ['scholia:limited', 'scholia:limited']);
+  answer = { status: 409, code: 'restart_required' }; // a close failed: the window says to open Scholia again
+  await assert.rejects(post('/api/backups/restore', {}));
+  assert.deepEqual(seen, ['scholia:limited', 'scholia:limited', 'scholia:limited']);
+  const app = readFileSync(fileURLToPath(new URL('../src/App.jsx', import.meta.url)), 'utf8');
+  assert.match(app, /restart=\{state\.health\?\.limited === 'restart_required'\}/);
+  // each limited answer reads health again, so a failed restore's restore_interrupted gives way to its
+  // restart_required (the backend ranks it first) and the window shows the restart screen
+  assert.match(app, /if \(health\.database_damaged\) setState\(\{ phase: 'damaged', health \}\)/);
+  for (const key of ['backups.restartTitle', 'backups.restartBody']) {
+    for (const catalog of [en, zhCN]) assert.ok(key in catalog, key);
+  }
 });

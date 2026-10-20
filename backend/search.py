@@ -11,8 +11,9 @@ at once). At most one runs per project:
 every trigger (a reading's commit, a title change, a deletion, the model's install, the launch, a
 restore, a whole-file rebuild, Retry, Rebuild) only requests one (`request_run`): while the project's run
 runs, it is marked to run once more when it ends (one rerun pending, a rebuild if one was asked
-for; at a launch or a restore, a plain request is the run the launch starts again, left as it is),
-else one is recorded, in the trigger's own transaction. Every embedding request carries the
+for), and the request gets the running run's id; else one is recorded, in the trigger's own
+transaction. A launch, or a restore, records every index run still running interrupted and one
+fresh run for each project with work left; a Retry records the old run interrupted and requests. Every embedding request carries the
 run's dispatch check, read in the outbound gate's decision transaction: the run still runs,
 unrevoked, and the passage is still one a current version in the project reads (`_may_index`); so
 nothing deleted or replaced is sent, and a vector is written only while its passage's row is there
@@ -121,13 +122,19 @@ async def open_index(state, db):
     (index_unavailable), and the app runs."""
     previous = state.pop("index", None)
     if previous is not None:
-        await asyncio.to_thread(previous.close)
+        try:
+            await asyncio.to_thread(previous.close)
+        except Exception as error:  # close_failed() holds; this open purges the file before any read
+            log.warning("the previous search index's close had failed (%s)", type(error).__name__)
     index = SearchIndex(state["data_dir"], db, identity(state.get("helper_config") or local_helper.Config()))
     try:
         wanted, rebuilding = await asyncio.to_thread(index.open)
     except Exception as error:
         log.error("the search index could not be opened (%s); search is unavailable", type(error).__name__)
-        await asyncio.to_thread(index.close)
+        try:
+            await asyncio.to_thread(index.close)
+        except Exception as failure:  # close_failed() holds; the next open purges the file
+            log.warning("closing the search index that could not be opened failed (%s)", type(failure).__name__)
         return
     db.closing.append(index.close)  # a restore under way or abandoned, or shutdown: nothing outlives db
     state["index"] = index
@@ -160,15 +167,27 @@ async def open_index(state, db):
         pending = None
 
     def requested(conn):
-        projects = set(queued)
+        # Every index run still recorded running ran in a process that has ended (or in a database a restore put
+        # in place): interrupted, and its project gets a fresh run, a rebuild if it or its rerun was one (index
+        # runs reconcile from the main database, so nothing is lost by starting afresh).
+        left = {}
+        for run_id, project, inputs in conn.execute(
+                "SELECT id, project_id, inputs FROM runs WHERE workflow = 'index' AND status = 'running'"
+                " AND cancel_reason IS NULL").fetchall():
+            inputs = json.loads(inputs or "{}")
+            left[project] = left.get(project, False) or bool(inputs.get("rebuild") or (inputs.get("again") or {}).get("rebuild"))
+            _event(conn, run_id, "run_finished", {"status": "interrupted"})
+            conn.execute("UPDATE runs SET status = 'interrupted', waiting = NULL, finished_at = ? WHERE id = ?",
+                         (utc_now(), run_id))
+        projects = set(queued) | set(left)
         if installed:
             projects |= pending if pending is not None else {p for (p,) in conn.execute(
                 "SELECT DISTINCT m.project_id FROM materials m JOIN material_versions v ON v.material_id = m.id"
                 " AND v.is_current = 1 WHERE v.file_sha256 IS NOT NULL")}
         for project in sorted(projects):
             if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project,)).fetchone():
-                request_run(conn, None, project, lambda conn, project, inputs: _insert_run(conn, None, project, inputs),
-                            startup=True)
+                request_run(conn, project, lambda conn, project, inputs: _insert_run(conn, None, project, inputs),
+                            left.get(project, False))
     await asyncio.to_thread(db.write, requested)
     if rebuilding is None:
         index.apply_soon()
@@ -181,50 +200,25 @@ def _insert_run(conn, run_id, project_id, inputs):
     return run_id
 
 
-def request_run(conn, registry, project_id, record, rebuild=False, startup=False, run_id=None):
-    """Ask for the project's index run, in the caller's transaction (see the module's docstring). While
-    one runs (unrevoked and held by registry, a Cancel draining included: a run is the project's until its
-    terminal transaction; at a launch or a restore, startup: one the launch starts again, which a plain
-    request leaves as it is, since it does all a plain run does), it is marked to run once more when it
-    ends: one rerun pending, its id chosen now (run_id, if given), a rebuild if any request asked for one
-    (a Rebuild while a rebuild runs is that one). Else record(conn, project id,
-    inputs) records one (under run_id, if given). Returns the id of the run that will do it. A run_id
-    that loses to an id already pending gets a terminal record (_close_pending), so whoever follows it
-    sees it end."""
-    for live, inputs in conn.execute(
-            "SELECT id, inputs FROM runs WHERE project_id = ? AND workflow = 'index' AND status = 'running'"
-            " AND cancel_reason IS NULL AND json_extract(inputs, '$.retried_by') IS NULL ORDER BY rowid DESC",
-            (project_id,)).fetchall():
-        if not (startup or (registry is not None and live in registry.runs)):
-            continue  # it will not end in this process (its terminal write failed): not the one
-        if startup and not rebuild:
-            return live
-        inputs = json.loads(inputs or "{}")
-        if rebuild and inputs.get("rebuild"):
-            if run_id is not None:
-                _close_pending(conn, project_id, run_id, "superseded", rebuild)
-            return live
-        again = inputs.get("again") or {"run_id": run_id or new_id()}
-        if run_id is not None and again["run_id"] != run_id:
-            _close_pending(conn, project_id, run_id, "superseded", rebuild)
-        again["rebuild"] = bool(again.get("rebuild") or rebuild)
+def request_run(conn, project_id, record, rebuild=False):
+    """Ask for the project's index run, in the caller's transaction (see the module's docstring). The
+    project's run is the unrevoked index run recorded running (only one is ever recorded: a launch records
+    every one still running interrupted, a Retry its own, and a run's rerun is recorded as it ends; one a
+    failed terminal write left running, held by no process, is it until a kick, a Retry or a launch; a
+    revoked one still ending is not): while there is one, it is marked to run once more
+    when it ends, a rebuild if any request asked for one (a Rebuild while a rebuild runs is that one),
+    and its id is returned. Else record(conn, project id, inputs) records one, and its id is returned."""
+    live = conn.execute(
+        "SELECT id, inputs FROM runs WHERE project_id = ? AND workflow = 'index' AND status = 'running'"
+        " AND cancel_reason IS NULL ORDER BY rowid DESC LIMIT 1", (project_id,)).fetchone()
+    if live is None:
+        return record(conn, project_id, {"rebuild": True} if rebuild else {})
+    run_id, inputs = live[0], json.loads(live[1] or "{}")
+    if not (rebuild and inputs.get("rebuild")):
+        again = {"rebuild": bool((inputs.get("again") or {}).get("rebuild") or rebuild)}
         conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.again', json(?)) WHERE id = ?",
-                     (json.dumps(again), live))
-        return again["run_id"]
-    return record(conn, project_id, {"rebuild": True} if rebuild else {})
-
-
-def _close_pending(conn, project_id, run_id, reason=None, rebuild=False):
-    """A pending run's id that will not run (its run's Cancel dropped it, or another pending run does its
-    work), recorded as a cancelled index run (a rebuild, if it was one), so the interface following it (a
-    Rebuild) sees it end."""
-    if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None:
-        return
-    conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs, status, cancel_reason, finished_at, summary)"
-                 " VALUES (?, ?, 'background', 'index', ?, 'cancelled', ?, ?, ?)",
-                 (run_id, project_id, json.dumps({"rebuild": True} if rebuild else {}), None if reason else "researcher",
-                  utc_now(), json.dumps({"reason": reason}) if reason else None))
-    _event(conn, run_id, "run_finished", {"status": "cancelled", **({"reason": reason} if reason else {})})
+                     (json.dumps(again), run_id))
+    return run_id
 
 
 async def _request(harness, project_id, rebuild=False):
@@ -233,10 +227,20 @@ async def _request(harness, project_id, rebuild=False):
     def write(conn, ids):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
             return None, []
-        run_id = request_run(conn, harness.registry, project_id,
-                         lambda conn, project, inputs: _insert_run(conn, ids[0], project, inputs), rebuild)
+        run_id = request_run(conn, project_id, lambda conn, project, inputs: _insert_run(conn, ids[0], project, inputs),
+                             rebuild)
         return run_id, [ids[0]] if run_id == ids[0] else []
-    return await harness.record_background(1, write)
+    return await harness.record_background(1, write, committed=lambda run_id: _started(harness, run_id))
+
+
+async def _started(harness, run_id):
+    """The run a request was answered with, started if no process holds it (one a failed terminal write left
+    running in its record, which reads interrupted): it is started (Harness.start_again), so the request's work and its rerun are
+    not left waiting for the next turn's end. Run by record_background once the request has committed, whatever
+    happens to the request after (committed). Returns run_id."""
+    if run_id is not None and not harness.registry.is_active(run_id):
+        await harness.start_again(run_id)  # that run only, if it is recorded running and not tried again
+    return run_id
 
 
 def _installed(state):
@@ -286,16 +290,12 @@ async def after_deletion(state, project_id):
 # Hooks for backend/materials.py, inside the transactions that queue passages
 
 
-def _registry(harness):
-    return harness.registry if harness is not None else None
-
-
 def queued(conn, harness, project_id, origin, record):
     """Passages were just queued for the project's index, in this transaction: its index run is
     requested (request_run), and the search model is offered at the project's first material (see the
     module's docstring). record(conn, project id, workflow, inputs) records a run that starts with the
     commit."""
-    request_run(conn, _registry(harness), project_id, lambda conn, project, inputs: record(conn, project, "index", inputs))
+    request_run(conn, project_id, lambda conn, project, inputs: record(conn, project, "index", inputs))
     state = _STATES.get(harness) if harness is not None else None
     if state is None or _installed(state) or _downloading(state):
         return
@@ -313,7 +313,7 @@ def queued(conn, harness, project_id, origin, record):
 def removed(conn, harness, project_id, record):
     """Passages were just queued to leave the project's index, with none to add (a reading without
     passages superseding one, a file replaced by one that gives none): its index run is requested."""
-    request_run(conn, _registry(harness), project_id, lambda conn, project, inputs: record(conn, project, "index", inputs))
+    request_run(conn, project_id, lambda conn, project, inputs: record(conn, project, "index", inputs))
 
 
 def retitled(conn, harness, project_id, material_id, record):
@@ -325,7 +325,7 @@ def retitled(conn, harness, project_id, material_id, record):
         JOIN extractions e ON {deletion._reads_now('w', 'e')} JOIN passages p ON p.extraction_id = e.id
         WHERE m.id = ? AND m.project_id = ? ORDER BY p.ordinal""", (project_id, material_id, project_id)).rowcount
     if count:
-        request_run(conn, _registry(harness), project_id, lambda conn, project, inputs: record(conn, project, "index", inputs))
+        request_run(conn, project_id, lambda conn, project, inputs: record(conn, project, "index", inputs))
 
 
 # The workflows
@@ -349,14 +349,14 @@ def register(harness, state):
         row = conn.execute("SELECT status, json_extract(inputs, '$.again') FROM runs WHERE id = ?",
                            (active.run_id,)).fetchone()
         again = json.loads(row[1]) if row and row[1] else None
-        if not again or not conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone():
+        # Cancel stops indexing for now (reading R29): its rerun is dropped; a later trigger or the next launch
+        # requests again
+        if not again or row[0] == "cancelled" or not conn.execute("SELECT 1 FROM projects WHERE id = ?",
+                                                                   (project_id,)).fetchone():
             return
-        if row[0] == "cancelled":  # Cancel stops indexing for now (reading R29): nothing starts at once; a later
-            # trigger or the next launch requests again
-            _close_pending(conn, project_id, again["run_id"], rebuild=again.get("rebuild"))
-            return
-        harness.record_in(conn, active, project_id, "index", {"rebuild": True} if again.get("rebuild") else {},
-                          run_id=again["run_id"])
+        # inputs.after: the run it follows, so a Rebuild asked while that one ran can follow it (index_status)
+        harness.record_in(conn, active, project_id, "index",
+                          {"rebuild": True, "after": active.run_id} if again.get("rebuild") else {"after": active.run_id})
 
     async def offer_run(harness, active, project_id, inputs):
         return await _offer_run(state, harness, active, project_id, inputs)
@@ -586,6 +586,8 @@ async def search(state, project_id, query, limit=None):
     mode, reason = search_mode(state)
     if index is None or index.closed or index.unusable:  # not opened, being replaced, or its rebuild failed (retried)
         return {"results": [], "mode": mode, "reason": reason, "index": "unavailable", "coverage": None}
+    if index.building:  # a whole rebuild asked for or under way: nothing is read until it is done (fail closed)
+        return {"results": [], "mode": mode, "reason": reason, "index": "building", "coverage": None}
     keyword = asyncio.ensure_future(asyncio.to_thread(index.keyword, project_id, text, values["bm25_candidates"]))
     counts = await _counts(index, project_id)
     totals = _totals(counts)
@@ -624,10 +626,11 @@ async def search_passages(project_id: str, body: Query, request: Request):
 
 
 @router.get("/api/projects/{project_id}/index")
-async def index_status(project_id: str, request: Request):
+async def index_status(project_id: str, request: Request, after: str | None = None):
     """The project's index: whether it is ready or being rebuilt, whether search is keyword-only and
     why, its passages indexed and embedded (in all, and by paper), and its index run: the one running
-    (with whether a rebuild is to follow it), else the latest."""
+    (with whether a rebuild is to follow it), else the latest; and its latest rebuild (or, with after, the
+    rebuild recorded as that run ended), with the run it was recorded after."""
     state = _state(request)
     registry = state["harness"].registry
 
@@ -635,10 +638,13 @@ async def index_status(project_id: str, request: Request):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
             raise AdmissionError(404, "not_found", "No such project")
         runs = "SELECT id, status, inputs FROM runs WHERE project_id = ? AND workflow = 'index'"
+        rebuild = conn.execute(runs + " AND json_extract(inputs, '$.rebuild') AND (?2 IS NULL OR"
+                               " json_extract(inputs, '$.after') = ?2) ORDER BY rowid DESC LIMIT 1",
+                               (project_id, after)).fetchone()
         return [*conn.execute(runs + " AND status = 'running' ORDER BY rowid DESC", (project_id,)),
-                *conn.execute(runs + " ORDER BY rowid DESC LIMIT 1", (project_id,))]
+                *conn.execute(runs + " ORDER BY rowid DESC LIMIT 1", (project_id,))], rebuild
 
-    runs = await asyncio.to_thread(state["db"].read, latest)
+    runs, rebuild = await asyncio.to_thread(state["db"].read, latest)
     # Each status worked out once (a run may be released between two looks at the registry). The latest is
     # last: one running in its record that this process does not hold (interrupted) is not taken over it.
     found = [(run_id, derived_status(status, run_id, registry), json.loads(inputs or "{}")) for run_id, status, inputs in runs]
@@ -655,21 +661,27 @@ async def index_status(project_id: str, request: Request):
             "materials": {m: dict(zip(_COUNTS, c)) for m, c in counts.items()},
             "run": {"run_id": run[0], "status": run[1], "rebuild": bool(run[2].get("rebuild")),
                     "rebuild_pending": run[1] == "running" and bool((run[2].get("again") or {}).get("rebuild")),
-                    "progress": active.progress if active is not None else None} if run else None}
+                    "progress": active.progress if active is not None else None} if run else None,
+            # the latest rebuild, and the run it was recorded after (a Rebuild asked while that one ran follows it)
+            "last_rebuild": {"run_id": rebuild[0], "status": derived_status(rebuild[1], rebuild[0], registry),
+                             "after": json.loads(rebuild[2] or "{}").get("after")} if rebuild else None}
 
 
 @router.post("/api/projects/{project_id}/index/rebuild", status_code=202)
 async def rebuild(project_id: str, request: Request):
     """Rebuild the project's index from the main database: keyword rows at once, then embeddings, as its
     index run (request_run): a rebuild already running is the one returned; while another run runs, the
-    rebuild follows it (its id returned now)."""
+    rebuild follows it: that run's id is returned, with rebuild_pending, and the rebuild is the run its end
+    records (the index status's run then)."""
     harness = _state(request)["harness"]
 
     def record(conn, ids):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
             raise AdmissionError(404, "not_found", "No such project")
-        run_id = request_run(conn, harness.registry, project_id,
-                         lambda conn, project, inputs: _insert_run(conn, ids[0], project, inputs), rebuild=True)
-        return run_id, [ids[0]] if run_id == ids[0] else []
+        run_id = request_run(conn, project_id, lambda conn, project, inputs: _insert_run(conn, ids[0], project, inputs),
+                             rebuild=True)
+        (inputs,) = conn.execute("SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return (run_id, not json.loads(inputs or "{}").get("rebuild")), [ids[0]] if run_id == ids[0] else []
 
-    return {"run_id": await harness.record_background(1, record)}
+    run_id, pending = await harness.record_background(1, record, committed=lambda result: _started(harness, result[0]))
+    return {"run_id": run_id, "rebuild_pending": pending}

@@ -7,9 +7,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { importReferences, MAX_REFERENCE_BYTES, paperLine, RECORD_LINES, REFERENCE_ACCEPT, reportParts } from '../src/references.js';
 import { detailsSource, latestLookup, unsettled } from '../src/library.js';
-import { makeT } from '../src/i18n/index.js';
+import { loadLanguage, makeT } from '../src/i18n/index.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zh from '../src/i18n/zh-CN.json' with { type: 'json' };
+
+await loadLanguage('zh-CN'); // a part of its own (i18n/index.js), loaded before Chinese is drawn
 
 const source = (name) => readFileSync(fileURLToPath(new URL(`../src/components/${name}`, import.meta.url)), 'utf8');
 const date = (value) => value.slice(0, 10);
