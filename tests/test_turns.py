@@ -1078,3 +1078,21 @@ async def test_an_endpoint_that_does_not_take_the_output_limit_is_not_used(tmp_p
         assert (await send(client, conversation))[-1]["status"] == "succeeded"
         [body] = provider.answers
         assert body["max_tokens"] == 8000 and body["provider"] == {"require_parameters": True}
+
+
+
+async def test_a_model_whose_reasoning_record_is_dropped_still_needs_the_output_limit(tmp_path, monkeypatch):
+    # Review a4 (P3-2): when reasoning cannot be honored and is dropped, the endpoints must still take
+    # the output limit, or the model is refused before anything is written.
+    from backend import budget_router, openrouter
+    monkeypatch.setattr(openrouter, "resolve_model_reasoning",
+                        lambda route, effort, **kw: ({"effort": effort}, "elsewhere") if effort else (None, None))
+    model = budget_router.MODEL_TIERS["mid"][0]
+    provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 128000,
+                                                "supported_parameters": ["reasoning"]}]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "hi", "effort": "high"})
+        assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
+        assert provider.chats == []

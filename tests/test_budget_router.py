@@ -196,6 +196,12 @@ def test_every_accepted_price_key_is_counted_or_refuses():
     counted = {"prompt": "input", "input_cache_write": "input", "input_cache_write_1h": "input",
                "input_cache_read": "input", "completion": "output", "internal_reasoning": "output",
                "request": "request", "web_search": "request"}
+    from backend import endpoint_pricing
+    inapplicable = {"image", "audio", "input_audio_cache", "video"}
+    # Tied to the reader's own list: a key added there must be placed here too (review a4, P3-3).
+    assert {k for k in counted if not k.startswith("input_cache")} | inapplicable | {"discount", "overrides"} \
+        == endpoint_pricing._ACCOUNTED_PRICE_KEYS
+    assert endpoint_pricing._CACHE_KEY_PREFIXES == ("input_cache_write", "input_cache_read")
     for key, side in counted.items():
         endpoint = {"tag": "a", "context_length": 8192, "supported_parameters": [], "pricing": {**base, key: "0.5"}}
         assert reach.reach(OPENROUTER, {}, [endpoint]).rates[side] >= 0.5, key
@@ -217,3 +223,6 @@ def test_a_private_request_never_reaches_an_endpoint_the_listing_reports_at_8192
         assert reach.reach(OPENROUTER, row, listing, zero_retention=True).problem == "route_unsupported", window
     listing[0]["context_length"] = 8193
     assert reach.reach(OPENROUTER, row, listing, zero_retention=True).problem is None
+    # A variant of a usable base slug is reachable through it: its window counts too (review a4, P3-1).
+    variant = {**listing[0], "tag": "example/turbo", "context_length": 4096}
+    assert reach.reach(OPENROUTER, row, [*listing, variant], zero_retention=True).problem == "route_unsupported"

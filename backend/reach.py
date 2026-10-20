@@ -48,13 +48,15 @@ def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -
     found = list(listing)
     if zero_retention:
         usable = set(((row or {}).get("zdr_endpoints") or {}).get("usable") or ())
+        # Section 6.4: a Private request reaches no endpoint whose window is 8,192 tokens or less,
+        # where OpenRouter compresses by default, by the endpoint listing's own report too; a usable
+        # tag that is a base slug reaches its variants as well, so theirs count.
+        related = [e for e in found if any(_related(e["tag"], tag) for tag in usable)]
+        if any(not e["context_length"] or e["context_length"] <= COMPRESSION_WINDOW for e in related):
+            return Reach((), None, UNKNOWN_RATES, "route_unsupported")
         found = [e for e in found if e["tag"] in usable]
         if {e["tag"] for e in found} != usable:  # an endpoint it may reach is not described
             return Reach((), None, UNKNOWN_RATES, "route_unverified")
-        # Section 6.4: a Private request reaches no endpoint whose window is 8,192 tokens or less,
-        # where OpenRouter compresses by default, by the endpoint listing's own report too.
-        if any(not e["context_length"] or e["context_length"] <= COMPRESSION_WINDOW for e in found):
-            return Reach((), None, UNKNOWN_RATES, "route_unsupported")
     if pin is not None:
         found = [e for e in found if _related(e["tag"], pin)]
         if [e["tag"] for e in found] != [pin]:  # a base slug names several endpoints, or none
