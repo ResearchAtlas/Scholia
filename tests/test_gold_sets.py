@@ -754,17 +754,25 @@ async def test_the_check_resolves_evidence_a_rater_chose_as_it_resolves_drafted_
                                   "of 2601.00011v1"]
 
 
-def test_field_one_is_refused_inside_any_git_work_tree_but_its_evals_local(tmp_path):
-    repo, worktree, plain = tmp_path / "repo", tmp_path / "wt", tmp_path / "plain"
+def test_field_one_is_refused_inside_any_git_work_tree_but_its_ignored_evals_local(tmp_path):
+    repo, worktree, plain, bare = tmp_path / "repo", tmp_path / "wt", tmp_path / "plain", tmp_path / "bare"
     (repo / ".git").mkdir(parents=True)
+    (repo / ".gitignore").write_text("# local\nevals/local/\n")
     worktree.mkdir()
     (worktree / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")  # a worktree's .git is a file
-    for inside in (repo / "evals" / "field1-private", repo / "notes" / "new", worktree / "evals" / "f1", repo):
-        with pytest.raises(tier1.Refused, match="inside the repository"):
+    (worktree / ".gitignore").write_text("evals/local/\n")
+    (bare / ".git").mkdir(parents=True)  # a repository whose .gitignore does not ignore evals/local/
+    nested = repo / "vendor" / "other"
+    (nested / ".git").mkdir(parents=True)  # a nested repository: its own rules decide
+    (plain / "x").mkdir(parents=True)
+    (plain / "link").symlink_to(repo / "notes")  # a link into a work tree is checked where it leads
+    for inside in (repo / "evals" / "field1-private", repo / "notes" / "new", worktree / "evals" / "f1", repo,
+                   bare / "evals" / "local" / "x", nested / "evals" / "local" / "x", plain / "link" / "f1"):
+        with pytest.raises(tier1.Refused, match="inside the repository|does not ignore"):
             gold.field_folder(1, inside)
     assert gold.field_folder(1, repo / "evals" / "local" / "harold") == (repo / "evals" / "local" / "harold").resolve()
     assert gold.field_folder(1, worktree / "evals" / "local") == (worktree / "evals" / "local").resolve()
-    assert gold.field_folder(1, plain / "harold") == (plain / "harold").resolve()
+    assert gold.field_folder(1, plain / "x") == (plain / "x").resolve()
 
 
 def test_from_a_worktree_the_main_checkout_is_refused_too():
@@ -775,4 +783,19 @@ def test_from_a_worktree_the_main_checkout_is_refused_too():
     main = gitdir.parents[2]
     with pytest.raises(tier1.Refused, match="inside the repository"):
         gold.field_folder(1, main / "evals" / "field1-private")
-    assert gold.field_folder(1, main / "evals" / "local" / "x") == (main / "evals" / "local" / "x").resolve()
+    if gold.ignores_local(main):  # once the main checkout's .gitignore carries evals/local/
+        assert gold.field_folder(1, main / "evals" / "local" / "x") == (main / "evals" / "local" / "x").resolve()
+    else:
+        with pytest.raises(tier1.Refused, match="does not ignore"):
+            gold.field_folder(1, main / "evals" / "local" / "x")
+    assert gold.ignores_local(ROOT)  # this branch's .gitignore does
+
+
+def test_apply_and_agreement_check_the_drafts_before_any_labels(tmp_path):
+    folder = field(tmp_path)
+    doc = json.loads((folder / "questions.json").read_text())
+    doc["items"].append(5)
+    write(folder / "questions.json", doc)
+    for argv in (["apply", "--rater", "harold"], ["agreement", "--raters", "harold", "lee"]):
+        with pytest.raises(SystemExit, match="questions.json does not pass its check"):
+            gold.main([argv[0], "--field", "2", "--folder", str(folder), "--set", "questions", *argv[1:]])

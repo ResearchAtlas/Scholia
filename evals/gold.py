@@ -100,13 +100,27 @@ def field_folder(field, folder=None):
 
 def private_path(field, path):
     """A field's path, resolved; for field 1, refused anywhere inside a git work tree (this checkout, the main
-    checkout or any other worktree, or any other repository) except under that tree's evals/local/, which
-    this repository's .gitignore ignores."""
+    checkout or any other worktree, or any other repository) except under that tree's evals/local/, and that
+    only where the tree's own .gitignore ignores evals/local/ (a checkout of a branch without S1-36 does not)."""
     path = Path(path).resolve()
-    if field == 1 and (top := work_tree(path)) is not None and not path.is_relative_to(top / "evals" / "local"):
-        raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside it "
-                      "or under its evals/local/")
+    if field == 1 and (top := work_tree(path)) is not None:
+        if not path.is_relative_to(top / "evals" / "local"):
+            raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside "
+                          "it or under its evals/local/")
+        if not ignores_local(top):
+            raise Refused(f"{path} is under evals/local/ of the git work tree {top}, whose .gitignore does not ignore "
+                          "evals/local/: field 1's files stay outside it")
     return path
+
+
+def ignores_local(top):
+    """Whether the work tree's top-level .gitignore names evals/local/ (as this repository's does).
+    ponytail: the exact line only; a broader pattern or a global ignore file is not read, so it errs on refusing."""
+    try:
+        lines = (top / ".gitignore").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return any(line.strip() in ("evals/local/", "/evals/local/") for line in lines)
 
 
 def work_tree(path):
@@ -1362,6 +1376,10 @@ def main(argv=None):
             else:
                 if not all(RATER.fullmatch(r) for r in (args.raters if args.command == "agreement" else [args.rater])):
                     raise Refused("a rater is named with lower-case letters, digits and hyphens")
+
+                if problems := check_papers(papers_doc, args.field, load_settings()) or \
+                        check_set(set_doc, args.set, args.field, papers):
+                    raise Refused(f"{args.set}.json does not pass its check: " + "; ".join(problems[:5]))
 
                 def labels_of(rater):
                     path = folder / "labels" / f"{set_doc['id']}.{rater}.json"
