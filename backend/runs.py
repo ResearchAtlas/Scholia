@@ -87,7 +87,7 @@ def _unusable(table, provider, model) -> str | None:
     it (Recommended, All or Pick) or its catalog, once read, no longer lists it; model_window when
     its window is not usable (slice-1 spec section 8: needed, or under 4,096); catalog_unread when
     its provider's catalog has not been read, so its window is unknown (an OpenRouter model's
-    always, another's unless a setting gives it); route_unpriced when OpenRouter lists no price for it. Before a call, the window every endpoint it can
+    always, another's unless a setting gives it). Before a call, the window every endpoint it can
     reach accepts is checked too (Harness._route_facts)."""
     if not providers.offered(table, provider, model, budget_router.RECOMMENDED):
         return "model_not_offered"
@@ -97,8 +97,8 @@ def _unusable(table, provider, model) -> str | None:
         return "model_not_offered"
     if row is None and provider.is_openrouter:
         return "catalog_unread"
-    if row is not None and provider.is_openrouter and row.get("pricing_source") != "provider":
-        return "route_unpriced"  # OpenRouter publishes no price for it: never estimated (Harold, 2026-10-20)
+    # A price the catalog does not list for the model as a whole is read per endpoint before the call
+    # (Harold, 2026-10-20: refused only when an endpoint it can reach publishes none; Harness._route_facts).
     if providers.window(table, model, (row or {}).get("context_length"))["status"] == "ok":
         return None
     return "model_window" if row is not None else "catalog_unread"

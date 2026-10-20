@@ -1038,25 +1038,34 @@ async def test_an_answer_cut_at_its_output_limit_is_saved_and_marked_cut_in_its_
         assert json.loads(finished)["cut"] == "output_limit"
 
 
-async def test_an_openrouter_model_with_no_published_price_is_refused_before_anything_is_written(tmp_path):
-    # Harold, 2026-10-20: never estimated; the model picker's Auto passes over it, and a chosen one is refused.
+@pytest.mark.parametrize("model", ["x/unpriced", None])  # a chosen model, and Auto
+async def test_an_openrouter_model_is_refused_as_unpriced_only_when_its_endpoints_publish_no_price(tmp_path, model):
+    # Harold, 2026-10-20, and the connector's finding on PR 37: the catalog's aggregate price may be
+    # missing while every endpoint publishes one; the endpoints decide. An endpoint without a price refuses.
     import httpx
+    from backend import budget_router, openrouter_client
 
-    class Unpriced(MockProvider):  # its catalog lists models with no price
+    class Unpriced(MockProvider):  # its catalog lists models with no aggregate price
         async def __call__(self, request):
             if request.url.path.endswith("/models") and request.url.host == "openrouter.ai":
                 return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000} for m in self.catalog]})
             return await super().__call__(request)
 
-    provider = Unpriced(catalog=["x/unpriced"])
+    chosen = model or budget_router.MODEL_TIERS["mid"][0]
+    provider = Unpriced(catalog=["x/unpriced", *budget_router.RECOMMENDED])
     async with started(tmp_path / "data", provider) as client:
         current = (await client.get("/api/settings")).json()
         await client.put("/api/settings", json={"hash": current["hash"], "updates": {"providers.openrouter.models": "all"}})
         conversation = await new_conversation(client, title="t")
-        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
-                                    json={"content": "hi", "model": "x/unpriced"})
+        body = {"content": "hi", **({"model": model} if model else {})}
+        assert (await send(client, conversation, **({"model": model} if model else {})))[-1]["status"] == "succeeded"
+        assert provider.answers[-1]["model"] == chosen  # priced by its endpoints, used
+        provider.endpoints[chosen] = [{"tag": "example", "context_length": 128000, "pricing": {}}]
+        openrouter_client.clear_cache()
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream", json=body)
         assert (refused.status_code, refused.json()["code"]) == (400, "route_unpriced")
-        assert provider.chats == [] and (await counts(client))["runs"] == 0
+        assert len(provider.answers) == 1
+
 
 
 async def test_an_endpoint_that_does_not_take_the_output_limit_is_not_used(tmp_path):
