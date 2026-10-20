@@ -15,7 +15,9 @@ PDF = b"%PDF-1.7\n% synthetic\n"
 
 
 def url(path):
-    return path.as_uri()
+    """The path a file URL names (zotero.file_path), from a path's own URL (as Zotero's newFileURI writes
+    one) or from a URL's text."""
+    return zotero.file_path(path if isinstance(path, str) else path.as_uri())
 
 
 @pytest.fixture
@@ -27,20 +29,31 @@ def pdf(tmp_path):
 
 
 def test_a_local_pdf_is_read_with_its_path_percent_decoded(pdf):
-    assert "%20" in url(pdf) and "%E8" in url(pdf)
+    assert "%20" in pdf.as_uri() and "%E8" in pdf.as_uri()
+    assert url(pdf) == str(pdf)
     assert zotero.read_attachment(url(pdf)) == (PDF, None)
-    assert zotero.read_attachment(url(pdf) + "\n") == (PDF, None)  # as Zotero's text answer may end
+    assert zotero.read_attachment(None) == (None, "pdf_missing")  # an attachment with no file
 
 
-@pytest.mark.parametrize("text, reason", [
-    (None, "pdf_missing"), ("", "pdf_missing"), ("false", "pdf_missing"),
-    ("file://nas.example/share/paper.pdf", "pdf_not_local"), ("file://localhost/tmp/x.pdf", "pdf_not_local"),
-    ("http://example.org/paper.pdf", "pdf_not_local"), ("smb://nas/paper.pdf", "pdf_not_local"),
-    ("file:paper.pdf", "pdf_not_local"), ("file:///tmp/a%00b.pdf", "pdf_not_local"),
-    ("file:///tmp/%FF.pdf", "pdf_not_local"), ("file:///tmp/x.pdf?q=1", "pdf_not_local"),
+def test_the_url_forms_zotero_writes_name_their_path_as_is():
+    # newFileURI leaves these unescaped (Mozilla's esc_Directory mask), so they are read as written
+    assert zotero.file_path("file:///tmp/a[1]|b;c=d,e&f'g(h)!$*+~@:x.pdf") == "/tmp/a[1]|b;c=d,e&f'g(h)!$*+~@:x.pdf"
+    assert zotero.file_path("file:///tmp/50%25%20%23%3F.pdf") == "/tmp/50% #?.pdf"
+    assert zotero.file_path("file:///tmp/../x.pdf") == "/tmp/../x.pdf"  # read_attachment refuses it
+
+
+@pytest.mark.parametrize("text", [
+    None, "", "false", " file:///tmp/x.pdf", "file:///tmp/x.pdf\n", "file:///tmp/x.pdf ", "FILE:///tmp/x.pdf",
+    "file:///tmp/pa\nper.pdf", "file:///tmp/pa\tper.pdf", "file:///tmp/a b.pdf", "file:///tmp/论文.pdf",
+    "file://nas.example/share/paper.pdf", "file://localhost/tmp/x.pdf", "file://[broken/path.pdf",
+    "file://[::1/x.pdf", "http://example.org/paper.pdf", "smb://nas/paper.pdf", "file:paper.pdf", "file:/tmp/x.pdf",
+    "file:///tmp/x.pdf?q=1", "file:///tmp/x.pdf#p", "file:///tmp/%2", "file:///tmp/%zz.pdf", "file:///tmp/a\\b.pdf",
+    "file:///tmp/%FF.pdf", "file:///tmp/a%00b.pdf", "file:///tmp/a%0Ab.pdf", "file:///tmp/a%7Fb.pdf",
+    "file:///tmp/a%C2%85b.pdf", "file://%2Ftmp/x.pdf",
 ])
-def test_anything_but_a_local_file_url_is_never_read(text, reason):
-    assert zotero.read_attachment(text) == (None, reason)
+def test_anything_but_a_file_url_of_the_form_zotero_writes_is_refused(text):
+    with pytest.raises(ValueError):
+        zotero.file_path(text)
 
 
 def test_files_that_are_not_regular_pdfs_are_refused(tmp_path, pdf):
@@ -154,7 +167,7 @@ def test_a_path_on_any_mount_not_local_is_refused_before_anything_is_opened(text
         raise AssertionError("opened")
 
     monkeypatch.setattr(zotero.os, "open", never)
-    assert zotero.read_attachment(text, mounts=lambda: TABLE) == (None, "pdf_on_network")
+    assert zotero.read_attachment(url(text), mounts=lambda: TABLE) == (None, "pdf_on_network")
 
 
 def test_a_direct_map_automount_under_a_local_folder_is_never_opened(tmp_path, monkeypatch):
@@ -168,7 +181,7 @@ def test_a_direct_map_automount_under_a_local_folder_is_never_opened(tmp_path, m
     assert opened == []  # nothing at all, not even /
     firmlinked = [("/", "apfs"), ("/System/Volumes/Data" + str(trigger), "autofs")]  # the table's other spelling
     assert zotero.read_attachment(url(trigger / "paper.pdf"), mounts=lambda: firmlinked) == (None, "pdf_on_network")
-    assert zotero.read_attachment("file:///System/Volumes/Data" + str(trigger) + "/paper.pdf",
+    assert zotero.read_attachment(url("file:///System/Volumes/Data" + str(trigger) + "/paper.pdf"),
                                   mounts=lambda: table) == (None, "pdf_on_network")  # the path's other spelling
     assert opened == []
 
@@ -189,7 +202,7 @@ def test_a_local_external_volume_is_read_and_an_unreadable_table_opens_nothing(p
 
 @pytest.mark.parametrize("text", ["file:///homework/x.pdf", "file:///Volumes/Share2/x.pdf", "file:///networking/x.pdf"])
 def test_mount_points_match_whole_names_only(text):
-    assert zotero.read_attachment(text, mounts=lambda: TABLE) == (None, "pdf_missing")  # looked for, not refused
+    assert zotero.read_attachment(url(text), mounts=lambda: TABLE) == (None, "pdf_missing")  # looked for, not refused
 
 
 def test_a_mount_point_in_another_unicode_form_or_case_is_one_path(tmp_path, monkeypatch):
@@ -197,7 +210,7 @@ def test_a_mount_point_in_another_unicode_form_or_case_is_one_path(tmp_path, mon
     opened = []
     monkeypatch.setattr(zotero.os, "open", lambda path, *a, **k: opened.append(path) or (_ for _ in ()).throw(OSError()))
     table = [("/", "apfs"), (unicodedata.normalize("NFD", "/Volumes/Café"), "autofs")]
-    assert zotero.read_attachment("file:///volumes/CAF%C3%89/x.pdf", mounts=lambda: table) == (None, "pdf_on_network")
+    assert zotero.read_attachment(url("file:///volumes/CAF%C3%89/x.pdf"), mounts=lambda: table) == (None, "pdf_on_network")
     assert opened == []
 
 
@@ -228,11 +241,7 @@ def test_a_link_into_an_automounted_folder_is_never_followed(tmp_path, monkeypat
 
 
 def test_a_path_with_dot_segments_is_not_local():
-    assert zotero.read_attachment("file:///tmp/../net/nas/x.pdf") == (None, "pdf_not_local")
-
-
-def test_a_file_url_with_a_host_it_cannot_read_is_refused():
-    assert zotero.read_attachment("file://[::1/x.pdf") == (None, "pdf_not_local")
+    assert zotero.read_attachment(url("file:///tmp/../net/nas/x.pdf")) == (None, "pdf_not_local")
 
 
 def test_only_a_pdfs_header_is_read_from_a_file_that_is_not_one(tmp_path, monkeypatch):

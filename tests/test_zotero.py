@@ -34,7 +34,7 @@ def quick(monkeypatch):
 
 
 def pdf_file(tmp_path, name, title, doi=DOI):
-    path = tmp_path / "zotero-files" / name
+    path = tmp_path / "Zotero 文件 storage" / name  # its URL escapes the space and the letters, as Zotero's does
     path.parent.mkdir(exist_ok=True)
     path.write_bytes(synthetic.paper_pdf(title, doi=doi))
     return path
@@ -329,7 +329,7 @@ async def test_collections_are_read_page_by_page_and_items_a_page_at_a_time(tmp_
 async def test_an_import_makes_one_paper_per_item_with_its_pdf_read(tmp_path):
     mock = library(tmp_path)
     mock.item("DDDD5555", "A Linked File", pdf=pdf_file(tmp_path, "linked.pdf", "A Linked File", doi=None), linked=True)
-    mock.item("EEEE6666", "A File on a Share", pdf="file://nas.example/share/paper.pdf")
+    mock.item("EEEE6666", "A File on a Share", pdf="file:///tmp/../net/nas.example/share/paper.pdf")
     keys = [*KEYS, "DDDD5555", "EEEE6666"]
     async with started(tmp_path / "data", provider(mock, openalex={DOI: openalex_work(DOI, "Resolved")})) as client:
         project = await project_of(client)
@@ -342,6 +342,7 @@ async def test_an_import_makes_one_paper_per_item_with_its_pdf_read(tmp_path):
         found = await papers(client, project)
         assert set(found) == {f"users/0/items/{k}" for k in keys}
         with_file = found[f"users/0/items/{KEYS[1]}"]
+        assert "%20" in mock.files["users/0", KEYS[1][:7] + "Z"] and "%E6%96%87" in mock.files["users/0", KEYS[1][:7] + "Z"]
         assert (with_file["title"], with_file["state"], with_file["evidence_type"]) == ("合成数据中的最低工资", "ready", "full_text")
         assert with_file["version"]["media_type"] == "application/pdf"
         assert found["users/0/items/DDDD5555"]["state"] == "ready"
@@ -459,7 +460,7 @@ async def test_a_pdf_already_in_the_project_is_reported_already_there(tmp_path):
     mock = library(tmp_path)
     async with started(tmp_path / "data", provider(mock)) as client:
         project = await project_of(client)
-        data = (tmp_path / "zotero-files" / "two.pdf").read_bytes()
+        data = (tmp_path / "Zotero 文件 storage" / "two.pdf").read_bytes()
         import base64
         response = await client.post(f"/api/projects/{project}/materials", json={"files": [
             {"name": "two.pdf", "data": base64.b64encode(data).decode()}]})
@@ -1149,6 +1150,13 @@ IMPORT_FIELDS = [  # (what is changed, how), each a value of another type than Z
     ("file URL null", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "null")),
     ("file URL object", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "{}")),
     ("file URL a word", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "nothing")),
+    # Z19: only the whole URL in the form Zotero writes is read; no URL parser mends one first
+    ("file URL a broken host", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "file://[broken/path.pdf")),
+    ("file URL a host", lambda m: m.files.__setitem__(("users/0", KEYS[1][:7] + "Z"), "file://nas.example/share/x.pdf")),
+    ("file URL a newline", lambda m: m.files.__setitem__(
+        ("users/0", KEYS[1][:7] + "Z"), m.files["users/0", KEYS[1][:7] + "Z"].replace("two.pdf", "tw\no.pdf"))),
+    ("file URL a trailing newline", lambda m: m.files.__setitem__(
+        ("users/0", KEYS[1][:7] + "Z"), m.files["users/0", KEYS[1][:7] + "Z"] + "\n")),
     ("collection parent true", None),  # browse only: see BROWSE_FIELDS
 ]
 IMPORT_FIELDS = [(f, c) for f, c in IMPORT_FIELDS if c]

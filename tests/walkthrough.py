@@ -185,7 +185,9 @@ ZOTERO_ITEMS = {
     "ZWAGE001": ("Minimum Wages in Synthetic Towns", ZOTERO_DOI, "zotero-wages.pdf", False, "WAGECOL1"),
     "ZLINK002": ("Linked Notes on Synthetic Labour Markets", None, "zotero-linked.pdf", True, "LINKCOL2"),
     "ZMETA003": ("A Synthetic Working Paper Without a File", None, None, False, "WAGECOL1"),
-    "ZNAS0004": ("A Report Kept on a Network Share (synthetic)", None, "file://nas.example/share/report.pdf", False,
+    # ZNAS0004's URL is refused by name before anything is opened (pdf_not_local, its ".."); a real share's
+    # path is refused by the Mac's mount table instead (pdf_on_network), which differs from Mac to Mac.
+    "ZNAS0004": ("A Report Kept on a Network Share (synthetic)", None, "file:///tmp/../net/nas.example/share/report.pdf", False,
                  "WAGECOL1"),
     "ZHAN0005": ("合成数据中的工资与就业", None, "zotero-hanzi.pdf", False, "WAGECOL1"),
     "ZLONG006": ("A Very Long Synthetic Title About Minimum Wages, Hours, Employment and Earnings in Small Towns and "

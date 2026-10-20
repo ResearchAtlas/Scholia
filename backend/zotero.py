@@ -21,8 +21,8 @@ still exists. The review lock is not part of it: nothing leaves this Mac, so eve
 
 An import reads, for each item in turn: the item with its CSL JSON (one request), its children, and,
 for its PDF attachment (a stored file before a linked one, then the earliest added), the attachment's
-file URL. Zotero's local API serves no file bytes: it names the file on disk (a file:// URL). Scholia
-reads that local file itself (read_attachment), only when it is on this Mac's own disk, reached through
+file URL. Zotero's local API serves no file bytes: it names the file on disk (a file:// URL, read only
+in the whole form Zotero writes, else the import fails: file_path). Scholia reads that local file itself (read_attachment), only when it is on this Mac's own disk, reached through
 no link, a regular PDF of at most extraction.MAX_FILE_BYTES; otherwise the item is imported with its
 details only, and the reason recorded. Every answer of Zotero's is checked for its shape before it is
 used; one of another shape fails the import (zotero_unavailable), never read as an empty answer. The
@@ -62,7 +62,7 @@ import stat
 import sys
 import time
 import unicodedata
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -89,7 +89,12 @@ SF_DATALESS = 0x40000000  # a file whose contents are not on this Mac (a cloud p
 _LIBRARY = re.compile(r"users/0|groups/[1-9][0-9]{0,9}")
 _KEY = re.compile(r"[A-Z0-9]{8}")
 _SERVER_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
-_URL_START = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")  # a URL's scheme
+# A file URL as Zotero's local API gives one (Zotero.File.pathToFileURI, Mozilla's newFileURI): file:/// and
+# a path of RFC 3986's path characters (unreserved, sub-delims, ":", "@", "/") and %XX escapes, plus "[",
+# "]" and "|", which newFileURI leaves unescaped (its esc_Directory mask, xpcom/io/nsEscape.cpp); a space, a
+# letter outside ASCII, "#", "?", "%" and every control character always come escaped. Nothing else is read.
+_FILE_URL = re.compile(r"file:///(?:[A-Za-z0-9\-._~!$&'()*+,;=:@/\[\]|]|%[0-9A-Fa-f]{2})*")
+_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f]")
 _NOT_ITEMS = ("note", "attachment", "annotation")  # never offered or imported as a paper
 _DATABASES = (".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm", "-journal", ".sqlite.bak")  # file names never read
 MNT_NOWAIT = 2  # getfsstat(2): the kernel's table as it is, mounting nothing and asking no file system
@@ -403,10 +408,23 @@ async def import_zotero(project_id: str, body: ZoteroImport, request: Request):
     return {"run_id": await state["harness"].record_background(1, admit)}
 
 
-def read_attachment(text, fs_type=None, mounts=None):
-    """(the PDF's bytes, None) or (None, why not) for the file URL Zotero named for an attachment.
-    Only a file on this Mac's own disk is read, and no link is ever followed: a file: URL with no host,
-    whose path (with no "." or ".." in it) is opened from / one folder at a time, each relative to the
+def file_path(text):
+    """The local path a file URL from Zotero names (Harold, 2026-10-20): the whole URL matches _FILE_URL,
+    and its path, percent-decoded as UTF-8 (strictly), is absolute and holds no control character (NUL
+    included). ValueError for anything else. Nothing normalizes it on the way (no URL parser)."""
+    if not isinstance(text, str) or not _FILE_URL.fullmatch(text):
+        raise ValueError("not a file URL Zotero gives")
+    path = unquote(text[len("file://"):], errors="strict")  # a byte sequence not UTF-8: UnicodeDecodeError
+    if not path.startswith("/") or _CONTROL_CHARS.search(path):
+        raise ValueError("not an absolute path")
+    return path
+
+
+def read_attachment(path, fs_type=None, mounts=None):
+    """(the PDF's bytes, None) or (None, why not) for the local path a file URL from Zotero names
+    (file_path), or None for an attachment with no file (pdf_missing).
+    Only a file on this Mac's own disk is read, and no link is ever followed: the path (with no "." or
+    ".." in it) is opened from / one folder at a time, each relative to the
     folder opened before it and never by name again, refusing a symbolic link at any step (pdf_link: an
     attachment reached through one imports with its details only; a Finder alias is a file, not a PDF). Before any of
     it is opened, a path at or under any mount point of the Mac's mount table (read with getfsstat and
@@ -424,20 +442,8 @@ def read_attachment(text, fs_type=None, mounts=None):
     not seen by name (the per-descriptor check still refuses what is below it once opened); it needs an
     administrator to run automount meanwhile."""
     fs_type, mounts = fs_type or _file_system_type, mounts or _mount_table
-    if not isinstance(text, str):
+    if path is None:
         return None, "pdf_missing"
-    try:
-        parts = urlsplit(text.strip())
-    except ValueError:  # a host it cannot read
-        return None, "pdf_not_local"
-    if parts.scheme != "file":
-        return None, "pdf_missing" if not parts.scheme else "pdf_not_local"
-    if parts.netloc or parts.query or parts.fragment:
-        return None, "pdf_not_local"
-    try:
-        path = unquote(parts.path, errors="strict")
-    except UnicodeDecodeError:
-        return None, "pdf_not_local"
     names = [name for name in path.split("/") if name]
     if not path.startswith("/") or "\x00" in path or not names or {".", ".."} & set(names):
         return None, "pdf_not_local"
@@ -648,7 +654,7 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
     # (zotero_unavailable) before the item is written or done, so a resume or a new import reads it again.
     url, _ = await _read(client, f"/api/{library}/items/{child}/file/view/url", server_id, RETRIES, none=(400, 404))
     try:
-        text = None if url is NOT_FOUND else url.decode("utf-8").strip()
+        text = None if url is NOT_FOUND else url.decode("utf-8")  # as sent: nothing trimmed
     except UnicodeDecodeError:
         raise Unreachable("zotero_unavailable") from None
     # Its answer is text: a URL, or, for an attachment with no file, getLocalFileURL's false, which Zotero's
@@ -656,10 +662,12 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
     # answer (null, {}, a word) is no answer to go by, never "no file".
     if text in ("", "false"):
         text = None
-    elif text is not None and not _URL_START.match(text):
-        raise Unreachable("zotero_unavailable")
+    try:  # anything but a file URL of the form Zotero gives fails the import (Harold, 2026-10-20)
+        path = None if text is None else file_path(text)
+    except ValueError:
+        raise Unreachable("zotero_unavailable") from None
     def read_and_store():  # run to its end (Harness.work), so nothing of it outlasts the run's record
-        data, why = read_attachment(text)
+        data, why = read_attachment(path)
         if data is None or active.cancel_requested.is_set():
             return None, why
         return content.put(data, extraction.PDF), None  # collected later if no record names it
