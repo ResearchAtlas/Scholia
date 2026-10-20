@@ -624,3 +624,19 @@ def test_a_same_field_change_after_a_conflict_is_saved_as_sent_and_shown_as_save
     assert two.save("q01", {"decision": "edit", "evidence": [[a]]}, base=2)[0] == 200
     status, answer = one.save("q01", {"decision": "edit", "evidence": [[b]]}, base=3)
     assert status == 200 and [[loc["paper"] for loc in ev] for ev in answer["label"]["evidence"]] == [["2601.00002v2"]]
+
+
+def test_an_answer_named_for_a_question_that_stays_unanswerable_is_not_saved(tmp_path, pages):
+    folder = field(tmp_path)
+    one, two = pages(folder, "questions"), pages(folder, "questions")
+    # Window two had made the drafted-unanswerable q03 answerable; window one then dropped it, which applies no edit
+    assert two.save("q03", {"decision": "edit", "answerable": True, "short_answer": "Not said",
+                            "evidence": [[pick(two, "2601.00001v1", 2)]]}, base=0)[0] == 200
+    assert one.save("q03", {"decision": "drop"}, base=1)[0] == 200
+    before = labels_file(folder, "questions").read_bytes()
+    # Window two's retry names only the answer it changed: the question would stay unanswerable, so not saved
+    status, answer = two.save("q03", {"decision": "edit", "short_answer": "Still not said"}, base=2)
+    assert status == 409 and answer["code"] == "change_not_kept" and answer["label"]["decision"] == "drop"
+    assert labels_file(folder, "questions").read_bytes() == before
+    status, answer = two.save("q03", {"decision": "edit", "evidence": [[pick(two, "2601.00001v1", 2)]]}, base=2)
+    assert status == 409 and answer["code"] == "change_not_kept"

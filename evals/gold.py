@@ -1117,7 +1117,9 @@ class Review:
                     and all(isinstance(ev, list) and 0 < len(ev) <= 10 for ev in chosen)):
                 raise ValueError("evidence_invalid")
             label["evidence"] = [[self.locator(c) for c in ev] for ev in chosen]
-        if label.get("answerable") is False:  # an unanswerable question keeps no answer and no evidence
+        if not label.get("answerable", item["answerable"]):
+            # The question this label leaves is unanswerable (said here, or drafted so): it keeps no answer and
+            # no evidence, so a request naming either is then refused as not kept (kept_as_sent).
             label.pop("short_answer", None)
             label.pop("evidence", None)
         made = labeled(item, label)

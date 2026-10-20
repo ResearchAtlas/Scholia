@@ -164,7 +164,9 @@
       form.append(el('section', { class: 'saved-elsewhere', 'aria-label': t('edit.savedElsewhere') },
         el('h3', { text: t('edit.savedElsewhere') }), el('p', { lang: question.query_language, text: saved.text }),
         saved.answerable ? el('p', { lang: question.query_language, text: `${t('q.shortAnswer')}: ${saved.short_answer}` })
-          : el('p', { text: t('q.unanswerable') })));
+          : el('p', { text: t('q.unanswerable') }),
+        ...(saved.answerable ? saved.evidence.map((ev, n) => el('div', { class: 'evidence' },
+          el('h4', { text: t('q.evidenceItem', { n: n + 1 }) }), ...ev.map((loc) => passageView(loc, question.document_language)))) : [])));
     }
     form.append(el('h3', { text: t('edit.heading') }),
       el('label', { for: 'editText', text: t('edit.text') }),
@@ -313,7 +315,7 @@
         setStatus(answer.body.code === 'change_not_kept' ? t('status.changeNotKept', { n }) : t('status.conflictEditing', { n }));
       } else {
         render();
-        setStatus(t('status.conflict', { n }));
+        setStatus(answer.body.code === 'change_not_kept' ? t('status.notKept', { n }) : t('status.conflict', { n }));
       }
     } else if (answer.status === 400 || answer.status === 413) {
       pending = null;
