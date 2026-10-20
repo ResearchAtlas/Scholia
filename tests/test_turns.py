@@ -1096,3 +1096,21 @@ async def test_a_model_whose_reasoning_record_is_dropped_still_needs_the_output_
                                     json={"content": "hi", "effort": "high"})
         assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
         assert provider.chats == []
+
+
+async def test_an_answer_cut_at_its_output_limit_that_cannot_be_saved_keeps_its_cut_mark(tmp_path, monkeypatch):
+    # The connector's finding on PR 37: the save-failure fallback carries the cut mark, as a saved answer does.
+    provider = MockProvider((200, {"choices": [{"message": {"content": "Half an ans"}, "finish_reason": "length"}],
+                                   "usage": {"cost": 0.001}}), (200, {"choices": [{"message": {"content": "Whole."}}],
+                                                                      "usage": {"cost": 0.001}}))
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+
+        def disk_full(self, conn, claim, answer, ctx):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(runs_module.Harness, "_commit_answer", disk_full)
+        response = next(e for e in await send(client, conversation) if e["type"] == "chat_response")
+        assert (response["content"], response["result_saved"], response["cut"]) == ("Half an ans", False, True)
+        response = next(e for e in await send(client, conversation) if e["type"] == "chat_response")
+        assert response["result_saved"] is False and "cut" not in response  # a whole answer carries no mark

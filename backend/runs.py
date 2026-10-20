@@ -718,14 +718,14 @@ class Harness:
             except Exception as error:  # the answer could not be saved: it is still shown, marked unsaved
                 log.error("the answer could not be saved (%s at %s)", type(error).__name__, _where(error))
                 emit({"type": "chat_response", "content": result.content, "reasoning": result.reasoning,
-                      "result_saved": False, "error": "save_failed"})
+                      "result_saved": False, "error": "save_failed", **({"cut": True} if result.cut else {})})
                 with suppress(Exception):
                     final = await _through(self._write(lambda conn: self._finish_turn(
                         conn, claim.run_id, "failed", None, "save_failed", claim=claim)))
                     emit({"type": "run_finished", **final[0]})
                 return
             emit({"type": "chat_response", "content": result.content, "reasoning": result.reasoning,
-                  "result_saved": True})
+                  "result_saved": True, **({"cut": True} if result.cut else {})})
             emit({"type": "run_finished", **final})
         except asyncio.CancelledError:
             final, _ = await _through(self._stop_turn(claim))
