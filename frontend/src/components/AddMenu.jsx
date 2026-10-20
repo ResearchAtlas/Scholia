@@ -1,13 +1,14 @@
 // i18n: migrated
-// The Library's Add (S7; slice-1 spec F3): files, or a reference file (S1-14); Zotero joins it with
-// S1-15. A reference file is imported once it is chosen, and what the import did is said only from the
-// backend's answer, after its commit (backend/references.py).
+// The Library's Add (S7; slice-1 spec F3): files, a reference file (S1-14), or Zotero's library (S1-15:
+// the Zotero browser, loaded when first opened: Parts.jsx). A reference file is imported once it is chosen, and
+// what the import did is said only from the backend's answer, after its commit (backend/references.py).
 import { useContext, useRef, useState } from 'react';
-import { BookMarked, FilePlus2 } from 'lucide-react';
+import { BookMarked, FilePlus2, Library as LibraryIcon } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { errorText } from '../text.js';
 import { importReferences, REFERENCE_ACCEPT, reportParts } from '../references.js';
+import { ZoteroBrowser } from './Parts.jsx'; // S1-15
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 
 // children(importing): the trigger, a button, disabled while a reference file is imported. onFiles opens
@@ -18,6 +19,7 @@ export function AddMenu({ project, onFiles, onStart, onDone, children }) {
   const language = useContext(LanguageContext);
   const chooser = useRef(null);
   const [importing, setImporting] = useState(false);
+  const [zotero, setZotero] = useState(false); // S1-15: the Zotero browser is open
 
   async function chosen(file) {
     if (!file || !project) return;
@@ -47,8 +49,12 @@ export function AddMenu({ project, onFiles, onStart, onDone, children }) {
           <DropdownMenuItem onSelect={() => chooser.current?.click()}>
             <BookMarked aria-hidden="true" />{t('library.addMenu.referenceFile')}
           </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setZotero(true)}>
+            <LibraryIcon aria-hidden="true" />{t('library.addMenu.zotero')}
+          </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      <ZoteroBrowser open={zotero} project={project} onOpenChange={setZotero} />
     </>
   );
 }

@@ -171,6 +171,16 @@ SCOPE_LINKS: tuple[str, ...] = (
     WHERE r.status = 'running' AND j.value IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
 )
 
+# S1-15: a Zotero import names its items (inputs.library and inputs.items), not the papers it will make,
+# so deleting a Zotero paper revokes every running import of its item into its project, one that made it
+# and one still to come to it alike: none makes it again (backend/zotero.py).
+SCOPE_LINKS += (
+    f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.items') j, materials m
+    WHERE r.status = 'running' AND r.workflow = 'zotero_import' AND m.rowid IN {_doomed('materials')}
+    AND m.source = 'zotero' AND m.project_id = r.project_id
+    AND m.source_key = json_extract(r.inputs, '$.library') || '/items/' || j.value""",
+)
+
 
 def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed=None):
     """Delete one object and everything that belongs to it. Returns the ids of the active runs it revoked.

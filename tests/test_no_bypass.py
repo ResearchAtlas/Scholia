@@ -34,6 +34,7 @@ ALLOWED_IMPORTS = {
     "self_test.py": {"httpx", "urllib.request"},  # in-process app, and the helper it starts on loopback
     "desktop.py": {"socket"},  # the loopback socket the app is served on
 }
+ALLOWED_IMPORTS["zotero.py"] = {"httpx"}  # S1-15: error types; Zotero's local API through the gate's Zotero client
 MAKES_REQUESTS = {"Client", "AsyncClient", "HTTPTransport", "AsyncHTTPTransport", "get", "post", "put", "patch",
                   "delete", "head", "options", "request", "stream"}
 IN_PROCESS = {"ASGITransport", "MockTransport"}
@@ -133,3 +134,25 @@ def test_no_dependency_is_a_telemetry_client():
     package = json.loads((ROOT / "frontend/package.json").read_text())
     npm = list(package.get("dependencies", {})) + list(package.get("devDependencies", {}))
     assert [name for name in python + npm if TELEMETRY.search(name)] == []
+
+
+# S1-15: Scholia reads Zotero only (ticket 19: never writes, never local/authorize, never zotero.sqlite).
+
+
+def test_the_zotero_client_only_reads():
+    """backend/zotero.py sends every request as client.stream("GET", ...): no other method, no other call."""
+    tree = ast.parse((ROOT / "backend" / "zotero.py").read_text())
+    calls = [(attr, node) for attr, node in attribute_calls(tree, "client")]
+    assert calls and all(attr == "stream" and isinstance(node.args[0], ast.Constant) and node.args[0].value == "GET"
+                         for attr, node in calls)
+
+
+def test_no_module_names_zoteros_database_but_in_its_text():
+    """No code names zotero.sqlite (or a Zotero data folder's database) outside docstrings and comments."""
+    for path in MODULES:
+        tree = ast.parse(path.read_text())
+        docstrings = {id(node.body[0].value) for node in ast.walk(tree)
+                      if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                      and node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant)}
+        assert not [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docstrings and "zotero.sqlite" in node.value.lower()], path
