@@ -244,8 +244,8 @@ def test_the_bounds_and_the_routing_sent_come_from_one_set_of_endpoints():
     # changes the request's bound, or a variant that cannot be bounded refuses the route.
     from backend import reach
     row, listing, routing = _variant_case()
-    assert routing["only"] == ["example"] and [e["tag"] for e in reach.reachable(listing, routing)] == [
-        "example", "example/turbo"]
+    assert routing["only"] == ["example"] and [e["tag"] for e in reach.reachable(listing, routing, ("max_tokens",))] \
+        == ["example", "example/turbo"]
     assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).tags == (
         "example", "example/turbo")
     for variant, field, expected in (({"context_length": 16384}, "window", 16384),
@@ -260,6 +260,12 @@ def test_the_bounds_and_the_routing_sent_come_from_one_set_of_endpoints():
         row, listing, _ = _variant_case(**variant)
         assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).problem \
             in ("route_unsupported", "route_unpriced"), variant
+    # Private's 8,192 rule is checked before parameters narrow the set (review a5, P2-1): a small variant
+    # whose listing does not say it takes max_tokens still refuses.
+    for parameters in ([], None):
+        row, listing, _ = _variant_case(context_length=4096, supported_parameters=parameters)
+        assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).problem \
+            == "route_unsupported", parameters
     # A variant that does not take a required parameter is excluded by require_parameters, as the bound is.
     row, listing, routing = _variant_case(supported_parameters=[], context_length=16384)
     assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).window == 131072
