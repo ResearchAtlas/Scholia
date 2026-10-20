@@ -644,7 +644,7 @@ def test_a_passage_key_names_its_paper_and_ordinal_as_well_as_its_text():
     ({"decision": "edit", "text": "x", "answerable": True, "evidence": [[{"paper": "2601.00001v1", "ordinal": 1}]]},
      "changed"),
 ])
-def test_a_malformed_labels_file_is_refused_naming_the_label_never_a_crash(tmp_path, label, state):
+def test_a_malformed_label_that_applies_is_refused_naming_it_and_history_is_left_alone(tmp_path, label, state):
     folder = field(tmp_path)
     doc = json.loads((folder / "questions.json").read_text())
     path = labels_file(folder, "questions")
@@ -652,9 +652,13 @@ def test_a_malformed_labels_file_is_refused_naming_the_label_never_a_crash(tmp_p
     sha = gold.item_sha256(doc["items"][0]) if state == "done" else "an older version"
     path.write_text(json.dumps({"set": doc["id"], "kind": "questions", "field": 2, "rater": "harold", "set_sha256": "x",
                                 "labels": {"q01": {"item_sha256": sha, "revision": 1, "saved_at": "t", **label}}}))
+    report = asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
+    if state == "changed":  # history: never validated, so it opens no matter its shape (L3)
+        assert gold.Review(2, folder, "questions", "harold").data()["labels"]["q01"] == {"state": "changed", "revision": 1}
+        assert report["problems"] == []
+        return
     with pytest.raises(gold.Refused, match="label q01"):
         gold.Review(2, folder, "questions", "harold")
-    report = asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
     assert any(p.startswith("field2-questions.harold.json: label q01") for p in report["problems"])
 
 
@@ -706,3 +710,45 @@ def test_a_paper_named_constructor_is_served_like_any_other(tmp_path, pages):
     assert "constructor" in page.get("/api/data")[1]["papers"]
     assert page.get("/api/passages?paper=constructor")[0] == 200
     assert page.send("q01", evidence=[[pick(page, "constructor", 1)]])[0] == 200
+
+
+# G8: a label applies to its item as it now is, or it is history (L3)
+
+
+def test_a_label_whose_paper_was_removed_after_its_item_changed_is_history_and_the_item_reopens(tmp_path, pages):
+    folder = field(tmp_path)
+    page = pages(folder, "questions")
+    assert page.send("q02", short_answer="Dense; reranking added four points")[0] == 200  # cites paper b
+    page.close()
+    # Paper b is then removed: the drafts stop citing it (q02 changes, the pairs on b go), and the worksheet follows
+    b = "2601.00002v2"
+    questions = json.loads((folder / "questions.json").read_text())
+    questions["items"][1]["evidence"] = questions["items"][1]["evidence"][:1]
+    (folder / "questions.json").write_text(json.dumps(questions, ensure_ascii=False))
+    pairs = json.loads((folder / "pairs.json").read_text())
+    pairs["items"] = [i for i in pairs["items"] if i["passage"]["paper"] != b]
+    (folder / "pairs.json").write_text(json.dumps(pairs, ensure_ascii=False))
+    papers = json.loads((folder / "papers.json").read_text())
+    papers["papers"] = [p for p in papers["papers"] if p["id"] != b]
+    (folder / "papers.json").write_text(json.dumps(papers))
+    sheet = json.loads((gold.outputs(folder) / "worksheet.json").read_text())
+    del sheet["papers"][b]
+    sheet["papers_sha256"] = gold.sha256_of(folder / "papers.json")
+    gold.write_json(gold.outputs(folder) / "worksheet.json", sheet)
+    labels = json.loads(labels_file(folder, "questions").read_text())
+    labels["labels"]["gone"] = {"item_sha256": "x", "revision": 1, "decision": "edit", "evidence": [[{"paper": b}]]}
+    labels["labels"]["not-a-label"] = "anything"
+    labels_file(folder, "questions").write_text(json.dumps(labels))
+    before = labels_file(folder, "questions").read_bytes()
+    page = pages(folder, "questions")  # opens: the old label is history
+    assert page.get("/api/data")[1]["labels"]["q02"] == {"state": "changed", "revision": 1}
+    report = asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
+    assert report["problems"] == [] and report["labels"]["field2-questions.harold.json"]["changed"] == 1
+    corrected = gold.apply(questions, labels, page.review.papers)
+    assert corrected["counts"]["changed"] == 1 and corrected["counts"]["orphaned"] == 2
+    assert next(i for i in corrected["items"] if i["id"] == "q02")["provisional"] is True  # never applied
+    assert labels_file(folder, "questions").read_bytes() == before  # kept untouched until q02 is labeled again
+    status, answer = page.send("q02", base=1)
+    assert status == 200 and answer["label"]["state"] == "done"
+    saved = json.loads(labels_file(folder, "questions").read_text())["labels"]
+    assert saved["gone"] == labels["labels"]["gone"] and saved["not-a-label"] == "anything"  # history stays as it was

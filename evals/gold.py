@@ -400,10 +400,11 @@ CONTENT = ("text", "short_answer", "answerable", "evidence")  # a question's who
 
 
 def check_labels(doc, set_doc, papers, rater=None):
-    """A labels file's problems (L1, L7): its header names this set and rater; each label's fields and types
-    (a question's edit holds the whole question, its locators checked as a draft's); and the set as the labels
-    leave it (effective_items) passes every rule the drafts pass, set-wide ones (repeated ids or text)
-    included. The page's saves, `check`, `apply` and `agreement` all use this one check."""
+    """A labels file's problems (L1, L3, L7): its header names this set and rater; each label that applies to
+    its item as it now is (applies) has the right fields and types (a question's edit holds the whole
+    question, its locators checked as a draft's); and the set as the labels leave it (effective_items) passes
+    every rule the drafts pass, set-wide ones (repeated ids or text) included. Labels that do not apply are
+    history and are not checked. The page's saves, `check`, `apply` and `agreement` all use this one check."""
     problems = _keys("labels", doc, ("set", "kind", "field", "rater", "set_sha256", "labels"), ("sample",))
     if problems:
         return problems
@@ -413,7 +414,10 @@ def check_labels(doc, set_doc, papers, rater=None):
         return [f"labels: they are rater {doc['rater']!r}'s, not {rater!r}'s"]
     if not isinstance(doc["labels"], dict):
         return ["labels: labels is not an object"]
+    items = {i["id"]: i for i in set_doc["items"]}
     for item, label in doc["labels"].items():
+        if not applies(items.get(item), label):
+            continue  # history (changed or removed since): kept as it is, never validated against the current set
         try:
             problems += label_problems(item, label, set_doc["kind"], set_doc["field"], papers)
         except Exception as error:  # noqa: BLE001 a hand-edited file of any shape is refused, never a crash
@@ -777,12 +781,25 @@ async def passages(field, folder, pdfs, open_app=None, settings=None):
 # Labels, the corrected set, the sample and the agreement
 
 
+def applies(item, label):
+    """Whether a label applies to the item as it now is (its content hash is the item's): the one test that
+    every reader (the page, check, apply, agreement) uses. Only a label that applies is validated (as a whole
+    item, with the set and the papers as they now are) and applied. Any other label (for an item changed or
+    removed since, or not even well formed) is history: kept untouched in the file, never validated against
+    the current set, never applied, and its item, if still there, is shown again for labeling."""
+    return item is not None and isinstance(label, dict) and label.get("item_sha256") == item_sha256(item)
+
+
 def label_state(item, label):
-    """None (not labeled), "changed" (labeled before the item changed: shown again, never applied) or
-    "done"."""
+    """None (not labeled), "done" (the label applies) or "changed" (history: shown again, never applied)."""
     if label is None:
         return None
-    return "done" if label["item_sha256"] == item_sha256(item) else "changed"
+    return "done" if applies(item, label) else "changed"
+
+
+def revision_of(label):
+    """A label's revision as saving over it must name: 0 for history that has none (a save then replaces it)."""
+    return label["revision"] if isinstance(label, dict) and is_count(label.get("revision")) else 0
 
 
 def label_counts(items, labels):
@@ -1061,6 +1078,8 @@ class Review:
         label = self.labels.get(item_id)
         if label is None:
             return None
+        if not applies(self.items[item_id], label):  # history: the item is shown again; only its revision matters
+            return {"state": "changed", "revision": revision_of(label)}
         out = {k: v for k, v in label.items() if k != "item_sha256"}
         if "evidence" in out:
             out["evidence"] = keyed(out["evidence"])
@@ -1152,7 +1171,7 @@ class Review:
         with self.file_lock():
             self.labels = self.read_labels()
             current = self.labels.get(item["id"])
-            if body["base"] != (current["revision"] if current else 0):
+            if body["base"] != revision_of(current):
                 return 409, {"code": "changed_elsewhere", "label": self.shown_label(item["id"]), "done": self.done()}
             try:
                 label = self.label_of(item, body["label"])

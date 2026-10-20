@@ -74,7 +74,7 @@ Run from the repository root. `--folder` is required for field 1.
   - Before anything is written, the whole set as it would stand is checked with the drafts' own rules, including that no two questions have the same text. A save that would break one is refused, naming the rule. `check`, `apply` and `agreement` use the same check, and `check` with the PDFs also resolves a rater's chosen evidence.
   - Each passage chosen in the picker goes back with a key the server gave it, so a passage is never saved under another paper.
   - Every evidence passage of a saved question, a draft's own included, must be a passage of the current worksheet. A draft whose passage no longer resolves (`check` reports it moved) can be saved only once its evidence is chosen again.
-  - A label for an item that changed since is shown again.
+  - A label applies to its item as it now is (its content hash matches), and only such a label is validated and applied. A label for an item changed or removed since is history: kept untouched in the file, never validated against the current set or papers, never applied, and its item is shown again for labeling.
   - The page loads nothing remote and logs nothing.
   - `--sample` serves only the sampled items, for the second rater, from their own labels file.
   - Field 1's sample holds Harold's papers' text, so its page is written only with `--colleague`, on Harold's decision.
