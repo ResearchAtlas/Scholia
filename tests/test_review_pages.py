@@ -30,7 +30,7 @@ class Page:
         self.secret = self.server.secret
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def request(self, method, path, body=None, headers=None, raw=None):
+    def request(self, method, path, body=None, headers=None, raw=None, length=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         sent = {"Host": f"127.0.0.1:{self.port}", "Origin": self.origin, "X-Scholia-Session": self.secret,
                 "Content-Type": "application/json", **(headers or {})}
@@ -39,7 +39,7 @@ class Page:
         conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
         for name, value in sent.items():
             conn.putheader(name, value)
-        conn.putheader("Content-Length", str(len(data or b"")))
+        conn.putheader("Content-Length", str(len(data or b"") if length is None else length))
         conn.endheaders(data)
         response = conn.getresponse()
         payload = response.read()
@@ -174,7 +174,8 @@ def test_requests_from_elsewhere_or_outside_the_page_folder_are_refused(tmp_path
 
 def test_an_oversized_save_is_refused_before_it_is_read(tmp_path, pages):
     page = pages(field(tmp_path), "pairs")
-    status, payload, _ = page.request("POST", "/api/label", raw=b"{" + b" " * gold.MAX_BODY + b"}")
+    # It says it is larger than the bound and sends a little: answered from the length, the body never read.
+    status, payload, _ = page.request("POST", "/api/label", raw=b"{}", length=gold.MAX_BODY + 1)
     assert status == 413 and json.loads(payload)["code"] == "request_too_large"
 
 
