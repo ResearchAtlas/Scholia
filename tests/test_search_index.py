@@ -2451,20 +2451,26 @@ async def test_a_damage_report_made_on_a_file_since_replaced_leaves_its_healthy_
 
 
 def test_nothing_but_the_index_module_opens_the_index_file():
-    """Finding 68 and recheck 2's 72, as an invariant: the data folder is held by one process (backend/desktop.py's
-    exclusive flock), and in it nothing but backend/search_index.py names the index file or opens it (backups,
-    restore, the self-test and the walkthrough server included), so no other connection ever holds it. The only
-    other mention, a timing tool's, takes its size."""
+    """Finding 68 and recheck 2's 72, as an invariant: the packaged app's data folder is held by one process
+    (backend/desktop.py's exclusive flock; the walkthrough, tools, evals and tests each use a folder of their own), and
+    in the app nothing but backend/search_index.py names the index file or opens it (backups, restore, the data-folder
+    chooser and the self-test included), so no other connection ever holds it. The only other mentions, a timing
+    tool's and an eval's, take its size, and neither opens a database. A line-by-line check: an import split over
+    lines or an aliased module would pass it, which the review of each change covers."""
     assert "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)" in (ROOT / "backend" / "desktop.py").read_text()
     names = re.compile(r"search\.sqlite3|search_index\.(FILE|connect)\b|from backend\.search_index import[^\n]*\b(FILE|connect)\b")
     found = []
-    for path in [*(ROOT / "backend").rglob("*.py"), *(ROOT / "tools").rglob("*.py"), ROOT / "tests" / "walkthrough.py"]:
+    for path in [*(ROOT / "backend").rglob("*.py"), *(ROOT / "tools").rglob("*.py"), *(ROOT / "evals").rglob("*.py"),
+                 ROOT / "tests" / "walkthrough.py"]:
         if path == ROOT / "backend" / "search_index.py":
             continue
-        for number, line in enumerate(path.read_text().splitlines(), 1):
+        for line in path.read_text().splitlines():
             if names.search(line):
-                found.append((path.relative_to(ROOT).as_posix(), line.strip()))
-    assert [(where, "size(" in line) for where, line in found] == [("tools/search_timings.py", True)], found
+                found.append(path.relative_to(ROOT).as_posix())
+    assert sorted(found) == ["evals/tier1.py", "tools/search_timings.py"], found
+    for where in found:  # their sizes only: no database connection in either
+        text = (ROOT / where).read_text()
+        assert "apsw" not in text and "sqlite3.connect" not in text, where
     module = (ROOT / "backend" / "search_index.py").read_text()
     assert "BEGIN EXCLUSIVE" not in module  # no lock probing: nothing else holds the file
 
@@ -2585,8 +2591,8 @@ async def test_a_rebuild_asked_during_an_outage_survives_a_failed_retry_and_is_a
 
 @pytest.mark.asyncio
 async def test_damage_and_a_retry_after_a_rebuild_is_ready_are_never_erased_by_that_rebuild(tmp_path, monkeypatch):
-    """Recheck 2's 73: a rebuild is ready (reads admitted) and its writer is still finishing (its pass after the
-    rebuild). In that interval the new file is found damaged again (unusable, its give-up queued) and a Retry is
+    """Recheck 2's 73: a rebuild has published its file (reads admitted) and its writer is still finishing (what
+    followed publication there: the cleanup, which erased both). In that interval the new file is found damaged again (unusable, its give-up queued) and a Retry is
     asked. Nothing of the finished rebuild erases either: the give-up asks for the whole rebuild at once, once, for
     that Retry, and no retry is armed."""
     monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
@@ -2595,23 +2601,55 @@ async def test_damage_and_a_retry_after_a_rebuild_is_ready_are_never_erased_by_t
         await added(client, project, WAGES)
         await idle(client, project)
         index = client.state["index"]
-        attempts, real_all, real_apply = [], SearchIndex._rebuild_all, SearchIndex._apply
+        attempts, real_all = [], SearchIndex._rebuild_all
 
-        def counted(self):
+        def counted(self):  # right after the first rebuild has published its file, from the writer: the interval
             attempts.append(True)
-            return real_all(self)
-
-        def after_ready(self, *args):  # the pass right after the first rebuild: the interval, from the writer
-            if len(attempts) == 1 and not after_ready.done:
-                after_ready.done = True
+            finished = real_all(self)
+            if len(attempts) == 1:
                 self._damaged()  # damaged again before any read succeeded: unusable, the give-up queued behind
                 assert self.unusable and self.retry_rebuild()  # a Retry: kept (no retry armed yet)
-            return real_apply(self, *args)
-        after_ready.done = False
+            return finished
         monkeypatch.setattr(SearchIndex, "_rebuild_all", counted)
-        monkeypatch.setattr(SearchIndex, "_apply", after_ready)
         index.rebuilt = None  # no run reads the new file first: it is still fresh in the interval
         await asyncio.to_thread(index._damaged)  # damage found: rebuilt at once
         await _until(lambda: len(attempts) == 2 and not index.unusable and not index.building, timeout=20)
         assert index._rebuild_retry is None and not index._asked  # the Retry asked for it at once, once
         assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
+async def test_a_request_a_successful_rebuild_served_leaves_nothing_for_a_later_outage(tmp_path, monkeypatch):
+    """Review 3, P3-1: a Rebuild asked while a retry's rebuild runs is kept; that rebuild succeeds, which serves it
+    (cleared as it publishes). The file damaged again later, before any read: that outage waits its retry (armed,
+    no rebuild at once), since nothing asked in it."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        index.rebuilt = None  # no run reads the new file: it stays fresh
+        index._fresh = True
+        await asyncio.to_thread(index._damaged)  # damaged again: unusable, its retry armed
+        await _until(lambda: index._rebuild_retry is not None)
+        started, go, attempts, real_all = threading.Event(), threading.Event(), [], SearchIndex._rebuild_all
+
+        def held(self):
+            attempts.append(True)
+            if len(attempts) == 1:
+                started.set()
+                go.wait(20)
+            return real_all(self)
+        monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+        retry = index._rebuild_retry
+        retry.cancel()
+        await asyncio.to_thread(retry.function)  # the retry, now: its rebuild waits, then succeeds
+        assert await asyncio.to_thread(started.wait, 20)
+        assert index.retry_rebuild() and index._asked  # a Retry meanwhile: kept
+        go.set()
+        await _until(lambda: not index.unusable and not index.building, timeout=20)
+        assert not index._asked  # served by that rebuild
+        await asyncio.to_thread(index._damaged)  # a later outage: the new file damaged again before any read
+        await _until(lambda: index._rebuild_retry is not None, timeout=20)
+        assert attempts == [True] and index.unusable  # its retry armed; nothing rebuilt at once

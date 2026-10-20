@@ -359,7 +359,7 @@ class SearchIndex:
         """fn(conn) on an idle read connection, in one read transaction. Refused (Unavailable) from the moment damage
         is found or a whole rebuild is asked for, while one is under way, or after one failed. Reads are the index's own
         fixed queries, so an APSW error one meets, opening its connection or in its query, is the file's: damage
-        (_damaged), unless the file is only busy or locked (another connection holds it), which refuses the read and
+        (_damaged), unless the file is only busy or locked (by the index's own writer: no other connection opens it), which refuses the read and
         rebuilds nothing. Admitted, given its connection (an idle one, or a new one to the file as it is then), and that
         connection given back to the idle ones, all under _lock: so a file that replaces this one, or its removal, waits
         for the reads admitted before (_quiet), and no read admitted before reaches a file made after; close() refuses
