@@ -393,7 +393,9 @@ async def test_a_reimport_updates_details_and_a_changed_pdf_becomes_the_next_ver
 
 async def test_identifiers_follow_s114s_rule_and_a_local_only_import_asks_once(tmp_path):
     mock = library(tmp_path, pdfs=False)
-    mock.item("FFFF7777", "A DOI Written as a Link", doi=f"https://doi.org/{DOI}")
+    # S1-14's rule since its follow-up (PR 35): https://doi.org/ and three other prefixes are taken off; any
+    # other link is no DOI
+    mock.item("FFFF7777", "A DOI Written as a Link", doi=f"https://example.org/{DOI}")
     mock.item("GGGG8888", "A Second DOI", doi=" 10.5555/scholia.zotero.002\n")
     async with started(tmp_path / "data", provider(mock, openalex={DOI: openalex_work(DOI, "Resolved")})) as client:
         project = await project_of(client, level="local_only")
