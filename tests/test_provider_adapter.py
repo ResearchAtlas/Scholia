@@ -111,7 +111,7 @@ async def test_zero_retention_is_limited_to_the_endpoints_the_catalog_lists():
 
 
 @pytest.mark.parametrize("status, kind", [
-    (400, "request"), (401, "auth"), (402, "quota"), (403, "request"), (404, "request"), (408, "timeout"),
+    (400, "request"), (401, "auth"), (402, "quota"), (403, "policy_block"), (404, "request"), (408, "timeout"),
     (429, "rate_limit"), (500, "other"), (502, "other"), (503, "other"),
 ])
 async def test_an_http_error_is_classified_and_never_retried(status, kind):
@@ -196,6 +196,74 @@ async def test_openrouter_never_drops_the_reasoning_field_on_a_400(takes_reasoni
     client, sent = client_for(httpx.Response(400, json={}), ok())
     result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, effort="high")
     assert result.error_kind == "request" and len(sent) == 1
+
+
+async def test_a_request_relying_on_reasoning_requires_it_of_every_endpoint(takes_reasoning):
+    # Model-route rule 2: OpenRouter routes only to endpoints that take the parameter, and with none
+    # left fails rather than ignoring it; that failure is not retried.
+    import json
+    client, sent = client_for(httpx.Response(404, json={"error": {"message": "No endpoints found"}}), ok())
+    result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, effort="high")
+    assert json.loads(sent[0].read())["provider"] == {"require_parameters": True}
+    assert (result.error_kind, len(sent)) == ("request", 1)
+    await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)  # no reasoning: nothing required
+    assert "provider" not in json.loads(sent[1].read())
+    await openrouter.query_model(client, LOCAL, "key", MESSAGES, effort="high")  # OpenRouter's field only
+    assert "provider" not in json.loads(sent[2].read())
+
+
+async def test_no_request_forces_a_tool_choice():
+    # Model-route rule 4: role calls never force a tool; no request the adapter builds names one.
+    import json
+    client, sent = client_for(ok(), ok())
+    for route in (OPENROUTER, LOCAL):
+        await openrouter.query_model(client, route, "key", MESSAGES, max_tokens=1024)
+    assert all("tool_choice" not in json.loads(request.read()) for request in sent)
+
+
+@pytest.mark.parametrize("message, finish, kind", [
+    ({"content": None, "refusal": "I cannot help with that."}, "stop", "model_refusal"),
+    ({"content": "Partial answer"}, "content_filter", "policy_block"),
+    ({"content": "", "reasoning": "Long thoughts"}, "length", "output_limit"),  # the limit spent before any text
+])
+async def test_a_refusal_or_a_policy_block_is_its_own_outcome_with_its_cost_and_no_retry(message, finish, kind):
+    client, sent = client_for(httpx.Response(200, json={"choices": [{"message": message, "finish_reason": finish}],
+                                                        "usage": {"prompt_tokens": 4, "completion_tokens": 1,
+                                                                  "cost": 0.0003}}))
+    result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)
+    assert (result.ok, result.error_kind, result.reported_cost, len(sent)) == (False, kind, 0.0003, 1)
+    assert result.attempts[0].record()["outcome"] == kind
+
+
+async def test_an_answer_stopped_at_its_output_limit_is_an_answer_marked_cut():
+    client, _ = client_for(httpx.Response(200, json={"choices": [{"message": {"content": "Half an ans"},
+                                                                  "finish_reason": "length"}]}),
+                           ok("Whole."))
+    cut = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)
+    whole = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)
+    assert (cut.ok, cut.content, cut.cut, whole.cut) == (True, "Half an ans", True, False)
+
+
+async def test_a_reply_of_tool_calls_alone_is_an_answer_with_its_calls():
+    calls = [{"id": "call_1", "type": "function", "function": {"name": "search_passages", "arguments": "{}"}}]
+    client, _ = client_for(httpx.Response(200, json={"choices": [{"message": {"content": "", "tool_calls": calls}}]}))
+    result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)
+    assert (result.ok, result.tool_calls) == (True, calls)
+
+
+async def test_an_attempt_keeps_the_cache_counts_the_provider_reports():
+    # Model-route rule 6: cache reads and writes beside the other counts; an absent count stays absent.
+    client, _ = client_for(ok("Hi.", prompt_tokens=100, completion_tokens=5, cost=0.001,
+                              prompt_tokens_details={"cached_tokens": 60, "cache_write_tokens": 40}),
+                           ok("Hi.", prompt_tokens=100, completion_tokens=5, cost=0.001,
+                              prompt_tokens_details={"cached_tokens": 0}),
+                           ok("Hi.", prompt_tokens=100, completion_tokens=5, cost=0.001,
+                              prompt_tokens_details={"cached_tokens": "60", "cache_write_tokens": -1}))
+    records = [(await openrouter.query_model(client, OPENROUTER, "key", MESSAGES)).attempts[0].record()
+               for _ in range(3)]
+    assert (records[0]["cached_tokens"], records[0]["cache_write_tokens"]) == (60, 40)
+    assert records[1]["cached_tokens"] == 0 and "cache_write_tokens" not in records[1]
+    assert "cached_tokens" not in records[2] and "cache_write_tokens" not in records[2]  # not counts: left out
 
 
 async def test_the_negotiation_memory_expires_and_is_bounded(takes_reasoning, monkeypatch):

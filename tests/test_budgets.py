@@ -4,6 +4,7 @@ The budget bar, notices and the asks at the cap come with the budgets PR; these
 tests cover admission, settling once, and spending that outlives deletion.
 """
 
+import asyncio
 import sqlite3
 import threading
 
@@ -278,3 +279,56 @@ async def test_a_budget_lowered_while_a_turn_waits_binds_its_next_call(tmp_path)
         rest = [event async for event in stream]
         assert [e for e in rest if e["type"] == "limit_reached"] == [{"type": "limit_reached", "budget": "project"}]
         assert client.provider.answers == []  # nothing was sent
+
+
+@pytest.mark.asyncio
+async def test_a_turn_reserves_from_its_counted_request_and_output_limit_at_the_highest_reachable_rate(tmp_path):
+    # status.md's S1-19 follow-up and model-route rule 6: no fixed bucket per mode. A long message
+    # reserves more than a short one, and the reservation is the request's counted tokens and its
+    # whole output limit at the highest rates among the model's endpoints.
+    import json
+    from backend import budget_router, context
+    from scholia_app import MockProvider, send, started
+    model = budget_router.MODEL_TIERS["mid"][0]  # what Auto picks first
+    provider = MockProvider(endpoints={model: [
+        {"tag": "a", "context_length": 131072, "pricing": {"prompt": "0.000002", "completion": "0.00001",
+                                                           "input_cache_write": "0.0000025"}},
+        {"tag": "b", "context_length": 131072, "pricing": {"prompt": "0.000001", "completion": "0.000012",
+                                                           "overrides": [{"prompt": "0.000004"}]}}]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        await send(client, conversation, "Short?")
+        long = "A long question about cohort studies and their follow-up. " * 1500  # about 90,000 characters
+        await send(client, conversation, long)
+        read = client.state["db"].read
+        steps = [json.loads(d) for (d,) in await asyncio.to_thread(read, lambda conn: conn.execute(
+            "SELECT data FROM run_events r JOIN runs u ON u.id = r.run_id WHERE r.type = 'step_started'"
+            " AND u.kind = 'turn' ORDER BY u.started_at, r.seq").fetchall())]
+        reserved = await asyncio.to_thread(read, lambda conn: conn.execute(
+            "SELECT b.estimate_usd FROM budget_reservations b JOIN runs u ON u.id = b.run_id WHERE u.kind = 'turn'"
+            " ORDER BY u.started_at").fetchall())
+        assert [e for (e,) in reserved] == [s["estimate_usd"] for s in steps]
+        assert steps[1]["estimate_usd"] > steps[0]["estimate_usd"] and steps[1]["input_tokens"] > 20000
+        for step, body in zip(steps, provider.answers):
+            # 4e-6 a prompt token (b's long-context override), 1.2e-5 an output one (b's completion).
+            assert step["estimate_usd"] == pytest.approx(step["input_tokens"] * 4e-6 + step["max_tokens"] * 1.2e-5)
+            assert step["input_tokens"] == context.serialized_tokens(body["messages"]) and body["max_tokens"] == 8000
+
+
+@pytest.mark.asyncio
+async def test_a_request_too_costly_for_the_budget_stops_at_the_limit_before_any_call(tmp_path):
+    # Lifecycle (L9): the request-sized reservation does not fit, so no step starts and nothing is sent.
+    from scholia_app import MockProvider, send, started
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        project = (await client.get(f"/api/conversations/{conversation}")).json()["project_id"]
+        settings = (await client.get("/api/settings", params={"project_id": project})).json()
+        # 8,000 output tokens at $5 per million alone is $0.04: more than this budget holds.
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"project.budget_usd": 0.03}})
+        stream = await send(client, conversation, "Short?")
+        assert [e["type"] for e in stream] == ["run_started", "limit_reached", "run_finished"]
+        assert provider.chats == []
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT count(*) FROM budget_reservations").fetchone()) == (0,)

@@ -121,8 +121,20 @@ test('an answer shown but not saved stays available by its run', async (t) => {
     'data: {"type":"run_finished","status":"failed"}\n\n')));
   await send('c9', '/x', {}, 'Q');
   await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(unsavedAnswer('r9'), 'Kept');
+  assert.deepEqual(unsavedAnswer('r9'), { text: 'Kept', cut: false });
   assert.equal(unsavedAnswer('r1'), null);
+});
+
+test('an unsaved answer cut at its output limit keeps its cut mark', async (t) => {
+  // The connector's finding on PR 37: the save-failure fallback carries the mark, and the window keeps it.
+  t.mock.method(globalThis, 'fetch', async () => new Response(streamOf(
+    'data: {"type":"run_started","run_id":"r8"}\n\n',
+    'data: {"type":"chat_response","content":"Half","result_saved":false,"cut":true}\n\n',
+    'data: {"type":"run_finished","status":"failed"}\n\n')));
+  await send('c8', '/x', {}, 'Q');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(unsavedAnswer('r8'), { text: 'Half', cut: true });
+  assert.equal(apply({ text: 'Q' }, { type: 'chat_response', content: 'Half', result_saved: false, cut: true }).cut, true);
 });
 
 test('a live turn follows its events', () => {

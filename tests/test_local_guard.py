@@ -14,7 +14,7 @@ import pytest
 import uvicorn
 
 from network_guard import register_server
-from scholia_app import KEY, ORIGIN, FakeKeyring, MockProvider, app_for, started
+from scholia_app import KEY, ORIGIN, FakeKeyring, MockProvider, app_for, started, streaming
 
 pytestmark = pytest.mark.asyncio
 HOST = ORIGIN.split("://")[1]
@@ -179,7 +179,7 @@ async def test_a_closed_connection_mid_turn_cancels_it_over_real_loopback_tcp(tm
     origin = f"http://127.0.0.1:{port}"
     from backend.app import create_app
     app = create_app(tmp_path / "data", origin=origin, keyring_backend=keyring,
-                     transport=httpx.MockTransport(provider))
+                     transport=httpx.MockTransport(streaming(provider)))
     server = uvicorn.Server(uvicorn.Config(app, lifespan="on", loop="asyncio", http="h11", ws="none",
                                            log_config=None, access_log=False))
     loop_box = {}

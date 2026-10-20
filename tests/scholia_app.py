@@ -13,10 +13,13 @@ import pathlib
 
 import httpx
 
+from backend import budget_router
 from backend.app import create_app
 from backend.db import new_id as _new_id
 
 ORIGIN = "http://127.0.0.1:8765"
+PARAMETERS = ["max_tokens", "temperature", "reasoning", "include_reasoning", "tools", "tool_choice"]
+PRICING = {"prompt": "0.000001", "completion": "0.000005"}  # USD per token, as OpenRouter publishes them
 HEADERS = {"X-Scholia-Client": "local"}
 KEY = "sk-or-test-not-a-real-key"
 
@@ -41,15 +44,21 @@ class MockProvider:
     """Answers chat completions like OpenRouter. Each call takes the next reply from
     `replies` (a function of the request body, or a (status, body) pair), or a
     default answer. Set `hold` to an asyncio.Event to keep calls waiting until it is set.
-    Its model listing holds the ids in `catalog` (each with a 128K window), and its
-    zero-retention endpoints those in `zero_retention`: an id (one endpoint tagged "example"
-    with a 128K window) or a listing row of its own; both are empty by default."""
+    Its model listing holds the ids in `catalog` (each with a 128K window; by default the
+    models OpenRouter's Recommended offers), and its zero-retention endpoints those in
+    `zero_retention`: an id (one endpoint tagged "example" with a 128K window) or a listing
+    row of its own; none by default. Any other provider's listing holds the ids in `local`. A
+    model's endpoint listing (/models/{id}/endpoints) is
+    `endpoints[id]` when set, else its zero-retention rows, else one endpoint tagged "example"
+    with a 128K window; a row that names no pricing or parameters publishes PRICING and takes PARAMETERS."""
 
-    def __init__(self, *replies, cost=0.002, catalog=(), zero_retention=(), scholarly=None, zotero=None):
+    def __init__(self, *replies, cost=0.002, catalog=None, zero_retention=(), scholarly=None, endpoints=None, zotero=None):
         self.scholarly = scholarly if scholarly is not None else MockScholarly()  # OpenAlex, Crossref and arXiv
         self.zotero = zotero if zotero is not None else MockZotero(state="not_running")  # S1-15
-        self.catalog = list(catalog)
+        self.catalog = sorted(budget_router.RECOMMENDED) if catalog is None else list(catalog)
         self.zero_retention = list(zero_retention)
+        self.endpoints = dict(endpoints or {})
+        self.local = ["llama", "m", "m:1"]  # what another provider's model listing holds, each with a 128K window
         self.replies = list(replies)
         self.title_replies = []  # replies for title calls, which never take from `replies`
         self.requests = []
@@ -75,7 +84,12 @@ class MockProvider:
         if self.hold is not None:
             await self.hold.wait()
         if request.url.path.endswith("/models"):
-            return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000} for m in self.catalog]})
+            models = self.catalog if request.url.host == "openrouter.ai" else self.local
+            return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000, "pricing": PRICING}
+                                                      for m in models]})
+        if request.url.path.endswith("/endpoints") and "/models/" in request.url.path:
+            model = request.url.path.split("/models/", 1)[1].removesuffix("/endpoints")
+            return httpx.Response(200, json={"data": {"id": model, "endpoints": self.listing(model)}})
         if "/endpoints/" in request.url.path:
             return httpx.Response(200, json={"data": [
                 m if isinstance(m, dict) else {"model_id": m, "tag": "example", "context_length": 128000}
@@ -91,6 +105,13 @@ class MockProvider:
         if isinstance(payload, bytes):  # a body JSON encoders refuse to write, such as Infinity
             return httpx.Response(status, content=payload, headers={"content-type": "application/json"})
         return httpx.Response(status, json=payload)
+
+    def listing(self, model):
+        rows = self.endpoints.get(model) or [
+            row for row in self.zero_retention if isinstance(row, dict) and row.get("model_id") == model]
+        rows = rows or [{"tag": "example", "context_length": 128000, "supported_parameters": PARAMETERS}]
+        # A row that names its pricing or parameters keeps them.
+        return [{"pricing": PRICING, "supported_parameters": PARAMETERS, **row} for row in rows]
 
     @property
     def chat_headers(self):
@@ -127,6 +148,17 @@ def streamed(response):
     if not response.is_stream_consumed:
         return response
     return httpx.Response(response.status_code, headers=response.headers, stream=Chunks([response.content]))
+
+
+def streaming(handler):
+    """A transport handler whose answers arrive streamed (see streamed), as the catalog's reader
+    needs them: it decodes and bounds a body itself (backend/openrouter_client.py, _bounded)."""
+    async def answer(request):
+        response = handler(request)
+        if asyncio.iscoroutine(response):
+            response = await response
+        return streamed(response)
+    return answer
 
 
 class MockScholarly:
@@ -308,7 +340,7 @@ def _default_answer(body):
 
 def app_for(data_dir, provider, keyring=None, **options):
     return create_app(data_dir, origin=ORIGIN, keyring_backend=keyring or FakeKeyring(),
-                      transport=httpx.MockTransport(provider), **options)
+                      transport=httpx.MockTransport(streaming(provider)), **options)
 
 
 @contextlib.asynccontextmanager

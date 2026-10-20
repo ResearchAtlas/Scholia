@@ -408,6 +408,8 @@ async def test_a_restore_works_where_the_file_system_has_no_hard_links(tmp_path,
 async def test_a_restore_stops_a_running_turn(tmp_path):
     async with started(tmp_path / "data") as client:
         backup = (await client.post("/api/backups")).json()["id"]
+        await send(client, (await client.post("/api/conversations", json={"title": "t"})).json()["id"])
+        client.provider.started.clear()  # the catalog and the endpoints, read: what is held next is the call
         client.provider.hold = asyncio.Event()
         conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
         turn = asyncio.create_task(send(client, conversation))
@@ -937,6 +939,8 @@ async def test_a_turn_running_when_a_restore_starts_ends_before_the_safety_copy(
     data = tmp_path / "data"
     async with started(data) as client:
         backup = (await client.post("/api/backups")).json()["id"]
+        await send(client, (await client.post("/api/conversations", json={"title": "t"})).json()["id"])
+        client.provider.started.clear()  # the catalog and the endpoints, read: what is held next is the call
         client.provider.hold = asyncio.Event()
         conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
         turn = asyncio.create_task(send(client, conversation))
@@ -948,7 +952,8 @@ async def test_a_turn_running_when_a_restore_starts_ends_before_the_safety_copy(
         safety = data / "backups" / response.json()["safety_copy"] / DB_NAME
     conn = sqlite3.connect(safety.as_uri() + "?mode=ro", uri=True)
     try:  # the safety copy holds the turn as it ended, nothing it could commit after the copy
-        assert conn.execute("SELECT status FROM runs WHERE kind = 'turn'").fetchall() == [("interrupted",)]
+        assert conn.execute("SELECT status FROM runs WHERE kind = 'turn' ORDER BY started_at").fetchall() == [
+            ("succeeded",), ("interrupted",)]  # the turn that read the catalog first, then the one running
     finally:
         conn.close()
 
@@ -1483,6 +1488,17 @@ async def test_a_file_that_appears_at_a_backups_name_meanwhile_is_never_replaced
     with zipfile.ZipFile(path) as archive:
         assert archive.read("a.txt") == b"x" and mode(path) == 0o600
     assert sorted(p.name for p in destination.iterdir()) == sorted([audited[0].name, path.name])  # no temporary left
+
+
+@pytest.mark.parametrize("language", ["en", "zh-CN"])
+async def test_an_exported_answer_cut_at_its_output_limit_says_so(language):
+    # Harold, 2026-10-20: an answer cut at its output limit is marked cut; the export keeps the mark.
+    from backend import i18n
+    conversation = {"title": "t", "turns": [{"author": "researcher", "started_at": "2026-10-20T00:00:00Z",
+                                             "message": {"text": "q"}, "answer": {"text": "Half an ans", "cut": True},
+                                             "status": "succeeded"}]}
+    written = backups_module._conversation_markdown(conversation, language).decode()
+    assert f"*{i18n.render('export.cut', language)}*" in written
 
 
 # Failing closed (Harold, 2026-10-15, as simplified): one failed close holds file replacement off for the rest of the

@@ -162,17 +162,47 @@ async def test_a_dropped_response_releases_its_claim_after_the_grace_period(tmp_
 
 
 async def test_instructions_and_earlier_answers_go_into_the_request(tmp_path):
+    # Failed answers stay visible but never enter later prompts as the assistant's words (section 1.5,
+    # S1-19): a failed turn and a refused one leave nothing in the history.
     async with started(tmp_path / "data") as client:
         await client.put("/api/instructions", json={"text": "Always use British spelling."})
         conversation = await new_conversation(client)
         await send(client, conversation, "first question")
         client.provider.replies.append((500, {"error": {"message": "upstream"}}))
         await send(client, conversation, "second question")  # fails: its question stays, no answer
+        client.provider.replies.append((200, {"choices": [{"message": {"content": "Words the model wrote",
+                                                                       "refusal": "Declined."}}]}))
+        await send(client, conversation, "refused question")
         await send(client, conversation, "third question")
         messages = client.provider.answers[-1]["messages"]
-        assert messages[0]["role"] == "system" and "Always use British spelling." in messages[0]["content"]
+        assert messages[0]["role"] == "system"
+        assert "## AGENTS.md\nAlways use British spelling." in messages[0]["content"]  # labeled (section 8)
         assert [(m["role"], m["content"]) for m in messages[1:]] == [
             ("user", "first question"), ("assistant", "An answer."), ("user", "third question")]
+        assert "Words the model wrote" not in json.dumps(client.provider.answers[-1])
+        await background_idle(client)
+
+
+async def test_a_turn_keeps_the_route_effort_and_request_admission_chose(tmp_path):
+    # Model-route rule 5: Auto picks the route and effort once per researcher request, and every step
+    # records them; a catalog read between admission and the call changes nothing for the turn.
+    from backend import openrouter_client
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "admitted at 128K", effort="low")
+        model = claim.context["route"].model
+        provider.endpoints[model] = [{"tag": "example", "context_length": 8192}]  # what a later read would say
+        openrouter_client.clear_cache()
+        [event async for event in harness.events(claim)]
+        [body] = provider.answers
+        assert body["max_tokens"] == 8000  # sized for the window admission read
+        data = [json.loads(d) for (t, d) in await rows(
+            client, "SELECT type, data FROM run_events WHERE run_id = ? ORDER BY seq", claim.run_id)
+            if t in ("route", "step_started", "model_attempt")]
+        assert {(d["route"], d.get("effort", "low")) for d in data} == {(f"openrouter:{model}", "low")}
+        assert data[0]["effort"] == data[1]["effort"] == "low" and data[1]["window"] == 128000
         await background_idle(client)
 
 
@@ -199,6 +229,8 @@ async def test_cancel_during_the_model_call_ends_the_turn_and_settles_its_estima
         [(estimate, settled, basis)] = await rows(
             client, "SELECT estimate_usd, settled_usd, basis FROM budget_reservations WHERE run_id = ?", run_id)
         assert (settled, basis) == (estimate, "estimated") and estimate > 0  # never shown as $0
+        [(step,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_started'", run_id)
+        assert json.loads(step)["estimate_usd"] == estimate  # the request-sized estimate, settled once (S1-19)
         # The attempt cut off in flight is recorded, content-free, with an unknown charge.
         [(attempt,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
                                   run_id)
@@ -251,10 +283,17 @@ async def test_a_cancel_after_the_primary_commit_keeps_the_answer(tmp_path):
     (500, {"error": {"message": "provider exploded with secret details"}}, "other"),
     (401, {"error": {"message": "bad key"}}, "auth"),
     (402, {"error": {"message": "no credit"}}, "quota"),
-    (403, {"error": {"message": "moderation"}}, "request"),
+    (403, {"error": {"message": "moderation"}}, "policy_block"),  # OpenRouter's moderation (model-route rule 4)
     (429, {"error": {"message": "slow down"}}, "rate_limit"),
     (200, {"choices": [{"message": {"content": "  "}}], "usage": {"cost": 0.001}}, "malformed"),
     (200, {"choices": []}, "malformed"),
+    # A reply of tool calls alone, to a request that offered no tools, is no answer (G6).
+    (200, {"choices": [{"message": {"content": None, "tool_calls": [{"id": "c", "type": "function"}]}}],
+           "usage": {"cost": 0.001}}, "malformed"),
+    (200, {"choices": [{"message": {"content": None, "refusal": "I can't help with that."}}],
+           "usage": {"cost": 0.001}}, "model_refusal"),
+    (200, {"choices": [{"message": {"content": "Partial"}, "finish_reason": "content_filter"}],
+           "usage": {"cost": 0.001}}, "policy_block"),
 ])
 async def test_a_provider_failure_fails_the_turn_with_its_kind_and_settles_once(tmp_path, status, body, reason):
     provider = MockProvider((status, body))
@@ -282,6 +321,8 @@ async def test_a_request_the_gate_refuses_never_leaves_and_its_reservation_is_re
         # allowlist and OpenRouter's catalog itself, refuses a model with no zero-retention endpoint.
         monkeypatch.setattr(governance.Policy, "problem", lambda self, provider, model, key=None: None)
         monkeypatch.setattr(governance, "key_attested", lambda *args: True)
+        real_reach = runs_module.reach.reach  # and what the request can reach is read as for Normal
+        monkeypatch.setattr(runs_module.reach, "reach", lambda provider, row, listing, **kw: real_reach(provider, row, listing))
         conversation = await new_conversation(client, project_id=project)
         await client.put("/api/settings", json={"hash": (await client.get("/api/settings")).json()["hash"],
                                                 "updates": {"providers.openrouter.models": "all"}})
@@ -503,6 +544,7 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
         return real(data_root)
 
     async with started(tmp_path / "data") as client:
+        await send(client, await new_conversation(client, title="t"))  # the catalog and endpoints, read once
         conversation = await new_conversation(client, title="t")
         monkeypatch.setattr(providers_module, "gate_inputs", slow_inputs)
         stream = asyncio.create_task(send(client, conversation))
@@ -510,8 +552,9 @@ async def test_a_call_cancelled_during_the_gate_check_is_released_not_charged(tm
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
         assert (await stream)[-1]["status"] == "cancelled"
-        assert client.provider.chats == []
-        assert await rows(client, "SELECT status, settled_usd FROM budget_reservations") == [("released", None)]
+        assert len(client.provider.chats) == 1  # the first conversation's only
+        assert await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?",
+                          run_id) == [("released", None)]
 
 
 async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(tmp_path, monkeypatch):
@@ -525,6 +568,7 @@ async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(
         await real_exit(self, *exc)
 
     async with started(tmp_path / "data") as client:
+        await send(client, await new_conversation(client, title="t"))  # the catalog and endpoints, read once
         conversation = await new_conversation(client, title="t")
         monkeypatch.setattr(httpx.AsyncClient, "__aexit__", slow_exit)
         stream = asyncio.create_task(send(client, conversation))
@@ -532,9 +576,10 @@ async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(
         run_id = active_turn(client, conversation).run_id
         await client.post(f"/api/runs/{run_id}/cancel")
         assert (await stream)[-1]["status"] == "cancelled"
-        assert await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations") == [
-            ("settled", 0.002, "reported")]
-        assert await rows(client, "SELECT count(*) FROM run_events WHERE type = 'model_attempt'") == [(1,)]
+        assert await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations WHERE run_id = ?",
+                          run_id) == [("settled", 0.002, "reported")]
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE type = 'model_attempt' AND run_id = ?",
+                          run_id) == [(1,)]
 
 
 async def test_an_answer_that_cannot_be_saved_is_still_shown_marked_unsaved(tmp_path, monkeypatch):
@@ -976,3 +1021,113 @@ async def test_a_blank_model_is_refused_in_a_request_and_passed_over_in_settings
         assert (await send(client, conversation, "hello"))[-1]["status"] == "succeeded"
         assert client.provider.answers[-1]["model"].strip() == client.provider.answers[-1]["model"] != ""
         await background_idle(client)
+
+
+async def test_an_answer_cut_at_its_output_limit_is_saved_and_marked_cut_in_its_trace(tmp_path):
+    # Harold, 2026-10-20: saved as succeeded, marked cut in the answer and in the step's trace.
+    provider = MockProvider((200, {"choices": [{"message": {"content": "Half an ans"}, "finish_reason": "length"}],
+                                   "usage": {"cost": 0.001}}))
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        stream = await send(client, conversation)
+        assert stream[-1]["status"] == "succeeded"
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert (turn["status"], turn["answer"]) == ("succeeded", {"text": "Half an ans", "cut": True})
+        [(finished,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'",
+                                   turn["run_id"])
+        assert json.loads(finished)["cut"] == "output_limit"
+
+
+@pytest.mark.parametrize("model", ["x/unpriced", None])  # a chosen model, and Auto
+async def test_an_openrouter_model_is_refused_as_unpriced_only_when_its_endpoints_publish_no_price(tmp_path, model):
+    # Harold, 2026-10-20, and the connector's finding on PR 37: the catalog's aggregate price may be
+    # missing while every endpoint publishes one; the endpoints decide. An endpoint without a price
+    # refuses a chosen model; Auto passes over it to the next model it would take.
+    import httpx
+    from backend import budget_router, openrouter_client
+
+    class Unpriced(MockProvider):  # its catalog lists models with no aggregate price
+        async def __call__(self, request):
+            if request.url.path.endswith("/models") and request.url.host == "openrouter.ai":
+                return httpx.Response(200, json={"data": [{"id": m, "context_length": 128000} for m in self.catalog]})
+            return await super().__call__(request)
+
+    first = model or budget_router.MODEL_TIERS["mid"][0]
+    provider = Unpriced(catalog=["x/unpriced", *budget_router.RECOMMENDED])
+    async with started(tmp_path / "data", provider) as client:
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {"providers.openrouter.models": "all"}})
+        conversation = await new_conversation(client, title="t")
+        options = {"model": model} if model else {}
+        assert (await send(client, conversation, **options))[-1]["status"] == "succeeded"
+        assert provider.answers[-1]["model"] == first  # priced by its endpoints, used
+        provider.endpoints[first] = [{"tag": "example", "context_length": 128000, "pricing": {}}]
+        openrouter_client.clear_cache()
+        if model:
+            before = await counts(client)
+            refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                        json={"content": "hi", "model": model})
+            assert (refused.status_code, refused.json()["code"]) == (400, "route_unpriced")
+            assert len(provider.answers) == 1 and await counts(client) == before  # nothing written or sent
+        else:
+            assert (await send(client, conversation))[-1]["status"] == "succeeded"
+            assert provider.answers[-1]["model"] == budget_router.MODEL_TIERS["mid"][1]  # Auto passed over it
+
+
+
+async def test_an_endpoint_that_does_not_take_the_output_limit_is_not_used(tmp_path):
+    # External review a2 and charter section 10 rule 2: the output limit is a parameter every request
+    # relies on, so it is required of the endpoint (provider.require_parameters) and a model whose
+    # endpoints do not list it is refused before anything is written.
+    from backend import budget_router
+    model = budget_router.MODEL_TIERS["mid"][0]
+    provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 128000,
+                                                "supported_parameters": ["temperature"]}]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "hi", "model": model})  # chosen: Auto would pass over it
+        assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
+        assert provider.chats == [] and (await counts(client))["runs"] == 0
+        provider.endpoints[model][0]["supported_parameters"] = ["max_tokens", "temperature"]
+        from backend import openrouter_client
+        openrouter_client.clear_cache()
+        assert (await send(client, conversation))[-1]["status"] == "succeeded"
+        [body] = provider.answers
+        assert body["max_tokens"] == 8000 and body["provider"] == {"require_parameters": True}
+
+
+
+async def test_a_model_whose_reasoning_record_is_dropped_still_needs_the_output_limit(tmp_path, monkeypatch):
+    # Review a4 (P3-2): when reasoning cannot be honored and is dropped, the endpoints must still take
+    # the output limit, or the model is refused before anything is written.
+    from backend import budget_router, openrouter
+    monkeypatch.setattr(openrouter, "resolve_model_reasoning",
+                        lambda route, effort, **kw: ({"effort": effort}, "elsewhere") if effort else (None, None))
+    model = budget_router.MODEL_TIERS["mid"][0]
+    provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 128000,
+                                                "supported_parameters": ["reasoning"]}]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "hi", "effort": "high", "model": model})
+        assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
+        assert provider.chats == []
+
+
+async def test_an_answer_cut_at_its_output_limit_that_cannot_be_saved_keeps_its_cut_mark(tmp_path, monkeypatch):
+    # The connector's finding on PR 37: the save-failure fallback carries the cut mark, as a saved answer does.
+    provider = MockProvider((200, {"choices": [{"message": {"content": "Half an ans"}, "finish_reason": "length"}],
+                                   "usage": {"cost": 0.001}}), (200, {"choices": [{"message": {"content": "Whole."}}],
+                                                                      "usage": {"cost": 0.001}}))
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client, title="t")
+
+        def disk_full(self, conn, claim, answer, ctx):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(runs_module.Harness, "_commit_answer", disk_full)
+        response = next(e for e in await send(client, conversation) if e["type"] == "chat_response")
+        assert (response["content"], response["result_saved"], response["cut"]) == ("Half an ans", False, True)
+        response = next(e for e in await send(client, conversation) if e["type"] == "chat_response")
+        assert response["result_saved"] is False and "cut" not in response  # a whole answer carries no mark
