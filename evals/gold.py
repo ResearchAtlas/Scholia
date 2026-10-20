@@ -925,6 +925,26 @@ def judge_scores(labels, verdicts, settings=None):
 # The review page
 
 
+def kept_as_sent(sent, label):
+    """Whether every field a request names ends up in the label as sent: typed text as trimmed (visible),
+    answerable as given, evidence as the same passages in the same items."""
+    from backend.settings import visible
+    if not isinstance(sent, dict) or sent.get("decision") != "edit":
+        return True
+    for name in EDITS:
+        if name not in sent:
+            continue
+        if name not in label:
+            return False
+        if name == "evidence":
+            if [[(c.get("paper"), c.get("ordinal")) for c in ev] for ev in sent[name]] != \
+                    [[(loc["paper"], loc["ordinal"]) for loc in ev] for ev in label[name]]:
+                return False
+        elif label[name] != (visible(sent[name]) if name in ("text", "short_answer") else sent[name]):
+            return False
+    return True
+
+
 def keyed(evidence):
     return [[{**loc, "key": passage_key(loc["paper"], loc["ordinal"], loc["quote"])} for loc in ev] for ev in evidence]
 
@@ -1136,6 +1156,10 @@ class Review:
                 label = self.label_of(item, given)
             except ValueError as error:
                 return 400, {"code": str(error)}
+            if not kept_as_sent(body["label"], label):
+                # The record would not hold a change the rater made (another window made the question
+                # unanswerable, so its answer and evidence would go): not saved, and the page is told why.
+                return 409, {"code": "change_not_kept", "label": self.shown_label(item["id"])}
             entry = {**label, "item_sha256": item_sha256(item), "revision": body["base"] + 1,
                      "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
             labels = {**self.labels, item["id"]: entry}

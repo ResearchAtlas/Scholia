@@ -557,9 +557,10 @@ def test_a_conflicting_window_saving_only_what_it_changed_keeps_the_other_window
 def test_an_edit_making_a_question_unanswerable_keeps_no_answer_or_evidence(tmp_path, pages):
     folder = field(tmp_path)
     page = pages(folder, "questions")
-    status, answer = page.save("q01", {"decision": "edit", "answerable": False, "short_answer": "71",
-                                       "evidence": [[pick(page, "2601.00001v1", 2)]]})
-    assert status == 200 and answer["label"] == {**answer["label"], "answerable": False}
+    assert page.save("q01", {"decision": "edit", "short_answer": "71 of them",
+                             "evidence": [[pick(page, "2601.00001v1", 2)]]})[0] == 200
+    status, answer = page.save("q01", {"decision": "edit", "answerable": False})  # names only answerable
+    assert status == 200 and answer["label"]["answerable"] is False
     assert "short_answer" not in answer["label"] and "evidence" not in answer["label"]
 
 
@@ -589,3 +590,37 @@ def test_a_malformed_labels_file_is_refused_naming_the_label_never_a_crash(tmp_p
         gold.Review(2, folder, "questions", "harold")
     report = asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
     assert any(p.startswith("field2-questions.harold.json: label q01") for p in report["problems"])
+
+
+# A change the rater names is saved as sent, or not saved at all (charter: statuses say saved only after the record does)
+
+
+def test_a_retried_answer_on_a_question_made_unanswerable_elsewhere_is_not_saved(tmp_path, pages):
+    folder = field(tmp_path)
+    one, two = pages(folder, "questions"), pages(folder, "questions")
+    assert one.save("q01", {"decision": "edit", "answerable": False}, base=0)[0] == 200
+    before = labels_file(folder, "questions").read_bytes()
+    for change in ({"short_answer": "71"}, {"evidence": [[pick(two, "2601.00001v1", 2)]]}):
+        status, answer = two.save("q01", {"decision": "edit", **change}, base=1)
+        assert status == 409 and answer["code"] == "change_not_kept" and answer["label"]["answerable"] is False
+        assert labels_file(folder, "questions").read_bytes() == before  # nothing written
+
+
+def test_an_edit_naming_answerable_false_with_an_answer_is_not_saved(tmp_path, pages):
+    folder = field(tmp_path)
+    page = pages(folder, "questions")
+    status, answer = page.save("q01", {"decision": "edit", "answerable": False, "short_answer": "71"})
+    assert status == 409 and answer["code"] == "change_not_kept" and not labels_file(folder, "questions").exists()
+
+
+def test_a_same_field_change_after_a_conflict_is_saved_as_sent_and_shown_as_saved(tmp_path, pages):
+    folder = field(tmp_path)
+    one, two = pages(folder, "questions"), pages(folder, "questions")
+    assert one.save("q01", {"decision": "edit", "text": "Window one's wording of the question?"}, base=0)[0] == 200
+    status, answer = two.save("q01", {"decision": "edit", "text": "  Window two's wording of the question?  "}, base=1)
+    assert status == 200 and answer["label"]["text"] == "Window two's wording of the question?"  # as typed, trimmed
+    assert one.get("/api/data")[1]["labels"]["q01"]["text"] == answer["label"]["text"]  # what every page then shows
+    a, b = pick(two, "2601.00001v1", 2), pick(two, "2601.00002v2", 0)
+    assert two.save("q01", {"decision": "edit", "evidence": [[a]]}, base=2)[0] == 200
+    status, answer = one.save("q01", {"decision": "edit", "evidence": [[b]]}, base=3)
+    assert status == 200 and [[loc["paper"] for loc in ev] for ev in answer["label"]["evidence"]] == [["2601.00002v2"]]

@@ -159,6 +159,13 @@
   function editBody() {
     const question = item();
     const form = el('form', { class: 'edit', on: { submit: (event) => { event.preventDefault(); saveEdit(); } } });
+    if (editing.showSaved) {  // after a conflict: the question as saved elsewhere, above the rater's open edit
+      const saved = effective(question);
+      form.append(el('section', { class: 'saved-elsewhere', 'aria-label': t('edit.savedElsewhere') },
+        el('h3', { text: t('edit.savedElsewhere') }), el('p', { lang: question.query_language, text: saved.text }),
+        saved.answerable ? el('p', { lang: question.query_language, text: `${t('q.shortAnswer')}: ${saved.short_answer}` })
+          : el('p', { text: t('q.unanswerable') })));
+    }
     form.append(el('h3', { text: t('edit.heading') }),
       el('label', { for: 'editText', text: t('edit.text') }),
       el('textarea', { id: 'editText', rows: '3', lang: question.query_language,
@@ -299,9 +306,11 @@
       pending = null;
       data.labels[request.item] = answer.body.label;
       if (editing) {
-        // The open edit stays as typed; saving it again sends only the changes made in it, on top of the label
-        // the other window saved.
-        setStatus(t('status.conflictEditing', { n }));
+        // Not saved. The open edit stays as typed, with the label as saved now shown above it; saving it again
+        // sends only the changes made in it, on top of that label.
+        editing.showSaved = true;
+        render();
+        setStatus(answer.body.code === 'change_not_kept' ? t('status.changeNotKept', { n }) : t('status.conflictEditing', { n }));
       } else {
         render();
         setStatus(t('status.conflict', { n }));

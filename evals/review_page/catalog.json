@@ -77,7 +77,9 @@
   "q.revert": "Revert to the drafted question",
   "error.keep_would_revert": "This question was edited. Keep keeps the edit; to go back to the draft, choose Revert.",
   "q.dropEdited": "Drop this edited question? Its edit will no longer apply.",
-  "status.conflictEditing": "Item {n} was saved in another window. Your open edit is kept: saving it applies only the changes you made in it, on top of what was saved there."
+  "status.conflictEditing": "Item {n} was saved in another window. Your open edit is kept: saving it applies only the changes you made in it, on top of what was saved there.",
+  "status.changeNotKept": "Item {n} is not saved: in another window the question was changed so that your change would not be kept (it is now unanswerable). Your edit is kept below, and the question as saved is shown above it.",
+  "edit.savedElsewhere": "As saved now"
  },
  "zh-CN": {
   "page.title": "标准集审阅",
@@ -157,6 +159,8 @@
   "q.revert": "恢复为草稿中的问题",
   "error.keep_would_revert": "此问题已被编辑。“保留”会保留编辑；如需恢复草稿，请选择“恢复”。",
   "q.dropEdited": "要删除这个已编辑的问题吗？它的编辑将不再适用。",
-  "status.conflictEditing": "第 {n} 项已在另一个窗口中保存。你正在进行的编辑已保留：保存时只会在那边已保存的内容之上应用你在此所做的更改。"
+  "status.conflictEditing": "第 {n} 项已在另一个窗口中保存。你正在进行的编辑已保留：保存时只会在那边已保存的内容之上应用你在此所做的更改。",
+  "status.changeNotKept": "第 {n} 项未保存：另一个窗口对问题的修改会使你的更改无法保留（问题现已标为无法回答）。你的编辑保留在下方，已保存的问题显示在其上方。",
+  "edit.savedElsewhere": "当前已保存的版本"
  }
 }

@@ -58,6 +58,7 @@ button[aria-pressed="true"] { background: var(--accent); color: var(--accent-fg)
 .passage figcaption { display: flex; flex-wrap: wrap; gap: 0 1rem; font-size: 0.875rem; color: var(--muted); }
 .passage blockquote { margin: 0.25rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .evidence { margin: 0.5rem 0; }
+.saved-elsewhere { margin: 0 0 1rem; padding: 0.5rem 0.75rem; border: 1px solid var(--changed); border-radius: 6px; }
 .edit label { display: block; margin-top: 0.75rem; font-weight: 600; }
 .edit label.check { display: flex; gap: 0.5rem; align-items: center; }
 .edit textarea, .edit input[type="text"], .edit input[type="search"], .edit select { width: 100%; font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem; }
