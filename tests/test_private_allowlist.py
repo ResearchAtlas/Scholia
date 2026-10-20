@@ -443,3 +443,27 @@ async def test_a_private_turn_is_refused_when_the_endpoint_listing_reports_a_com
                                     json={"content": "SECRET-INTERVIEW", "model": ZDR_MODEL})
         assert (refused.status_code, refused.json()["code"]) == (400, "route_unsupported")
         assert provider.chats == []
+
+
+
+async def test_a_private_turn_is_bounded_by_a_zero_retention_variant_its_routing_reaches(tmp_path):
+    # External review a3 (A9), its reproduction: the catalog's usable tag is the base slug "example";
+    # the model's endpoint listing also has "example/turbo" with a 16,384 window, a 1,024 completion limit
+    # and higher prices. provider.only ["example"] reaches it, so the request is sized and priced for it.
+    provider = provider_for_private()
+    provider.endpoints[ZDR_MODEL] = [
+        {"tag": "example", "context_length": 131072, "pricing": {"prompt": "0", "completion": "0"}},
+        {"tag": "example/turbo", "context_length": 16384, "max_completion_tokens": 1024,
+         "pricing": {"prompt": "0.00001", "completion": "0.00003"}}]
+    async with started(tmp_path / "data", provider) as client:
+        _, conversation = await private_conversation(client)
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "x " * 20000, "model": ZDR_MODEL})
+        assert (refused.status_code, refused.json()["code"]) == (400, "message_over_window")  # 16,384, not 131,072
+        assert (await send(client, conversation, model=ZDR_MODEL))[-1]["status"] == "succeeded"
+        body = provider.answers[-1]
+        assert body["max_tokens"] == 1024 and body["provider"]["only"] == ["example"]
+        [(estimate,)] = await rows(client, "SELECT b.estimate_usd FROM budget_reservations b JOIN runs r"
+                                           " ON r.id = b.run_id WHERE r.kind = 'turn'")
+        assert estimate >= 1024 * 0.00003 > 0  # the variant's price, never $0
+        await background_idle(client)

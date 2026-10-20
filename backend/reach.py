@@ -15,7 +15,7 @@ endpoint that publishes no prompt or completion rate is not estimated: the route
 import math
 from dataclasses import dataclass
 
-from backend import endpoint_pricing
+from backend import endpoint_pricing, openrouter
 from backend.budget_router import UNKNOWN_RATES
 from backend.openrouter_client import COMPRESSION_WINDOW
 
@@ -36,34 +36,45 @@ def _related(tag, pin):
     return tag == pin or tag.startswith(pin + "/")
 
 
+def reachable(listing, provider):
+    """The endpoints of listing an OpenRouter request carrying this `provider` routing (openrouter.routing)
+    can reach, as OpenRouter routes it: a tag in provider.only reaches itself and, as a base slug, its
+    variants ("example" reaches "example/turbo"); provider.ignore excludes the same way; a pin with no
+    fallbacks reaches only what the pin names. Every bound reach computes comes from this one set."""
+    found = list(listing)
+    if provider.get("zdr"):  # limited to its zero-retention endpoints, or none
+        only = provider.get("only") or ()
+        found = [e for e in found if any(_related(e["tag"], tag) for tag in only)]
+    found = [e for e in found if not any(_related(e["tag"], tag) for tag in provider.get("ignore") or ())]
+    if provider.get("order") and provider.get("allow_fallbacks") is False:
+        found = [e for e in found if _related(e["tag"], provider["order"][0])]
+    return found
+
+
 def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -> Reach:
     """What a request on provider for the model whose catalog row is row can reach, given the model's
-    endpoint listing (None when it could not be read). pin is the one endpoint tag the request is
-    pinned to, which must then be the only endpoint it can reach (rule 1); needs the parameters the
-    request relies on."""
+    endpoint listing (None when it could not be read): the endpoints the routing it sends lets it reach
+    (reachable), narrowed to those that take every parameter it needs (provider.require_parameters).
+    pin is the one endpoint tag the request is pinned to, which must then be the only endpoint it can
+    reach (rule 1). The window, the completion limit, the rates and Private's 8,192-token rule are all
+    read from that same set, variants of a base slug included."""
     if not provider.is_openrouter:
         return Reach((), (row or {}).get("context_length"), UNKNOWN_RATES)
     if listing is None:
         return Reach((), None, UNKNOWN_RATES, "route_unverified")
-    found = list(listing)
-    if zero_retention:
-        usable = set(((row or {}).get("zdr_endpoints") or {}).get("usable") or ())
-        # Section 6.4: a Private request reaches no endpoint whose window is 8,192 tokens or less,
-        # where OpenRouter compresses by default, by the endpoint listing's own report too; a usable
-        # tag that is a base slug reaches its variants as well, so theirs count.
-        related = [e for e in found if any(_related(e["tag"], tag) for tag in usable)]
-        if any(not e["context_length"] or e["context_length"] <= COMPRESSION_WINDOW for e in related):
-            return Reach((), None, UNKNOWN_RATES, "route_unsupported")
-        found = [e for e in found if e["tag"] in usable]
-        if {e["tag"] for e in found} != usable:  # an endpoint it may reach is not described
-            return Reach((), None, UNKNOWN_RATES, "route_unverified")
-    if pin is not None:
-        found = [e for e in found if _related(e["tag"], pin)]
-        if [e["tag"] for e in found] != [pin]:  # a base slug names several endpoints, or none
-            return Reach((), None, UNKNOWN_RATES, "route_unsupported")
+    routing = openrouter.routing(row, zdr_enabled=zero_retention, pin=pin, require=bool(needs))
+    found = reachable(listing, routing)
+    if zero_retention and not {tag for tag in routing.get("only") or ()} <= {e["tag"] for e in found}:
+        return Reach((), None, UNKNOWN_RATES, "route_unverified")  # an endpoint it may reach is not described
+    if pin is not None and [e["tag"] for e in found] != [pin]:  # a base slug names several endpoints, or none
+        return Reach((), None, UNKNOWN_RATES, "route_unsupported")
     if needs:
         found = [e for e in found if set(needs) <= set(e["supported_parameters"] or ())]
     if not found:
+        return Reach((), None, UNKNOWN_RATES, "route_unsupported")
+    # Section 6.4: a Private request reaches no endpoint whose window is 8,192 tokens or less, where
+    # OpenRouter compresses by default, by the endpoint listing's own report too.
+    if zero_retention and any(not e["context_length"] or e["context_length"] <= COMPRESSION_WINDOW for e in found):
         return Reach((), None, UNKNOWN_RATES, "route_unsupported")
     # The smallest window any of them reports; one that reports none leaves it to a setting, which
     # can lower this but never raise it (providers.window).

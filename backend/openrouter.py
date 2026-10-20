@@ -197,6 +197,30 @@ def resolve_model_reasoning(route, effort: str | None, *, model_entry=None, capa
     return reasoning, capability.get("provider_pinned") if reasoning is not None else None
 
 
+def routing(model_entry, *, zdr_enabled=False, pin=None, require=False) -> dict:
+    """The `provider` routing an OpenRouter request carries (Scholia): the one description of which
+    endpoints it can reach, which backend/reach.py reads to bound the request (reachable).
+
+    A Private request carries provider.zdr = true and is limited to the model's zero-retention
+    endpoints above the window where OpenRouter compresses by default (provider.only), never its
+    smaller ones (provider.ignore; slice 1 section 6.4); without them in the catalog's row, the gate
+    refuses it. A pinned request goes to that endpoint alone. require: provider.require_parameters."""
+    provider = {}
+    if zdr_enabled:
+        provider["zdr"] = True  # never weakened
+        endpoints = (model_entry or {}).get("zdr_endpoints") or {}
+        if endpoints.get("usable"):
+            provider["only"] = list(endpoints["usable"])
+            if endpoints.get("small"):
+                provider["ignore"] = list(endpoints["small"])
+    if pin:
+        provider["order"] = [pin]
+        provider["allow_fallbacks"] = False
+    if require:
+        provider["require_parameters"] = True
+    return provider
+
+
 def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens=None, model_entry=None,
                   capability_records=None) -> dict:
     """The request body. Raises ValueError for zero-retention routing off OpenRouter,
@@ -209,24 +233,10 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
         payload["max_tokens"] = max_tokens
     reasoning, pin = resolve_model_reasoning(route, effort, model_entry=model_entry,
                                              capability_records=capability_records, zdr_enabled=zdr_enabled)
-    provider = {}
-    if zdr_enabled:
-        provider["zdr"] = True  # never weakened
-        # Only the model's zero-retention endpoints above the window where OpenRouter compresses
-        # by default, and never its smaller ones (slice 1 section 6.4). Without them in the
-        # catalog's row, the gate refuses the request.
-        endpoints = (model_entry or {}).get("zdr_endpoints") or {}
-        if endpoints.get("usable"):
-            provider["only"] = list(endpoints["usable"])
-            if endpoints.get("small"):
-                provider["ignore"] = list(endpoints["small"])
-    if pin and route.provider.is_openrouter:
-        provider["order"] = [pin]
-        provider["allow_fallbacks"] = False
-    if (reasoning or max_tokens is not None) and route.provider.is_openrouter:
-        # Parameters the request relies on (the output limit, reasoning): an endpoint that would ignore
-        # one is not used, and with none left the request fails rather than run without it (rule 2).
-        provider["require_parameters"] = True
+    # Parameters the request relies on (the output limit, reasoning): an endpoint that would ignore one
+    # is not used, and with none left the request fails rather than run without it (rule 2).
+    provider = routing(model_entry, zdr_enabled=zdr_enabled, pin=pin,
+                       require=bool(reasoning or max_tokens is not None)) if route.provider.is_openrouter else {}
     if provider:
         payload["provider"] = provider
     if reasoning:

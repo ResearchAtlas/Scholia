@@ -142,9 +142,9 @@ def test_what_a_request_can_reach():
     # A pin must name exactly one endpoint: a base slug that reaches a variant too is refused.
     assert reach.reach(OPENROUTER, {}, listing, pin="b").tags == ("b",)
     assert reach.reach(OPENROUTER, {}, listing, pin="a").problem == "route_unsupported"
-    # Private: only the zero-retention endpoints it is limited to, each of which must be described.
+    # Private: only the zero-retention endpoints it is limited to, and the variants a base slug reaches.
     row = {"zdr_endpoints": {"usable": ["a"], "small": []}}
-    assert reach.reach(OPENROUTER, row, listing, zero_retention=True).tags == ("a",)
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True).tags == ("a", "a/turbo")
     assert reach.reach(OPENROUTER, {"zdr_endpoints": {"usable": ["c"]}}, listing,
                        zero_retention=True).problem == "route_unverified"
     assert reach.reach(OPENROUTER, {}, None).problem == "route_unverified"  # no listing read
@@ -226,3 +226,43 @@ def test_a_private_request_never_reaches_an_endpoint_the_listing_reports_at_8192
     # A variant of a usable base slug is reachable through it: its window counts too (review a4, P3-1).
     variant = {**listing[0], "tag": "example/turbo", "context_length": 4096}
     assert reach.reach(OPENROUTER, row, [*listing, variant], zero_retention=True).problem == "route_unsupported"
+
+
+
+def _variant_case(**variant):
+    from backend.openrouter import routing
+    row = {"zdr_endpoints": {"usable": ["example"], "small": []}}
+    base = {"tag": "example", "context_length": 131072, "max_completion_tokens": 16384,
+            "supported_parameters": ["max_tokens"], "pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+    listing = [base, {**base, "tag": "example/turbo", **variant}]
+    return row, listing, routing(row, zdr_enabled=True, require=True)
+
+
+def test_the_bounds_and_the_routing_sent_come_from_one_set_of_endpoints():
+    # External review a3 (A9): the routing a request sends (provider.only ["example"]) reaches the
+    # variant "example/turbo", so the variant's smaller window, smaller completion limit or higher price
+    # changes the request's bound, or a variant that cannot be bounded refuses the route.
+    from backend import reach
+    row, listing, routing = _variant_case()
+    assert routing["only"] == ["example"] and [e["tag"] for e in reach.reachable(listing, routing)] == [
+        "example", "example/turbo"]
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).tags == (
+        "example", "example/turbo")
+    for variant, field, expected in (({"context_length": 16384}, "window", 16384),
+                                     ({"max_completion_tokens": 1024}, "output", 1024)):
+        row, listing, _ = _variant_case(**variant)
+        assert getattr(reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)),
+                       field) == expected, variant
+    row, listing, _ = _variant_case(pricing={"prompt": "0.00003", "completion": "0.00006"})
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).rates == {
+        "input": 0.00003, "output": 0.00006, "request": 0.0}
+    for variant in ({"context_length": 8192}, {"context_length": None}, {"pricing": {}}):
+        row, listing, _ = _variant_case(**variant)
+        assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).problem \
+            in ("route_unsupported", "route_unpriced"), variant
+    # A variant that does not take a required parameter is excluded by require_parameters, as the bound is.
+    row, listing, routing = _variant_case(supported_parameters=[], context_length=16384)
+    assert reach.reach(OPENROUTER, row, listing, zero_retention=True, needs=("max_tokens",)).window == 131072
+    # An ignored tag (a small endpoint) and its variants are reached by neither the routing nor the bound.
+    assert reach.reachable([{"tag": "s/x"}, {"tag": "big"}], {"zdr": True, "only": ["big", "s"], "ignore": ["s"]}) \
+        == [{"tag": "big"}]
