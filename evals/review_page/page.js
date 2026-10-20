@@ -109,7 +109,7 @@
     body.push(el('div', { class: 'actions' },
       el('button', { type: 'button', 'aria-keyshortcuts': 'K', text: edited ? t('q.keepEdited') : t('q.keep'), on: { click: keepShown } }),
       el('button', { type: 'button', 'aria-keyshortcuts': 'E', text: t('q.edit'), on: { click: startEdit } }),
-      el('button', { type: 'button', 'aria-keyshortcuts': 'D', text: t('q.drop'), on: { click: () => decide({ decision: 'drop' }) } }),
+      el('button', { type: 'button', 'aria-keyshortcuts': 'D', text: t('q.drop'), on: { click: dropShown } }),
       edited ? el('button', { type: 'button', text: t('q.revert'), on: { click: () => decide({ decision: 'keep' }, { revert: true }) } }) : null));
     return body;
   }
@@ -117,6 +117,13 @@
   // A passage as the page sends it back: its paper, ordinal and the key the server gave it, so that a
   // passage is never saved under another paper.
   const choice = (loc) => ({ paper: loc.paper, ordinal: loc.ordinal, key: loc.key });
+
+  // Dropping an edited question discards its edit: asked first, so a stray key press loses nothing.
+  function dropShown() {
+    const label = data.labels[item().id];
+    if (label?.state === 'done' && label.decision === 'edit' && !window.confirm(t('q.dropEdited'))) return;
+    decide({ decision: 'drop' });
+  }
 
   // Keep keeps what the page shows: after an edit, the edit as saved (going back to the draft is Revert).
   function keepShown() {
@@ -133,6 +140,10 @@
     editing = { text: shown.text, short_answer: shown.short_answer ?? '', answerable: shown.answerable,
                 evidence: shown.evidence.map((ev) => ev.map((loc) => ({ ...loc }))),
                 paper: shown.evidence[0]?.[0]?.paper ?? Object.keys(data.papers)[0], filter: '', target: 'new' };
+    // What the form started from: a save sends only what the rater changed from it, and the server keeps
+    // every other field as saved (another window's edit included), so nothing is overwritten unasked.
+    editing.from = { text: editing.text, short_answer: editing.short_answer, answerable: editing.answerable,
+                     evidence: evidenceKey(editing.evidence) };
     render();
     $('editText')?.focus();
   }
@@ -207,26 +218,19 @@
     return box;
   }
 
+  const evidenceKey = (evidence) => JSON.stringify(evidence.map((ev) => ev.map((loc) => [loc.paper, loc.ordinal])));
+
   function saveEdit() {
-    const before = effective(item());
+    const from = editing.from;
     const label = { decision: 'edit' };
-    const key = (evidence) => JSON.stringify(evidence.map((ev) => ev.map((loc) => [loc.paper, loc.ordinal])));
-    if (editing.text !== before.text) label.text = editing.text;
-    if (editing.answerable !== before.answerable) label.answerable = editing.answerable;
-    if (editing.answerable && editing.short_answer !== (before.short_answer ?? '')) label.short_answer = editing.short_answer;
-    if (editing.answerable && key(editing.evidence) !== key(before.evidence)) {
+    if (editing.text !== from.text) label.text = editing.text;
+    if (editing.answerable !== from.answerable) label.answerable = editing.answerable;
+    if (editing.answerable && editing.short_answer !== from.short_answer) label.short_answer = editing.short_answer;
+    if (editing.answerable && evidenceKey(editing.evidence) !== from.evidence) {
       label.evidence = editing.evidence.map((ev) => ev.map(choice));
     }
     if (Object.keys(label).length === 1) { setStatus(t('error.edit_needs_a_change')); return; }
-    const saved = data.labels[item().id];  // an edit of an edit carries the earlier edit's other fields
-    if (saved?.state === 'done' && saved.decision === 'edit') {
-      for (const name of ['text', 'short_answer', 'answerable', 'evidence']) {
-        if (name in saved && !(name in label)) label[name] = name === 'evidence'
-          ? saved.evidence.map((ev) => ev.map(choice)) : saved[name];
-      }
-      if (label.answerable === false) { delete label.short_answer; delete label.evidence; }
-    }
-    decide(label);
+    decide(label);  // an edit builds on the saved one on the server: what it does not name stays as saved
   }
 
   function pairBody(pair) {
@@ -294,8 +298,14 @@
     } else if (answer.status === 409) {
       pending = null;
       data.labels[request.item] = answer.body.label;
-      if (!editing) render();  // an open edit stays as typed: saving it again is a deliberate choice
-      setStatus(t('status.conflict', { n }));
+      if (editing) {
+        // The open edit stays as typed; saving it again sends only the changes made in it, on top of the label
+        // the other window saved.
+        setStatus(t('status.conflictEditing', { n }));
+      } else {
+        render();
+        setStatus(t('status.conflict', { n }));
+      }
     } else if (answer.status === 400 || answer.status === 413) {
       pending = null;
       setStatus(t(`error.${answer.body?.code ?? 'label_invalid'}`));
@@ -316,7 +326,7 @@
     const actions = data.kind === 'pairs'
       ? { 1: () => decide({ category: 'supported' }), 2: () => decide({ category: 'partly' }), 3: () => decide({ category: 'unsupported' }) }
       : editing ? { escape: () => { editing = null; render(); } }
-        : { k: keepShown, e: startEdit, d: () => decide({ decision: 'drop' }) };
+        : { k: keepShown, e: startEdit, d: dropShown };
     const move = { arrowleft: () => go(index - 1), arrowright: () => go(index + 1) };
     const action = actions[key] ?? (editing ? null : move[key]);
     if (action) { event.preventDefault(); action(); }

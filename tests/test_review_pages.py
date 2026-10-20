@@ -540,3 +540,52 @@ def test_a_label_file_whose_edits_break_the_rules_opens_no_page_and_never_become
     # A label for an item changed since is not applied, so its content is checked at its next save
     bad["labels"]["q01"] = {"item_sha256": "older", "revision": 1, "saved_at": "t", "decision": "edit", "evidence": []}
     assert gold.check_labels(bad, doc, papers) == []
+
+
+def test_a_conflicting_window_saving_only_what_it_changed_keeps_the_other_windows_edit(tmp_path, pages):
+    folder = field(tmp_path)
+    one, two = pages(folder, "questions"), pages(folder, "questions")
+    assert one.save("q01", {"decision": "edit", "text": "How many of 100 synthetic questions did dense retrieval answer?"},
+                    base=0)[0] == 200
+    # Window two had opened its edit before: changing only the short answer, it is first told of the conflict
+    assert two.save("q01", {"decision": "edit", "short_answer": "71"}, base=0)[0] == 409
+    # and saving again sends only that change, on top of window one's saved edit
+    status, answer = two.save("q01", {"decision": "edit", "short_answer": "71"}, base=1)
+    assert status == 200 and answer["label"]["text"].startswith("How many of 100") and answer["label"]["short_answer"] == "71"
+
+
+def test_an_edit_making_a_question_unanswerable_keeps_no_answer_or_evidence(tmp_path, pages):
+    folder = field(tmp_path)
+    page = pages(folder, "questions")
+    status, answer = page.save("q01", {"decision": "edit", "answerable": False, "short_answer": "71",
+                                       "evidence": [[pick(page, "2601.00001v1", 2)]]})
+    assert status == 200 and answer["label"] == {**answer["label"], "answerable": False}
+    assert "short_answer" not in answer["label"] and "evidence" not in answer["label"]
+
+
+def test_a_passage_key_names_its_paper_and_ordinal_as_well_as_its_text():
+    keys = {gold.passage_key(paper, ordinal, "The same text.") for paper in ("a", "b") for ordinal in (1, 2)}
+    assert len(keys) == 4 and gold.passage_key("a", 1, "The  same text") == gold.passage_key("a", 1, "the same TEXT.")
+
+
+@pytest.mark.parametrize("label, state", [
+    ({"decision": "edit", "text": 5}, "done"),
+    ({"decision": "edit", "text": None}, "done"),
+    ({"decision": "edit", "evidence": [[{"paper": ["x"], "ordinal": 1, "page": 1, "kind": "paragraph",
+                                         "section_path": [], "quote": "q", "attribution": "a", "license": "l"}]]}, "done"),
+    ({"decision": "edit", "evidence": "abc"}, "changed"),
+    ({"decision": "edit", "evidence": [5]}, "changed"),
+    ({"decision": "edit", "evidence": [[{"paper": "2601.00001v1", "ordinal": 1}]]}, "changed"),
+])
+def test_a_malformed_labels_file_is_refused_naming_the_label_never_a_crash(tmp_path, label, state):
+    folder = field(tmp_path)
+    doc = json.loads((folder / "questions.json").read_text())
+    path = labels_file(folder, "questions")
+    path.parent.mkdir()
+    sha = gold.item_sha256(doc["items"][0]) if state == "done" else "an older version"
+    path.write_text(json.dumps({"set": doc["id"], "kind": "questions", "field": 2, "rater": "harold", "set_sha256": "x",
+                                "labels": {"q01": {"item_sha256": sha, "revision": 1, "saved_at": "t", **label}}}))
+    with pytest.raises(gold.Refused, match="label q01"):
+        gold.Review(2, folder, "questions", "harold")
+    report = asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
+    assert any(p.startswith("field2-questions.harold.json: label q01") for p in report["problems"])

@@ -133,10 +133,10 @@ def sha256_of(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def passage_key(text):
-    """A short digest of a passage's letters and digits: the page sends it back with each passage it picks,
-    so a choice that pairs one paper with another paper's passage is refused, never saved."""
-    return hashlib.sha256(_key(text).encode()).hexdigest()[:16]
+def passage_key(paper, ordinal, text):
+    """A short digest of a passage's paper, ordinal and letters and digits: the page sends it back with each
+    passage it picks, so a choice that pairs one paper with another paper's passage is refused, never saved."""
+    return hashlib.sha256(f"{paper}\0{ordinal}\0{_key(text)}".encode()).hexdigest()[:16]
 
 
 def item_sha256(item):
@@ -172,8 +172,10 @@ def language_problem(text, language):
     English none. English terms and full-width punctuation in Chinese text are fine.
     ponytail: GB2312 stands for Simplified Chinese; a rare simplified character outside it is refused too,
     and is then written another way."""
-    if language not in LANGUAGES:
+    if not isinstance(language, str) or language not in LANGUAGES:
         return f"language {language!r} is not one of {list(LANGUAGES)}"
+    if not isinstance(text, str):
+        return "not text"
     han = [ch for ch in text if _han(ch)]
     if language == "en":
         return "marked en but holds Chinese characters" if han else None
@@ -266,6 +268,8 @@ def check_locator(where, loc, field, papers):
                      + (("attribution", "license") if field == 2 else ()))
     if problems:
         return problems
+    if not isinstance(loc["paper"], str):
+        return [f"{where}: paper is not a paper's id"]
     paper = papers.get(loc["paper"])
     if paper is None:
         return [f"{where}: paper {loc['paper']!r} is not in papers.json"]
@@ -403,19 +407,40 @@ def check_labels(doc, set_doc, papers, rater=None):
                 problems.append(f"label {item}: category {label.get('category')!r}")
         else:
             found = _keys(f"label {item}", label, ("item_sha256", "revision", "saved_at", "decision"), EDITS)
-            if not found and label["decision"] not in DECISIONS:
-                found.append(f"label {item}: decision {label['decision']!r}")
-            if not found and (label["decision"] == "edit") != any(k in label for k in EDITS):
-                found.append(f"label {item}: an edit names what it changes; keep and drop change nothing")
-            drafted = items.get(item)
-            if not found and drafted is not None and label_state(drafted, label) == "done":
-                made = labeled(drafted, label)
-                if made is not None:
-                    found += [f"label {item}: {p}" for p in check_question(made, set_doc["field"], papers)]
+            if not found:
+                try:
+                    found = label_content_problems(item, label, items.get(item), set_doc["field"], papers)
+                except Exception as error:  # noqa: BLE001 a hand-edited file of any shape is refused, never a crash
+                    found = [f"label {item}: malformed ({type(error).__name__})"]
             problems += found
         if isinstance(label, dict) and not (isinstance(label.get("revision"), int) and label["revision"] >= 1):
             problems.append(f"label {item}: revision is not a count")
     return problems
+
+
+def label_content_problems(item_id, label, drafted, field, papers):
+    """A question label's content problems: its decision; each field it changes, of the right type, its
+    evidence locators each checked as a draft's are (whatever the item's state, since the page shows them);
+    and for an item as it now is (one the label will be applied to), the question it leaves must pass every
+    rule a draft passes."""
+    where = f"label {item_id}"
+    if label["decision"] not in DECISIONS:
+        return [f"{where}: decision {label['decision']!r}"]
+    if (label["decision"] == "edit") != any(k in label for k in EDITS):
+        return [f"{where}: an edit names what it changes; keep and drop change nothing"]
+    found = [f"{where}: {name} is not text" for name in ("text", "short_answer")
+             if name in label and not isinstance(label[name], str)]
+    if "answerable" in label and not isinstance(label["answerable"], bool):
+        found.append(f"{where}: answerable is not true or false")
+    if "evidence" in label:
+        if not (isinstance(label["evidence"], list) and all(isinstance(ev, list) and ev for ev in label["evidence"])):
+            return found + [f"{where}: evidence is not a list of evidence items"]
+        found += [p for ev in label["evidence"] for loc in ev for p in check_locator(f"{where} evidence", loc, field, papers)]
+    if not found and drafted is not None and label_state(drafted, label) == "done":
+        made = labeled(drafted, label)
+        if made is not None:
+            found += [f"{where}: {p}" for p in check_question(made, field, papers)]
+    return found
 
 
 def mix(kind, items):
@@ -901,7 +926,7 @@ def judge_scores(labels, verdicts, settings=None):
 
 
 def keyed(evidence):
-    return [[{**loc, "key": passage_key(loc["quote"])} for loc in ev] for ev in evidence]
+    return [[{**loc, "key": passage_key(loc["paper"], loc["ordinal"], loc["quote"])} for loc in ev] for ev in evidence]
 
 
 class Review:
@@ -1021,7 +1046,7 @@ class Review:
     def paper_passages(self, paper):
         if paper not in self.passages:
             return None
-        return [{**{k: p[k] for k in ("ordinal", "page", "kind", "section_path", "text")}, "key": passage_key(p["text"])}
+        return [{**{k: p[k] for k in ("ordinal", "page", "kind", "section_path", "text")}, "key": passage_key(paper, p["ordinal"], p["text"])}
                 for p in self.passages[paper].values()]
 
     def locator(self, choice):
@@ -1029,7 +1054,7 @@ class Review:
         if not (isinstance(choice, dict) and set(choice) == {"paper", "ordinal", "key"}):
             raise ValueError("evidence_invalid")
         found = self.passages.get(choice["paper"], {}).get(choice["ordinal"])
-        if found is None or isinstance(choice["ordinal"], bool) or choice["key"] != passage_key(found["text"]):
+        if found is None or isinstance(choice["ordinal"], bool) or choice["key"] != passage_key(choice["paper"], found["ordinal"], found["text"]):
             raise ValueError("evidence_invalid")  # not that paper's passage as the page was shown it
         loc = {"paper": choice["paper"], "ordinal": found["ordinal"], "page": found["page"], "kind": found["kind"],
                "section_path": found["section_path"], "quote": found["text"]}
@@ -1103,7 +1128,8 @@ class Review:
                 # An edit builds on the saved one: what it does not name stays as saved, never silently dropped
                 given = {**{k: current[k] for k in EDITS if k in current and k != "evidence"},
                          **({"evidence": [[{"paper": loc["paper"], "ordinal": loc["ordinal"],
-                                            "key": passage_key(loc["quote"])} for loc in ev]
+                                            "key": passage_key(loc["paper"], loc["ordinal"], loc["quote"])}
+                                           for loc in ev]
                                           for ev in current["evidence"]]} if "evidence" in current else {}),
                          **given}
             try:

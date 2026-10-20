@@ -75,7 +75,9 @@
   "edit.discard": "Leave this question? Your unsaved edit will be lost.",
   "q.keepEdited": "Keep as edited",
   "q.revert": "Revert to the drafted question",
-  "error.keep_would_revert": "This question was edited. Keep keeps the edit; to go back to the draft, choose Revert."
+  "error.keep_would_revert": "This question was edited. Keep keeps the edit; to go back to the draft, choose Revert.",
+  "q.dropEdited": "Drop this edited question? Its edit will no longer apply.",
+  "status.conflictEditing": "Item {n} was saved in another window. Your open edit is kept: saving it applies only the changes you made in it, on top of what was saved there."
  },
  "zh-CN": {
   "page.title": "标准集审阅",
@@ -153,6 +155,8 @@
   "edit.discard": "要离开这个问题吗？尚未保存的编辑将会丢失。",
   "q.keepEdited": "按编辑保留",
   "q.revert": "恢复为草稿中的问题",
-  "error.keep_would_revert": "此问题已被编辑。“保留”会保留编辑；如需恢复草稿，请选择“恢复”。"
+  "error.keep_would_revert": "此问题已被编辑。“保留”会保留编辑；如需恢复草稿，请选择“恢复”。",
+  "q.dropEdited": "要删除这个已编辑的问题吗？它的编辑将不再适用。",
+  "status.conflictEditing": "第 {n} 项已在另一个窗口中保存。你正在进行的编辑已保留：保存时只会在那边已保存的内容之上应用你在此所做的更改。"
  }
 }
