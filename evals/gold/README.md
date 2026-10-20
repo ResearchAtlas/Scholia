@@ -28,12 +28,12 @@ A locator names the paper, the passage's ordinal in the app's own reading (secti
   - The long-context group's query also returned method papers that test on long-context benchmarks, and the draw kept them.
   - They were prepared on 2026-10-20 under the M2 charter's section 6, from arXiv itself. Each group's candidates were filtered by primary category, first-submission date, QASPER and language, then drawn with the group's recorded seed.
   - **Recorded limits.**
-    - Each license rests on that exact version's own abstract page alone. arXiv's API returns no license field, so no second source could confirm it; arXiv's license help page says a license is chosen per version.
+    - Each license rests on that exact version's own abstract page alone. The arXiv API listings used carry no license field, and no other metadata source was queried; arXiv's license help page says a license is chosen per version.
     - Each group's candidates were also filtered by a title pattern, to keep the group coherent.
     - The retrieval-augmented generation group drew from the 200 most recent of 1,525 listing results.
   - `papers.json` records the criteria, queries, patterns and seeds.
 - **The drafting.** Claude drafted the questions and pairs in its own session from the passage worksheet (`gold.py passages`). No tool called a model.
-  - Each answerable question's evidence is the passages that answer it, and every quote is a whole passage of the app's own reading. The check confirmed every locator against the pinned PDFs.
+  - Each answerable question's evidence is the passages that answer it, and every quote is a whole passage of the app's own reading (without the noncharacter U+FFFE that PDF extraction leaves at a line-break hyphen). The check confirmed every locator against the pinned PDFs.
   - Each unanswerable question was checked by searching every paper's passages for its subject. No retrieval was run over the drafted questions, because they are held out.
   - Pair sentences are written in new words. Unsupported pairs are near misses: a wrong number, a reversed finding, an overclaim. Partly supported pairs join a supported claim to one the passage does not make.
 - **The samples.** The second rater's samples (`sample-*.json`) were drawn once, before any labeling.

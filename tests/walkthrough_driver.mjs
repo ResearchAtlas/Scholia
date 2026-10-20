@@ -1558,8 +1558,10 @@ async function goldPages(ctx) {
     let order;
     await step('81-gold-pairs', async () => {
       await open(['--set', 'pairs', '--rater', 'harold']);
-      order = await page.evaluate(() => fetch('/api/data', { headers: { 'X-Scholia-Client': 'local',
-        'X-Scholia-Session': sessionStorage.getItem('gold.session') } }).then((r) => r.json()).then((d) => d.items.map((i) => i.id)));
+      const served = await page.evaluate(() => fetch('/api/data', { headers: { 'X-Scholia-Client': 'local',
+        'X-Scholia-Session': sessionStorage.getItem('gold.session') } }).then((r) => r.text()));
+      order = JSON.parse(served).items.map((i) => i.id);
+      check('the page is served no drafted category and no verdict', !/drafted_category|verdict|"(supported|partly|unsupported)"/.test(served));
       for (const [n, key] of [[1, '1'], [2, '2'], [3, '3']]) {
         await page.keyboard.press(key);
         await status().getByText(G('status.saved', { n })).waitFor();

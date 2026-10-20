@@ -238,17 +238,26 @@
 
   function go(i) {
     if (i < 0 || i >= data.items.length) return;
+    if (editing && !window.confirm(t('edit.discard'))) return;  // an open edit is never dropped unasked
     index = i;
     editing = null;
     render();
     $('itemHeading').focus();
   }
 
+  let saving = false;  // one save at a time: a second key press while one is on its way is ignored
+
   function decide(label) {
     send({ item: item().id, base: data.labels[item().id]?.revision ?? 0, label });
   }
 
   async function send(request) {
+    if (saving) return;
+    saving = true;
+    try { await save(request); } finally { saving = false; }
+  }
+
+  async function save(request) {
     pending = request;
     const n = data.items.findIndex((it) => it.id === request.item) + 1;
     setStatus(t('status.saving'));

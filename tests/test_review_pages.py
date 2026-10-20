@@ -4,6 +4,7 @@ Each test registers the server's port with the network block, which refuses ever
 Lifecycle cases first: a save that fails, a save cut off, a labels file that is not this set's.
 """
 
+import contextlib
 import http.client
 import json
 import re
@@ -432,3 +433,29 @@ def test_the_command_prints_the_address_and_serves_until_stopped(tmp_path, monke
     out = capsys.readouterr().out
     assert started and re.search(r"open: http://127\.0\.0\.1:\d+/#session=[\w-]{43}&lang=zh-CN", out)
     assert f"labels: {labels_file(folder, 'pairs')}" in out
+
+
+def test_field_ones_colleague_sees_only_the_sampled_items_papers(tmp_path, pages):
+    folder = field(tmp_path, 1, sample=True)
+    page = pages(folder, "questions", rater="lee", number=1, sample=True, colleague=True)
+    data = page.get("/api/data")[1]
+    cited = {loc["paper"] for item in data["items"] for ev in item["evidence"] for loc in ev}
+    assert set(data["papers"]) == cited
+    for paper in ("p-wages", "p-zh"):
+        assert page.get(f"/api/passages?paper={paper}")[0] == (200 if paper in cited else 404)
+    harold = pages(folder, "questions", number=1)
+    assert set(harold.get("/api/data")[1]["papers"]) == {"p-wages", "p-zh"}
+
+
+def test_a_lock_that_cannot_be_taken_says_not_saved(tmp_path, pages, monkeypatch):
+    folder = field(tmp_path)
+    page = pages(folder, "pairs")
+
+    @contextlib.contextmanager
+    def refused():
+        raise PermissionError(13, "Permission denied")
+        yield
+    monkeypatch.setattr(page.review, "file_lock", refused)
+    status, payload, _ = page.request("POST", "/api/label", {"item": "p01", "base": 0, "label": {"category": "partly"}})
+    assert status == 500 and json.loads(payload) == {"code": "not_saved"}
+    assert page.get("/api/data")[0] == 500

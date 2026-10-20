@@ -669,3 +669,50 @@ def test_the_committed_field_two_drafts_pass_their_checks_and_meet_the_settings(
         sample = json.loads((gold.FIELD2 / f"sample-{kind}.json").read_text())
         assert sample == gold.draw(doc, settings) and len(sample["items"]) == 20
     assert not (gold.FIELD2 / "labels").exists()  # nothing is labeled in M2
+
+
+def test_sigterm_stops_a_command_as_ctrl_c_does_leaving_its_marker_and_no_data_folder(tmp_path, monkeypatch):
+    import signal
+    folder, pdfs = pdf_field(tmp_path)
+    seen = []
+
+    async def held(state):
+        os.kill(os.getpid(), signal.SIGTERM)  # as `kill <pid>` would
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(tier1, "until_read", held)
+    monkeypatch.setattr(gold, "reading_app", opener(seen))
+    with pytest.raises(SystemExit, match="stopped"):
+        gold.main(["passages", "--field", "2", "--folder", str(folder), "--pdfs", str(pdfs)])
+    assert json.loads((gold.outputs(folder) / "worksheet.json").read_text())["status"] == "incomplete"
+    assert seen and not seen[0].parent.exists()
+
+
+def test_a_refusal_before_any_work_still_replaces_an_earlier_finished_report(tmp_path):
+    folder, pdfs = pdf_field(tmp_path)
+    gold.write_json(gold.outputs(folder) / "check.json", {"status": "finished", "problems": []})
+    with pytest.raises(tier1.Refused, match="--qasper"):
+        asyncio.run(gold.check(2, folder, pdfs, None, opener()))
+    written = json.loads((gold.outputs(folder) / "check.json").read_text())
+    assert written["status"] == "incomplete" and "--qasper" in written["reason"]
+
+
+def test_a_written_file_is_owner_only_from_its_creation_even_over_an_old_part_file(tmp_path, monkeypatch):
+    path = tmp_path / "a" / "b" / "x.json"
+    path.parent.mkdir(parents=True)
+    (path.parent / "x.json.part").write_text("cut off")
+    os.chmod(path.parent / "x.json.part", 0o644)
+    modes = []
+    real = os.replace
+    monkeypatch.setattr(gold.os, "replace", lambda a, b: modes.append(stat.S_IMODE(os.stat(a).st_mode)) or real(a, b))
+    gold.write_json(path, {"a": 1})
+    assert modes == [0o600] and stat.S_IMODE(path.stat().st_mode) == 0o600
+    deep = tmp_path / "c" / "d" / "y.json"
+    gold.write_json(deep, {})
+    assert all(stat.S_IMODE(p.stat().st_mode) == 0o700 for p in (tmp_path / "c", tmp_path / "c" / "d"))
+
+
+def test_apply_and_agreement_take_only_a_plainly_named_rater(tmp_path):
+    folder = field(tmp_path)
+    for argv in (["apply", "--rater", "../../x"], ["agreement", "--raters", "harold", "../x"]):
+        with pytest.raises(SystemExit, match="rater"):
+            gold.main([argv[0], "--field", "2", "--folder", str(folder), "--set", "pairs", *argv[1:]])

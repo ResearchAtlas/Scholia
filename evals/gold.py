@@ -41,6 +41,7 @@ import os
 import random
 import re
 import secrets
+import signal
 import sys
 import tempfile
 import threading
@@ -109,12 +110,18 @@ def outputs(folder):
 
 
 def write_json(path, data):
-    """Written whole (tier1.write_atomic), owner-only, in a folder made owner-only if it is made here."""
+    """Written whole, as tier1.write_atomic writes (a part file, synced, then renamed over the file), and
+    owner-only from its creation: the part file is made 0600, and every folder made here 0700."""
     path = Path(path)
-    if not path.parent.exists():
-        path.parent.mkdir(mode=0o700, parents=True)
-    tier1.write_atomic(path, data)
-    os.chmod(path, 0o600)
+    for folder in reversed([p for p in (path.parent, *path.parent.parents) if not p.exists()]):
+        folder.mkdir(mode=0o700)
+    part = path.with_name(path.name + ".part")
+    with os.fdopen(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)  # a part file left by an earlier cut-off save keeps its mode otherwise
+        f.write(json.dumps(data, ensure_ascii=False, indent=1) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(part, path)
 
 
 def read_json(path):
@@ -480,6 +487,12 @@ async def read_papers(client, state, papers, pdfs):
     return out, project
 
 
+def readable(text):
+    """A passage's text without the noncharacters PDF extraction leaves at a line-break hyphen (U+FFFE): the
+    worksheet, the quotes and the page show it so; quotes are compared by letters and digits either way."""
+    return text.replace("\ufffe", "").replace("\uffff", "")
+
+
 def worksheet(field, doc, papers_sha256, read):
     """The drafter's worksheet: every paper's passages as the app reads them, with what a locator needs;
     reference passages marked not usable. `finished` only when every paper was read whole."""
@@ -497,10 +510,15 @@ def worksheet(field, doc, papers_sha256, read):
         if field == 2:
             entry.update(attribution=attribution(paper), license=paper["license"])
         entry["passages"] = [{"ordinal": p["ordinal"], "page": p["page"], "kind": p["kind"],
-                              "section_path": p["section_path"], "usable": p["kind"] != "reference", "text": p["text"]}
+                              "section_path": p["section_path"], "usable": p["kind"] != "reference",
+                              "text": readable(p["text"])}
                              for p in r["passages"]]
         sheet["papers"][pid] = entry
     return sheet
+
+
+def locators_of_item(kind, item):
+    return [loc for ev in item["evidence"] for loc in ev] if kind == "questions" else [item["passage"]]
 
 
 def locators_of(kind, items):
@@ -581,16 +599,17 @@ async def write_when_done(out, make):
     return result
 
 
-async def check(field, folder, pdfs=None, qasper=None, open_app=reading_app, settings=None):
+async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=None):
     """The field's report: the paper list, each set and labels file checked; with pdfs, every locator
     resolved on the app's reading; with qasper, field 2's papers checked against QASPER's. Written to the
     output folder's check.json; `status: finished` and `problems` empty when everything holds."""
     settings = settings or load_settings()
-    doc, papers_sha256, sets = load_field(field, folder)
-    if field == 2 and pdfs is not None and qasper is None:
-        raise Refused("field 2's check with the PDFs also needs --qasper (QASPER's papers are left out)")
+    open_app = open_app or reading_app
 
     async def make():
+        doc, papers_sha256, sets = load_field(field, folder)
+        if field == 2 and pdfs is not None and qasper is None:
+            raise Refused("field 2's check with the PDFs also needs --qasper (QASPER's papers are left out)")
         problems = check_papers(doc, field, settings)
         papers = {p["id"]: p for p in doc["papers"]} if not problems else {}
         report = {"status": "finished", "field": field, "papers_sha256": papers_sha256, "papers": len(papers),
@@ -648,14 +667,15 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=reading_app, set
     return await write_when_done(outputs(folder) / "check.json", make)
 
 
-async def passages(field, folder, pdfs, open_app=reading_app, settings=None):
+async def passages(field, folder, pdfs, open_app=None, settings=None):
     """The passage worksheet (D1): every listed paper read by the app, written to the output folder."""
     settings = settings or load_settings()
-    doc, papers_sha256, _ = load_field(field, folder)
-    if problems := check_papers(doc, field, settings):
-        raise Refused("; ".join(problems[:5]))
+    open_app = open_app or reading_app
 
     async def make():
+        doc, papers_sha256, _ = load_field(field, folder)
+        if problems := check_papers(doc, field, settings):
+            raise Refused("; ".join(problems[:5]))
         verify_pdfs(doc["papers"], pdfs)
         with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
             async with open_app(Path(tmp) / "data") as (client, state):
@@ -714,7 +734,8 @@ def apply(set_doc, labels):
             items.append({**item, "provisional": True})
     counts = {**out, "orphaned": sum(1 for i in labels["labels"] if i not in {x["id"] for x in set_doc["items"]})}
     return {"id": f"{set_doc['id']}.corrected", "kind": set_doc["kind"], "field": set_doc["field"], "corrected": True,
-            "rater": labels["rater"], "set_sha256": item_sha256(set_doc), "labels_sha256": item_sha256(labels),
+            "rater": labels["rater"], "set_content_sha256": item_sha256(set_doc),
+            "labels_content_sha256": item_sha256(labels),
             "counts": counts, "items": items}
 
 
@@ -889,6 +910,10 @@ class Review:
                 raise Refused(f"{path} is not a finished worksheet of this paper list: write it again")
             self.passages = {pid: {p["ordinal"]: p for p in entry["passages"] if p["usable"]}
                              for pid, entry in sheet["papers"].items()}
+        self.shown_papers = set(self.papers)
+        if self.sample is not None and field == 1:  # the colleague sees the sampled items' papers, no more
+            self.shown_papers = {loc["paper"] for i in order for loc in locators_of_item(kind, self.items[i])}
+            self.passages = {pid: found for pid, found in self.passages.items() if pid in self.shown_papers}
         self.path = folder / "labels" / f"{self.set['id']}.{rater}.json"
         self.notices = []
         if self.path.with_name(self.path.name + ".part").exists():
@@ -950,7 +975,7 @@ class Review:
             self.labels = self.read_labels()
             return {"kind": self.kind, "field": self.field, "set": self.set["id"], "rater": self.rater,
                     "sample": self.sample is not None, "notices": self.notices,
-                    "papers": {pid: p["title"] for pid, p in self.papers.items()},
+                    "papers": {pid: p["title"] for pid, p in self.papers.items() if pid in self.shown_papers},
                     "items": [self.shown(self.items[i]) for i in self.order],
                     "labels": {i: self.shown_label(i) for i in self.order if i in self.labels},
                     "done": self.done(), "total": len(self.order)}
@@ -1092,7 +1117,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.command == "GET" and path == "/api/data":
             try:
                 return self._send(200, review.data())
-            except Refused:  # the labels file was changed to something unreadable meanwhile: left as it is
+            except (Refused, OSError):  # the labels file unreadable meanwhile (left as it is), or its folder
                 return self._send(500, {"code": "labels_unreadable"})
         if self.command == "GET" and path == "/api/passages":
             found = review.paper_passages((parse_qs(urlsplit(self.path).query).get("paper") or [""])[0])
@@ -1107,8 +1132,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"code": "label_invalid"})
             try:
                 return self._send(*review.save(body))
-            except Refused:
-                return self._send(500, {"code": "labels_unreadable"})
+            except (Refused, OSError):  # nothing was written: the labels file unreadable, or its lock not taken
+                return self._send(500, {"code": "not_saved"})
         return self._send(404, {"code": "not_found"})
 
 
@@ -1126,6 +1151,15 @@ def serve(review, lang="en"):
 
 
 # The command line
+
+
+def stoppable(work):
+    """Run a command's coroutine so that SIGTERM stops it as Ctrl-C does: cancelled, so its incomplete
+    marker stays and its temporary data folder is removed (as tier1's run)."""
+    async def main_task():
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+        return await work
+    return asyncio.run(main_task())
 
 
 def main(argv=None):
@@ -1158,12 +1192,12 @@ def main(argv=None):
                 parser.error("field 2's worksheet needs --pdfs")
             pdfs = folder / "pdfs"
         if args.command == "check":
-            report = asyncio.run(check(args.field, folder, pdfs, args.qasper))
+            report = stoppable(check(args.field, folder, pdfs, args.qasper))
             print(json.dumps(report, ensure_ascii=False, indent=1))
             if report["problems"]:
                 sys.exit(f"{len(report['problems'])} problems")
         elif args.command == "passages":
-            sheet = asyncio.run(passages(args.field, folder, pdfs))
+            sheet = stoppable(passages(args.field, folder, pdfs))
             print(f"{outputs(folder) / 'worksheet.json'}: {sheet['status']}"
                   + (f", not read whole: {sheet['not_read_whole']}" if sheet["not_read_whole"] else ""))
         elif args.command == "review":
@@ -1187,6 +1221,9 @@ def main(argv=None):
                 write_json(out, draw(set_doc, load_settings()))
                 print(f"{out}: {len(read_json(out)['items'])} items")
             else:
+                if not all(RATER.fullmatch(r) for r in (args.raters if args.command == "agreement" else [args.rater])):
+                    raise Refused("a rater is named with lower-case letters, digits and hyphens")
+
                 def labels_of(rater):
                     path = folder / "labels" / f"{set_doc['id']}.{rater}.json"
                     labels = read_json(path)
@@ -1202,6 +1239,8 @@ def main(argv=None):
                     print(f"{out}: {corrected['counts']}")
     except (Refused, OSError, ValueError) as refused:
         sys.exit(f"refused: {refused}")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        sys.exit("stopped: the output file says incomplete")
 
 
 if __name__ == "__main__":
