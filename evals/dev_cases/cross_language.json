@@ -1,0 +1,186 @@
+{
+ "about": "Thirty QASPER v0.3 test questions (AllenAI, CC BY 4.0), drawn with seed 20261021 from the questions with text evidence in tier 1's small fixed subset, each translated into Chinese for S1-19 by Claude and keyed by its paper and question id. The English question, the paper and the annotators' evidence are QASPER's own, read from the prepared set; only the Chinese wording is committed. Cross-language development cases: they do not establish the Chinese result (ticket 72 E3).",
+ "seed": 20261021,
+ "cases": [
+  {
+   "id": "xl-01",
+   "paper": "1911.12722",
+   "question_id": "87b65b538d79e1218fa19aaac71e32e9b49208df",
+   "question_zh": "这个语料库的文本都来自哪些领域？"
+  },
+  {
+   "id": "xl-02",
+   "paper": "1908.11664",
+   "question_id": "940a16e9db8be5b5f4e67d9c7622b3df99ac10a5",
+   "question_zh": "这篇论文研究了哪些领域？"
+  },
+  {
+   "id": "xl-03",
+   "paper": "2003.11687",
+   "question_id": "814e945668e2b6f31b088918758b120fb00ada7d",
+   "question_zh": "构建的数据集有多大？"
+  },
+  {
+   "id": "xl-04",
+   "paper": "1603.00957",
+   "question_id": "cbb4eba59434d596749408be5b923efda7560890",
+   "question_zh": "神经关系抽取模型和哪些基线做了比较？"
+  },
+  {
+   "id": "xl-05",
+   "paper": "1908.11046",
+   "question_id": "77bbe1698e001c5889217be3164982ea36e85752",
+   "question_zh": "基线模型有哪些？"
+  },
+  {
+   "id": "xl-06",
+   "paper": "1909.04242",
+   "question_id": "8b49423b7d1fa834128aa5038aa16c6ef3fdfa32",
+   "question_zh": "跨数据集评估用了哪些数据集？"
+  },
+  {
+   "id": "xl-07",
+   "paper": "1906.01076",
+   "question_id": "1002bd01372eba0f3078fb4a951505278ed45f2e",
+   "question_zh": "他们有没有和其他模型做比较？"
+  },
+  {
+   "id": "xl-08",
+   "paper": "2004.04124",
+   "question_id": "f6346828c2f44529dc307abf04dd246bfeb4a9b2",
+   "question_zh": "他们有没有评估哪种压缩方法带来的提升最大？"
+  },
+  {
+   "id": "xl-09",
+   "paper": "1805.04579",
+   "question_id": "c2745e44ebe7dd57126b784ac065f0b7fc2630f1",
+   "question_zh": "他们有没有和最先进的摘要方法做比较？"
+  },
+  {
+   "id": "xl-10",
+   "paper": "1911.03642",
+   "question_id": "159025c44c0115ab4cdc253885384f72e592e83a",
+   "question_zh": "硬去偏如何影响预测中的性别偏见和模型性能？"
+  },
+  {
+   "id": "xl-11",
+   "paper": "1909.00871",
+   "question_id": "3138f916e253abed643d3399aa8a4555b2bd8c0f",
+   "question_zh": "用了哪些实证比较方法？"
+  },
+  {
+   "id": "xl-12",
+   "paper": "1601.03313",
+   "question_id": "e6204daf4efeb752fdbd5c26e179efcb8ddd2807",
+   "question_zh": "他们是怎么衡量语法正确性的？"
+  },
+  {
+   "id": "xl-13",
+   "paper": "1803.08419",
+   "question_id": "8fdb4f521d3ba4179f8ccc4c28ba399aab6c3550",
+   "question_zh": "早期开创性工作中提出对话代理用来做什么？"
+  },
+  {
+   "id": "xl-14",
+   "paper": "1603.01547",
+   "question_id": "df7fb8e6e44c9c5af3f19dde762c75cbf2f8452f",
+   "question_zh": "他们的模型表现如何？"
+  },
+  {
+   "id": "xl-15",
+   "paper": "1605.05156",
+   "question_id": "8ddf78dbdc6ac964a7102ae84df18582841f2e3c",
+   "question_zh": "一共有多少名标注者？"
+  },
+  {
+   "id": "xl-16",
+   "paper": "2004.03090",
+   "question_id": "d038e5d2a6f85e68422caaf8b96cb046db6599fa",
+   "question_zh": "标注是怎么做的？"
+  },
+  {
+   "id": "xl-17",
+   "paper": "2003.12660",
+   "question_id": "80bb07e553449bde9ac0ff35fcc718d7c161f2d4",
+   "question_zh": "他们的数据集有多长？"
+  },
+  {
+   "id": "xl-18",
+   "paper": "2004.03090",
+   "question_id": "b9d9803ba24127f91ba4d7cff4da11492da20f09",
+   "question_zh": "他们和哪些基线做了比较？"
+  },
+  {
+   "id": "xl-19",
+   "paper": "1605.05156",
+   "question_id": "76ae794ced3b5ae565f361451813f2f3bc85b214",
+   "question_zh": "用了哪些数据集？"
+  },
+  {
+   "id": "xl-20",
+   "paper": "1708.07252",
+   "question_id": "d2f91303cec132750a416192f67c8ac1d3cf6fc0",
+   "question_zh": "缓存机制是什么？"
+  },
+  {
+   "id": "xl-21",
+   "paper": "1910.12203",
+   "question_id": "7ef34b4996ada33a4965f164a8f96e20af7470c0",
+   "question_zh": "他们达到的最高准确率是多少？"
+  },
+  {
+   "id": "xl-22",
+   "paper": "1909.07158",
+   "question_id": "ec54ae2f4811196fcaafa45e76130239e69995f9",
+   "question_zh": "基线是什么？"
+  },
+  {
+   "id": "xl-23",
+   "paper": "1610.09722",
+   "question_id": "742d5e182b57bfa5f589fde645717ed0ac3f49c2",
+   "question_zh": "用哪些指标来评估模型？"
+  },
+  {
+   "id": "xl-24",
+   "paper": "1704.04451",
+   "question_id": "a59e86a15405c8a11890db072b99fda3173e5ab2",
+   "question_zh": "训练数据集有多长？"
+  },
+  {
+   "id": "xl-25",
+   "paper": "1905.08392",
+   "question_id": "9f8c0e02a7a8e9ee69f4c1757817cde85c7944bd",
+   "question_zh": "使用基于依存树的递归结构的动机是什么？"
+  },
+  {
+   "id": "xl-26",
+   "paper": "1808.00957",
+   "question_id": "a398c9b061f28543bc77c2951d0dfc5d1bee9e87",
+   "question_zh": "他们用的是哪个数据集？"
+  },
+  {
+   "id": "xl-27",
+   "paper": "1711.03759",
+   "question_id": "a064d01d45a33814947161ff208abb88d4353b26",
+   "question_zh": "现有的标注工具有哪些？"
+  },
+  {
+   "id": "xl-28",
+   "paper": "1709.06365",
+   "question_id": "0fee37ebe0a010cf8bd665fa566306d8e7d12631",
+   "question_zh": "他们和哪些融合了元信息的模型做了比较？"
+  },
+  {
+   "id": "xl-29",
+   "paper": "1709.09749",
+   "question_id": "1237b6fcc64b43901415f3ded17cc210a54ab698",
+   "question_zh": "用的是什么数据集？"
+  },
+  {
+   "id": "xl-30",
+   "paper": "1708.07252",
+   "question_id": "22375aac4cbafd252436b756bdf492a05f97eed8",
+   "question_zh": "实验用了哪些语言？"
+  }
+ ]
+}

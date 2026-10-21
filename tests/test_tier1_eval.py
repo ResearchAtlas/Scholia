@@ -279,6 +279,90 @@ async def test_a_deadline_fallback_is_counted_and_marked_but_scored_as_the_app_r
     assert hybrid["metrics_without_fallbacks"]["ndcg@10"]["n"] == 0 and results["status"] == "finished"
 
 
+
+# S1-19: the rerank arm (ticket 70; ticket 72 E)
+
+def reranking(scores=None, hold=False):
+    """before_yield for opener: the stand-in reranker beside the embedding helper, as desktop_app adds the
+    real one with --reranker; scores answer each rerank (the stand-in's 1 / (rank + 1) otherwise), and
+    hold keeps every rerank past its deadline."""
+    async def add(client):
+        from test_local_helper import RERANKER_PIN, RERANKER_WEIGHTS
+        path = client.state["data_dir"] / "reranker.gguf"
+        path.write_bytes(RERANKER_WEIGHTS)
+        client.state["local_helper"].add(RERANKER_PIN, path)
+        client.remote.rerank_scores = scores
+        if hold:
+            client.remote.rerank_hold = asyncio.Event()
+    return add
+
+
+@pytest.mark.asyncio
+async def test_the_rerank_arm_reorders_the_hybrid_top_and_is_paired_with_the_hybrid_arm(tmp_path):
+    seen = []
+
+    async def recording(state, project_id, query):
+        answer = await tier1.rerank(state, project_id, query)
+        seen.append(answer)
+        return answer
+    reverse = [float(i) for i in range(24)]  # the stand-in scores the last of the top 24 highest
+    _, out, running = await _run(tmp_path, ["scifact"], open_app=opener(before_yield=reranking(reverse)),
+                                 arms={"keyword_only": tier1.keyword_only, "rerank": recording, "hybrid": tier1.hybrid})
+    results = await running
+    assert results["status"] == "finished" and results["arms"] == ["keyword_only", "rerank", "hybrid"]
+    assert results["rerank_model"]["file"] == "qwen3-reranker-0.6b-q8_0.gguf"
+    assert results["model_settings"]["reranker"] is None  # the hybrid arms' settings, like for like with the baseline
+    arm = results["benchmarks"]["scifact"]["arms"]["rerank"]
+    assert arm["complete"] and arm["fallbacks"] == {} and "minus_hybrid" in arm  # rule E's paired difference
+    assert all(answer["rerank"]["order"] and answer["results"][0]["passage_id"] == answer["rerank"]["order"][0]
+               for answer in seen)
+    assert all(len(answer["results"]) == len({r["passage_id"] for r in answer["results"]}) for answer in seen)
+
+
+@pytest.mark.asyncio
+async def test_a_rerank_past_its_deadline_keeps_the_fused_order_counted_and_scored(tmp_path):
+    from test_search import setting
+
+    async def slow(client):
+        await setting(client, "retrieval.rerank_ms", 100)
+        await reranking(hold=True)(client)
+    plain = []
+
+    async def hybrid(state, project_id, query):
+        answer = await tier1.hybrid(state, project_id, query)
+        plain.append([r["passage_id"] for r in answer["results"]])
+        return answer
+    reranked = []
+
+    async def rerank(state, project_id, query):
+        answer = await tier1.rerank(state, project_id, query)
+        reranked.append([r["passage_id"] for r in answer["results"]])
+        return answer
+    _, out, running = await _run(tmp_path, ["scifact"], open_app=opener(before_yield=slow),
+                                 arms={"rerank": rerank, "hybrid": hybrid})
+    results = await running
+    arm = results["benchmarks"]["scifact"]["arms"]["rerank"]
+    assert arm["complete"] is True and arm["fallbacks"] == {"rerank_deadline": 3}  # the product's own fallback
+    assert arm["metrics_without_fallbacks"]["ndcg@10"]["n"] == 0
+    assert reranked == plain  # the fused order stands
+
+
+def test_a_reranker_that_cannot_serve_keeps_the_arm_from_being_scored():
+    out = {"rerank": {"outcomes": [("hybrid", None), ("hybrid", "rerank_unavailable")], "seconds": {},
+                      "digests": ["a", "b"]}}
+    bench = {"ids_committable": False, "resample": "query", "metrics": [{"name": "ndcg@10", "k": 10}]}
+    record = tier1.summarize(bench, {"resamples": 10, "seed": 1, "level": 0.95}, [{"key": "a"}, {"key": "b"}], out,
+                             {"rerank": [{"ndcg@10": 1.0}, {"ndcg@10": 0.0}]})
+    assert record["arms"]["rerank"]["complete"] is False and "scores" not in record["arms"]["rerank"]
+
+
+def test_the_reranker_file_is_checked_against_its_pin(tmp_path):
+    wrong = tmp_path / "reranker.gguf"
+    wrong.write_bytes(b"not the reranker")
+    with pytest.raises(tier1.Refused, match="the reranker"):
+        tier1.check_models(tier1.load_manifest(), tmp_path / "llama-server", tmp_path / "model.gguf", wrong)
+
+
 # Success paths
 
 

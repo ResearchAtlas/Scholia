@@ -4,7 +4,8 @@ and written to one results file.
 
     sandbox-exec -f tests/loopback-only.sb uv run --no-sync python -I evals/tier1.py run \\
         --level subset|full --sets <folder holding the prepared sets> \\
-        --helper <Scholia.app>/Contents/MacOS/llama-server --model <Qwen3-Embedding-0.6B-Q8_0.gguf> --out FILE
+        --helper <Scholia.app>/Contents/MacOS/llama-server --model <Qwen3-Embedding-0.6B-Q8_0.gguf> \\
+        [--reranker <qwen3-reranker-0.6b-q8_0.gguf>] --out FILE
     uv run --no-sync python -I evals/tier1.py compare BASELINE RUN
 
 Each benchmark's files are added and read (and keyword-indexed) before the search model is imported,
@@ -20,7 +21,8 @@ through it. Every project is review-locked, so nothing is looked up and nothing 
 under the loopback-only sandbox; the helper's sockets are listed with lsof.
 
 The arms (ARMS) are plain named async functions of (state, project id, query) returning search's
-answer, so S1-19 adds a rerank arm without changing the runner. The results file is written whole,
+answer; with --reranker, S1-19's rerank arm runs too (RERANK_ARMS), its paired difference from the hybrid
+arm being ticket 72's rule E comparison. The results file is written whole,
 when the run ends (an `incomplete` marker stands in its place meanwhile): `status: finished` only when
 every benchmark ran to its end with every arm run as named, every reading succeeded and no socket off
 loopback, `status: incomplete` with the reason or the gaps otherwise (an interrupted run, a refusal, a
@@ -92,9 +94,12 @@ def verify(manifest, sets, names):
     return found
 
 
-def check_models(manifest, helper, model):
-    """The helper bundle (its SHA-256 manifest) and the embedding model, checked before use."""
-    from backend.local_helper import EMBEDDING_MODEL, binary_problem, mismatch
+def check_models(manifest, helper, model, reranker=None):
+    """The helper bundle (its SHA-256 manifest), the embedding model and the reranker, if any, checked
+    before use."""
+    from backend.local_helper import EMBEDDING_MODEL, RERANKER_MODEL, binary_problem, mismatch
+    if reranker is not None and (problem := mismatch(Path(reranker), RERANKER_MODEL)):
+        raise Refused(f"the reranker: {problem}")
     if EMBEDDING_MODEL["sha256"] != manifest["model_settings"]["embedding_model"]["sha256"]:
         raise Refused("the app's embedding pin differs from the manifest's")
     if problem := mismatch(Path(model), EMBEDDING_MODEL):
@@ -273,10 +278,37 @@ async def keyword_only(state, project_id, query):
     return await search({**state, "local_helper": _NoDense()}, project_id, query, MAX_LIMIT)
 
 
+async def rerank(state, project_id, query):
+    """S1-19's rerank arm (ticket 70; slice-1 spec section 7.4 step 4): the hybrid arm's answer with its top
+    `rerank_top` reordered by the pinned Qwen3-Reranker-0.6B Q8_0 within `rerank_ms`, through the answer
+    pipeline's own rerank step (backend/pipeline.py, reranked); past the deadline, or when the reranker
+    cannot serve, the fused order stands and the answer's reason says so (`rerank_deadline`,
+    `rerank_unavailable`); a deadline is counted like the hybrid deadline, a reranker that cannot serve
+    keeps the arm from being scored. Run only with --reranker."""
+    from backend.local_helper import RERANKER_MODEL
+    from backend.pipeline import reranked
+    from backend.settings import load_settings
+    answer = await hybrid(state, project_id, query)
+    results = answer["results"]
+    helper = state["local_helper"].helpers[RERANKER_MODEL["id"]]
+    values = load_settings(state["data_dir"]).values["retrieval"]
+    order, note = await reranked(query, [r["passage_id"] for r in results], {r["passage_id"]: r["text"] for r in results},
+                                 lambda q, texts, deadline: helper.rerank(q, texts, deadline=deadline, project_id=project_id),
+                                 values)
+    if order is None:
+        return {**answer, "reason": answer["reason"] or ("rerank_deadline" if note["fallback"] == "deadline"
+                                                         else "rerank_unavailable"), "rerank": note}
+    by_id = {r["passage_id"]: r for r in results}
+    return {**answer, "results": [by_id[pid] for pid in order] + results[len(order):], "rerank": note}
+
+
 # keyword_only first: the hybrid arm, last, keeps the helper running for the socket check after the arms
 ARMS = {"keyword_only": keyword_only, "hybrid": hybrid}
+RERANK_ARMS = {"keyword_only": keyword_only, "rerank": rerank, "hybrid": hybrid}  # with --reranker
 # What each arm's answers must say (mode, reason) to count as that arm; an arm S1-19 adds names its own.
-EXPECTED = {"hybrid": ("hybrid", None), "keyword_only": ("keyword_only", "reference_arm")}
+EXPECTED = {"hybrid": ("hybrid", None), "keyword_only": ("keyword_only", "reference_arm"), "rerank": ("hybrid", None)}
+# The product's own fallbacks, scored as returned and counted: the hybrid deadline, and the rerank step's.
+OWN_FALLBACKS = {"hybrid": {"deadline"}, "rerank": {"deadline", "rerank_deadline"}}
 
 
 # Building a benchmark through the app
@@ -501,16 +533,16 @@ def summarize(bench, boot, queries, arms_out, scores):
         expected = EXPECTED.get(arm, ("hybrid", None))
         marked = [i for i, outcome in enumerate(out["outcomes"]) if tuple(outcome) != expected]
         reasons = Counter(out["outcomes"][i][1] or out["outcomes"][i][0] for i in marked)
-        # Only the hybrid deadline is the product's own fallback: scored as returned, and counted. Any other
-        # reason means the arm did not run as named: it gets no score, and its queries are marked.
-        complete = set(reasons) <= {"deadline"} if arm == "hybrid" else not marked
+        # Only the deadlines are the product's own fallbacks (OWN_FALLBACKS): scored as returned, and counted.
+        # Any other reason means the arm did not run as named: it gets no score, and its queries are marked.
+        complete = set(reasons) <= OWN_FALLBACKS[arm] if arm in OWN_FALLBACKS else not marked
         entry = {"complete": complete, "fallbacks": dict(reasons), "fallback_queries": marked,
                  "search_seconds": out["seconds"], "ranking_digests": out["digests"]}
         if complete:
             entry["scores"] = {s["name"]: [None if row[s["name"]] is None else round(row[s["name"]], 6)
                                            for row in scores[arm]] for s in bench["metrics"]}
             entry["metrics"] = metric_summary(bench, boot, entry["scores"], groups, specific)
-            if marked:  # the deadline's keyword-only answers, counted above, also left out
+            if marked:  # the deadlines' answers, counted above, also left out
                 entry["metrics_without_fallbacks"] = metric_summary(bench, boot, entry["scores"], groups, specific,
                                                                     set(marked))
         record["arms"][arm] = entry
@@ -661,9 +693,11 @@ def model_settings(state, values):
 
 
 @contextlib.asynccontextmanager
-async def desktop_app(data_dir, helper, model):
+async def desktop_app(data_dir, helper, model, reranker=None):
     """The app on a new data folder as the desktop runs it; yields (client, state, install), install
-    importing the embedding model through the API."""
+    importing the embedding model through the API. With reranker (the pinned Qwen3-Reranker-0.6B Q8_0's
+    file, checked by check_models), a helper of its own for the rerank arm (local_helper.Local.add, as
+    S1-16's timings do): no setting or offer exposes it."""
     import httpx
     from backend import local_helper
     from backend.app import create_app
@@ -675,6 +709,8 @@ async def desktop_app(data_dir, helper, model):
             async def install():
                 await _post(client, "/api/helper/models/import",
                             {"model": local_helper.EMBEDDING, "path": str(Path(model).resolve())}, 200)
+            if reranker is not None:
+                app.app.state.scholia["local_helper"].add(local_helper.RERANKER_MODEL, Path(reranker).resolve())
             yield client, app.app.state.scholia, install
 
 
@@ -701,6 +737,9 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
                "commit": commit(), "machine": machine(), "reference_machine": manifest["reference_machine"],
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "load_average_start": os.getloadavg(),
                "arms": list(arms), "bootstrap": manifest["bootstrap"], "benchmarks": {}}
+    if "rerank" in arms:  # the rerank arm's model; model_settings stays the hybrid arms' (like for like)
+        from backend.local_helper import RERANKER_MODEL
+        results["rerank_model"] = {k: RERANKER_MODEL[k] for k in ("id", "file", "size", "sha256")}
     began = time.perf_counter()
     # Whatever was at out before (a run killed outright leaves this marker, never an older finished file)
     write_atomic(out, {**{k: results[k] for k in ("level", "benchmarks_asked", "commit", "started_at")},
@@ -726,7 +765,9 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
                     helper = next(iter(local.helpers.values()), None) if local is not None else None
                     pid = getattr(getattr(helper, "_process", None), "pid", None)
                     record["helper_sockets"] = sockets(pid) if pid else None
-                    record["not_loopback_sockets"] = not_loopback([os.getpid(), pid] if pid else [os.getpid()])
+                    others = [p for h in (local.helpers.values() if local is not None else ())  # the reranker's too
+                              if (p := getattr(getattr(h, "_process", None), "pid", None)) and p != pid]
+                    record["not_loopback_sockets"] = not_loopback([os.getpid(), *([pid] if pid else []), *others])
                 results["benchmarks"][name] = record
     except BaseException as error:  # interrupted, refused or failed: said so, never a finished-looking file
         write_atomic(out, {**{k: results[k] for k in ("level", "benchmarks_asked", "commit", "started_at")},
@@ -876,6 +917,7 @@ def main(argv=None):
     go.add_argument("--sets", required=True, help="the folder holding the prepared sets (the manifest's folders)")
     go.add_argument("--helper", required=True, help="the bundle's llama-server")
     go.add_argument("--model", required=True, help="Qwen3-Embedding-0.6B-Q8_0.gguf")
+    go.add_argument("--reranker", help="qwen3-reranker-0.6b-q8_0.gguf: adds S1-19's rerank arm")
     go.add_argument("--benchmarks", nargs="+", help="only these of the level's benchmarks")
     go.add_argument("--out", type=Path, required=True)
     against = sub.add_parser("compare")
@@ -902,7 +944,7 @@ def main(argv=None):
     write_atomic(args.out, {"status": "incomplete", "reason": "checking the inputs", "level": args.level})
     try:
         files = verify(manifest, args.sets, names)
-        check_models(manifest, args.helper, args.model)
+        check_models(manifest, args.helper, args.model, args.reranker)
     except (Refused, OSError) as refused:  # a file missing or unreadable is refused like one that differs
         reason = str(refused) if isinstance(refused, Refused) else f"{type(refused).__name__}: {refused}"
         write_atomic(args.out, {"status": "incomplete", "reason": f"refused: {reason}", "level": args.level})
@@ -912,7 +954,8 @@ def main(argv=None):
         task = asyncio.current_task()
         asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)  # cleaned up as for Ctrl-C
         return await run(manifest, args.level, names, files, args.out,
-                         lambda data: desktop_app(data, args.helper, args.model))
+                         lambda data: desktop_app(data, args.helper, args.model, args.reranker),
+                         RERANK_ARMS if args.reranker else ARMS)
     results = asyncio.run(main_task())
     print(json.dumps({name: {arm: entry.get("metrics") for arm, entry in bench["arms"].items()}
                       for name, bench in results["benchmarks"].items()}, indent=1))
