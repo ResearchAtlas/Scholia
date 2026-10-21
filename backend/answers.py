@@ -10,7 +10,9 @@ bodies it sent; and an answer's citations, resolved again or checked again.
   (`body_removed`), never its text.
 - `POST /api/citations/resolve`: each citation's existence now (a batch existence check): its passage
   still read by its paper, or its quote held by a current reading of the paper (status.md, decided
-  2026-10-17 (8)), else `source_removed`. Nothing is written.
+  2026-10-17 (8)), else `source_removed`; a paper not read yet by this app's extractor (its file just
+  replaced, or being read again) keeps the stored existence. Nothing is written. The conversation read and
+  the trace use it only to mark a found citation removed.
 - `POST /api/citations/check`: the support judge again on an answer's citations, as background runs of
   the project (workflow `citation_check`), one per batch of up to `[retrieval] judge_pairs` pairs, so
   every pair is judged: each admitted and reserved like any model call and listed with its cost; on
