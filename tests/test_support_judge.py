@@ -126,3 +126,55 @@ async def test_a_chinese_question_over_an_english_paper_is_cited_and_judged(tmp_
         [chip] = turn["citations"]
         assert chip["existence"] == "ok" and chip["sentence"].startswith("该论文报告")
         assert json.loads(json.dumps(provider.judged[0]))["messages"][-1]["content"].count("Pair ") == 1
+
+
+# The judge's cap and its share (coordinator's reading B, 2026-10-21): at most judge_calls calls of judge_pairs
+# pairs; the pairs past that are unchecked, said; the share reserved with the answer bounds every judge call.
+
+@pytest.mark.parametrize("pairs, over", [(80, 0), (81, 1)])
+async def test_eighty_pairs_are_judged_in_two_calls_and_the_eighty_first_is_left_unchecked_and_said(tmp_path, pairs, over):
+    text = " ".join(f"Claim {n} holds [S1.1]." for n in range(1, pairs + 1))
+    provider = Provider(answer_text=text)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, QUESTION)
+        assert [b["messages"][-1]["content"].count("Pair ") for b in provider.judged] == [40, 40]
+        turn = await turn_of(client, conversation)
+        supports = [c["support"] for c in turn["citations"]]
+        assert supports.count("supported") == 80 and supports.count("unchecked") == over
+        notices = turn["answer"].get("notices", [])
+        assert ("citations_over_limit" in notices) == bool(over) and ("unchecked" in notices) == bool(over)
+        [(checks,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'citation_checks'",
+                                 stream[0]["run_id"])
+        assert json.loads(checks).get("over_limit", 0) == over
+        steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events WHERE run_id = ?"
+                                                              " AND type = 'step_started' ORDER BY seq", stream[0]["run_id"])]
+        share = steps[0]["allowance_usd"]
+        assert sum(step["estimate_usd"] for step in steps if step["phase"] == "judge") <= share  # within the share
+
+
+async def test_a_judge_calls_estimate_never_exceeds_its_part_of_the_share_at_the_caps_worst_case():
+    # The largest passages the evidence allows, the most pairs the cap allows, and sentences far past the cut
+    # in text our counting finds dearest (upper case, digits, punctuation, Han, emoji, space runs).
+    from backend import budget_router, context, settings
+    from backend.citations import JUDGE_RULES, batches, judge_plan, judge_request
+    retrieval = settings._RETRIEVAL
+    pairs, calls, units = retrieval["judge_pairs"][0], retrieval["judge_calls"][0], retrieval["judge_sentence_units"][0]
+    dear = "ABC 123 !? 工资 😀    " * 200
+    passages = {f"p{i}": dear[:2000 - i] for i in range(8)}
+    rates = {"input": 3e-6, "output": 15e-6, "request": 0.0}
+    for window in (8192, 16384, 32768, 131072):
+        size, bound = judge_plan(list(passages.values()), window=window, margin_percent=5, pairs=pairs, units=units)
+        assert size >= 1
+        share = calls * budget_router.request_cost(rates, bound, context.MIN_OUTPUT)
+        wanted = [(dear * 3 + f" {n}", f"p{n % 8}") for n in range(calls * size)]
+        spent = 0.0
+        for batch in batches(wanted, size):
+            request = context.assemble("judge", window=window, output=context.MIN_OUTPUT,
+                                       budgets={k: v[0] for k, v in settings._CONTEXT.items()},
+                                       margin_percent=5, system_rules=JUDGE_RULES,
+                                       request=judge_request(batch, passages, units))
+            assert request.input_tokens <= bound and request.max_tokens == context.MIN_OUTPUT
+            spent += budget_router.request_cost(rates, request.input_tokens, request.max_tokens)
+        assert spent <= share + 1e-12, window

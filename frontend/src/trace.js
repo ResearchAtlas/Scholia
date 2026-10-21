@@ -22,7 +22,7 @@ export async function readTrace(runId, read = get) {
 // { route, retrieval, search, steps: [{ phase, route, estimate, cut, attempts: [{ outcome, cost, charge, body, removed, unavailable }] }],
 //   checks, finished } from the trace's events. A step whose answer stopped at its output limit is cut.
 export function summarize(events) {
-  const found = { route: null, retrieval: null, search: null, steps: [], checks: [], finished: null };
+  const found = { route: null, retrieval: null, search: null, steps: [], checks: [], overLimit: 0, finished: null };
   const steps = new Map();
   for (const { type, data, body_ref: body, body_removed: removed } of events) {
     if (type === 'route') {
@@ -44,6 +44,7 @@ export function summarize(events) {
       if (step && data.cut) step.cut = true; // saved, and marked as stopped at its output limit
     } else if (type === 'citation_checks') {
       found.checks = data.citations ?? [];
+      found.overLimit = data.over_limit ?? 0; // pairs past the judge's cap, left unchecked
     } else if (type === 'run_finished') {
       found.finished = data.status;
     }

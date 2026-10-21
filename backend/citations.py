@@ -24,8 +24,10 @@ primary commit with the answer.
 """
 
 import json
+import math
 import re
 
+from backend.context import MESSAGE_FRAMING, MIN_OUTPUT, REPLY_FRAMING, count
 from backend.evidence import CITATION
 from backend.search_index import readings, still_read
 
@@ -138,7 +140,8 @@ def check_existence(conn, project_id, text, numbered):
         quote = record["text"][:QUOTE_CHARS]
         found = {"material_id": record["material_id"], "material_version_id": record["version_id"],
                  "passage_id": record["passage_id"], "quote": quote, "page": record.get("page"),
-                 "evidence_type": record["evidence_type"], "retraction": record.get("retraction")}
+                 "evidence_type": record["evidence_type"], "retraction": record.get("retraction"),
+                 "judged_text": record["text"]}  # what the answer was given, which the judge is shown too
         if (record["passage_id"], record["material_id"]) in current:
             out.append({**row, **found, "existence": "ok"})
             continue
@@ -174,19 +177,58 @@ def pairs(checked):
 
 
 JUDGE_RULES = (
-    "You check citations in a research assistant's answer. For each numbered pair, say whether the passage "
-    "supports the sentence: supported (the passage states what the sentence claims), partly (it supports some "
-    "of it, or with conditions the sentence leaves out) or unsupported. Judge only from the passage. Reply with "
-    "one line per pair, exactly in the form `N: verdict`, and nothing else."
+    "You check citations in a research assistant's answer. The passages come first, each with its label; then "
+    "numbered pairs, each a sentence and the label of the passage it cites. For each pair, say whether that "
+    "passage supports the sentence: supported (the passage states what the sentence claims), partly (it supports "
+    "some of it, or with conditions the sentence leaves out) or unsupported. Judge only from the passage. Reply "
+    "with one line per pair, exactly in the form `N: verdict`, and nothing else."
 )
+# The most a label and its framing can add, counted (four-digit numbers, the blank line after each part).
+_PASSAGE_FRAME = count("Passage P9999: ") + 2
+_PAIR_FRAME = count("Pair 9999\nSentence: \nPassage: P9999") + 2
 
 
-def judge_request(batch, texts):
-    """The judge's request text for a batch of pairs; texts maps a passage id to its text."""
-    lines = []
-    for i, (sentence, pid) in enumerate(batch, start=1):
-        lines.append(f"Pair {i}\nSentence: {sentence}\nPassage: {texts[pid]}")
-    return "\n\n".join(lines)
+def judge_view(sentence, units):
+    """The sentence as the judge is shown it: whole, or cut at a character so that it counts at most units."""
+    if count(sentence) <= units:
+        return sentence
+    cut = sentence
+    while cut and count(cut + "…") > units:
+        cut = cut[:max(0, min(len(cut) - 1, int(len(cut) * 0.9)))]
+    return cut + "…"
+
+
+def judge_request(batch, texts, units):
+    """The judge's request text for a batch of (sentence, passage id) pairs: each passage the batch cites once,
+    labeled, then the pairs, each sentence cut to units (judge_view); texts maps a passage id to its text."""
+    labels = {}
+    for _, pid in batch:
+        labels.setdefault(pid, f"P{len(labels) + 1}")
+    parts = [f"Passage {label}: {texts[pid]}" for pid, label in labels.items()]
+    parts += [f"Pair {i}\nSentence: {judge_view(sentence, units)}\nPassage: {labels[pid]}"
+              for i, (sentence, pid) in enumerate(batch, start=1)]
+    return "\n\n".join(parts)
+
+
+def judge_bound(passages, pairs, units):
+    """An upper bound on the counted input of any judge request (context.serialized_tokens) of at most `pairs`
+    pairs over these passage texts: the rules, the `pairs` largest passages once each with their labels (a
+    request shows only the passages its pairs cite), each pair at its sentence's cut and its framing, the two
+    messages' framing and the reply's. A count of joined parts is never above the sum of the parts' counts
+    (context.count)."""
+    largest = sorted((count(text) + _PASSAGE_FRAME for text in passages), reverse=True)[:pairs]
+    return (count(JUDGE_RULES) + sum(largest) + pairs * (units + _PAIR_FRAME) + 2 * MESSAGE_FRAMING
+            + REPLY_FRAMING)
+
+
+def judge_plan(passages, *, window, margin_percent, pairs, units):
+    """(pairs per call, the input bound of one call) for an answer whose evidence is these passage texts, on a
+    judge route of this window: judge_pairs, halved until a call of that many fits the window at the least
+    output limit; (0, 0) when not even one pair fits. The judge's share is calls x one call's bound."""
+    room = window - MIN_OUTPUT - math.ceil(window * margin_percent / 100)
+    while pairs >= 1 and judge_bound(passages, pairs, units) > room:
+        pairs //= 2
+    return (pairs, judge_bound(passages, pairs, units)) if pairs else (0, 0)
 
 
 def parse_verdicts(reply, count):

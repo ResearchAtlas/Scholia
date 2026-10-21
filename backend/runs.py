@@ -774,12 +774,21 @@ class Harness:
             await self._register_context(claim, numbered)  # the dispatch check now covers its passages
             judge = await self._judge_route(ctx)
             # The judge's share is reserved with the answer: a budget that cannot hold both refuses the step
-            # before the answer call (section 6.2, final review F02). The share is held until the judge's own call
-            # takes it; a call it does not cover is refused like any other (no reservation skips a budget), and
-            # its pairs stay unchecked, said in the answer.
-            judge_estimate = 0.0 if judge[1] is None else budget_router.request_cost(judge[2]["rates"], request.max_tokens + sum(
-                context.count(r["text"]) for r in numbered.values()) + context.count(citations.JUDGE_RULES),
-                context.MIN_OUTPUT) if numbered else 0.0
+            # before the answer call (section 6.2, final review F02; C5). It is an upper bound on every judge call
+            # the answer can lead to: at most judge_calls calls, each at most the plan's bound of input (the
+            # largest passages the request holds, each sentence cut to judge_sentence_units) at the least output
+            # limit, at the judge route's highest rate. The share is held until the judge's calls take it.
+            retrieval = ctx["personal"].values["retrieval"]
+            ctx["judge_plan"] = (0, 0)
+            judge_estimate = 0.0
+            if numbered and judge[1] is not None:
+                ctx["judge_plan"] = citations.judge_plan(
+                    [r["text"] for r in numbered.values()], window=judge[2]["window"],
+                    margin_percent=ctx["budgets"]["margin_percent"], pairs=retrieval["judge_pairs"],
+                    units=retrieval["judge_sentence_units"])
+                if ctx["judge_plan"][0]:
+                    judge_estimate = retrieval["judge_calls"] * budget_router.request_cost(
+                        judge[2]["rates"], ctx["judge_plan"][1], context.MIN_OUTPUT)
             estimate = budget_router.request_cost(ctx["facts"]["rates"], request.input_tokens, request.max_tokens)
             call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
                                        phase="answer", step={**_step(ctx["route"], ctx["facts"], request),
@@ -798,10 +807,11 @@ class Harness:
             # The delivered answer's checks, before its primary commit: existence and mapping, then the judge.
             checked = await self._read(lambda conn: citations.check_existence(
                 conn, ctx["project_id"], result.content, numbered))
-            verdicts, judged = await self._support(claim, ctx, checked, judge)
+            verdicts, judged, over = await self._support(claim, ctx, checked, judge)
             ctx["cited"] = (result.content, numbered, verdicts)  # checked again in the primary commit
+            ctx["over_limit"] = over
             unsearched = (found.get("trace") or {}).get("index") in ("building", "unavailable")
-            notices = [n for n, shown in (("index_unavailable", unsearched),
+            notices = [n for n, shown in (("index_unavailable", unsearched), ("citations_over_limit", over > 0),
                                           ("keyword_only", found["mode"] == "keyword_only" and not unsearched),
                                           ("unchecked", not judged),
                                           ("skills_unavailable", not ctx["facts"].get("tools")),
@@ -910,7 +920,8 @@ class Harness:
         now = utc_now()
         citations.write_rows(conn, claim.run_id, checked, now, new_id)
         _event(conn, claim.run_id, "citation_checks", {"citations": [
-            {k: c.get(k) for k in ("marker", "existence", "support", "passage_id", "sentence")} for c in checked]})
+            {k: c.get(k) for k in ("marker", "existence", "support", "passage_id", "sentence")} for c in checked],
+            **({"over_limit": ctx["over_limit"]} if ctx.get("over_limit") else {})})
         _event(conn, claim.run_id, "run_finished", {"status": "succeeded"})
         conn.execute("UPDATE turns SET answer = ?, result_saved = 1, phase = 'answer', memory_status = 'skipped',"
                      " accounting = ? WHERE run_id = ?",
@@ -1003,23 +1014,27 @@ class Harness:
     # S1-19: the router's small model, the evidence, the cited request and the support judge
 
     async def _role_call(self, claim, ctx, model, function, rules, text, *, timeout=None, from_allowance=False,
-                         materials=()):
+                         materials=(), facts=None):
         """One role call (the router's small model, the support judge) on the turn's provider: model, or the
         turn's own route when None; on the project's allowed routes, through the dispatch path, never
         forcing a tool choice. materials: the papers whose passages text holds. Returns the call's result, or
         None when the route cannot serve it (not allowed, unusable, too small for the request)."""
         # The turn's route and privacy controls, but not its reasoning effort: a role step's output limit is the
         # least a step has, which reasoning tokens would use up.
+        given = facts  # the route's facts the caller planned with (the judge's share), used as they are
         route, facts = ctx["route"], {**ctx["facts"], "effort": None}
         if model is not None:
             if ctx["policy"].problem(ctx["provider"], model, ctx["key"]) or \
                     _unusable(ctx["table"], ctx["provider"], model):
                 return None
             route = providers.Route(ctx["provider"], model)
-            problem, facts = await self._route_facts(route, ctx["key"], ctx["table"],
-                                                     zero_retention=ctx["zero_retention"], effort=None)
-            if problem:
-                return None
+            if given is not None:
+                facts = {**given, "effort": None}
+            else:
+                problem, facts = await self._route_facts(route, ctx["key"], ctx["table"],
+                                                         zero_retention=ctx["zero_retention"], effort=None)
+                if problem:
+                    return None
         budgets = ctx["budgets"]
         try:
             request = context.assemble(function, window=facts["window"], output=_output(context.MIN_OUTPUT, facts),
@@ -1151,36 +1166,36 @@ class Harness:
         return None, None, None
 
     async def _support(self, claim, ctx, checked, judge):
-        """({(sentence, passage id): verdict}, whether every pair was judged). Up to `judge_pairs` pairs per
-        call; a batch too large for the judge's window is split; a call that fails, times out or refuses, or a
-        pair it leaves unanswered, leaves those pairs unchecked."""
+        """({(sentence, passage id): verdict}, whether every pair was judged, how many pairs were past the
+        cap). The judge's plan (ctx["judge_plan"], set with its share) gives the pairs per call; at most
+        `judge_calls` calls are made, so the pairs past judge_calls x that are left unchecked and counted (a
+        fixed limit, said in the answer, never a budget). Each call is shown the passage text the answer was
+        given and each sentence cut to `judge_sentence_units`, so its estimate never exceeds its part of the
+        share. A call that fails, times out or refuses, or a pair it leaves unanswered, leaves those pairs
+        unchecked."""
         wanted = citations.pairs(checked)
         if not wanted:
-            return {}, True
+            return {}, True, 0
         if judge[1] is None:  # a judge is set that cannot run here: unchecked, said, never another model
-            return {}, False
-        wanted_ids = sorted({pid for _, pid in wanted})
-        texts = await self._read(lambda conn: {pid: text for pid, text in conn.execute(
-            "SELECT id, text FROM passages WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(wanted_ids),))})
-        verdicts, complete = {}, True
+            return {}, False, 0
+        retrieval = ctx["personal"].values["retrieval"]
+        size, units = ctx["judge_plan"][0], retrieval["judge_sentence_units"]
+        if not size:  # not one pair fits the judge's window
+            return {}, False, 0
+        cap = retrieval["judge_calls"] * size
+        over, wanted = max(0, len(wanted) - cap), wanted[:cap]
+        texts = {c["passage_id"]: c["judged_text"] for c in checked if c["existence"] == "ok"}
         material_of = {c["passage_id"]: c["material_id"] for c in checked if c["existence"] == "ok"}
-        size = ctx["personal"].values["retrieval"]["judge_pairs"]
-        queue = citations.batches(wanted, size)
-        while queue:
-            batch = queue.pop(0)
-            if any(pid not in texts for _, pid in batch):
-                complete = False
-                continue
+        verdicts, complete = {}, True
+        for batch in citations.batches(wanted, size):
             try:
                 result = await self._role_call(claim, ctx, judge[0], "judge", citations.JUDGE_RULES,
-                                               citations.judge_request(batch, texts), timeout=JUDGE_SECONDS,
-                                               from_allowance=True,
+                                               citations.judge_request(batch, texts, units), timeout=JUDGE_SECONDS,
+                                               from_allowance=True, facts=judge[2],
                                                materials={*ctx["context_materials"], *(material_of[pid] for _, pid in batch)})
-            except spending.BudgetExceeded:  # its share, held with the answer, did not cover it: never past the budget
+            except spending.BudgetExceeded:  # unreachable: the share bounds every call; fails closed, unchecked
+                log.error("a judge call was refused past its share; its pairs are left unchecked")
                 complete = False
-                continue
-            if result is None and len(batch) > 1:  # too large for its window: halved
-                queue[:0] = [batch[:len(batch) // 2], batch[len(batch) // 2:]]
                 continue
             if result is None or not result.ok:
                 complete = False
@@ -1188,7 +1203,7 @@ class Harness:
             found = citations.parse_verdicts(result.content, len(batch))
             complete = complete and len(found) == len(batch)
             verdicts.update({pair: found[i] for i, pair in enumerate(batch, start=1) if i in found})
-        return verdicts, complete
+        return verdicts, complete and not over, over
 
     async def _general(self):
         return await self._read(lambda conn: conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
@@ -1461,7 +1476,9 @@ class Harness:
             check = await self._read(lambda conn: _check_request(conn, inputs))
             if check is None:
                 return None
-            judged, text = check
+            judged, texts = check
+            text = citations.judge_request([(s, p) for s, p, _ in judged], texts,
+                                           personal.values["retrieval"]["judge_sentence_units"])
             papers = inputs.get("context_materials") or ()
             rules = citations.JUDGE_RULES
 
@@ -1709,16 +1726,15 @@ def _output(setting, facts):
 
 
 def _check_request(conn, inputs):
-    """For a citation_check run: ([(sentence, passage id, citation ids)] for the pairs its inputs name, the
-    judge's request text), or None (the run fails, writing nothing) when one of their passages is gone:
+    """For a citation_check run: ([(sentence, passage id, citation ids)] for the pairs its inputs name, their
+    passages' texts), or None (the run fails, writing nothing) when one of their passages is gone:
     a check never reports success with a pair it did not judge."""
     pairs = inputs.get("pairs") or []
     texts = dict(conn.execute("SELECT id, text FROM passages WHERE id IN (SELECT value FROM json_each(?))",
                               (json.dumps(sorted({p for _, p, _, _ in pairs})),)).fetchall())
     if not pairs or any(pid not in texts for _, pid, _, _ in pairs):
         return None
-    judged = [(sentence, pid, cids) for sentence, pid, _, cids in pairs]
-    return judged, citations.judge_request([(s, p) for s, p, _ in judged], texts)
+    return [(sentence, pid, cids) for sentence, pid, _, cids in pairs], texts
 
 
 def _stored(content, body):

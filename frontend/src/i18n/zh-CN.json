@@ -1108,6 +1108,7 @@
   },
   "turn.details": "详情",
   "turn.notice.indexUnavailable": "无法检索你的论文：文献库的检索索引正在建立或不可用。",
+  "turn.notice.citationsOverLimit": "这个回答的引用多于一次核查能覆盖的数量，超出部分未核查。",
   "turn.notice.keywordOnly": "语义检索不可用，这个回答的证据只来自关键词检索。",
   "turn.notice.unchecked": "部分引用未能与其段落核对。",
   "turn.notice.noSkills": "这个模型不支持技能，Scholia 直接根据你的资料库回答。",
@@ -1157,6 +1158,9 @@
   "trace.charged": "实际花费 {cost}",
   "trace.bodyRemoved": "发送的原文已随删除的论文一并移除。",
   "trace.bodyUnavailable": "发送的原文未能保存。",
+  "trace.checksOverLimit": {
+    "other": "超出一次核查范围的 {count} 组引用未核查。"
+  },
   "trace.showSent": "显示发送的原文",
   "trace.sent": "发送的原文",
   "trace.checks": "引用核对",

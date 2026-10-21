@@ -102,6 +102,11 @@ _RETRIEVAL = {
     "keep": (8, _int(1)),
     "embedding_batch": (32, _int(1)),
     "judge_pairs": (40, _int(1)),
+    # S1-19b: the support judge's calls per answer (judge_calls x judge_pairs pairs at most; more are left
+    # unchecked, said), and the counted units of a sentence the judge is shown, so the judge's share reserved
+    # with its answer is an upper bound on what the judge can cost (backend/citations.py, judge_bound).
+    "judge_calls": (2, _int(1)),
+    "judge_sentence_units": (300, _int(16)),
     "rules_ms": (100, _int(1)),
     "router_ms": (2000, _int(1)),
     "memory_ms": (200, _int(1)),

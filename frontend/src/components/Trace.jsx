@@ -58,6 +58,7 @@ export function Trace({ turn }) {
       {trace.checks.length > 0 && (
         <div className="space-y-1">
           <p className="font-medium">{t('trace.checks')}</p>
+          {trace.overLimit > 0 && <p className="text-muted-foreground">{t('trace.checksOverLimit', { count: trace.overLimit })}</p>}
           <ul className="space-y-1">
             {trace.checks.map((check, i) => (
               <li key={i} className="grid gap-0.5">
