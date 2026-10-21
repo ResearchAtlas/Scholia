@@ -364,6 +364,12 @@ def test_the_synthetic_sets_pass_and_the_report_gives_their_mix(tmp_path):
     ("questions", lambda items: items[0].update(document_language="zh-CN"), "document_language is not its evidence's papers'"),
     ("questions", lambda items: items[0].update(text="x" * 1001), "question q01 text: longer than 1000 characters"),
     ("questions", lambda items: items[0].update(provisional=True), "provisional is not a field of this format"),
+    ("questions", lambda items: items[0].update(id=["q01"]), "questions item ['q01']: id is not a plain name"),
+    ("questions", lambda items: items[0]["evidence"][0][0].update(ordinal=True), "evidence item 1: ordinal is not a passage's"),
+    ("questions", lambda items: items[0]["evidence"][0][0].update(page=True), "evidence item 1: page is not a page number"),
+    # G11: an id is text of the allowed shape, kept as validated (a number is not its text)
+    ("pairs", lambda items: items[0].update(id=123), "pairs item 123: id is not a plain name"),
+    ("pairs", lambda items: items[0].update(id=True), "pairs item True: id is not a plain name"),
     ("pairs", lambda items: items[0].update(drafted_category="maybe"), "pair p01: drafted_category 'maybe' is not one of"),
     ("pairs", lambda items: items[0].update(verdict="supported"), "pair p01: verdict is not a field of this format"),
     ("pairs", lambda items: items[0].update(judge={"support": "supported"}), "pair p01: judge is not a field of this format"),
@@ -397,6 +403,9 @@ def test_drafts_are_provisional_and_a_set_names_its_own_kind_and_field(tmp_path)
     assert "questions.json: drafts are provisional until a rater's labels make them gold" in problems_of(folder)[0]
     write(folder / "questions.json", {**doc, "field": 1})
     assert any("is not this set's" in p for p in problems_of(folder)[0])
+    for header in ({"field": 2.0}, {"id": 123}, {"id": ["field2-questions"]}):  # G11: kept as validated, not as compared
+        write(folder / "questions.json", {**doc, **header})
+        assert any("is not this set's" in p for p in problems_of(folder)[0]), header
 
 
 @pytest.mark.parametrize("change, expected", [
@@ -410,6 +419,9 @@ def test_drafts_are_provisional_and_a_set_names_its_own_kind_and_field(tmp_path)
     (lambda p: p.update(authors=[]), "authors missing"),
     (lambda p: p.update(document_language="zh-CN"), "field 2's papers are English"),
     (lambda p: p.pop("topic"), "topic missing"),
+    (lambda p: p.update(id=["2601.00001v1"]), "not an arXiv id with its version"),  # G11: refused, not a crash
+    (lambda p: p.update(size=True), "size or SHA-256 missing"),
+    (lambda p: p.update(submitted=["2026-01-05"]), "is outside 2026-01-01 to 2026-09-30"),
 ])
 def test_the_paper_list_holds_only_versions_meeting_the_criteria(tmp_path, change, expected):
     folder = field(tmp_path)

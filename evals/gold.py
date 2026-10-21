@@ -192,6 +192,22 @@ def _keys(where, obj, required, optional=()):
     return problems + [f"{where}: {k} is not a field of this format" for k in obj if k not in (*required, *optional)]
 
 
+def plain_id(value):
+    """An id as every reader keys it: text of the allowed shape, never a number or anything else str() would
+    turn into one (G11: a pair with id 123 kept its number, so its label, keyed "123", never applied again)."""
+    return isinstance(value, str) and ID.fullmatch(value) is not None
+
+
+def same(value, expected):
+    """Equal and of the same JSON type: true is not 1, 2.0 is not 2, 123 is not "123"."""
+    return type(value) is type(expected) and value == expected
+
+
+def whole(value, least):
+    """A whole number of at least least (true and false are not numbers here)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= least
+
+
 def _text(where, value, bound=None):
     if not isinstance(value, str) or not value.strip():
         return [f"{where}: empty or not text"]
@@ -237,10 +253,10 @@ def check_papers(doc, field, settings):
                      ("note",))
     if problems:
         return problems
-    if doc["field"] != field:
-        return [f"papers.json: field {doc['field']}, expected {field}"]
+    if not same(doc["field"], field):
+        return [f"papers.json: field {doc['field']!r}, expected {field}"]
     problems += _keys("papers.json extractor", doc["extractor"], ("name", "version"))
-    if field == 2 and not (isinstance(doc["criteria"], dict) and isinstance(doc["seed"], int)):
+    if field == 2 and not (isinstance(doc["criteria"], dict) and whole(doc["seed"], 0)):
         problems.append("papers.json: the selection's criteria and seed are not recorded")
     criteria = settings["field2_papers"]
     seen = set()
@@ -256,21 +272,21 @@ def check_papers(doc, field, settings):
         if found:
             problems += found
             continue
-        if paper["id"] in seen:
+        pid = paper["id"]
+        if not (plain_id(pid) and (field == 1 or ARXIV.fullmatch(pid))):
+            problems.append(f"{where}: " + ("id is not a plain name" if field == 1
+                                            else "not an arXiv id with its version (2601.01234v2)"))
+            continue
+        if pid in seen:
             problems.append(f"{where}: listed twice")
-        seen.add(paper["id"])
+        seen.add(pid)
         problems += _text(f"{where} title", paper["title"])
-        if not (isinstance(paper["size"], int) and isinstance(paper["sha256"], str) and len(paper["sha256"]) == 64):
+        if not (whole(paper["size"], 0) and isinstance(paper["sha256"], str) and len(paper["sha256"]) == 64):
             problems.append(f"{where}: size or SHA-256 missing")
         if paper["document_language"] not in LANGUAGES:
             problems.append(f"{where}: document_language {paper['document_language']!r}")
         if field == 1:
-            if not ID.fullmatch(str(paper["id"])):
-                problems.append(f"{where}: id is not a plain name")
             continue
-        pid = str(paper["id"])
-        if not ARXIV.fullmatch(pid):
-            problems.append(f"{where}: not an arXiv id with its version (2601.01234v2)")
         if not (isinstance(paper["authors"], list) and paper["authors"] and all(isinstance(a, str) and a.strip()
                                                                                for a in paper["authors"])):
             problems.append(f"{where}: authors missing")
@@ -281,7 +297,7 @@ def check_papers(doc, field, settings):
             problems.append(f"{where}: primary category {paper['primary_category']!r} is not one of "
                             f"{criteria['primary_categories']}")
         window = criteria["submitted"]
-        if not (DATE.fullmatch(str(paper["submitted"])) and window["from"] <= paper["submitted"] <= window["to"]):
+        if not (is_date(paper["submitted"]) and window["from"] <= paper["submitted"] <= window["to"]):
             problems.append(f"{where}: submitted {paper['submitted']!r} is outside {window['from']} to {window['to']}")
         if paper["license"] not in LICENSES:
             problems.append(f"{where}: license {paper['license']!r} is neither CC BY 4.0 nor CC0 1.0")
@@ -289,11 +305,15 @@ def check_papers(doc, field, settings):
             problems.append(f"{where}: the license must be read from that version's own abstract page")
         if paper["pdf_url"] != f"https://arxiv.org/pdf/{pid}":
             problems.append(f"{where}: pdf_url is not that version's")
-        if not DATE.fullmatch(str(paper["license_checked"])):
+        if not is_date(paper["license_checked"]):
             problems.append(f"{where}: license_checked is not a date")
     if not isinstance(doc["papers"], list):
         problems.append("papers.json: papers is not a list")
     return problems
+
+
+def is_date(value):
+    return isinstance(value, str) and DATE.fullmatch(value) is not None
 
 
 def check_locator(where, loc, field, papers):
@@ -308,9 +328,9 @@ def check_locator(where, loc, field, papers):
     paper = papers.get(loc["paper"])
     if paper is None:
         return [f"{where}: paper {loc['paper']!r} is not in papers.json"]
-    if not (isinstance(loc["ordinal"], int) and loc["ordinal"] >= 0):
+    if not whole(loc["ordinal"], 0):
         problems.append(f"{where}: ordinal is not a passage's")
-    if not (loc["page"] is None or isinstance(loc["page"], int) and loc["page"] >= 1):
+    if not (loc["page"] is None or whole(loc["page"], 1)):
         problems.append(f"{where}: page is not a page number")
     if loc["kind"] == "reference":
         problems.append(f"{where}: a reference passage is never evidence (section 7.1)")
@@ -397,7 +417,7 @@ def check_set(doc, kind, field, papers):
     problems = _keys(f"{kind}.json", doc, ("id", "kind", "field", "provisional", "items"), ("note",))
     if problems:
         return problems
-    if doc["kind"] != kind or doc["field"] != field or not ID.fullmatch(str(doc["id"])):
+    if not (same(doc["kind"], kind) and same(doc["field"], field) and plain_id(doc["id"])):
         return [f"{kind}.json: kind {doc['kind']!r}, field {doc['field']!r} or id {doc['id']!r} is not this set's"]
     if doc["provisional"] is not True:
         problems.append(f"{kind}.json: drafts are provisional until a rater's labels make them gold")
@@ -408,9 +428,10 @@ def check_set(doc, kind, field, papers):
     for item in doc["items"]:
         problems += check(item, field, papers)
         if isinstance(item, dict):
-            if not ID.fullmatch(str(item.get("id"))):
+            if not plain_id(item.get("id")):
                 problems.append(f"{kind} item {item.get('id')!r}: id is not a plain name")
-            ids[item.get("id")] += 1
+                continue
+            ids[item["id"]] += 1
             texts[_key(str(item.get("text") or item.get("sentence") or ""))].append(str(item.get("id")))
     problems += [f"{kind}: id {i!r} is used {n} times" for i, n in ids.items() if n > 1]
     problems += [f"{kind}: {', '.join(same)} have the same text" for t, same in texts.items() if t and len(same) > 1]
@@ -429,8 +450,10 @@ def check_labels(doc, set_doc, papers, rater=None):
     problems = _keys("labels", doc, ("set", "kind", "field", "rater", "set_sha256", "labels"), ("sample",))
     if problems:
         return problems
-    if (doc["set"], doc["kind"], doc["field"]) != (set_doc["id"], set_doc["kind"], set_doc["field"]):
-        return [f"labels: they are set {doc['set']!r}'s ({doc['kind']}, field {doc['field']}), not this set's"]
+    if not all(same(doc[k], set_doc[w]) for k, w in (("set", "id"), ("kind", "kind"), ("field", "field"))):
+        return [f"labels: they are set {doc['set']!r}'s ({doc['kind']}, field {doc['field']!r}), not this set's"]
+    if not (isinstance(doc["rater"], str) and RATER.fullmatch(doc["rater"])):
+        return [f"labels: rater {doc['rater']!r} is not a rater's name"]
     if rater is not None and doc["rater"] != rater:
         return [f"labels: they are rater {doc['rater']!r}'s, not {rater!r}'s"]
     if not isinstance(doc["labels"], dict):
@@ -479,7 +502,7 @@ def label_problems(item_id, label, kind, field, papers):
 
 
 def is_count(value):
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+    return whole(value, 1)
 
 
 def effective_items(set_doc, labels):
@@ -756,7 +779,7 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
                                      and (made := labeled(items[i], label)) is not None]
             if (folder / f"sample-{kind}.json").is_file():
                 sample = read_json(folder / f"sample-{kind}.json", field=field)
-                if sample.get("set") != set_doc["id"] or not set(sample.get("items", [])) <= set(items):
+                if not sample_of(sample, set_doc):
                     problems.append(f"sample-{kind}.json: not a sample of this set")
                 else:
                     report["samples"][kind] = len(sample["items"])
@@ -894,6 +917,12 @@ def draw(set_doc, settings):
             "items": sorted(chosen)}
 
 
+def sample_of(sample, set_doc):
+    """Whether a sample file is a sample of this set: its set's id, and a list of its items' ids."""
+    return (isinstance(sample, dict) and same(sample.get("set"), set_doc["id"]) and isinstance(sample.get("items"), list)
+            and all(plain_id(i) for i in sample["items"]) and set(sample["items"]) <= {i["id"] for i in set_doc["items"]})
+
+
 def kappa(pairs, categories):
     """Cohen's kappa of (a, b) labels over the categories; None when both raters used one category alone."""
     n = len(pairs)
@@ -1019,9 +1048,10 @@ class Review:
         doc, papers_sha256, sets = load_field(field, folder)
         if kind not in sets:
             raise Refused(f"{kind}.json is not drafted yet")
-        self.papers = {p["id"]: p for p in doc["papers"]}
         self.set = sets[kind]
-        if problems := check_papers(doc, field, settings) or check_set(self.set, kind, field, self.papers):
+        problems = check_papers(doc, field, settings)
+        self.papers = {} if problems else {p["id"]: p for p in doc["papers"]}  # ids keyed only once they are checked
+        if problems := problems or check_set(self.set, kind, field, self.papers):
             raise Refused("the set does not pass its check: " + "; ".join(problems[:5]))
         self.items = {item["id"]: item for item in self.set["items"]}
         order = list(self.items)
@@ -1030,7 +1060,7 @@ class Review:
         self.sample = None
         if sample:
             self.sample = read_json(folder / f"sample-{kind}.json", field=field)
-            if self.sample.get("set") != self.set["id"] or not set(self.sample["items"]) <= set(self.items):
+            if not sample_of(self.sample, self.set):
                 raise Refused(f"sample-{kind}.json is not a sample of this set")
             order = [i for i in order if i in set(self.sample["items"])]
         self.order = order
@@ -1372,10 +1402,13 @@ def main(argv=None):
                 server.serve_forever()
         else:
             papers_doc, _, sets = load_field(args.field, folder)
-            papers = {p["id"]: p for p in papers_doc["papers"]}
             if args.set not in sets:
                 raise Refused(f"{args.set}.json is not drafted yet")
             set_doc = sets[args.set]
+            problems = check_papers(papers_doc, args.field, load_settings())
+            papers = {} if problems else {p["id"]: p for p in papers_doc["papers"]}
+            if problems := problems or check_set(set_doc, args.set, args.field, papers):
+                raise Refused(f"{args.set}.json does not pass its check: " + "; ".join(problems[:5]))
             if args.command == "sample":
                 out = folder / f"sample-{args.set}.json"
                 if out.exists():
@@ -1385,10 +1418,6 @@ def main(argv=None):
             else:
                 if not all(RATER.fullmatch(r) for r in (args.raters if args.command == "agreement" else [args.rater])):
                     raise Refused("a rater is named with lower-case letters, digits and hyphens")
-
-                if problems := check_papers(papers_doc, args.field, load_settings()) or \
-                        check_set(set_doc, args.set, args.field, papers):
-                    raise Refused(f"{args.set}.json does not pass its check: " + "; ".join(problems[:5]))
 
                 def labels_of(rater):
                     path = folder / "labels" / f"{set_doc['id']}.{rater}.json"

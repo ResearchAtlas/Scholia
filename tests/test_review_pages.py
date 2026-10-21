@@ -801,3 +801,45 @@ def test_a_labels_folder_linked_into_a_git_work_tree_after_the_page_opened_gets_
     assert page.get("/api/data")[0] == 500
     assert list((repo / "leak").iterdir()) == []
     assert fixtures.git("status", repo) == ""
+
+
+# G11: ids are text, kept as validated
+
+
+def test_an_item_id_that_is_not_text_is_refused_before_any_page_sample_or_label(tmp_path):
+    """sol's reproduction: a pair with id 123 passed (str(id) was checked, the number kept), its label was
+    stored under "123", a reload showed none done, apply called it orphaned and a second save crashed."""
+    folder = field(tmp_path)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    pairs["items"][0]["id"] = 123
+    (folder / "pairs.json").write_text(json.dumps(pairs, ensure_ascii=False))
+    with pytest.raises(gold.Refused, match="id is not a plain name"):
+        gold.Review(2, folder, "pairs", "harold")
+    (folder / "sample-pairs.json").unlink(missing_ok=True)
+    for argv in (["apply", "--rater", "harold"], ["agreement", "--raters", "harold", "lee"], ["sample"]):
+        with pytest.raises(SystemExit, match="pairs.json does not pass its check"):
+            gold.main([argv[0], "--field", "2", "--folder", str(folder), "--set", "pairs", *argv[1:]])
+    assert not (folder / "sample-pairs.json").exists()
+    papers = json.loads((folder / "papers.json").read_text())
+    papers["papers"][0]["id"] = [papers["papers"][0]["id"]]  # a paper id that is not text: refused, never a crash
+    (folder / "papers.json").write_text(json.dumps(papers))
+    with pytest.raises(gold.Refused, match="not an arXiv id"):
+        gold.Review(2, folder, "questions", "harold")
+    with pytest.raises(SystemExit, match="not an arXiv id"):
+        gold.main(["apply", "--field", "2", "--folder", str(folder), "--set", "questions", "--rater", "harold"])
+
+
+def test_a_labels_header_or_sample_of_another_type_is_refused(tmp_path):
+    folder = field(tmp_path, sample=True)
+    doc = json.loads((folder / "pairs.json").read_text())
+    papers = {p["id"]: p for p in json.loads((folder / "papers.json").read_text())["papers"]}
+    good = {"set": doc["id"], "kind": "pairs", "field": 2, "rater": "harold", "set_sha256": "x", "labels": {}}
+    assert gold.check_labels(good, doc, papers) == []
+    for header in ({"field": 2.0}, {"rater": 7}, {"rater": "Harold Z"}):
+        assert gold.check_labels({**good, **header}, doc, papers) != [], header
+    for items in ([1], [["p01"]], "p01"):
+        (folder / "sample-pairs.json").write_text(json.dumps({"set": doc["id"], "items": items}))
+        assert "sample-pairs.json: not a sample of this set" in asyncio.run(
+            gold.check(2, folder, settings=gold.load_settings()))["problems"], items
+        with pytest.raises(gold.Refused, match="not a sample of this set"):
+            gold.Review(2, folder, "pairs", "lee", sample=True)
