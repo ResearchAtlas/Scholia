@@ -141,7 +141,7 @@ def test_no_pin_fetch_fixture_or_arm_names_the_excluded_rerankers():
     # Slice 1 section 15 and ticket 70: Qwen3-Reranker-4B and 8B are excluded, as benchmark candidates too.
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
-    found = [str(path.relative_to(root)) for folder in ("backend", "evals", "tools", "frontend/src")
+    found = [str(path.relative_to(root)) for folder in ("backend", "evals", "tools", "frontend/src", "tests/fixtures")
              for path in (root / folder).rglob("*") if path.is_file() and path.suffix in (".py", ".json", ".js", ".jsx", ".mjs", ".md")
              and any(name in path.read_text(errors="ignore") for name in ("Reranker-4B", "Reranker-8B"))]
     assert found == []
