@@ -791,14 +791,14 @@ def test_a_label_whose_paper_was_removed_after_its_item_changed_is_history_and_t
 
 
 def test_saving_over_a_history_label_needs_its_revision_and_readers_leave_history_alone(tmp_path, pages):
-    folder = field(tmp_path)
+    folder = field(tmp_path, sample=True)  # agreement is measured on the sample: q06
     doc = json.loads((folder / "questions.json").read_text())
     path = labels_file(folder, "questions")
     path.parent.mkdir()
     labels = {"set": doc["id"], "kind": "questions", "field": 2, "rater": "harold", "set_sha256": "x", "labels": {
         "q01": {"item_sha256": "older", "revision": 3, "saved_at": "t", "decision": "drop"},
         "q02": {"item_sha256": "older", "revision": "two", "decision": "keep"},  # history without a count revision
-        "q03": {"item_sha256": gold.item_sha256(doc["items"][2]), "revision": 1, "saved_at": "t", "decision": "drop"}}}
+        "q06": {"item_sha256": gold.item_sha256(doc["items"][5]), "revision": 1, "saved_at": "t", "decision": "drop"}}}
     path.write_text(json.dumps(labels))
     page = pages(folder, "questions")
     data = page.get("/api/data")[1]["labels"]
@@ -808,7 +808,7 @@ def test_saving_over_a_history_label_needs_its_revision_and_readers_leave_histor
     lee = {**labels, "rater": "lee"}
     (folder / "labels" / "field2-questions.lee.json").write_text(json.dumps(lee))
     out = json.loads(subprocess_free_agreement(folder))
-    assert out["kept"]["both_labeled"] == 1  # q03 only: the history labels are never compared
+    assert out["kept"]["both_labeled"] == 1  # q06 only: the history labels are never compared
 
 
 def subprocess_free_agreement(folder):

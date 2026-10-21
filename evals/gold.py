@@ -582,12 +582,13 @@ def check_set(doc, kind, field, papers):
 CONTENT = ("text", "short_answer", "answerable", "evidence")  # a question's whole content, as an edit stores it
 
 
-def check_labels(doc, set_doc, papers, rater=None):
-    """A labels file's problems (L1, L3, L7): its header names this set and rater; each label that applies to
-    its item as it now is (applies) has the right fields and types (a question's edit holds the whole
-    question, its locators checked as a draft's); and the set as the labels leave it (effective_items) passes
-    every rule the drafts pass, set-wide ones (repeated ids or text) included. Labels that do not apply are
-    history and are not checked. The page's saves, `check`, `apply` and `agreement` all use this one check."""
+def check_labels(doc, set_doc, papers, rater=None, sample=None):
+    """A labels file's problems (L1, L3, L7): its header names this set and rater; a sample's labels (marked
+    sample: true, as the sample's page writes them) are for the recorded sample's items (sample: their ids)
+    only; each label that applies to its item as it now is (applies) has the right fields and types (a
+    question's edit holds the whole question, its locators checked as a draft's); and the set as the labels
+    leave it (effective_items) passes every rule the drafts pass, set-wide ones (repeated ids or text)
+    included. Labels that do not apply are history and are not checked. The page's saves, `check`, `apply` and `agreement` all use this one check."""
     problems = _keys("labels", doc, ("set", "kind", "field", "rater", "set_sha256", "labels"), ("sample",))
     if problems:
         return problems
@@ -599,6 +600,13 @@ def check_labels(doc, set_doc, papers, rater=None):
         return [f"labels: they are rater {doc['rater']!r}'s, not {rater!r}'s"]
     if not isinstance(doc["labels"], dict):
         return ["labels: labels is not an object"]
+    if "sample" in doc:
+        if doc["sample"] is not True:
+            return ["labels: sample is not true"]
+        if sample is None:
+            return ["labels: they are the sample's, and no sample of this set is recorded"]
+        if outside := sorted(set(doc["labels"]) - set(sample)):
+            return [f"labels: they are the sample's, and {', '.join(outside)} are not in the recorded sample"]
     items = {i["id"]: i for i in set_doc["items"]}
     for item, label in doc["labels"].items():
         if not applies(items.get(item), label):
@@ -915,23 +923,25 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
                                     **mix(kind, set_doc["items"])}
             report["differences"] += [f"{kind}: {d}" for d in differences(kind, report["sets"][kind], settings)]
             items = {i["id"]: i for i in set_doc["items"]}
+            sample = None  # read first: a sample's labels are checked against it
+            if entry(folder, folder / f"sample-{kind}.json"):
+                drawn = read_json(folder, folder / f"sample-{kind}.json")
+                if not sample_of(drawn, set_doc, settings):
+                    problems.append(f"sample-{kind}.json: not a sample of this set")
+                else:
+                    sample = drawn["items"]
+                    report["samples"][kind] = len(sample)
             for path in [folder / "labels" / n for n in names(folder, folder / "labels")
                          if fnmatch.fnmatchcase(n, f"{set_doc['id']}.*.json")]:
                 labels = read_json(folder, path)
                 rater = path.name[len(set_doc["id"]) + 1:-len(".json")]  # <set id>.<rater>.json: its header names it
-                found = check_labels(labels, set_doc, papers, rater)
+                found = check_labels(labels, set_doc, papers, rater, sample)
                 problems += [f"{path.name}: {p}" for p in found]
                 if not found:
                     report["labels"][path.name] = label_counts(items, labels)
                     edited[kind] += [(path.name, made) for i, label in labels["labels"].items()
                                      if i in items and label_state(items[i], label) == "done" and "evidence" in label
                                      and (made := labeled(items[i], label)) is not None]
-            if entry(folder, folder / f"sample-{kind}.json"):
-                sample = read_json(folder, folder / f"sample-{kind}.json")
-                if not sample_of(sample, set_doc, settings):
-                    problems.append(f"sample-{kind}.json: not a sample of this set")
-                else:
-                    report["samples"][kind] = len(sample["items"])
         if pdfs is not None and not problems:
             verify_pdfs(doc["papers"], pdfs, field)
             with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
@@ -1014,12 +1024,12 @@ def labeled(item, label):
     return {**{k: v for k, v in item.items() if k not in CONTENT}, **{k: label[k] for k in CONTENT if k in label}}
 
 
-def apply(set_doc, labels, papers):
+def apply(set_doc, labels, papers, sample=None):
     """The corrected set (L5): each item a label is done for, as the label leaves it (dropped items out),
     `provisional: false`; every other item as drafted, `provisional: true`, never counted as gold; labels
     of items no longer in the set kept out and counted. Labels that do not pass check_labels are refused
-    whole: nothing invalid becomes gold."""
-    if problems := check_labels(labels, set_doc, papers):
+    whole: nothing invalid becomes gold. sample: the recorded sample's ids, for a sample's labels."""
+    if problems := check_labels(labels, set_doc, papers, sample=sample):
         raise Refused("the labels do not pass their check: " + "; ".join(problems[:5]))
     items, out = [], {"labeled": 0, "dropped": 0, "changed": 0, "provisional": 0}
     for item in set_doc["items"]:
@@ -1072,6 +1082,17 @@ def sample_of(sample, set_doc, settings):
     return isinstance(sample, dict) and item_sha256(sample) == item_sha256(draw(set_doc, settings))
 
 
+def recorded_sample(folder, set_doc, settings):
+    """The recorded sample's item ids (sample-<set>.json), or None when none is drawn; a file that is not
+    this set's draw is refused."""
+    path = folder / f"sample-{set_doc['kind']}.json"
+    if entry(folder, path) is None:
+        return None
+    if not sample_of(sample := read_json(folder, path), set_doc, settings):
+        raise Refused(f"{path.name}: not a sample of this set")
+    return sample["items"]
+
+
 def kappa(pairs, categories):
     """Cohen's kappa of (a, b) labels over the categories; None when both raters used one category alone."""
     n = len(pairs)
@@ -1090,13 +1111,14 @@ def _agreement(pairs, categories):
             "kappa": None if value is None else round(value, 4), "confusion": table}
 
 
-def agreement(set_doc, first, second):
-    """The agreement of two raters' labels on the items both labeled (H2). Pairs: percent agreement,
+def agreement(set_doc, first, second, sample):
+    """The agreement of two raters' labels on the recorded sample's items (sample: their ids) both labeled
+    (H2; spec section 14: the overlap sample), never on any other item either labeled. Pairs: percent agreement,
     Cohen's kappa over the three categories and the confusion table (rows the first rater's). Questions:
     the same for keep or drop, then over the items both kept, for answerable, and for evidence: both chose
     the same items, and the mean overlap of the passages they chose (shared over either's)."""
-    both = []
-    for item in set_doc["items"]:
+    both, sampled = [], set(sample)
+    for item in (i for i in set_doc["items"] if i["id"] in sampled):
         a, b = (labels["labels"].get(item["id"]) for labels in (first, second))
         if label_state(item, a) == "done" and label_state(item, b) == "done":
             both.append((item, a, b))
@@ -1213,12 +1235,12 @@ class Review:
         order = list(self.items)
         if kind == "pairs" and settings["review"]["pair_order"] == "shuffled":
             random.Random(f"{settings['review']['order_seed']}:{self.set['id']}").shuffle(order)
-        self.sample = None
+        self.sample = None  # the recorded sample's ids, on the sample's page
         if sample:
-            self.sample = read_json(folder, folder / f"sample-{kind}.json")
-            if not sample_of(self.sample, self.set, settings):
-                raise Refused(f"sample-{kind}.json is not a sample of this set")
-            order = [i for i in order if i in set(self.sample["items"])]
+            self.sample = recorded_sample(folder, self.set, settings)
+            if self.sample is None:
+                raise Refused(f"sample-{kind}.json is missing: draw it first (gold.py sample)")
+            order = [i for i in order if i in set(self.sample)]
         self.order = order
         self.show_category = settings["review"]["show_drafted_category"]
         self.passages = {}
@@ -1255,7 +1277,11 @@ class Review:
             labels = read_json(self.root, self.path)
         except (OSError, ValueError) as error:
             raise Refused(f"{self.path.name} cannot be read ({type(error).__name__}); it is left as it is") from None
-        if problems := check_labels(labels, self.set, self.papers, self.rater):
+        if isinstance(labels, dict) and ("sample" in labels) != (self.sample is not None):
+            raise Refused(f"{self.path.name}: " + ("these are the sample's labels: open the sample's page (--sample)"
+                                                   if self.sample is None else "these labels are not the sample's")
+                          + "; it is left as it is")
+        if problems := check_labels(labels, self.set, self.papers, self.rater, self.sample):
             raise Refused(f"{self.path.name}: " + "; ".join(problems[:5]) + "; it is left as it is")
         return labels["labels"]
 
@@ -1393,7 +1419,7 @@ class Review:
             if problems := set_problems(self.set, labels, self.papers):
                 return 400, {"code": rule_code(problems[0]), "problem": problems[0]}
             doc = {"set": self.set["id"], "kind": self.kind, "field": self.field, "rater": self.rater,
-                   "set_sha256": self.set_sha256, **({"sample": True} if self.sample else {}),
+                   "set_sha256": self.set_sha256, **({"sample": True} if self.sample is not None else {}),
                    "labels": dict(sorted(labels.items()))}
             try:
                 write_json(self.root, self.path, doc)
@@ -1561,8 +1587,8 @@ def main(argv=None):
             papers_doc, _, sets = load_field(args.field, folder)
             if args.set not in sets:
                 raise Refused(f"{args.set}.json is not drafted yet")
-            set_doc = sets[args.set]
-            problems = check_papers(papers_doc, args.field, load_settings())
+            set_doc, settings = sets[args.set], load_settings()
+            problems = check_papers(papers_doc, args.field, settings)
             papers = {} if problems else {p["id"]: p for p in papers_doc["papers"]}
             if problems := problems or check_set(set_doc, args.set, args.field, papers):
                 raise Refused(f"{args.set}.json does not pass its check: " + "; ".join(problems[:5]))
@@ -1570,7 +1596,7 @@ def main(argv=None):
                 out = folder / f"sample-{args.set}.json"
                 if entry(folder, out):
                     raise Refused(f"{out.name} exists: a sample is drawn once, before anyone labels it")
-                write_json(folder, out, draw(set_doc, load_settings()))
+                write_json(folder, out, draw(set_doc, settings))
                 print(f"{out}: {len(read_json(folder, out)['items'])} items")
             else:
                 if not all(RATER.fullmatch(r) for r in (args.raters if args.command == "agreement" else [args.rater])):
@@ -1579,14 +1605,21 @@ def main(argv=None):
                 def labels_of(rater):
                     path = folder / "labels" / f"{set_doc['id']}.{rater}.json"
                     labels = read_json(folder, path)
-                    if problems := check_labels(labels, set_doc, papers, rater):
+                    if problems := check_labels(labels, set_doc, papers, rater, sample_if(labels)):
                         raise Refused(f"{path.name}: " + "; ".join(problems[:5]))
                     return labels
+
+                def sample_if(labels):  # the recorded sample, read only for a sample's labels
+                    return recorded_sample(folder, set_doc, settings) if isinstance(labels, dict) and "sample" in labels else None
                 if args.command == "agreement":
-                    print(json.dumps(agreement(set_doc, *map(labels_of, args.raters)), ensure_ascii=False, indent=1))
+                    first, second = map(labels_of, args.raters)
+                    if (sample := recorded_sample(folder, set_doc, settings)) is None:
+                        raise Refused("agreement is measured on the recorded sample: draw it first (gold.py sample)")
+                    print(json.dumps(agreement(set_doc, first, second, sample), ensure_ascii=False, indent=1))
                 else:
                     out = outputs(folder) / f"{set_doc['id']}.corrected.{args.rater}.json"
-                    corrected = apply(set_doc, labels_of(args.rater), papers)
+                    labels = labels_of(args.rater)
+                    corrected = apply(set_doc, labels, papers, sample_if(labels))
                     write_json(out_root(folder), out, corrected)
                     print(f"{out}: {corrected['counts']}")
     except (Refused, OSError, ValueError) as refused:

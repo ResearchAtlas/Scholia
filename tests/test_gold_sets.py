@@ -599,7 +599,8 @@ def test_pair_agreement_gives_percent_kappa_and_the_confusion_table(tmp_path):
 
     def score(a, b):
         return gold.agreement(doc, labels_for(doc, "harold", {f"p{n}": {"category": c} for n, c in enumerate(a)}),
-                              labels_for(doc, "lee", {f"p{n}": {"category": c} for n, c in enumerate(b)}))
+                              labels_for(doc, "lee", {f"p{n}": {"category": c} for n, c in enumerate(b)}), every)
+    every = [i["id"] for i in doc["items"]]
     same = score(["supported", "partly", "unsupported", "supported"], ["supported", "partly", "unsupported", "supported"])
     assert same["both_labeled"] == 4 and same["percent_agreement"] == 100.0 and same["kappa"] == 1.0
     chance = score(["supported", "supported", "unsupported", "unsupported"], ["supported", "unsupported", "supported", "unsupported"])
@@ -610,7 +611,7 @@ def test_pair_agreement_gives_percent_kappa_and_the_confusion_table(tmp_path):
     assert lopsided["kappa"] == 0.5
     one = score(["supported"] * 4, ["supported"] * 4)
     assert one["kappa"] is None and one["percent_agreement"] == 100.0  # kappa undefined, said so
-    partial = gold.agreement(doc, labels_for(doc, "harold", {"p0": {"category": "partly"}}), labels_for(doc, "lee", {}))
+    partial = gold.agreement(doc, labels_for(doc, "harold", {"p0": {"category": "partly"}}), labels_for(doc, "lee", {}), every)
     assert partial["both_labeled"] == 0 and partial["kappa"] is None
 
 
@@ -622,11 +623,58 @@ def test_question_agreement_covers_keep_or_drop_answerable_and_evidence(tmp_path
     second = labels_for(doc, "lee", {"q01": {"decision": "keep"},
                                      "q02": edit(doc["items"][1], evidence=doc["items"][1]["evidence"][:1]),
                                      "q03": {"decision": "keep"}, "q04": edit(doc["items"][3], answerable=False)})
-    out = gold.agreement(doc, first, second)
+    out = gold.agreement(doc, first, second, [i["id"] for i in doc["items"]])
     assert out["kept"]["both_labeled"] == 4 and out["kept"]["percent_agreement"] == 75.0
     assert out["answerable"]["both_labeled"] == 3 and out["answerable"]["percent_agreement"] == round(200 / 3, 2)
     # q01 the same evidence; q02: one item of two, one passage of three (the split paragraph's two out)
     assert out["evidence"] == {"both_answerable": 2, "same_items": 1, "mean_passage_overlap": round((1 + 1 / 3) / 2, 4)}
+
+
+def test_agreement_is_measured_on_the_recorded_sample_alone(tmp_path):
+    """T7: agreement counted every item both raters labeled; spec section 14 measures it on the overlap sample.
+    A history label inside the sample is not compared either."""
+    folder = field(tmp_path)
+    doc = json.loads((folder / "questions.json").read_text())
+    decisions = {"q01": {"decision": "keep"}, "q02": {"decision": "drop"}, "q03": {"decision": "keep"},
+                 "q04": {"decision": "keep"}}
+    first, second = labels_for(doc, "harold", decisions), labels_for(doc, "lee", {**decisions, "q02": {"decision": "keep"}})
+    second["labels"]["q04"]["item_sha256"] = "an older version of the item"
+    out = gold.agreement(doc, first, second, ["q01", "q02", "q04"])
+    assert out["kept"]["both_labeled"] == 2 and out["kept"]["percent_agreement"] == 50.0  # q01 and q02; q03 out
+
+
+def test_a_samples_labels_hold_only_the_recorded_samples_items_and_agreement_needs_the_sample(tmp_path):
+    """T7: a labels file marked as the sample's could hold labels outside the sample; the page, check, apply
+    and agreement now refuse it, and agreement refuses to run without a recorded sample."""
+    folder = field(tmp_path, sample=True)
+    doc = json.loads((folder / "questions.json").read_text())
+    sample = json.loads((folder / "sample-questions.json").read_text())["items"]
+    outside = next(i["id"] for i in doc["items"] if i["id"] not in sample)
+    (folder / "labels").mkdir()
+    write(folder / "labels" / f"{doc['id']}.harold.json", labels_for(doc, "harold", {i: {"decision": "keep"} for i in sample}))
+    lee = {**labels_for(doc, "lee", {i: {"decision": "keep"} for i in [*sample, outside]}), "sample": True}
+    write(folder / "labels" / f"{doc['id']}.lee.json", lee)
+    said = f"labels: they are the sample's, and {outside} are not in the recorded sample"
+    assert f"{doc['id']}.lee.json: {said}" in problems_of(folder)[0]
+    with pytest.raises(gold.Refused, match=said):
+        gold.Review(2, folder, "questions", "lee", sample=True)
+    command = ["--field", "2", "--folder", str(folder), "--set", "questions"]
+    for argv in (["agreement", *command, "--raters", "harold", "lee"], ["apply", *command, "--rater", "lee"]):
+        with pytest.raises(SystemExit, match=said):
+            gold.main(argv)
+    with pytest.raises(gold.Refused, match="open the sample's page"):  # a sample's labels on the whole set's page
+        gold.Review(2, folder, "questions", "lee")
+    with pytest.raises(gold.Refused, match="not the sample's"):  # the whole set's labels on the sample's page
+        gold.Review(2, folder, "questions", "harold", sample=True)
+    del lee["labels"][outside]
+    write(folder / "labels" / f"{doc['id']}.lee.json", lee)
+    assert problems_of(folder)[0] == []
+    gold.main(["agreement", *command, "--raters", "harold", "lee"])
+    (folder / "sample-questions.json").unlink()
+    assert f"{doc['id']}.lee.json: labels: they are the sample's, and no sample of this set is recorded" in problems_of(folder)[0]
+    write(folder / "labels" / f"{doc['id']}.lee.json", {k: v for k, v in lee.items() if k != "sample"})
+    with pytest.raises(SystemExit, match="agreement is measured on the recorded sample"):
+        gold.main(["agreement", *command, "--raters", "harold", "lee"])
 
 
 # Tiers 2 and 3
