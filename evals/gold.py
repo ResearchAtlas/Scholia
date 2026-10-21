@@ -174,7 +174,7 @@ def _open_dir(root, folder, create=False):
     """An open descriptor of folder, reached from root one folder at a time, none of them a git work tree;
     folders made 0700 when create."""
     root, folder = Path(root), Path(folder)
-    for accepted in [a for a in FIELD1_ROOTS if root.is_relative_to(a)]:
+    for accepted in [a for a in tuple(FIELD1_ROOTS) if root.is_relative_to(a)]:  # a copy: a page thread may add to it
         private_path(1, accepted)  # the folders above field 1's, again: one may have become a git work tree since
     parts = folder.relative_to(root).parts
     if create:
