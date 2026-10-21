@@ -800,7 +800,7 @@ def test_nothing_private_or_whole_is_committed_under_evals():
             doc = json.loads(path.read_text())
             assert not (isinstance(doc, dict) and doc.get("field") == 1), path
     ignored = (ROOT / ".gitignore").read_text().splitlines()
-    assert "evals/local/" in ignored and "evals/out/" in ignored
+    assert "evals/local/" in ignored and "evals/out/" in ignored  # evals/local/: kept as a defence; field 1 is never there
 
 
 def test_the_gold_sets_public_text_states_the_hold_out_and_never_calls_scholia_bilingual():
@@ -953,6 +953,29 @@ async def test_field_ones_temporary_app_never_writes_under_tmpdir_even_inside_a_
     folder, pdfs = pdf_field(tmp_path / "f2", 2)
     await gold.passages(2, folder, pdfs, watching(opener()))
     assert during[1][0].is_relative_to(repo / "tmp")  # field 2 is public: TMPDIR as before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tmpdir", [None, "given"])
+async def test_field_ones_temporary_folder_is_removed_and_tmpdir_given_back_when_the_run_fails(tmp_path, monkeypatch, tmpdir):
+    """Internal review 3: a refusal, failure or Ctrl-C leaves no .tmp-scholia-gold-* folder and TMPDIR as it was
+    (unset stays unset)."""
+    if tmpdir is None:
+        monkeypatch.delenv("TMPDIR", raising=False)
+    else:
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    folder, pdfs = pdf_field(tmp_path, 1)
+
+    @contextlib.asynccontextmanager
+    async def failing(data):
+        assert data.is_relative_to(folder) and os.environ["TMPDIR"].startswith(str(folder))
+        raise RuntimeError("the app failed")
+        yield
+    with pytest.raises(RuntimeError):
+        await gold.passages(1, folder, pdfs, failing)
+    assert not [p for p in folder.iterdir() if p.name.startswith(".tmp-")] and tempfile.tempdir is None
+    assert os.environ.get("TMPDIR") == (None if tmpdir is None else str(tmp_path))
 
 
 def test_from_a_worktree_the_main_checkout_is_refused_too():
