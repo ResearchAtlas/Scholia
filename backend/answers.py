@@ -65,6 +65,9 @@ async def trace(run_id: str, request: Request, after: int = -1, limit: int = PAG
                    for cid, existence, support, sentence in conn.execute(
                        "SELECT id, existence, support, json_extract(context, '$.sentence') FROM citations"
                        " WHERE owner_id = ?", (run_id,))}
+        for cid, existence in resolve_now(conn, list(current)).items():  # as it stands now (T7)
+            if existence != current[cid]["existence"]:
+                current[cid].update(existence=existence, support="unchecked")
         return rows, kept, current
     rows, kept, current = await asyncio.to_thread(_state(request)["db"].read, read)
     events = []
@@ -113,12 +116,14 @@ def resolve_now(conn, citation_ids):
         "SELECT c.id, c.passage_id, c.material_id, c.quote, c.existence, m.project_id FROM citations c"
         " LEFT JOIN materials m ON m.id = c.material_id WHERE c.id IN (SELECT value FROM json_each(?))",
         (json.dumps(citation_ids),)).fetchall()
-    found = {}
+    found, read = {}, {}
     for cid, pid, material, quote, existence, project in rows:
         if existence in ("not_found", "not_read_in_run") or project is None:
             found[cid] = existence if existence in ("not_found", "not_read_in_run") else "source_removed"
             continue
-        current = readings(conn, project, references=False, materials=[material])
+        if material not in read:  # each paper's current reading once, however many of its citations
+            read[material] = readings(conn, project, references=False, materials=[material])
+        current = read[material]
         found[cid] = "ok" if pid in current or (quote and any(quote in r[4] for r in current.values())) \
             else "source_removed"
     return found

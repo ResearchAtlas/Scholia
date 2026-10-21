@@ -70,6 +70,27 @@ async def test_a_citation_whose_passage_was_re_read_maps_by_its_quote_or_is_sour
         assert (removed["existence"], removed["passage_id"]) == ("source_removed", None)
 
 
+async def test_after_a_cited_papers_file_is_replaced_its_chip_reads_removed_not_found_and_supported(tmp_path):
+    # T7 (PR 41): the conversation read, and Details, give each citation's existence as it stands now: the
+    # replacement no longer holds the quote, so the stored "ok" and its verdict are not shown as current.
+    from test_materials import added
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (chip["existence"], chip["support"]) == ("ok", "supported") and chip["quote"]
+        await added(client, project, paper("Wage Floors", "Rents rose in the synthetic city."), material_id=material)
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (chip["existence"], chip["support"], chip["quote"], chip["passage_id"]) == (
+            "source_removed", "unchecked", None, None)
+        [check] = [e["data"] for e in (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+                   if e["type"] == "citation_checks"]
+        assert [(c["existence"], c["support"]) for c in check["citations"]] == [("source_removed", "unchecked")]
+
+
 async def test_selected_papers_that_fit_are_read_whole_and_larger_ones_are_searched_within(tmp_path):
     other = paper("Rents", "Housing rents rose in the synthetic city.")
     async with cited(tmp_path) as client:
