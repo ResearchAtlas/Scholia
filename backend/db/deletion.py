@@ -283,11 +283,13 @@ def _delete(conn, kind, object_id, remove_all_trace):
     _close_over(conn, edges)
 
     revoked = _revoke(conn)
-    # S1-19b: a deleted turn's judge share held open (an allowance its step_started names) is released here, while
-    # its events still say which it is; the call's own reservation settles by its id when the call returns.
+    # S1-19b: a deleted turn's judge share and its answer's unspent held open (named by its step events'
+    # allowance_id and unspent_id) are released here, while its events still say which they are; the call's
+    # own reservation settles by its id when the call returns.
     conn.execute(
         "UPDATE budget_reservations SET status = 'released', settled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
-        " WHERE status = 'open' AND id IN (SELECT json_extract(e.data, '$.allowance_id') FROM run_events e"
+        " WHERE status = 'open' AND id IN (SELECT value FROM run_events e, json_each(json_array("
+        "json_extract(e.data, '$.allowance_id'), json_extract(e.data, '$.unspent_id')))"
         " WHERE e.type IN ('step_started', 'step_finished')"
         f" AND e.run_id IN (SELECT id FROM runs WHERE rowid IN {_doomed('runs')}))")
     _queue_index_removals(conn)

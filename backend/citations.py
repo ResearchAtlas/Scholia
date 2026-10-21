@@ -37,10 +37,15 @@ _MALFORMED = re.compile(r"\[S[^\]\n]{0,12}\]")
 # a marker or a number ([S1.2], 3.5) does not end it. The look-behind makes a long run of points cost what
 # its length does.
 _END = re.compile(r"(?<![.!?])[.!?]++(?=\s|$)|[。！？]++|\n")
-# Code, where a marker is not a citation (the interface draws it as code): fenced blocks and inline spans.
 _LEADING = re.compile(r"^(?:[\s|]*\[S[^\]\n]{0,12}\])+")
 _EDGES = re.compile(r"^[\s|]+|[\s|]+$")  # a table row's cell bars and the space around a sentence
-_CODE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
+# Code, where a marker is not a citation, read as the interface's Markdown renderer reads it (CommonMark, so
+# frontend/tests/fixtures/code-markers.json holds for both): a fence of three or more backticks or tildes at a
+# line's start (up to three spaces in), closed by a line of at least as many of the same character, or by the
+# text's end; and a code span, a run of backticks closed by a run of the same length within its paragraph.
+_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})([^\n]*)")
+_FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*$")
+_SPAN = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
 VERDICTS = ("supported", "partly", "unsupported")
 QUOTE_CHARS = 500  # the part of a passage a citation keeps as its quote
 
@@ -99,9 +104,33 @@ def sentences(text):
     return [(at, sentence) for at, sentence in out if sentence.strip()]
 
 
+def _code(text):
+    """The (start, end) ranges of text that are code: fenced blocks, then code spans outside them."""
+    fences, outside, fence, at = [], [], None, 0
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if fence is None:
+            m = _FENCE_OPEN.match(body)
+            if m and not (m[1][0] == "`" and "`" in m[2]):  # a backtick fence's info string has no backtick
+                fence = (m[1][0], len(m[1]), at)
+        else:
+            m = _FENCE_CLOSE.match(body)
+            if m and m[1][0] == fence[0] and len(m[1]) >= fence[1]:
+                fences.append((fence[2], at + len(line)))
+                fence = None
+        at += len(line)
+    if fence is not None:  # an unclosed fence runs to the end
+        fences.append((fence[2], len(text)))
+    start = 0
+    for a, b in [*fences, (len(text), len(text))]:
+        outside += [(start + m.start(), start + m.end()) for m in _SPAN.finditer(text[start:a])]
+        start = b
+    return fences + outside
+
+
 def markers(text):
     """[(offset, marker, (source, passage) or None)] for every citation-like marker outside code, in order."""
-    code = [m.span() for m in _CODE.finditer(text)]
+    code = _code(text)
     found = {m.start(): (m.start(), m.group(), (int(m[1]), int(m[2]))) for m in CITATION.finditer(text)}
     for m in _MALFORMED.finditer(text):
         found.setdefault(m.start(), (m.start(), m.group(), None))
@@ -232,8 +261,18 @@ def sentence_key(sentence):
     return hashlib.sha256((sentence or "").encode("utf-8")).hexdigest()
 
 
-def batches(items, size):
-    return [items[i:i + size] for i in range(0, len(items), size)]
+def batches(items, size, fits=None):
+    """items in batches of up to size, in order; with fits(batch), a batch that does not fit is halved until it
+    does (section 7.5), a single item that fits nowhere left as it is, for its call to fail. The one splitting
+    path of the turn's check and of /check (backend/runs.py)."""
+    queue, out = [items[i:i + size] for i in range(0, len(items), size)], []
+    while queue:
+        batch = queue.pop(0)
+        if fits is None or len(batch) == 1 or fits(batch):
+            out.append(batch)
+        else:
+            queue[:0] = [batch[:len(batch) // 2], batch[len(batch) // 2:]]
+    return out
 
 
 def apply_verdicts(checked, verdicts):

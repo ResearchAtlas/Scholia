@@ -12,7 +12,7 @@ from backend import pipeline, runs as runs_module
 from backend.db import deletion
 from cited import ANSWER, Provider, cited, conversation_in, rows, with_papers
 from scholia_app import events, run_finished, send
-from test_search import WAGES
+from test_search import WAGES, paper, setting
 
 pytestmark = pytest.mark.asyncio
 QUESTION = "What do minimum wages do to earnings?"
@@ -535,3 +535,127 @@ async def test_a_citation_mapped_to_a_re_read_passage_is_judged_on_what_that_pas
         [row] = await asyncio.to_thread(db.read, lambda conn: citations.check_existence(
             conn, project, "Wages rise [S1.1].", {(1, 1): record}))
         assert (row["existence"], row["passage_id"], row["judged_text"]) == ("ok", pid, now)
+
+
+# Fix batch b3 (external recheck b3): findings 3 to 8, each a test that failed before its fix.
+
+TWINNED = paper("Wage Floors Again", "Minimum wages raise the earnings of low-paid workers in the synthetic panel.",
+                "Housing costs were not measured in this second synthetic panel.")
+
+
+async def test_recovery_records_an_interrupted_call_whose_body_an_earlier_call_also_sent(tmp_path):
+    # b3 (3): two judge calls with the same bytes (two papers holding the same passage); the second is in flight
+    # when recovery runs, and is recorded as interrupted although the first call's attempt names the same body.
+    release, second = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def verdicts(body):
+        calls.append(body)
+        if len(calls) == 2:
+            second.set()
+            await release.wait()
+        return Provider().answer("1: supported")
+    provider = Provider(answer_text="Low-paid workers earn more. [S1.1] Low-paid workers earn more. [S2.1]",
+                        verdicts=verdicts)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES, TWINNED)
+        await setting(client, "retrieval.judge_pairs", 1)
+        conversation = await conversation_in(client, project)
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": QUESTION}))
+        await asyncio.wait_for(second.wait(), 10)
+        assert calls[0] == calls[1]  # the same bytes, so the same stored body
+        [(run_id,)] = await rows(client, "SELECT id FROM runs WHERE kind = 'turn'")
+        [(step,)] = await rows(client, "SELECT max(step) FROM run_bodies WHERE run_id = ?", run_id)
+        await client.state["harness"].recover(kick=False)
+        attempts = [json.loads(d) for (d,) in await rows(
+            client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'", run_id)]
+        assert [(a["step"], a.get("attempt")) for a in attempts if a["outcome"] == "interrupted"] == [(step, 0)]
+        release.set()
+        await stream
+
+
+async def test_the_answers_unspent_is_held_again_against_the_budget_as_it_is_when_the_answer_settles(tmp_path):
+    # b3 (4): a budget lowered while the answer is out governs the reservation its settlement holds again.
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+
+        async def lower_then_answer(body):
+            current = (await client.get("/api/settings", params={"project_id": project})).json()
+            response = await client.put("/api/settings", json={"project_id": project, "hash": current["hash"],
+                                                               "updates": {"project.budget_usd": 0.001}})
+            assert response.status_code == 200, response.text
+            return client.provider.answer(ANSWER)
+        client.provider.answer_text = lower_then_answer
+        stream = await send(client, conversation, QUESTION)
+        finished = [json.loads(d) for (d,) in await rows(
+            client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished'", stream[0]["run_id"])]
+        assert stream[-1]["status"] == "succeeded"
+        answer = finished[0]
+        assert "unspent_id" not in answer and "allowance_id" not in answer  # nothing held past the lowered budget
+
+
+async def test_a_recheck_too_large_for_the_judges_window_is_split_as_the_answers_check_is(tmp_path, monkeypatch):
+    # b3 (5): /check halves a batch its judge's window cannot take, through the same path as the turn's check.
+    long = "and the effect held in every region, every year and every firm size of the synthetic panel " * 4
+    text = " ".join(f"Claim {n} holds {long}[S1.1]." for n in range(1, 41))
+    provider = Provider(answer_text=text)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        real = runs_module.Harness._route_facts
+
+        async def small(self, *args, **kwargs):  # the judge's endpoints take 4,096 tokens
+            problem, facts = await real(self, *args, **kwargs)
+            return problem, facts and {**facts, "window": 4096}
+        monkeypatch.setattr(runs_module.Harness, "_route_facts", small)
+        provider.judged.clear()
+        provider.verdicts = lambda body: "\n".join(
+            f"{i}: unsupported" for i in range(1, body["messages"][-1]["content"].count("Pair ") + 1))
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "succeeded"
+        assert len(provider.judged) > 1 and sum(b["messages"][-1]["content"].count("Pair ") for b in provider.judged) == 40
+        assert await rows(client, "SELECT support, count(*) FROM citations GROUP BY support") == [("unsupported", 40)]
+
+
+async def test_each_judge_call_says_which_held_amount_funded_it_and_each_is_held_apart(tmp_path):
+    # b3 (6): what is left of the share and of the answer's unspent are held apart, so a later call the share's
+    # rest cannot cover is said to be funded by the answer's unspent, never by the share.
+    provider = Provider(answer_text="Earnings rise [S1.1]. Employment barely moves [S1.1]. Prices adjust [S1.1].")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        await setting(client, "retrieval.judge_pairs", 1)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, QUESTION)
+        steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events WHERE run_id = ?"
+                                                              " AND type = 'step_started' ORDER BY seq", stream[0]["run_id"])]
+        [answer] = [s for s in steps if s["phase"] == "answer"]
+        judges = [s for s in steps if s["phase"] == "judge"]
+        assert len(judges) == 3 and judges[0]["funded"] == "share"
+        share_left = answer["allowance_usd"] - judges[0]["estimate_usd"]
+        assert judges[1]["estimate_usd"] > share_left and judges[1]["funded"] == "answer_unspent"
+        assert ("open",) not in await rows(client, "SELECT status FROM budget_reservations")
+
+
+async def test_a_marker_in_a_tilde_fence_is_code_never_a_citation_or_a_judge_call(tmp_path):
+    # b3 (8): code fences of either kind, as the interface's renderer reads them.
+    text = "Earnings rise [S1.1].\n\n~~~\nexample [S1.2]\n~~~\n"
+    provider = Provider(answer_text=text)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert [c["marker"] for c in turn["citations"]] == ["[S1.1]"]
+        assert sum(b["messages"][-1]["content"].count("Pair ") for b in provider.judged) == 1
+
+
+async def test_code_spans_and_fences_are_read_as_the_interfaces_renderer_reads_them():
+    # b3 (8): one set of cases, read by frontend/tests/answers.test.mjs too.
+    from pathlib import Path
+    from backend import citations
+    cases = json.loads((Path(__file__).parents[1] / "frontend/tests/fixtures/code-markers.json").read_text())
+    for case in cases:
+        assert [m for _, m, _ in citations.markers(case["text"])] == case["markers"], case["text"]

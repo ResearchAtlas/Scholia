@@ -1,0 +1,51 @@
+[
+ {
+  "text": "Earnings rise [S1.1].\n\n~~~\nexample [S1.2]\n~~~\n\nPrices adjust [S1.2].",
+  "markers": [
+   "[S1.1]",
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "```\nexample [S1.1]\n```\n\nPrices adjust [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "````\n```\nexample [S1.1]\n````\n\nPrices adjust [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "~~~\nexample [S1.1]\n```\nstill code [S1.1]\n~~~\n\nPrices adjust [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "   ~~~\nexample [S1.1]\n   ~~~\n\nPrices adjust [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "Written `[S1.1]` and ``a ` [S1.1]`` in code, then [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "A lone ` before [S1.1] is text.",
+  "markers": [
+   "[S1.1]"
+  ]
+ },
+ {
+  "text": "Earnings rise [S1.1].\n\n~~~\nunclosed [S1.2]",
+  "markers": [
+   "[S1.1]"
+  ]
+ }
+]
