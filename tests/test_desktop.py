@@ -20,7 +20,7 @@ import pytest
 from backend import desktop
 from backend.db import Database
 from network_guard import allow_subprocess, register_server
-from scholia_app import KEY, FakeKeyring
+from scholia_app import KEY, FakeKeyring, MockProvider, streamed
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -77,7 +77,11 @@ def test_closing_the_window_interrupts_running_work_and_stops_the_server(tmp_pat
     data = tmp_path / "data"
     call_started = threading.Event()
 
+    listings = MockProvider()  # the model catalog and endpoint listing the turn's admission reads
+
     async def provider(request):
+        if not request.url.path.endswith("/chat/completions"):
+            return streamed(await listings(request))
         call_started.set()
         import asyncio
         await asyncio.sleep(3600)  # a model call still waiting when the window closes

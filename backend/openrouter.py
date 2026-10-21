@@ -3,7 +3,10 @@
 # HTTP client (the outbound gate's, for the request's project) are passed in instead
 # of read from the legacy configuration; every HTTP attempt is reported with its usage;
 # errors are classified completely and returned, never logged with their bodies; and
-# reasoning is sent only for a model whose capability record says how.
+# reasoning is sent only for a model whose capability record says how. S1-19: a request
+# requires the output limit and any reasoning it sends (provider.require_parameters); a refusal or a
+# provider's policy block is its own outcome; a reply of tool calls alone is an answer;
+# attempts keep the cache counts the provider reports.
 """The provider adapter: one chat completion against a model route.
 
 `query_model` makes at most two HTTP attempts: the second only when an
@@ -98,6 +101,10 @@ class Attempt:
         reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else None
         if _count(reasoning):
             tokens["reasoning_tokens"] = reasoning
+        prompt = self.usage.get("prompt_tokens_details") or {}
+        for name in ("cached_tokens", "cache_write_tokens"):  # cache reads and writes, as reported
+            if isinstance(prompt, dict) and _count(prompt.get(name)):
+                tokens[name] = prompt[name]
         cost = self.reported_cost
         return {"outcome": self.outcome, "http_status": self.http_status, "elapsed_ms": self.elapsed_ms,
                 "dispatched": self.dispatched, **({"retention": self.retention} if self.retention is not None else {}),
@@ -112,6 +119,8 @@ class ModelResult:
     reasoning: str | None
     error_kind: str | None  # None when the answer is usable
     attempts: list = field(default_factory=list)
+    tool_calls: list = field(default_factory=list)  # as the provider sent them; with or without content
+    cut: bool = False  # the answer stopped at the request's output limit (finish_reason "length")
 
     @property
     def ok(self) -> bool:
@@ -188,6 +197,30 @@ def resolve_model_reasoning(route, effort: str | None, *, model_entry=None, capa
     return reasoning, capability.get("provider_pinned") if reasoning is not None else None
 
 
+def routing(model_entry, *, zdr_enabled=False, pin=None, require=False) -> dict:
+    """The `provider` routing an OpenRouter request carries (Scholia): the one description of which
+    endpoints it can reach, which backend/reach.py reads to bound the request (reachable).
+
+    A Private request carries provider.zdr = true and is limited to the model's zero-retention
+    endpoints above the window where OpenRouter compresses by default (provider.only), never its
+    smaller ones (provider.ignore; slice 1 section 6.4); without them in the catalog's row, the gate
+    refuses it. A pinned request goes to that endpoint alone. require: provider.require_parameters."""
+    provider = {}
+    if zdr_enabled:
+        provider["zdr"] = True  # never weakened
+        endpoints = (model_entry or {}).get("zdr_endpoints") or {}
+        if endpoints.get("usable"):
+            provider["only"] = list(endpoints["usable"])
+            if endpoints.get("small"):
+                provider["ignore"] = list(endpoints["small"])
+    if pin:
+        provider["order"] = [pin]
+        provider["allow_fallbacks"] = False
+    if require:
+        provider["require_parameters"] = True
+    return provider
+
+
 def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens=None, model_entry=None,
                   capability_records=None) -> dict:
     """The request body. Raises ValueError for zero-retention routing off OpenRouter,
@@ -200,20 +233,10 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
         payload["max_tokens"] = max_tokens
     reasoning, pin = resolve_model_reasoning(route, effort, model_entry=model_entry,
                                              capability_records=capability_records, zdr_enabled=zdr_enabled)
-    provider = {}
-    if zdr_enabled:
-        provider["zdr"] = True  # never weakened
-        # Only the model's zero-retention endpoints above the window where OpenRouter compresses
-        # by default, and never its smaller ones (slice 1 section 6.4). Without them in the
-        # catalog's row, the gate refuses the request.
-        endpoints = (model_entry or {}).get("zdr_endpoints") or {}
-        if endpoints.get("usable"):
-            provider["only"] = list(endpoints["usable"])
-            if endpoints.get("small"):
-                provider["ignore"] = list(endpoints["small"])
-    if pin and route.provider.is_openrouter:
-        provider["order"] = [pin]
-        provider["allow_fallbacks"] = False
+    # Parameters the request relies on (the output limit, reasoning): an endpoint that would ignore one
+    # is not used, and with none left the request fails rather than run without it (rule 2).
+    provider = routing(model_entry, zdr_enabled=zdr_enabled, pin=pin,
+                       require=bool(reasoning or max_tokens is not None)) if route.provider.is_openrouter else {}
     if provider:
         payload["provider"] = provider
     if reasoning:
@@ -272,7 +295,10 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         body = _json(response)
         usage = body.get("usage") if isinstance(body, dict) and isinstance(body.get("usage"), dict) else {}
         if response.status_code >= 400:
-            attempts.append(Attempt(classify_status(response.status_code), response.status_code, _ms(started), usage,
+            # OpenRouter answers 403 for its moderation and its providers' guardrails: a policy block.
+            kind = "policy_block" if response.status_code == 403 and route.provider.is_openrouter \
+                else classify_status(response.status_code)
+            attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
                                     retention=sent[-1] if sent else None))
             retry = (response.status_code == 400 and "reasoning" in payload and not route.provider.is_openrouter
                      and len(attempts) < MAX_ATTEMPTS)
@@ -283,14 +309,21 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
                 continue
             return _failed(attempts[-1].outcome, attempts, route)
         content, reasoning = _answer(body)
-        if visible(content) is None:  # nothing to show, invisible characters included
-            attempts.append(Attempt("malformed", response.status_code, _ms(started), usage,
+        refusal = _refusal(body)
+        tool_calls = _tool_calls(body)
+        if refusal is not None or (visible(content) is None and not tool_calls):
+            # Nothing to show, invisible characters included (the output limit spent before any text,
+            # say on reasoning); or the model or a policy declined. Its reported cost is kept, and the
+            # same prompt is never sent again (model-route rule 4).
+            kind = refusal or ("output_limit" if _choice(body).get("finish_reason") == "length" else "malformed")
+            attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
                                     retention=sent[-1] if sent else None))
-            return _failed("malformed", attempts, route)
+            return _failed(kind, attempts, route)
         attempts.append(Attempt("ok", response.status_code, _ms(started), usage, retention=sent[-1] if sent else None))
         if len(attempts) > 1 and "reasoning" not in payload:
             _remember_no_reasoning(route, key)
-        return ModelResult(content, reasoning, None, attempts)
+        return ModelResult(content, reasoning, None, attempts, tool_calls,
+                           cut=_choice(body).get("finish_reason") == "length")
 
 
 def _count(value):
@@ -323,6 +356,31 @@ def _answer(body):
         return None, None
     content = message.get("content")
     return (content if isinstance(content, str) else None), extract_reasoning(message)
+
+
+def _choice(body):
+    try:
+        choice = body["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return {}
+    return choice if isinstance(choice, dict) else {}
+
+
+def _refusal(body):
+    """"model_refusal" when the model declined (its message's refusal), "policy_block" when a content
+    filter stopped the answer, else None."""
+    choice = _choice(body)
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    if visible(message.get("refusal")) is not None:
+        return "model_refusal"
+    return "policy_block" if choice.get("finish_reason") == "content_filter" else None
+
+
+def _tool_calls(body):
+    """The reply's tool calls, as sent, when it has a list of them; else none."""
+    message = _choice(body).get("message")
+    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    return calls if isinstance(calls, list) and calls and all(isinstance(c, dict) for c in calls) else []
 
 
 def extract_reasoning(message: dict) -> str | None:

@@ -10,7 +10,7 @@ import tomlkit
 from backend.credentials import FALLBACK_FILE, SERVICE
 from backend.db import new_id
 from backend.governance import KEY_STATEMENT
-from scholia_app import KEY, FakeKeyring, background_idle, send, started
+from scholia_app import KEY, FakeKeyring, MockProvider, background_idle, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -177,7 +177,7 @@ async def test_several_providers_each_with_their_own_key(tmp_path):
 
 
 async def test_a_providers_models_come_from_its_catalog_through_the_gate(tmp_path):
-    async with started(tmp_path / "data") as client:
+    async with started(tmp_path / "data", MockProvider(catalog=())) as client:
         response = await client.get("/api/providers/openrouter/models")
         assert response.status_code == 200 and response.json()["models"] == []
         paths = [path for method, path, body in client.provider.requests]
@@ -396,6 +396,7 @@ async def test_long_provider_names_and_model_ids_are_accepted_in_messages(tmp_pa
             f'"providers"."{long_name}".kind': "openai-compatible",
             f'"providers"."{long_name}".base_url': "http://127.0.0.1:9/v1"}})
         await client.put(f"/api/keys/{long_name}", json={"key": "k"})
+        client.provider.local.append(long_model)  # the provider's listing names it
         conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
         stream = await send(client, conversation, provider=long_name, model=long_model)
         assert stream[-1]["status"] == "succeeded"

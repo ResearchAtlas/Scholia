@@ -328,7 +328,7 @@ function PerModel({ provider, table, save }) {
                   <dt>{t('providers.price')}</dt>
                   <dd>{m.pricing?.input != null && m.pricing?.output != null
                     ? t('providers.pricePerMillion', { input: price.format(m.pricing.input), output: price.format(m.pricing.output) })
-                    : t('providers.priceUnknown')}</dd>
+                    : t(provider.kind === 'openrouter' ? 'providers.priceUnpublished' : 'providers.priceUnknown')}</dd>
                 </dl>
               </div>
               <Field label={t('providers.window')} htmlFor={`w-${provider.name}-${m.id}`}

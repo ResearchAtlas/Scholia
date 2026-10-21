@@ -1461,6 +1461,8 @@ def _conversation_markdown(conversation, language="en"):
         lines += [f"## {author} ({turn['started_at']})", "", (turn["message"] or {}).get("text", ""), ""]
         if turn["answer"]:
             lines += ["## Scholia", "", turn["answer"].get("text", ""), ""]
+            if turn["answer"].get("cut"):  # stopped at the model's output limit
+                lines += [f"*{text('cut')}*", ""]
         elif turn["status"] != "running":
             status = text(f"status.{turn['status']}")
             lines += [f"*{text('no_answer', status=status)}*", ""]

@@ -15,11 +15,10 @@ rate.
 is metadata, not inference, so resolving prices here costs nothing and is safe to
 run before any paid call.
 
-In Scholia it is for pricing a route pinned to one endpoint, such as a model
-whose reasoning record names the endpoint it was probed on, where a model-wide
-catalog price would not be that endpoint's. No route is pinned yet: no model has a
-probed reasoning record. The current app's maintainer probes, which first used it
-to bound their spend, are not carried over.
+In Scholia it prices every endpoint a request can reach, so an estimate takes the
+highest rate among them (backend/reach.py; the M2 charter's model-route rule 6),
+including the cache-write and long-context rates (`pricing.overrides`). The current
+app's maintainer probes, which first used it to bound their spend, are not carried over.
 
 Rates are USD PER TOKEN (strings upstream); the catalog's are per MILLION.
 A pinned endpoint's price can exceed the model-wide value, so an estimate from
@@ -38,15 +37,18 @@ _TOKEN_PRICE_KEYS = frozenset({"prompt", "completion", "internal_reasoning"})
 # tripping the fail-closed guard (or, worse, being dropped from a ceiling).
 _CACHE_KEY_PREFIXES = ("input_cache_write", "input_cache_read")
 _PER_REQUEST_PRICE_KEYS = frozenset({"request", "web_search"})
-# Cannot apply: the probe sends one short text message and attaches no plugin, so no
-# image/audio/video units are ever billed (see reasoning_probe._post).
+# Cannot apply: every request Scholia sends holds text only (its messages are strings the context
+# assembler builds) and attaches no plugin, so no image, audio or video input is ever billed. An
+# image_output rate could apply to a model that answers with images, so it is not in this list: a
+# non-zero one is unaccounted and refuses the estimate (Scholia, S1-19a).
 _INAPPLICABLE_PRICE_KEYS = frozenset({
-    "image", "image_output", "audio", "input_audio_cache", "video",
+    "image", "audio", "input_audio_cache", "video",
 })
-# Not charges: `discount` reduces cost, `overrides` is routing metadata.
-_NON_PRICE_KEYS = frozenset({"discount", "overrides"})
+# Not a charge: `discount` reduces cost. `overrides` holds other rates, such as long-context ones
+# (Scholia; the M2 charter's model-route rule 6): see _override_rates.
+_NON_PRICE_KEYS = frozenset({"discount"})
 _ACCOUNTED_PRICE_KEYS = (
-    _TOKEN_PRICE_KEYS | _PER_REQUEST_PRICE_KEYS | _INAPPLICABLE_PRICE_KEYS | _NON_PRICE_KEYS
+    _TOKEN_PRICE_KEYS | _PER_REQUEST_PRICE_KEYS | _INAPPLICABLE_PRICE_KEYS | _NON_PRICE_KEYS | {"overrides"}
 )
 
 
@@ -63,6 +65,42 @@ def _is_nonzero_rate(value):
         return float(value) != 0.0
     except (TypeError, ValueError):
         return True
+
+
+# The conditions an override may name: token counts past which its rates apply. Its shape is not
+# documented, so only these are read as conditions (Scholia; Harold, 2026-10-20); any other key, or a
+# value of another shape, makes the endpoint's pricing unaccounted, and no estimate is made from it.
+_CONDITION_KEYS = frozenset({"min_prompt_tokens", "max_prompt_tokens", "min_context_tokens", "max_context_tokens"})
+
+
+def _override_rates(value, path="overrides"):
+    """({price key: [rates]}, [unaccounted paths]) from `pricing.overrides`, whose rates apply under
+    conditions, such as prompts past a length. Read conservatively (Scholia): every price key found at
+    any depth counts as a rate that may apply; a key in _CONDITION_KEYS is a condition when its value is
+    a whole number; anything else that is not zero or empty (another key, a bare value, a list of
+    values) is unaccounted."""
+    if not isinstance(value, (dict, list)):
+        return {}, [path] if _is_nonzero_rate(value) or isinstance(value, bool) else []
+    rates, unaccounted = {}, []
+    for key, item in (value.items() if isinstance(value, dict) else enumerate(value)):
+        name = key if isinstance(key, str) else None
+        if isinstance(item, (dict, list)):
+            found, missing = _override_rates(item, f"{path}.{key}")
+            for k, v in found.items():
+                rates.setdefault(k, []).extend(v)
+            unaccounted += missing
+        elif name in _CONDITION_KEYS:
+            if type(item) is not int or item < 0:
+                unaccounted.append(f"{path}.{key}")
+        elif name is not None and _is_accounted_price_key(name) and name not in _NON_PRICE_KEYS | {"overrides"}:
+            if _is_nonzero_rate(item):
+                try:
+                    rates.setdefault(name, []).append(float(item))
+                except (TypeError, ValueError):
+                    unaccounted.append(f"{path}.{key}")
+        elif isinstance(item, bool) or _is_nonzero_rate(item):
+            unaccounted.append(f"{path}.{key}")
+    return rates, unaccounted
 
 
 class EndpointPricingError(RuntimeError):
@@ -96,6 +134,8 @@ def price_endpoint(url, endpoint):
 
     def rate(key):
         value = pricing.get(key)
+        if isinstance(value, bool):  # a flag is no rate (Scholia)
+            raise EndpointPricingError(f"endpoint {endpoint.get('tag')!r} publishes {key} as a flag")
         return float(value) if value not in (None, "") else None
 
     prompt_rate = rate("prompt")
@@ -121,6 +161,15 @@ def price_endpoint(url, endpoint):
         key for key, value in pricing.items()
         if not _is_accounted_price_key(key) and _is_nonzero_rate(value)
     )
+    overrides, missing = _override_rates(pricing.get("overrides") or {})
+    unaccounted = sorted(unaccounted + missing)
+
+    def highest(keys):  # the base rate or any override's, whichever is highest (Scholia)
+        found = [rate0(key) for key in pricing if key in keys]
+        found += [rate for key, values in overrides.items() if key in keys for rate in values]
+        return max(found or [0.0])
+
+    caching = {key for key in [*pricing, *overrides] if key.startswith(_CACHE_KEY_PREFIXES)}  # reads and writes
 
     return {
         "source": url,
@@ -144,7 +193,12 @@ def price_endpoint(url, endpoint):
             [rate0(key) for key in pricing if key.startswith("input_cache_write")] or [0.0]
         ),
         # Flat charges that land once per call regardless of token counts.
-        "per_request_usd": rate0("request") + rate0("web_search"),
+        "per_request_usd": highest({"request"}) + highest({"web_search"}),
+        # The most a prompt token or an output token can cost here (Scholia): the prompt at its own
+        # rate, a cache write's or read's, or a long-context override's; output at the completion or
+        # reasoning rate. Every other accepted key is a per-request charge, inapplicable or a discount.
+        "max_input_per_token": highest({"prompt"} | caching),
+        "max_output_per_token": highest({"completion", "internal_reasoning"}),
         # Non-zero published rates this module cannot map to a probe call. Non-empty
         # means NO sound bound can be computed -- callers must refuse, not guess.
         "unaccounted_nonzero_price_keys": unaccounted,

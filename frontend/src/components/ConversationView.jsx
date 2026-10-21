@@ -164,7 +164,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // An answer shown but not saved stays shown, marked unsaved, for as long as the window is open.
   const shown = (turns ?? []).filter((turn) => !(live && !live.done && turn.status === 'running')).map((turn) => {
     const unsaved = !turn.answer && unsavedAnswer(turn.run_id);
-    return unsaved ? { ...turn, answer: { text: unsaved }, result_saved: false } : turn;
+    return unsaved ? { ...turn, answer: unsaved, result_saved: false } : turn;
   });
   const running = Boolean(live && !live.done) || shown.some((turn) => turn.status === 'running');
   const latest = shown.at(-1);
@@ -277,6 +277,7 @@ function Turn({ turn, onContinue }) {
       {turn.status === 'running' && <Working />}
       {turn.answer?.text && <Answer text={turn.answer.text} />}
       {turn.answer && !turn.result_saved && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
+      {turn.answer?.cut && <p className="text-xs text-muted-foreground">{t('turn.cut')}</p>}
       {(note || cost || onContinue) && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground">
           {note && <span className={cn(turn.status === 'failed' && 'text-destructive')}>{note}</span>}
@@ -299,6 +300,7 @@ function LiveTurn({ turn }) {
       <Question text={turn.text} />
       {turn.answer ? <Answer text={turn.answer} /> : !turn.done && <Working />}
       {turn.answer && turn.resultSaved === false && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
+      {turn.answer && turn.cut && <p className="text-xs text-muted-foreground">{t('turn.cut')}</p>}
       {turn.error && <p className="text-xs text-destructive">{t('turn.failed', { reason: errorText(t, turn.error) })}</p>}
       {turn.limit && <p className="text-xs text-muted-foreground">{t('turn.limit')}</p>}
     </li>

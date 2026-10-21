@@ -4,20 +4,19 @@
 # config.py) and the model tiers (execution_modes.py). Left out: retrieval budgets,
 # Council, web search and the steward, which Scholia does not have yet, and the
 # advisory budget brackets, which budgets per conversation and project replace. Prices
-# come from the route's provider catalog (openrouter_client.py), not a curated registry.
+# come from the endpoints a request can reach (reach.py), not a curated registry, and an
+# estimate counts the step's own request, not a fixed amount per mode (Scholia, S1-19).
 """The run plan for a message and the pre-send cost estimate (D3).
 
-The plan records the task signal, the model tier and the model a step will use,
-and a deliberately conservative estimate of what the step will cost. The estimate
-is what the harness reserves against the budgets before the call; the settled
-cost comes from the provider's reported usage. Estimates are approximate and
-never authoritative.
+The plan records the task signal, the model tier and the model a step will use. A step's
+estimate is a deliberately conservative bound on what it will cost: its counted request and
+its whole output limit at the highest rates it can reach. The estimate is what the harness
+reserves against the budgets before the call; the settled cost comes from the provider's
+reported usage. Estimates are approximate and never authoritative.
 """
 
 import re
 from dataclasses import asdict, dataclass
-
-from backend.openrouter_client import get_model_metadata
 
 AUTO = "auto"
 
@@ -42,19 +41,12 @@ MODEL_TIERS = {
 # The models offered as Recommended on OpenRouter: the tiers' preferred models.
 RECOMMENDED = frozenset(model for tier in MODEL_TIERS.values() for model in tier)
 
-# Rough tokens per mode for one answer call. Deliberately conservative and clearly
-# approximate: heuristics, never measured.
-_MODE_TOKENS = {
-    "quick": {"input": 2000, "output": 500},
-    "standard": {"input": 4000, "output": 1000},
-    "research": {"input": 8000, "output": 2000},
-}
-_TITLE_TOKENS = {"input": 600, "output": 40}
-# Rough reasoning tokens (billed as output) a generation call adds at each effort.
+# Effort levels a turn may ask for, lowest first, with the reasoning tokens (billed as output) each
+# roughly adds; a step's output limit bounds them (backend/context.py).
 _REASONING_OUTPUT_TOKENS = {"minimal": 0, "low": 800, "medium": 2000, "high": 5000, "xhigh": 9000}
 EFFORT_LEVELS = tuple(_REASONING_OUTPUT_TOKENS)  # the levels a turn may ask for, lowest first
-# Per million tokens, when the provider publishes no price.
-_UNKNOWN_PRICE = {"input": 1.0, "output": 5.0}
+# USD per token, when the provider publishes no price: $1 per million input and $5 output.
+UNKNOWN_RATES = {"input": 1.0 / 1_000_000, "output": 5.0 / 1_000_000, "request": 0.0}
 
 
 @dataclass
@@ -63,7 +55,7 @@ class RunPlan:
     mode: str  # "quick", "standard", "research"
     model_tier: str  # "budget", "mid", "premium"
     model: str | None  # None when Auto cannot choose for this provider
-    predicted_cost: float  # estimated USD
+    predicted_cost: float | None  # estimated USD: the answer step's, set once its request is counted
     policy_reason: str  # why this model
     task_signal: str
 
@@ -91,13 +83,12 @@ def detect_task_signal(query: str, has_files: bool = False) -> str:
     return "standard"
 
 
-def create_run_plan(query: str, model: str | None, route_for, *, effort: str | None = None,
-                    is_openrouter: bool = True, has_files: bool = False, offered=lambda m: True,
-                    picked=()) -> RunPlan:
-    """The plan for a message. model is a model id or Auto; route_for(model) gives
-    the route whose catalog prices it. Auto takes the first model the provider offers
-    (offered(model)) among the tiers' preferred models on OpenRouter, the balanced tier
-    first, then among the models picked for it; with none, the plan's model is None."""
+def create_run_plan(query: str, model: str | None, *, is_openrouter: bool = True, has_files: bool = False,
+                    offered=lambda m: True, picked=()) -> RunPlan:
+    """The plan for a message. model is a model id or Auto. Auto takes the first model the provider
+    offers (offered(model)) among the tiers' preferred models on OpenRouter, the balanced tier first,
+    then among the models picked for it; with none, the plan's model is None. Its cost is estimated
+    once the answer step's request is built (request_cost)."""
     signal = detect_task_signal(query, has_files)
     if model and model != AUTO:
         chosen, reason = model, "chosen_model"
@@ -105,43 +96,22 @@ def create_run_plan(query: str, model: str | None, route_for, *, effort: str | N
         preferred = [m for tier in ("mid", "budget", "premium") for m in MODEL_TIERS[tier]] if is_openrouter else []
         chosen = next((m for m in [*preferred, *picked] if offered(m)), None)
         reason = ("auto_mid_tier" if chosen == MODEL_TIERS["mid"][0] else "auto_offered") if chosen else "model_needed"
-    predicted = estimate_message_cost(signal, route_for(chosen), effort) if chosen else 0.0
     tier = next((name for name, models in MODEL_TIERS.items() if chosen in models), "mid")
-    return RunPlan(mode=signal, model_tier=tier, model=chosen, predicted_cost=predicted,
+    return RunPlan(mode=signal, model_tier=tier, model=chosen, predicted_cost=None,
                    policy_reason=reason, task_signal=signal)
 
 
-def _model_call_cost(route, input_tokens: int, output_tokens: int) -> float:
-    """The provider's published price for the route's model, or the conservative
-    unknown-price heuristic ($1 and $5 per million tokens)."""
-    pricing = (get_model_metadata(route) or {}).get("pricing") or {} if route else {}
-    input_price = pricing.get("input")
-    output_price = pricing.get("output")
-    if input_price is None:
-        input_price = _UNKNOWN_PRICE["input"]
-    if output_price is None:
-        output_price = _UNKNOWN_PRICE["output"]
-    return (input_tokens / 1_000_000) * input_price + (output_tokens / 1_000_000) * output_price
+def request_cost(rates, input_tokens: int, output_tokens: int) -> float:
+    """A step's estimate (D3): its counted request and its whole output limit at the highest rates
+    among the endpoints it can reach (backend/reach.py), plus any charge per request. The settled
+    cost comes from the provider's reported usage."""
+    return round(input_tokens * rates["input"] + output_tokens * rates["output"] + rates["request"], 9)
 
 
-def estimate_message_cost(mode: str, route, effort: str | None = None) -> float:
-    """A rough, conservative estimate of one answer call in this mode. Reasoning
-    tokens at the chosen effort are added, at medium when none is chosen, since a
-    model may reason by default."""
-    tokens = _MODE_TOKENS.get(mode, _MODE_TOKENS["standard"])
-    reasoning = _REASONING_OUTPUT_TOKENS.get(effort or "medium", _REASONING_OUTPUT_TOKENS["medium"])
-    return round(_model_call_cost(route, tokens["input"], tokens["output"] + reasoning), 6)
-
-
-def estimate_title_cost(route) -> float:
-    """A rough estimate of one title call: a short prompt and a few words back."""
-    return round(_model_call_cost(route, _TITLE_TOKENS["input"], _TITLE_TOKENS["output"]), 6)
-
-
-def cost_from_usage(route, usage: dict) -> float | None:
-    """An estimate from reported token counts, when the provider reported tokens but no
-    cost; None when it reported neither."""
+def cost_from_usage(rates, usage: dict) -> float | None:
+    """An estimate from reported token counts, at the step's rates, when the provider reported tokens
+    but no cost; None when it reported neither."""
     prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
     if not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in (prompt, completion)):
         return None
-    return round(_model_call_cost(route, prompt, completion), 9)
+    return request_cost(rates, prompt, completion)

@@ -12,6 +12,7 @@ import pytest
 from backend import budget_router
 from backend import openrouter_client as catalog
 from backend.providers import Provider, Route
+from scholia_app import streaming
 
 OPENROUTER = Provider("openrouter", "openrouter", "https://openrouter.ai/api/v1")
 GENERIC = Provider("lab", "openai-compatible", "https://llm.example.org/v1")
@@ -26,7 +27,7 @@ def isolated_catalog():
 
 
 def client_for(handler):
-    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return httpx.AsyncClient(transport=httpx.MockTransport(streaming(handler)))
 
 
 def state(provider=OPENROUTER, key=KEY):
@@ -48,14 +49,11 @@ async def test_discovery_updates_prices_and_feeds_the_estimate():
     assert (model["supports_reasoning"], model["reasoning_extraction"], model["supports_tools"]) == (True, "field", True)
     assert (model["context_length"], model["supports_zdr"]) == (32000, False)
     route = Route(OPENROUTER, "new/reasoner")
-    assert budget_router._model_call_cost(route, 1_000_000, 1_000_000) == 0
+    assert catalog.get_model_metadata(route)["pricing"] == {"input": 0, "output": 0}
     rows[0]["pricing"] = {"prompt": "0.000003", "completion": "0.000008"}
     state()["last_attempt"] = 0
     await catalog.models(client, OPENROUTER, KEY, force=True)
-    assert budget_router._model_call_cost(route, 1_000_000, 1_000_000) == pytest.approx(11)
-    assert budget_router.cost_from_usage(route, {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}) == 11
-    # A model the catalog does not list is priced with the conservative unknown-price heuristic.
-    assert budget_router._model_call_cost(Route(OPENROUTER, "unlisted"), 1_000_000, 1_000_000) == 6
+    assert catalog.get_model_metadata(route)["pricing"] == pytest.approx({"input": 3, "output": 8})  # per million
 
 
 @pytest.mark.asyncio
@@ -277,7 +275,7 @@ def test_a_snapshot_older_than_a_cache_clear_lists_and_caches_nothing():
     async def go():
         snapshot = openrouter_client.generation()  # read with the provider and its old key
         openrouter_client.clear_cache()  # a key change lands meanwhile
-        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(streaming(answer))) as client:
             return await openrouter_client.models(client, provider, "old", generation=snapshot)
 
     assert asyncio.run(go()) is None
@@ -344,3 +342,60 @@ async def test_a_model_with_only_small_zero_retention_endpoints_has_no_zero_rete
         "model/b": (True, {"usable": ["big"], "small": ["small"]}),
         "model/c": (False, {"usable": [], "small": []}),
     }
+
+
+def gzipped(*members):
+    import gzip
+    return b"".join(gzip.compress(member) for member in members)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    gzipped(b'{"data": [' + b'{"id": "a"},' * 10 + b'{"id": "b"}' + b" " * (catalog.MAX_CATALOG_BYTES + 10) + b"]}"),
+    gzipped(b'{"data": [{"id": "a"}]}', b'{"data": [{"id": "b"}]}'),  # a second member after the first's end
+    gzipped(b'{"data": [{"id": "a"}]}')[:-4],  # cut before its trailer
+])
+async def test_a_catalog_that_expands_past_its_bound_or_carries_more_than_one_gzip_stream_is_refused(body):
+    # status.md's follow-up for S1-19: the catalog's answer is decoded here and bounded as decoded
+    # bytes, so a small compressed body cannot expand unbounded; the previous catalog is kept.
+    answers = [b'{"data": [{"id": "kept"}]}', body]
+
+    def serve(request):
+        if request.url.path.endswith("/zdr"):
+            return httpx.Response(200, json={"data": []})
+        payload = answers.pop(0) if len(answers) > 1 else answers[0]
+        gzip_body = payload is body
+        return httpx.Response(200, content=payload, headers={"content-encoding": "gzip"} if gzip_body else {})
+
+    client = client_for(serve)
+    assert set(await catalog.models(client, OPENROUTER, KEY)) == {"kept"}
+    state()["last_attempt"] = 0
+    assert set(await catalog.models(client, OPENROUTER, KEY, force=True)) == {"kept"}
+    assert catalog.catalog_status(OPENROUTER, KEY)["error"] == "refresh_failed"
+    assert len(body) < catalog.MAX_CATALOG_BYTES  # small as sent
+
+
+@pytest.mark.asyncio
+async def test_a_models_endpoint_listing_is_read_bounded_and_cached():
+    seen = []
+
+    def serve(request):
+        seen.append(request.url.path)
+        assert "authorization" not in request.headers  # public metadata: no key goes with it
+        return httpx.Response(200, json={"data": {"endpoints": [
+            {"tag": "a", "context_length": 8192, "supported_parameters": ["tools"], "pricing": {"prompt": "1"}},
+            {"tag": "b", "context_length": "big"}]}})
+
+    client = client_for(serve)
+    listing = await catalog.endpoints(client, OPENROUTER, "model/x")
+    assert listing == [{"tag": "a", "context_length": 8192, "max_completion_tokens": None,
+                        "supported_parameters": ["tools"], "pricing": {"prompt": "1"}},
+                       {"tag": "b", "context_length": None, "max_completion_tokens": None,
+                        "supported_parameters": None, "pricing": {}}]
+    assert await catalog.endpoints(client, OPENROUTER, "model/x") == listing and len(seen) == 1  # cached
+    assert seen == ["/api/v1/models/model/x/endpoints"]
+
+    def untagged(request):
+        return httpx.Response(200, json={"data": {"endpoints": [{"tag": "a"}, {"context_length": 9}]}})
+
+    assert await catalog.endpoints(client_for(untagged), OPENROUTER, "model/y") is None  # one it cannot name
