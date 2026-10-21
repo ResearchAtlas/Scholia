@@ -1,0 +1,8 @@
+qasper keyword_only: 328 queries paired, rankings identical for 328; fallbacks none
+  recall@8: difference +0.0000 [+0.0000, +0.0000] n=328
+  ndcg@10: difference +0.0000 [+0.0000, +0.0000] n=328
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=328
+qasper hybrid: 328 queries paired, rankings identical for 325; fallbacks none
+  recall@8: difference +0.0000 [+0.0000, +0.0000] n=328
+  ndcg@10: difference +0.0000 [+0.0000, +0.0000] n=328
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=328
