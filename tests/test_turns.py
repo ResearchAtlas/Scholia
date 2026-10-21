@@ -824,6 +824,40 @@ async def test_a_turn_whose_terminal_write_fails_reads_interrupted_once_released
         await background_idle(client)
 
 
+@pytest.mark.parametrize("ending", ["cancelled", "succeeded"])
+async def test_a_read_taken_before_a_turns_terminal_record_commits_never_reads_it_interrupted(tmp_path, monkeypatch,
+                                                                                            ending):
+    """Main CI on 7cff1e7 (the loopback test in test_local_guard.py): a poll's read, taken while a turn's terminal record
+    was still to commit, whose status was worked out once the turn had been released, read it interrupted with no
+    cancel reason. A turn whose terminal record has committed is known finished before it is released, as a background
+    run is: that read says running, and the next one reads how it ended."""
+    from backend.runs import Registry, derived_status
+    real_release, seen = Registry.release, []
+
+    def release(self, active):  # the moment after the turn's hold is released, as a read taken before its commit reads it
+        real_release(self, active)
+        if active.kind == "turn":
+            seen.append(derived_status("running", active.run_id, self))
+
+    monkeypatch.setattr(Registry, "release", release)
+    provider = MockProvider()
+    if ending == "cancelled":
+        held(provider)  # never released: the call is in flight when its stream closes
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client)
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": "hi"}))
+        if ending == "cancelled":
+            await wait_for(lambda: provider.answers)
+            client.state["harness"].stream_closed(active_turn(client, conversation))  # as a closed connection does
+        assert events(await stream)[-1]["status"] == ending
+        assert seen == ["running"]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert (turn["status"], turn["cancel_reason"]) == {"cancelled": ("cancelled", "researcher"),
+                                                           "succeeded": ("succeeded", None)}[ending]
+        await background_idle(client)
+
+
 async def test_an_admission_stopped_by_shutdown_writes_no_run(tmp_path, monkeypatch):
     async with started(tmp_path / "data") as client:
         conversation = await new_conversation(client)
