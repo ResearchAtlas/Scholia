@@ -133,6 +133,41 @@ def test_closing_the_window_interrupts_running_work_and_stops_the_server(tmp_pat
     os.close(fd)
 
 
+def test_a_backend_that_outlives_its_stop_keeps_the_data_folder_locked(tmp_path, monkeypatch):
+    from backend.search_index import SearchIndex
+    data, writing, taken = tmp_path / "data", threading.Event(), []
+    real_take_lock, real_close = desktop.take_lock, SearchIndex.close
+
+    def take_lock(data_dir):
+        taken.append(real_take_lock(data_dir))
+        return taken[-1]
+
+    def slow_close(self):  # a rebuild still running in the index's writer as the window closes
+        self._writer.submit(writing.wait)
+        real_close(self)
+
+    monkeypatch.setattr(desktop, "take_lock", take_lock)
+    monkeypatch.setattr(SearchIndex, "close", slow_close)
+    monkeypatch.setattr(desktop, "STOP_SECONDS", 1)
+    seen = []
+    try:
+        assert desktop.run(data, _open_and_close(seen), keyring_backend=FakeKeyring(),
+                           listening=register_server) == 0
+        [server] = [t for t in threading.enumerate() if t.name == "scholia-server"]
+        assert seen == [True] and server.is_alive()  # its index's writer still runs
+        assert real_take_lock(data) is None  # so no second launch takes the folder (and replaces the index)
+    finally:
+        writing.set()
+        for thread in threading.enumerate():
+            if thread.name == "scholia-server":
+                thread.join(30)
+    assert real_take_lock(data) is None  # held until the process ends, which releases it
+    os.close(taken[0])
+    fd = real_take_lock(data)
+    assert fd is not None
+    os.close(fd)
+
+
 def test_an_existing_data_folder_is_narrowed_to_owner_only(tmp_path):
     data = tmp_path / "data"
     (data / "projects" / "p").mkdir(parents=True)

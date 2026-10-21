@@ -291,13 +291,17 @@ def run(data_dir, open_window, *, keyring_backend=None, transport=None, listenin
     except UnsafeDataFolderError as error:
         os.close(lock)
         return _serve_limited(default, data_dir, "unsafe", str(error), open_window, listening)
+    backend = []  # the server's thread, once it starts
     try:
-        return _serve(data_dir, open_window, keyring_backend, transport, listening)
+        return _serve(data_dir, open_window, keyring_backend, transport, listening, backend)
     finally:
-        os.close(lock)
+        # A backend that outlived its bounded wait (_stop) may still write in the folder (the index's writer, say):
+        # the lock is then held until the process ends, which releases it, so no other launch opens the folder.
+        if not any(thread.is_alive() for thread in backend):
+            os.close(lock)
 
 
-def _serve(data_dir, open_window, keyring_backend, transport, listening):
+def _serve(data_dir, open_window, keyring_backend, transport, listening, backend):
     from backend import logs
     from backend.app import create_app
     from backend.settings import write_private
@@ -309,7 +313,7 @@ def _serve(data_dir, open_window, keyring_backend, transport, listening):
 
     handler = logs.configure(data_dir)
     try:
-        return _run_app(app_for, open_window, listening)
+        return _run_app(app_for, open_window, listening, backend)
     finally:
         with contextlib.suppress(FileNotFoundError):  # this launch's session ends with it
             os.unlink(data_dir / SESSION_FILE)
@@ -324,13 +328,14 @@ def _serve_limited(default, data_dir, problem, reason, open_window, listening):
 
     print(f"Scholia: {reason}", file=sys.stderr)
     _run_app(lambda origin, session: limited_app(default, data_dir, problem, reason, origin=origin, session=session,
-                                                 frontend_dir=frontend_folder()), open_window, listening)
+                                                 frontend_dir=frontend_folder()), open_window, listening, [])
     return 1
 
 
-def _run_app(app_for, open_window, listening):
+def _run_app(app_for, open_window, listening, backend):
     """Serve app_for(origin, session) on a loopback port, open the window on it, and stop
-    the server once the window closes. Returns 0, or 1 when the server did not start."""
+    the server once the window closes. Returns 0, or 1 when the server did not start. The
+    server's thread is added to backend as it starts: it may outlive the bounded wait."""
     import uvicorn
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -345,6 +350,7 @@ def _run_app(app_for, open_window, listening):
         timeout_graceful_shutdown=5))
     loop = {}
     thread = threading.Thread(target=_run_server, args=(server, sock, loop), name="scholia-server", daemon=True)
+    backend.append(thread)
     thread.start()
     if not _wait_started(server, thread, app.app.state.scholia):
         log.error("the backend did not start")
