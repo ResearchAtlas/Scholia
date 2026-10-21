@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -976,6 +977,50 @@ async def test_field_ones_temporary_folder_is_removed_and_tmpdir_given_back_when
         await gold.passages(1, folder, pdfs, failing)
     assert not [p for p in folder.iterdir() if p.name.startswith(".tmp-")] and tempfile.tempdir is None
     assert os.environ.get("TMPDIR") == (None if tmpdir is None else str(tmp_path))
+
+
+def test_two_overlapping_field_one_scratches_never_leave_its_folder_and_give_tmpdir_back(tmp_path, monkeypatch):
+    """PR 42's connector thread: scratch() points the process's TMPDIR into field 1's folder, so two calls
+    overlapping in one process overwrote each other (the first to end gave TMPDIR back while the second ran).
+    They run one at a time: each sees its own folder from start to end, and TMPDIR is given back once both
+    end. One from the thread already inside (two tasks on one event loop) is refused, not left waiting."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    folder = tmp_path / "f1"
+    folder.mkdir()
+    first_in, second_in, first_out, seen = threading.Event(), threading.Event(), threading.Event(), {}
+
+    def run(name, inside):
+        with gold.scratch(1, folder) as tmp:
+            seen[name] = [(os.environ["TMPDIR"], tempfile.gettempdir())]
+            inside()
+            seen[name] = tmp, seen[name] + [(os.environ["TMPDIR"], tempfile.gettempdir())]
+        if name == "first":
+            first_out.set()
+
+    def first():
+        first_in.set()
+        second_in.wait(1)  # without the lock the second is inside by now; with it, it waits for this one to end
+
+    def second():
+        second_in.set()
+        first_out.wait(10)  # the first has ended: without the lock, it gave TMPDIR back while this one runs
+    first_thread = threading.Thread(target=run, args=("first", first))
+    first_thread.start()
+    first_in.wait()
+    second_thread = threading.Thread(target=run, args=("second", second))
+    second_thread.start()
+    first_thread.join()
+    second_thread.join()
+    for tmp, values in seen.values():
+        assert tmp.parent == folder and all(Path(v).parent == tmp for pair in values for v in pair)
+    assert seen["first"][0] != seen["second"][0]
+    assert os.environ["TMPDIR"] == str(tmp_path) and tempfile.tempdir is None
+    assert not [p for p in folder.iterdir() if p.name.startswith(".tmp-")]
+    with gold.scratch(1, folder), pytest.raises(tier1.Refused, match="one after another"):
+        with gold.scratch(1, folder):
+            pass
+    assert os.environ["TMPDIR"] == str(tmp_path) and tempfile.tempdir is None
 
 
 def test_a_folder_below_field_ones_that_is_a_git_work_tree_is_never_read_or_written(tmp_path):
