@@ -59,17 +59,20 @@ async def trace(run_id: str, request: Request, after: int = -1, limit: int = PAG
         rows = conn.execute("SELECT seq, at, type, data FROM run_events WHERE run_id = ? AND seq > ?"
                             " ORDER BY seq LIMIT ?", (run_id, after, limit + 1)).fetchall()
         kept = {sha for (sha,) in conn.execute("SELECT sha256 FROM run_bodies WHERE run_id = ?", (run_id,))}
-        # A check's sentences come from the citation rows, which lose them when their paper is deleted;
-        # the event names each citation by id (backend/provenance.py).
-        sentences = dict(conn.execute(
-            "SELECT id, json_extract(context, '$.sentence') FROM citations WHERE owner_id = ?", (run_id,)).fetchall())
-        return rows, kept, sentences
-    rows, kept, sentences = await asyncio.to_thread(_state(request)["db"].read, read)
+        # A check's citations are read from their current rows (existence, support, sentence), which a
+        # deletion changes; the event names each citation by id (backend/provenance.py).
+        current = {cid: {"existence": existence, "support": support, "sentence": sentence}
+                   for cid, existence, support, sentence in conn.execute(
+                       "SELECT id, existence, support, json_extract(context, '$.sentence') FROM citations"
+                       " WHERE owner_id = ?", (run_id,))}
+        return rows, kept, current
+    rows, kept, current = await asyncio.to_thread(_state(request)["db"].read, read)
     events = []
     for seq, at, kind, data, in rows[:limit]:
         data = json.loads(data)
         if kind == "citation_checks":
-            data["citations"] = [{**c, "sentence": sentences.get(c.get("id"))} if "id" in c else c
+            gone = {"existence": "source_removed", "support": "unchecked", "sentence": None}  # its row is gone
+            data["citations"] = [{**c, **current.get(c["id"], gone)} if "id" in c else c
                                  for c in data.get("citations", [])]
         sent = data.get("body") if kind == "model_attempt" else None
         events.append({"seq": seq, "at": at, "type": kind, "data": data,

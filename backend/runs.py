@@ -402,17 +402,19 @@ class Harness:
                 "SELECT DISTINCT run_id FROM budget_reservations WHERE status = 'open' AND run_id IS NOT NULL")}
             spending.settle_left_open(conn)
             now = utc_now()
-            # S1-19b: a call in flight at the crash kept its exact request body (stored and linked before it was
-            # sent); its attempt is recorded now, naming it, with an unknown charge, for every kind of run. An
-            # attempt is known by its step and number: two calls can send the same bytes.
-            for run_id, step, attempt, sha in conn.execute(
-                    "SELECT b.run_id, b.step, b.attempt, b.sha256 FROM run_bodies b JOIN runs r ON r.id = b.run_id"
-                    " WHERE r.status = 'running' AND NOT EXISTS (SELECT 1 FROM run_events e WHERE e.run_id = b.run_id"
-                    " AND e.type = 'model_attempt' AND json_extract(e.data, '$.step') = b.step"
-                    " AND json_extract(e.data, '$.attempt') = b.attempt)"
-                    " ORDER BY b.run_id, b.step, b.attempt").fetchall():
-                _event(conn, run_id, "model_attempt", {"step": step, "attempt": attempt, "outcome": "interrupted",
-                                                       "dispatched": None, "charge": "unknown", "body": sha})
+            # S1-19b: a call in flight at the crash left its dispatch event (written before it was sent, with
+            # its body's link, and kept whatever becomes of the body); its attempt is recorded now, naming its body,
+            # with an unknown charge, for every kind of run. An attempt is known by its step and number.
+            for run_id, data in conn.execute(
+                    "SELECT s.run_id, s.data FROM run_events s JOIN runs r ON r.id = s.run_id"
+                    " WHERE r.status = 'running' AND s.type = 'dispatch' AND NOT EXISTS (SELECT 1 FROM run_events e"
+                    " WHERE e.run_id = s.run_id AND e.type = 'model_attempt'"
+                    " AND json_extract(e.data, '$.step') = json_extract(s.data, '$.step')"
+                    " AND json_extract(e.data, '$.attempt') = json_extract(s.data, '$.attempt'))"
+                    " ORDER BY s.run_id, s.seq").fetchall():
+                started = json.loads(data)
+                _event(conn, run_id, "model_attempt", {**started, "outcome": "interrupted", "dispatched": None,
+                                                       "charge": "unknown"})
             for run_id, revoked in conn.execute(
                     "SELECT id, cancel_reason = 'revoked' FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')"
             ).fetchall():
@@ -1330,8 +1332,7 @@ class Harness:
             ref = await asyncio.to_thread(_stored, self.content, body)
             number = len(call.bodies)
             call.bodies.append(ref)
-            if ref is not None:
-                await self._write(lambda conn: _keep_body(conn, call, number, ref))
+            await self._write(lambda conn: _keep_body(conn, call, number, ref))
 
         call.materials = tuple(sorted(set(materials)))
 
@@ -1904,11 +1905,16 @@ def _settle_attempts(conn, reservation_id, rates, attempts):
 
 
 def _keep_body(conn, call, number, ref):
-    """Keep an attempt's exact request body, before it is sent, in run_bodies with the papers its text
-    holds (run_body_materials), so a deletion of one of them removes it: only while its run exists and every
-    one of those papers does (backend/provenance.py; a body of a paper deleted already is never kept)."""
-    if conn.execute("SELECT 1 FROM runs WHERE id = ?", (call.run_id,)).fetchone() is None or \
-            not provenance.carried(conn, call.materials):
+    """Before an attempt is sent: an append-only `dispatch` event naming it (step, attempt, and its
+    body's hash or body_unavailable; no text), which recovery reads, so the attempt's record never depends on
+    its body (Harold, 2026-10-21); and its exact request body kept in run_bodies with the papers its text holds
+    (run_body_materials), so a deletion of one of them removes it: only while every one of those papers exists
+    (backend/provenance.py; a body of a paper deleted already is never kept). Nothing once its run is gone."""
+    if conn.execute("SELECT 1 FROM runs WHERE id = ?", (call.run_id,)).fetchone() is None:
+        return
+    _event(conn, call.run_id, "dispatch", {"step": call.step, "attempt": number,
+                                                  **({"body": ref} if ref else {"body_unavailable": True})})
+    if ref is None or not provenance.carried(conn, call.materials):
         return
     conn.execute("INSERT OR IGNORE INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
                  (call.run_id, call.step, number, ref))

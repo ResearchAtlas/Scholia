@@ -844,3 +844,51 @@ async def test_judge_verdicts_for_a_pair_twice_or_an_unknown_pair_are_not_taken(
     from backend import citations
     assert citations.parse_verdicts("1: supported\n2: partly\n2: partly\n3: unsupported\n7: supported", 3) == {
         1: "supported", 3: "unsupported"}
+
+
+# Harold, 2026-10-21: the deletion simplification (external recheck b4, findings 1, 3 and 5).
+
+async def test_details_reads_each_citations_status_from_its_current_row(tmp_path):
+    # b4 (5): the trace's check names citations by id; their existence, support and sentence are the rows'.
+    provider = Provider(answer_text=QUOTING)
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        trace = (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+        [checks] = [e for e in trace if e["type"] == "citation_checks"]
+        [row] = await rows(client, "SELECT existence, support FROM citations WHERE owner_id = ?", run_id)
+        [shown] = checks["data"]["citations"]
+        assert (shown["existence"], shown["support"], shown["sentence"]) == (*row, None)
+        assert shown["existence"] == "source_removed"
+
+
+async def test_recovery_records_a_dispatched_attempt_whose_body_went_with_a_deleted_paper(tmp_path, monkeypatch):
+    # b4 (3): the attempt's record does not depend on its body: an append-only event written when the body is
+    # linked names the attempt, so a crash after a deletion took the body still records the attempt.
+    release, judging = asyncio.Event(), asyncio.Event()
+
+    async def held(body):
+        judging.set()
+        await release.wait()
+        return Provider().answer("1: supported")
+    monkeypatch.setattr(runs_module.Harness, "_request_cancel", lambda self, active, reason: None)  # the crash comes first
+    provider = Provider(verdicts=held)
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": QUESTION}))
+        await asyncio.wait_for(judging.wait(), 10)
+        [(run_id,)] = await rows(client, "SELECT id FROM runs WHERE kind = 'turn'")
+        [(step,)] = await rows(client, "SELECT max(json_extract(data, '$.step')) FROM run_events WHERE run_id = ?"
+                                       " AND type = 'step_started'", run_id)
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        assert await rows(client, "SELECT count(*) FROM run_bodies") == [(0,)]
+        await client.state["harness"].recover(kick=False)
+        attempts = [json.loads(d) for (d,) in await rows(
+            client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'", run_id)]
+        assert [(a["step"], a["attempt"]) for a in attempts if a["outcome"] == "interrupted"] == [(step, 0)]
+        release.set()
+        await stream
