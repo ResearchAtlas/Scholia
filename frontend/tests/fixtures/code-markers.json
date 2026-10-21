@@ -113,5 +113,17 @@
   "markers": [
    "[S1.2]"
   ]
+ },
+ {
+  "text": "Text.\r\n\r\n```\r\ncode [S1.1]\r\n```\r\n\r\nAfter [S2.1].",
+  "markers": [
+   "[S2.1]"
+  ]
+ },
+ {
+  "text": "| a | b |\n|---|---|\n| `p(A\\|B) [S1.1]` | y [S1.2] |",
+  "markers": [
+   "[S1.2]"
+  ]
  }
 ]

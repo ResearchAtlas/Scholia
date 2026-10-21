@@ -54,7 +54,7 @@ _QUOTE = re.compile(r" {0,3}> ?")
 _ITEM = re.compile(r" {0,3}(?:[-*+]|\d{1,9}[.)])(?: {1,4}|$)")
 _STARTS_BLOCK = re.compile(r" {0,3}(?:#{1,6}(?:[ \t]|$)|>|(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$))")
 _SPAN = re.compile(r"(?<![`\\])(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
-_CELL_SPAN = re.compile(r"(?<![`\\])(`+)(?!`)([^|]+?)(?<!`)\1(?!`)", re.DOTALL)
+_CELL_SPAN = re.compile(r"(?<![`\\])(`+)(?!`)((?:\\\||[^|])+?)(?<!`)\1(?!`)", re.DOTALL)  # \| stays in its cell
 VERDICTS = ("supported", "partly", "unsupported")
 QUOTE_CHARS = 500  # the part of a passage a citation keeps as its quote
 
@@ -124,7 +124,7 @@ def _code(text):
     fence, item, paragraph, at = None, 0, False, 0
     for m in re.finditer(r"[^\n]*\n|[^\n]+$", text):  # lines end at \n only, as CommonMark's do
         line, start = m.group(), m.start()
-        body, at = line.rstrip("\n"), m.end()
+        body, at = line.rstrip("\n").removesuffix("\r"), m.end()  # a CRLF line ends as an LF one
         while (q := _QUOTE.match(body)):  # block quote markers
             body = body[q.end():]
         if fence is not None:

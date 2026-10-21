@@ -87,7 +87,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   useEffect(() => {
     load();
   }, [load]);
-  // A paper deleted (or read again) changes what this conversation's citations may show: read it again, so a
+  // A paper deleted changes what this conversation's citations may show: read it again, so a
   // deleted paper's text never stays on screen (backend/provenance.py).
   useEffect(() => {
     const changed = (event) => { if (event.detail === projectId) load(); };

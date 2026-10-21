@@ -23,7 +23,7 @@ export function Trace({ turn }) {
   const [problem, setProblem] = useState(null);
   const [tries, setTries] = useState(0); // each read: a retry, or the library changed
   useEffect(() => { // a paper deleted: read the trace again, and drop every text shown from it (its bodies)
-    const changed = () => setTries((n) => n + 1);
+    const changed = () => { setTrace(null); setTries((n) => n + 1); }; // nothing old shown while it reads
     libraryEvents.addEventListener('changed', changed);
     return () => libraryEvents.removeEventListener('changed', changed);
   }, []);
