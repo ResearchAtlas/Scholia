@@ -846,7 +846,8 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
     leaves the paper unchecked rather than keeping the old DOI's check. A changed title is indexed anew
     (search.retitled), its project's index run requested with record (harness: its runs, for the request).
     A paper's details changed put its project first in the list, as an import does, however long the
-    lookup's question waited; a retraction check alone does not, as it leaves the paper's updated_at."""
+    lookup's question waited; a lookup that changes no detail (a retraction check alone, or a record the
+    paper carries already) does not."""
     now, changed = utc_now(), False
     for material, version in pairs:
         row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title, m.csl FROM materials m"
