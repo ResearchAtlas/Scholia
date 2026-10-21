@@ -127,13 +127,16 @@ class Field1Path(Path):
     """A path of field 1's: made from a folder private_path accepted (accepted), so each walk from it knows it
     serves field 1 (_open_dir): it checks the folders above accepted again (a git init there later counts) and
     each folder it passes for .git. Paths made from it (folder / "labels") are field 1's too. Field 2's paths
-    are plain: field 2 is public, and its folders may sit in a repository."""
+    are plain: field 2 is public, and its folders may sit in a repository. The commands, the page, check and
+    passages make field 1's folders so (field1); a library caller handing the walk helpers (read_bytes,
+    write_json, pdf_bytes) a plain path of field 1's gets field 2's walk, without these checks."""
     accepted = None
 
     def with_segments(self, *segments):
         made = type(self)(*segments)
         made.accepted = self.accepted
         return made
+
 
 def work_tree(path):
     """The top of the git work tree holding path (the nearest folder above it with a .git folder, or the
