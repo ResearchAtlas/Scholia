@@ -231,6 +231,34 @@ def test_held_content_is_kept_however_old_until_its_hold_ends(store, db):
     assert rows(db) == [] and stored(store) == []
 
 
+@pytest.mark.asyncio
+async def test_a_put_that_outlives_its_cancelled_hold_takes_no_hold(store, db):
+    # Internal review 2 of PR 44: a caller cancelled while its put runs in a worker thread leaves the block
+    # first; the put finishing afterwards must not hold its content for good.
+    started, finish = asyncio.Event(), __import__("threading").Event()
+    loop = asyncio.get_running_loop()
+
+    class Slow(io.BytesIO):
+        def read(self, *args):
+            loop.call_soon_threadsafe(started.set)
+            finish.wait(5)
+            return super().read(*args)
+
+    async def caller():
+        with store.hold() as held:
+            await asyncio.to_thread(store.put, Slow(b"a body"), "application/json", held)
+    task = asyncio.create_task(caller())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    finish.set()
+    while not await asyncio.to_thread(rows, db):  # the put, still running in its thread, commits its row
+        await asyncio.sleep(0.01)
+    assert not store._held
+    assert await asyncio.to_thread(store.collect_garbage, later()) == 1
+
+
 @pytest.mark.parametrize("reference", [add_material_version, add_extraction, add_event_body])
 def test_referenced_files_are_kept(store, db, reference):
     sha256 = store.put(b"in use")

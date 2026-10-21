@@ -590,13 +590,13 @@ def register(harness, state):
     harness.workflows["project_export"] = archive
 
 
-def _full_backup(db, destination, passphrase, archives, stop=None, progress=None, content=None):
+def _full_backup(db, destination, passphrase, archives, stop=None, progress=None, store=None):
     with _written(), _watched(archives, None, passphrase) as archive, contextlib.ExitStack() as held:
-        return _write_full_backup(db, destination, passphrase, archive, stop, progress, content, held)
+        return _write_full_backup(db, destination, passphrase, archive, stop, progress, store, held)
 
 
-def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None, content=None, held=None):
-    """content and held: the content store and a stack, which holds the files the backup lists from collection
+def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None, store=None, held=None):
+    """store and held: the content store and a stack, which holds the files the backup lists from collection
     until it is written (ContentStore.hold)."""
     staging = _staging(db.data_dir)
     try:
@@ -608,8 +608,8 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
             # Only the files the copy's records refer to: one of a project deleted moments ago, which
             # collection keeps for a while, would leave without the encryption its project needed.
             hashes = [sha256 for sha256, *_ in _referenced_content(copy)]
-        if content is not None and held is not None:  # read later: none is collected meanwhile
-            held.enter_context(content.hold(hashes))
+        if store is not None and held is not None:  # read later: none is collected meanwhile
+            held.enter_context(store.hold(hashes))
         if sensitive and not passphrase:
             raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
         entries, left_out = [], []
@@ -1381,19 +1381,19 @@ async def export_project(project_id: str, body: Export, request: Request):
     return {"run_id": run_id}
 
 
-def _export(db, project_id, destination, passphrase, language, archives, stop=None, progress=None, content=None):
+def _export(db, project_id, destination, passphrase, language, archives, stop=None, progress=None, store=None):
     with _written(), _watched(archives, {project_id}, passphrase) as archive, contextlib.ExitStack() as held:
-        return _write_export(db, project_id, destination, passphrase, language, archive, stop, progress, content, held)
+        return _write_export(db, project_id, destination, passphrase, language, archive, stop, progress, store, held)
 
 
-def _write_export(db, project_id, destination, passphrase, language, archive, stop=None, progress=None, content=None,
+def _write_export(db, project_id, destination, passphrase, language, archive, stop=None, progress=None, store=None,
                   held=None):
-    """content and held: as for _write_full_backup."""
+    """store and held: as for _write_full_backup."""
     data = db.read(lambda conn: _project_records(conn, project_id))
     if data is None:
         raise BackupError(404, "not_found", "No such project")
-    if content is not None and held is not None:  # the papers' files, read later: none is collected meanwhile
-        held.enter_context(content.hold([v["file_sha256"] for m in data["materials"] for v in m["versions"]
+    if store is not None and held is not None:  # the papers' files, read later: none is collected meanwhile
+        held.enter_context(store.hold([v["file_sha256"] for m in data["materials"] for v in m["versions"]
                                          if v["file_sha256"]]))
     if data["project"]["sensitivity"] in SENSITIVE and not passphrase:
         raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")

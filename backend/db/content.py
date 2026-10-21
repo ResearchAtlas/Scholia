@@ -52,7 +52,7 @@ class ContentStore:
         """Keep content from collection for the block, however long it takes: the hashes given (content a
         reader has listed and reads later), and each one put with hold= the list this yields (content whose
         record commits later, inside the block). On leaving, content nothing refers to is collected once idle."""
-        held = []
+        held = _Held()
         with self._lock:
             for sha256 in hashes:
                 self._held[sha256] += 1
@@ -61,6 +61,7 @@ class ContentStore:
             yield held
         finally:
             with self._lock:
+                held.closed = True  # a put still running when the block ends takes no hold (put)
                 for sha256 in held:
                     self._held[sha256] -= 1
                     if self._held[sha256] <= 0:
@@ -96,7 +97,8 @@ class ContentStore:
             with self._lock:  # collect_garbage removes a file only under this lock
                 created = _mkdir_new(folder)
                 os.utime(tmp)  # written now, however long the copy took
-                if hold is not None:  # held before the file is in place, under the lock collection takes
+                if hold is not None and not hold.closed:  # held before the file is in place, under the lock
+                    # collection takes; a put that outlives its block (its caller cancelled) is not held
                     self._held[sha256] += 1
                     hold.append(sha256)
                 os.replace(tmp, folder / sha256)
@@ -195,6 +197,11 @@ class ContentStore:
             for path in folder.iterdir():
                 if _HASH.fullmatch(path.name) and path.name.startswith(folder.name) and path.is_file():
                     yield path
+
+
+class _Held(list):
+    """The hashes one hold() block keeps; closed once the block has ended."""
+    closed = False
 
 
 def _idle(path, cutoff):
