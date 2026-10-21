@@ -1519,26 +1519,13 @@ async def test_a_launch_records_runs_left_running_interrupted_and_one_run_for_th
 async def test_retry_after_a_failed_terminal_write_requests_the_projects_run_with_its_pending_rebuild(tmp_path,
                                                                                                       monkeypatch):
     """Review 4, item 3, as Harold's simplification (2) has it: a run whose terminal write failed (interrupted)
-    had a Rebuild pending; Retry records it interrupted and requests the project's run, a rebuild, which runs."""
-    from backend.runs import Harness
-    real = Harness._finish_local
+    had a Rebuild pending; Retry records it interrupted and requests the project's run, a rebuild, which runs.
+    The Retry comes once the run is settled: its one start again in the session has failed too and no process
+    holds it. A Retry while that start holds it answers 409 (CI on c9f1cd6, before PR 39, where a poll could
+    read the run interrupted in the moment before that start held it)."""
     async with app(tmp_path, batch=1) as client:
-        project = await project_of(client)
-        client.remote.hold, client.remote.free = asyncio.Event(), 1
-        await added(client, project, WAGES)
-        await asyncio.wait_for(client.remote.reached.wait(), 10)
-        [run] = await _running_index_runs(client, project)
-        assert (await client.post(f"/api/projects/{project}/index/rebuild")).json()["run_id"] == run
-
-        def failing(self, conn, active, status, cancel_reason, summary, effect=None):
-            if active.run_id == run:
-                raise OSError("the disk is full")
-            return real(self, conn, active, status, cancel_reason, summary, effect)
-        monkeypatch.setattr(Harness, "_finish_local", failing)
-        client.remote.hold.set()
-        interrupted = await run_finished(client, run)
-        assert (interrupted["status"], interrupted["retryable"]) == ("interrupted", True)
-        monkeypatch.setattr(Harness, "_finish_local", real)
+        project, run = await _interrupted_with_a_rebuild_pending(client, monkeypatch)
+        assert (await run_finished(client, run))["retryable"] is True
         again = await client.post(f"/api/runs/{run}/retry")
         assert again.status_code == 201 and again.json()["run_id"] != run
         ended = await run_finished(client, again.json()["run_id"])
