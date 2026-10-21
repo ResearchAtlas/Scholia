@@ -38,7 +38,8 @@ with their query ("target").
 
 S1-19b: the provider's synthetic replies know each call's role: a title, the support judge (its pairs judged
 supported, partly and unsupported in turn), the small router (literature), an answer citing the evidence
-its request carries ([S1.1] and on), and an abstention when the request says the library matched nothing.
+its request carries ([S1.1] and on; the earlier flows' own walkthrough question keeps its formatted
+answer), and an abstention when the request says the library matched nothing.
 One model (NO_TOOLS) lists no endpoint that takes tools, for chat with the library. The request log
 records each call's role.
 
@@ -337,7 +338,8 @@ def synthetic(body):
         text = "literature"
     elif "No passage in the researcher's library matched" in first:
         text = ABSTAIN
-    elif "## RESEARCH EVIDENCE" in first:
+    elif "## RESEARCH EVIDENCE" in first and not any(  # the earlier flows' own question keeps its formatted answer
+            mark in body["messages"][-1]["content"] for mark in ("synthetic walkthrough question", "合成演示问题")):
         markers = re.findall(r"^\[S[0-9]+\.[0-9]+\]", first.split("## RESEARCH EVIDENCE", 1)[1], re.M)
         text = " ".join(sentence.format(markers[i % len(markers)]) for i, sentence in enumerate(CITED))
     else:
