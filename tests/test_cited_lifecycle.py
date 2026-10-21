@@ -952,3 +952,8 @@ async def test_each_reply_line_is_exactly_a_pair_and_a_verdict_or_its_pair_is_un
     assert parse("1: supported\n1: supported", 1) == {}  # a second line for a pair, even the same
     assert parse("1: supported\n7: unsupported", 1) == {1: "supported"}  # a pair it was not given: not taken
     assert parse("", 2) == {} and parse(None, 2) == {}
+    # Internal review of b5: a pair mentioned anywhere else, in a line that is not exactly a verdict, is unchecked
+    assert parse("1: supported\n2: unsupported; 1: partly", 2) == {}
+    for lead in ["- 1: unsupported", "**1: unsupported**", "Pair 1 is unsupported"]:
+        assert parse(f"{lead}\n1: supported", 1) == {}, lead
+    assert parse("9" * 5000 + ": supported\n1: partly", 1) == {1: "partly"}  # no number is read past six digits

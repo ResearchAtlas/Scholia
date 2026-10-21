@@ -229,7 +229,7 @@ async def test_no_cited_answer_canary_reaches_the_log(tmp_path, caplog):
     caplog.set_level(logging.DEBUG, logger="backend")
     canaries = ["CANARY-QUESTION", "CANARY-EVIDENCE", "CANARY-CITED", "CANARY-VERDICT", "CANARY-JUDGE-BODY",
                 "CANARY-PAPER", "金丝雀证据"]
-    replies = iter([(500, {"error": {"message": "CANARY-JUDGE-BODY"}}), "1: supported CANARY-VERDICT"])
+    replies = iter([(500, {"error": {"message": "CANARY-JUDGE-BODY"}}), "1: supported\nCANARY-VERDICT"])  # a verdict, then a line it ignores
     provider = Provider(answer_text="CANARY-CITED earnings rise [S1.1].", verdicts=lambda body: next(replies))
     try:
         async with cited(tmp_path, provider) as client:

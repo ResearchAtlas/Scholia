@@ -282,25 +282,30 @@ def typical_judge_input(passages, pairs):
             + pairs * (TYPICAL_SENTENCE + _PAIR_FRAME) + 2 * MESSAGE_FRAMING + REPLY_FRAMING)
 
 
-_NAMES_PAIR = re.compile(r"\s*(?:pair\s*)?(\d+)\s*[:.)-]", re.IGNORECASE)  # a line that answers a pair
-_VERDICT_LINE = re.compile(r"\s*(?:pair\s*)?(\d+)\s*[:.)-]\s*(supported|partly|unsupported)\s*", re.IGNORECASE)
+# ASCII digits, at most six: no other numbering is a pair's, and no digit run is converted past that.
+_VERDICT_LINE = re.compile(r"\s*(?:pair\s*)?(\d{1,6})\s*[:.)-]\s*(supported|partly|unsupported)\s*",
+                           re.IGNORECASE | re.ASCII)
+_NUMBER = re.compile(r"(?<!\d)\d{1,6}(?!\d)", re.ASCII)
 
 
 def parse_verdicts(reply, count):
     """{pair number: verdict} from the judge's reply, read strictly (JUDGE_RULES: one line per pair, exactly
-    `N: verdict`): a line is a verdict only when it is exactly a pair number and one of the verdicts, whitespace,
-    case and the separator aside. A pair named by a line that is not exactly that, or by more than one line, is
-    left out (unchecked); a pair it was not given is not taken; lines that name no pair are not read."""
+    `N: verdict`): a line is a verdict only when it is exactly a pair number and one of the verdicts (whitespace,
+    case, a `Pair` prefix and the separator aside). A pair mentioned by any other line, or by more than one
+    verdict line, is left out (unchecked); a pair it was not given is not taken; a line that mentions no pair is
+    not read."""
     found, spoiled = {}, set()
     for line in (reply or "").splitlines():
-        named = _NAMES_PAIR.match(line)
-        if not named or not 1 <= int(named[1]) <= count:
+        exact = _VERDICT_LINE.fullmatch(line)
+        if exact is None:  # not a verdict: every pair it mentions is in doubt
+            spoiled.update(int(n) for n in _NUMBER.findall(line) if 1 <= int(n) <= count)
             continue
-        pair, exact = int(named[1]), _VERDICT_LINE.fullmatch(line)
-        if exact is None or pair in found:
+        pair = int(exact[1])
+        if not 1 <= pair <= count:
+            continue
+        if pair in found:
             spoiled.add(pair)
-        else:
-            found[pair] = exact[2].lower()
+        found[pair] = exact[2].lower()
     return {pair: verdict for pair, verdict in found.items() if pair not in spoiled}
 
 
