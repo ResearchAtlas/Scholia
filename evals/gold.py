@@ -79,8 +79,8 @@ TEXT_BOUND = {"text": 1000, "short_answer": 500}  # characters of a question or 
 MAX_BODY = 256 * 1024  # bytes of one save's request
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 RATER = re.compile(r"[a-z][a-z0-9-]{0,39}")
-ARXIV = re.compile(r"\d{4}\.\d{4,5}v[1-9]\d*")
-DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+ARXIV = re.compile(r"\d{4}\.\d{4,5}v[1-9]\d*", re.ASCII)  # ASCII digits only, not full-width ones
+DATE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
 RECALL = [{"name": "recall@8", "kind": "recall", "k": 8}]  # tier 2's metric (section 14), tier 1's item rule
 
 
@@ -283,6 +283,9 @@ def check_papers(doc, field, settings):
         problems += _text(f"{where} title", paper["title"])
         if not (whole(paper["size"], 0) and isinstance(paper["sha256"], str) and len(paper["sha256"]) == 64):
             problems.append(f"{where}: size or SHA-256 missing")
+        if not (isinstance(paper["file"], str) and paper["file"] == Path(paper["file"]).name
+                and paper["file"] not in ("", ".", "..")):
+            problems.append(f"{where}: file is not a file name in the PDFs' folder")
         if paper["document_language"] not in LANGUAGES:
             problems.append(f"{where}: document_language {paper['document_language']!r}")
         if field == 1:
@@ -1071,10 +1074,14 @@ class Review:
             if not path.is_file():
                 raise Refused(f"{path} is missing: write the worksheet first (gold.py passages)")
             sheet = read_json(path, field=field)
-            if sheet.get("status") != "finished" or sheet.get("field") != field or sheet.get("papers_sha256") != papers_sha256:
-                raise Refused(f"{path} is not a finished worksheet of this paper list: write it again")
-            self.passages = {pid: {p["ordinal"]: p for p in entry["passages"] if p["usable"]}
-                             for pid, entry in sheet["papers"].items()}
+            try:
+                if not (sheet["status"] == "finished" and same(sheet["field"], field)
+                        and sheet["papers_sha256"] == papers_sha256):
+                    raise ValueError
+                self.passages = {pid: {p["ordinal"]: p for p in entry["passages"] if p["usable"]}
+                                 for pid, entry in sheet["papers"].items()}
+            except (LookupError, TypeError, AttributeError, ValueError):  # a hand-edited file: refused, not a crash
+                raise Refused(f"{path} is not a finished worksheet of this paper list: write it again") from None
         self.shown_papers = set(self.papers)
         if self.sample is not None and field == 1:  # the colleague sees the sampled items' papers, no more
             self.shown_papers = {loc["paper"] for i in order for loc in locators_of_item(kind, self.items[i])}

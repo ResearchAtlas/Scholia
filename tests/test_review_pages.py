@@ -843,3 +843,27 @@ def test_a_labels_header_or_sample_of_another_type_is_refused(tmp_path):
             gold.check(2, folder, settings=gold.load_settings()))["problems"], items
         with pytest.raises(gold.Refused, match="not a sample of this set"):
             gold.Review(2, folder, "pairs", "lee", sample=True)
+
+
+@pytest.mark.parametrize("name", ["field1-pairs.harold.json", "field1-pairs.harold.json.part",
+                                  ".field1-pairs.harold.json.lock"])
+def test_a_labels_file_part_or_lock_linked_into_a_git_work_tree_gets_nothing(tmp_path, pages, name):
+    """G10: the labels file itself, its part file or its lock file, each a link into a git work tree made
+    after the page opened: the save says not saved and nothing is written in the repository."""
+    repo = fixtures.git("init", tmp_path / "repo")
+    folder = field(tmp_path, 1)
+    page = pages(folder, "pairs", number=1)
+    (folder / "labels").mkdir()
+    (folder / "labels" / name).symlink_to(repo / "leak.json")
+    assert page.save("p01", {"category": "supported"}, base=0) == (500, {"code": "not_saved"})
+    assert not (repo / "leak.json").exists() and fixtures.git("status", repo) == ""
+
+
+@pytest.mark.parametrize("sheet", ["[]", '{"status": "finished", "field": 2, "papers_sha256": "SHA", "papers": [1]}',
+                                   '{"status": "finished"}'])
+def test_a_worksheet_of_another_shape_is_refused_not_a_crash(tmp_path, sheet):
+    folder = field(tmp_path)
+    sheet = sheet.replace("SHA", gold.sha256_of(folder / "papers.json", field=2))
+    (gold.outputs(folder) / "worksheet.json").write_text(sheet)
+    with pytest.raises(gold.Refused, match="not a finished worksheet"):
+        gold.Review(2, folder, "questions", "harold")

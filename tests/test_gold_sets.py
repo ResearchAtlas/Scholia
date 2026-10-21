@@ -421,6 +421,10 @@ def test_drafts_are_provisional_and_a_set_names_its_own_kind_and_field(tmp_path)
     (lambda p: p.pop("topic"), "topic missing"),
     (lambda p: p.update(id=["2601.00001v1"]), "not an arXiv id with its version"),  # G11: refused, not a crash
     (lambda p: p.update(size=True), "size or SHA-256 missing"),
+    (lambda p: p.update(file=123), "file is not a file name"),  # refused, not a crash at the PDFs' path
+    (lambda p: p.update(file="../elsewhere/a.pdf"), "file is not a file name"),
+    (lambda p: p.update(file="/elsewhere/a.pdf"), "file is not a file name"),
+    (lambda p: p.update(license_checked="２０２６-１０-０１"), "license_checked is not a date"),  # full-width digits
     (lambda p: p.update(submitted=["2026-01-05"]), "is outside 2026-01-01 to 2026-09-30"),
 ])
 def test_the_paper_list_holds_only_versions_meeting_the_criteria(tmp_path, change, expected):
