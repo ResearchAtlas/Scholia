@@ -440,6 +440,16 @@ def test_the_paper_list_holds_only_versions_meeting_the_criteria(tmp_path, chang
     assert "papers.json: seed missing" in problems_of(folder)[0]
 
 
+@pytest.mark.parametrize("number", [1, 2])
+def test_an_empty_paper_list_is_refused_and_never_skips_the_sets_checks(tmp_path, number):
+    """T6: papers: [] gave a finished report with no problems, however malformed questions.json was."""
+    folder = field(tmp_path, number)
+    doc = json.loads((folder / "papers.json").read_text())
+    write(folder / "papers.json", {**doc, "papers": []})
+    edit_set(folder, "questions", lambda items: items.append(5))
+    assert "papers.json: papers is empty" in problems_of(folder, number)[0]
+
+
 def test_field_one_takes_the_same_format_without_licenses_and_with_chinese_documents(tmp_path):
     folder = field(tmp_path, 1)
     problems, report = problems_of(folder, 1)

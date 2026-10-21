@@ -434,6 +434,8 @@ def check_papers(doc, field, settings):
             problems.append(f"{where}: license_checked is not a date")
     if not isinstance(doc["papers"], list):
         problems.append("papers.json: papers is not a list")
+    elif not doc["papers"]:  # else every set check would be skipped (they run once the paper list passes)
+        problems.append("papers.json: papers is empty")
     return problems
 
 
