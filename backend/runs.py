@@ -1336,6 +1336,8 @@ class Harness:
                 # The receipt settles the reservation by its id even if the run was deleted
                 # meanwhile; the run's own record goes with the run.
                 exists = conn.execute("SELECT 1 FROM runs WHERE id = ?", (active.run_id,)).fetchone() is not None
+                for number in range(len(result.attempts), len(call.bodies)):  # kept, then never sent (its time ran out)
+                    _kept_body(conn, call, number, False)
                 if exists:
                     for number, attempt in enumerate(result.attempts):
                         _event(conn, active.run_id, "model_attempt", {

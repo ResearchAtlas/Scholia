@@ -153,7 +153,9 @@ def check_existence(conn, project_id, text, numbered):
         holder = next((pid for pid, r in by_material[record["material_id"]].items() if quote and quote in r[4]), None)
         if holder is not None:
             r = by_material[record["material_id"]][holder]
-            out.append({**row, **found, "passage_id": holder, "material_version_id": r[7], "page": r[5], "existence": "ok"})
+            # the judge is shown what the passage says now, never the old text (a verdict belongs to the text judged)
+            out.append({**row, **found, "passage_id": holder, "material_version_id": r[7], "page": r[5],
+                        "judged_text": r[4], "existence": "ok"})
         else:  # its paper or passage may be gone: the row keeps only what still exists (foreign keys), no quote
             kept = {k: v for k, v, table in (("material_id", found["material_id"], "materials"),
                                              ("material_version_id", found["material_version_id"], "material_versions"),

@@ -518,3 +518,20 @@ async def test_a_call_stopped_before_it_left_keeps_no_body(tmp_path, monkeypatch
         stream = await send(client, conversation, QUESTION)
         assert stream[-1]["status"] in ("cancelled", "failed")
         assert await rows(client, "SELECT count(*) FROM run_bodies") == [(0,)]
+
+
+async def test_a_citation_mapped_to_a_re_read_passage_is_judged_on_what_that_passage_says_now(tmp_path):
+    # Recheck of b2 (P3-1): a verdict belongs to the text judged, so the judge is shown the holder's text.
+    from backend import citations
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        db = client.state["db"]
+        now = "Minimum wages raise earnings. " * 25  # 750 characters, past the quote's 500
+        [(pid, version)] = await rows(client, "SELECT p.id, v.id FROM passages p JOIN material_versions v"
+                                              " ON v.material_id = ? ORDER BY p.ordinal LIMIT 1", material)
+        await asyncio.to_thread(db.write, lambda conn: conn.execute("UPDATE passages SET text = ? WHERE id = ?", (now, pid)))
+        record = {"material_id": material, "version_id": version, "passage_id": "gone", "text": now[:500] + " but no longer.",
+                  "page": None, "evidence_type": "full_text", "title": "Wage Floors"}
+        [row] = await asyncio.to_thread(db.read, lambda conn: citations.check_existence(
+            conn, project, "Wages rise [S1.1].", {(1, 1): record}))
+        assert (row["existence"], row["passage_id"], row["judged_text"]) == ("ok", pid, now)
