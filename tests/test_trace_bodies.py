@@ -7,16 +7,17 @@ test-owned mock and the local helper is S1-16's stand-in; nothing leaves the pro
 import asyncio
 import json
 import os
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from backend import app as app_module, backups, runs as runs_module
+from backend import backups, runs as runs_module
 from backend.db import deletion
 from cited import Provider, cited, conversation_in, rows, with_papers
 from scholia_app import send, started
-from test_search import CHINESE, WAGES
+from test_search import CHINESE, WAGES, paper
 
 pytestmark = pytest.mark.asyncio
 QUESTION = "What do minimum wages do to earnings?"
@@ -144,11 +145,11 @@ async def test_a_body_left_unlinked_is_collected_by_the_scheduled_pass_once_idle
     # link, or the attempt never sent) is collected by the app's own pass once past the idle window, not only
     # by a later deletion; the idle window still protects it before then.
     from backend import openrouter
-    monkeypatch.setattr(app_module, "COLLECT_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(backups, "COLLECT_SECONDS", 0.05)
     stored, holder, real_stored = [], {}, runs_module._stored
 
-    def storing(content, body):
-        ref = real_stored(content, body)
+    def storing(content, body, hold=None):
+        ref = real_stored(content, body, hold)
         stored.append(ref)
         if orphan == "deleted_before_link" and len(stored) == 1:
             deletion.delete(holder["client"].state["db"], content, "material", holder["material"])
@@ -192,6 +193,92 @@ async def test_unreferenced_content_past_the_idle_window_is_collected_at_launch(
     async with started(tmp_path) as client:
         await until(lambda: not path.exists())
         assert await rows(client, "SELECT count(*) FROM content_files WHERE sha256 = ?", sha) == [(0,)]
+
+
+def aged_now(content, shas):
+    """aged, from a worker thread."""
+    content.db.write(lambda conn: conn.executemany(
+        "UPDATE content_files SET created_at = '2020-01-01T00:00:00.000Z' WHERE sha256 = ?", [(s,) for s in shas]))
+    old = time.time() - 2 * 3600
+    for sha in shas:
+        os.utime(content.root / sha[:2] / sha, (old, old))
+
+
+async def test_an_upload_whose_records_commit_after_the_idle_window_keeps_its_file(tmp_path, monkeypatch):
+    # Internal review of PR 44 (T8, P1): an upload held between storing its file and committing the record that
+    # names it, past the idle window, keeps its file and row through a collection; it then commits.
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        content = client.state["content"]
+        real_put = content.put
+
+        def put_then_wait(data, media_type=None, hold=None):  # a slow upload, with a collection meanwhile
+            sha = real_put(data, media_type, hold)
+            aged_now(content, [sha])
+            content.collect_garbage()
+            return sha
+        monkeypatch.setattr(content, "put", put_then_wait)
+        from test_materials import add
+        response = await add(client, project, paper("Late", "A slow upload of a synthetic paper."))
+        assert response.status_code == 201, response.text
+        [material] = response.json()["materials"]
+        [(sha,)] = await rows(client, "SELECT file_sha256 FROM material_versions WHERE material_id = ?", material["id"])
+        assert (content.root / sha[:2] / sha).is_file()
+
+
+async def test_a_full_backup_keeps_the_files_it_listed_through_a_deletion_and_collection(tmp_path, monkeypatch):
+    # Internal review of PR 44 (T8, P1): a full backup that has listed its files reads them later; a paper
+    # deleted meanwhile, past the idle window, keeps its file until the backup is written, then it is collected.
+    from scholia_app import run_finished, stored_material
+    destination = tmp_path / "chosen"
+    destination.mkdir()
+    async with started(tmp_path / "data") as client:
+        project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+        sha = await stored_material(client, project, b"%PDF-1.7 a paper", "application/pdf")
+        [(material,)] = await rows(client, "SELECT material_id FROM material_versions WHERE file_sha256 = ?", sha)
+        content, real_zip = client.state["content"], backups._write_zip
+
+        def delete_then_write(*args, **kwargs):  # the file list assembled; then a deletion and a collection
+            deletion.delete(content.db, content, "material", material)
+            aged_now(content, [sha])
+            content.collect_garbage()
+            return real_zip(*args, **kwargs)
+        monkeypatch.setattr(backups, "_write_zip", delete_then_write)
+        started_run = await client.post("/api/backups/full", json={"destination": str(destination)})
+        run = await run_finished(client, started_run.json()["run_id"])
+        assert run["status"] == "succeeded", run
+        assert run["result"]["content_files"] == 1 and run["result"]["missing_files"] == 0
+        assert await asyncio.to_thread(content.collect_garbage) == 1  # no longer held: collected
+        assert not (content.root / sha[:2] / sha).exists()
+
+
+async def test_shutdown_after_a_restore_ends_a_collection_pass_before_any_database_closes(tmp_path, monkeypatch, caplog):
+    # Internal review of PR 44 (T8, P1): after a restore, the backups router closes the database it opened as
+    # the app stops; a collection pass under way ends first, so it never meets a closed database.
+    monkeypatch.setattr(backups, "COLLECT_SECONDS", 0.05)
+    entered, release, seen = threading.Event(), threading.Event(), {}
+
+    async def run_then_stop():
+        async with started(tmp_path / "data") as client:
+            generation = (await client.post("/api/backups")).json()["id"]
+            response = await client.post("/api/backups/restore", json={"generation": generation})
+            assert response.status_code == 200, response.text
+            content = client.state["content"]
+            seen["db"], real = client.state["db"], content.collect_garbage
+
+            def held(now=None):
+                entered.set()
+                release.wait(10)
+                return real(now)
+            monkeypatch.setattr(content, "collect_garbage", held)
+            await until(entered.is_set)
+    stopping = asyncio.create_task(run_then_stop())
+    await until(entered.is_set)
+    await asyncio.sleep(0.3)  # the app is stopping meanwhile
+    assert not seen["db"].closed  # the pass is not cut short by a closed database
+    release.set()
+    await stopping
+    assert seen["db"].closed and "content collection failed" not in caplog.text
 
 
 # Success paths

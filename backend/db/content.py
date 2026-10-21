@@ -7,8 +7,14 @@ Records refer to a file through a foreign key to content_files; garbage
 collection removes files and rows that nothing references.
 
 Like Database, every call blocks and is refused on an event loop thread.
+
+Collection never removes content held (ContentStore.hold), whatever its age: content stored before the
+record naming it commits (put with hold), and content a reader has listed and reads later (a backup,
+an export, a reading of a paper). The idle window is a second guard, for a put in progress.
 """
 
+import collections
+import contextlib
 import hashlib
 import os
 import re
@@ -39,14 +45,37 @@ class ContentStore:
         self.root = db.data_dir / "content"
         self._lock = threading.Lock()
         self._writing = set()  # temporary files of puts in progress, however long they take
+        self._held = collections.Counter()  # hashes collection keeps, however old (hold)
 
-    def put(self, data, media_type=None):
+    @contextlib.contextmanager
+    def hold(self, hashes=()):
+        """Keep content from collection for the block, however long it takes: the hashes given (content a
+        reader has listed and reads later), and each one put with hold= the list this yields (content whose
+        record commits later, inside the block). On leaving, content nothing refers to is collected once idle."""
+        held = []
+        with self._lock:
+            for sha256 in hashes:
+                self._held[sha256] += 1
+                held.append(sha256)
+        try:
+            yield held
+        finally:
+            with self._lock:
+                for sha256 in held:
+                    self._held[sha256] -= 1
+                    if self._held[sha256] <= 0:
+                        del self._held[sha256]
+
+    def put(self, data, media_type=None, hold=None):
         """Store bytes, or a binary file object read to its end. Returns the SHA-256.
 
         The file is synced and renamed into place, and its folder synced, before
         the content_files row is committed. Storing content that is already
         there writes it again, which repairs a damaged copy and marks it as
-        recently added. Must not be called inside Database.write.
+        recently added. hold, a list from hold(), keeps the content from collection
+        from the moment its file is in place until that block ends: a caller that
+        commits a record naming it later passes one. Must not be called inside
+        Database.write.
         """
         _refuse_event_loop()
         tmp = self.root / f".put-{uuid.uuid4()}.tmp"
@@ -67,6 +96,9 @@ class ContentStore:
             with self._lock:  # collect_garbage removes a file only under this lock
                 created = _mkdir_new(folder)
                 os.utime(tmp)  # written now, however long the copy took
+                if hold is not None:  # held before the file is in place, under the lock collection takes
+                    self._held[sha256] += 1
+                    hold.append(sha256)
                 os.replace(tmp, folder / sha256)
                 _fsync(folder)
                 if created:
@@ -99,8 +131,9 @@ class ContentStore:
     def collect_garbage(self, now=None):
         """Remove files and rows nothing references once idle. Returns the number of files removed.
 
-        A row is removed when no foreign key in the schema points at it and both
-        it and its file are older than IDLE_AFTER. A file is removed when it has
+        Content held (hold) is never removed. Otherwise a row is removed when no
+        foreign key in the schema points at it and both it and its file are older
+        than IDLE_AFTER. A file is removed when it has
         no row and was last written more than IDLE_AFTER ago; temporary files
         left by an interrupted put are removed the same way, never those of a put
         still in progress in this store. Names the store did not write
@@ -124,7 +157,9 @@ class ContentStore:
                 f" WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch') AND sha256 NOT IN ({referenced})",
                 (cutoff.timestamp(),),
             )]
-            idle = [sha256 for sha256 in candidates if _idle(self._path(sha256), cutoff)]
+            # A held put that misses this check has its row put back by its own insert, which the one writer
+            # runs after this transaction; its file, held, is kept below, under the lock.
+            idle = [sha256 for sha256 in candidates if sha256 not in self._held and _idle(self._path(sha256), cutoff)]
             conn.executemany("DELETE FROM content_files WHERE sha256 = ?", [(sha256,) for sha256 in idle])
 
         self.db.write(remove_rows)
@@ -138,7 +173,7 @@ class ContentStore:
             if path.name in kept:
                 continue
             with self._lock:
-                if _idle(path, cutoff):
+                if path.name not in self._held and _idle(path, cutoff):
                     path.unlink(missing_ok=True)
                     removed += 1
         for path in self.root.glob(".put-*.tmp"):  # left by an interrupted put, not one still running

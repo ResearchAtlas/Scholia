@@ -38,7 +38,6 @@ from backend import search  # S1-17: the search index, index runs and the search
 from backend import zotero  # S1-15: Zotero's library, read only
 from backend.db import (ContentStore, Database, DatabaseCloseError, DatabaseClosedError, close_failed, delete, new_id,
                         utc_now)
-from backend.db.content import IDLE_AFTER
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
@@ -84,28 +83,6 @@ async def _to_end(awaitable):
 async def _finished(fn, *args):
     """Run fn in a worker thread to its end (see _to_end)."""
     return await _to_end(asyncio.to_thread(fn, *args))
-
-
-COLLECT_SECONDS = IDLE_AFTER.total_seconds()  # how often the content store is collected while the app runs
-
-
-async def _collect_unreferenced(state):
-    """Collect the content store at launch and every COLLECT_SECONDS, off the event loop, not only after a
-    deletion: a request body stored before its dispatch and left unlinked (its paper deleted between the store
-    and the link, or the attempt never sent; backend/runs.py) goes once idle (ContentStore.collect_garbage's
-    window, which keeps a put in progress). Inside state["writers"], as a request is, so a restore waits for
-    it; skipped while the app is limited or restoring. A failure is logged and the next pass tries again."""
-    while True:
-        writers = state.get("writers")  # set by the backups router's lifespan, which opens after this one
-        async with writers.shared() if writers is not None else contextlib.nullcontext():
-            content = state.get("content")
-            if (content is not None and not content.db.closed and not state.get("restoring")
-                    and backups.limited(state) is None):
-                try:
-                    await _finished(content.collect_garbage)
-                except Exception as error:
-                    log.warning("content collection failed (%s)", type(error).__name__)
-        await asyncio.sleep(COLLECT_SECONDS)
 
 
 class ApiError(Exception):
@@ -361,7 +338,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         # that opens.
         db = await backups.open_at_launch(state, maintenance)
         ended = False  # the routers' own closing (a restore's database, the local helpers) raised nothing
-        collector = None  # T8: the content store's own collection
         try:
             if db is not None:
                 await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
@@ -374,14 +350,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 # database it found damaged (the app is then limited) nothing runs on its own.
                 if db.damaged is None:
                     await backups.start_background(state)
-            collector = asyncio.create_task(_collect_unreferenced(state))
             yield
             ended = True
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
-            if collector is not None:
-                collector.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await collector
             running = await state["harness"].shutdown() if state.get("harness") is not None else 0
             # A close that fails is logged by it; the next launch's index open purges what it left
             if state.get("index") is not None:  # S1-17: closed by its database's close, once no write can commit

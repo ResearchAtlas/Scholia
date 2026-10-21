@@ -47,6 +47,7 @@ from backend.db import (DB_NAME, BackupBusyError, Database, DatabaseCloseError, 
                         DatabaseDamagedError, ForeignDatabaseError, NewerDatabaseError, close_failed, utc_now)
 from backend.db.database import KINDS, SETTINGS_FILES, _fsync, _mkdir_private, _open_checked, _stamp_of, \
     closing_connection, list_generations
+from backend.db.content import IDLE_AFTER
 from backend.db.migrations import MIGRATIONS
 from backend.runs import RunOutcome, _through
 from backend.settings import known_only, write_private
@@ -219,12 +220,14 @@ async def lifespan(app):
     if not await asyncio.to_thread(_replay_pending, state["data_dir"]):  # else a restore is still to be finished
         await asyncio.to_thread(shutil.rmtree, state["data_dir"] / "backups" / STAGING, ignore_errors=True)
     idle = asyncio.create_task(_idle_backups(state))
+    collector = asyncio.create_task(_collect_content(state))  # S1-19b follow-up (T8)
     try:
         yield
     finally:
-        idle.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await idle
+        for task in (collector, idle):  # both ended, a pass in a worker thread included, before anything closes
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         if (state.get("db"), state.get("harness")) != opened:
             if state.get("harness") is not None:
                 await state["harness"].shutdown()
@@ -236,6 +239,29 @@ async def lifespan(app):
 
 
 router = APIRouter(lifespan=lifespan, route_class=_Route)
+
+
+COLLECT_SECONDS = IDLE_AFTER.total_seconds()  # how often the content store is collected while the app runs
+
+
+async def _collect_content(state):
+    """Collect the content store at launch and every COLLECT_SECONDS, in a worker thread, not only after a
+    deletion: a request body stored before its dispatch and left unlinked (its paper deleted between the store
+    and the link, or the attempt never sent; backend/runs.py) goes once idle. What is held is kept however old
+    (ContentStore.hold: a file whose record has not committed yet, a file a backup or reading has listed). Inside
+    state["writers"], as a request is, so a restore waits for it; skipped while the app is limited or restoring,
+    or its database closed. Started and stopped by this module's lifespan, so it has ended before any database
+    closes. A failure is logged and the next pass tries again."""
+    while True:
+        async with state["writers"].shared():
+            content = state.get("content")
+            if (content is not None and not content.db.closed and not state.get("restoring")
+                    and limited(state) is None):
+                try:
+                    await _to_end(asyncio.to_thread(content.collect_garbage))
+                except Exception as error:
+                    log.warning("content collection failed (%s)", type(error).__name__)
+        await asyncio.sleep(COLLECT_SECONDS)
 
 
 async def _idle_backups(state):
@@ -547,10 +573,11 @@ def register(harness, state):
                 destination = Path(inputs["destination"])
                 if inputs.get("project_id"):  # an export; else a full backup
                     write = lambda: _export(db, inputs["project_id"], destination, passphrase,  # noqa: E731
-                                            inputs.get("language", "en"), state["archives"], stop, progress)
+                                            inputs.get("language", "en"), state["archives"], stop, progress,
+                                            state.get("content"))
                 else:
                     write = lambda: _full_backup(db, destination, passphrase, state["archives"], stop,  # noqa: E731
-                                                 progress)
+                                                 progress, state.get("content"))
                 result = await harness.work(active, write)
         except BackupError as error:
             raise RunOutcome("failed", error.code) from None
@@ -563,12 +590,14 @@ def register(harness, state):
     harness.workflows["project_export"] = archive
 
 
-def _full_backup(db, destination, passphrase, archives, stop=None, progress=None):
-    with _written(), _watched(archives, None, passphrase) as archive:
-        return _write_full_backup(db, destination, passphrase, archive, stop, progress)
+def _full_backup(db, destination, passphrase, archives, stop=None, progress=None, content=None):
+    with _written(), _watched(archives, None, passphrase) as archive, contextlib.ExitStack() as held:
+        return _write_full_backup(db, destination, passphrase, archive, stop, progress, content, held)
 
 
-def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None):
+def _write_full_backup(db, destination, passphrase, archive, stop=None, progress=None, content=None, held=None):
+    """content and held: the content store and a stack, which holds the files the backup lists from collection
+    until it is written (ContentStore.hold)."""
     staging = _staging(db.data_dir)
     try:
         with _backup_errors():
@@ -579,6 +608,8 @@ def _write_full_backup(db, destination, passphrase, archive, stop=None, progress
             # Only the files the copy's records refer to: one of a project deleted moments ago, which
             # collection keeps for a while, would leave without the encryption its project needed.
             hashes = [sha256 for sha256, *_ in _referenced_content(copy)]
+        if content is not None and held is not None:  # read later: none is collected meanwhile
+            held.enter_context(content.hold(hashes))
         if sensitive and not passphrase:
             raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
         entries, left_out = [], []
@@ -1350,15 +1381,20 @@ async def export_project(project_id: str, body: Export, request: Request):
     return {"run_id": run_id}
 
 
-def _export(db, project_id, destination, passphrase, language, archives, stop=None, progress=None):
-    with _written(), _watched(archives, {project_id}, passphrase) as archive:
-        return _write_export(db, project_id, destination, passphrase, language, archive, stop, progress)
+def _export(db, project_id, destination, passphrase, language, archives, stop=None, progress=None, content=None):
+    with _written(), _watched(archives, {project_id}, passphrase) as archive, contextlib.ExitStack() as held:
+        return _write_export(db, project_id, destination, passphrase, language, archive, stop, progress, content, held)
 
 
-def _write_export(db, project_id, destination, passphrase, language, archive, stop=None, progress=None):
+def _write_export(db, project_id, destination, passphrase, language, archive, stop=None, progress=None, content=None,
+                  held=None):
+    """content and held: as for _write_full_backup."""
     data = db.read(lambda conn: _project_records(conn, project_id))
     if data is None:
         raise BackupError(404, "not_found", "No such project")
+    if content is not None and held is not None:  # the papers' files, read later: none is collected meanwhile
+        held.enter_context(content.hold([v["file_sha256"] for m in data["materials"] for v in m["versions"]
+                                         if v["file_sha256"]]))
     if data["project"]["sensitivity"] in SENSITIVE and not passphrase:
         raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
     entries = [("project.json", _json({"format": "scholia-project-export", "version": 1, "app_version": APP_VERSION,

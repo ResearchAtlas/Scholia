@@ -215,6 +215,22 @@ def test_unreferenced_idle_files_and_rows_are_collected(store, db):
     assert rows(db) == [] and stored(store) == []
 
 
+def test_held_content_is_kept_however_old_until_its_hold_ends(store, db):
+    # Internal review of PR 44 (T8): age cannot show content is unused. A put whose record has not committed
+    # yet, and a file a reader has listed, are held; once released, unreferenced content goes once idle.
+    listed = store.put(b"listed by a backup")
+    with store.hold() as pending, store.hold([listed]):
+        put = store.put(b"stored before its record", hold=pending)
+        assert pending == [put]
+        assert store.collect_garbage(now=later()) == 0
+        assert stored(store) == sorted([listed, put])
+        with store.hold([listed]):  # holds of one hash count
+            pass
+        assert store.collect_garbage(now=later()) == 0
+    assert store.collect_garbage(now=later()) == 2
+    assert rows(db) == [] and stored(store) == []
+
+
 @pytest.mark.parametrize("reference", [add_material_version, add_extraction, add_event_body])
 def test_referenced_files_are_kept(store, db, reference):
     sha256 = store.put(b"in use")
