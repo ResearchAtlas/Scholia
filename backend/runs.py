@@ -668,7 +668,9 @@ class Harness:
                 " AND t.answer IS NOT NULL ORDER BY t.seq DESC", (claim.conversation_id,)).fetchall()
             history = [(json.loads(u).get("text", ""), historical_citations(json.loads(a).get("text", "")))
                        for u, a, _ in earlier]
-            history_materials = sorted({m for _, _, held in earlier for m in json.loads(held or "[]")})
+            # newest first, as history is: each earlier turn's papers that still exist (a deleted one's text is gone)
+            history_materials = [[m for m in json.loads(held or "[]") if conn.execute(
+                "SELECT 1 FROM materials WHERE id = ?", (m,)).fetchone()] for _, _, held in earlier]
             if material_ids and conn.execute(
                     "SELECT count(*) FROM materials WHERE project_id = ? AND id IN (SELECT value FROM json_each(?))",
                     (project_id, json.dumps(material_ids))).fetchone()[0] != len(material_ids):
@@ -1097,9 +1099,11 @@ class Harness:
                 history=ctx["history"])
         request = assemble(lines, numbered)
         kept = len(lines) - request.cuts.get("research_evidence", 0)
+        ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)  # newest first, as they fit
         if lines and not kept:  # the window left no room for any of it: the request says so, not "none matched"
             request = assemble([], {}, cut=True)
             request.cuts["research_evidence"] = len(lines)
+            ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)
         return dict(list(numbered.items())[:kept]), request
 
     async def _register_context(self, claim, numbered):
@@ -1108,7 +1112,9 @@ class Harness:
         passage its paper no longer reads (may_dispatch reads inputs.evidence, [passage, paper] pairs)."""
         papers = sorted({r["material_id"] for r in numbered.values()})
         pairs = sorted({(r["passage_id"], r["material_id"]) for r in numbered.values()})
-        held = sorted({*papers, *claim.context["history_materials"]})  # every paper whose text the request carries
+        # every paper whose text the request carries: its evidence, and the earlier turns its history holds
+        shown = claim.context["history_materials"][:claim.context.get("history_kept", 0)]
+        held = sorted({*papers, *(m for turn in shown for m in turn)})
         claim.context["context_materials"] = held
         if not held:
             return

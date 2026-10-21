@@ -319,3 +319,20 @@ async def test_a_recheck_the_judge_leaves_partly_unanswered_fails_and_writes_not
         [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
         assert (await run_finished(client, check))["status"] == "failed"
         assert await rows(client, "SELECT support FROM citations") == [("supported",)]
+
+
+async def test_a_paper_deleted_earlier_does_not_cost_the_conversations_later_turns_their_trace(tmp_path):
+    # Recheck of b1 (P2): the history links only papers that still exist, so after a cited paper is deleted a
+    # later turn's body is kept (it can hold none of the deleted text, which went with the paper).
+    from test_search import CHINESE
+    async with cited(tmp_path) as client:
+        project, [wages, chinese] = await with_papers(client, WAGES, CHINESE)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        assert (await client.delete(f"/api/materials/{wages}")).status_code == 200
+        later = (await send(client, conversation, "Rewrite your last answer more formally."))[0]["run_id"]
+        attempts = [e for e in (await client.get(f"/api/runs/{later}/trace")).json()["events"]
+                    if e["type"] == "model_attempt"]
+        assert attempts and all(e["body_ref"] and not e.get("body_removed") for e in attempts)
+        [(held,)] = await rows(client, "SELECT json_extract(inputs, '$.context_materials') FROM runs WHERE id = ?", later)
+        assert wages not in json.loads(held or "[]")

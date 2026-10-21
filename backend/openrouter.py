@@ -279,8 +279,10 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         # Encoded here, as httpx would encode json=, so the trace keeps the exact bytes that went out (S1-19).
         sending = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if on_body is not None:
+            keeping = time.monotonic()
             await on_body(sending)
-        remaining = deadline - time.monotonic()  # the call's bound counts from after the body was kept
+            deadline += time.monotonic() - keeping  # keeping the body does not spend the call's bound
+        remaining = deadline - time.monotonic()
         if remaining <= 0:
             return _failed("timeout", attempts, route)
         started = time.monotonic()
