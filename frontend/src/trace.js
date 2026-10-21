@@ -19,8 +19,8 @@ export async function readTrace(runId, read = get) {
   return events;
 }
 
-// { route, retrieval, search, steps: [{ phase, route, estimate, attempts: [{ outcome, cost, charge, body }] }],
-//   checks, finished } from the trace's events.
+// { route, retrieval, search, steps: [{ phase, route, estimate, cut, attempts: [{ outcome, cost, charge, body }] }],
+//   checks, finished } from the trace's events. A step whose answer stopped at its output limit is cut.
 export function summarize(events) {
   const found = { route: null, retrieval: null, search: null, steps: [], checks: [], finished: null };
   const steps = new Map();
@@ -32,12 +32,15 @@ export function summarize(events) {
       found.search = { mode: data.mode, reason: data.reason ?? null, passages: (data.selected ?? []).length,
         rerank: data.rerank?.fallback ? 'fallback' : data.rerank ? 'reranked' : null };
     } else if (type === 'step_started') {
-      const step = { phase: data.phase, route: data.route, estimate: data.estimate_usd ?? null, attempts: [] };
+      const step = { phase: data.phase, route: data.route, estimate: data.estimate_usd ?? null, cut: false, attempts: [] };
       steps.set(data.step, step);
       found.steps.push(step);
     } else if (type === 'model_attempt') {
       steps.get(data.step)?.attempts.push({ outcome: data.outcome, cost: data.cost_usd ?? null, charge: data.charge ?? null,
         body: body ?? null });
+    } else if (type === 'step_finished') {
+      const step = steps.get(data.step);
+      if (step && data.cut) step.cut = true; // saved, and marked as stopped at its output limit
     } else if (type === 'citation_checks') {
       found.checks = data.citations ?? [];
     } else if (type === 'run_finished') {

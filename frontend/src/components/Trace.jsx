@@ -50,6 +50,7 @@ export function Trace({ turn }) {
           <li key={i} className="space-y-1">
             <p className="font-medium">{t(PHASE[step.phase] ?? 'trace.phaseOther')}
               {step.estimate !== null && <> · <span className="font-normal text-muted-foreground">{about(step.estimate)}</span></>}</p>
+            {step.cut && <p className="text-muted-foreground">{t('turn.cut')}</p>}
             {step.attempts.map((attempt, j) => <Attempt key={j} runId={turn.run_id} attempt={attempt} />)}
           </li>
         ))}

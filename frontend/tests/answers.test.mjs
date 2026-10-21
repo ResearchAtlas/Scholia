@@ -98,6 +98,7 @@ test('Details sums up the trace from its events, read a page at a time', async (
     1: { events: [
       { seq: 2, type: 'step_started', data: { step: 0, phase: 'answer', route: 'openrouter:m', estimate_usd: 0.05 }, body_ref: null },
       { seq: 3, type: 'model_attempt', data: { step: 0, outcome: 'ok', cost_usd: 0.002, charge: 'reported' }, body_ref: 'aa' },
+      { seq: 3.5, type: 'step_finished', data: { step: 0, cut: 'output_limit' }, body_ref: null }, // saved, cut
       { seq: 4, type: 'step_started', data: { step: 1, phase: 'judge', estimate_usd: 0.01 }, body_ref: null },
       { seq: 5, type: 'model_attempt', data: { step: 1, outcome: 'timeout' }, body_ref: 'bb' },
       { seq: 6, type: 'citation_checks', data: { citations: [{ marker: '[S1.1]', existence: 'ok', support: 'unchecked' }] }, body_ref: null },
@@ -111,8 +112,8 @@ test('Details sums up the trace from its events, read a page at a time', async (
   assert.equal(found.route, 'openrouter:m');
   assert.deepEqual(found.retrieval, { route: 'literature', decided_by: 'fallback' });
   assert.deepEqual(found.search, { mode: 'hybrid', reason: null, passages: 2, rerank: 'fallback' });
-  assert.deepEqual(found.steps.map((s) => [s.phase, s.estimate, s.attempts.map((a) => [a.outcome, a.body])]),
-    [['answer', 0.05, [['ok', 'aa']]], ['judge', 0.01, [['timeout', 'bb']]]]);
+  assert.deepEqual(found.steps.map((s) => [s.phase, s.estimate, s.cut, s.attempts.map((a) => [a.outcome, a.body])]),
+    [['answer', 0.05, true, [['ok', 'aa']]], ['judge', 0.01, false, [['timeout', 'bb']]]]);
   assert.equal(found.checks.length, 1);
   assert.equal(found.finished, 'succeeded');
 });
