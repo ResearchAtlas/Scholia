@@ -143,7 +143,8 @@ def test_a_backend_that_outlives_its_stop_keeps_the_data_folder_locked(tmp_path,
         return taken[-1]
 
     def slow_close(self):  # a rebuild still running in the index's writer as the window closes
-        self._writer.submit(writing.wait)
+        if not self.closed:  # a later close only waits for the first
+            self._writer.submit(writing.wait)
         real_close(self)
 
     monkeypatch.setattr(desktop, "take_lock", take_lock)
