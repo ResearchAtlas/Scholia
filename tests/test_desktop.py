@@ -220,16 +220,24 @@ def test_a_server_that_ends_before_the_index_closed_keeps_the_data_folder_locked
     os.close(taken[0])
 
 
-def test_a_close_that_failed_keeps_the_data_folder_locked(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failed", ["a close", "a router's closing"])
+def test_a_close_that_failed_keeps_the_data_folder_locked(tmp_path, monkeypatch, failed):
     from backend import app as app_module
+    from backend import local_helper
     data, taken, real_take_lock = tmp_path / "data", [], desktop.take_lock
 
     def take_lock(data_dir):
         taken.append(real_take_lock(data_dir))
         return taken[-1]
 
+    async def failing_close(self):
+        raise RuntimeError("the local helpers did not stop")
+
     monkeypatch.setattr(desktop, "take_lock", take_lock)
-    monkeypatch.setattr(app_module, "close_failed", lambda: True)  # what it left open may still be open
+    if failed == "a close":
+        monkeypatch.setattr(app_module, "close_failed", lambda: True)  # what it left open may still be open
+    else:
+        monkeypatch.setattr(local_helper.Local, "close", failing_close)
     seen = []
     assert desktop.run(data, _open_and_close(seen), keyring_backend=FakeKeyring(), listening=register_server) == 0
     assert seen == [True] and not [t for t in threading.enumerate() if t.name == "scholia-server"]

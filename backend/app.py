@@ -326,6 +326,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @contextlib.asynccontextmanager
     async def lifespan(app):
         state.update(data_dir=data_dir, start=start, helper_config=helper)
+        state.pop("closed", None)  # this lifespan's own, set as it ends (below)
         # Finishing a restore a crash interrupted, opening the database (its checks, the backup
         # before a migration, migrations) and the daily backup are local maintenance: the desktop
         # entry's start deadline does not count them (see maintenance), since on a large folder
@@ -334,6 +335,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         # (backups.Gate) until a restore puts a backup in place; the backups router closes what
         # that opens.
         db = await backups.open_at_launch(state, maintenance)
+        ended = False  # the routers' own closing (a restore's database, the local helpers) raised nothing
         try:
             if db is not None:
                 await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
@@ -347,6 +349,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 if db.damaged is None:
                     await backups.start_background(state)
             yield
+            ended = True
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
             running = await state["harness"].shutdown() if state.get("harness") is not None else 0
             # A close that fails is logged by it; the next launch's index open purges what it left
@@ -359,7 +362,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             state.clear()
             # Only now, with no work left running and every close done (close_failed() never set in this process),
             # is the data folder free: the desktop entry keeps its lock otherwise, until the process ends.
-            if not running and not close_failed():
+            if ended and not running and not close_failed():
                 state["closed"] = True
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
