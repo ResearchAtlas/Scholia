@@ -55,7 +55,7 @@ import logging
 import threading
 import time
 import traceback
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 
 from backend import (budget_router, citations, context, credentials, governance, openrouter, openrouter_client,
@@ -798,7 +798,7 @@ class Harness:
             await handed({"type": "route", "route": decision["route"], "decided_by": decision["decided_by"]})
             found = {"records": [], "mode": None, "reason": None}
             if decision["route"] in RETRIEVAL_ROUTES:
-                found = await self._evidence(claim, ctx)
+                found = await self._evidence(claim, ctx, decision)
             numbered, request = self._cited_request(ctx, found, decision)
             await self._register_context(claim, numbered)  # the dispatch check now covers its passages
             judge = await self._judge_route(ctx)
@@ -1129,16 +1129,25 @@ class Harness:
             raise asyncio.CancelledError() from None
         return decision
 
-    async def _evidence(self, claim, ctx):
+    async def _evidence(self, claim, ctx, decision):
         """The pipeline's evidence for the turn (backend/pipeline.py), traced. Nothing when the app has no
-        search index (keyword-only and unavailable, said)."""
+        search index (keyword-only and unavailable, said). A selection is read whole only when the answer's
+        request, assembled as it will be sent, holds every one of its records (B40)."""
         from backend import pipeline, search  # search imports this module
         state = search._STATES.get(self)
+
+        def whole(records):
+            try:
+                request = self._cited_request(ctx, {"records": records, "mode": "selection", "reason": None}, decision)[1]
+            except context.OverWindow:
+                return False
+            return not request.cuts.get("research_evidence")
         if state is None:
             found = {"records": [], "mode": "keyword_only", "reason": "index_unavailable",
                      "trace": {"index": "unavailable"}}
         else:
-            found = await pipeline.evidence(state, ctx["project_id"], ctx["message"], materials=ctx["selection"])
+            found = await pipeline.evidence(state, ctx["project_id"], ctx["message"], materials=ctx["selection"],
+                                            whole=whole)
 
         def record(conn):
             if not _running(conn, claim.run_id) or _revoked(conn, claim.run_id):
@@ -1330,10 +1339,12 @@ class Harness:
             call.dispatched, call.retention = True, terms
 
         async def keep(body):  # stored, and linked to its papers, before it is sent: a stop or a crash keeps it
-            ref = await asyncio.to_thread(_stored, self.content, body)
-            number = len(call.bodies)
-            call.bodies.append(ref)
-            await self._write(lambda conn: _keep_body(conn, call, number, ref))
+            # Held from collection until its link commits (or is skipped: then collected once idle).
+            with self.content.hold() if self.content is not None else nullcontext([]) as held:
+                ref = await asyncio.to_thread(_stored, self.content, body, held)
+                number = len(call.bodies)
+                call.bodies.append(ref)
+                await self._write(lambda conn: _keep_body(conn, call, number, ref))
 
         call.materials = tuple(sorted(set(materials)))
 
@@ -1858,13 +1869,13 @@ def _check_request(conn, inputs):
     return (judged, texts) if judged else None
 
 
-def _stored(content, body):
+def _stored(content, body, hold=None):
     """The content store's name for an attempt's request body, or None (no body, no store, or a store that
     could not take it: the attempt's receipt is recorded and settled all the same)."""
     if content is None or body is None:
         return None
     try:
-        return content.put(body, "application/json")
+        return content.put(body, "application/json", hold=hold)
     except Exception as error:
         log.warning("a request body could not be kept for the trace (%s)", type(error).__name__)
         return None

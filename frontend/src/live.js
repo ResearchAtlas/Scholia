@@ -7,7 +7,7 @@ import { post, stream } from './api.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
-const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut }, for this window
+const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
 
 function set(conversationId, turn, eventType) {
@@ -46,7 +46,7 @@ export function send(conversationId, path, body, text) {
     stream(path, body, (event) => {
       turn = apply(turn, event);
       if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
-        unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut) });
+        unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
       }
       set(conversationId, turn, event.type);
       if (turn.runId) admitted();

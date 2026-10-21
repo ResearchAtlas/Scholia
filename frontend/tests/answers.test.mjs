@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import Answer, { Chip } from '../src/markdown.js';
+import Answer, { Chip, backedSentences } from '../src/markdown.js';
 import { readTrace, summarize } from '../src/trace.js';
 import { MAX_CHOSEN, choosePapers, chosenPapers, openPaperAt, readGuard, takeOpening, watchChosen } from '../src/library.js';
 import { NOTICES } from '../src/live.js';
@@ -150,6 +150,17 @@ test('a citation that does not exist is never a chip, and an answer without its 
   const live = render(text, null);
   assert.doesNotMatch(live, /cite/);
   assert.match(live, /Wages rise \[S1\.1\]\. Prices fall \[S9\.9\]\./);
+});
+
+test('a chip the conversation read resolves as removed after its paper\'s file is replaced shows as removed', () => {
+  // T7 (PR 41): backend/app.py overlays the citation's current existence; the chip is removed, with no quote,
+  // link or verdict shown as current, and no stale verdict backs its sentence.
+  const text = 'Wages rise [S1.1].';
+  const removed = cite(text, '[S1.1]', { existence: 'source_removed', support: 'unchecked', quote: null, passage_id: null, ordinal: null });
+  const html = render(text, [removed]);
+  assert.doesNotMatch(html, /<button|cite-quote|cite\.supported|Minimum wages/);
+  assert.match(html, /class="cite-missing" title="cite\.removed"/);
+  assert.equal(backedSentences([{ ...removed, support: 'supported', sentence: 'Wages rise [S1.1].' }]).size, 0);
 });
 
 test('Details sums up the trace from its events, read a page at a time', async () => {

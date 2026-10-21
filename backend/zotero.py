@@ -632,7 +632,7 @@ def _archive_id(value):
     return reference_files._arxiv(rest)[0]
 
 
-async def _fetch_item(harness, active, client, library, key, server_id, content):
+async def _fetch_item(harness, active, client, library, key, server_id, content, hold=None):
     """What Zotero holds of one item: None when it is gone (or a note, an attachment, in the trash),
     else (its record, values left out, its PDF's stored SHA-256 or None, why its PDF was not read or None)."""
     item, _ = await _read(client, f"/api/{library}/items/{key}?format=json&include=data,csljson", server_id, RETRIES)
@@ -670,7 +670,7 @@ async def _fetch_item(harness, active, client, library, key, server_id, content)
         data, why = read_attachment(path)
         if data is None or active.cancel_requested.is_set():
             return None, why
-        return content.put(data, extraction.PDF), None  # collected later if no record names it
+        return content.put(data, extraction.PDF, hold), None  # held until its item commits; else collected once idle
 
     sha256, why = await harness.work(active, read_and_store)
     return csl, dropped, sha256, why
@@ -711,16 +711,17 @@ async def _import(harness, active, project_id, inputs, content):
     try:
         async with harness.gate.async_client(project_id, zotero=True, admit=admit, follow_redirects=False) as client:
             for key in [k for k in inputs["items"] if k not in done]:
-                fetched = await _fetch_item(harness, active, client, library, key, server_id, content)
-                try:
-                    await harness.record_background(8, lambda conn, ids: _commit(
-                        conn, ids, harness, active, project_id, inputs, key, fetched))
-                except _Ended:
-                    raise RunOutcome("cancelled", "project_changed", "revoked") from None
-                except _Stopped:
-                    raise asyncio.CancelledError() from None
-                except AdmissionError:  # the app is closing: it stays as it is, read interrupted
-                    raise RunOutcome("interrupted") from None
+                with content.hold() as held:  # its file kept from collection until its transaction commits
+                    fetched = await _fetch_item(harness, active, client, library, key, server_id, content, held)
+                    try:
+                        await harness.record_background(8, lambda conn, ids: _commit(
+                            conn, ids, harness, active, project_id, inputs, key, fetched))
+                    except _Ended:
+                        raise RunOutcome("cancelled", "project_changed", "revoked") from None
+                    except _Stopped:
+                        raise asyncio.CancelledError() from None
+                    except AdmissionError:  # the app is closing: it stays as it is, read interrupted
+                        raise RunOutcome("interrupted") from None
                 done.append(key)
                 active.progress = {"done": len(done), "total": len(inputs["items"])}
     except Unreachable as unreachable:

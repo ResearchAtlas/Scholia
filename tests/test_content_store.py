@@ -215,6 +215,50 @@ def test_unreferenced_idle_files_and_rows_are_collected(store, db):
     assert rows(db) == [] and stored(store) == []
 
 
+def test_held_content_is_kept_however_old_until_its_hold_ends(store, db):
+    # Internal review of PR 44 (T8): age cannot show content is unused. A put whose record has not committed
+    # yet, and a file a reader has listed, are held; once released, unreferenced content goes once idle.
+    listed = store.put(b"listed by a backup")
+    with store.hold() as pending, store.hold([listed]):
+        put = store.put(b"stored before its record", hold=pending)
+        assert pending == [put]
+        assert store.collect_garbage(now=later()) == 0
+        assert stored(store) == sorted([listed, put])
+        with store.hold([listed]):  # holds of one hash count
+            pass
+        assert store.collect_garbage(now=later()) == 0
+    assert store.collect_garbage(now=later()) == 2
+    assert rows(db) == [] and stored(store) == []
+
+
+@pytest.mark.asyncio
+async def test_a_put_that_outlives_its_cancelled_hold_takes_no_hold(store, db):
+    # Internal review 2 of PR 44: a caller cancelled while its put runs in a worker thread leaves the block
+    # first; the put finishing afterwards must not hold its content for good.
+    started, finish = asyncio.Event(), __import__("threading").Event()
+    loop = asyncio.get_running_loop()
+
+    class Slow(io.BytesIO):
+        def read(self, *args):
+            loop.call_soon_threadsafe(started.set)
+            finish.wait(5)
+            return super().read(*args)
+
+    async def caller():
+        with store.hold() as held:
+            await asyncio.to_thread(store.put, Slow(b"a body"), "application/json", held)
+    task = asyncio.create_task(caller())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    finish.set()
+    while not await asyncio.to_thread(rows, db):  # the put, still running in its thread, commits its row
+        await asyncio.sleep(0.01)
+    assert not store._held
+    assert await asyncio.to_thread(store.collect_garbage, later()) == 1
+
+
 @pytest.mark.parametrize("reference", [add_material_version, add_extraction, add_event_body])
 def test_referenced_files_are_kept(store, db, reference):
     sha256 = store.put(b"in use")
