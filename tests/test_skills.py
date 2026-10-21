@@ -203,6 +203,10 @@ def test_the_help_skill_says_exactly_what_each_protection_level_sends():
     for wrong in ("sends nothing to the internet", "only to zero-retention routes"):
         assert wrong not in english
     for said in ("declared runs on this machine", "not a retention guarantee", "only after asking",
-                 "sending only the identifier", "looks no identifier up"):
+                 "sending only the identifier", "looks no identifier up", "Crossref and OpenAlex", "arXiv ID with arXiv",
+                 "helper for search"):
         assert said in english, said
     assert "不向互联网发送任何内容" not in chinese and "已声明" in chinese and "不是留存保证" in chinese
+    assert "arXiv 编号通过 arXiv" in chinese and "Crossref 和 OpenAlex" in chinese
+    from backend import lookup
+    assert lookup.SERVICES == {"doi": ("openalex", "crossref"), "arxiv": ("arxiv",)}  # what the text names

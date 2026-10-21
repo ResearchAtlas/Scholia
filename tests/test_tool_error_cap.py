@@ -64,3 +64,39 @@ async def test_a_success_between_failures_starts_the_count_again(tmp_path):
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "Which papers do I have?")
         assert stream[-1]["status"] == "succeeded"
+
+
+async def test_the_researchers_words_follow_the_steps_last_tool_result(tmp_path):
+    provider = Scripted([call("no_such_tool", call_id="a"), call("no_such_tool", call_id="b"),
+                         call("no_such_tool", call_id="c"), call("list_materials", call_id="d")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"text": "Go on"})
+        assert (await sending)[-1]["status"] == "succeeded"
+        roles = [m["role"] for m in provider.agent_steps[1]["messages"]]
+        assert roles[-6:] == ["assistant", "tool", "tool", "tool", "tool", "user"]  # tool results right after their step
+
+
+async def test_a_change_of_protection_asks_again_rather_than_stopping(tmp_path, monkeypatch):
+    from backend import agent
+    monkeypatch.setattr(agent, "ANSWERED_POLL_SECONDS", 0.05)
+    provider = Scripted(*FAILING, "never reached")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        first = await asked(client, conversation)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE projects SET sensitivity = 'private' WHERE id = ?", (project,)))  # a change that revokes nothing
+        for _ in range(200):
+            found = (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"]
+            if found and found[0]["ask_id"] != first["ask_id"]:
+                break
+            await asyncio.sleep(0.05)
+        assert found and found[0]["ask_id"] != first["ask_id"] and found[0]["params"]["tool_errors"] == 3  # asked anew
+        await client.post(f"/api/runs/{found[0]['run_id']}/asks/{found[0]['ask_id']}", json={"option": "stop"})
+        stream = await asyncio.wait_for(sending, 20)
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "researcher")

@@ -150,12 +150,15 @@ SHOWN = {"choice": _agents_question}
 def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
     """The asks that can be answered now: of running runs waiting on them, under the policy they were
     asked under; for a project, a conversation they were raised from, or a run. Each names its
-    project (project_name, project_kind), wherever it is shown."""
+    project (project_name, project_kind), wherever it is shown. A turn's asks (the agent's, S1-19c) are shown only
+    where their work started, in their conversation (section 6.2): a project's listing (the Library panel) leaves
+    them out, so their text is read only under the conversation's library-change guard."""
     rows = conn.execute(
         "SELECT r.id, r.workflow, p.name, p.kind FROM runs r JOIN projects p ON p.id = r.project_id"
         " WHERE r.status = 'running' AND r.waiting = 'ask'"
         " AND r.cancel_reason IS NULL AND (?1 IS NULL OR r.project_id = ?1) AND (?2 IS NULL OR r.id = ?2)"
-        " ORDER BY r.started_at", (project_id, run_id)).fetchall()
+        " AND (?3 IS NOT NULL OR ?2 IS NOT NULL OR r.kind != 'turn')"
+        " ORDER BY r.started_at", (project_id, run_id, conversation_id)).fetchall()
     found = []
     for run, workflow, project_name, project_kind in rows:
         ask, answered = asked(conn, run)

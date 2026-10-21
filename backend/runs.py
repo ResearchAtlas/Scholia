@@ -1324,6 +1324,7 @@ class Harness:
                 return "agent_steps"
             await self._release_held(claim)  # this step called tools: its judge share and unspent go back
             chain.append({"role": "assistant", **result.message} if "role" not in result.message else result.message)
+            said = []  # the researcher's words given at a tool-errors ask, after the step's tool results
             for raw in result.tool_calls:
                 if calls_made >= limits["tool_calls"]:
                     return "tool_calls"
@@ -1337,12 +1338,16 @@ class Harness:
                                   {"error": answered.error.type, "message": answered.error.message})})
                 failures = 0 if answered.ok else failures + 1
                 if failures >= 3:  # compact errors: after three failed calls in a row the run stops and asks (6.6)
-                    reply = await self._ask(turn, "choice", ["continue", "stop"], {"tool_errors": failures}, None)
-                    if not reply or reply.get("option") == "stop":
+                    # Asked again if a change of protection withdrew it; a Stop, deletion or revocation ends the turn.
+                    while (reply := await self._ask(turn, "choice", ["continue", "stop"], {"tool_errors": failures},
+                                                    None)) is None:
+                        pass
+                    if reply.get("option") == "stop":
                         return "stopped"
                     failures = 0
-                    if "text" in reply:  # the researcher's own words, for the next step
-                        chain.append({"role": "user", "content": reply["text"]})
+                    if "text" in reply:  # the researcher's own words, after this step's tool results
+                        said.append({"role": "user", "content": reply["text"]})
+            chain += said
         return "agent_steps"
 
     async def _tool_rules(self, ctx):
@@ -1401,7 +1406,9 @@ class Harness:
         reply = await self._ask(turn, "choice", ["allow", "decline"], {"approval": call.name}, call.id,
                                 applies=still_asked)
         rule = ToolRouter(agent.REGISTRY, **await self._tool_rules(turn.ctx)).rule(call.name)
-        return rule != "deny" and (rule == "allow" or (reply or {}).get("option") == "allow")
+        if rule == "deny" or reply is not None:  # a deny wins; else the researcher's own answer stands
+            return rule != "deny" and reply.get("option") == "allow"
+        return rule == "allow"  # withdrawn because the rule changed: what it says now
 
     async def _ask(self, turn, kind, options, params, call_id, question=None, applies=None):
         """Raise a shared confirmation for the turn (backend/asks.py; ticket 71: the agent's way in) and wait for its

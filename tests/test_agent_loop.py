@@ -402,6 +402,7 @@ async def test_c1_1_a_quoted_call_id_reaches_no_event_from_any_tool(tmp_path):
     provider = Scripted([call("search_passages", call_id=QUOTE, query="minimum wages")],
                         [call("answer_from_library", call_id=QUOTE + " again", question=QUESTION)],
                         [call("read_passage", call_id=QUOTE + " read", material_id="nothing")],
+                        [call("list_materials", call_id="Minimum-wages-raise-the-earnings-of-low-paid-workers")],
                         "Done.", inner=["Wages rose [S1.1]."])
     async with cited(tmp_path, provider) as client:
         project, [material] = await with_papers(client, WAGES)
@@ -410,8 +411,9 @@ async def test_c1_1_a_quoted_call_id_reaches_no_event_from_any_tool(tmp_path):
         assert stream[-1]["status"] == "succeeded"
         assert tool_messages(provider.agent_steps[1])[-1]["tool_call_id"] == QUOTE  # the chain keeps the provider's id
         assert (await client.delete(f"/api/materials/{material}")).status_code == 200
-        kept = await rows(client, "SELECT type FROM run_events WHERE data LIKE ?", "%synthetic panel%")
-        assert kept == []
+        kept = await rows(client, "SELECT type FROM run_events WHERE data LIKE ? OR data LIKE ?", "%synthetic panel%",
+                          "%Minimum-wages%")
+        assert kept == []  # an id that is a plain token of the paper's words included: every id is hashed
 
 
 @pytest.mark.asyncio
@@ -534,3 +536,37 @@ async def test_c1_7_a_skill_activated_in_a_turn_that_ended_at_a_limit_joins_acti
         assert first[-1]["cancel_reason"] == "limit"
         await send(client, conversation, "And Zotero?")
         assert '<skill name="help">' in provider.agent_steps[-1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_c1_review_a_researchers_decline_stands_when_the_rule_changes_to_allow_meanwhile(tmp_path):
+    provider = Scripted([call("list_materials")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+
+        async def rules(**updates):
+            settings = (await client.get(f"/api/settings?project_id={project}")).json()
+            await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"], "updates": updates})
+        await rules(**{"tools.ask": ["list_materials"]})
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        await rules(**{"tools.ask": []})  # now allowed, before the wait looks again
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "decline"})
+        stream = await sending
+        [result] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
+        assert (result["ok"], result["error"]) == (False, "denied")
+
+
+@pytest.mark.asyncio
+async def test_c1_review_the_agents_ask_is_shown_in_its_conversation_not_the_library(tmp_path):
+    provider = Scripted([call("ask", question=f"The paper says: {QUOTE} Go on?", options=["Yes"])], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        listing = (await client.get(f"/api/projects/{project}/materials")).json()
+        assert listing["asks"] == [] and QUOTE not in json.dumps(listing)  # only under the conversation's guard
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
+        await sending
