@@ -36,6 +36,12 @@ It reads its state from the file named by "zotero state": not_running, api_off, 
 with one item's title and PDF changed since, for the re-import). Its requests go to the request log too,
 with their query ("target").
 
+S1-19b: the provider's synthetic replies know each call's role: a title, the support judge (its pairs judged
+supported, partly and unsupported in turn), the small router (literature), an answer citing the evidence
+its request carries ([S1.1] and on), and an abstention when the request says the library matched nothing.
+One model (NO_TOOLS) lists no endpoint that takes tools, for chat with the library. The request log
+records each call's role.
+
 tests/walkthrough_driver.mjs drives the rendered walkthrough against this server.
 """
 
@@ -43,6 +49,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 import socket
 import sys
@@ -65,9 +72,10 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 from scholia_app import FakeKeyring, MockProvider, MockScholarly, MockZotero, crossref_work, openalex_work, streaming  # noqa: E402
 
-from backend import local_helper, reading  # noqa: E402
+from backend import local_helper, reading, router  # noqa: E402
 from backend.app import create_app  # noqa: E402
 from backend.budget_router import MODEL_TIERS  # noqa: E402
+from backend.citations import JUDGE_RULES  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 ANSWER = """A cohort study follows a group of people over time to see who develops an outcome.
@@ -270,6 +278,19 @@ def helper_answer(request, control):
                                               for i, text in enumerate(texts)]})
 
 
+# S1-19b: a model with no endpoint that takes tools (one without zero retention, so no Private flow uses it)
+NO_TOOLS = "deepseek/deepseek-v4-flash"
+NO_TOOLS_ENDPOINTS = [{"tag": "example", "context_length": 131072,
+                       "supported_parameters": ["max_tokens", "temperature", "reasoning", "include_reasoning"]}]
+
+
+def role(body):
+    """A chat call's role, from its first message: title, judge, router or answer."""
+    first = ((body or {}).get("messages") or [{}])[0].get("content", "") if isinstance(body, dict) else ""
+    return "title" if first.startswith("Write a title") else "judge" if first.startswith(JUDGE_RULES) else \
+        "router" if first.startswith(router.ROUTER_RULES) else "answer"
+
+
 class SyntheticProvider(MockProvider):
     log = None  # the --request-log file
     control = None  # the stand-in helper's control file (S1-17)
@@ -277,9 +298,11 @@ class SyntheticProvider(MockProvider):
     async def __call__(self, request):
         if self.log is not None:
             body = json.loads(request.content) if request.content and request.method == "POST" else {}
+            chat = request.url.path.endswith("/chat/completions")
             with open(self.log, "a", encoding="utf-8") as out:
                 out.write(json.dumps({"method": request.method, "host": request.url.host, "path": request.url.path,
-                                      "model": body.get("model") if isinstance(body, dict) else None}) + "\n")
+                                      "model": body.get("model") if isinstance(body, dict) else None,
+                                      **({"role": role(body)} if chat else {})}) + "\n")
         if (request.url.host, request.url.port) == MockZotero.ORIGIN:  # S1-15: the test-owned Zotero
             if self.log is not None:
                 with open(self.log, "a", encoding="utf-8") as out:
@@ -295,9 +318,30 @@ class SyntheticProvider(MockProvider):
         return await super().__call__(request)
 
 
+VERDICTS = ("supported", "partly", "unsupported")
+CITED = ("The synthetic notes report that wage floors raised the earnings of low-paid workers {0}.",
+         "They report that employment fell slightly in the smallest firms {1}.",
+         "They also report that prices fell in every region {2}.")  # the judge finds this one unsupported
+ABSTAIN = "Your library holds no evidence on this question, so I cannot answer it from your papers."
+
+
 def synthetic(body):
+    kind = role(body)
     first = ((body or {}).get("messages") or [{}])[0].get("content", "")
-    text = "Designing a cohort study" if first.startswith("Write a title") else ANSWER
+    if kind == "title":
+        text = "Designing a cohort study"
+    elif kind == "judge":
+        pairs = body["messages"][-1]["content"].count("Pair ")
+        text = "\n".join(f"{i}: {VERDICTS[(i - 1) % 3]}" for i in range(1, pairs + 1))
+    elif kind == "router":
+        text = "literature"
+    elif "No passage in the researcher's library matched" in first:
+        text = ABSTAIN
+    elif "## RESEARCH EVIDENCE" in first:
+        markers = re.findall(r"^\[S[0-9]+\.[0-9]+\]", first.split("## RESEARCH EVIDENCE", 1)[1], re.M)
+        text = " ".join(sentence.format(markers[i % len(markers)]) for i, sentence in enumerate(CITED))
+    else:
+        text = ANSWER
     return 200, {"choices": [{"message": {"role": "assistant", "content": text}}],
                  "usage": {"prompt_tokens": 120, "completion_tokens": 180, "total_tokens": 300, "cost": 0.0042}}
 
@@ -316,8 +360,9 @@ def main(argv=None):
     reading.STEP_SECONDS = 5.0  # the silent file is stopped in seconds; the app's ceiling is longer
     provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]],  # half have zero retention
                                  scholarly=RECORDS)
-    provider.replies = [synthetic] * 1000
+    provider.replies = [synthetic] * 5000
     provider.title_replies = [synthetic] * 1000
+    provider.endpoints[NO_TOOLS] = NO_TOOLS_ENDPOINTS  # S1-19b
     provider.log = args.request_log
     data_dir = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-"))
     harness = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-files-"))

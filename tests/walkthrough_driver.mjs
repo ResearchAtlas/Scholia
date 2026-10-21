@@ -1913,6 +1913,139 @@ async function parts(ctx) {
   await page.reload(); await composer().waitFor(); await page.waitForTimeout(500);
 }
 
+// S1-19b: cited answers (steps from 70): a question about a paper chosen with @, its chips with their
+// quote and page, one opening the paper at its passage; Details with the route, the steps' estimates,
+// the exact text sent and the judge's verdicts, and the underline on the unsupported sentence; keyword-
+// only retrieval with the helper stopped, and an abstention; and chat with the library on a model with
+// no tools. Each answer and its citations are read back through the API.
+async function s119(ctx) {
+  const { page, L, P, C, step, check, get } = ctx;
+  const { openSidebar } = navigation(ctx);
+  const panel = () => page.getByRole('complementary', { name: L('panel.library') });
+  const box = () => page.getByRole('textbox', { name: L('composer.label') });
+  const name = C.lang === 'en' ? 'Cited answers (synthetic)' : '引用回答（合成数据）';
+  const notes = 'Wage floors and employment';
+  const chinese = '最低工资与就业笔记';
+  const requests = () => readFileSync(C.requestLog, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const until = async (what, test, tries = 150) => {
+    for (let i = 0; i < tries; i += 1) { const value = await test(); if (value) return value; await page.waitForTimeout(200); }
+    throw new Error(`${what} did not happen in time`);
+  };
+  const id = (await get('/api/projects', { method: 'POST', body: JSON.stringify({ name, sensitivity: 'normal' }) })).body.id;
+  await page.reload(); await box().waitFor();
+  await openSidebar();
+  await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+  await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(1200);
+  if (!(await panel().count())) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+  for (const title of [notes, chinese]) {
+    await page.getByTestId('library-files').setInputFiles(join(C.materials, `${title}.md`));
+    await until('the paper read', async () => (await get(`/api/projects/${id}/materials`)).body.materials
+      .some((m) => m.title === title && m.state === 'ready'));
+  }
+  await until('every passage embedded', async () => {
+    const index = (await get(`/api/projects/${id}/index`)).body;
+    return index.passages.embedded === index.passages.embeddable && index.passages.indexed > 0;
+  });
+  const papers = (await get(`/api/projects/${id}/materials`)).body.materials;
+  const notesId = papers.find((m) => m.title === notes).id;
+  const latest = async () => {
+    const conversation = (await get('/api/conversations')).body.conversations.find((c) => c.project_id === id);
+    return (await get(`/api/conversations/${conversation.id}`)).body.turns.at(-1);
+  };
+  const ask = async (text) => {
+    const before = requests().filter((r) => r.role === 'answer').length;
+    await box().fill(text);
+    await page.getByRole('button', { name: L('composer.send') }).click();
+    await until('the answer', async () => requests().filter((r) => r.role === 'answer').length > before);
+    await until('the answer saved', async () => { const turn = await latest(); return turn?.message?.text === text && turn.status === 'succeeded' && turn; });
+    await page.waitForTimeout(1500); // the live turn hands over to its record
+    return latest();
+  };
+  const chips = () => page.locator('.prose-answer').last().locator('.cite-chip');
+
+  let cited;
+  await step('70-cited-answer', async () => {
+    await box().fill('@Wage');
+    const offered = page.getByRole('listbox', { name: L('composer.mentions') });
+    await offered.getByRole('option', { name: notes }).waitFor();
+    await box().press('Enter');
+    await page.getByRole('list', { name: L('composer.chosen') }).getByText(notes).waitFor();
+    check('the @ is taken out of the message', (await box().inputValue()) === '');
+    cited = await ask(C.lang === 'en' ? 'What did the wage floors do to earnings and employment?' : '最低工资对收入和就业有什么影响？');
+    check('the message went with the chosen paper', JSON.stringify(cited.message.material_ids) === JSON.stringify([notesId]));
+    check('the chosen paper is cleared once sent', !(await page.getByRole('list', { name: L('composer.chosen') }).count()));
+    check('each citation is recorded, found and mapped to the chosen paper', cited.citations.length === 3
+      && cited.citations.every((c) => c.existence === 'ok' && c.material_id === notesId && c.passage_id));
+    check('the judge was asked', requests().some((r) => r.role === 'judge'));
+    await chips().first().waitFor();
+    check('each citation is a chip', await chips().count() === 3);
+    await chips().first().hover(); await page.waitForTimeout(400);
+    const card = page.locator('.prose-answer').last().locator('.cite-card').first();
+    check('hovering a chip shows its paper and quote', await card.isVisible() && (await card.innerText()).includes(notes)
+      && (await card.innerText()).includes(cited.citations[0].quote.slice(0, 20)));
+  });
+  await step('70b-cited-opened', async () => {
+    await chips().first().click();
+    await until('the passage focused', () => page.evaluate((pid) => document.activeElement?.dataset?.passage === pid,
+      cited.citations[0].passage_id), 50);
+    check('the paper opens at the cited passage, shown', await page.evaluate(() => {
+      const shown = document.activeElement.getBoundingClientRect();
+      return shown.top >= 0 && shown.bottom <= window.innerHeight;
+    }));
+  });
+  await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
+
+  await step('72-details', async () => {
+    const answer = page.locator('ol > li').last();
+    await answer.getByRole('button', { name: L('turn.details') }).click();
+    await answer.getByText(L('trace.phaseJudge'), { exact: true }).first().waitFor();
+    check('Details shows each step\'s estimated cost as about', await answer.getByText(P('trace.about')).count() >= 2);
+    await answer.getByRole('button', { name: L('trace.showSent') }).first().click();
+    const sent = answer.getByLabel(L('trace.sent'));
+    await sent.waitFor();
+    check('the exact text sent holds the evidence', (await sent.innerText()).includes('## RESEARCH EVIDENCE'));
+    check('the unsupported sentence is underlined', await page.locator('.prose-answer').last().locator('.unsupported').count() === 1);
+    const events = (await get(`/api/runs/${cited.run_id}/trace`)).body.events;
+    const checks = events.find((e) => e.type === 'citation_checks').data.citations.map((c) => c.support);
+    check('the judge\'s verdicts are recorded', JSON.stringify(checks) === JSON.stringify(['supported', 'partly', 'unsupported']));
+    check('the route is the run\'s first event', events[0].type === 'route');
+  });
+
+  writeFileSync(C.helperControl, 'offline');
+  try {
+    await step('76-keyword-only', async () => {
+      const turn = await ask(C.lang === 'en' ? 'How did employment change?' : '就业有什么变化？');
+      check('the answer is saved as keyword-only', turn.answer.notices?.includes('keyword_only'));
+      await page.getByText(L('turn.notice.keywordOnly'), { exact: true }).last().waitFor();
+    });
+    await step('71-abstention', async () => {
+      const turn = await ask(C.lang === 'en' ? 'Quasars at radio wavelengths?' : '类星体的射电辐射？');
+      check('the answer says the library holds no evidence', turn.answer.text.startsWith('Your library holds no evidence'));
+      check('nothing is cited', turn.citations.length === 0 && await chips().count() === 0);
+      const events = (await get(`/api/runs/${turn.run_id}/trace`)).body.events;
+      const body = events.find((e) => e.type === 'model_attempt').body_ref;
+      const sent = JSON.stringify((await get(`/api/runs/${turn.run_id}/trace/bodies/${body}`)).body);
+      check('its request said the library matched nothing', sent.includes('No passage in the researcher'));
+    });
+  } finally {
+    rmSync(C.helperControl, { force: true });
+  }
+
+  await step('75-no-tools', async () => {
+    await page.getByRole('button', { name: P('picker.label') }).click();
+    const picker = page.getByRole('dialog').filter({ has: page.getByRole('textbox', { name: L('picker.search') }) });
+    await picker.getByRole('textbox', { name: L('picker.search') }).fill('V4 Flash');
+    await picker.getByRole('option').filter({ hasText: 'Deepseek V4 Flash' }).first().click(); await page.waitForTimeout(500);
+    const turn = await ask(C.lang === 'en' ? 'What did the wage floors do to earnings?' : '最低工资对收入有什么影响？');
+    check('the answer went to the model without tools', requests().filter((r) => r.role === 'answer').at(-1).model === 'deepseek/deepseek-v4-flash');
+    check('the answer says skills are unavailable', turn.answer.notices?.includes('skills_unavailable'));
+    check('its citations are still checked', turn.citations.length > 0 && turn.citations.every((c) => c.existence === 'ok'));
+    await page.getByText(L('turn.notice.noSkills'), { exact: true }).last().waitFor();
+  });
+  await page.getByRole('button', { name: P('picker.label') }).click();
+  await page.getByRole('option', { name: new RegExp(`^${L('picker.auto')}`) }).first().click(); await page.waitForTimeout(500);
+}
+
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
 // of its animations, read with them paused (Web Animations API). The box shows the composed
 // motion, whichever properties (transform, translate) carry it.
@@ -2267,6 +2400,7 @@ async function run(combo, build, outRoot) {
     if (C.materials) await ceilings(ctx);  // a reading stopped at its memory ceiling and at its time ceiling
     if (C.materials) await references(ctx);  // S1-14: a reference file's import, its merges, a Local only import, Attach
     if (C.zoteroState) await zotero(ctx);  // S1-15: the Zotero browser, an import and a re-import
+    if (C.materials) await s119(ctx);  // S1-19b: cited answers; its stand-in helper and provider are the test server's
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);
