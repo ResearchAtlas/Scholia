@@ -629,14 +629,15 @@ def check_labels(doc, set_doc, papers, rater=None, sample=None):
         return [f"labels: they are rater {doc['rater']!r}'s, not {rater!r}'s"]
     if not isinstance(doc["labels"], dict):
         return ["labels: labels is not an object"]
+    items = {i["id"]: i for i in set_doc["items"]}
     if "sample" in doc:
         if doc["sample"] is not True:
             return ["labels: sample is not true"]
         if sample is None:
             return ["labels: they are the sample's, and no sample of this set is recorded"]
-        if outside := sorted(set(doc["labels"]) - set(sample)):
+        # only labels that apply: history (its item changed or removed since) is never checked against the set (G8)
+        if outside := sorted(i for i, label in doc["labels"].items() if applies(items.get(i), label) and i not in sample):
             return [f"labels: they are the sample's, and {', '.join(outside)} are not in the recorded sample"]
-    items = {i["id"]: i for i in set_doc["items"]}
     for item, label in doc["labels"].items():
         if not applies(items.get(item), label):
             continue  # history (changed or removed since): kept as it is, never validated against the current set

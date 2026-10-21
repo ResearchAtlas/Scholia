@@ -679,6 +679,29 @@ def test_a_samples_labels_hold_only_the_recorded_samples_items_and_agreement_nee
         gold.main(["agreement", *command, "--raters", "harold", "lee"])
 
 
+def test_a_samples_history_label_for_a_removed_item_never_blocks_the_page_or_apply(tmp_path):
+    """sol recheck 2 (H3): lee's sample label for p05 becomes history when p05 leaves the set; with the sample
+    drawn again from the set as it now is, the label sits outside it. History is never validated (G8): the
+    page opens, apply counts it orphaned, and the file is left as it was."""
+    folder = field(tmp_path, sample=True)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    sampled = json.loads((folder / "sample-pairs.json").read_text())["items"]
+    (folder / "labels").mkdir()
+    lee = {**labels_for(pairs, "lee", {i: {"category": "supported"} for i in sampled}), "sample": True}
+    path = folder / "labels" / f"{pairs['id']}.lee.json"
+    write(path, lee)
+    edit_set(folder, "pairs", lambda items: items.pop(next(n for n, i in enumerate(items) if i["id"] == sampled[0])))
+    pairs = json.loads((folder / "pairs.json").read_text())
+    write(folder / "sample-pairs.json", gold.draw(pairs, gold.load_settings()))
+    assert sampled[0] not in json.loads((folder / "sample-pairs.json").read_text())["items"]
+    before = path.read_bytes()
+    assert problems_of(folder)[0] == []
+    gold.Review(2, folder, "pairs", "lee", sample=True)
+    gold.main(["apply", "--field", "2", "--folder", str(folder), "--set", "pairs", "--rater", "lee"])
+    corrected = json.loads((gold.outputs(folder) / f"{pairs['id']}.corrected.lee.json").read_text())
+    assert corrected["counts"]["orphaned"] == 1 and path.read_bytes() == before
+
+
 # Tiers 2 and 3
 
 
