@@ -3,7 +3,7 @@
 The gold sets measure Scholia's retrieval on papers of two research fields, and its support judge on labeled citation pairs (slice 1 section 14; tickets 17, 22, 70 and 72). They are built by `evals/gold.py` (S1-36). Every set here is a draft until a rater has reviewed it.
 
 - **Field 2** (AI and NLP): recent arXiv cs.CL and cs.AI papers whose specific version is licensed CC BY 4.0 or CC0 1.0, leaving out QASPER's papers. Its files are public and live in `field2/`.
-- **Field 1** (social science, English and Chinese papers): Harold's own papers. Its files never enter this repository. They stay in a folder given with `--folder`, outside any git work tree (this repository's checkouts and worktrees included) or under the `evals/local/` of a checkout whose `.gitignore` ignores it, and are written owner-only. No link is followed in it or in the output folders: a link at or below the folder (its `labels/` or `out/`, a set, a written file) refuses the command. The one exception is a PDF in the PDFs folder, which may link to storage outside every git work tree (Zotero's, say).
+- **Field 1** (social science, English and Chinese papers): Harold's own papers. Its files never enter this repository. They stay in a folder given with `--folder`, outside every git work tree (this repository's checkouts and worktrees included, their `evals/local/` too), and are written owner-only. No link is followed in it or in the output folders: a link at or below the folder (its `labels/` or `out/`, a set, a written file) refuses the command, and so does a folder there that is itself a git work tree (it holds `.git`). The one exception is a PDF in the PDFs folder, which may link to storage outside every git work tree (Zotero's, say).
 
 ## Held out and provisional
 
@@ -64,7 +64,7 @@ Run from the repository root. `--folder` is required for field 1.
     uv run --no-sync python -I evals/gold.py apply --field 2 --set questions --rater harold
 
 - `check` checks the paper list, each set, each labels file and each sample, and reports the mix. With the PDFs, it reads every paper through the app and confirms every locator against that reading. Field 2's check with the PDFs also checks the papers against QASPER v0.3's three splits. When the extractor's version has changed since drafting, it reports each locator whose passage moved and refuses a quote that matches nothing. It never rewrites a set.
-- `passages` writes the drafter's worksheet: every paper's passages as the app reads them, with what a locator needs. It runs the app as the desktop does: a temporary data folder, an in-memory credential store, a review-locked project, so nothing is looked up. The worksheet and the check's report hold whole papers' text, so they go to the git-ignored `evals/out/` (field 1: `<folder>/out/`). They say `incomplete` until finished.
+- `passages` writes the drafter's worksheet: every paper's passages as the app reads them, with what a locator needs. It runs the app as the desktop does: a temporary data folder (field 1's inside its own folder, never under the system's temporary folder, removed after), an in-memory credential store, a review-locked project, so nothing is looked up. The worksheet and the check's report hold whole papers' text, so they go to the git-ignored `evals/out/` (field 1: `<folder>/out/`). They say `incomplete` until finished.
 - `review` serves one set's review page on 127.0.0.1 and prints its address with this launch's secret.
   - Questions: Harold keeps, edits or drops each one, and confirms or changes its evidence, shown with its text, page and section and chosen from the paper's passages.
   - Pairs: he marks each one supported, partly supported or unsupported.
@@ -79,7 +79,7 @@ Run from the repository root. `--folder` is required for field 1.
   - `--sample` serves only the sampled items, for the second rater, from their own labels file.
   - Field 1's sample holds Harold's papers' text, so its page is written only with `--colleague`, on Harold's decision.
 - `sample` draws the second rater's sample once.
-- `agreement` reports, on the items both raters labeled:
+- `agreement` reports, on the recorded sample's items both raters labeled (it refuses until a sample is drawn):
   - for pairs: percent agreement, Cohen's kappa over the three categories, and the confusion table;
   - for questions: agreement on keep or drop and on answerable, and on evidence (the same items, and the overlap of the passages chosen).
 - `apply` writes the corrected set from the drafts and one rater's labels.

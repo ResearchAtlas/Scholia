@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -367,6 +368,13 @@ def test_the_synthetic_sets_pass_and_the_report_gives_their_mix(tmp_path):
     ("questions", lambda items: items[0].update(id=["q01"]), "questions item ['q01']: id is not a plain name"),
     ("questions", lambda items: items[0]["evidence"][0][0].update(ordinal=True), "evidence item 1: ordinal is not a passage's"),
     ("questions", lambda items: items[0]["evidence"][0][0].update(page=True), "evidence item 1: page is not a page number"),
+    # T1: an evidence item is one passage or the consecutive passages of one paper
+    ("questions", lambda items: items[1]["evidence"][0].append(items[1]["evidence"][1][0]),
+     "question q02 evidence item 1: not one passage or the consecutive passages of one paper"),
+    ("questions", lambda items: items[1]["evidence"][0].append(items[0]["evidence"][0][0]),
+     "question q02 evidence item 1: not one passage or the consecutive passages of one paper"),
+    ("questions", lambda items: items[1]["evidence"][1].append(items[1]["evidence"][1][0]),
+     "question q02 evidence item 2: not one passage or the consecutive passages of one paper"),
     # G11: an id is text of the allowed shape, kept as validated (a number is not its text)
     ("pairs", lambda items: items[0].update(id=123), "pairs item 123: id is not a plain name"),
     ("pairs", lambda items: items[0].update(id=True), "pairs item True: id is not a plain name"),
@@ -426,6 +434,8 @@ def test_drafts_are_provisional_and_a_set_names_its_own_kind_and_field(tmp_path)
     (lambda p: p.update(file="/elsewhere/a.pdf"), "file is not a file name"),
     (lambda p: p.update(license_checked="２０２６-１０-０１"), "license_checked is not a date"),  # full-width digits
     (lambda p: p.update(submitted=["2026-01-05"]), "is outside 2026-01-01 to 2026-09-30"),
+    (lambda p: p.update(submitted="2026-02-31"), "is outside 2026-01-01 to 2026-09-30"),  # T12: no such day
+    (lambda p: p.update(license_checked="2026-99-99"), "license_checked is not a date"),
 ])
 def test_the_paper_list_holds_only_versions_meeting_the_criteria(tmp_path, change, expected):
     folder = field(tmp_path)
@@ -436,6 +446,16 @@ def test_the_paper_list_holds_only_versions_meeting_the_criteria(tmp_path, chang
     doc = json.loads((folder / "papers.json").read_text())
     write(folder / "papers.json", {k: v for k, v in doc.items() if k != "seed"})
     assert "papers.json: seed missing" in problems_of(folder)[0]
+
+
+@pytest.mark.parametrize("number", [1, 2])
+def test_an_empty_paper_list_is_refused_and_never_skips_the_sets_checks(tmp_path, number):
+    """T6: papers: [] gave a finished report with no problems, however malformed questions.json was."""
+    folder = field(tmp_path, number)
+    doc = json.loads((folder / "papers.json").read_text())
+    write(folder / "papers.json", {**doc, "papers": []})
+    edit_set(folder, "questions", lambda items: items.append(5))
+    assert "papers.json: papers is empty" in problems_of(folder, number)[0]
 
 
 def test_field_one_takes_the_same_format_without_licenses_and_with_chinese_documents(tmp_path):
@@ -449,13 +469,12 @@ def test_field_one_takes_the_same_format_without_licenses_and_with_chinese_docum
     assert stat.S_IMODE(gold.outputs(folder).stat().st_mode) == 0o700
 
 
-@pytest.mark.parametrize("where", ["evals/gold/field1", "tests/field1", "."])
-def test_field_one_refuses_a_folder_inside_the_repository_but_evals_local(where):
+@pytest.mark.parametrize("where", ["evals/gold/field1", "tests/field1", ".", "evals/local/harold"])
+def test_field_one_refuses_any_folder_inside_the_repository_evals_local_included(where):
     with pytest.raises(tier1.Refused, match="inside the repository"):
         gold.field_folder(1, ROOT / where)
     with pytest.raises(tier1.Refused, match="--folder"):
         gold.field_folder(1, None)
-    assert gold.field_folder(1, ROOT / "evals" / "local" / "harold") == ROOT / "evals" / "local" / "harold"
     with pytest.raises(SystemExit, match="inside the repository"):
         gold.main(["check", "--field", "1", "--folder", str(ROOT / where)])
     with pytest.raises(SystemExit, match="inside the repository"):
@@ -477,6 +496,17 @@ def test_the_labels_format_refuses_another_set_or_rater_and_a_missing_field(tmp_
     assert gold.check_labels(broken, doc, papers) == ["label p01: saved_at missing"]
     broken["labels"]["p01"].update(saved_at="t", category="maybe")
     assert gold.check_labels(broken, doc, papers) == ["label p01: category 'maybe'"]
+
+
+def test_check_refuses_a_labels_file_whose_header_names_another_rater_than_its_name(tmp_path):
+    """T10: field2-pairs.harold.json holding lee's header passed check, while review and apply for harold refuse it."""
+    folder = field(tmp_path)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    (folder / "labels").mkdir()
+    write(folder / "labels" / f"{pairs['id']}.harold.json", labels_for(pairs, "lee", {}))
+    assert f"{pairs['id']}.harold.json: labels: they are rater 'lee''s, not 'harold''s" in problems_of(folder)[0]
+    write(folder / "labels" / f"{pairs['id']}.harold.json", labels_for(pairs, "harold", {}))
+    assert problems_of(folder)[0] == []
 
 
 # Labels, the corrected set, the sample and the agreement
@@ -546,13 +576,31 @@ def test_the_sample_is_a_fifth_stratified_and_the_same_for_the_same_seed():
     assert other["items"] != sample["items"] and len(other["items"]) == 20
 
 
+def test_a_sample_file_is_refused_unless_it_is_the_draw_the_settings_make(tmp_path):
+    """T5: any subset of the set's ids passed, so an emptied, cut or hand-picked sample opened the second
+    rater's page and was measured."""
+    folder = field(tmp_path, sample=True)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    drawn = gold.draw(pairs, gold.load_settings())
+    others = [i["id"] for i in pairs["items"] if i["id"] not in drawn["items"]]
+    for changed in ({**drawn, "items": []}, {**drawn, "items": others[:1]}, {**drawn, "seed": drawn["seed"] + 1},
+                    {"set": drawn["set"], "items": drawn["items"]}):
+        write(folder / "sample-pairs.json", changed)
+        assert "sample-pairs.json: not a sample of this set" in problems_of(folder)[0], changed
+        with pytest.raises(gold.Refused, match="not a sample of this set"):
+            gold.Review(2, folder, "pairs", "lee", sample=True)
+    write(folder / "sample-pairs.json", drawn)
+    assert problems_of(folder)[0] == [] and gold.Review(2, folder, "pairs", "lee", sample=True).order == drawn["items"]
+
+
 def test_pair_agreement_gives_percent_kappa_and_the_confusion_table(tmp_path):
     doc = {"id": "s", "kind": "pairs", "field": 2,
            "items": [{"id": f"p{n}", "sentence": str(n)} for n in range(4)]}
 
     def score(a, b):
         return gold.agreement(doc, labels_for(doc, "harold", {f"p{n}": {"category": c} for n, c in enumerate(a)}),
-                              labels_for(doc, "lee", {f"p{n}": {"category": c} for n, c in enumerate(b)}))
+                              labels_for(doc, "lee", {f"p{n}": {"category": c} for n, c in enumerate(b)}), every)
+    every = [i["id"] for i in doc["items"]]
     same = score(["supported", "partly", "unsupported", "supported"], ["supported", "partly", "unsupported", "supported"])
     assert same["both_labeled"] == 4 and same["percent_agreement"] == 100.0 and same["kappa"] == 1.0
     chance = score(["supported", "supported", "unsupported", "unsupported"], ["supported", "unsupported", "supported", "unsupported"])
@@ -563,7 +611,7 @@ def test_pair_agreement_gives_percent_kappa_and_the_confusion_table(tmp_path):
     assert lopsided["kappa"] == 0.5
     one = score(["supported"] * 4, ["supported"] * 4)
     assert one["kappa"] is None and one["percent_agreement"] == 100.0  # kappa undefined, said so
-    partial = gold.agreement(doc, labels_for(doc, "harold", {"p0": {"category": "partly"}}), labels_for(doc, "lee", {}))
+    partial = gold.agreement(doc, labels_for(doc, "harold", {"p0": {"category": "partly"}}), labels_for(doc, "lee", {}), every)
     assert partial["both_labeled"] == 0 and partial["kappa"] is None
 
 
@@ -575,11 +623,81 @@ def test_question_agreement_covers_keep_or_drop_answerable_and_evidence(tmp_path
     second = labels_for(doc, "lee", {"q01": {"decision": "keep"},
                                      "q02": edit(doc["items"][1], evidence=doc["items"][1]["evidence"][:1]),
                                      "q03": {"decision": "keep"}, "q04": edit(doc["items"][3], answerable=False)})
-    out = gold.agreement(doc, first, second)
+    out = gold.agreement(doc, first, second, [i["id"] for i in doc["items"]])
     assert out["kept"]["both_labeled"] == 4 and out["kept"]["percent_agreement"] == 75.0
     assert out["answerable"]["both_labeled"] == 3 and out["answerable"]["percent_agreement"] == round(200 / 3, 2)
     # q01 the same evidence; q02: one item of two, one passage of three (the split paragraph's two out)
     assert out["evidence"] == {"both_answerable": 2, "same_items": 1, "mean_passage_overlap": round((1 + 1 / 3) / 2, 4)}
+
+
+def test_agreement_is_measured_on_the_recorded_sample_alone(tmp_path):
+    """T7: agreement counted every item both raters labeled; spec section 14 measures it on the overlap sample.
+    A history label inside the sample is not compared either."""
+    folder = field(tmp_path)
+    doc = json.loads((folder / "questions.json").read_text())
+    decisions = {"q01": {"decision": "keep"}, "q02": {"decision": "drop"}, "q03": {"decision": "keep"},
+                 "q04": {"decision": "keep"}}
+    first, second = labels_for(doc, "harold", decisions), labels_for(doc, "lee", {**decisions, "q02": {"decision": "keep"}})
+    second["labels"]["q04"]["item_sha256"] = "an older version of the item"
+    out = gold.agreement(doc, first, second, ["q01", "q02", "q04"])
+    assert out["kept"]["both_labeled"] == 2 and out["kept"]["percent_agreement"] == 50.0  # q01 and q02; q03 out
+
+
+def test_a_samples_labels_hold_only_the_recorded_samples_items_and_agreement_needs_the_sample(tmp_path):
+    """T7: a labels file marked as the sample's could hold labels outside the sample; the page, check, apply
+    and agreement now refuse it, and agreement refuses to run without a recorded sample."""
+    folder = field(tmp_path, sample=True)
+    doc = json.loads((folder / "questions.json").read_text())
+    sample = json.loads((folder / "sample-questions.json").read_text())["items"]
+    outside = next(i["id"] for i in doc["items"] if i["id"] not in sample)
+    (folder / "labels").mkdir()
+    write(folder / "labels" / f"{doc['id']}.harold.json", labels_for(doc, "harold", {i: {"decision": "keep"} for i in sample}))
+    lee = {**labels_for(doc, "lee", {i: {"decision": "keep"} for i in [*sample, outside]}), "sample": True}
+    write(folder / "labels" / f"{doc['id']}.lee.json", lee)
+    said = f"labels: they are the sample's, and {outside} are not in the recorded sample"
+    assert f"{doc['id']}.lee.json: {said}" in problems_of(folder)[0]
+    with pytest.raises(gold.Refused, match=said):
+        gold.Review(2, folder, "questions", "lee", sample=True)
+    command = ["--field", "2", "--folder", str(folder), "--set", "questions"]
+    for argv in (["agreement", *command, "--raters", "harold", "lee"], ["apply", *command, "--rater", "lee"]):
+        with pytest.raises(SystemExit, match=said):
+            gold.main(argv)
+    with pytest.raises(gold.Refused, match="open the sample's page"):  # a sample's labels on the whole set's page
+        gold.Review(2, folder, "questions", "lee")
+    with pytest.raises(gold.Refused, match="not the sample's"):  # the whole set's labels on the sample's page
+        gold.Review(2, folder, "questions", "harold", sample=True)
+    del lee["labels"][outside]
+    write(folder / "labels" / f"{doc['id']}.lee.json", lee)
+    assert problems_of(folder)[0] == []
+    gold.main(["agreement", *command, "--raters", "harold", "lee"])
+    (folder / "sample-questions.json").unlink()
+    assert f"{doc['id']}.lee.json: labels: they are the sample's, and no sample of this set is recorded" in problems_of(folder)[0]
+    write(folder / "labels" / f"{doc['id']}.lee.json", {k: v for k, v in lee.items() if k != "sample"})
+    with pytest.raises(SystemExit, match="agreement is measured on the recorded sample"):
+        gold.main(["agreement", *command, "--raters", "harold", "lee"])
+
+
+def test_a_samples_history_label_for_a_removed_item_never_blocks_the_page_or_apply(tmp_path):
+    """sol recheck 2 (H3): lee's sample label for p05 becomes history when p05 leaves the set; with the sample
+    drawn again from the set as it now is, the label sits outside it. History is never validated (G8): the
+    page opens, apply counts it orphaned, and the file is left as it was."""
+    folder = field(tmp_path, sample=True)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    sampled = json.loads((folder / "sample-pairs.json").read_text())["items"]
+    (folder / "labels").mkdir()
+    lee = {**labels_for(pairs, "lee", {i: {"category": "supported"} for i in sampled}), "sample": True}
+    path = folder / "labels" / f"{pairs['id']}.lee.json"
+    write(path, lee)
+    edit_set(folder, "pairs", lambda items: items.pop(next(n for n, i in enumerate(items) if i["id"] == sampled[0])))
+    pairs = json.loads((folder / "pairs.json").read_text())
+    write(folder / "sample-pairs.json", gold.draw(pairs, gold.load_settings()))
+    assert sampled[0] not in json.loads((folder / "sample-pairs.json").read_text())["items"]
+    before = path.read_bytes()
+    assert problems_of(folder)[0] == []
+    gold.Review(2, folder, "pairs", "lee", sample=True)
+    gold.main(["apply", "--field", "2", "--folder", str(folder), "--set", "pairs", "--rater", "lee"])
+    corrected = json.loads((gold.outputs(folder) / f"{pairs['id']}.corrected.lee.json").read_text())
+    assert corrected["counts"]["orphaned"] == 1 and path.read_bytes() == before
 
 
 # Tiers 2 and 3
@@ -596,13 +714,28 @@ async def test_tier_two_takes_a_corrected_sets_gold_answerable_questions_in_tier
     papers = json.loads((folder / "papers.json").read_text())["papers"]
     async with opener()(tmp_path / "data") as (client, state):
         read, project = await gold.read_papers(client, state, papers, pdfs, 2)
-        passage_of = {(pid, p["ordinal"]): p["id"] for pid, r in read.items() for p in r["passages"]}
+        passage_of = {(pid, p["ordinal"]): p for pid, r in read.items() for p in r["passages"]}
         queries = gold.tier2_queries(corrected, passage_of, project)
         assert [q["key"] for q in queries] == ["q1"]  # q2 is provisional (unlabeled), q3 unanswerable
         out = await tier1.run_arms(state, {"keyword_only": tier1.keyword_only}, queries,
                                    lambda answer, query: [r["passage_id"] for r in answer["results"]])
     scores = gold.tier2_scores(queries, out["keyword_only"]["rankings"])
     assert scores["scores"] == [1.0] and scores["recall@8"]["query_language"] == {"en": {"mean": 1.0, "n": 1}}
+
+
+def test_tier_two_refuses_a_locator_whose_passage_in_this_reading_is_not_its_quote():
+    """T8: after a reading moved a passage, the stored ordinal names another passage; tier 2 scored the
+    question against it. It is refused; the quote's own letters and digits still match through spacing."""
+    quote = "Dense retrieval found the evidence passage for 71 of 100 questions."
+    corrected = {"corrected": True, "kind": "questions", "items": [
+        {"id": "q1", "text": "How many?", "query_language": "en", "document_language": "en", "answerable": True,
+         "short_answer": "71", "provisional": False, "evidence": [[{"paper": "a", "ordinal": 2, "quote": quote}]]}]}
+    moved = {("a", 2): {"id": "a:2", "text": "Keyword retrieval missed paraphrased questions."},
+             ("a", 3): {"id": "a:3", "text": quote}}
+    with pytest.raises(tier1.Refused, match="passage 2 of a is no longer its quote"):
+        gold.tier2_queries(corrected, moved, "p")
+    same = {("a", 2): {"id": "a:2", "text": quote.replace(" 71", "  71\ufffe")}}
+    assert gold.tier2_queries(corrected, same, "p")[0]["annotators"] == [[["a:2"]]]
 
 
 def test_tier_two_recall_at_eight_follows_tier_ones_item_rule_by_language():
@@ -667,7 +800,7 @@ def test_nothing_private_or_whole_is_committed_under_evals():
             doc = json.loads(path.read_text())
             assert not (isinstance(doc, dict) and doc.get("field") == 1), path
     ignored = (ROOT / ".gitignore").read_text().splitlines()
-    assert "evals/local/" in ignored and "evals/out/" in ignored
+    assert "evals/local/" in ignored and "evals/out/" in ignored  # evals/local/: kept as a defence; field 1 is never there
 
 
 def test_the_gold_sets_public_text_states_the_hold_out_and_never_calls_scholia_bilingual():
@@ -770,25 +903,140 @@ async def test_the_check_resolves_evidence_a_rater_chose_as_it_resolves_drafted_
                                   "of 2601.00011v1"]
 
 
-def test_field_one_is_refused_inside_any_git_work_tree_but_its_ignored_evals_local(tmp_path):
-    repo, worktree, plain, bare = tmp_path / "repo", tmp_path / "wt", tmp_path / "plain", tmp_path / "bare"
-    (repo / ".git").mkdir(parents=True)
-    (repo / ".gitignore").write_text("# local\nevals/local/\n")
+def test_field_one_is_refused_inside_any_git_work_tree_ignored_there_or_not(tmp_path):
+    """Harold, 2026-10-21: field 1 lives outside every git work tree. A folder git ignores (evals/local/, the
+    S1-36 option this replaces) is refused like any other; no git is asked."""
+    repo, worktree, plain = tmp_path / "repo", tmp_path / "wt", tmp_path / "plain"
+    fixtures.git("init", repo)
+    (repo / ".gitignore").write_text("evals/local/\n")
     worktree.mkdir()
     (worktree / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")  # a worktree's .git is a file
-    (worktree / ".gitignore").write_text("evals/local/\n")
-    (bare / ".git").mkdir(parents=True)  # a repository whose .gitignore does not ignore evals/local/
     nested = repo / "vendor" / "other"
-    (nested / ".git").mkdir(parents=True)  # a nested repository: its own rules decide
+    fixtures.git("init", nested)
     (plain / "x").mkdir(parents=True)
     (plain / "link").symlink_to(repo / "notes")  # a link into a work tree is checked where it leads
-    for inside in (repo / "evals" / "field1-private", repo / "notes" / "new", worktree / "evals" / "f1", repo,
-                   bare / "evals" / "local" / "x", nested / "evals" / "local" / "x", plain / "link" / "f1"):
-        with pytest.raises(tier1.Refused, match="inside the repository|does not ignore"):
+    for inside in (repo / "evals" / "local" / "harold", repo / "evals" / "local", repo / "notes" / "new", repo,
+                   worktree / "evals" / "local", nested / "evals" / "local" / "x", plain / "link" / "f1"):
+        with pytest.raises(tier1.Refused, match="inside the repository"):
             gold.field_folder(1, inside)
-    assert gold.field_folder(1, repo / "evals" / "local" / "harold") == (repo / "evals" / "local" / "harold").resolve()
-    assert gold.field_folder(1, worktree / "evals" / "local") == (worktree / "evals" / "local").resolve()
     assert gold.field_folder(1, plain / "x") == (plain / "x").resolve()
+    assert gold.field_folder(2, repo / "evals" / "local" / "x") == (repo / "evals" / "local" / "x").resolve()  # field 2 is public
+
+
+@pytest.mark.asyncio
+async def test_field_ones_temporary_app_never_writes_under_tmpdir_even_inside_a_git_work_tree(tmp_path, monkeypatch):
+    """sol recheck 2 (H2): the passages tools' temporary app wrote its data folder (content files, databases,
+    backups: a PDF byte for byte) under TMPDIR, which may sit in a git work tree. Field 1's is made inside its
+    own folder, TMPDIR pointed there meanwhile, and removed after; field 2's stays under TMPDIR."""
+    repo = fixtures.git("init", tmp_path / "repo")
+    (repo / "tmp").mkdir()
+    monkeypatch.setenv("TMPDIR", str(repo / "tmp"))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    during = []
+
+    def watching(open_app):
+        @contextlib.asynccontextmanager
+        async def watched(data):
+            async with open_app(data) as opened:
+                yield opened
+                during.append((data, os.environ["TMPDIR"], sorted(p for p in repo.rglob("*") if ".git" not in p.parts)))
+        return watched
+    (tmp_path / "f1").mkdir()
+    (tmp_path / "f2").mkdir()
+    folder, pdfs = pdf_field(tmp_path / "f1", 1)
+    sheet = await gold.passages(1, folder, pdfs, watching(opener()))
+    assert sheet["status"] == "finished"
+    data, tmpdir, found = during[0]
+    assert data.is_relative_to(folder) and Path(tmpdir).is_relative_to(folder) and found == [repo / "tmp"]
+    assert fixtures.git("status", repo) == "" and not [p for p in folder.iterdir() if p.name.startswith(".tmp-")]
+    assert os.environ["TMPDIR"] == str(repo / "tmp")  # given back
+    folder, pdfs = pdf_field(tmp_path / "f2", 2)
+    await gold.passages(2, folder, pdfs, watching(opener()))
+    assert during[1][0].is_relative_to(repo / "tmp")  # field 2 is public: TMPDIR as before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tmpdir", [None, "given"])
+async def test_field_ones_temporary_folder_is_removed_and_tmpdir_given_back_when_the_run_fails(tmp_path, monkeypatch, tmpdir):
+    """Internal review 3: a refusal, failure or Ctrl-C leaves no .tmp-scholia-gold-* folder and TMPDIR as it was
+    (unset stays unset)."""
+    if tmpdir is None:
+        monkeypatch.delenv("TMPDIR", raising=False)
+    else:
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    folder, pdfs = pdf_field(tmp_path, 1)
+
+    @contextlib.asynccontextmanager
+    async def failing(data):
+        assert data.is_relative_to(folder) and os.environ["TMPDIR"].startswith(str(folder))
+        raise RuntimeError("the app failed")
+        yield
+    with pytest.raises(RuntimeError):
+        await gold.passages(1, folder, pdfs, failing)
+    assert not [p for p in folder.iterdir() if p.name.startswith(".tmp-")] and tempfile.tempdir is None
+    assert os.environ.get("TMPDIR") == (None if tmpdir is None else str(tmp_path))
+
+
+def test_a_folder_below_field_ones_that_is_a_git_work_tree_is_never_read_or_written(tmp_path):
+    """sol recheck 3: field 1's folder is outside git, but its labels/ or out/ is itself a repository (or holds
+    a worktree's .git file). The page saved a question and its quote there and apply wrote a corrected set
+    there. The walk from the root refuses any folder holding a .git entry: nothing is written."""
+    folder = field(tmp_path, 1)
+    questions = json.loads((folder / "questions.json").read_text())
+    page = gold.Review(1, folder, "questions", "harold")
+    fixtures.git("init", folder / "labels")  # made a repository after the page opened
+    with pytest.raises(tier1.Refused, match="git work tree"):
+        page.save({"item": "q01", "base": 0, "label": {"decision": "drop"}})
+    with pytest.raises(tier1.Refused, match="git work tree"):
+        gold.Review(1, folder, "questions", "harold")
+    assert fixtures.git("status", folder / "labels") == ""
+    other = field(tmp_path / "other", 1)
+    gold.write_json(other, other / "labels" / f"{questions['id']}.harold.json", labels_for(questions, "harold", {}))
+    fixtures.git("init", other / "out")
+    before = sorted(p.name for p in (other / "out").iterdir())
+    with pytest.raises(SystemExit, match="git work tree"):
+        gold.main(["apply", "--field", "1", "--folder", str(other), "--set", "questions", "--rater", "harold"])
+    assert sorted(p.name for p in (other / "out").iterdir()) == before
+    third = field(tmp_path / "third", 1)
+    (third / "out" / ".git").write_text("gitdir: /somewhere/.git/worktrees/out\n")  # a worktree's .git is a file
+    before = sorted(p.name for p in (third / "out").iterdir())
+    with pytest.raises(SystemExit, match="git work tree"):
+        gold.main(["check", "--field", "1", "--folder", str(third)])
+    assert sorted(p.name for p in (third / "out").iterdir()) == before
+
+
+def test_a_page_left_open_refuses_to_save_once_a_folder_above_field_ones_becomes_a_git_work_tree(tmp_path):
+    """sol recheck 4: the ancestors were checked only when the folder was opened; a git init above it while the
+    page was open let the next save write a question and its quote where git lists it. Each walk from field 1's
+    folder checks them again (private_path); with nothing changed, saves go on as before."""
+    folder = field(tmp_path / "parent", 1)
+    page = gold.Review(1, folder, "pairs", "harold")
+    assert page.save({"item": "p01", "base": 0, "label": {"category": "supported"}})[0] == 200
+    assert page.save({"item": "p02", "base": 0, "label": {"category": "partly"}})[0] == 200
+    labels = folder / "labels" / "field1-pairs.harold.json"
+    before = sorted((p.relative_to(folder), p.read_bytes()) for p in folder.rglob("*") if p.is_file())
+    fixtures.git("init", tmp_path / "parent")
+    with pytest.raises(tier1.Refused, match="inside the repository"):
+        page.save({"item": "p03", "base": 0, "label": {"category": "unsupported"}})
+    assert sorted((p.relative_to(folder), p.read_bytes()) for p in folder.rglob("*") if p.is_file()) == before
+    assert "p03" not in json.loads(labels.read_text())["labels"]
+
+
+def test_field_twos_public_folders_are_walked_as_on_main_wherever_field_one_has_been(tmp_path):
+    """sol recheck 5: Harold's git rule restricts field 1 only. Field 2's files at a repository's top opened
+    no page (the .git check ran for every root), and a field 2 folder under a field 1 folder accepted earlier
+    in the same process was checked as field 1's after a git init above it. Both open their six pairs again;
+    field 1's walks are still refused."""
+    repo = fixtures.git("init", tmp_path / "repo")
+    fixtures.write_field(repo, 2)
+    assert len(gold.Review(2, repo.resolve(), "pairs", "harold").data()["items"]) == 6
+    pdfs = gold.private_path(1, tmp_path / "x" / "pdfs")  # field 1's PDFs folder, accepted
+    public = fixtures.write_field(pdfs / "public", 2).resolve()
+    fixtures.git("init", tmp_path / "x")
+    assert len(gold.Review(2, public, "pairs", "harold").data()["items"]) == 6
+    with pytest.raises(tier1.Refused, match="inside the repository"):
+        gold.pdf_bytes(1, pdfs, "a.pdf")
 
 
 def test_from_a_worktree_the_main_checkout_is_refused_too():
@@ -797,14 +1045,9 @@ def test_from_a_worktree_the_main_checkout_is_refused_too():
         pytest.skip("this checkout is not a git worktree")
     gitdir = Path(git.read_text().split(":", 1)[1].strip())  # <main>/.git/worktrees/<name>
     main = gitdir.parents[2]
-    with pytest.raises(tier1.Refused, match="inside the repository"):
-        gold.field_folder(1, main / "evals" / "field1-private")
-    if gold.ignores_local(main):  # once the main checkout's .gitignore carries evals/local/
-        assert gold.field_folder(1, main / "evals" / "local" / "x") == (main / "evals" / "local" / "x").resolve()
-    else:
-        with pytest.raises(tier1.Refused, match="does not ignore"):
-            gold.field_folder(1, main / "evals" / "local" / "x")
-    assert gold.ignores_local(ROOT)  # this branch's .gitignore does
+    for inside in (main / "evals" / "field1-private", main / "evals" / "local" / "x"):
+        with pytest.raises(tier1.Refused, match="inside the repository"):
+            gold.field_folder(1, inside)
 
 
 def test_apply_and_agreement_check_the_drafts_before_any_labels(tmp_path):
