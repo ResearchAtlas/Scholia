@@ -343,9 +343,14 @@ def _answered(conn, project_id, material, record, option, harness, active, keep=
     A Merge whose paper no longer matches the record as a duplicate (its DOI or title changed while
     the question waited) applies nothing: the run ends failed, no_longer_duplicate. One that changes
     the identifier a reference file's paper is looked up by (DOI first) records its lookup, as the import's
-    (_merged_lookup)."""
+    (_merged_lookup). An answer that changes the project's papers puts the project first in the list, as an
+    import does; a Zotero item's Keep both does so in its import run, which adds the paper."""
     if option == "keep_both":
-        (keep or (lambda conn: new_material(conn, project_id, record)))(conn)
+        if keep:
+            keep(conn)
+        else:
+            new_material(conn, project_id, record)
+            conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
         return
     row = conn.execute("SELECT csl, checked_by, evidence_type, title, source, lookup_filled FROM materials"
                        " WHERE id = ? AND project_id = ?", (material, project_id)).fetchone()
@@ -364,6 +369,8 @@ def _answered(conn, project_id, material, record, option, harness, active, keep=
     csl.update(added)
     conn.execute("UPDATE materials SET csl = ?, title = ?, evidence_type = ?, updated_at = ? WHERE id = ?",
                  (json.dumps(csl), added.get("title", row[3]), _evidence(csl, row[2]), utc_now(), material))
+    if added:  # the paper changed
+        conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (utc_now(), project_id))
     # A reference file's paper is identified by its record (materials._identifiers), which now holds it. A
     # paper not from a reference file is identified by its file's text alone, as every lookup's identifier
     # is (its own text or record): what a merge gives it is its details, never looked up.

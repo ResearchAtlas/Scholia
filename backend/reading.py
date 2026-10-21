@@ -372,7 +372,7 @@ def _run(request, ceiling, limit, stop, received, stats, payload=b""):
             raise _Ceiling(peak)
         if buffer:
             raise _Bad("a frame cut short")
-        return child.wait()
+        return _end(child)
     except _Ceiling as passed:
         log.warning("a reading's child passed its memory ceiling (%d MiB at %d MiB); it was stopped",
                     ceiling >> 20, passed.peak >> 20)
@@ -380,12 +380,7 @@ def _run(request, ceiling, limit, stop, received, stats, payload=b""):
     except _Bad as bad:
         raise received.bad(str(bad)) from None
     finally:
-        if child.returncode is None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):  # EPERM: a group of zombies only
-                os.killpg(child.pid, signal.SIGKILL)  # the child and its sentinel
-            with contextlib.suppress(ProcessLookupError):
-                child.kill()  # a child that had not made its group yet
-            child.wait()
+        _end(child)
         if writer is not None:  # done, or stopped by the pipe's end now the child is gone
             writer.join()
         for stream in (child.stdin, child.stdout):
@@ -691,6 +686,24 @@ class _References(_Received):
 
 
 # The child
+
+
+def _end(child):
+    """End the child, whatever it is doing, with every process in its group, and reap it: its exit status.
+    The group is ended again once the child has ended, before it is reaped (its pid, the group's id, is no
+    other process's until then): a sentinel the child makes just as the first kill comes is not ended by
+    it, and would stop itself in a group orphaned already, which no SIGHUP ends, and stay stopped for good.
+    A child reaped already is left alone, as its pid may be another process's."""
+    if child.returncode is not None:
+        return child.returncode
+    with contextlib.suppress(ProcessLookupError, PermissionError):  # EPERM: a group of zombies only
+        os.killpg(child.pid, signal.SIGKILL)  # the child and its sentinel
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(child.pid, signal.SIGKILL)  # a child that had not made its group yet
+    os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)  # ended, not reaped
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(child.pid, signal.SIGKILL)  # a sentinel made as the first kill came
+    return child.wait()
 
 
 # socket.__new__: no socket is made at all, so none can connect, send or look a name up: a connection

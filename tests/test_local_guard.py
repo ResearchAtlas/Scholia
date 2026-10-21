@@ -152,6 +152,27 @@ async def test_a_body_over_the_limit_or_of_unknown_length_is_refused_before_anyt
         assert (await client.get(f"/api/projects/{project}/materials")).json()["materials"] == []
 
 
+@pytest.mark.parametrize(("length", "expected"), [
+    ("\u0663".encode(), (411, "length_required")),  # an Arabic-Indic three, a digit to str.isdigit
+    ("\u00b2".encode("latin-1"), (411, "length_required")),  # a superscript two, as one byte
+    ("\uff12".encode(), (411, "length_required")),  # a fullwidth two
+    (b"2\xd9\xa3", (411, "length_required")),
+    (b"+2", (411, "length_required")),
+    (b" 2", (411, "length_required")),
+    (b"1" * 5000, (413, "request_too_large")),  # past int()'s 4,300 digits
+    (b"0" * 5000 + b"2", None),  # a length of 2, however written
+], ids=["arabic-indic", "superscript", "fullwidth", "mixed", "sign", "space", "5000-digits", "leading-zeros"])
+async def test_a_content_length_of_anything_but_ascii_digits_is_refused_never_dropped(tmp_path, length, expected):
+    async with started(tmp_path / "data") as client:
+        status, body = await raw(client.app, "POST", "/api/projects", headers(SAME, JSON, (b"content-length", length)),
+                                 b"{}")
+        if expected is None:  # admitted: the route answers (the body lacks a name)
+            assert (status, body["code"]) == (400, "invalid_request")
+        else:
+            assert (status, body["code"]) == expected
+        assert len((await client.get("/api/projects")).json()["projects"]) == 1  # General only: nothing created
+
+
 async def test_the_body_limit_admits_one_file_of_the_largest_size_and_no_more():
     from backend import extraction, local_guard
     encoded = (extraction.MAX_FILE_BYTES + 2) // 3 * 4  # its bytes in base64

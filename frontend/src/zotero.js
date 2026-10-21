@@ -62,6 +62,18 @@ export function appendPage(shown, found, asked) {
 // (another Zotero, or its database replaced) has other items under the same keys, so the choice is dropped.
 export const chosenFor = (chosen, chosenUnder, serverId) => ((chosenUnder ?? null) === (serverId ?? null) ? chosen : []);
 
+// The library shown, kept while the refreshed status still lists it: a group Zotero no longer lists falls
+// back to My Library (or the first library listed), so no request goes to a library that is gone.
+export function libraryIn(library, libraries) {
+  if (!libraries?.length || libraries.some((l) => l.id === library)) return library;
+  return (libraries.find((l) => l.id === 'users/0') ?? libraries[0]).id;
+}
+
+// The collection shown, kept while the refreshed list of the library's collections has it; else all items.
+// A list still loading (null) or that failed to load (false) says nothing, so the collection is kept.
+export const collectionIn = (collection, collections) => (collection === null || !collections
+  || collections.some((c) => c.key === collection) ? collection : null);
+
 // The status's text and whether it says how to turn the API on, as catalog keys.
 export const statusKey = (status) => `zotero.status.${status?.state ?? 'checking'}`;
 

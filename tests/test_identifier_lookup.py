@@ -21,6 +21,7 @@ import synthetic_materials as synthetic
 from scholia_app import (Chunks, MockProvider, MockScholarly, arxiv_feed, background_idle, crossref_work, openalex_work,
                          read_in_process, run_finished, started, streamed)
 from test_materials import added, hold_extraction, kept_queue, listing, project_of, rows, settled  # noqa: F401
+from test_reference_import import first_project
 
 pytestmark = pytest.mark.asyncio
 
@@ -117,6 +118,23 @@ async def test_a_local_only_projects_ask_is_withdrawn_when_it_no_longer_needs_on
         [paper] = await settled(client, project)
         assert paper["title"] == TITLE and paper["checked_by"] == "lookup"
         assert [entry["approved"] for entry in await gate_log(client)] == [False]  # Normal needs no approval
+
+
+@pytest.mark.parametrize("edited", [False, True])
+async def test_an_uploads_lookup_answered_later_puts_the_project_first_only_when_it_changes_the_paper(tmp_path, edited):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, TITLE)})) as client:
+        project = await project_of(client, level="local_only")
+        result = await added(client, project, ("paper.pdf", synthetic.paper_pdf()))
+        [ask] = await ask_of(client, project)
+        paper = result["materials"][0]["id"]
+        if edited:  # what the researcher edited stays: the lookup changes nothing
+            assert (await client.patch(f"/api/materials/{paper}", json={"title": "Edited, by me"})).status_code == 200
+        other = await project_of(client, "Changed since")
+        assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}",
+                                  json={"option": "lookup"})).status_code == 200
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        assert (await client.get(f"/api/materials/{paper}")).json()["title"] == ("Edited, by me" if edited else TITLE)
+        assert await first_project(client) == (other if edited else project)
 
 
 async def test_a_lookup_resumed_after_a_restart_keeps_its_answer(tmp_path, monkeypatch):

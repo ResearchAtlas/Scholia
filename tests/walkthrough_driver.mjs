@@ -147,6 +147,7 @@ async function startServer(dir) {
   return { child, pid, origin: url.origin, session: url.hash.replace('#session=', ''), dataFolder: lines['data folder'],
            materials: lines.materials, modelFile: lines['model file'], helperControl: lines['helper control'], log,
            zoteroState: lines['zotero state'],  // S1-15
+           stepCeiling: Number(lines['step ceiling']),  // the harness's time ceiling, in seconds
            stderr: () => stderr, exit: () => exit };
 }
 
@@ -1447,6 +1448,10 @@ async function ceilings(ctx) {
       [runs[reason]] = (await get(`/api/activity?run_id=${paper.reading.run_id}`)).body.runs;
       check('its reading failed with that reason, and Retry applies', runs[reason]?.status === 'failed'
         && runs[reason].result?.reason === reason && runs[reason].retryable === true);
+      if (reason === 'step_limit' && C.stepCeiling) {  // stopped by the ceiling: its reading lasted at least that long
+        check(`its reading ran the time ceiling's ${C.stepCeiling} s`, Date.parse(runs[reason].finished_at)
+          - Date.parse(runs[reason].started_at) >= C.stepCeiling * 1000);
+      }
       await row(title).locator('summary', { hasText: L('library.details') }).click(); await page.waitForTimeout(400);
     });
   }
@@ -1688,6 +1693,33 @@ async function zotero(ctx) {
   });
 
   await step('47-zotero-selected', async () => {
+    // After Check again, a group or a collection Zotero no longer lists is left, before any request goes to
+    // it: the library for My Library, the collection for all items (status.md's Z21).
+    const select = browser().getByLabel(L('zotero.library'), { exact: true });
+    const again = async (text) => {  // the requests Zotero got from this Check again on
+      state(text);
+      const from = zoteroRequests().length;
+      await browser().getByRole('button', { name: L('zotero.checkAgain'), exact: true }).click();
+      await browser().getByText(L('zotero.status.ready'), { exact: true }).waitFor({ timeout: 15000 });
+      await browser().getByText(plural('zotero.itemCount', 6), { exact: true }).waitFor({ timeout: 15000 });
+      await page.waitForTimeout(500);
+      return zoteroRequests().slice(from);
+    };
+    await browser().getByRole('button', { name: 'Linked files', exact: true }).click();
+    await browser().getByText(plural('zotero.itemCount', 1), { exact: true }).waitFor();
+    let sent = await again('pruned');
+    check('a collection gone since is left for all items, and not asked for again',
+      await browser().getByRole('button', { name: L('zotero.allItems'), exact: true }).getAttribute('aria-current') === 'true'
+      && await browser().getByRole('button', { name: 'Linked files', exact: true }).count() === 0
+      && sent.length > 0 && !sent.some((r) => r.target.includes('LINKCOL2')));
+    await again('ready');
+    await select.selectOption('groups/4711');
+    await browser().getByText(plural('zotero.itemCount', 0), { exact: true }).waitFor();
+    sent = await again('pruned');
+    check('a group gone since is left for My Library, and not asked for again', await select.inputValue() === 'users/0'
+      && (await select.locator('option').allTextContents()).join('|') === [L('zotero.myLibrary'), '合成课题组'].join('|')
+      && sent.length > 0 && !sent.some((r) => r.target.includes('groups/4711')));
+    await again('ready');
     await browser().getByRole('button', { name: 'Wage studies', exact: true }).click();
     await browser().getByText(plural('zotero.itemCount', 4), { exact: true }).waitFor();
     for (const title of Object.keys(chosen)) await browser().getByRole('checkbox', { name: title }).check();
@@ -2239,6 +2271,7 @@ async function run(combo, build, outRoot) {
                 dataFolder: server?.dataFolder, modelFile: server?.modelFile, requestLog: server?.log,
                 helperControl: server?.helperControl,
                 zoteroState: server?.zoteroState,  // S1-15
+                stepCeiling: server?.stepCeiling,
                 question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
     const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
     const step = async (name, body, before) => {
