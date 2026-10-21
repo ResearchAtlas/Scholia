@@ -793,12 +793,17 @@ def test_a_failed_checks_cleanup_ends_only_the_processes_it_saw(monkeypatch):
     assert ended == [6, -5, 5, 6]
 
 
-def test_a_sentinel_whose_child_is_ended_by_its_pid_before_it_stops_is_found_left_stopped():
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_a_sentinel_whose_child_is_ended_by_its_pid_before_it_stops_is_found_left_stopped(interrupted, monkeypatch):
     """How a stopped process outlives a reading (state T, its parent launchd): its child ended by the
     child's own pid, not its group, after making its sentinel and before the sentinel stopped, leaves a
     group orphaned with no stopped member, which the kernel never signals; the sentinel then stops for
-    good. conftest's check finds it by the child's pid, its group's id."""
+    good. conftest's check finds it by the child's pid, its group's id. Interrupted just after the fork,
+    the test itself ends the whole group (reading._end), so it leaves nothing stopped either."""
     from conftest import _stopped_left
+
+    if interrupted:
+        monkeypatch.setattr(reading, "_info", lambda pid: (_ for _ in ()).throw(KeyboardInterrupt))
 
     command = [sys.executable, "-c", "import os, signal, time\n"
                "pid = os.fork()\n"
@@ -819,12 +824,13 @@ def test_a_sentinel_whose_child_is_ended_by_its_pid_before_it_stops_is_found_lef
         while not _stopped_left({child.pid}) and time.monotonic() < deadline:
             time.sleep(0.02)
         assert _stopped_left({child.pid}) == [stand_in]
+    except KeyboardInterrupt:
+        assert interrupted
     finally:
         if start is not None and (info := reading._info(stand_in)) is not None and tuple(info.start) == start:
             os.kill(stand_in, signal.SIGKILL)  # by its pid, while it is still that process; launchd reaps it
         if child.poll() is None:
-            child.kill()
-            child.wait()
+            reading._end(child)  # its whole group, the stand-in sentinel with it, before the child is reaped
         child.stdout.close()
     deadline = time.monotonic() + 5
     while _stopped_left({child.pid}) and time.monotonic() < deadline:
