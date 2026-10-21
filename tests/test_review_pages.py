@@ -121,7 +121,7 @@ def test_a_failed_write_says_not_saved_leaves_the_file_as_it_was_and_the_retry_s
     before = labels_file(folder, "pairs").read_bytes()
     real = gold.write_json
 
-    def full_disk(path, data):
+    def full_disk(path, data, field):
         raise OSError(28, "No space left on device")
     monkeypatch.setattr(gold, "write_json", full_disk)
     status, answer = page.save("p02", {"category": "unsupported"})
@@ -704,8 +704,8 @@ def test_a_paper_named_constructor_is_served_like_any_other(tmp_path, pages):
     (folder / "papers.json").write_text(json.dumps(papers))
     sheet = json.loads((gold.outputs(folder) / "worksheet.json").read_text())
     sheet["papers"] = {("constructor" if k == "p-wages" else k): v for k, v in sheet["papers"].items()}
-    sheet["papers_sha256"] = gold.sha256_of(folder / "papers.json")
-    gold.write_json(gold.outputs(folder) / "worksheet.json", sheet)
+    sheet["papers_sha256"] = gold.sha256_of(folder / "papers.json", field=1)
+    gold.write_json(gold.outputs(folder) / "worksheet.json", sheet, field=1)
     page = pages(folder, "questions", number=1)
     assert "constructor" in page.get("/api/data")[1]["papers"]
     assert page.get("/api/passages?paper=constructor")[0] == 200
@@ -733,8 +733,8 @@ def test_a_label_whose_paper_was_removed_after_its_item_changed_is_history_and_t
     (folder / "papers.json").write_text(json.dumps(papers))
     sheet = json.loads((gold.outputs(folder) / "worksheet.json").read_text())
     del sheet["papers"][b]
-    sheet["papers_sha256"] = gold.sha256_of(folder / "papers.json")
-    gold.write_json(gold.outputs(folder) / "worksheet.json", sheet)
+    sheet["papers_sha256"] = gold.sha256_of(folder / "papers.json", field=2)
+    gold.write_json(gold.outputs(folder) / "worksheet.json", sheet, field=2)
     labels = json.loads(labels_file(folder, "questions").read_text())
     labels["labels"]["gone"] = {"item_sha256": "x", "revision": 1, "decision": "edit", "evidence": [[{"paper": b}]]}
     labels["labels"]["not-a-label"] = "anything"
@@ -782,3 +782,22 @@ def subprocess_free_agreement(folder):
     with redirect_stdout(buffer):
         gold.main(["agreement", "--field", "2", "--folder", str(folder), "--set", "questions", "--raters", "harold", "lee"])
     return buffer.getvalue()
+
+
+def test_a_labels_folder_linked_into_a_git_work_tree_after_the_page_opened_gets_nothing(tmp_path, pages):
+    """G10, sol's reproduction: field 1's labels/ is a link into a git work tree. Present when the page opens,
+    the page refuses to open; made after it opened, the save says not saved, and nothing (the label, its part
+    file, the lock file) is written there."""
+    repo = fixtures.git("init", tmp_path / "repo")
+    (repo / "leak").mkdir()
+    folder = field(tmp_path, 1)
+    (folder / "labels").symlink_to(repo / "leak")
+    with pytest.raises(gold.Refused, match="inside the repository"):
+        gold.Review(1, folder, "pairs", "harold")
+    (folder / "labels").unlink()
+    page = pages(folder, "pairs", number=1)
+    (folder / "labels").symlink_to(repo / "leak")
+    assert page.save("p01", {"category": "supported"}, base=0) == (500, {"code": "not_saved"})
+    assert page.get("/api/data")[0] == 500
+    assert list((repo / "leak").iterdir()) == []
+    assert fixtures.git("status", repo) == ""

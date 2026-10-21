@@ -159,12 +159,27 @@ def write_field(folder, field=2, sample=False):
     for name, doc in (("papers", papers), ("questions", questions), ("pairs", pairs)):
         (folder / f"{name}.json").write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
     gold.write_json(gold.outputs(folder.resolve()) / "worksheet.json",
-                    worksheet_doc(field, papers, gold.sha256_of(folder / "papers.json")))
+                    worksheet_doc(field, papers, gold.sha256_of(folder / "papers.json", field=field)), field=field)
     if sample:
         settings = gold.load_settings()
         for doc in (questions, pairs):
-            gold.write_json(folder / f"sample-{doc['kind']}.json", gold.draw(doc, settings))
+            gold.write_json(folder / f"sample-{doc['kind']}.json", gold.draw(doc, settings), field=field)
     return folder
+
+
+def git(command, repo):
+    """A real git repository made, staged or its status read (sol's reproductions use one): the init's path,
+    else git's porcelain output. Git is allowed past the tests' network block for this; it makes no connection."""
+    import shutil
+    import subprocess
+    from network_guard import allow_subprocess
+    program = shutil.which("git")
+    argv = {"init": ["-c", "init.defaultBranch=main", "init", "-q", str(repo)],
+            "add": ["-C", str(repo), "add", "-A"],
+            "status": ["-C", str(repo), "status", "--porcelain", "--untracked-files=all"]}[command]
+    with allow_subprocess(program):
+        out = subprocess.run([program, *argv], capture_output=True, text=True, check=True).stdout
+    return repo if command == "init" else out
 
 
 if __name__ == "__main__":

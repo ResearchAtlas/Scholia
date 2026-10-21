@@ -579,7 +579,7 @@ async def test_tier_two_takes_a_corrected_sets_gold_answerable_questions_in_tier
                            papers_by_id(folder))
     papers = json.loads((folder / "papers.json").read_text())["papers"]
     async with opener()(tmp_path / "data") as (client, state):
-        read, project = await gold.read_papers(client, state, papers, pdfs)
+        read, project = await gold.read_papers(client, state, papers, pdfs, 2)
         passage_of = {(pid, p["ordinal"]): p["id"] for pid, r in read.items() for p in r["passages"]}
         queries = gold.tier2_queries(corrected, passage_of, project)
         assert [q["key"] for q in queries] == ["q1"]  # q2 is provisional (unlabeled), q3 unanswerable
@@ -667,7 +667,7 @@ def test_the_fixture_quotes_are_shown_whole_near_the_passage_limit():
 
 def test_files_written_are_owner_only(tmp_path):
     path = tmp_path / "made" / "x.json"
-    gold.write_json(path, {"a": 1})
+    gold.write_json(path, {"a": 1}, field=None)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600 and stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert os.listdir(path.parent) == ["x.json"]
 
@@ -706,7 +706,7 @@ def test_sigterm_stops_a_command_as_ctrl_c_does_leaving_its_marker_and_no_data_f
 
 def test_a_refusal_before_any_work_still_replaces_an_earlier_finished_report(tmp_path):
     folder, pdfs = pdf_field(tmp_path)
-    gold.write_json(gold.outputs(folder) / "check.json", {"status": "finished", "problems": []})
+    gold.write_json(gold.outputs(folder) / "check.json", {"status": "finished", "problems": []}, field=2)
     with pytest.raises(tier1.Refused, match="--qasper"):
         asyncio.run(gold.check(2, folder, pdfs, None, opener()))
     written = json.loads((gold.outputs(folder) / "check.json").read_text())
@@ -721,10 +721,10 @@ def test_a_written_file_is_owner_only_from_its_creation_even_over_an_old_part_fi
     modes = []
     real = os.replace
     monkeypatch.setattr(gold.os, "replace", lambda a, b: modes.append(stat.S_IMODE(os.stat(a).st_mode)) or real(a, b))
-    gold.write_json(path, {"a": 1})
+    gold.write_json(path, {"a": 1}, field=None)
     assert modes == [0o600] and stat.S_IMODE(path.stat().st_mode) == 0o600
     deep = tmp_path / "c" / "d" / "y.json"
-    gold.write_json(deep, {})
+    gold.write_json(deep, {}, field=None)
     assert all(stat.S_IMODE(p.stat().st_mode) == 0o700 for p in (tmp_path / "c", tmp_path / "c" / "d"))
 
 
@@ -799,3 +799,54 @@ def test_apply_and_agreement_check_the_drafts_before_any_labels(tmp_path):
     for argv in (["apply", "--rater", "harold"], ["agreement", "--raters", "harold", "lee"]):
         with pytest.raises(SystemExit, match="questions.json does not pass its check"):
             gold.main([argv[0], "--field", "2", "--folder", str(folder), "--set", "questions", *argv[1:]])
+
+
+def outcome(action):
+    try:
+        action()
+    except (tier1.Refused, SystemExit) as refused:
+        return str(refused)
+    return "ok"
+
+
+EVERY = {"check", "apply", "sample", "pairs page", "questions page", "sample page", "passages"}
+
+
+@pytest.mark.parametrize("entry, refusing", [
+    ("papers.json", EVERY),
+    ("pairs.json", EVERY),
+    ("sample-pairs.json", {"check", "sample page"}),
+    ("labels", {"check", "apply", "pairs page", "questions page", "sample page"}),
+    ("out", {"check", "apply", "questions page", "passages"}),
+    ("pdfs", {"passages"}),
+])
+def test_a_link_under_field_ones_folder_into_a_git_work_tree_is_refused_by_every_command(tmp_path, entry, refusing):
+    """G10: field 1's folder passes G7's guard, but an entry in it (labels/, out/, a set, the PDFs) is a link
+    into a git work tree. Every command checks each file where it really leads before opening it: the ones
+    that would read or write through the link refuse, and nothing is written in the repository."""
+    repo = fixtures.git("init", tmp_path / "repo")
+    folder = field(tmp_path, 1)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    gold.write_json(folder / "labels" / "field1-pairs.harold.json", labels_for(pairs, "harold", {}), field=1)
+    gold.write_json(folder / "sample-pairs.json", gold.draw(pairs, gold.load_settings()), field=1)
+    (folder / "pdfs").mkdir()
+    (folder / entry).rename(repo / entry)
+    (folder / entry).symlink_to(repo / entry)
+    fixtures.git("add", repo)  # what is there already is not the question
+
+    def repo_now():
+        return fixtures.git("status", repo), sorted(p.relative_to(repo) for p in repo.rglob("*") if ".git" not in p.parts)
+    before = repo_now()
+    command = ["--field", "1", "--folder", str(folder)]
+    actions = {
+        "check": lambda: gold.main(["check", *command]),
+        "apply": lambda: gold.main(["apply", *command, "--set", "pairs", "--rater", "harold"]),
+        "sample": lambda: gold.main(["sample", *command, "--set", "pairs"]),
+        "pairs page": lambda: gold.Review(1, folder, "pairs", "harold"),
+        "questions page": lambda: gold.Review(1, folder, "questions", "harold"),
+        "sample page": lambda: gold.Review(1, folder, "pairs", "lee", sample=True, colleague=True),
+        "passages": lambda: gold.main(["passages", *command]),  # last: it rewrites the worksheet's marker
+    }
+    found = {name: outcome(action) for name, action in actions.items()}
+    assert {name for name, said in found.items() if "inside the repository" in said} == refusing, found
+    assert repo_now() == before
