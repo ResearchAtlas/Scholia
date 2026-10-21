@@ -6,14 +6,15 @@
 import { useContext, useEffect, useRef, useState } from 'react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, getBlob } from '../api.js';
-import { errorText, money } from '../text.js';
+import { errorText, money, toolName } from '../text.js';
 import { readTrace, summarize } from '../trace.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState } from './fields.jsx';
 
 const SUPPORT = { supported: 'cite.supported', partly: 'cite.partly', unsupported: 'cite.unsupported', unchecked: 'cite.unchecked' };
 const EXISTENCE = { ok: 'trace.exists', not_found: 'cite.notFound', not_read_in_run: 'cite.notRead', source_removed: 'cite.removed' };
-const PHASE = { answer: 'trace.phaseAnswer', judge: 'trace.phaseJudge', route: 'trace.phaseRoute' };
+const PHASE = { answer: 'trace.phaseAnswer', judge: 'trace.phaseJudge', route: 'trace.phaseRoute',
+  answer_from_library: 'trace.phaseLibrary' };
 const FUNDED = { share: 'trace.fundedShare', answer_unspent: 'trace.fundedUnspent', budget: 'trace.fundedBudget' };
 
 export function Trace({ turn }) {
@@ -54,6 +55,9 @@ export function Trace({ turn }) {
           <dd>{t('trace.passages', { count: trace.search.passages })} · {t(`trace.mode.${trace.search.mode}`)}
             {trace.search.rerank === 'fallback' ? ` · ${t('trace.rerankFallback')}` : ''}</dd>
         </>}
+        {trace.skills.length > 0 && <>
+          <dt className="text-muted-foreground">{t('trace.skills')}</dt><dd>{trace.skills.join(', ')}</dd>
+        </>}
         {trace.historyLeftOut > 0 && <>
           <dt className="text-muted-foreground">{t('trace.history')}</dt>
           <dd>{t('trace.historyLeftOut', { count: trace.historyLeftOut })}</dd>
@@ -68,6 +72,15 @@ export function Trace({ turn }) {
               {step.estimate !== null && <> · <span className="font-normal text-muted-foreground">{about(step.estimate)}</span></>}
               {FUNDED[step.funded] && <> · <span className="font-normal text-muted-foreground">{t(FUNDED[step.funded])}</span></>}</p>
             {step.cut && <p className="text-muted-foreground">{t('turn.cut')}</p>}
+            {step.tools.length > 0 && (
+              <ul className="space-y-0.5 pl-3 text-muted-foreground" aria-label={t('trace.tools')}>
+                {step.tools.map((tool, j) => (
+                  <li key={j}>{toolName(t, tool.name)} · {tool.ok ? t('trace.toolOk') : tool.ok === false
+                    ? t('trace.toolFailed', { reason: t(`trace.toolError.${tool.error}`) === `trace.toolError.${tool.error}`
+                      ? t('trace.toolError.tool_error') : t(`trace.toolError.${tool.error}`) }) : t('trace.toolUnfinished')}</li>
+                ))}
+              </ul>
+            )}
             {step.attempts.map((attempt, j) => <Attempt key={`${tries}:${j}`} runId={turn.run_id} attempt={attempt} />)}
           </li>
         ))}
@@ -79,6 +92,7 @@ export function Trace({ turn }) {
             t('trace.pairsJudged', { count: trace.pairs.judged }),
             trace.pairs.failed > 0 && t('trace.pairsFailed', { count: trace.pairs.failed }),
             trace.pairs.budget > 0 && t('trace.pairsBudget', { count: trace.pairs.budget }),
+            trace.pairs.reused > 0 && t('trace.pairsReused', { count: trace.pairs.reused }),
           ].filter(Boolean).join(' · ')}</p>}
           <ul className="space-y-1">
             {trace.checks.map((check, i) => (

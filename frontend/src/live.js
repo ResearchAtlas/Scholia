@@ -4,6 +4,7 @@
 // (slice-1 spec section 2).
 import { useSyncExternalStore } from 'react';
 import { post, stream } from './api.js';
+import { asksChanged } from './library.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
@@ -28,7 +29,9 @@ export function apply(turn, event) {
     case 'chat_response': return { ...turn, answer: event.content, resultSaved: event.result_saved, ...(event.cut ? { cut: true } : {}),
       ...(event.notices ? { notices: event.notices } : {}) }; // S1-19b: keyword-only, unchecked, no skills, retracted
     case 'error': return { ...turn, error: event.code };
-    case 'limit_reached': return { ...turn, limit: true };
+    case 'limit_reached': return { ...turn, limit: event.limit ?? 'budget' }; // S1-19c: a turn limit, or the budget
+    case 'tool_call': return { ...turn, tool: event.name }; // S1-19c: the tool the agent is using now
+    case 'skill': return { ...turn, skills: [...(turn.skills ?? []), event.name] };
     case 'run_finished': return { ...turn, done: true };
     default: return turn;
   }
@@ -45,6 +48,8 @@ export function send(conversationId, path, body, text) {
   return new Promise((admitted, refused) => {
     stream(path, body, (event) => {
       turn = apply(turn, event);
+      if (event.type === 'ask') asksChanged(conversationId); // S1-19c: the agent asks; the conversation shows it
+      if (event.type === 'open_place') openPlace(event.place); // S1-19c: the help skill opens a place
       if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
         unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut) });
       }
@@ -68,6 +73,21 @@ export async function stop(conversationId, runId) {
   const id = runId ?? turns.get(conversationId)?.runId;
   if (id) await post(`/api/runs/${id}/cancel`);
   else aborts.get(conversationId)?.abort();
+}
+
+// S1-19c: open_place's places (backend/agent.py PLACES): the window opens the one named (Shell.jsx).
+export const PLACES = ['library', 'settings.general', 'settings.providers', 'settings.subagents', 'settings.project',
+  'settings.advanced'];
+export const places = new EventTarget();
+export function openPlace(place) {
+  if (PLACES.includes(place)) places.dispatchEvent(new CustomEvent('open', { detail: place }));
+}
+
+// A turn stopped at a limit (backend/runs.py): its catalog key; the budget's when it names none.
+export const LIMITS = { agent_steps: 'turn.limitSteps', tool_calls: 'turn.limitToolCalls', turn_minutes: 'turn.limitMinutes',
+  tool_errors: 'turn.limitToolErrors', chain_over_window: 'turn.limitChain' };
+export function limitText(code) {
+  return LIMITS[code] ?? 'turn.limit';
 }
 
 export function unsavedAnswer(runId) {

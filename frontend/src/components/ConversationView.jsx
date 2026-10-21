@@ -11,8 +11,8 @@ import { Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
-import { errorText, money } from '../text.js';
+import { NOTICES, clear, limitText, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
+import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
@@ -290,11 +290,12 @@ function Question({ text }) {
   );
 }
 
-function Working() {
+function Working({ tool }) {
   const t = useT();
   return (
     <p className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
-      <Loader2 className="size-4 animate-spin text-brand" aria-hidden="true" />{t('turn.working')}
+      <Loader2 className="size-4 animate-spin text-brand" aria-hidden="true" />
+      {tool ? t('turn.usingTool', { tool: toolName(t, tool) }) : t('turn.working')}
     </p>
   );
 }
@@ -309,7 +310,7 @@ function Turn({ turn, onContinue, onOpen }) {
     // an answer that was shown but not saved says so below it instead
     failed: turn.answer && turn.reason_code === 'save_failed' ? null : t('turn.failed', { reason: errorText(t, turn.reason_code) }),
   }[turn.status] ?? (turn.status === 'cancelled'
-    ? { limit: t('turn.limit'), revoked: t('turn.revoked') }[turn.cancel_reason] ?? t('turn.stopped')
+    ? { limit: t(limitText(turn.reason_code)), revoked: t('turn.revoked') }[turn.cancel_reason] ?? t('turn.stopped')
     : null);
   return (
     <li className="space-y-3">
@@ -357,12 +358,12 @@ function LiveTurn({ turn }) {
   return (
     <li className="space-y-3">
       <Question text={turn.text} />
-      {turn.answer ? <Answer text={turn.answer} /> : !turn.done && <Working />}
+      {turn.answer ? <Answer text={turn.answer} /> : !turn.done && <Working tool={turn.tool} />}
       {turn.answer && turn.resultSaved === false && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
       {turn.answer && turn.cut && <p className="text-xs text-muted-foreground">{t('turn.cut')}</p>}
       {turn.answer && <Notices notices={turn.notices} />}
       {turn.error && <p className="text-xs text-destructive">{t('turn.failed', { reason: errorText(t, turn.error) })}</p>}
-      {turn.limit && <p className="text-xs text-muted-foreground">{t('turn.limit')}</p>}
+      {turn.limit && <p className="text-xs text-muted-foreground">{t(limitText(turn.limit))}</p>}
     </li>
   );
 }

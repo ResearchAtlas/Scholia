@@ -25,3 +25,10 @@ export function visible(text) {
   if (typeof text !== 'string' || ![...text].some((c) => !/[\p{C}\p{M}\p{Z}]/u.test(c) && !BLANK_LETTERS.has(c))) return null;
   return text.trim();
 }
+
+// S1-19c: a tool's name as the interface says it (backend/agent.py's tools), or as recorded.
+export function toolName(t, name) {
+  const key = `tool.${name}`;
+  const text = t(key);
+  return text === key ? (name ?? '?') : text;
+}

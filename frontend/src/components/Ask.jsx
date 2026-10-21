@@ -9,7 +9,7 @@ import { MessageCircleQuestion } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { post } from '../api.js';
 import { useAction } from '../action.js';
-import { visible } from '../text.js';
+import { toolName, visible } from '../text.js';
 import { projectName } from '../projects.js';
 import { paperLine } from '../references.js';
 import { Button } from '@/components/ui/button';
@@ -33,7 +33,10 @@ export function Ask({ ask, onAnswered }) {
   // A kind the app defines is asked in its own words; another (the agent's, S1-19) carries its question.
   const questionKey = `ask.${ask.kind}.question`;
   const asked = t(questionKey, { count: ask.params?.identifiers ?? 0, services });
-  const question = asked === questionKey ? ask.params?.question ?? '' : asked;
+  // S1-19c: a tool the project's rules ask about before it runs is asked in the app's words, naming the tool.
+  const approval = ask.params?.approval;
+  const question = approval ? t('ask.approval.question', { tool: toolName(t, approval) })
+    : asked === questionKey ? ask.params?.question ?? '' : asked;
   // A Local only lookup of a reference file's papers says so (S1-14): its answer covers those papers.
   // S1-15: so does a Zotero import's, and a Zotero item's merge question says the record is Zotero's.
   const zotero = ask.params?.batch === 'zotero' || ask.params?.from === 'zotero';
@@ -79,7 +82,7 @@ export function Ask({ ask, onAnswered }) {
           <Button key={option} type="button" size="sm" variant={i === 0 ? 'default' : 'outline'} disabled={busy}
             className={i === 0 ? 'bg-brand text-brand-foreground hover:bg-brand/90' : undefined}
             onClick={() => answer({ option })}>
-            {named(t, `ask.${ask.kind}.option.${option}`, option)}
+            {named(t, approval ? `ask.approval.option.${option}` : `ask.${ask.kind}.option.${option}`, option)}
           </Button>
         ))}
       </div>

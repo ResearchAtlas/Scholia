@@ -10,7 +10,7 @@ import { useT } from '../i18n/index.js';
 import { ApiError, get, saveSettings } from '../api.js';
 import { DEFAULTS, LIMITS, clamp, columns, fromSettings, panelShareAt, toSettings } from '../layout.js';
 import { errorText } from '../text.js';
-import { subscribe } from '../live.js';
+import { places, subscribe } from '../live.js';
 import { libraryChanged } from '../library.js';
 import { projectName } from '../projects.js';
 import { addTo } from './Library.jsx';
@@ -141,6 +141,19 @@ export function Shell({ health, settings, onLanguage }) {
     saveSettings(changed).catch(fail);
   }, [fail]);
 
+  // S1-19c: the help skill's open_place (live.js): the Library panel, or a Settings page; it only opens it.
+  const [settingsPage, setSettingsPage] = useState(null);
+  useEffect(() => {
+    const open = (event) => {
+      const place = event.detail;
+      if (place === 'library') { setPanel('library'); return; }
+      setSettingsPage(place.slice('settings.'.length));
+      setSettingsOpen(true);
+    };
+    places.addEventListener('open', open);
+    return () => places.removeEventListener('open', open);
+  }, []);
+
   const togglePanel = useCallback((which, from) => {
     const next = panel === which ? 'none' : which;
     if (from) opener.current = from;
@@ -261,7 +274,8 @@ export function Shell({ health, settings, onLanguage }) {
           )}
         </div>
       </div>
-      <Settings open={settingsOpen} onOpenChange={setSettingsOpen} health={health} onLanguage={onLanguage}
+      <Settings open={settingsOpen} onOpenChange={(open) => { setSettingsOpen(open); if (!open) setSettingsPage(null); }}
+        startPage={settingsPage} health={health} onLanguage={onLanguage}
         project={project} onProjectChanged={() => loadProjects(projectId).catch(fail)} />
       {notice && (
         <div role="alert" className="fixed bottom-4 left-1/2 z-50 -translate-x-1/2 animate-fade-up rounded-lg border bg-card px-4 py-2.5 text-sm shadow-lg"
