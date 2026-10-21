@@ -1,6 +1,6 @@
 // i18n: migrated
-// The parts of the window loaded when first opened (parts.js): Settings, a paper's page and the
-// Markdown of answers. While one loads, a status says so, shown only once loading takes a moment,
+// The parts of the window loaded when first opened (parts.js): Settings, a paper's page, the
+// Markdown of answers and an answer's Details (S1-19b). While one loads, a status says so, shown only once loading takes a moment,
 // so a quick load flashes nothing and nothing moves. One that cannot load says so where it would
 // show, with Try again. A browser keeps a script that failed to load as failed while the page is
 // open, so Try again reloads the window, which keeps its session (session.js).
@@ -106,4 +106,11 @@ export function Markdown(props) {
   if (Loaded) return <Loaded {...props} />;
   if (markdown.failed()) return <Unavailable />;
   return <Boundary fallback={<Pending />} failed={<Unavailable />}><LazyMarkdown {...props} /></Boundary>;
+}
+
+// S1-19b: an answer's Details (its trace), loaded when first opened.
+const LazyTrace = part(() => import('./Trace.jsx'), 'Trace');
+
+export function Trace(props) {
+  return <Boundary fallback={<Pending />} failed={<Unavailable />}><LazyTrace {...props} /></Boundary>;
 }

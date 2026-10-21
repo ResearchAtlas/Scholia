@@ -99,4 +99,16 @@
   .prose-answer blockquote { @apply border-l-2 pl-3 text-muted-foreground; }
   .prose-answer table { @apply my-2 w-full border-collapse text-sm; }
   .prose-answer th, .prose-answer td { @apply border px-2 py-1 text-left; }
+  /* S1-19b: citation chips (markdown.js); the card shows while the chip is hovered or focused */
+  .prose-answer .cite { @apply relative inline-block align-baseline; }
+  .prose-answer .cite-chip { @apply mx-0.5 inline-flex h-[1.15rem] min-w-[1.15rem] items-center justify-center rounded-full bg-brand-soft px-1 text-[11px] font-medium leading-none text-brand hover:bg-brand/15 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring; }
+  .prose-answer .cite-chip.cite-partial { @apply border border-dashed border-brand/50 bg-transparent; }
+  .prose-answer .cite-chip.cite-retracted { @apply bg-destructive/10 text-destructive; }
+  .prose-answer .cite-card { @apply pointer-events-none invisible absolute left-0 top-full z-20 mt-1 grid w-72 gap-1 rounded-md border bg-popover p-2 text-left text-xs font-normal leading-snug text-popover-foreground opacity-0 shadow-md transition-opacity; }
+  .prose-answer .cite:hover .cite-card, .prose-answer .cite:focus-within .cite-card { @apply visible opacity-100; }
+  .prose-answer .cite-title { @apply font-medium; }
+  .prose-answer .cite-quote { @apply text-muted-foreground; }
+  .prose-answer .cite-notes { @apply text-muted-foreground; }
+  .prose-answer .cite-missing { @apply mx-0.5 text-[11px] text-muted-foreground line-through; }
+  .prose-answer .unsupported { @apply underline decoration-warning/60 decoration-dotted underline-offset-4; }
 }

@@ -10,8 +10,8 @@ import { ApiError, get, post } from '../api.js';
 import { useAction } from '../action.js';
 import { errorText } from '../text.js';
 import { fileSize } from '../backups.js';
-import { ACCEPT, addFiles, authorNames, detailsSource, latestLookup, libraryEvents, newest, ocrPages, reasonKey, sortFiles,
-  stateKey, typeKey, unsettled, uploadsWaiting, watchUploads, yearOf } from '../library.js';
+import { ACCEPT, addFiles, authorNames, choosePapers, chosenPapers, detailsSource, latestLookup, libraryEvents, newest, ocrPages,
+  reasonKey, sortFiles, stateKey, takeOpening, typeKey, unsettled, uploadsWaiting, watchChosen, watchUploads, yearOf } from '../library.js';
 import { fraction } from '../runs.js';
 import { Ask } from './Ask.jsx';
 import { AddMenu } from './AddMenu.jsx'; // S1-14: Add offers a reference file
@@ -87,6 +87,14 @@ export function Library({ project }) {
   const adding = useSyncExternalStore(watchUploads, uploadsWaiting) > 0; // while any upload is still to finish
   const [over, setOver] = useState(false);
   const input = useRef(null);
+  // S1-19b: a cited paper opened from an answer's chip, at its passage; papers chosen for the next message
+  useEffect(() => {
+    const take = () => { const found = takeOpening(project?.id); if (found) setOpen(found); };
+    take();
+    libraryEvents.addEventListener('open', take);
+    return () => libraryEvents.removeEventListener('open', take);
+  }, [project?.id]);
+  const chosen = useSyncExternalStore(watchChosen, () => chosenPapers(project?.id));
 
   async function add(files) {
     setNotice(null);
@@ -134,9 +142,19 @@ export function Library({ project }) {
           <Ask key={ask.ask_id} ask={ask} onAnswered={load} />
         ))}
         {listing === null && !problem && <p role="status" className="text-sm text-muted-foreground">{t('common.loading')}</p>}
+        {chosen.length > 0 && !searching && (
+          <div className="flex flex-wrap items-center gap-2 rounded-md bg-brand-soft/60 px-3 py-2 text-sm" role="status">
+            <span className="flex-1">{t('library.chosen', { count: chosen.length })}</span>
+            <Button size="sm" className="h-7" onClick={() => document.getElementById('composer')?.focus()}>{t('library.askAbout')}</Button>
+            <Button size="sm" variant="ghost" className="h-7" onClick={() => choosePapers(project.id, [])}>{t('library.chooseNone')}</Button>
+          </div>
+        )}
         {listing && materials.length > 0 && !searching && (
           <ul className="divide-y rounded-lg border" aria-label={t('library.papers')}>
             {materials.map((material) => <PaperRow key={material.id} material={material} project={project} index={index}
+              chosen={chosen.some((paper) => paper.id === material.id)}
+              onChoose={(on) => choosePapers(project.id, on ? [...chosen, { id: material.id, title: material.title }]
+                : chosen.filter((paper) => paper.id !== material.id))}
               onOpen={() => setOpen({ id: material.id })} onChanged={load} />)}
           </ul>
         )}
@@ -224,12 +242,15 @@ export function Progress({ material }) {
   );
 }
 
-function PaperRow({ material, project, index, onOpen, onChanged }) {
+function PaperRow({ material, project, index, chosen, onChoose, onOpen, onChanged }) {
   const t = useT();
   const reason = reasonKey(material.reason);
   return (
     <li className="grid grid-cols-1 gap-1.5 px-3 py-3">
       <div className="flex min-w-0 items-start gap-2">
+        <input type="checkbox" checked={chosen} onChange={(event) => onChoose(event.target.checked)}
+          aria-label={t('library.choose', { title: material.title })} title={t('library.choose', { title: material.title })}
+          className="mt-0.5 size-4 shrink-0 accent-[hsl(var(--brand))]" />
         <FileText className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
         <button type="button" onClick={onOpen} title={material.title}
           className="min-w-0 flex-1 truncate rounded-sm text-left text-sm font-medium hover:text-brand focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">
