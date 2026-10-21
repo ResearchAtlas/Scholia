@@ -683,7 +683,7 @@ def test_the_fixture_quotes_are_shown_whole_near_the_passage_limit():
 
 def test_files_written_are_owner_only(tmp_path):
     path = tmp_path / "made" / "x.json"
-    gold.write_json(path, {"a": 1}, field=None)
+    gold.write_json(tmp_path, path, {"a": 1})
     assert stat.S_IMODE(path.stat().st_mode) == 0o600 and stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert os.listdir(path.parent) == ["x.json"]
 
@@ -722,7 +722,7 @@ def test_sigterm_stops_a_command_as_ctrl_c_does_leaving_its_marker_and_no_data_f
 
 def test_a_refusal_before_any_work_still_replaces_an_earlier_finished_report(tmp_path):
     folder, pdfs = pdf_field(tmp_path)
-    gold.write_json(gold.outputs(folder) / "check.json", {"status": "finished", "problems": []}, field=2)
+    gold.write_json(folder, gold.outputs(folder) / "check.json", {"status": "finished", "problems": []})
     with pytest.raises(tier1.Refused, match="--qasper"):
         asyncio.run(gold.check(2, folder, pdfs, None, opener()))
     written = json.loads((gold.outputs(folder) / "check.json").read_text())
@@ -736,11 +736,11 @@ def test_a_written_file_is_owner_only_from_its_creation_even_over_an_old_part_fi
     os.chmod(path.parent / "x.json.part", 0o644)
     modes = []
     real = os.replace
-    monkeypatch.setattr(gold.os, "replace", lambda a, b: modes.append(stat.S_IMODE(os.stat(a).st_mode)) or real(a, b))
-    gold.write_json(path, {"a": 1}, field=None)
+    monkeypatch.setattr(gold.os, "replace", lambda a, b, **at: modes.append(stat.S_IMODE(os.stat(a, dir_fd=at["src_dir_fd"]).st_mode)) or real(a, b, **at))
+    gold.write_json(tmp_path, path, {"a": 1})
     assert modes == [0o600] and stat.S_IMODE(path.stat().st_mode) == 0o600
     deep = tmp_path / "c" / "d" / "y.json"
-    gold.write_json(deep, {}, field=None)
+    gold.write_json(tmp_path, deep, {})
     assert all(stat.S_IMODE(p.stat().st_mode) == 0o700 for p in (tmp_path / "c", tmp_path / "c" / "d"))
 
 
@@ -831,7 +831,7 @@ EVERY = {"check", "apply", "sample", "pairs page", "questions page", "sample pag
 @pytest.mark.parametrize("entry, refusing", [
     ("papers.json", EVERY),
     ("pairs.json", EVERY),
-    ("sample-pairs.json", {"check", "sample page"}),
+    ("sample-pairs.json", {"check", "sample", "sample page"}),
     ("labels", {"check", "apply", "pairs page", "questions page", "sample page"}),
     ("out", {"check", "apply", "questions page", "passages"}),
     ("pdfs", {"passages"}),
@@ -843,8 +843,8 @@ def test_a_link_under_field_ones_folder_into_a_git_work_tree_is_refused_by_every
     repo = fixtures.git("init", tmp_path / "repo")
     folder = field(tmp_path, 1)
     pairs = json.loads((folder / "pairs.json").read_text())
-    gold.write_json(folder / "labels" / "field1-pairs.harold.json", labels_for(pairs, "harold", {}), field=1)
-    gold.write_json(folder / "sample-pairs.json", gold.draw(pairs, gold.load_settings()), field=1)
+    gold.write_json(folder, folder / "labels" / "field1-pairs.harold.json", labels_for(pairs, "harold", {}))
+    gold.write_json(folder, folder / "sample-pairs.json", gold.draw(pairs, gold.load_settings()))
     (folder / "pdfs").mkdir()
     (folder / entry).rename(repo / entry)
     (folder / entry).symlink_to(repo / entry)
@@ -864,5 +864,93 @@ def test_a_link_under_field_ones_folder_into_a_git_work_tree_is_refused_by_every
         "passages": lambda: gold.main(["passages", *command]),  # last: it rewrites the worksheet's marker
     }
     found = {name: outcome(action) for name, action in actions.items()}
-    assert {name for name, said in found.items() if "inside the repository" in said} == refusing, found
+    assert {name for name, said in found.items() if "is a link" in said} == refusing, found
     assert repo_now() == before
+
+
+# G12: no link is followed where S1-36 writes, or where it reads its own files
+
+
+@pytest.mark.parametrize("number", [1, 2])
+def test_a_check_report_linked_to_the_drafts_is_refused_and_the_drafts_stay_as_they_were(tmp_path, monkeypatch, number):
+    """sol's reproduction: <output>/check.json is a link to the field's questions.json; check wrote its
+    marker and then its report through it, over the drafts. Field 2 with its own folders (evals/out/field2/)."""
+    folder = field(tmp_path, number)
+    if number == 2:
+        monkeypatch.setattr(gold, "FIELD2", folder)
+        monkeypatch.setattr(gold, "OUT", tmp_path / "evals-out")
+        (tmp_path / "evals-out" / "field2").mkdir(parents=True)
+    drafts = (folder / "questions.json").read_bytes()
+    report = gold.outputs(folder) / "check.json"
+    report.symlink_to(folder / "questions.json")
+    with pytest.raises(SystemExit, match="is a link"):
+        gold.main(["check", "--field", str(number), "--folder", str(folder)])
+    assert (folder / "questions.json").read_bytes() == drafts and report.is_symlink()
+
+
+@pytest.mark.parametrize("name, command", [
+    ("out/check.json", ["check"]),
+    ("out/worksheet.json", ["passages"]),
+    ("out/field1-pairs.corrected.harold.json", ["apply", "--set", "pairs", "--rater", "harold"]),
+    ("sample-pairs.json", ["sample", "--set", "pairs"]),
+    ("out/check.json.part", ["check"]),
+    ("labels", ["check"]),  # a folder level: field 1's labels/ and out/ (and field 2's evals/out/ below)
+    ("out", ["check"]),
+])
+def test_a_link_at_any_written_name_or_folder_is_refused_and_nothing_is_written_through_it(tmp_path, name, command):
+    folder = field(tmp_path, 1)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    gold.write_json(folder, folder / "labels" / "field1-pairs.harold.json", labels_for(pairs, "harold", {}))
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "kept.json").write_text("kept")
+    target = folder / name
+    if target.is_dir():
+        for child in target.iterdir():
+            child.rename(victim / child.name)
+        target.rmdir()
+        target.symlink_to(victim, target_is_directory=True)
+    else:
+        target.unlink(missing_ok=True)
+        target.symlink_to(victim / "kept.json")
+    before = sorted((p.name, p.read_bytes()) for p in victim.iterdir())
+    with pytest.raises(SystemExit, match="is a link"):
+        gold.main([command[0], "--field", "1", "--folder", str(folder), *command[1:]])
+    assert sorted((p.name, p.read_bytes()) for p in victim.iterdir()) == before and target.is_symlink()
+
+
+@pytest.mark.parametrize("linked", ["out", "out/field2"])
+def test_field_twos_output_folders_are_never_links(tmp_path, monkeypatch, linked):
+    folder = field(tmp_path)
+    monkeypatch.setattr(gold, "FIELD2", folder)
+    monkeypatch.setattr(gold, "OUT", tmp_path / "evals" / "out")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (tmp_path / "evals" / linked).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "evals" / linked).symlink_to(victim, target_is_directory=True)
+    with pytest.raises(tier1.Refused, match="is a link"):
+        asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
+    assert list(victim.iterdir()) == []
+
+
+def test_a_pdf_may_be_a_link_outside_any_git_work_tree_but_not_into_one_nor_its_folder(tmp_path):
+    folder, pdfs = pdf_field(tmp_path, 1)
+    papers = json.loads((folder / "papers.json").read_text())["papers"]
+    storage = tmp_path / "zotero-storage"
+    repo = fixtures.git("init", tmp_path / "repo")
+    storage.mkdir()
+    for paper in papers:  # each PDF moved to Harold's storage and linked from the PDFs' folder
+        (pdfs / paper["file"]).rename(storage / paper["file"])
+        (pdfs / paper["file"]).symlink_to(storage / paper["file"])
+    gold.verify_pdfs(papers, pdfs, 1)
+    first = papers[0]["file"]
+    assert gold.pdf_bytes(1, pdfs, first) == (storage / first).read_bytes()
+    (storage / first).rename(repo / first)
+    (pdfs / first).unlink()
+    (pdfs / first).symlink_to(repo / first)
+    with pytest.raises(tier1.Refused, match="inside the repository"):
+        gold.verify_pdfs(papers, pdfs, 1)
+    linked = tmp_path / "linked-pdfs"
+    linked.symlink_to(pdfs, target_is_directory=True)
+    with pytest.raises(tier1.Refused, match="is a link"):
+        gold.verify_pdfs(papers, linked, 1)

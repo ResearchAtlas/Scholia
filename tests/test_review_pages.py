@@ -121,7 +121,7 @@ def test_a_failed_write_says_not_saved_leaves_the_file_as_it_was_and_the_retry_s
     before = labels_file(folder, "pairs").read_bytes()
     real = gold.write_json
 
-    def full_disk(path, data, field):
+    def full_disk(root, path, data):
         raise OSError(28, "No space left on device")
     monkeypatch.setattr(gold, "write_json", full_disk)
     status, answer = page.save("p02", {"category": "unsupported"})
@@ -704,8 +704,8 @@ def test_a_paper_named_constructor_is_served_like_any_other(tmp_path, pages):
     (folder / "papers.json").write_text(json.dumps(papers))
     sheet = json.loads((gold.outputs(folder) / "worksheet.json").read_text())
     sheet["papers"] = {("constructor" if k == "p-wages" else k): v for k, v in sheet["papers"].items()}
-    sheet["papers_sha256"] = gold.sha256_of(folder / "papers.json", field=1)
-    gold.write_json(gold.outputs(folder) / "worksheet.json", sheet, field=1)
+    sheet["papers_sha256"] = gold.sha256_of(folder, folder / "papers.json")
+    gold.write_json(folder, gold.outputs(folder) / "worksheet.json", sheet)
     page = pages(folder, "questions", number=1)
     assert "constructor" in page.get("/api/data")[1]["papers"]
     assert page.get("/api/passages?paper=constructor")[0] == 200
@@ -733,8 +733,8 @@ def test_a_label_whose_paper_was_removed_after_its_item_changed_is_history_and_t
     (folder / "papers.json").write_text(json.dumps(papers))
     sheet = json.loads((gold.outputs(folder) / "worksheet.json").read_text())
     del sheet["papers"][b]
-    sheet["papers_sha256"] = gold.sha256_of(folder / "papers.json", field=2)
-    gold.write_json(gold.outputs(folder) / "worksheet.json", sheet, field=2)
+    sheet["papers_sha256"] = gold.sha256_of(folder, folder / "papers.json")
+    gold.write_json(folder, gold.outputs(folder) / "worksheet.json", sheet)
     labels = json.loads(labels_file(folder, "questions").read_text())
     labels["labels"]["gone"] = {"item_sha256": "x", "revision": 1, "decision": "edit", "evidence": [[{"paper": b}]]}
     labels["labels"]["not-a-label"] = "anything"
@@ -792,7 +792,7 @@ def test_a_labels_folder_linked_into_a_git_work_tree_after_the_page_opened_gets_
     (repo / "leak").mkdir()
     folder = field(tmp_path, 1)
     (folder / "labels").symlink_to(repo / "leak")
-    with pytest.raises(gold.Refused, match="inside the repository"):
+    with pytest.raises(gold.Refused, match="is a link"):
         gold.Review(1, folder, "pairs", "harold")
     (folder / "labels").unlink()
     page = pages(folder, "pairs", number=1)
@@ -863,7 +863,7 @@ def test_a_labels_file_part_or_lock_linked_into_a_git_work_tree_gets_nothing(tmp
                                    '{"status": "finished"}'])
 def test_a_worksheet_of_another_shape_is_refused_not_a_crash(tmp_path, sheet):
     folder = field(tmp_path)
-    sheet = sheet.replace("SHA", gold.sha256_of(folder / "papers.json", field=2))
+    sheet = sheet.replace("SHA", gold.sha256_of(folder, folder / "papers.json"))
     (gold.outputs(folder) / "worksheet.json").write_text(sheet)
     with pytest.raises(gold.Refused, match="not a finished worksheet"):
         gold.Review(2, folder, "questions", "harold")

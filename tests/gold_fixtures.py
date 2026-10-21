@@ -158,12 +158,13 @@ def write_field(folder, field=2, sample=False):
     papers, questions, pairs = sets(field)
     for name, doc in (("papers", papers), ("questions", questions), ("pairs", pairs)):
         (folder / f"{name}.json").write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-    gold.write_json(gold.outputs(folder.resolve()) / "worksheet.json",
-                    worksheet_doc(field, papers, gold.sha256_of(folder / "papers.json", field=field)), field=field)
+    root = folder.resolve()
+    gold.write_json(root, gold.outputs(root) / "worksheet.json",
+                    worksheet_doc(field, papers, gold.sha256_of(root, root / "papers.json")))
     if sample:
         settings = gold.load_settings()
         for doc in (questions, pairs):
-            gold.write_json(folder / f"sample-{doc['kind']}.json", gold.draw(doc, settings), field=field)
+            gold.write_json(root, root / f"sample-{doc['kind']}.json", gold.draw(doc, settings))
     return folder
 
 

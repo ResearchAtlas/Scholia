@@ -34,6 +34,8 @@ files, and logs nothing. Each decision is written to the labels file before the 
 import argparse
 import asyncio
 import contextlib
+import errno
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -42,6 +44,7 @@ import random
 import re
 import secrets
 import signal
+import stat
 import sys
 import tempfile
 import threading
@@ -102,9 +105,8 @@ def private_path(field, path):
     """A field's path, resolved; for field 1, refused anywhere inside a git work tree (this checkout, the main
     checkout or any other worktree, or any other repository) except under that tree's evals/local/, and that
     only where the tree's own .gitignore ignores evals/local/ (a checkout of a branch without S1-36 does not).
-    Every file read or written under a field's folder is checked so right before it is opened (read_json,
-    write_json, sha256_of, the PDFs, the lock file), where it really leads: a link in field 1's folder
-    (labels/, out/, a set, the PDFs) into a git work tree is refused, never followed there (G10)."""
+    Checked for the folders given (--folder, --pdfs) and where a linked PDF leads; under a folder no link is
+    followed at all (the files below)."""
     path = Path(path).resolve()
     if field == 1 and (top := work_tree(path)) is not None:
         if not path.is_relative_to(top / "evals" / "local"):
@@ -140,32 +142,139 @@ def outputs(folder):
     return OUT / "field2" if folder == FIELD2 else folder / "out"
 
 
-def write_json(path, data, *, field):
-    """Written whole, as tier1.write_atomic writes (a part file, synced, then renamed over the file), and
-    owner-only from its creation: the part file is made 0600, and every folder made here 0700. Written where
-    the path really leads, checked first as a field's folder is (private_path); the part file is never a link."""
-    path = private_path(field, path)
-    for folder in reversed([p for p in (path.parent, *path.parent.parents) if not p.exists()]):
-        folder.mkdir(mode=0o700)
+def out_root(folder):
+    """The folder the output folder is walked from: evals/out/ for field 2, the field's own folder for field 1."""
+    return OUT if folder == FIELD2 else folder
+
+
+# Files under a folder: no link is followed (G12). Every file S1-36 opens under a field's folder, an output
+# folder or the PDFs' folder is reached from that folder (its root) one component at a time, each folder
+# opened O_NOFOLLOW | O_DIRECTORY relative to the one before and the file O_NOFOLLOW relative to its folder:
+# a link at or below the root refuses the command. Writes go to a part file in the destination's own folder,
+# renamed onto the name itself. The one exception is a PDF entry, which may be a link (to Zotero's storage,
+# say): it is read only, and only where it leads passes private_path.
+
+
+def _link(path):
+    raise Refused(f"{path} is a link: no link is followed under a gold set's folders")
+
+
+def _step(fd, name, shown):
+    """The folder name in the folder fd (None: name is the root's absolute path), opened without following a link."""
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+    except OSError:
+        if stat.S_ISLNK(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+            _link(shown)
+        raise
+
+
+def _open_dir(root, folder, create=False):
+    """An open descriptor of folder, reached from root one folder at a time; folders made 0700 when create."""
+    root, folder = Path(root), Path(folder)
+    parts = folder.relative_to(root).parts
+    if create:
+        for made in reversed([p for p in (root, *root.parents) if not p.exists()]):
+            made.mkdir(mode=0o700)
+    fd = _step(None, str(root), root)
+    try:
+        for n, name in enumerate(parts, start=1):
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(name, 0o700, dir_fd=fd)
+            fd, before = _step(fd, name, root.joinpath(*parts[:n])), fd
+            os.close(before)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextlib.contextmanager
+def _folder_of(root, path, create=False):
+    fd = _open_dir(root, Path(path).parent, create)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _open(fd, path, flags):
+    try:
+        return os.open(Path(path).name, flags | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            _link(path)
+        raise
+
+
+def entry(root, path):
+    """The entry at path (its lstat), or None when it or its folder is not there; a link is refused."""
+    try:
+        with _folder_of(root, path) as fd:
+            found = os.stat(Path(path).name, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(found.st_mode):
+        _link(path)
+    return found
+
+
+def names(root, folder):
+    """The names in folder (none when it is not there)."""
+    try:
+        fd = _open_dir(root, folder)
+    except FileNotFoundError:
+        return []
+    try:
+        return sorted(os.listdir(fd))
+    finally:
+        os.close(fd)
+
+
+def read_bytes(root, path):
+    with _folder_of(root, path) as fd:
+        f = _open(fd, path, os.O_RDONLY)
+    with os.fdopen(f, "rb") as file:
+        return file.read()
+
+
+def read_json(root, path):
+    return json.loads(read_bytes(root, path).decode("utf-8"))
+
+
+def sha256_of(root, path):
+    return hashlib.sha256(read_bytes(root, path)).hexdigest()
+
+
+def write_json(root, path, data):
+    """Written whole, as tier1.write_atomic writes (a part file in the file's own folder, synced, then renamed
+    onto the name itself), and owner-only from its creation: the part file is made 0600, every folder made
+    here 0700. A link at the name, at its part file or at any folder from root down refuses it."""
+    path = Path(path)
     part = path.with_name(path.name + ".part")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-    with os.fdopen(os.open(part, flags, 0o600), "w", encoding="utf-8") as f:
-        os.fchmod(f.fileno(), 0o600)  # a part file left by an earlier cut-off save keeps its mode otherwise
-        f.write(json.dumps(data, ensure_ascii=False, indent=1) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(part, path)
+    with _folder_of(root, path, create=True) as fd:
+        entry(root, path)  # a link at the name itself is refused, never written through or replaced
+        f = _open(fd, part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        with os.fdopen(f, "w", encoding="utf-8") as out:
+            os.fchmod(out.fileno(), 0o600)  # a part file left by an earlier cut-off save keeps its mode otherwise
+            out.write(json.dumps(data, ensure_ascii=False, indent=1) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(part.name, path.name, src_dir_fd=fd, dst_dir_fd=fd)
 
 
-def read_json(path, *, field):
-    """A JSON file read where its path really leads, checked first as a field's folder is (private_path).
-    field None: a file of no field's folder (the settings, QASPER's)."""
-    with open(private_path(field, path), encoding="utf-8") as f:
-        return json.load(f)
-
-
-def sha256_of(path, *, field):
-    return hashlib.sha256(private_path(field, path).read_bytes()).hexdigest()
+def pdf_bytes(field, pdfs, name):
+    """A PDF's bytes from the PDFs' folder (the root, never through a link), read only. The PDF entry itself
+    may be a link: it is followed only when where it leads passes private_path."""
+    path = Path(pdfs) / name
+    with _folder_of(pdfs, path) as fd:
+        if stat.S_ISLNK(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+            f = os.open(private_path(field, path), os.O_RDONLY)
+        else:
+            f = _open(fd, path, os.O_RDONLY)
+    with os.fdopen(f, "rb") as file:
+        return file.read()
 
 
 def passage_key(paper, ordinal, text):
@@ -179,7 +288,7 @@ def item_sha256(item):
 
 
 def load_settings(path=SETTINGS):
-    return read_json(path, field=None)
+    return read_json(Path(path).parent, path)
 
 
 # Formats
@@ -583,14 +692,16 @@ async def reading_app(data_dir):
 
 def verify_pdfs(papers, pdfs, field):
     """Each listed PDF checked against its size and SHA-256 before anything is read (never downloaded)."""
-    from backend.local_helper import mismatch
     for paper in papers:
-        path = private_path(field, Path(pdfs) / paper["file"])
-        if not path.is_file():
+        try:
+            data = pdf_bytes(field, pdfs, paper["file"])
+        except FileNotFoundError:
             raise Refused(f"paper {paper['id']}: {paper['file']} is missing under {pdfs}; prepare it first "
-                          "(the runner never downloads)")
-        if problem := mismatch(path, paper):
-            raise Refused(f"paper {paper['id']}: {problem}")
+                          "(the runner never downloads)") from None
+        if len(data) != paper["size"]:
+            raise Refused(f"paper {paper['id']}: {paper['file']}: {len(data)} bytes, expected {paper['size']}")
+        if (digest := hashlib.sha256(data).hexdigest()) != paper["sha256"]:
+            raise Refused(f"paper {paper['id']}: {paper['file']}: SHA-256 {digest}, expected {paper['sha256']}")
 
 
 async def read_papers(client, state, papers, pdfs, field):
@@ -601,7 +712,7 @@ async def read_papers(client, state, papers, pdfs, field):
     project = await tier1.new_project(client, "Gold set papers")
     materials = []
     for paper in papers:
-        pdf = private_path(field, Path(pdfs) / paper["file"]).read_bytes()
+        pdf = pdf_bytes(field, pdfs, paper["file"])
         materials += await tier1.add_files(client, project, [(f"{paper['id']}.pdf", pdf)])
     if len(set(materials)) != len(materials):
         raise Refused("two listed papers are the same file")
@@ -705,7 +816,7 @@ def qasper_ids(folder, settings):
             raise Refused(f"QASPER: {pin['path']} is missing under {folder}")
         if problem := mismatch(path, pin):
             raise Refused(f"QASPER: {problem}")
-        ids |= set(read_json(path, field=None))
+        ids |= set(read_json(folder, path))
     return ids
 
 
@@ -714,22 +825,22 @@ def qasper_ids(folder, settings):
 
 def load_field(field, folder):
     """(papers.json, its SHA-256, {kind: set}) of a field's folder; a set not drafted yet is absent."""
-    if not (folder / "papers.json").is_file():
+    if entry(folder, folder / "papers.json") is None:
         raise Refused(f"{folder / 'papers.json'} is missing: nothing is drafted yet")
-    sets = {kind: read_json(folder / f"{kind}.json", field=field) for kind in SETS if (folder / f"{kind}.json").is_file()}
-    return read_json(folder / "papers.json", field=field), sha256_of(folder / "papers.json", field=field), sets
+    sets = {kind: read_json(folder, folder / f"{kind}.json") for kind in SETS if entry(folder, folder / f"{kind}.json")}
+    return read_json(folder, folder / "papers.json"), sha256_of(folder, folder / "papers.json"), sets
 
 
-async def write_when_done(out, make, field):
+async def write_when_done(root, out, make):
     """The file at out says incomplete from the start, and holds the result only once it is all made (an
     interruption, refusal or failure leaves the incomplete marker with its reason)."""
-    write_json(out, {"status": "incomplete", "reason": "running"}, field=field)
+    write_json(root, out, {"status": "incomplete", "reason": "running"})
     try:
         result = await make()
     except BaseException as error:
-        write_json(out, {"status": "incomplete", "reason": f"{type(error).__name__}: {str(error)[:300]}"}, field=field)
+        write_json(root, out, {"status": "incomplete", "reason": f"{type(error).__name__}: {str(error)[:300]}"})
         raise
-    write_json(out, result, field=field)
+    write_json(root, out, result)
     return result
 
 
@@ -767,12 +878,13 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
             problems += found
             if found or not papers:
                 continue
-            report["sets"][kind] = {"id": set_doc["id"], "sha256": sha256_of(folder / f"{kind}.json", field=field),
+            report["sets"][kind] = {"id": set_doc["id"], "sha256": sha256_of(folder, folder / f"{kind}.json"),
                                     **mix(kind, set_doc["items"])}
             report["differences"] += [f"{kind}: {d}" for d in differences(kind, report["sets"][kind], settings)]
             items = {i["id"]: i for i in set_doc["items"]}
-            for path in sorted((folder / "labels").glob(f"{set_doc['id']}.*.json")):
-                labels = read_json(path, field=field)
+            for path in [folder / "labels" / n for n in names(folder, folder / "labels")
+                         if fnmatch.fnmatchcase(n, f"{set_doc['id']}.*.json")]:
+                labels = read_json(folder, path)
                 found = check_labels(labels, set_doc, papers)
                 problems += [f"{path.name}: {p}" for p in found]
                 if not found:
@@ -780,8 +892,8 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
                     edited[kind] += [(path.name, made) for i, label in labels["labels"].items()
                                      if i in items and label_state(items[i], label) == "done" and "evidence" in label
                                      and (made := labeled(items[i], label)) is not None]
-            if (folder / f"sample-{kind}.json").is_file():
-                sample = read_json(folder / f"sample-{kind}.json", field=field)
+            if entry(folder, folder / f"sample-{kind}.json"):
+                sample = read_json(folder, folder / f"sample-{kind}.json")
                 if not sample_of(sample, set_doc):
                     problems.append(f"sample-{kind}.json: not a sample of this set")
                 else:
@@ -806,7 +918,7 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
             report["resolved"] = not problems
         report["problems"] = problems
         return report
-    return await write_when_done(outputs(folder) / "check.json", make, field)
+    return await write_when_done(out_root(folder), outputs(folder) / "check.json", make)
 
 
 async def passages(field, folder, pdfs, open_app=None, settings=None):
@@ -823,7 +935,7 @@ async def passages(field, folder, pdfs, open_app=None, settings=None):
             async with open_app(Path(tmp) / "data") as (client, state):
                 read, _ = await read_papers(client, state, doc["papers"], pdfs, field)
         return worksheet(field, doc, papers_sha256, read)
-    return await write_when_done(outputs(folder) / "worksheet.json", make, field)
+    return await write_when_done(out_root(folder), outputs(folder) / "worksheet.json", make)
 
 
 # Labels, the corrected set, the sample and the agreement
@@ -1062,7 +1174,7 @@ class Review:
             random.Random(f"{settings['review']['order_seed']}:{self.set['id']}").shuffle(order)
         self.sample = None
         if sample:
-            self.sample = read_json(folder / f"sample-{kind}.json", field=field)
+            self.sample = read_json(folder, folder / f"sample-{kind}.json")
             if not sample_of(self.sample, self.set):
                 raise Refused(f"sample-{kind}.json is not a sample of this set")
             order = [i for i in order if i in set(self.sample["items"])]
@@ -1071,9 +1183,9 @@ class Review:
         self.passages = {}
         if kind == "questions":
             path = outputs(folder) / "worksheet.json"
-            if not path.is_file():
+            if entry(out_root(folder), path) is None:
                 raise Refused(f"{path} is missing: write the worksheet first (gold.py passages)")
-            sheet = read_json(path, field=field)
+            sheet = read_json(out_root(folder), path)
             try:
                 if not (sheet["status"] == "finished" and same(sheet["field"], field)
                         and sheet["papers_sha256"] == papers_sha256):
@@ -1086,20 +1198,20 @@ class Review:
         if self.sample is not None and field == 1:  # the colleague sees the sampled items' papers, no more
             self.shown_papers = {loc["paper"] for i in order for loc in locators_of_item(kind, self.items[i])}
             self.passages = {pid: found for pid, found in self.passages.items() if pid in self.shown_papers}
-        self.path = folder / "labels" / f"{self.set['id']}.{rater}.json"
+        self.root, self.path = folder, folder / "labels" / f"{self.set['id']}.{rater}.json"
         self.notices = []
-        if private_path(field, self.path.with_name(self.path.name + ".part")).exists():
+        if entry(folder, self.path.with_name(self.path.name + ".part")):
             self.notices.append("cut_off")  # a save cut off before its rename: the labels file is as last saved
         self.labels = self.read_labels()
-        self.set_sha256 = sha256_of(folder / f"{kind}.json", field=field)
+        self.set_sha256 = sha256_of(folder, folder / f"{kind}.json")
 
     def read_labels(self):
         """The labels file as it is now (another page on the same file may have saved since); a file that
         cannot be read, or is not this set's and rater's, is refused and left as it is."""
-        if not private_path(self.field, self.path).exists():
+        if entry(self.root, self.path) is None:
             return {}
         try:
-            labels = read_json(self.path, field=self.field)
+            labels = read_json(self.root, self.path)
         except (OSError, ValueError) as error:
             raise Refused(f"{self.path.name} cannot be read ({type(error).__name__}); it is left as it is") from None
         if problems := check_labels(labels, self.set, self.papers, self.rater):
@@ -1111,11 +1223,9 @@ class Review:
         """This page's lock, and the labels file's for every process: two pages on one file never lose a save.
         The lock file beside it is owner-only and ignored by git."""
         import fcntl
-        lock = private_path(self.field, self.path.with_name(f".{self.path.name}.lock"))
-        if not lock.parent.exists():
-            lock.parent.mkdir(mode=0o700, parents=True)
         with self.lock:
-            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with _folder_of(self.root, self.path, create=True) as folder:
+                fd = _open(folder, self.path.with_name(f".{self.path.name}.lock"), os.O_WRONLY | os.O_CREAT)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 yield
@@ -1246,7 +1356,7 @@ class Review:
                    "set_sha256": self.set_sha256, **({"sample": True} if self.sample else {}),
                    "labels": dict(sorted(labels.items()))}
             try:
-                write_json(self.path, doc, field=self.field)
+                write_json(self.root, self.path, doc)
             except OSError:
                 return 500, {"code": "not_saved"}
             self.labels = labels
@@ -1418,17 +1528,17 @@ def main(argv=None):
                 raise Refused(f"{args.set}.json does not pass its check: " + "; ".join(problems[:5]))
             if args.command == "sample":
                 out = folder / f"sample-{args.set}.json"
-                if out.exists():
+                if entry(folder, out):
                     raise Refused(f"{out.name} exists: a sample is drawn once, before anyone labels it")
-                write_json(out, draw(set_doc, load_settings()), field=args.field)
-                print(f"{out}: {len(read_json(out, field=args.field)['items'])} items")
+                write_json(folder, out, draw(set_doc, load_settings()))
+                print(f"{out}: {len(read_json(folder, out)['items'])} items")
             else:
                 if not all(RATER.fullmatch(r) for r in (args.raters if args.command == "agreement" else [args.rater])):
                     raise Refused("a rater is named with lower-case letters, digits and hyphens")
 
                 def labels_of(rater):
                     path = folder / "labels" / f"{set_doc['id']}.{rater}.json"
-                    labels = read_json(path, field=args.field)
+                    labels = read_json(folder, path)
                     if problems := check_labels(labels, set_doc, papers, rater):
                         raise Refused(f"{path.name}: " + "; ".join(problems[:5]))
                     return labels
@@ -1437,7 +1547,7 @@ def main(argv=None):
                 else:
                     out = outputs(folder) / f"{set_doc['id']}.corrected.{args.rater}.json"
                     corrected = apply(set_doc, labels_of(args.rater), papers)
-                    write_json(out, corrected, field=args.field)
+                    write_json(out_root(folder), out, corrected)
                     print(f"{out}: {corrected['counts']}")
     except (Refused, OSError, ValueError) as refused:
         sys.exit(f"refused: {refused}")
