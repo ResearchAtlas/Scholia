@@ -492,8 +492,9 @@ async def test_a_private_turns_router_answer_and_judge_all_carry_the_private_con
             assert not {"plugins", "tools", "web_search_options"} & body.keys()
 
 
-async def test_a_private_turns_judge_set_to_a_model_the_project_does_not_allow_inherits_the_turns_route(tmp_path):
-    # Ticket 71: an unset judge, or one the project's level does not allow, is the turn's own route.
+async def test_a_private_turns_judge_set_to_a_model_the_project_does_not_allow_judges_nothing_and_says_so(tmp_path):
+    # Ticket 71: only an unset judge inherits the turn's route; one that is set but that the project's level
+    # does not allow judges nothing, no other model in its place, and the citations stay unchecked, said.
     from cited import Provider, cited, conversation_in, with_papers
     from test_search import WAGES
     provider = Provider(catalog=[ZDR_MODEL, PLAIN_MODEL], zero_retention=[ZDR_MODEL])
@@ -504,6 +505,6 @@ async def test_a_private_turns_judge_set_to_a_model_the_project_does_not_allow_i
         assert (await confirm_key(client)).status_code == 200
         conversation = await conversation_in(client, project)
         await send(client, conversation, "What do minimum wages do to earnings?", model=ZDR_MODEL)
-        [judged] = provider.judged
-        assert judged["model"] == ZDR_MODEL and judged["provider"]["zdr"] is True
-        assert PLAIN_MODEL not in [b["model"] for b in provider.chats]
+        assert provider.judged == [] and PLAIN_MODEL not in [b["model"] for b in provider.chats]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert "unchecked" in turn["answer"]["notices"] and all(c["support"] == "unchecked" for c in turn["citations"])

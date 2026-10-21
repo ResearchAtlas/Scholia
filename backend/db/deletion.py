@@ -47,7 +47,9 @@ KINDS = {
 }
 
 DELETE = None
-_SOURCE_REMOVED = "material_id = NULL, material_version_id = NULL, passage_id = NULL, existence = 'source_removed'"
+# S1-19b (a deletion reaches every copy, slice 1 section 4.2): the citation keeps no quote of the source's text.
+_SOURCE_REMOVED = ("material_id = NULL, material_version_id = NULL, passage_id = NULL, quote = NULL,"
+                   " existence = 'source_removed'")
 # For every foreign key into a table this service deletes from, what happens to a
 # referencing row when the row it references is deleted: DELETE, or the SET
 # clause that keeps the row and clears its link. A test checks that this covers
@@ -85,9 +87,9 @@ ON_DELETE = {
     ("comment_threads", "run_id"): "run_id = NULL",
     ("memory_records", "created_by_run_id"): "created_by_run_id = NULL",
     # A material's versions; extractions (readings, each shared by the versions that read
-    # it) go by RULES. A citation of a deleted source keeps its quote, loses every link to
-    # the source (a passage may live on in another project's material) and shows that the
-    # source was removed.
+    # it) go by RULES. A citation of a deleted source loses its quote (S1-19b: the source's text
+    # goes everywhere) and every link to the source (a passage may live on in another project's
+    # material), and shows that the source was removed.
     ("material_versions", "material_id"): DELETE,
     ("run_body_materials", "material_id"): DELETE,  # and every body that holds its text goes (RULES)
     ("passages", "extraction_id"): DELETE,

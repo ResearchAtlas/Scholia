@@ -1191,6 +1191,7 @@
   "trace.outcomeFailed": "Failed: {reason}",
   "trace.charged": "charged {cost}",
   "trace.bodyRemoved": "The exact text sent was removed with a deleted paper.",
+  "trace.bodyUnavailable": "The exact text sent could not be kept.",
   "trace.showSent": "Show the exact text sent",
   "trace.sent": "The exact text sent",
   "trace.checks": "Citation check",

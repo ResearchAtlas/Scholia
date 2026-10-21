@@ -88,7 +88,6 @@ class Attempt:
     usage: dict = field(default_factory=dict)  # tokens and cost as the provider reported them
     dispatched: bool = True  # False when the request certainly never reached the provider
     retention: dict | None = None  # the retention terms the outbound gate applied to it (Scholia)
-    body: bytes | None = field(default=None, repr=False)  # the exact request body sent (S1-19: the trace); never logged
 
     @property
     def reported_cost(self):
@@ -250,13 +249,14 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
 
 async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, timeout: float = 120.0,
                       effort: str | None = None, zdr_enabled: bool = False, max_tokens: int | None = None,
-                      model_entry=None, capability_records=None, on_dispatch=None) -> ModelResult:
+                      model_entry=None, capability_records=None, on_dispatch=None, on_body=None) -> ModelResult:
     """One chat completion. Never raises for a provider failure: the result carries
     the failure kind and every attempt. Cancellation propagates (the caller settles
     what the attempt in flight cost). The client must be the outbound gate's: its
     notice that a request went out is the only evidence that an attempt may be
     billed. on_dispatch, if given, is called with that notice, so a caller cancelled
-    before it knows nothing left.
+    before it knows nothing left. on_body, if given, is awaited with each attempt's exact request bytes
+    before they are sent (S1-19: the trace keeps them even for a call stopped in flight).
     """
     sent = []  # the gate's notices that the current attempt's request went out, with the terms it applied
 
@@ -283,6 +283,8 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         sent.clear()
         # Encoded here, as httpx would encode json=, so the trace keeps the exact bytes that went out (S1-19).
         sending = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if on_body is not None:
+            await on_body(sending)
         try:
             response = await asyncio.wait_for(
                 client.post(route.provider.chat_url, headers=headers, content=sending, extensions=extensions,
@@ -294,7 +296,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             # bound during the gate's check, or never connected, it did not.
             left = bool(sent) and not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout))
             attempts.append(Attempt(classify_error(error), None, _ms(started), dispatched=left,
-                                    retention=sent[-1] if left else None, body=sending if left else None))
+                                    retention=sent[-1] if left else None))
             return _failed(attempts[-1].outcome, attempts, route)
         body = _json(response)
         usage = body.get("usage") if isinstance(body, dict) and isinstance(body.get("usage"), dict) else {}
@@ -303,7 +305,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             kind = "policy_block" if response.status_code == 403 and route.provider.is_openrouter \
                 else classify_status(response.status_code)
             attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
-                                    retention=sent[-1] if sent else None, body=sending))
+                                    retention=sent[-1] if sent else None))
             retry = (response.status_code == 400 and "reasoning" in payload and not route.provider.is_openrouter
                      and len(attempts) < MAX_ATTEMPTS)
             if retry:
@@ -321,10 +323,9 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             # same prompt is never sent again (model-route rule 4).
             kind = refusal or ("output_limit" if _choice(body).get("finish_reason") == "length" else "malformed")
             attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
-                                    retention=sent[-1] if sent else None, body=sending))
+                                    retention=sent[-1] if sent else None))
             return _failed(kind, attempts, route)
-        attempts.append(Attempt("ok", response.status_code, _ms(started), usage, retention=sent[-1] if sent else None,
-                                body=sending))
+        attempts.append(Attempt("ok", response.status_code, _ms(started), usage, retention=sent[-1] if sent else None))
         if len(attempts) > 1 and "reasoning" not in payload:
             _remember_no_reasoning(route, key)
         return ModelResult(content, reasoning, None, attempts, tool_calls,

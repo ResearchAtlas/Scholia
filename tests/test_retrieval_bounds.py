@@ -145,3 +145,34 @@ def test_no_pin_fetch_fixture_or_arm_names_the_excluded_rerankers():
              for path in (root / folder).rglob("*") if path.is_file() and path.suffix in (".py", ".json", ".js", ".jsx", ".mjs", ".md")
              and any(name in path.read_text(errors="ignore") for name in ("Reranker-4B", "Reranker-8B"))]
     assert found == []
+
+
+@pytest.mark.asyncio
+async def test_a_selections_dense_search_is_its_own_nearest_whatever_the_rest_of_the_project_holds(tmp_path):
+    # Review b1 (11): the selection's own top passages by the same distance, not a filter over the project's
+    # nearest 4,096 (vec0's largest k), which other papers can fill entirely.
+    import sqlite_vec
+    from backend import search_index
+    from test_search_index import until_embedded
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        [selected] = [m["id"] for m in (await added(client, project, WAGES))["materials"]]
+        await until_embedded(client, project)
+        index = client.state["index"]
+        query = [1.0] + [0.0] * (search_index.DIMENSIONS - 1)
+        conn, _ = search_index.connect(index.path)
+        try:  # 4,200 passages of another paper, each nearer the query than anything the selection holds
+            with conn:
+                for i in range(4200):
+                    rowid = conn.execute("INSERT INTO index_rows (project_id, passage_id, material_id, kind, digest, embedded)"
+                                         " VALUES (?, ?, 'other', 'paragraph', 'd', 1) RETURNING id",
+                                         (project, f"near-{i}")).fetchone()[0]
+                    conn.execute("INSERT INTO vec_passages (rowid, project_id, passage_id, embedding) VALUES (?, ?, ?, ?)",
+                                 (rowid, project, f"near-{i}", sqlite_vec.serialize_float32(query)))
+        finally:
+            conn.close()
+        own = await asyncio.to_thread(index.dense, project, query, 50, {selected})
+        mine = {pid for pid, in await asyncio.to_thread(index._read, lambda c: c.execute(
+            "SELECT passage_id FROM index_rows WHERE material_id = ? AND embedded = 1", (selected,)).fetchall())}
+        assert own and set(own) == mine  # every embedded passage of the selection, none of the others
+        assert len(await asyncio.to_thread(index.dense, project, query, 50)) == 50  # the project's own nearest

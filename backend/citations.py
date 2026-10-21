@@ -27,7 +27,7 @@ import json
 import re
 
 from backend.evidence import CITATION
-from backend.search_index import readings
+from backend.search_index import readings, still_read
 
 # A marker that starts like a citation but does not parse ([S1], [S1.x], [S 2.3]): kept as not_found.
 _MALFORMED = re.compile(r"\[S[^\]\n]{0,12}\]")
@@ -36,7 +36,8 @@ _MALFORMED = re.compile(r"\[S[^\]\n]{0,12}\]")
 # its length does.
 _END = re.compile(r"(?<![.!?])[.!?]++(?=\s|$)|[。！？]++|\n")
 # Code, where a marker is not a citation (the interface draws it as code): fenced blocks and inline spans.
-_LEADING = re.compile(r"^(?:\s*\[S[^\]\n]{0,12}\])+")
+_LEADING = re.compile(r"^(?:[\s|]*\[S[^\]\n]{0,12}\])+")
+_EDGES = re.compile(r"^[\s|]+|[\s|]+$")  # a table row's cell bars and the space around a sentence
 _CODE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
 VERDICTS = ("supported", "partly", "unsupported")
 QUOTE_CHARS = 500  # the part of a passage a citation keeps as its quote
@@ -62,12 +63,16 @@ def bundle(numbered):
     return lines
 
 
-def missing(numbered, *, mode, route, index="ready"):
+def missing(numbered, *, mode, route, index="ready", cut=False):
     """The conflicts and missing information section's records for this evidence. index is the search
     index's state when it was searched: one being built or unavailable searched nothing, which is not the
-    library holding no evidence."""
+    library holding no evidence. cut: passages matched, but the model's window left no room for any."""
     notes = []
-    if route in ("literature", "memory_literature") and index in ("building", "unavailable"):
+    if route in ("literature", "memory_literature") and cut:
+        notes.append("Passages in the researcher's library matched this question, but none fits this model's context "
+                     "window, so none is included. Say that the evidence could not be included with this model; do not "
+                     "say the library holds no evidence, and do not answer from general knowledge as if it were cited.")
+    elif route in ("literature", "memory_literature") and index in ("building", "unavailable"):
         notes.append("The library's search index is being built or is unavailable, so the researcher's papers could "
                      "not be searched for this question. Say so; do not say the library holds no evidence, and do not "
                      "answer from general knowledge as if it were cited.")
@@ -102,27 +107,30 @@ def markers(text):
 
 
 def _sentence_of(spans, text, offset):
-    """The sentence a marker at offset cites: the one it sits in, or, when only markers come before it in
-    that one ("Wages rose. [S1.1]", "工资上涨。[S1.1]"), the sentence before."""
+    """The sentence a marker at offset cites: the one it sits in, or, when only markers (or a table's cell
+    bars) come before it in that one ("Wages rose. [S1.1]", "工资上涨。[S1.1]", "| Wages rose. | [S1.1] |"),
+    the sentence before, as the interface underlines it (frontend/src/markdown.js)."""
     for i, (start, sentence) in enumerate(spans):
         if start <= offset < start + len(sentence):
-            if i and not _MALFORMED.sub("", text[start:offset]).strip():
+            if i and not _EDGES.sub("", _MALFORMED.sub("", text[start:offset])):
                 sentence = spans[i - 1][1]
-            return _LEADING.sub("", sentence)  # without the markers that cite the sentence before it
+            return _EDGES.sub("", _LEADING.sub("", sentence))  # without the markers that cite the sentence before it
     return ""
 
 
 def check_existence(conn, project_id, text, numbered):
     """The answer's citations, each with its existence, read in the transaction given: a list of dicts
-    for citation rows, each with the sentence it sits in."""
+    for citation rows, each with the sentence it sits in. A citation exists while the paper it names still
+    reads its passage (still_read): a passage another paper also reads does not keep a deleted paper's
+    citation. A source removed keeps no quote of its text."""
     spans = sentences(text)
     cited = [n for _, _, n in markers(text) if n in numbered]
-    current = readings(conn, project_id, {numbered[n]["passage_id"] for n in cited}, references=False) if cited else {}
+    current = still_read(conn, project_id, {(numbered[n]["passage_id"], numbered[n]["material_id"]) for n in cited})
     by_material = {}
     out = []
     for offset, marker, number in markers(text):
         sentence = _sentence_of(spans, text, offset)
-        row = {"marker": marker, "offset": offset, "sentence": sentence.strip(), "number": number}
+        row = {"marker": marker, "offset": offset, "sentence": sentence, "number": number}
         record = numbered.get(number) if number else None
         if record is None:
             out.append({**row, "existence": "not_found"})
@@ -131,7 +139,7 @@ def check_existence(conn, project_id, text, numbered):
         found = {"material_id": record["material_id"], "material_version_id": record["version_id"],
                  "passage_id": record["passage_id"], "quote": quote, "page": record.get("page"),
                  "evidence_type": record["evidence_type"], "retraction": record.get("retraction")}
-        if record["passage_id"] in current:
+        if (record["passage_id"], record["material_id"]) in current:
             out.append({**row, **found, "existence": "ok"})
             continue
         # Re-read since: a current reading of its paper that holds its quote still supports it (status.md,
@@ -143,13 +151,14 @@ def check_existence(conn, project_id, text, numbered):
         if holder is not None:
             r = by_material[record["material_id"]][holder]
             out.append({**row, **found, "passage_id": holder, "material_version_id": r[7], "page": r[5], "existence": "ok"})
-        else:  # its paper or passage may be gone: the row keeps only what still exists (foreign keys)
+        else:  # its paper or passage may be gone: the row keeps only what still exists (foreign keys), no quote
             kept = {k: v for k, v, table in (("material_id", found["material_id"], "materials"),
                                              ("material_version_id", found["material_version_id"], "material_versions"),
                                              ("passage_id", found["passage_id"], "passages"))
                     if conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (v,)).fetchone()}
+            kept = kept if "material_id" in kept else {}  # a deleted paper's citation keeps no link to the text
             out.append({**row, **found, "material_id": None, "material_version_id": None, "passage_id": None, **kept,
-                        "existence": "source_removed"})
+                        "quote": None, "existence": "source_removed"})
     return out
 
 

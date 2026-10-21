@@ -85,6 +85,21 @@ test('a marker after the sentence\'s end cites the sentence before it, as the ba
   assert.equal(html.replace(/<[^>]+>/g, '').includes('Prices fall.'), true);
 });
 
+test('an unsupported sentence is underlined across bold text, a link and a table row\'s cells', () => {
+  const bold = '**Earnings rise.** [S1.1] Prices hold.';
+  let html = render(bold, [cite(bold, '[S1.1]', { support: 'unsupported' })]);
+  assert.match(html, /<strong><span class="unsupported">Earnings rise\.<\/span><\/strong>/);
+  assert.doesNotMatch(html, /<span class="unsupported">[^<]*Prices/);
+  const table = '| Effect | Source |\n|---|---|\n| Earnings rise. | [S1.1] |';
+  html = render(table, [cite(table, '[S1.1]', { support: 'unsupported' })]);
+  assert.match(html, /<td><span class="unsupported">Earnings rise\.<\/span><\/td>/);
+  assert.doesNotMatch(html, /<th><span class="unsupported">/); // never past its row
+  const mixed = 'First claim. Rents *rise* in [the panel](https://example.com/x) a lot [S1.1].';
+  html = render(mixed, [cite(mixed, '[S1.1]', { support: 'unsupported' })]);
+  assert.equal((html.match(/class="unsupported"/g) ?? []).length, 5); // "Rents ", "rise", " in ", "the panel", " a lot "
+  assert.doesNotMatch(html, /<span class="unsupported">First claim/);
+});
+
 test('a citation that does not exist is never a chip, and an answer without its checks keeps its markers as text', () => {
   const text = 'Wages rise [S1.1]. Prices fall [S9.9]. Unclear [S1].';
   const html = render(text, [cite(text, '[S1.1]', { existence: 'source_removed' }), { ...cite(text, '[S9.9]'), existence: 'not_found' },
@@ -110,6 +125,7 @@ test('Details sums up the trace from its events, read a page at a time', async (
       { seq: 4, type: 'step_started', data: { step: 1, phase: 'judge', estimate_usd: 0.01 }, body_ref: null },
       { seq: 5, type: 'model_attempt', data: { step: 1, outcome: 'timeout' }, body_ref: 'bb' },
       { seq: 5.5, type: 'model_attempt', data: { step: 1, outcome: 'ok', body: 'cc' }, body_ref: null, body_removed: true },
+      { seq: 5.6, type: 'model_attempt', data: { step: 1, outcome: 'ok', body_unavailable: true }, body_ref: null },
       { seq: 6, type: 'citation_checks', data: { citations: [{ marker: '[S1.1]', existence: 'ok', support: 'unchecked' }] }, body_ref: null },
       { seq: 7, type: 'run_finished', data: { status: 'succeeded' }, body_ref: null },
     ], next: null },
@@ -122,8 +138,8 @@ test('Details sums up the trace from its events, read a page at a time', async (
   assert.deepEqual(found.retrieval, { route: 'literature', decided_by: 'fallback' });
   assert.deepEqual(found.search, { mode: 'hybrid', reason: null, passages: 2, rerank: 'fallback' });
   assert.deepEqual(found.steps.map((s) => [s.phase, s.estimate, s.cut, s.attempts.map((a) => [a.outcome, a.body])]),
-    [['answer', 0.05, true, [['ok', 'aa']]], ['judge', 0.01, false, [['timeout', 'bb'], ['ok', null]]]]);
-  assert.deepEqual(found.steps[1].attempts.map((a) => a.removed), [false, true]); // its text went with a deleted paper
+    [['answer', 0.05, true, [['ok', 'aa']]], ['judge', 0.01, false, [['timeout', 'bb'], ['ok', null], ['ok', null]]]]);
+  assert.deepEqual(found.steps[1].attempts.map((a) => [a.removed, a.unavailable]), [[false, false], [true, false], [false, true]]);
   assert.equal(found.checks.length, 1);
   assert.equal(found.finished, 'succeeded');
 });

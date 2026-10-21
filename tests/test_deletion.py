@@ -377,7 +377,7 @@ def test_deleting_a_material_removes_its_versions_and_marks_citations_elsewhere(
     assert ids_in(db, "materials", [x["m1"]]) | ids_in(db, "material_versions", [x["v1"]]) == set()
     assert ids_in(db, "extractions", [x["e1"]]) | ids_in(db, "passages", [x["s1"]]) == set()
     assert one(db, "SELECT material_id, material_version_id, passage_id, existence, quote FROM citations WHERE id = ?",
-               x["ct1"]) == (None, None, None, "source_removed", "quote p")
+               x["ct1"]) == (None, None, None, "source_removed", None)  # S1-19b: no copy of the source's text
     assert one(db, "SELECT material_id, status FROM candidates WHERE id = ?", x["k1"]) == (None, "added")
     assert ids_in(db, "memory_records", [only_source]) == set()
     assert tombstones(db) == {(x["m1"], "material", "Paper p"), (only_source, "memory", None)}

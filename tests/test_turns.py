@@ -231,12 +231,15 @@ async def test_cancel_during_the_model_call_ends_the_turn_and_settles_its_estima
         assert (settled, basis) == (estimate, "estimated") and estimate > 0  # never shown as $0
         [(step,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_started'", run_id)
         assert json.loads(step)["estimate_usd"] == estimate  # the request-sized estimate, settled once (S1-19)
-        # The attempt cut off in flight is recorded, content-free, with an unknown charge.
+        # The attempt cut off in flight is recorded, content-free, with an unknown charge; it names the exact
+        # text it sent (S1-19b: stored before it was sent, in the content store, never in the event).
         [(attempt,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
                                   run_id)
         assert json.loads(attempt) == {"step": 0, "route": json.loads(attempt)["route"], "outcome": "cancelled",
                                        "http_status": None, "dispatched": True, "charge": "unknown",
-                                       "retention": {"level": "normal"}}  # the terms it was sent under
+                                       "retention": {"level": "normal"},  # the terms it was sent under
+                                       "body": json.loads(attempt)["body"]}
+        assert len(json.loads(attempt)["body"]) == 64
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert turn["accounting"] == {"reported_usd": 0, "estimated_usd": estimate, "unknown_attempts": 1,
                                       "complete": True}
@@ -1163,7 +1166,7 @@ async def test_stop_during_the_judge_call_settles_each_step_once_and_publishes_n
         assert await rows(client, "SELECT answer FROM turns WHERE run_id = ?", run_id) == [(None,)]
         assert await rows(client, "SELECT count(*) FROM citations") == [(0,)]
         spending = sorted(await rows(client, "SELECT status, basis, settled_usd > 0 FROM budget_reservations"
-                                             " WHERE run_id = ?", run_id))
+                                             " WHERE run_id = ? AND status != 'released'", run_id))  # the judge's share
         assert spending == [("settled", "estimated", 1), ("settled", "reported", 1)]
         again = await send(client, conversation, "What do minimum wages do to earnings?")  # a new turn
         assert again[-1]["status"] == "succeeded"
@@ -1197,4 +1200,5 @@ async def test_two_conversations_of_one_project_asking_at_once_keep_their_own_ci
         for conversation, material in ((first, wages), (second, rents)):
             [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
             assert [c["material_id"] for c in turn["citations"]] == [material]
-            assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ?", turn["run_id"]) == [(2,)]
+            assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status != 'released'",
+                              turn["run_id"]) == [(2,)]  # the answer's and the judge's; the judge's share released

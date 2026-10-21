@@ -215,6 +215,17 @@ def readings(conn, project_id, passage_ids=None, references=True, materials=None
     return found
 
 
+def still_read(conn, project_id, pairs):
+    """Of the (passage id, material id) pairs given, those whose material, current in the project, reads
+    that passage now (S1-19: a request's evidence, checked before each dispatch and at each answer's
+    commit). A passage another material also reads does not keep a deleted or re-read material's pair."""
+    by_material = {}
+    for pid, material in pairs:
+        by_material.setdefault(material, set()).add(pid)
+    return {(pid, material) for material, pids in by_material.items()
+            for pid in readings(conn, project_id, pids, references=False, materials=[material])}
+
+
 def granted(conn, project_id):
     """The ids of the passages a current version of a material in the project reads now (as readings)."""
     return {pid for (pid,) in conn.execute(f"SELECT p.id FROM {_readings_from()} WHERE m.project_id = ?", (project_id,))}
@@ -996,8 +1007,8 @@ class SearchIndex:
 
     def dense(self, project_id, vector, limit, materials=None):
         """The nearest embedded passage ids in the project to vector, nearest first (references have none);
-        with materials, the nearest of those papers' passages, among the project's nearest 4,096 (vec0's
-        largest k)."""
+        with materials, the nearest of those papers' own passages (S1-19: a selection), by the same cosine
+        distance, over every embedded passage of theirs."""
         if not self.vectors:
             return []
         if len(vector) != DIMENSIONS or not 0 <= limit <= 4096:  # refused before the read (vec0's largest k is 4096):
@@ -1006,12 +1017,11 @@ class SearchIndex:
             return [pid for (pid,) in self._read(lambda conn: conn.execute(
                 "SELECT passage_id FROM vec_passages WHERE embedding MATCH ? AND k = ? AND project_id = ? ORDER BY distance",
                 (sqlite_vec.serialize_float32(vector), limit, project_id)).fetchall())]
-        # ponytail: a selection's nearest from the project's 4,096 nearest; a partition key per paper if selections outgrow it
         return [pid for (pid,) in self._read(lambda conn: conn.execute(
-            "SELECT v.passage_id FROM vec_passages v JOIN index_rows r ON r.id = v.rowid"
-            " WHERE v.embedding MATCH ? AND v.k = 4096 AND v.project_id = ?"
-            " AND r.material_id IN (SELECT value FROM json_each(?)) ORDER BY v.distance LIMIT ?",
-            (sqlite_vec.serialize_float32(vector), project_id, json.dumps(list(materials)), limit)).fetchall())]
+            "SELECT v.passage_id FROM index_rows r JOIN vec_passages v ON v.rowid = r.id"
+            " WHERE r.project_id = ? AND r.material_id IN (SELECT value FROM json_each(?))"
+            " ORDER BY vec_distance_cosine(v.embedding, ?), v.rowid LIMIT ?",
+            (project_id, json.dumps(list(materials)), sqlite_vec.serialize_float32(vector), limit)).fetchall())]
 
     def counts(self, project_id):
         """{material id: (indexed, embedded, embeddable, refused)} for the project's rows."""

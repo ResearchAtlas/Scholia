@@ -30,74 +30,115 @@ function finder(citations) {
   };
 }
 
-// The text from the start of its sentence, within one text node, to a marker run. A run that follows the
-// sentence's end ("Wages rose. [S1.1]") cites the sentence before it, as backend/citations.py reads it.
-function sentenceStart(before) {
-  const starts = [0, ...[...before.matchAll(SENTENCE_END)].map((match) => match.index + match[0].length)];
-  const last = starts.at(-1);
-  const start = before.slice(last).trim() || starts.length < 2 ? last : starts.at(-2);
-  return start + (before.slice(start).length - before.slice(start).trimStart().length); // not the space before it
+const BLOCKS = new Set(['paragraph', 'heading', 'tableRow']); // a sentence never runs past one of these
+const MARKERS_AND_BARS = /\[S[^\]\n]{0,12}\]|\|/g;
+
+// The consecutive markers in a text ([S1.1][S1.2] cite one sentence together), each with its citation.
+function runsOf(node, find, citations) {
+  const value = node.value;
+  const base = node.position?.start?.offset;
+  const runs = [];
+  for (const match of value.matchAll(MARKER)) {
+    const chip = { start: match.index, end: match.index + match[0].length, marker: match[0],
+      index: find(match[0], base === undefined ? -1 : base + match.index) };
+    const last = runs.at(-1);
+    if (last && RUN_GAP.test(value.slice(last.end, chip.start))) { last.chips.push(chip); last.end = chip.end; } else {
+      runs.push({ start: chip.start, end: chip.end, chips: [chip] });
+    }
+  }
+  for (const run of runs) {
+    run.unsupported = run.chips.some(({ index }) => citations[index]?.support === 'unsupported' && citations[index]?.existence === 'ok');
+  }
+  return runs;
+}
+
+// Where sentences end in a leaf's text: after . ! ? before a space (or before the next leaf's space, as
+// `**Wages rose.** [S1.1]` ends its sentence), and after 。！？.
+function sentenceEnds(value, next) {
+  return [...(value + next).matchAll(SENTENCE_END)].map((m) => m.index + m[0].length).filter((at) => at <= value.length);
+}
+
+// Mark the sentence a marker run at `to` in leaves[i] cites, from `from` (the previous run's end) back to the
+// sentence's start, across the leaves of its block (bold, a link, a table row's cells): each leaf gets its own
+// range. A run that follows its sentence's end ("Wages rose. [S1.1]", "| Wages rose. | [S1.1] |") cites the
+// sentence before it, as backend/citations.py reads it.
+function markBack(leaves, i, from, to) {
+  let seen = '';
+  for (let j = i; j >= 0 && leaves[j].block === leaves[i].block; j -= 1) {
+    const value = leaves[j].node.value;
+    const [lower, upper] = j === i ? [from, to] : [0, value.length];
+    const next = j + 1 < leaves.length ? leaves[j + 1].node.value.slice(0, 1) : '';
+    const ends = sentenceEnds(value.slice(0, upper), j === i ? value.slice(upper, upper + 1) : next)
+      .filter((at) => at >= lower && at < upper);
+    for (const at of ends.reverse()) {
+      if ((value.slice(at, upper) + seen).replace(MARKERS_AND_BARS, '').trim()) {
+        const text = value.slice(at, upper);
+        leaves[j].marks.push([at + (text.length - text.trimStart().length), upper]);
+        return;
+      }
+    }
+    leaves[j].marks.push([lower, upper]);
+    seen = value.slice(lower, upper) + seen;
+    if (j === i && lower > 0) return; // within its text node a previous run ends the sentence's reach
+  }
 }
 
 // remark plugin: markers in text become `cite` elements naming their citation's index in the record, and
-// the text of an unsupported sentence before them a `span.unsupported`. Text in code, and in a link (a
-// chip is a button), is left as it is.
+// the text of an unsupported sentence before them `span.unsupported`, across the Markdown nodes that
+// sentence spans. Text in code, and in a link (a chip is a button), keeps its markers as they are.
 export function citationChips({ citations = [] } = {}) {
   return (tree) => {
     const find = finder(citations);
-    const walk = (node, inLink) => {
-      if (!node.children) return;
-      const out = [];
-      for (const child of node.children) {
-        if (child.type === 'text' && !inLink) out.push(...split(child, find, citations));
-        else {
-          walk(child, inLink || child.type === 'link' || child.type === 'linkReference');
-          out.push(child);
-        }
+    const leaves = [];
+    const collect = (node, block, inLink) => {
+      for (const child of node.children ?? []) {
+        if (child.type === 'text') leaves.push({ node: child, parent: node, block, inLink, marks: [], runs: [] });
+        else collect(child, BLOCKS.has(child.type) ? child : block, inLink || child.type === 'link' || child.type === 'linkReference');
       }
-      node.children = out;
     };
-    walk(tree, false);
+    collect(tree, tree, false);
+    for (const leaf of leaves) if (!leaf.inLink) leaf.runs = runsOf(leaf.node, find, citations);
+    leaves.forEach((leaf, i) => {
+      let cursor = 0;
+      for (const run of leaf.runs) {
+        if (run.unsupported) markBack(leaves, i, cursor, run.start);
+        cursor = run.end;
+      }
+    });
+    for (const leaf of leaves) {
+      if (leaf.runs.length || leaf.marks.some(([a, b]) => b > a)) leaf.node.replacement = rebuild(leaf);
+    }
+    const replace = (node) => {
+      if (!node.children) return;
+      node.children = node.children.flatMap((child) => child.replacement ?? [child]);
+      for (const child of node.children) replace(child);
+    };
+    replace(tree);
   };
 }
 
-function split(node, find, citations) {
-  const value = node.value;
-  const base = node.position?.start?.offset;
-  const matches = [...value.matchAll(MARKER)];
-  if (!matches.length) return [node];
-  const runs = []; // consecutive markers, each run with the matches in it
-  for (const match of matches) {
-    const last = runs.at(-1);
-    const previous = last?.at(-1);
-    if (previous && RUN_GAP.test(value.slice(previous.index + previous[0].length, match.index))) last.push(match);
-    else runs.push([match]);
-  }
+// A leaf's text as nodes: its chips, its marked ranges as `span.unsupported`, the rest as text.
+function rebuild(leaf) {
+  const value = leaf.node.value;
+  const chips = leaf.runs.flatMap((run) => run.chips);
+  const cuts = new Set([0, value.length, ...leaf.marks.flat(), ...chips.flatMap((c) => [c.start, c.end])]);
+  const points = [...cuts].filter((at) => at >= 0 && at <= value.length).sort((a, b) => a - b);
   const out = [];
-  let cursor = 0;
-  for (const run of runs) {
-    const before = value.slice(cursor, run[0].index);
-    const chips = run.map((match) => ({ match, index: find(match[0], base === undefined ? -1 : base + match.index) }));
-    const unsupported = chips.some(({ index }) => citations[index]?.support === 'unsupported' && citations[index]?.existence === 'ok');
-    const start = unsupported ? sentenceStart(before) : before.length;
-    if (before.slice(0, start)) out.push({ type: 'text', value: before.slice(0, start) });
-    if (before.slice(start)) {
-      out.push({ type: 'unsupported', data: { hName: 'span', hProperties: { className: ['unsupported'] } },
-        children: [{ type: 'text', value: before.slice(start) }] });
-    }
-    let end = run[0].index;
-    for (const { match, index } of chips) {
-      const gap = value.slice(end, match.index);
-      if (gap) out.push({ type: 'text', value: gap });
-      out.push(index < 0 ? { type: 'text', value: match[0] } : {
-        type: 'citation', data: { hName: 'cite', hProperties: { dataCitation: String(index) } },
-        children: [{ type: 'text', value: match[0] }],
+  for (let k = 0; k + 1 < points.length; k += 1) {
+    const [a, b] = [points[k], points[k + 1]];
+    const chip = chips.find((c) => c.start === a);
+    if (chip) {
+      out.push(chip.index < 0 ? { type: 'text', value: chip.marker } : {
+        type: 'citation', data: { hName: 'cite', hProperties: { dataCitation: String(chip.index) } },
+        children: [{ type: 'text', value: chip.marker }],
       });
-      end = match.index + match[0].length;
+      continue;
     }
-    cursor = end;
+    const text = value.slice(a, b);
+    const marked = leaf.marks.some(([x, y]) => x <= a && b <= y);
+    out.push(marked ? { type: 'unsupported', data: { hName: 'span', hProperties: { className: ['unsupported'] } },
+      children: [{ type: 'text', value: text }] } : { type: 'text', value: text });
   }
-  if (value.slice(cursor)) out.push({ type: 'text', value: value.slice(cursor) });
   return out;
 }
 

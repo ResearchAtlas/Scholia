@@ -115,9 +115,12 @@ async def test_the_citation_endpoints_resolve_existence_and_check_support_as_a_r
         client.provider.verdicts = "1: partly"
         started_check = await client.post("/api/citations/check", json={"run_id": stream[0]["run_id"]})
         assert started_check.status_code == 202
-        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", started_check.json()["run_id"])
-        assert (json.loads(inputs)["passage_ids"], json.loads(inputs)["material_ids"]) == ([chip["passage_id"]], [material])
-        done = await run_finished(client, started_check.json()["run_id"])
+        [check_run] = started_check.json()["run_ids"]  # one batch
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", check_run)
+        inputs = json.loads(inputs)
+        assert (inputs["evidence"], inputs["material_ids"]) == ([[chip["passage_id"], material]], [material])
+        assert inputs["pairs"] == [[chip["sentence"], chip["passage_id"], material, [chip["id"]]]]
+        done = await run_finished(client, check_run)
         assert done["status"] == "succeeded" and done["workflow"] == "citation_check"
         assert await rows(client, "SELECT support FROM citations WHERE id = ?", chip["id"]) == [("partly",)]
         [listed] = [r for r in (await client.get("/api/activity")).json()["runs"] if r["run_id"] == done["run_id"]]

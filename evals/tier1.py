@@ -295,9 +295,9 @@ async def rerank(state, project_id, query):
     order, note = await reranked(query, [r["passage_id"] for r in results], {r["passage_id"]: r["text"] for r in results},
                                  lambda q, texts, deadline: helper.rerank(q, texts, deadline=deadline, project_id=project_id),
                                  values)
-    if order is None:
-        return {**answer, "reason": answer["reason"] or ("rerank_deadline" if note["fallback"] == "deadline"
-                                                         else "rerank_unavailable"), "rerank": note}
+    if order is None:  # a reranker that cannot serve is said whatever else happened, so the arm is never scored
+        reason = (answer["reason"] or "rerank_deadline") if note["fallback"] == "deadline" else "rerank_unavailable"
+        return {**answer, "reason": reason, "rerank": note}
     by_id = {r["passage_id"]: r for r in results}
     return {**answer, "results": [by_id[pid] for pid in order] + results[len(order):], "rerank": note}
 

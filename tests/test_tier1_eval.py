@@ -744,3 +744,22 @@ def test_the_rules_hash_ignores_the_levels_only_and_an_older_file_is_judged_by_i
     assert tier1.rules_sha256({**manifest, "search_limit": 49}) != tier1.rules_sha256(manifest)
     assert tier1.rules_of({"manifest_rules_sha256": "r", "manifest_sha256": "m"}) == "r"
     assert tier1.rules_of({"manifest_sha256": "m"}) == "m"  # predates the rules hash: never like a newer run
+
+
+@pytest.mark.asyncio
+async def test_a_reranker_that_cannot_serve_is_said_even_when_the_hybrid_search_fell_back(monkeypatch):
+    # Review b1 (13): a retrieval deadline must not hide the reranker's failure (the arm is then unscored).
+    from backend.local_helper import HelperUnavailable, RERANKER_MODEL
+
+    async def hybrid(state, project_id, query):
+        return {"results": [{"passage_id": "p", "text": "t"}], "mode": "keyword_only", "reason": "deadline"}
+
+    class Broken:
+        async def rerank(self, *args, **kwargs):
+            raise HelperUnavailable("request_failed")
+    monkeypatch.setattr(tier1, "hybrid", hybrid)
+    state = {"local_helper": type("L", (), {"helpers": {RERANKER_MODEL["id"]: Broken()}})(), "data_dir": "x"}
+    monkeypatch.setattr("backend.settings.load_settings", lambda folder: type("S", (), {"values": {"retrieval": {
+        "rerank_top": 24, "rerank_ms": 500}}})())
+    answer = await tier1.rerank(state, "p", "q")
+    assert answer["reason"] == "rerank_unavailable"

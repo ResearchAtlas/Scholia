@@ -11,10 +11,13 @@ bodies it sent; and an answer's citations, resolved again or checked again.
 - `POST /api/citations/resolve`: each citation's existence now (a batch existence check): its passage
   still read by its paper, or its quote held by a current reading of the paper (status.md, decided
   2026-10-17 (8)), else `source_removed`. Nothing is written.
-- `POST /api/citations/check`: the support judge again on an answer's citations, as a background run of
-  the project (workflow `citation_check`): admitted and reserved like any model call, listed with its
-  cost, up to `[retrieval] judge_pairs` pairs a run; the passages it sends are registered with the
-  dispatch check, so one deleted or re-read before its dispatch stops it.
+- `POST /api/citations/check`: the support judge again on an answer's citations, as background runs of
+  the project (workflow `citation_check`), one per batch of up to `[retrieval] judge_pairs` pairs, so
+  every pair is judged: each admitted and reserved like any model call and listed with its cost; on
+  `[models] judge` when it is set (a judge that cannot run fails the run, visibly), else the answer's
+  route. Each run names the exact (sentence, passage) pairs it judges, and a verdict is written only
+  to a citation that still has that sentence and passage. The passages it sends are registered with
+  the dispatch check, so one deleted or re-read before its dispatch stops it.
 """
 
 import asyncio
@@ -24,7 +27,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from backend import governance
+from backend import citations, governance
+from backend.settings import load_settings, visible
 from backend.db import ContentCorruptError
 from backend.runs import AdmissionError
 from backend.search_index import readings
@@ -80,9 +84,14 @@ async def body(run_id: str, sha256: str, request: Request):
     found = await asyncio.to_thread(state["db"].read, find)
     if found == "kept":
         try:
-            return Response(await asyncio.to_thread(state["content"].read, sha256), media_type="application/json")
+            data = await asyncio.to_thread(state["content"].read, sha256)
         except (OSError, ContentCorruptError):  # removed between that read and this one (a deletion, then collection)
-            found = await asyncio.to_thread(state["db"].read, find)
+            data = None
+        # Read again once the text is in hand: a deletion that committed meanwhile wins, so no text leaves
+        # after the record says it was removed.
+        found = await asyncio.to_thread(state["db"].read, find)
+        if found == "kept" and data is not None:
+            return Response(data, media_type="application/json")
     if found in ("removed", "kept"):
         raise AdmissionError(410, "body_removed", "This text was removed with a deleted paper")
     raise AdmissionError(404, "not_found", "No such request body")
@@ -113,32 +122,50 @@ async def resolve(body: Resolve, request: Request):
 
 @router.post("/api/citations/check", status_code=202)
 async def check(body: Check, request: Request):
-    """Start a support check of an answer's citations; returns its background run's id."""
-    harness = _state(request)["harness"]
+    """Start a support check of an answer's citations: {"run_ids": [...]}, one background run per batch."""
+    state = _state(request)
+    harness = state["harness"]
+    values = await asyncio.to_thread(lambda: load_settings(state["data_dir"]).values)
+    size, judge = values["retrieval"]["judge_pairs"], visible(values["models"].get("judge"))
+
+    def cited(conn):
+        return conn.execute(
+            "SELECT c.id, json_extract(c.context, '$.sentence'), c.passage_id, c.material_id FROM citations c"
+            " WHERE c.owner_kind = 'answer' AND c.owner_id = ? AND c.existence = 'ok' AND c.passage_id IS NOT NULL"
+            " ORDER BY c.rowid", (body.run_id,)).fetchall()
+    expected = await asyncio.to_thread(state["db"].read, cited)
 
     def record(conn, ids):
         row = conn.execute(
-            "SELECT r.project_id, json_extract(r.inputs, '$.route') FROM turns t JOIN runs r ON r.id = t.run_id"
-            " WHERE t.run_id = ? AND r.status = 'succeeded'", (body.run_id,)).fetchone()
+            "SELECT r.project_id, json_extract(r.inputs, '$.route'), json_extract(r.inputs, '$.context_materials')"
+            " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.run_id = ? AND r.status = 'succeeded'",
+            (body.run_id,)).fetchone()
         if row is None:
             raise AdmissionError(404, "not_found", "No such answer")
-        project_id, route = row
+        project_id, route, held = row
         policy = governance.policy(conn, project_id)
         if policy is None or policy.locked:
             raise AdmissionError(403, "review_locked", "This project is review-locked")
-        cited = conn.execute("SELECT passage_id, material_id FROM citations WHERE owner_kind = 'answer' AND owner_id = ?"
-                             " AND existence = 'ok' AND passage_id IS NOT NULL", (body.run_id,)).fetchall()
-        if not cited:
+        pairs = {}  # (sentence, passage) -> [citation ids, material]
+        for cid, sentence, pid, material in cited(conn):
+            pairs.setdefault((sentence or "", pid), [[], material])[0].append(cid)
+        if not pairs:
             raise AdmissionError(409, "nothing_to_check", "The answer has no citation to check")
+        batches = citations.batches([[s, p, m, cids] for (s, p), (cids, m) in pairs.items()], size)
+        if len(batches) > len(ids):  # citations added since the count above: asked again
+            raise AdmissionError(409, "changed", "The answer's citations changed; check again")
         provider, _, model = (route or ":").partition(":")
-        conn.execute("INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
-                     " VALUES (?, ?, 'background', 'citation_check', ?, ?)",
-                     (ids[0], project_id, body.run_id, json.dumps({"check": body.run_id, "provider": provider, "model": model,
-                                 # registered with the dispatch check and deletion's scope links, as a turn's are
-                                 "passage_ids": sorted({p for p, _ in cited}),
-                                 "material_ids": sorted({m for _, m in cited if m})})))
-        return ids[0], [ids[0]]
+        for run_id, batch in zip(ids, batches):
+            conn.execute(
+                "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
+                " VALUES (?, ?, 'background', 'citation_check', ?, ?)",
+                (run_id, project_id, body.run_id, json.dumps({
+                    "check": body.run_id, "provider": provider, "model": judge or model, "pairs": batch,
+                    # registered with the dispatch check and deletion's scope links, as a turn's are
+                    "evidence": sorted({(p, m) for _, p, m, _ in batch}),
+                    "material_ids": sorted({m for _, _, m, _ in batch}),
+                    "context_materials": sorted({*json.loads(held or "[]"), *(m for _, _, m, _ in batch)})})))
+        return ids[:len(batches)], ids[:len(batches)]
 
-    run_id = await harness.record_background(1, record)
-    return {"run_id": run_id}
-
+    run_ids = await harness.record_background(max(1, -(-len(expected) // size)) + 1, record)
+    return {"run_ids": run_ids}

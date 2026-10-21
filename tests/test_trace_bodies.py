@@ -42,21 +42,23 @@ async def collected(client, shas):
 # Lifecycle
 
 
-async def test_a_paper_deleted_while_its_answer_is_being_recorded_keeps_no_body_of_its_text(tmp_path, monkeypatch):
-    # The deletion commits after the answer came back and before its record: the body holding the paper's
-    # passages is never kept, and the run, revoked by the deletion, publishes nothing.
-    async with cited(tmp_path) as client:
-        project, [material] = await with_papers(client, WAGES)
-        conversation = await conversation_in(client, project)
-        real, done = runs_module._stored, []
+async def test_a_paper_deleted_while_its_answer_is_being_recorded_keeps_no_body_of_its_text(tmp_path):
+    # The body is stored before it is sent; the deletion commits while the call is out, before its record:
+    # the body holding the paper's passages is never kept, and the run, revoked by the deletion, publishes nothing.
+    from cited import ANSWER
+    holder = {}
 
-        def delete_then_store(content, body):
-            if not done:
-                done.append(deletion.delete(client.state["db"], content, "material", material))
-            return real(content, body)
-        monkeypatch.setattr(runs_module, "_stored", delete_then_store)
+    async def delete_then_answer():
+        client = holder["client"]
+        await asyncio.to_thread(deletion.delete, client.state["db"], client.state["content"], "material", holder["material"])
+        return provider.answer(ANSWER)
+    provider = Provider(answer_text=lambda body: delete_then_answer())
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        holder.update(client=client, material=material)
+        conversation = await conversation_in(client, project)
         stream = await send(client, conversation, QUESTION)
-        assert stream[-1]["status"] in ("cancelled", "failed") and done
+        assert stream[-1]["status"] in ("cancelled", "failed")
         run_id = stream[0]["run_id"]
         found = await bodies_of(client, run_id)
         assert found and all(status == 410 and removed and ref is None for status, removed, ref in found.values())

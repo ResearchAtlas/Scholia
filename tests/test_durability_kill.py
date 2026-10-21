@@ -289,7 +289,9 @@ async def cited_state(client):
     turn = await rows(client, "SELECT r.status, t.answer IS NOT NULL FROM runs r JOIN turns t ON t.run_id = r.id")
     citations = await rows(client, "SELECT existence, support FROM citations")
     spending = sorted(await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations"
-                                         " WHERE run_id IN (SELECT run_id FROM turns)"))
+                                         " WHERE run_id IN (SELECT run_id FROM turns) AND status != 'released'"))
+    # The judge's share held with the answer is released, not charged, after a crash (runs._release_allowances).
+    assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(0,)]
     return turn, citations, spending
 
 
