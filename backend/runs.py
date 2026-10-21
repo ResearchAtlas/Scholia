@@ -798,7 +798,7 @@ class Harness:
             await handed({"type": "route", "route": decision["route"], "decided_by": decision["decided_by"]})
             found = {"records": [], "mode": None, "reason": None}
             if decision["route"] in RETRIEVAL_ROUTES:
-                found = await self._evidence(claim, ctx)
+                found = await self._evidence(claim, ctx, decision)
             numbered, request = self._cited_request(ctx, found, decision)
             await self._register_context(claim, numbered)  # the dispatch check now covers its passages
             judge = await self._judge_route(ctx)
@@ -1129,16 +1129,25 @@ class Harness:
             raise asyncio.CancelledError() from None
         return decision
 
-    async def _evidence(self, claim, ctx):
+    async def _evidence(self, claim, ctx, decision):
         """The pipeline's evidence for the turn (backend/pipeline.py), traced. Nothing when the app has no
-        search index (keyword-only and unavailable, said)."""
+        search index (keyword-only and unavailable, said). A selection is read whole only when the answer's
+        request, assembled as it will be sent, holds every one of its records (B40)."""
         from backend import pipeline, search  # search imports this module
         state = search._STATES.get(self)
+
+        def whole(records):
+            try:
+                request = self._cited_request(ctx, {"records": records, "mode": "selection", "reason": None}, decision)[1]
+            except context.OverWindow:
+                return False
+            return not request.cuts.get("research_evidence")
         if state is None:
             found = {"records": [], "mode": "keyword_only", "reason": "index_unavailable",
                      "trace": {"index": "unavailable"}}
         else:
-            found = await pipeline.evidence(state, ctx["project_id"], ctx["message"], materials=ctx["selection"])
+            found = await pipeline.evidence(state, ctx["project_id"], ctx["message"], materials=ctx["selection"],
+                                            whole=whole)
 
         def record(conn):
             if not _running(conn, claim.run_id) or _revoked(conn, claim.run_id):

@@ -3,9 +3,10 @@ and 70).
 
 1. The query is normalized (visible, NFKC) and filtered on metadata: a selection (papers selected in the
    Library or @-mentioned) restricts it to those papers.
-2. Selected papers whose passages fit the evidence budget whole are read directly, in their order;
-   otherwise BM25 (top 50) and dense retrieval (top 50) run concurrently, within `hybrid_ms`
-   (backend/search.py, retrieve), restricted to the selection when there is one.
+2. Selected papers whose evidence records (each passage with its marker, title and facts, as the request
+   holds them) fit the request's room for evidence whole are read directly, in their order; otherwise
+   BM25 (top 50) and dense retrieval (top 50) run concurrently, within `hybrid_ms` (backend/search.py,
+   retrieve), restricted to the selection when there is one.
 3. The lists are fused by reciprocal rank fusion (k 60).
 4. The top 8 are kept. Reranking is off by default: no setting enables it, and it runs only when a
    caller passes a reranker in (the tier 1 `rerank` arm and tests; ticket 70: no reranker qualifies
@@ -25,7 +26,7 @@ import json
 import time
 import unicodedata
 
-from backend import context, search
+from backend import citations, context, search
 from backend.search_index import readings
 from backend.settings import load_settings, visible
 
@@ -62,10 +63,18 @@ async def reranked(query, fused, texts, rerank, values):
     return order, {"order": order, "ms": _ms(began)}
 
 
-async def evidence(state, project_id, query, *, materials=None, rerank=None):
+def fits(records, room):
+    """Whether the request's evidence section holds these records whole in room tokens: the records as
+    citations.bundle writes them, counted as the context assembler counts them."""
+    lines = citations.bundle(citations.sources(records))
+    return not context._take(lines, room - context.count(f"## {context.LABELS['research_evidence']}\n"))[2]
+
+
+async def evidence(state, project_id, query, *, materials=None, rerank=None, whole=None):
     """The evidence for a turn: {"records": [...], "mode", "reason", "trace"}. materials, if given, is the
     selection (material ids, in the order chosen). rerank(query, texts, deadline) -> scores or None is the
-    optional reranker."""
+    optional reranker. whole(records) says whether the turn's request holds the selection's records whole
+    (backend/runs.py assembles it); without it, they are counted against the evidence budget (fits)."""
     started = time.monotonic()
     settings = load_settings(state["data_dir"]).values
     values, budget = settings["retrieval"], settings["context"]["research_evidence"]
@@ -73,13 +82,14 @@ async def evidence(state, project_id, query, *, materials=None, rerank=None):
     db = state["db"]
     trace = {"query": text, "selection": list(materials) if materials else None}
     if materials:
-        # Selected papers that fit the evidence budget whole are read directly, in their order.
+        # Selected papers whose records fit the request whole are read directly, in their order (B40: the
+        # records with their framing, not the passages' text, else the assembler cuts the last ones).
         rows = await asyncio.to_thread(db.read, lambda conn: list(
             readings(conn, project_id, references=False, materials=materials).items()))
         rows.sort(key=lambda item: (materials.index(item[1][0]), item[1][6]))  # paper, then passage order
-        size = sum(context.count(row[4]) for _, row in rows)
-        if rows and size <= budget:
-            records = await asyncio.to_thread(db.read, lambda conn: _records(conn, rows))
+        size = sum(context.count(row[4]) for _, row in rows)  # the text alone over the budget never fits
+        records = await asyncio.to_thread(db.read, lambda conn: _records(conn, rows)) if rows and size <= budget else []
+        if records and (whole(records) if whole else fits(records, budget)):
             trace.update(read_directly=True, selected=[r["passage_id"] for r in records], total_ms=_ms(started))
             return {"records": records, "mode": "selection", "reason": None, "trace": trace}
         trace["read_directly"] = False

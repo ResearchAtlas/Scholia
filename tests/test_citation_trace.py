@@ -11,7 +11,7 @@ import pytest
 from backend import citations
 from cited import ANSWER, Provider, cited, conversation_in, events_of, rows, with_papers
 from scholia_app import run_finished, send
-from test_search import WAGES, paper
+from test_search import WAGES, paper, setting
 
 pytestmark = pytest.mark.asyncio
 QUESTION = "What do minimum wages do to earnings?"
@@ -84,6 +84,29 @@ async def test_selected_papers_that_fit_are_read_whole_and_larger_ones_are_searc
         bad = await client.post(f"/api/conversations/{conversation}/message/stream",
                                 json={"content": "Summarize.", "material_ids": ["00000000-0000-4000-8000-000000000000"]})
         assert (bad.status_code, bad.json()["code"]) == (400, "selection_invalid")
+
+
+async def test_a_selection_whose_records_do_not_fit_with_their_framing_is_searched_within_not_cut(tmp_path):
+    # B40: the passages' text alone fits the evidence budget, but with each record's marker, title and evidence
+    # type it does not; the selection is searched within, so the last passage, which holds the answer, is sent
+    # rather than cut from the end.
+    from backend import context
+    from backend.search_index import readings
+    answer = "Zebra stripes confuse biting flies in the synthetic paddock."
+    filler = [f"Paragraph {i} describes the synthetic paddock's fences and gates." for i in range(12)]
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Stripes", *filler, answer))
+        texts = await asyncio.to_thread(client.state["db"].read, lambda conn: [
+            row[4] for row in readings(conn, project, references=False, materials=[material]).values()])
+        assert answer in texts[-1]
+        await setting(client, "context.research_evidence", sum(context.count(t) for t in texts) + 2)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "What do zebra stripes do to biting flies?", material_ids=[material])
+        assert stream[-1]["status"] == "succeeded"
+        [body] = client.provider.answers
+        assert answer in body["messages"][0]["content"]
+        [trace] = [d for kind, d, _ in await events_of(client, stream[0]["run_id"]) if kind == "retrieval_trace"]
+        assert trace["read_directly"] is False
 
 
 async def test_an_answer_with_no_evidence_states_it_and_a_keyword_only_search_says_so(tmp_path):
