@@ -562,6 +562,23 @@ async def test_a_merge_that_adds_nothing_leaves_the_projects_order(tmp_path):
         assert await first_project(client) == other
 
 
+@pytest.mark.parametrize("edited", [False, True])
+async def test_a_lookup_answered_later_puts_the_project_first_only_when_it_fills_the_paper(tmp_path, edited):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "Resolved", retracted=True)})) as client:
+        project = await project_of(client, level="local_only")  # its lookup waits on the question
+        result = await imported(client, project, ris(("An Imported Paper", f"DO  - {DOI}\n")))
+        [ask] = await asks_of(client, project)
+        [paper] = result["imported"]
+        if edited:  # a paper the researcher edited takes nothing from a lookup, which checks its retraction alone
+            assert (await client.patch(f"/api/materials/{paper}", json={"title": "Edited, by me"})).status_code == 200
+        other = await project_of(client, "Changed since")
+        assert (await answer(client, ask, "lookup")).status_code == 200
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        found = (await client.get(f"/api/materials/{paper}")).json()
+        assert found["retraction"] == "retracted" and ("author" in found["csl"]) is not edited
+        assert await first_project(client) == (other if edited else project)
+
+
 async def test_merge_runs_are_listed_with_their_paper_and_question_and_no_retry(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)

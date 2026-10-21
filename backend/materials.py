@@ -844,10 +844,12 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
     file was replaced meanwhile keeps what its newer file gives (outcome replaced). A retraction
     check is about one DOI: a record of another DOI, or of none, that says nothing on retraction
     leaves the paper unchecked rather than keeping the old DOI's check. A changed title is indexed anew
-    (search.retitled), its project's index run requested with record (harness: its runs, for the request)."""
-    now = utc_now()
+    (search.retitled), its project's index run requested with record (harness: its runs, for the request).
+    A paper's details changed put its project first in the list, as an import does, however long the
+    lookup's question waited; a retraction check alone does not, as it leaves the paper's updated_at."""
+    now, changed = utc_now(), False
     for material, version in pairs:
-        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title FROM materials m"
+        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title, m.csl FROM materials m"
                            " JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
                            " WHERE m.id = ? AND m.project_id = ?",
                            (version, material, project_id)).fetchone()
@@ -856,8 +858,10 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
         # S1-15: a record that gives another identifier now is not this lookup's to fill
         mine, result = (found, outcome) if row[1] and _gives(conn, material, version, (scheme, value)) else (None, "replaced")
         filled = _fill_imported(conn, material, mine) if mine is not None else None  # S1-14: its record stays
+        changed = changed or bool(filled)
         if mine is not None:
             if row[0] != "researcher" and filled is None:  # what the researcher edited stays
+                changed = changed or (mine.csl["title"], mine.csl) != (row[3], json.loads(row[4] or "null"))
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
                              (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
@@ -874,6 +878,8 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
         _event(conn, run_id, "step_finished", {"material_id": material, "identifier": f"{scheme}:{value}",
                                                "source": mine.source if mine else None, "outcome": result,
                                                **({"filled": filled} if filled else {})})
+    if changed:
+        conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now, project_id))
 
 
 def _fill_imported(conn, material, found):
