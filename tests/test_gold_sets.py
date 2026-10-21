@@ -1064,6 +1064,21 @@ def test_a_field_one_scratch_that_waited_refuses_a_folder_replaced_meanwhile_by_
     assert not [p for p in (tmp_path / "f1-moved").iterdir() if p.name.startswith(".tmp-")]
 
 
+def test_a_field_one_scratch_refuses_a_folder_replaced_since_its_check_by_a_link_outside_git(tmp_path):
+    """The same, for a link to a folder outside every git work tree: the root, opened without following a link,
+    is refused as a link, and nothing is made where it leads."""
+    folder, elsewhere = tmp_path / "f1", tmp_path / "elsewhere"
+    folder.mkdir()
+    elsewhere.mkdir()
+    root = gold.field1(folder)
+    folder.rename(tmp_path / "f1-moved")
+    folder.symlink_to(elsewhere)
+    with pytest.raises(tier1.Refused, match="is a link"):
+        with gold.scratch(1, root):
+            pass
+    assert list(elsewhere.iterdir()) == [] and gold.SCRATCH_HOLDER == [None] and not gold.SCRATCH_LOCK.locked()
+
+
 def test_a_folder_below_field_ones_that_is_a_git_work_tree_is_never_read_or_written(tmp_path):
     """sol recheck 3: field 1's folder is outside git, but its labels/ or out/ is itself a repository (or holds
     a worktree's .git file). The page saved a question and its quote there and apply wrote a corrected set

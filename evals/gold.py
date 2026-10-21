@@ -924,9 +924,9 @@ def scratch(field, folder):
     with SCRATCH_LOCK:
         # Field 1's folder checked again now this call runs (it may have changed while the call waited), and the
         # temporary folder made in it as the walk reaches a folder: from the root, opened without following a link.
+        name = f".tmp-scholia-gold-{secrets.token_hex(8)}"
         root = field1(folder)
         fd = _open_dir(root, root)
-        name = f".tmp-scholia-gold-{secrets.token_hex(8)}"
         try:
             os.mkdir(name, 0o700, dir_fd=fd)
             made = _step(fd, name, root / name)
@@ -947,9 +947,11 @@ def scratch(field, folder):
                 tempfile.tempdir = saved[1]
                 SCRATCH_HOLDER[0] = None
         finally:
-            with contextlib.suppress(FileNotFoundError):  # not made, if its making failed
-                shutil.rmtree(name, dir_fd=fd)
-            os.close(fd)
+            try:
+                with contextlib.suppress(FileNotFoundError):  # not made, if its making failed
+                    shutil.rmtree(name, dir_fd=fd)
+            finally:
+                os.close(fd)
 
 
 async def write_when_done(root, out, make):
