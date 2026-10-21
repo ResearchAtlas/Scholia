@@ -13,6 +13,7 @@ import { LoadState } from './fields.jsx';
 const SUPPORT = { supported: 'cite.supported', partly: 'cite.partly', unsupported: 'cite.unsupported', unchecked: 'cite.unchecked' };
 const EXISTENCE = { ok: 'trace.exists', not_found: 'cite.notFound', not_read_in_run: 'cite.notRead', source_removed: 'cite.removed' };
 const PHASE = { answer: 'trace.phaseAnswer', judge: 'trace.phaseJudge', route: 'trace.phaseRoute' };
+const FUNDED = { share: 'trace.fundedShare', answer_unspent: 'trace.fundedUnspent', budget: 'trace.fundedBudget' };
 
 export function Trace({ turn }) {
   const t = useT();
@@ -53,7 +54,8 @@ export function Trace({ turn }) {
         {trace.steps.map((step, i) => (
           <li key={i} className="space-y-1">
             <p className="font-medium">{t(PHASE[step.phase] ?? 'trace.phaseOther')}
-              {step.estimate !== null && <> · <span className="font-normal text-muted-foreground">{about(step.estimate)}</span></>}</p>
+              {step.estimate !== null && <> · <span className="font-normal text-muted-foreground">{about(step.estimate)}</span></>}
+              {FUNDED[step.funded] && <> · <span className="font-normal text-muted-foreground">{t(FUNDED[step.funded])}</span></>}</p>
             {step.cut && <p className="text-muted-foreground">{t('turn.cut')}</p>}
             {step.attempts.map((attempt, j) => <Attempt key={j} runId={turn.run_id} attempt={attempt} />)}
           </li>

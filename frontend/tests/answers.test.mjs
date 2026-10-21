@@ -49,6 +49,34 @@ test('a citation is a chip with its quote and page, in a table cell too, and a m
   assert.match(html, /<code>\[S1\.1\]<\/code>/);
 });
 
+test('a sentence another citation supports is not underlined, and the failed citation says so in its chip', () => {
+  // b3 (7): the underline means no passage supports the sentence (backend: any supported or partly verdict
+  // for the sentence supports it); a citation whose passage fails it says that of its own passage.
+  for (const text of ['Earnings rise [S1.1][S2.1].', 'Earnings rise [S1.1] and keep rising [S2.1].']) {
+    const sentence = text;
+    const html = render(text, [cite(text, '[S1.1]', { sentence }), cite(text, '[S2.1]', { support: 'unsupported', sentence })]);
+    assert.doesNotMatch(html, /class="unsupported"/, text);
+    assert.match(html, /cite\.unsupportedHere/);
+    assert.doesNotMatch(html, /cite\.unsupported[^H]/);
+  }
+  const text = 'Earnings rise [S1.1][S2.1].';
+  const html = render(text, [cite(text, '[S1.1]', { support: 'unsupported', sentence: text }),
+    cite(text, '[S2.1]', { support: 'unsupported', sentence: text })]);
+  assert.match(html, /<span class="unsupported">Earnings rise <\/span>/); // no passage supports it
+  assert.match(html, /cite\.unsupported[^H]/);
+});
+
+test('a marker in a code span or a fence of either kind is code, as backend/citations.py reads it', () => {
+  // b3 (8): the same cases as tests/test_cited_lifecycle.py reads.
+  const cases = JSON.parse(readFileSync(fileURLToPath(new URL('./fixtures/code-markers.json', import.meta.url)), 'utf8'));
+  for (const { text, markers } of cases) {
+    const all = [...text.matchAll(/\[S\d+\.\d+\]/g)].map((m) => cite(text, m[0], {}, m.index));
+    const html = render(text, all);
+    const chips = [...html.matchAll(/aria-label="cite\.open\{&quot;number&quot;:&quot;(\d+)/g)].map((m) => m[1]);
+    assert.deepEqual(chips, markers.map((m) => /\[S(\d+)\./.exec(m)[1]), text);
+  }
+});
+
 test('pressing a chip opens its paper at its passage', () => {
   const citation = cite('x [S1.1]', '[S1.1]');
   const opened = [];
@@ -135,7 +163,7 @@ test('Details sums up the trace from its events, read a page at a time', async (
         history_left_out: 2 }, body_ref: null },
       { seq: 3, type: 'model_attempt', data: { step: 0, outcome: 'ok', cost_usd: 0.002, charge: 'reported' }, body_ref: 'aa' },
       { seq: 3.5, type: 'step_finished', data: { step: 0, cut: 'output_limit' }, body_ref: null }, // saved, cut
-      { seq: 4, type: 'step_started', data: { step: 1, phase: 'judge', estimate_usd: 0.01 }, body_ref: null },
+      { seq: 4, type: 'step_started', data: { step: 1, phase: 'judge', estimate_usd: 0.01, funded: 'answer_unspent' }, body_ref: null },
       { seq: 5, type: 'model_attempt', data: { step: 1, outcome: 'timeout' }, body_ref: 'bb' },
       { seq: 5.5, type: 'model_attempt', data: { step: 1, outcome: 'ok', body: 'cc' }, body_ref: null, body_removed: true },
       { seq: 5.6, type: 'model_attempt', data: { step: 1, outcome: 'ok', body_unavailable: true }, body_ref: null },
@@ -154,6 +182,7 @@ test('Details sums up the trace from its events, read a page at a time', async (
   assert.deepEqual(found.steps.map((s) => [s.phase, s.estimate, s.cut, s.attempts.map((a) => [a.outcome, a.body])]),
     [['answer', 0.05, true, [['ok', 'aa']]], ['judge', 0.01, false, [['timeout', 'bb'], ['ok', null], ['ok', null]]]]);
   assert.deepEqual(found.steps[1].attempts.map((a) => [a.removed, a.unavailable]), [[false, false], [true, false], [false, true]]);
+  assert.deepEqual(found.steps.map((s) => s.funded), [null, 'answer_unspent']); // b3 (6): each judge call's funding
   assert.equal(found.checks.length, 1);
   assert.deepEqual(found.pairs, { judged: 5, failed: 1, budget: 2 }); // every outcome, shown in Details
   assert.equal(found.historyLeftOut, 2); // earlier answers left out with a deleted paper, shown in Details

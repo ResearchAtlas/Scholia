@@ -7,8 +7,9 @@
 // chip is the citation the answer's record holds at that marker's place in the text; hovering or
 // focusing it shows its paper, page and quote, and pressing it opens the paper at its passage. A marker
 // whose citation does not exist (not found, not read in the run, its source removed) is shown as such,
-// never as a chip that pretends. A sentence no passage supports is underlined quietly; its text is never
-// changed. A marker in code stays code.
+// never as a chip that pretends. A sentence no passage supports is underlined quietly (one a cited passage
+// supports is not, and the chip of a passage that does not says so of itself); its text is never changed. A
+// marker in code stays code.
 import { createElement as h, useId } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -33,8 +34,17 @@ function finder(citations) {
 const BLOCKS = new Set(['paragraph', 'heading', 'tableRow']); // a sentence never runs past one of these
 const MARKERS_AND_BARS = /\[S[^\]\n]{0,12}\]|\|/g;
 
-// The consecutive markers in a text ([S1.1][S1.2] cite one sentence together), each with its citation.
-function runsOf(node, find, citations) {
+// The sentences a citation supports (supported or partly), as the backend judges a sentence by each passage
+// it cites: one such citation means a passage supports the sentence, whatever another citation's verdict.
+const isOk = (c) => c?.existence === 'ok';
+export function backedSentences(citations) {
+  return new Set(citations.filter((c) => isOk(c) && (c.support === 'supported' || c.support === 'partly') && c.sentence)
+    .map((c) => c.sentence));
+}
+
+// The consecutive markers in a text ([S1.1][S1.2] cite one sentence together), each with its citation. A run is
+// underlined when a citation in it is unsupported and nothing supports its sentence.
+function runsOf(node, find, citations, backed) {
   const value = node.value;
   const base = node.position?.start?.offset;
   const runs = [];
@@ -47,7 +57,9 @@ function runsOf(node, find, citations) {
     }
   }
   for (const run of runs) {
-    run.unsupported = run.chips.some(({ index }) => citations[index]?.support === 'unsupported' && citations[index]?.existence === 'ok');
+    const cited = run.chips.map(({ index }) => citations[index]).filter(isOk);
+    run.unsupported = cited.some((c) => c.support === 'unsupported')
+      && !cited.some((c) => c.support === 'supported' || c.support === 'partly' || backed.has(c.sentence));
   }
   return runs;
 }
@@ -102,6 +114,7 @@ function markBack(leaves, i, from, to) {
 export function citationChips({ citations = [] } = {}) {
   return (tree) => {
     const find = finder(citations);
+    const backed = backedSentences(citations);
     const leaves = [];
     const collect = (node, block, inLink) => {
       let current = block;
@@ -112,7 +125,7 @@ export function citationChips({ citations = [] } = {}) {
       }
     };
     collect(tree, tree, false);
-    for (const leaf of leaves) if (!leaf.inLink) leaf.runs = runsOf(leaf.node, find, citations);
+    for (const leaf of leaves) if (!leaf.inLink) leaf.runs = runsOf(leaf.node, find, citations, backed);
     leaves.forEach((leaf, i) => {
       let cursor = 0;
       for (const run of leaf.runs) {
@@ -165,8 +178,9 @@ const MISSING = { not_found: 'cite.notFound', not_read_in_run: 'cite.notRead', s
 // The source's number in a marker ([S2.3] is 2), as the chip shows it.
 const sourceOf = (marker) => /^\[S([1-9][0-9]*)\./.exec(marker ?? '')?.[1] ?? '?';
 
-// A citation chip: a button with the source's number, its card shown while hovered or focused.
-export function Chip({ citation, t, onOpen }) {
+// A citation chip: a button with the source's number, its card shown while hovered or focused. backed: another
+// citation's passage supports its sentence, so an unsupported verdict is said of this passage alone.
+export function Chip({ citation, t, onOpen, backed = false }) {
   const id = useId();
   if (!citation || citation.existence !== 'ok') {
     const label = t(MISSING[citation?.existence] ?? 'cite.notFound');
@@ -174,7 +188,8 @@ export function Chip({ citation, t, onOpen }) {
       h('span', { 'aria-hidden': 'true' }, citation?.marker ?? '?'), h('span', { className: 'sr-only' }, label));
   }
   const notes = [citation.retracted && t('cite.retracted'), TYPE_NOTE[citation.evidence_type] && t(TYPE_NOTE[citation.evidence_type]),
-    t(SUPPORT[citation.support] ?? 'cite.unchecked')].filter(Boolean);
+    t(citation.support === 'unsupported' && backed ? 'cite.unsupportedHere' : SUPPORT[citation.support] ?? 'cite.unchecked')]
+    .filter(Boolean);
   const kind = [citation.retracted && 'cite-retracted', TYPE_NOTE[citation.evidence_type] && 'cite-partial',
     citation.support === 'unsupported' && 'cite-unsupported'].filter(Boolean).join(' ');
   return h('span', { className: 'cite group' },
@@ -192,6 +207,7 @@ export function Chip({ citation, t, onOpen }) {
 // opens a cited paper at its passage. Without citations (an answer still arriving, before its checks are
 // recorded), markers stay as they were written.
 export default function Answer({ text, citations = null, t, onOpen }) {
+  const backed = citations ? backedSentences(citations) : new Set();
   return h(ReactMarkdown, {
     skipHtml: true,
     remarkPlugins: citations ? [remarkGfm, [citationChips, { citations }]] : [remarkGfm],
@@ -208,7 +224,8 @@ export default function Answer({ text, citations = null, t, onOpen }) {
       },
       cite: (props) => {
         const index = Number(props['data-citation']);
-        return h(Chip, { citation: citations[index], t, onOpen });
+        const citation = citations[index];
+        return h(Chip, { citation, t, onOpen, backed: Boolean(citation?.sentence && backed.has(citation.sentence)) });
       },
     },
   }, text);
