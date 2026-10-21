@@ -108,11 +108,15 @@ def private_path(field, path):
     walked from there) and where a linked PDF leads; under a folder no link is followed at all (the files
     below)."""
     path = Path(path).resolve()
-    if field == 1 and (top := work_tree(path)) is not None:
-        raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside "
-                      "every git work tree")
+    if field == 1:
+        if (top := work_tree(path)) is not None:
+            raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside "
+                          "every git work tree")
+        FIELD1_ROOTS.add(path)  # each walk from it checks this again (_open_dir): a git init above it later counts
     return path
 
+
+FIELD1_ROOTS = set()  # field 1's folders as private_path accepted them
 
 def work_tree(path):
     """The top of the git work tree holding path (the nearest folder above it with a .git folder, or the
@@ -170,6 +174,8 @@ def _open_dir(root, folder, create=False):
     """An open descriptor of folder, reached from root one folder at a time, none of them a git work tree;
     folders made 0700 when create."""
     root, folder = Path(root), Path(folder)
+    for accepted in [a for a in FIELD1_ROOTS if root.is_relative_to(a)]:
+        private_path(1, accepted)  # the folders above field 1's, again: one may have become a git work tree since
     parts = folder.relative_to(root).parts
     if create:
         for made in reversed([p for p in (root, *root.parents) if not p.exists()]):
@@ -1248,6 +1254,8 @@ class Review:
             raise Refused("field 1's sample holds passages from Harold's library: its page is written only for a "
                           "colleague named with --colleague")
         self.field, self.kind, self.rater, self.lock = field, kind, rater, threading.Lock()
+        if field == 1:
+            folder = private_path(1, folder)  # a page stays open: its folder is checked again at each save (_open_dir)
         doc, papers_sha256, sets = load_field(field, folder)
         if kind not in sets:
             raise Refused(f"{kind}.json is not drafted yet")

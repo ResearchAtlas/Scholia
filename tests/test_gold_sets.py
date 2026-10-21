@@ -1006,6 +1006,23 @@ def test_a_folder_below_field_ones_that_is_a_git_work_tree_is_never_read_or_writ
     assert sorted(p.name for p in (third / "out").iterdir()) == before
 
 
+def test_a_page_left_open_refuses_to_save_once_a_folder_above_field_ones_becomes_a_git_work_tree(tmp_path):
+    """sol recheck 4: the ancestors were checked only when the folder was opened; a git init above it while the
+    page was open let the next save write a question and its quote where git lists it. Each walk from field 1's
+    folder checks them again (private_path); with nothing changed, saves go on as before."""
+    folder = field(tmp_path / "parent", 1)
+    page = gold.Review(1, folder, "pairs", "harold")
+    assert page.save({"item": "p01", "base": 0, "label": {"category": "supported"}})[0] == 200
+    assert page.save({"item": "p02", "base": 0, "label": {"category": "partly"}})[0] == 200
+    labels = folder / "labels" / "field1-pairs.harold.json"
+    before = sorted((p.relative_to(folder), p.read_bytes()) for p in folder.rglob("*") if p.is_file())
+    fixtures.git("init", tmp_path / "parent")
+    with pytest.raises(tier1.Refused, match="inside the repository"):
+        page.save({"item": "p03", "base": 0, "label": {"category": "unsupported"}})
+    assert sorted((p.relative_to(folder), p.read_bytes()) for p in folder.rglob("*") if p.is_file()) == before
+    assert "p03" not in json.loads(labels.read_text())["labels"]
+
+
 def test_from_a_worktree_the_main_checkout_is_refused_too():
     git = ROOT / ".git"
     if not git.is_file():
