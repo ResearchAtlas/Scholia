@@ -479,3 +479,42 @@ async def test_a_selected_paper_sharing_its_reading_with_another_is_searched_as_
         assert found["trace"]["read_directly"] is False
         assert found["records"] and {r["material_id"] for r in found["records"]} == {TWIN}
         assert found["trace"]["keyword"] and found["trace"]["dense"]
+
+
+async def test_a_sentence_citing_a_deleted_paper_goes_from_its_other_papers_rows_and_their_check_still_runs(tmp_path):
+    # Internal review of b2: the sentence goes from every row holding it; a recheck of the other paper's own
+    # sentence carries only that paper, so it still runs.
+    from test_search import CHINESE
+    both = "Both papers report the same rise [S1.1] [S2.1]. The second paper alone reports more [S2.1]."
+    provider = Provider(answer_text=both)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES, CHINESE)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, "minimum wages earnings 最低工资"))[0]["run_id"]
+        [(first,)] = await rows(client, "SELECT material_id FROM citations WHERE json_extract(context, '$.marker') = '[S1.1]'")
+        assert (await client.delete(f"/api/materials/{first}")).status_code == 200
+        assert await rows(client, "SELECT count(*) FROM citations WHERE context LIKE '%same rise%'") == [(0,)]
+        response = await client.post("/api/citations/check", json={"run_id": run_id})
+        [check] = response.json()["run_ids"]
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", check)
+        assert first not in json.loads(inputs)["context_materials"]
+        assert (await run_finished(client, check))["status"] == "succeeded"
+
+
+async def test_a_call_stopped_before_it_left_keeps_no_body(tmp_path, monkeypatch):
+    # Internal review of b2: a body stored for a call that never left the machine is not kept.
+    from backend import openrouter
+    real = openrouter.query_model
+
+    async def stop_after_keeping(*args, on_body=None, **kwargs):
+        async def keep_then_stop(body):
+            await on_body(body)
+            raise asyncio.CancelledError()
+        return await real(*args, on_body=keep_then_stop, **kwargs)
+    monkeypatch.setattr(openrouter, "query_model", stop_after_keeping)
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, QUESTION)
+        assert stream[-1]["status"] in ("cancelled", "failed")
+        assert await rows(client, "SELECT count(*) FROM run_bodies") == [(0,)]

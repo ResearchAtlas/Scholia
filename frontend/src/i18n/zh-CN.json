@@ -230,6 +230,7 @@
   "errors.request": "服务商拒绝了这个请求。",
   "errors.malformed": "无法读取服务商的回答。",
   "errors.refused": "这个项目不允许此请求。",
+  "errors.interrupted": "已中断：进行中时应用停止了。",
   "errors.unavailable": "服务没有回应，重试后也没有。请稍后再试。",
   "errors.replaced_meanwhile": "你选择此文件后，论文的文件已被更换，因此没有使用此文件。",
   "errors.save_failed": "回答未能保存。",
@@ -1161,6 +1162,10 @@
   "trace.showSent": "显示发送的原文",
   "trace.sent": "发送的原文",
   "trace.checks": "引用核对",
+  "trace.historyLeftOut": {
+    "other": "{count} 条较早的回答未被带上：它们依据的论文已删除。"
+  },
+  "trace.history": "历史",
   "trace.pairsJudged": {
     "other": "已核查 {count} 组引用"
   },

@@ -298,6 +298,15 @@ def _delete(conn, kind, object_id, remove_all_trace):
             f" WHERE rowid IN {_doomed(kind_table)}",
             (tombstone_kind,),
         )
+    # S1-19b (backend/provenance.py): a sentence citing a deleted source goes from every citation row holding it,
+    # those of the answer's other papers too, before the rows of the deleted source lose theirs (ON_DELETE).
+    conn.execute(f"""UPDATE citations SET context = json_remove(context, '$.sentence')
+        WHERE rowid NOT IN {_doomed('citations')} AND json_extract(context, '$.sentence') IS NOT NULL
+        AND EXISTS (SELECT 1 FROM citations d WHERE d.owner_kind = citations.owner_kind AND d.owner_id = citations.owner_id
+                    AND json_extract(d.context, '$.sentence') = json_extract(citations.context, '$.sentence')
+                    AND (d.material_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})
+                         OR d.material_version_id IN (SELECT id FROM material_versions WHERE rowid IN {_doomed('material_versions')})
+                         OR d.passage_id IN (SELECT id FROM passages WHERE rowid IN {_doomed('passages')})))""")
     for (child, column), (parent, key) in edges.items():
         action = ON_DELETE[child, column]
         if action is not DELETE:

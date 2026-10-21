@@ -149,13 +149,21 @@ async def check(body: Check, request: Request):
             (body.run_id,)).fetchone()
         if row is None:
             raise AdmissionError(404, "not_found", "No such answer")
-        project_id, route, held = row
+        project_id, route, _ = row
         policy = governance.policy(conn, project_id)
         if policy is None or policy.locked:
             raise AdmissionError(403, "review_locked", "This project is review-locked")
-        pairs = {}  # (sentence, passage) -> [citation ids, material]
+        pairs = {}  # (sentence, passage) -> [citation ids, material]; a sentence gone with its source is not sent
         for cid, sentence, pid, material in cited(conn):
-            pairs.setdefault((sentence or "", pid), [[], material])[0].append(cid)
+            if sentence:
+                pairs.setdefault((sentence, pid), [[], material])[0].append(cid)
+        # The papers each run's own request carries (backend/provenance.py): its passages' and those every
+        # sentence it sends cites, which are its scope and its dispatch check's, and its body's links.
+        cited_by = {}
+        for sentence, material in conn.execute(
+                "SELECT json_extract(context, '$.sentence'), material_id FROM citations WHERE owner_kind = 'answer'"
+                " AND owner_id = ? AND material_id IS NOT NULL", (body.run_id,)):
+            cited_by.setdefault(sentence, set()).add(material)
         if not pairs:
             raise AdmissionError(409, "nothing_to_check", "The answer has no citation to check")
         # Each pair named by its sentence's hash, never the text (backend/provenance.py)
@@ -164,7 +172,9 @@ async def check(body: Check, request: Request):
         if len(batches) > len(ids):  # citations added since the count above: asked again
             raise AdmissionError(409, "changed", "The answer's citations changed; check again")
         provider, _, model = (route or ":").partition(":")
+        keyed = {citations.sentence_key(sentence): sentence for sentence, _ in pairs}
         for run_id, batch in zip(ids, batches):
+            carried = sorted({m for key, _, m, _ in batch for m in (m, *cited_by.get(keyed[key], ()))})
             conn.execute(
                 "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
                 " VALUES (?, ?, 'background', 'citation_check', ?, ?)",
@@ -172,8 +182,7 @@ async def check(body: Check, request: Request):
                     "check": body.run_id, "provider": provider, "model": judge or model, "pairs": batch,
                     # registered with the dispatch check and deletion's scope links, as a turn's are
                     "evidence": sorted({(p, m) for _, p, m, _ in batch}),
-                    "material_ids": sorted({m for _, _, m, _ in batch}),
-                    "context_materials": sorted({*json.loads(held or "[]"), *(m for _, _, m, _ in batch)})})))
+                    "material_ids": carried, "context_materials": carried})))
         return ids[:len(batches)], ids[:len(batches)]
 
     run_ids = await harness.record_background(max(1, -(-len(expected) // size)) + 1, record)

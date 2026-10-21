@@ -42,6 +42,10 @@ export function Trace({ turn }) {
           <dd>{t('trace.passages', { count: trace.search.passages })} · {t(`trace.mode.${trace.search.mode}`)}
             {trace.search.rerank === 'fallback' ? ` · ${t('trace.rerankFallback')}` : ''}</dd>
         </>}
+        {trace.historyLeftOut > 0 && <>
+          <dt className="text-muted-foreground">{t('trace.history')}</dt>
+          <dd>{t('trace.historyLeftOut', { count: trace.historyLeftOut })}</dd>
+        </>}
         <dt className="text-muted-foreground">{t('trace.saved')}</dt>
         <dd>{turn.answer && turn.result_saved ? t('trace.savedYes') : t('trace.savedNo')}</dd>
       </dl>

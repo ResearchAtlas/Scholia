@@ -22,7 +22,7 @@ export async function readTrace(runId, read = get) {
 // { route, retrieval, search, steps: [{ phase, route, estimate, cut, attempts: [{ outcome, cost, charge, body, removed, unavailable }] }],
 //   checks, finished } from the trace's events. A step whose answer stopped at its output limit is cut.
 export function summarize(events) {
-  const found = { route: null, retrieval: null, search: null, steps: [], checks: [], pairs: null, finished: null };
+  const found = { route: null, retrieval: null, search: null, steps: [], checks: [], pairs: null, historyLeftOut: 0, finished: null };
   const steps = new Map();
   for (const { type, data, body_ref: body, body_removed: removed } of events) {
     if (type === 'route') {
@@ -33,6 +33,7 @@ export function summarize(events) {
         rerank: data.rerank?.fallback ? 'fallback' : data.rerank ? 'reranked' : null };
     } else if (type === 'step_started') {
       const step = { phase: data.phase, route: data.route, estimate: data.estimate_usd ?? null, cut: false, attempts: [] };
+      if (data.history_left_out) found.historyLeftOut = data.history_left_out; // left out: a paper it drew on is deleted
       steps.set(data.step, step);
       found.steps.push(step);
     } else if (type === 'model_attempt') {

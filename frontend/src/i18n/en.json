@@ -232,6 +232,7 @@
   "errors.request": "The provider refused the request.",
   "errors.malformed": "The provider's answer could not be read.",
   "errors.refused": "This request is not allowed for this project.",
+  "errors.interrupted": "Interrupted: the app stopped while this was under way.",
   "errors.unavailable": "The service did not answer, even after trying again. Try again later.",
   "errors.replaced_meanwhile": "The paper's file changed after you chose this one, so this one was not used.",
   "errors.save_failed": "The answer could not be saved.",
@@ -1196,6 +1197,11 @@
   "trace.showSent": "Show the exact text sent",
   "trace.sent": "The exact text sent",
   "trace.checks": "Citation check",
+  "trace.historyLeftOut": {
+    "one": "{count} earlier answer was left out: a paper it drew on was deleted.",
+    "other": "{count} earlier answers were left out: papers they drew on were deleted."
+  },
+  "trace.history": "History",
   "trace.pairsJudged": {
     "one": "{count} citation pair judged",
     "other": "{count} citation pairs judged"

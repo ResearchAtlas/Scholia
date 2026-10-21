@@ -131,7 +131,8 @@ test('Details sums up the trace from its events, read a page at a time', async (
       { seq: 1, type: 'retrieval_trace', data: { mode: 'hybrid', selected: ['a', 'b'], rerank: { fallback: 'deadline' } }, body_ref: null },
     ], next: 1 },
     1: { events: [
-      { seq: 2, type: 'step_started', data: { step: 0, phase: 'answer', route: 'openrouter:m', estimate_usd: 0.05 }, body_ref: null },
+      { seq: 2, type: 'step_started', data: { step: 0, phase: 'answer', route: 'openrouter:m', estimate_usd: 0.05,
+        history_left_out: 2 }, body_ref: null },
       { seq: 3, type: 'model_attempt', data: { step: 0, outcome: 'ok', cost_usd: 0.002, charge: 'reported' }, body_ref: 'aa' },
       { seq: 3.5, type: 'step_finished', data: { step: 0, cut: 'output_limit' }, body_ref: null }, // saved, cut
       { seq: 4, type: 'step_started', data: { step: 1, phase: 'judge', estimate_usd: 0.01 }, body_ref: null },
@@ -155,6 +156,7 @@ test('Details sums up the trace from its events, read a page at a time', async (
   assert.deepEqual(found.steps[1].attempts.map((a) => [a.removed, a.unavailable]), [[false, false], [true, false], [false, true]]);
   assert.equal(found.checks.length, 1);
   assert.deepEqual(found.pairs, { judged: 5, failed: 1, budget: 2 }); // every outcome, shown in Details
+  assert.equal(found.historyLeftOut, 2); // earlier answers left out with a deleted paper, shown in Details
   assert.equal(found.finished, 'succeeded');
 });
 

@@ -392,18 +392,19 @@ class Harness:
                 "SELECT DISTINCT run_id FROM budget_reservations WHERE status = 'open' AND run_id IS NOT NULL")}
             spending.settle_left_open(conn)
             now = utc_now()
+            # S1-19b: a call in flight at the crash kept its exact request body (stored and linked before it was
+            # sent); its attempt is recorded now, naming it, with an unknown charge, for every kind of run.
+            for run_id, step, sha in conn.execute(
+                    "SELECT b.run_id, b.step, b.sha256 FROM run_bodies b JOIN runs r ON r.id = b.run_id"
+                    " WHERE r.status = 'running' AND NOT EXISTS (SELECT 1 FROM run_events e WHERE e.run_id = b.run_id"
+                    " AND e.type = 'model_attempt' AND json_extract(e.data, '$.body') = b.sha256)"
+                    " ORDER BY b.run_id, b.step, b.attempt").fetchall():
+                _event(conn, run_id, "model_attempt", {"step": step, "outcome": "interrupted", "dispatched": None,
+                                                       "charge": "unknown", "body": sha})
             for run_id, revoked in conn.execute(
                     "SELECT id, cancel_reason = 'revoked' FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')"
             ).fetchall():
                 status = "cancelled" if revoked else "interrupted"  # a revoked run stays revoked
-                # S1-19b: a call in flight at the crash kept its exact request body (stored and linked before it
-                # was sent); its attempt is recorded now, naming it, with an unknown charge.
-                for step, sha in conn.execute(
-                        "SELECT b.step, b.sha256 FROM run_bodies b WHERE b.run_id = ? AND NOT EXISTS ("
-                        "SELECT 1 FROM run_events e WHERE e.run_id = b.run_id AND e.type = 'model_attempt'"
-                        " AND json_extract(e.data, '$.body') = b.sha256) ORDER BY b.step, b.attempt", (run_id,)).fetchall():
-                    _event(conn, run_id, "model_attempt", {"step": step, "outcome": "interrupted", "dispatched": None,
-                                                           "charge": "unknown", "body": sha})
                 _event(conn, run_id, "run_finished", {"status": status})
                 conn.execute(
                     "UPDATE runs SET status = ?, finished_at = ?, settled_cost_usd = ? WHERE id = ?",
@@ -1017,8 +1018,13 @@ class Harness:
             rest = allowance if not from_allowance else sum(held.values()) - estimate
             kept = None
             if rest > 0:
-                kept = spending.reserve(conn, run_id=run_id, step_seq=seq, project_id=project_id,
-                                        paying_conversation_id=paying_conversation_id, estimate_usd=rest, **budgets)
+                try:
+                    kept = spending.reserve(conn, run_id=run_id, step_seq=seq, project_id=project_id,
+                                            paying_conversation_id=paying_conversation_id, estimate_usd=rest, **budgets)
+                except spending.BudgetExceeded:
+                    if not from_allowance:
+                        raise  # the share must fit with its answer (C5)
+                    kept = None  # a budget lowered meanwhile: the rest is not held again; this call still runs
             _event(conn, run_id, "step_started", {"step": seq, "phase": phase, "estimate_usd": estimate,
                                                    "reservation_id": reservation, **step, **funded,
                                                    **({"allowance_id": kept, "allowance_usd": rest} if kept else {})})
@@ -1852,9 +1858,11 @@ def _kept_body(conn, call, number, dispatched):
         return {}
     ref = call.bodies[number]
     if not dispatched:
-        conn.execute("DELETE FROM run_bodies WHERE run_id = ? AND step = ? AND attempt = ?", (call.run_id, call.step, number))
-        conn.execute("DELETE FROM run_body_materials WHERE sha256 = ? AND NOT EXISTS ("
-                     "SELECT 1 FROM run_bodies WHERE sha256 = ?)", (ref, ref))
+        if ref is not None:
+            conn.execute("DELETE FROM run_bodies WHERE run_id = ? AND step = ? AND attempt = ?",
+                         (call.run_id, call.step, number))
+            conn.execute("DELETE FROM run_body_materials WHERE sha256 = ? AND NOT EXISTS ("
+                         "SELECT 1 FROM run_bodies WHERE sha256 = ?)", (ref, ref))
         return {}
     return {"body": ref} if ref is not None else {"body_unavailable": True}
 
@@ -1904,6 +1912,8 @@ def _close_call(conn, call):
                 **_kept_body(conn, call, len(call.bodies) - 1, True)})
     else:
         spending.release(conn, call.reservation_id)
+        for number in range(len(call.bodies)):  # its text never left the machine: none of it is kept
+            _kept_body(conn, call, number, False)
 
 
 def _accounting(conn, run_id, complete=True):
