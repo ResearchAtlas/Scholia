@@ -1291,8 +1291,9 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
         if harness.registry.closed:
             raise _Stop()
 
-    def render():
-        return reading.render(state["content"]._path(row[0]), row[0], number, max(0.5, min(scale, 3.0)), stop)
+    def render():  # its file held from collection while it is read (ContentStore.hold)
+        with state["content"].hold([row[0]]):
+            return reading.render(state["content"]._path(row[0]), row[0], number, max(0.5, min(scale, 3.0)), stop)
 
     ceiling = None
     try:
