@@ -892,3 +892,32 @@ async def test_recovery_records_a_dispatched_attempt_whose_body_went_with_a_dele
         assert [(a["step"], a["attempt"]) for a in attempts if a["outcome"] == "interrupted"] == [(step, 0)]
         release.set()
         await stream
+
+
+async def test_recovery_records_no_attempt_for_a_step_whose_call_was_recorded(tmp_path, monkeypatch):
+    # Internal review of b4: a dispatch event of an attempt never sent (its time ran out) is not taken for an
+    # attempt in flight once its step's call was recorded.
+    release, judging = asyncio.Event(), asyncio.Event()
+
+    async def held(body):
+        judging.set()
+        await release.wait()
+        return Provider().answer("1: supported")
+    monkeypatch.setattr(runs_module.Harness, "_request_cancel", lambda self, active, reason: None)
+    provider = Provider(verdicts=held)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": QUESTION}))
+        await asyncio.wait_for(judging.wait(), 10)
+        [(run_id,)] = await rows(client, "SELECT id FROM runs WHERE kind = 'turn'")
+        [(step,)] = await rows(client, "SELECT max(json_extract(data, '$.step')) FROM run_events WHERE run_id = ?"
+                                       " AND type = 'step_started'", run_id)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: runs_module._event(
+            conn, run_id, "step_finished", {"step": step, "outcome": "timeout"}))  # its call recorded, as record() does
+        await client.state["harness"].recover(kick=False)
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'model_attempt'"
+                                  " AND json_extract(data, '$.outcome') = 'interrupted'", run_id) == [(0,)]
+        release.set()
+        await stream

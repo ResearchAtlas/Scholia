@@ -34,7 +34,7 @@ export function summarize(events) {
     } else if (type === 'step_started') {
       const step = { phase: data.phase, route: data.route, estimate: data.estimate_usd ?? null,
         funded: data.funded ?? null, cut: false, attempts: [] }; // funded: what paid a judge call (share, answer_unspent, budget)
-      if (data.history_left_out) found.historyLeftOut = data.history_left_out; // left out: a paper it drew on is deleted
+      if (data.history_left_out) found.historyLeftOut = data.history_left_out; // left out: a paper it drew on is deleted, or its project no longer allows this request
       steps.set(data.step, step);
       found.steps.push(step);
     } else if (type === 'model_attempt') {

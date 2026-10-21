@@ -1171,7 +1171,7 @@
   "trace.sent": "发送的原文",
   "trace.checks": "引用核对",
   "trace.historyLeftOut": {
-    "other": "{count} 条较早的回答未被带上：它们依据的论文已删除。"
+    "other": "{count} 条较早的回答未被带上：它们依据的论文已删除，或其所在项目已不允许这次请求。"
   },
   "trace.history": "历史",
   "trace.pairsJudged": {

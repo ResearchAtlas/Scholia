@@ -1206,8 +1206,8 @@
   "trace.sent": "The exact text sent",
   "trace.checks": "Citation check",
   "trace.historyLeftOut": {
-    "one": "{count} earlier answer was left out: a paper it drew on was deleted.",
-    "other": "{count} earlier answers were left out: papers they drew on were deleted."
+    "one": "{count} earlier answer was left out: a paper it drew on was deleted, or its project no longer allows this request.",
+    "other": "{count} earlier answers were left out: a paper they drew on was deleted, or its project no longer allows this request."
   },
   "trace.history": "History",
   "trace.pairsJudged": {

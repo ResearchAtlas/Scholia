@@ -404,13 +404,14 @@ class Harness:
             now = utc_now()
             # S1-19b: a call in flight at the crash left its dispatch event (written before it was sent, with
             # its body's link, and kept whatever becomes of the body); its attempt is recorded now, naming its body,
-            # with an unknown charge, for every kind of run. An attempt is known by its step and number.
+            # with an unknown charge, for every kind of run. An attempt is known by its step and number; a step
+            # whose call was recorded (step_finished) left none in flight: an attempt it does not name was never sent.
             for run_id, data in conn.execute(
                     "SELECT s.run_id, s.data FROM run_events s JOIN runs r ON r.id = s.run_id"
                     " WHERE r.status = 'running' AND s.type = 'dispatch' AND NOT EXISTS (SELECT 1 FROM run_events e"
-                    " WHERE e.run_id = s.run_id AND e.type = 'model_attempt'"
-                    " AND json_extract(e.data, '$.step') = json_extract(s.data, '$.step')"
-                    " AND json_extract(e.data, '$.attempt') = json_extract(s.data, '$.attempt'))"
+                    " WHERE e.run_id = s.run_id AND (e.type = 'model_attempt'"
+                    " AND json_extract(e.data, '$.attempt') = json_extract(s.data, '$.attempt') OR e.type = 'step_finished')"
+                    " AND json_extract(e.data, '$.step') = json_extract(s.data, '$.step'))"
                     " ORDER BY s.run_id, s.seq").fetchall():
                 started = json.loads(data)
                 _event(conn, run_id, "model_attempt", {**started, "outcome": "interrupted", "dispatched": None,

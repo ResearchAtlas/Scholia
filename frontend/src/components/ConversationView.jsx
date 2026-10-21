@@ -99,7 +99,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // stays on screen (backend/provenance.py); a failed read is tried again after a pause.
   useEffect(() => {
     const changed = (event) => {
-      if (event.detail !== projectId) return;
+      if (event.detail !== projectId || !id) return; // a conversation not yet created has read nothing
       generation.current += 1;
       setTurns(null);
       setStale(true);

@@ -77,7 +77,8 @@ async def test_a_message_runs_one_turn_through_its_commit_boundaries(tmp_path):
         assert await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations WHERE run_id = ?",
                           run_id) == [("settled", 0.002, "reported")]
         types = [t for (t,) in await rows(client, "SELECT type FROM run_events WHERE run_id = ? ORDER BY seq", run_id)]
-        assert types == ["route", "step_started", "model_attempt", "step_finished", "citation_checks", "run_finished"]
+        assert types == ["route", "step_started", "dispatch", "model_attempt", "step_finished", "citation_checks",
+                         "run_finished"]
         [(attempt,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
                                   run_id)
         attempt = json.loads(attempt)
