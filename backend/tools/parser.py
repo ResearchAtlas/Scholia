@@ -40,6 +40,6 @@ class ToolParser:
         fenced = _FENCE.match(text)
         try:
             value = json.loads(fenced.group(1) if fenced else text)
-        except ValueError:
+        except (ValueError, RecursionError):  # not JSON, or nested past what the parser follows
             return None
         return value if isinstance(value, dict) else None

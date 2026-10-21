@@ -153,8 +153,8 @@ async def test_the_agents_ask_waits_for_the_researcher_whose_typed_answer_is_the
         conversation = await conversation_in(client, project)
         sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
         ask = await asked(client, conversation)
-        assert (ask["kind"], ask["options"], ask["text_box"], ask["params"]["question"]) == (
-            "choice", ["Earnings", "Jobs"], True, "Which outcome?")
+        assert (ask["kind"], ask["options"], ask["text_box"], ask["params"]["question"], ask["params"]["labels"]) == (
+            "choice", ["1", "2"], True, "Which outcome?", {"1": "Earnings", "2": "Jobs"})
         waiting = await rows(client, "SELECT waiting FROM runs WHERE id = ?", ask["run_id"])
         assert waiting == [("ask",)] and len(provider.agent_steps) == 1  # the run waits; nothing more is sent
         answered = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"text": "Both, please"})
@@ -181,7 +181,7 @@ async def test_an_agents_ask_closes_with_its_run_and_a_late_answer_changes_nothi
         else:
             assert (await client.delete(f"/api/conversations/{conversation}")).status_code in (200, 204)
         await sending
-        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "Yes"})
+        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
         assert late.status_code in (404, 409)  # L7: closed with its run, or gone with it
         assert len(provider.agent_steps) == 1
         if end == "stop":
@@ -206,7 +206,7 @@ async def test_an_agents_ask_is_withdrawn_when_its_projects_protection_changes(t
         # a policy change that revokes nothing here (written directly): the ask no longer applies
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
             "UPDATE projects SET sensitivity = 'local_only' WHERE id = ?", (project,)))
-        refused = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "Yes"})
+        refused = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
         # refused as invalid, or as closed once the run's wait has withdrawn it: either way never taken
         assert refused.status_code == 409 and refused.json()["code"] in ("ask_invalid", "ask_closed")
         stream = await sending

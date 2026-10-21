@@ -13,8 +13,8 @@ Answer questions about the app in a few plain sentences, then offer to open the 
 - `settings.general`: the interface language (applied when the window reloads), the default budget for each conversation, personal instructions and the Zotero connection.
 - `settings.providers`: model providers and their keys, and which models are offered.
 - `settings.subagents`: the ranked list of models for subagents.
-- `settings.project`: this project's name, budget, protection level (Normal, Private or Local only), citation style, target venue, project instructions and the project export.
-- `settings.advanced`: the data folder, backups, the search index and its model, declared local model servers, limits, the models used for routing, checking citations and memory, and the background-run list.
+- `settings.project`: this project's name, budget, protection level (Normal, Private or Local only), citation style, target venue, project instructions, its limits, the library's search index and the project export.
+- `settings.advanced`: the data folder, backups, the search model, declared local model servers, limits, the models used for routing, checking citations and memory, and the background-run list.
 
 ## Common questions
 

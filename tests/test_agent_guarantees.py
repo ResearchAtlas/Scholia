@@ -91,7 +91,7 @@ async def test_the_review_lock_stops_the_loop_before_its_next_tool_call_or_skill
         ask = await asked(client, conversation)
         locked = await lock(client, project, venue="A JOURNAL")
         assert locked.status_code == 200, locked.text
-        refused = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "Yes"})
+        refused = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
         assert refused.status_code == 409  # the ask is invalid under the new policy, or its run has ended
         stream = await sending
         assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")

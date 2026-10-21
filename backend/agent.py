@@ -39,8 +39,6 @@ READ_CHARS = 50_000  # the read tool's bound (section 13); its output is preview
 LIST_LIMIT = 500  # papers list_materials reads, before the preview bound
 MAX_SELECTED = 50  # papers a tool call may restrict itself to, as a message may
 ANSWERED_POLL_SECONDS = 2  # how often a waiting ask looks again without being woken
-# Arguments the trace records as given (ids, numbers, names from fixed lists); any other is recorded by its length.
-TRACED = {"material_ids", "material_id", "ordinal", "version_id", "name", "file_id", "place"}
 
 _IDS = {"type": "array", "items": {"type": "string", "maxLength": 64}, "maxItems": MAX_SELECTED}
 
@@ -69,6 +67,13 @@ class Evidence:
     def lines(self, keys):
         return citations.bundle({k: self.numbered[k] for k in dict.fromkeys(keys)})
 
+    def keep(self, keys, kept, before):
+        """Take back the markers of keys that were new (not in before) and are not in kept: passages retrieved but
+        never shown to a model are not read in the run."""
+        for key in keys:
+            if key not in kept and key not in before:
+                self.numbered.pop(key, None)
+
 
 class Turn:
     """What a tool call runs with: the harness, the turn's claim and context, its evidence, and emit for the
@@ -78,6 +83,7 @@ class Turn:
         self.harness, self.claim, self.ctx, self.evidence, self.emit = harness, claim, claim.context, evidence, emit
         self.step = step
         self.listed = set()
+        self.activated = set()  # the skills activated in this turn
         self.waited = 0.0  # seconds spent waiting on the researcher, which the turn's time limit leaves out
 
     async def read(self, fn):
@@ -99,10 +105,15 @@ def _wrapped(skill):
 
 
 def traced_arguments(arguments):
-    """A call's arguments as the trace keeps them: ids and fixed choices as given, free text by length only."""
-    return {k: v if k in TRACED and not isinstance(v, dict) else
-            {"chars": len(v) if isinstance(v, str) else len(json.dumps(v, ensure_ascii=False))}
-            for k, v in arguments.items()}
+    """A call's arguments as the trace keeps them: an ordinal (a number) and a place from the fixed list as given,
+    every other value by its length only, since the model may put any text in any argument, a passage's included
+    (backend/provenance.py: an append-only event never holds text drawn from a paper). The ids a call resolved are in
+    its tool_result's meta, once validated."""
+    def kept(key, value):
+        if (key == "ordinal" and type(value) is int) or (key == "place" and value in PLACES):
+            return value
+        return {"chars": len(value) if isinstance(value, str) else len(json.dumps(value, ensure_ascii=False))}
+    return {k if k in _ARGUMENT_NAMES else "other": kept(k, v) for k, v in arguments.items()}
 
 
 async def _selection(turn, ids):
@@ -169,15 +180,27 @@ async def search_passages(call, turn):
     selection = await _selection(turn, call.arguments.get("material_ids"))
     if selection is None:
         return failed(call.id, "access_denied", "A paper named is not in this project.")
+    selection = selection or turn.ctx["selection"]  # the papers the message selected narrow it too (F4)
     state = search._STATES.get(turn.harness)
     if state is None:
         return failed(call.id, "tool_error", "The library's search index is unavailable.")
     found = await pipeline.evidence(state, turn.ctx["project_id"], query, materials=selection or None)
     await turn.harness._trace_retrieval(turn.claim, found, call.id)
-    keys = turn.evidence.add(found["records"])
+    before = set(turn.evidence.numbered)
+    keys = list(dict.fromkeys(turn.evidence.add(found["records"])))
     if not keys:
         return ToolResult(id=call.id, ok=True, text="No passage matched.", meta={"passages": [], "mode": found["mode"]})
-    result = _shown(turn, call.id, keys, {"mode": found["mode"]})
+    shown, used = [], 0
+    for key in keys:  # whole passages, best first, within the output preview
+        size = len(turn.evidence.lines([key])[0]) + 2
+        if shown and used + size > 7000:
+            break
+        shown.append(key)
+        used += size
+    turn.evidence.keep(keys, shown, before)
+    result = _shown(turn, call.id, shown, {"mode": found["mode"]})
+    if len(shown) < len(keys):
+        result.text += f"\n\n({len(keys) - len(shown)} more passages matched; search more narrowly to see them.)"
     if found["mode"] == "keyword_only":
         result.text += "\n\n(Meaning search was unavailable: these come from keyword search only.)"
     return result
@@ -218,7 +241,7 @@ async def read_passage(call, turn):
         kept.append(record)
         room -= len(record["text"]) + 200
     left = [r["ordinal"] for r in records[len(kept):]]
-    result = _shown(turn, call.id, turn.evidence.add(kept), {"version_id": rows[0][1][7], "left_out": len(left)})
+    result = _shown(turn, call.id, turn.evidence.add(kept), {"version_id": rows[0][1][7], "left_out": len(left)})  # only those shown
     if left:
         result.text += f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)"
     return result
@@ -253,7 +276,7 @@ async def answer_from_library(call, turn):
     selection = await _selection(turn, call.arguments.get("material_ids"))
     if selection is None:
         return failed(call.id, "access_denied", "A paper named is not in this project.")
-    return await turn.harness._answer_from_library(turn, call.id, question, selection or None)
+    return await turn.harness._answer_from_library(turn, call.id, question, selection or turn.ctx["selection"])
 
 
 # Agent control
@@ -271,6 +294,11 @@ async def use_skill(call, turn):
     skill = loaded.get(call.arguments["name"])
     if skill is None:
         return failed(call.id, "validation_error", "No enabled skill has that name; use a name from the SKILL CATALOG.")
+    active = "".join(turn.ctx["skill_sections"].get("active_skills") or ())
+    if skill.name in turn.activated or f'<skill name="{skill.name}">' in active:  # loaded once per conversation
+        return ToolResult(id=call.id, ok=True, text=f"The {skill.name} skill is already active; its instructions are "
+                                                    "above.", meta={"skill": skill.name, "already_active": True})
+    turn.activated.add(skill.name)
     await turn.harness._skill_activated(turn.claim, skill, turn.step)
     turn.emit({"type": "skill", "name": skill.name})
     files = "\n".join(f"- {file_id}: {path}" for file_id, path, _ in skill.files)
@@ -309,7 +337,7 @@ async def ask(call, turn):
     options = [visible(o) for o in call.arguments["options"]]
     if question is None or None in options or len(set(options)) != len(options):
         return failed(call.id, "validation_error", "The question and each option must have text, and the options differ.")
-    answer = await turn.harness._ask(turn, "choice", options, {"question": question}, call.id)
+    answer = await turn.harness._ask(turn, "choice", options, {}, call.id, question=question)
     if answer is None:
         return failed(call.id, "tool_error", "The question was withdrawn: the project's protection changed.")
     said = answer.get("option") if "option" in answer else answer.get("text")
@@ -332,6 +360,15 @@ async def open_place(call, turn):
 
 def definitions():
     return REGISTRY.to_request_format()
+
+
+def known_name(name):
+    """A tool name as the trace keeps it: one the registry knows, else None (the model's text is not kept)."""
+    return name if REGISTRY.get_definition(name) is not None else None
+
+
+# The argument names the tools declare: any other name the model sends is recorded as "other"
+_ARGUMENT_NAMES = {name for tool in REGISTRY.list_tools() for name in tool.args_schema.get("properties", {})}
 
 
 @router.get("/api/skills")

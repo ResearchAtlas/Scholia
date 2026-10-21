@@ -177,3 +177,19 @@ def test_the_license_audit_ships_literature_reviews_notice_with_the_app():
     assert {("LICENSE.md", "licenses/K-Dense scientific-agent-skills"),
             ("NOTICE.md", "licenses/K-Dense scientific-agent-skills")} <= shipped
     assert license_audit.component(license_audit.KDENSE)[0] == "MIT"
+
+
+@pytest.mark.asyncio
+async def test_use_skill_on_an_active_skill_does_not_load_its_body_again(tmp_path):
+    provider = Scripted([call("use_skill", name="help")], [call("use_skill", call_id="c2", name="help")], "First.",
+                        [call("use_skill", call_id="c3", name="help")], "Second.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "How do I add papers?")
+        await send(client, conversation, "And Zotero?")
+        again = tool_messages(provider.agent_steps[2])[-1]["content"]
+        assert again.startswith("The help skill is already active")  # within the turn
+        later = tool_messages(provider.agent_steps[4])[-1]["content"]
+        assert later.startswith("The help skill is already active")  # and once it is in ACTIVE SKILLS
+        assert json.dumps(provider.agent_steps[4]).count("# Using Scholia") == 1

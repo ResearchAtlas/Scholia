@@ -61,7 +61,7 @@ async def test_an_approved_tool_call_and_an_answered_ask_replay_to_their_record(
                                                 "updates": {"tools.ask": ["list_materials"]}})
         conversation = await conversation_in(client, project)
         sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
-        for option in ("allow", "B"):
+        for option in ("allow", "2"):  # the approval, then B by its number
             ask = await asked(client, conversation)
             assert (await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": option})).status_code == 200
             while (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"] == [ask]:

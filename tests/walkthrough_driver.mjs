@@ -2294,7 +2294,7 @@ async function s119(ctx) {
     check('the run went on with the researcher\'s answer', turn.answer.text.includes(option));
     const events = (await get(`/api/runs/${turn.run_id}/trace`)).body.events;
     check('the ask and its answer are recorded', events.some((e) => e.type === 'ask')
-      && events.some((e) => e.type === 'ask_answered' && e.data.by === 'researcher' && e.data.option === option));
+      && events.some((e) => e.type === 'ask_answered' && e.data.by === 'researcher' && e.data.option === '2')); // by its number
     await page.waitForTimeout(1500);
     check('the question is gone once answered', !(await card.count()));
   });

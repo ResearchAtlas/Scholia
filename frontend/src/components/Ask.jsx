@@ -68,7 +68,7 @@ export function Ask({ ask, onAnswered }) {
           )}
         </div>
       </div>
-      {ask.text_box && (
+      {ask.text_box && !approval && ( // S1-19c: an approval is answered with its options only
         <form className="flex gap-2" onSubmit={(event) => { event.preventDefault(); if (visible(text)) answer({ text }); }}>
           <label htmlFor={textId} className="sr-only">{t('ask.textLabel')}</label>
           <Input id={textId} value={text} onChange={(event) => setText(event.target.value)} disabled={busy} className="h-8" />
@@ -82,7 +82,8 @@ export function Ask({ ask, onAnswered }) {
           <Button key={option} type="button" size="sm" variant={i === 0 ? 'default' : 'outline'} disabled={busy}
             className={i === 0 ? 'bg-brand text-brand-foreground hover:bg-brand/90' : undefined}
             onClick={() => answer({ option })}>
-            {named(t, approval ? `ask.approval.option.${option}` : `ask.${ask.kind}.option.${option}`, option)}
+            {ask.params?.labels?.[option] // S1-19c: the agent's options, by number, labeled while its run waits
+              ?? named(t, approval ? `ask.approval.option.${option}` : `ask.${ask.kind}.option.${option}`, option)}
           </Button>
         ))}
       </div>

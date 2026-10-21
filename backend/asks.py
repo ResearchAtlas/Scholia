@@ -129,11 +129,22 @@ def withdraw(conn, run_id, ask_id, reason):
     return True
 
 
+# S1-19c: the agent's choice ask (backend/runs.py Harness._ask): its event names its options by number; its question
+# and option labels, the model's text, are held in the run's inputs while it runs and shown from there.
+def _agents_question(conn, run_id):
+    row = conn.execute("SELECT json_extract(inputs, '$.held.ask') FROM runs WHERE id = ?", (run_id,)).fetchone()
+    held = json.loads(row[0]) if row and row[0] else None
+    ask, _ = asked(conn, run_id)
+    if not held or ask is None or held.get("ask_id") != ask["ask_id"]:
+        return {}
+    return {"question": held["question"], "labels": dict(zip(ask["options"], held["labels"]))}
+
+
 # S1-14's merge (backend/references.py): it takes one of its options, a typed answer having no defined
 # effect; and its question shows the two papers it is about, read as they are when it is listed, so
 # neither is kept in the question itself. SHOWN: kind -> fn(conn, run id) -> what its params add.
 NO_TEXT.add("merge")
-SHOWN = {}
+SHOWN = {"choice": _agents_question}
 
 
 def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
