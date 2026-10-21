@@ -481,6 +481,17 @@ def test_the_labels_format_refuses_another_set_or_rater_and_a_missing_field(tmp_
     assert gold.check_labels(broken, doc, papers) == ["label p01: category 'maybe'"]
 
 
+def test_check_refuses_a_labels_file_whose_header_names_another_rater_than_its_name(tmp_path):
+    """T10: field2-pairs.harold.json holding lee's header passed check, while review and apply for harold refuse it."""
+    folder = field(tmp_path)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    (folder / "labels").mkdir()
+    write(folder / "labels" / f"{pairs['id']}.harold.json", labels_for(pairs, "lee", {}))
+    assert f"{pairs['id']}.harold.json: labels: they are rater 'lee''s, not 'harold''s" in problems_of(folder)[0]
+    write(folder / "labels" / f"{pairs['id']}.harold.json", labels_for(pairs, "harold", {}))
+    assert problems_of(folder)[0] == []
+
+
 # Labels, the corrected set, the sample and the agreement
 
 

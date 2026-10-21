@@ -909,7 +909,8 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
             for path in [folder / "labels" / n for n in names(folder, folder / "labels")
                          if fnmatch.fnmatchcase(n, f"{set_doc['id']}.*.json")]:
                 labels = read_json(folder, path)
-                found = check_labels(labels, set_doc, papers)
+                rater = path.name[len(set_doc["id"]) + 1:-len(".json")]  # <set id>.<rater>.json: its header names it
+                found = check_labels(labels, set_doc, papers, rater)
                 problems += [f"{path.name}: {p}" for p in found]
                 if not found:
                     report["labels"][path.name] = label_counts(items, labels)
