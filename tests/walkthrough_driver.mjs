@@ -28,7 +28,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
@@ -1470,6 +1470,190 @@ async function ceilings(ctx) {
   await page.keyboard.press('Escape'); await page.waitForTimeout(500);
 }
 
+// S1-36: the gold sets' review pages (not an app flow). Each page is served by evals/gold.py review on
+// synthetic sets written into a temporary folder by tests/gold_fixtures.py, opened in the run's browser
+// with the address the command prints. Steps check the page's own words from its catalog and read every
+// saved label back from the labels file; each page's process is checked for sockets that are not loopback.
+async function startReview(args) {
+  const child = spawn('uv', ['run', '--no-sync', 'python', '-I', 'evals/gold.py', 'review', ...args],
+    { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const address = await new Promise((resolve, reject) => {
+    let text = '';
+    child.stdout.on('data', (chunk) => { text += chunk; const found = text.match(/^open: (\S+)$/m); if (found) resolve(found[1]); });
+    child.on('exit', (code) => reject(new Error(`the review page exited ${code}: ${stderr}`)));
+  });
+  const port = new URL(address).port;
+  let pid = 0;
+  for (let tries = 0; !pid && tries < 100; tries += 1) {
+    try { pid = Number(sh('lsof', ['-t', '-nP', `-iTCP:${port}`, '-sTCP:LISTEN'])); } catch { await new Promise((r) => setTimeout(r, 100)); }
+  }
+  if (!Number.isInteger(pid) || pid <= 0) { child.kill(); throw new Error(`the review page's listener on port ${port} was not found`); }
+  return { address, pid, child, stderr: () => stderr,
+           stop: () => { child.kill(); try { process.kill(pid); } catch { /* already gone */ } } };
+}
+
+async function goldPages(ctx) {
+  const { page, C, step, check } = ctx;
+  const strings = JSON.parse(readFileSync(join(ROOT, 'evals/review_page/catalog.json'), 'utf8'))[C.lang];
+  const G = (key, vars = {}) => strings[key].replace(/\{(\w+)\}/g, (all, name) => (name in vars ? String(vars[name]) : all));
+  const folder = join(tmpdir(), `scholia-walkthrough-gold-${process.pid}-${C.tag}`);
+  rmSync(folder, { recursive: true, force: true });
+  sh('uv', ['run', '--no-sync', 'python', 'tests/gold_fixtures.py', folder, '--field', '2', '--sample']);
+  const labels = (set, rater = 'harold') => {
+    try { return JSON.parse(readFileSync(join(folder, 'labels', `field2-${set}.${rater}.json`), 'utf8')).labels; } catch { return {}; }
+  };
+  const status = () => page.getByRole('status');
+  const heading = () => page.locator('#itemHeading');
+  let review = null;
+  const open = async (args) => {
+    review?.stop();
+    review = await startReview(['--field', '2', '--folder', folder, '--lang', C.lang, ...args]);
+    await page.goto(review.address);
+    await heading().waitFor();
+    await page.waitForTimeout(300);
+  };
+  const isolated = () => {
+    const found = foreignSockets(descendants(review.child.pid).concat(review.pid));
+    check('the review page holds loopback sockets only', found.length === 0);
+  };
+  const unlabeledControls = () => page.evaluate(() => [...document.querySelectorAll('button, input, select, textarea')]
+    .filter((e) => !e.labels?.length && !e.getAttribute('aria-label') && !e.textContent.trim()).length);
+  try {
+    await step('80-gold-questions', async () => {
+      await open(['--set', 'questions', '--rater', 'harold']);
+      check('the page opens on the first question', await heading().textContent() === G('item.heading', { n: 1, total: 6 }));
+      check('the heading has focus', await page.evaluate(() => document.activeElement?.id === 'itemHeading'));
+      await page.keyboard.press('k');
+      await status().getByText(G('status.saved', { n: 1 })).waitFor();
+      check('kept by its key: saved in the labels file', labels('questions').q01?.decision === 'keep');
+      check('the next open question is shown', await heading().textContent() === G('item.heading', { n: 2, total: 6 }));
+      await page.keyboard.press('e');
+      await page.getByLabel(G('edit.text'), { exact: true }).fill('Which method found more evidence, and did reranking help?');
+      await page.getByRole('button', { name: G('edit.removeItem', { n: 2 }) }).click();
+      await page.getByLabel(G('edit.filter'), { exact: true }).fill('paraphrased');
+      await page.waitForTimeout(400);
+      // Paper B's passages are held back while A's are still shown: the passage clicked is A's, saved as A's.
+      const slow = async (route) => { await new Promise((r) => setTimeout(r, 1500)); await route.continue(); };
+      await page.route('**/api/passages?paper=2601.00002v2', slow);
+      const shownA = page.getByRole('button', { name: G('edit.addThis') });
+      await page.getByLabel(G('edit.paper'), { exact: true }).selectOption('2601.00002v2');
+      await shownA.click();
+      await page.waitForTimeout(2000);
+      await page.unroute('**/api/passages?paper=2601.00002v2', slow);
+      check("the passage added while another paper loaded is the paper it was shown under",
+        await page.locator('.edit .evidence').nth(1).getByText('paraphrased', { exact: false }).count() === 1);
+      await page.getByLabel(G('edit.filter'), { exact: true }).fill('');
+      await page.waitForTimeout(600);
+      check('a passage holding markup is shown as text: no script ran and no image was made',
+        await page.evaluate(() => window.hostile === undefined && document.querySelectorAll('img').length === 0)
+        && await page.getByText('<script>window.hostile = 1</script>', { exact: false }).count() === 1);
+      check('every control on the page has a label', await unlabeledControls() === 0);
+      await page.getByRole('button', { name: G('edit.save') }).scrollIntoViewIfNeeded();
+    });
+    await step('80b-gold-questions-saved', async () => {
+      await page.getByRole('button', { name: G('edit.save') }).click();
+      await status().getByText(G('status.saved', { n: 2 })).waitFor();
+      await page.keyboard.press('d');
+      await status().getByText(G('status.saved', { n: 3 })).waitFor();
+      const saved = labels('questions');
+      check('edited: its text and its evidence (item 2 removed, a passage added) read back from the labels file',
+        saved.q02?.decision === 'edit' && /^Which method found more evidence/.test(saved.q02.text)
+        && saved.q02.evidence?.length === 2 && saved.q02.evidence[0][0].quote.startsWith('Table 1.')
+        && saved.q02.evidence[1][0].paper === '2601.00001v1' && saved.q02.evidence[1][0].quote.includes('paraphrased'));
+      check('dropped by its key', saved.q03?.decision === 'drop');
+      check('the progress says three done', await page.locator('#progress').textContent() === G('progress', { done: 3, total: 6 }));
+      await page.keyboard.press('ArrowLeft'); await page.keyboard.press('ArrowLeft');
+      check('the edited question shows as edited', await page.getByText(G('q.label.edit')).count() === 1);
+      await page.keyboard.press('k');  // Keep on an edited question keeps the edit it shows
+      await status().getByText(G('status.saved', { n: 2 })).waitFor();
+      check('Keep after the edit kept the edit, read back from the labels file', labels('questions').q02?.decision === 'edit'
+        && /^Which method found more evidence/.test(labels('questions').q02.text) && labels('questions').q02.revision === 2);
+      // A save's answer touches only its own question: q04's Keep is held back while q05's edit is opened and typed in.
+      const held = async (route) => { await new Promise((r) => setTimeout(r, 1500)); await route.continue(); };
+      await page.route('**/api/label', held);
+      check('the next open question is q04', await heading().textContent() === G('item.heading', { n: 4, total: 6 }));
+      await page.keyboard.press('k');
+      await page.keyboard.press('ArrowRight');
+      await page.keyboard.press('e');
+      await page.getByLabel(G('edit.text'), { exact: true }).fill('长段落主要讨论了检索深度吗？');
+      await status().getByText(G('status.saved', { n: 4 })).waitFor();
+      await page.unroute('**/api/label', held);
+      check("q04's answer left q05's open edit as typed", await heading().textContent() === G('item.heading', { n: 5, total: 6 })
+        && await page.getByLabel(G('edit.text'), { exact: true }).inputValue() === '长段落主要讨论了检索深度吗？');
+      check('q04 was kept, read back from the labels file', labels('questions').q04?.decision === 'keep');
+      isolated();
+    });
+
+    let order;
+    await step('81-gold-pairs', async () => {
+      await open(['--set', 'pairs', '--rater', 'harold']);
+      const served = await page.evaluate(() => fetch('/api/data', { headers: { 'X-Scholia-Client': 'local',
+        'X-Scholia-Session': sessionStorage.getItem('gold.session') } }).then((r) => r.text()));
+      order = JSON.parse(served).items.map((i) => i.id);
+      check('the page is served no drafted category and no verdict', !/drafted_category|verdict|"(supported|partly|unsupported)"/.test(served));
+      for (const [n, key] of [[1, '1'], [2, '2'], [3, '3']]) {
+        await page.keyboard.press(key);
+        await status().getByText(G('status.saved', { n })).waitFor();
+      }
+      const saved = labels('pairs');
+      check('three labels by their keys read back from the labels file', saved[order[0]]?.category === 'supported'
+        && saved[order[1]]?.category === 'partly' && saved[order[2]]?.category === 'unsupported');
+      const text = await page.locator('body').textContent();
+      check('no drafted category or verdict on the page', !text.includes(G('p.drafted', { category: '' }).trim()));
+      isolated();
+    });
+
+    await step('82-gold-resume', async () => {
+      await page.reload(); await heading().waitFor(); await page.waitForTimeout(300);
+      check('the saved count shows', await page.locator('#progress').textContent() === G('progress', { done: 3, total: 6 }));
+      check('the first unlabeled pair is shown with focus', await heading().textContent() === G('item.heading', { n: 4, total: 6 })
+        && await page.evaluate(() => document.activeElement?.id === 'itemHeading'));
+      await page.getByRole('button', { name: G('nav.item', { n: 1, state: G('state.done') }) }).click();
+      check('a saved pair shows its label', await page.getByText(G('p.label', { category: G('p.supported') })).count() === 1);
+      await page.getByRole('button', { name: G('nav.nextOpen') }).click();
+    });
+
+    await step('83-gold-not-saved', async () => {
+      const before = readFileSync(join(folder, 'labels', 'field2-pairs.harold.json'), 'utf8');
+      chmodSync(join(folder, 'labels'), 0o500);
+      try {
+        await page.keyboard.press('1');
+        await status().getByText(G('status.notSaved', { n: 4 })).waitFor();
+        check('not saved: the labels file is as it was', readFileSync(join(folder, 'labels', 'field2-pairs.harold.json'), 'utf8') === before);
+        check('the count is unchanged', await page.locator('#progress').textContent() === G('progress', { done: 3, total: 6 }));
+      } finally {
+        chmodSync(join(folder, 'labels'), 0o700);
+      }
+    });
+    await step('83b-gold-retried', async () => {
+      await page.getByRole('button', { name: G('status.retry') }).click();
+      await status().getByText(G('status.saved', { n: 4 })).waitFor();
+      check('the retry saved it', labels('pairs')[order[3]]?.category === 'supported');
+    });
+
+    await step('84-gold-second-rater', async () => {
+      await open(['--set', 'pairs', '--rater', 'lee', '--sample']);
+      const sample = JSON.parse(readFileSync(join(folder, 'sample-pairs.json'), 'utf8')).items;
+      check("the colleague's page holds the sample only", await page.locator('#list li').count() === sample.length
+        && await heading().textContent() === G('item.heading', { n: 1, total: sample.length }));
+      check("none of Harold's labels show", await page.locator('#progress').textContent() === G('progress', { done: 0, total: sample.length })
+        && await page.getByText(G('state.open'), { exact: true }).count() === 1);
+      check('the title says it is the second rater\'s sample', (await page.locator('#title').textContent())
+        === G('title.sample', { title: G('title.pairs', { field: 2 }) }));
+      await page.keyboard.press('3');
+      await status().getByText(G('status.saved', { n: 1 })).waitFor();
+      check("the colleague's label is in its own file", labels('pairs', 'lee')[sample[0]]?.category === 'unsupported'
+        && Object.keys(labels('pairs', 'lee')).length === 1);
+      isolated();
+    });
+  } finally {
+    review?.stop();
+    rmSync(folder, { recursive: true, force: true });
+  }
+}
+
 // S1-14: a reference file imported through the Library's Add menu: its new records become papers with
 // no full text, their details completed by the test-owned OpenAlex and Crossref (one retracted), and
 // two duplicates of papers already here each raise the merge question, answered Merge and Keep both;
@@ -2300,6 +2484,13 @@ async function run(combo, build, outRoot) {
     if (C.materials) await ceilings(ctx);  // a reading stopped at its memory ceiling and at its time ceiling
     if (C.materials) await references(ctx);  // S1-14: a reference file's import, its merges, a Local only import, Attach
     if (C.zoteroState) await zotero(ctx);  // S1-15: the Zotero browser, an import and a re-import
+    if (server) {  // S1-36: the gold sets' review pages, in a tab of their own
+      const appPage = page;
+      page = await appPage.context().newPage();
+      page.on('console', (message) => { if (['error', 'warning'].includes(message.type())) consoleMessages.push(`${message.type()}: ${message.text()}`); });
+      page.on('pageerror', (error) => consoleMessages.push(`pageerror: ${error.message}`));
+      try { await goldPages({ ...ctx, page }); } finally { await page.close(); page = appPage; }
+    }
     if (opts.motion) {
       current = { name: 'motion', checks: [] }; manifest.steps.push(current);
       await motion(ctx); current.ok = current.checks.every((c) => c.ok);

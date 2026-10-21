@@ -1,0 +1,58 @@
+{
+ "set": "field2-pairs",
+ "kind": "pairs",
+ "fraction": 0.2,
+ "seed": 3620,
+ "strata": [
+  "sentence_language",
+  "drafted_category"
+ ],
+ "drawn": {
+  "en|partly": {
+   "items": 15,
+   "drawn": 3
+  },
+  "en|supported": {
+   "items": 20,
+   "drawn": 4
+  },
+  "en|unsupported": {
+   "items": 15,
+   "drawn": 3
+  },
+  "zh-CN|partly": {
+   "items": 18,
+   "drawn": 4
+  },
+  "zh-CN|supported": {
+   "items": 14,
+   "drawn": 3
+  },
+  "zh-CN|unsupported": {
+   "items": 18,
+   "drawn": 3
+  }
+ },
+ "items": [
+  "p013",
+  "p021",
+  "p022",
+  "p034",
+  "p039",
+  "p044",
+  "p046",
+  "p047",
+  "p050",
+  "p056",
+  "p060",
+  "p061",
+  "p069",
+  "p073",
+  "p076",
+  "p082",
+  "p084",
+  "p096",
+  "p097",
+  "p098"
+ ]
+}
