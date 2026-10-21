@@ -1955,7 +1955,7 @@ async function s119(ctx) {
   const ask = async (text) => {
     const before = requests().filter((r) => r.role === 'answer').length;
     await box().fill(text);
-    await page.getByRole('button', { name: L('composer.send') }).click();
+    await page.getByRole('button', { name: L('composer.send'), exact: true }).click();
     await until('the answer', async () => requests().filter((r) => r.role === 'answer').length > before);
     await until('the answer saved', async () => { const turn = await latest(); return turn?.message?.text === text && turn.status === 'succeeded' && turn; });
     await page.waitForTimeout(1500); // the live turn hands over to its record
