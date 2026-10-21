@@ -138,11 +138,13 @@ test('after Check again, a group or collection Zotero no longer lists is left be
   assert.equal(collectionIn('COL00001', collections), 'COL00001');
   assert.equal(collectionIn('COL00002', collections), null); // gone: all items
   assert.equal(collectionIn('COL00002', null), 'COL00002'); // the list is still loading: kept until it says
+  assert.equal(collectionIn('COL00002', false), 'COL00002'); // the list failed to load: kept, not taken as gone
   assert.equal(collectionIn(null, collections), null);
   const browser = source('ZoteroBrowser.jsx');
   // left while rendering (so no effect sends a request for it), with the items chosen in the library left
   assert.match(browser, /if \(ready && libraryIn\(library, status\.libraries\) !== library\) \{\s*setLibrary\(libraryIn\(library, status\.libraries\)\);\s*setCollection\(null\);\s*setChosen\(\[\]\);/);
   assert.match(browser, /else if \(collectionIn\(collection, collections\) !== collection\) \{\s*setCollection\(null\);/);
+  assert.match(browser, /\.catch\(\(error\) => \{ if \(live\) \{ setCollections\(false\);/); // a failed refresh is not an empty list
   // Check again refreshes the collections too, and a chosen collection's items wait for its list
   assert.match(browser, /setStatus\(null\);\s*setCollections\(null\);[^\n]*\n\s*setPage\(null\);/);
   assert.match(browser, /const confirming = collection !== null && collections === null;/);

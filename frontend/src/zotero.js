@@ -70,6 +70,7 @@ export function libraryIn(library, libraries) {
 }
 
 // The collection shown, kept while the refreshed list of the library's collections has it; else all items.
+// A list still loading (null) or that failed to load (false) says nothing, so the collection is kept.
 export const collectionIn = (collection, collections) => (collection === null || !collections
   || collections.some((c) => c.key === collection) ? collection : null);
 

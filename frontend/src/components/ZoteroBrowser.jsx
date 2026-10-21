@@ -73,7 +73,7 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
     let live = true;
     setCollections(null);
     zoteroCollections(library).then((found) => { if (live) setCollections(found.collections); })
-      .catch((error) => { if (live) { setCollections([]); setProblem(codeOf(error)); } });
+      .catch((error) => { if (live) { setCollections(false); setProblem(codeOf(error)); } }); // failed: not a list, so a chosen collection is kept
     return () => { live = false; };
   }, [ready, library]);
   const generation = useRef(0); // each list shown has its own: a page asked for another one is dropped
