@@ -295,6 +295,27 @@ def test_the_evidence_picker_offers_a_papers_usable_passages_and_refuses_any_oth
     assert pairs.get("/api/passages?paper=2601.00001v1")[0] == 404
 
 
+@pytest.mark.parametrize("change", [{"text": "Dense retrieval found the evidence passage for 72 of 100 questions."},
+                                    {"page": 2}, {"kind": "table"}, {"section_path": ["2 Results"]}])
+def test_a_repicked_passage_whose_locator_changed_is_saved_as_an_edit_holding_the_new_locator(tmp_path, pages, change):
+    """T9: the worksheet written again after the reading changed: passage 2 of 2601.00001v1 has another quote,
+    page, kind or section at the same ordinal. Picking it again was stored as keep (paper and ordinal compared
+    only), so apply kept the draft's stale locator."""
+    folder = field(tmp_path)
+    sheet_path = gold.outputs(folder) / "worksheet.json"
+    sheet = json.loads(sheet_path.read_text())
+    sheet["papers"]["2601.00001v1"]["passages"][2].update(change)
+    gold.write_json(folder, sheet_path, sheet)
+    page = pages(folder, "questions")
+    assert page.send("q02")[1]["label"]["decision"] == "keep"  # other passages as drafted: still kept
+    status, saved = page.send("q01", evidence=[[pick(page, "2601.00001v1", 2)]])
+    assert status == 200 and saved["label"]["decision"] == "edit"
+    loc = saved["label"]["evidence"][0][0]
+    assert {k: loc[k] for k in ("page", "kind", "section_path")} == {
+        k: sheet["papers"]["2601.00001v1"]["passages"][2][k] for k in ("page", "kind", "section_path")}
+    assert loc["quote"] == sheet["papers"]["2601.00001v1"]["passages"][2]["text"]
+
+
 def test_an_evidence_item_is_one_passage_or_the_consecutive_passages_of_one_paper(tmp_path, pages):
     """T1: one item mixing papers, or one paper's passages with a gap, was saved; tier 2 would count either
     found by any one of its passages."""

@@ -1358,9 +1358,8 @@ class Review:
             raise ValueError("evidence_invalid")
         content["evidence"] = [[self.locator(c) for c in ev] for ev in chosen]
 
-        def plain(question):
-            return ({k: question[k] for k in ("text", "short_answer", "answerable") if k in question},
-                    [[(loc["paper"], loc["ordinal"]) for loc in ev] for ev in question["evidence"]])
+        def plain(question):  # whole locators: a passage picked again with another quote, page, kind or section is an edit
+            return {k: question[k] for k in ("text", "short_answer", "answerable", "evidence") if k in question}
         return {"decision": "keep"} if plain(content) == plain(item) else {"decision": "edit", **content}
 
     def save(self, body):
