@@ -1158,6 +1158,9 @@
   "trace.charged": "实际花费 {cost}",
   "trace.bodyRemoved": "发送的原文已随删除的论文一并移除。",
   "trace.bodyUnavailable": "发送的原文未能保存。",
+  "trace.checksCut": {
+    "other": "{count} 个长句只按开头部分核查，因此至多算部分支持。"
+  },
   "trace.checksOverLimit": {
     "other": "超出一次核查范围的 {count} 组引用未核查。"
   },

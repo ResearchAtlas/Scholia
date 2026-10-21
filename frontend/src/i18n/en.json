@@ -1193,6 +1193,10 @@
   "trace.charged": "charged {cost}",
   "trace.bodyRemoved": "The exact text sent was removed with a deleted paper.",
   "trace.bodyUnavailable": "The exact text sent could not be kept.",
+  "trace.checksCut": {
+    "one": "{count} long sentence was judged on its beginning only, so it counts as partly supported at most.",
+    "other": "{count} long sentences were judged on their beginnings only, so each counts as partly supported at most."
+  },
   "trace.checksOverLimit": {
     "one": "{count} citation pair past what one check covers was left unchecked.",
     "other": "{count} citation pairs past what one check covers were left unchecked."

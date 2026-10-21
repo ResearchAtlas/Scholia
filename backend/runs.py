@@ -779,7 +779,7 @@ class Harness:
             # largest passages the request holds, each sentence cut to judge_sentence_units) at the least output
             # limit, at the judge route's highest rate. The share is held until the judge's calls take it.
             retrieval = ctx["personal"].values["retrieval"]
-            ctx["judge_plan"] = (0, 0)
+            ctx["judge_plan"] = (0, 0, frozenset())
             judge_estimate = 0.0
             if numbered and judge[1] is not None:
                 ctx["judge_plan"] = citations.judge_plan(
@@ -807,9 +807,9 @@ class Harness:
             # The delivered answer's checks, before its primary commit: existence and mapping, then the judge.
             checked = await self._read(lambda conn: citations.check_existence(
                 conn, ctx["project_id"], result.content, numbered))
-            verdicts, judged, over = await self._support(claim, ctx, checked, judge)
+            verdicts, judged, over, cut = await self._support(claim, ctx, checked, judge)
             ctx["cited"] = (result.content, numbered, verdicts)  # checked again in the primary commit
-            ctx["over_limit"] = over
+            ctx["over_limit"], ctx["cut_sentences"] = over, cut
             unsearched = (found.get("trace") or {}).get("index") in ("building", "unavailable")
             notices = [n for n, shown in (("index_unavailable", unsearched), ("citations_over_limit", over > 0),
                                           ("keyword_only", found["mode"] == "keyword_only" and not unsearched),
@@ -921,7 +921,8 @@ class Harness:
         citations.write_rows(conn, claim.run_id, checked, now, new_id)
         _event(conn, claim.run_id, "citation_checks", {"citations": [
             {k: c.get(k) for k in ("marker", "existence", "support", "passage_id", "sentence")} for c in checked],
-            **({"over_limit": ctx["over_limit"]} if ctx.get("over_limit") else {})})
+            **({"over_limit": ctx["over_limit"]} if ctx.get("over_limit") else {}),
+            **({"cut_sentences": ctx["cut_sentences"]} if ctx.get("cut_sentences") else {})})
         _event(conn, claim.run_id, "run_finished", {"status": "succeeded"})
         conn.execute("UPDATE turns SET answer = ?, result_saved = 1, phase = 'answer', memory_status = 'skipped',"
                      " accounting = ? WHERE run_id = ?",
@@ -1166,27 +1167,31 @@ class Harness:
         return None, None, None
 
     async def _support(self, claim, ctx, checked, judge):
-        """({(sentence, passage id): verdict}, whether every pair was judged, how many pairs were past the
-        cap). The judge's plan (ctx["judge_plan"], set with its share) gives the pairs per call; at most
-        `judge_calls` calls are made, so the pairs past judge_calls x that are left unchecked and counted (a
-        fixed limit, said in the answer, never a budget). Each call is shown the passage text the answer was
-        given and each sentence cut to `judge_sentence_units`, so its estimate never exceeds its part of the
-        share. A call that fails, times out or refuses, or a pair it leaves unanswered, leaves those pairs
-        unchecked."""
+        """({(sentence, passage id): verdict}, whether every pair it was to judge was judged, how many pairs were
+        past the cap, how many judged sentences were cut). The judge's plan (ctx["judge_plan"], set with its
+        share) gives the pairs per call and the passages a call can hold; at most `judge_calls` calls are made,
+        so the pairs past judge_calls x that are left unchecked and counted (a fixed limit, said in the answer
+        apart, never a budget). Each call is shown the passage text the answer was given and each sentence cut
+        to `judge_sentence_units`, so its estimate never exceeds its part of the share; a cut sentence's
+        verdict is at most partly, since only part of it was judged. A call that fails, times out or refuses, a
+        pair it leaves unanswered, or one citing a passage too large for the judge's window, stays unchecked."""
         wanted = citations.pairs(checked)
         if not wanted:
-            return {}, True, 0
+            return {}, True, 0, 0
         if judge[1] is None:  # a judge is set that cannot run here: unchecked, said, never another model
-            return {}, False, 0
+            return {}, False, 0, 0
         retrieval = ctx["personal"].values["retrieval"]
-        size, units = ctx["judge_plan"][0], retrieval["judge_sentence_units"]
+        size, _, fitting = ctx["judge_plan"]
         if not size:  # not one pair fits the judge's window
-            return {}, False, 0
-        cap = retrieval["judge_calls"] * size
-        over, wanted = max(0, len(wanted) - cap), wanted[:cap]
+            return {}, False, 0, 0
+        units = retrieval["judge_sentence_units"]
         texts = {c["passage_id"]: c["judged_text"] for c in checked if c["existence"] == "ok"}
         material_of = {c["passage_id"]: c["material_id"] for c in checked if c["existence"] == "ok"}
-        verdicts, complete = {}, True
+        complete = all(texts[pid] in fitting for _, pid in wanted)
+        wanted = [pair for pair in wanted if texts[pair[1]] in fitting]
+        cap = retrieval["judge_calls"] * size
+        over, wanted = max(0, len(wanted) - cap), wanted[:cap]
+        verdicts, cut = {}, 0
         for batch in citations.batches(wanted, size):
             try:
                 result = await self._role_call(claim, ctx, judge[0], "judge", citations.JUDGE_RULES,
@@ -1202,8 +1207,13 @@ class Harness:
                 continue
             found = citations.parse_verdicts(result.content, len(batch))
             complete = complete and len(found) == len(batch)
-            verdicts.update({pair: found[i] for i, pair in enumerate(batch, start=1) if i in found})
-        return verdicts, complete and not over, over
+            for i, pair in enumerate(batch, start=1):
+                if i not in found:
+                    continue
+                shortened = citations.judge_view(pair[0], units) != pair[0]
+                cut += shortened
+                verdicts[pair] = "partly" if shortened and found[i] == "supported" else found[i]
+        return verdicts, complete, over, cut
 
     async def _general(self):
         return await self._read(lambda conn: conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
@@ -1482,12 +1492,15 @@ class Harness:
             papers = inputs.get("context_materials") or ()
             rules = citations.JUDGE_RULES
 
+            units = personal.values["retrieval"]["judge_sentence_units"]
+
             def output(result):  # each citation's verdict with the pair it was given for; None (the run fails,
                 found = citations.parse_verdicts(result.content, len(judged))  # writing nothing) if one is unanswered
                 if len(found) < len(judged):
                     return None
-                return {cid: [found[i], pid, sentence] for i, (sentence, pid, cids) in enumerate(judged, start=1)
-                        for cid in cids}
+                return {cid: ["partly" if found[i] == "supported" and citations.judge_view(sentence, units) != sentence
+                              else found[i], pid, sentence]  # a sentence judged only in part: at most partly
+                        for i, (sentence, pid, cids) in enumerate(judged, start=1) for cid in cids}
         try:  # a role step's output limit is the least a step has
             request = context.assemble(workflow, window=facts["window"], output=_output(context.MIN_OUTPUT, facts),
                                        budgets=budgets,

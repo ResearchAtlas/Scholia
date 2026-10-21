@@ -214,21 +214,25 @@ def judge_bound(passages, pairs, units):
     """An upper bound on the counted input of any judge request (context.serialized_tokens) of at most `pairs`
     pairs over these passage texts: the rules, the `pairs` largest passages once each with their labels (a
     request shows only the passages its pairs cite), each pair at its sentence's cut and its framing, the two
-    messages' framing and the reply's. A count of joined parts is never above the sum of the parts' counts
-    (context.count)."""
+    messages' framing and the reply's. Each part is counted on its own: context.count of their join is not above
+    the sum because judge_request joins them only at ": ", a line's end or a blank line, never letter to letter
+    (a join inside a run of ASCII letters could count more than its parts), and labels and pair numbers have at
+    most four digits ([retrieval] judge_pairs is at most 9999)."""
     largest = sorted((count(text) + _PASSAGE_FRAME for text in passages), reverse=True)[:pairs]
     return (count(JUDGE_RULES) + sum(largest) + pairs * (units + _PAIR_FRAME) + 2 * MESSAGE_FRAMING
             + REPLY_FRAMING)
 
 
 def judge_plan(passages, *, window, margin_percent, pairs, units):
-    """(pairs per call, the input bound of one call) for an answer whose evidence is these passage texts, on a
-    judge route of this window: judge_pairs, halved until a call of that many fits the window at the least
-    output limit; (0, 0) when not even one pair fits. The judge's share is calls x one call's bound."""
+    """(pairs per call, the input bound of one call, the passage texts a call can hold) for an answer whose
+    evidence is these passage texts, on a judge route of this window: only passages one pair of which fits
+    the window at the least output limit (a pair citing another is left unchecked); judge_pairs, halved until
+    a call of that many fits; (0, 0, ()) when no pair fits. The judge's share is calls x one call's bound."""
     room = window - MIN_OUTPUT - math.ceil(window * margin_percent / 100)
-    while pairs >= 1 and judge_bound(passages, pairs, units) > room:
+    fitting = [text for text in passages if judge_bound([text], 1, units) <= room]
+    while pairs >= 1 and judge_bound(fitting, pairs, units) > room:
         pairs //= 2
-    return (pairs, judge_bound(passages, pairs, units)) if pairs else (0, 0)
+    return (pairs, judge_bound(fitting, pairs, units), frozenset(fitting)) if pairs and fitting else (0, 0, frozenset())
 
 
 def parse_verdicts(reply, count):

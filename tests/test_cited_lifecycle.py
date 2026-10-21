@@ -134,7 +134,8 @@ async def test_the_judges_share_stays_held_until_the_judge_takes_it_and_no_reser
         assert json.loads(started)["allowance_usd"] == allowance[1]
 
 
-async def test_a_judge_share_that_does_not_cover_the_judge_leaves_it_unchecked_never_past_the_budget(tmp_path, monkeypatch):
+async def test_a_judge_share_that_does_not_cover_the_judge_leaves_it_unchecked_never_past_the_budget(tmp_path, monkeypatch,
+                                                                                                    caplog):
     # b1 (5): a judge call the budget cannot hold is refused, not reserved past it: unchecked, said.
     from backend import budget_router
     real, judging = budget_router.request_cost, []
@@ -160,6 +161,7 @@ async def test_a_judge_share_that_does_not_cover_the_judge_leaves_it_unchecked_n
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert "unchecked" in turn["answer"]["notices"]
         assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE estimate_usd >= 10000") == [(0,)]
+        assert "a judge call was refused past its share" in caplog.text  # unreachable by design: logged, closed
 
 
 async def test_a_recheck_verdict_is_written_only_to_the_pair_it_was_given_for(tmp_path):

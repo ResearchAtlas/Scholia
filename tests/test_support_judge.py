@@ -75,11 +75,11 @@ async def test_the_judge_is_reserved_with_its_answer_and_a_budget_that_cannot_ho
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, QUESTION)
         [step, *_] = [d for kind, d, _ in await events_of(client, stream[0]["run_id"]) if kind == "step_started"]
-        assert step["judge_estimate_usd"] > 0 and step["estimate_usd"] > step["judge_estimate_usd"]
+        assert step["judge_estimate_usd"] > 0 and step["allowance_usd"] == step["judge_estimate_usd"]
         tight, _ = await with_papers(client, WAGES)
         current = (await client.get("/api/settings", params={"project_id": tight})).json()
         await client.put("/api/settings", json={"project_id": tight, "hash": current["hash"], "updates": {
-            "project.budget_usd": round(step["estimate_usd"] - step["judge_estimate_usd"] / 2, 6)}})
+            "project.budget_usd": round(step["estimate_usd"] + step["judge_estimate_usd"] / 2, 6)}})  # the answer alone fits
         before = len(client.provider.chats)
         refused = await send(client, await conversation_in(client, tight), QUESTION)
         assert [e["type"] for e in refused][-2:] == ["limit_reached", "run_finished"]
@@ -144,7 +144,7 @@ async def test_eighty_pairs_are_judged_in_two_calls_and_the_eighty_first_is_left
         supports = [c["support"] for c in turn["citations"]]
         assert supports.count("supported") == 80 and supports.count("unchecked") == over
         notices = turn["answer"].get("notices", [])
-        assert ("citations_over_limit" in notices) == bool(over) and ("unchecked" in notices) == bool(over)
+        assert ("citations_over_limit" in notices) == bool(over) and "unchecked" not in notices  # distinct
         [(checks,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'citation_checks'",
                                  stream[0]["run_id"])
         assert json.loads(checks).get("over_limit", 0) == over
@@ -165,10 +165,12 @@ async def test_a_judge_calls_estimate_never_exceeds_its_part_of_the_share_at_the
     passages = {f"p{i}": dear[:2000 - i] for i in range(8)}
     rates = {"input": 3e-6, "output": 15e-6, "request": 0.0}
     for window in (8192, 16384, 32768, 131072):
-        size, bound = judge_plan(list(passages.values()), window=window, margin_percent=5, pairs=pairs, units=units)
+        size, bound, fitting = judge_plan(list(passages.values()), window=window, margin_percent=5, pairs=pairs,
+                                          units=units)
         assert size >= 1
         share = calls * budget_router.request_cost(rates, bound, context.MIN_OUTPUT)
-        wanted = [(dear * 3 + f" {n}", f"p{n % 8}") for n in range(calls * size)]
+        usable = [pid for pid, text in passages.items() if text in fitting]
+        wanted = [(dear * 3 + f" {n}", usable[n % len(usable)]) for n in range(calls * size)]
         spent = 0.0
         for batch in batches(wanted, size):
             request = context.assemble("judge", window=window, output=context.MIN_OUTPUT,
@@ -178,3 +180,28 @@ async def test_a_judge_calls_estimate_never_exceeds_its_part_of_the_share_at_the
             assert request.input_tokens <= bound and request.max_tokens == context.MIN_OUTPUT
             spent += budget_router.request_cost(rates, request.input_tokens, request.max_tokens)
         assert spent <= share + 1e-12, window
+
+
+async def test_a_sentence_the_judge_sees_only_in_part_is_at_most_partly_supported_and_counted(tmp_path):
+    long = "Minimum wages raise earnings " + "and the effect holds across every region of the panel " * 20
+    provider = Provider(answer_text=f"{long}[S1.1]. Short claim [S1.1].")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        await setting(client, "retrieval.judge_sentence_units", 40)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, QUESTION)
+        [judged] = provider.judged
+        assert long not in judged["messages"][-1]["content"] and "…" in judged["messages"][-1]["content"]
+        turn = await turn_of(client, conversation)
+        assert [c["support"] for c in turn["citations"]] == ["partly", "supported"]
+        [(checks,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'citation_checks'",
+                                 stream[0]["run_id"])
+        assert json.loads(checks)["cut_sentences"] == 1
+
+
+async def test_a_passage_too_large_for_the_judges_window_leaves_only_its_own_pairs_unchecked():
+    from backend.citations import judge_plan
+    small, huge = "A short passage.", "x " * 20000
+    size, bound, fitting = judge_plan([small, huge], window=8192, margin_percent=5, pairs=40, units=300)
+    assert size >= 1 and fitting == {small} and bound < 8192
+    assert judge_plan([huge], window=8192, margin_percent=5, pairs=40, units=300) == (0, 0, frozenset())
