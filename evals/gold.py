@@ -112,11 +112,28 @@ def private_path(field, path):
         if (top := work_tree(path)) is not None:
             raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside "
                           "every git work tree")
-        FIELD1_ROOTS.add(path)  # each walk from it checks this again (_open_dir): a git init above it later counts
+        path = Field1Path(path)
+        path.accepted = path
     return path
 
 
-FIELD1_ROOTS = set()  # field 1's folders as private_path accepted them
+def field1(path):
+    """path as field 1's (a Field1Path): as given when it is one already (main's <folder>/pdfs, walked from
+    there, a link in it refused as a link), else as private_path accepts it."""
+    return path if isinstance(path, Field1Path) else private_path(1, path)
+
+
+class Field1Path(Path):
+    """A path of field 1's: made from a folder private_path accepted (accepted), so each walk from it knows it
+    serves field 1 (_open_dir): it checks the folders above accepted again (a git init there later counts) and
+    each folder it passes for .git. Paths made from it (folder / "labels") are field 1's too. Field 2's paths
+    are plain: field 2 is public, and its folders may sit in a repository."""
+    accepted = None
+
+    def with_segments(self, *segments):
+        made = type(self)(*segments)
+        made.accepted = self.accepted
+        return made
 
 def work_tree(path):
     """The top of the git work tree holding path (the nearest folder above it with a .git folder, or the
@@ -160,9 +177,9 @@ def _step(fd, name, shown):
 
 
 def _not_a_work_tree(fd, shown):
-    """A folder at or below a root holding a .git entry (a folder, or the file a worktree or submodule has) is a
-    git work tree: nothing in it is read or written (Harold, 2026-10-21: field 1 outside every git work tree;
-    private_path checks a root and what is above it, this each folder below)."""
+    """A folder at or below field 1's root holding a .git entry (a folder, or the file a worktree or submodule
+    has) is a git work tree: nothing in it is read or written (Harold, 2026-10-21: field 1 outside every git work
+    tree; private_path checks a root and what is above it, this each folder below)."""
     try:
         os.stat(".git", dir_fd=fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -171,25 +188,28 @@ def _not_a_work_tree(fd, shown):
 
 
 def _open_dir(root, folder, create=False):
-    """An open descriptor of folder, reached from root one folder at a time, none of them a git work tree;
-    folders made 0700 when create."""
+    """An open descriptor of folder, reached from root one folder at a time; folders made 0700 when create.
+    For field 1 (a Field1Path root), none of them a git work tree, nor any folder above the accepted one."""
+    field1 = isinstance(root, Field1Path)
+    if field1:
+        private_path(1, root.accepted)  # the folders above field 1's, again: one may have become a git work tree since
     root, folder = Path(root), Path(folder)
-    for accepted in [a for a in tuple(FIELD1_ROOTS) if root.is_relative_to(a)]:  # a copy: a page thread may add to it
-        private_path(1, accepted)  # the folders above field 1's, again: one may have become a git work tree since
     parts = folder.relative_to(root).parts
     if create:
         for made in reversed([p for p in (root, *root.parents) if not p.exists()]):
             made.mkdir(mode=0o700)
     fd = _step(None, str(root), root)
     try:
-        _not_a_work_tree(fd, root)
+        if field1:
+            _not_a_work_tree(fd, root)
         for n, name in enumerate(parts, start=1):
             if create:
                 with contextlib.suppress(FileExistsError):
                     os.mkdir(name, 0o700, dir_fd=fd)
             fd, before = _step(fd, name, root.joinpath(*parts[:n])), fd
             os.close(before)
-            _not_a_work_tree(fd, root.joinpath(*parts[:n]))
+            if field1:
+                _not_a_work_tree(fd, root.joinpath(*parts[:n]))
     except BaseException:
         os.close(fd)
         raise
@@ -922,6 +942,8 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
     output folder's check.json; `status: finished` and `problems` empty when everything holds."""
     settings = settings or load_settings()
     open_app = open_app or reading_app
+    if field == 1:  # field 1's walks, however called: from folders private_path accepted (Field1Path)
+        folder, pdfs = field1(folder), pdfs and field1(pdfs)
 
     async def make():
         doc, papers_sha256, sets = load_field(field, folder)
@@ -1000,6 +1022,8 @@ async def passages(field, folder, pdfs, open_app=None, settings=None):
     """The passage worksheet (D1): every listed paper read by the app, written to the output folder."""
     settings = settings or load_settings()
     open_app = open_app or reading_app
+    if field == 1:
+        folder, pdfs = field1(folder), field1(pdfs)
 
     async def make():
         doc, papers_sha256, _ = load_field(field, folder)
@@ -1255,7 +1279,7 @@ class Review:
                           "colleague named with --colleague")
         self.field, self.kind, self.rater, self.lock = field, kind, rater, threading.Lock()
         if field == 1:
-            folder = private_path(1, folder)  # a page stays open: its folder is checked again at each save (_open_dir)
+            folder = field1(folder)  # field 1's walks (Field1Path): checked again at each save (_open_dir)
         doc, papers_sha256, sets = load_field(field, folder)
         if kind not in sets:
             raise Refused(f"{kind}.json is not drafted yet")

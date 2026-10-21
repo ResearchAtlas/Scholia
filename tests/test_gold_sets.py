@@ -1023,6 +1023,22 @@ def test_a_page_left_open_refuses_to_save_once_a_folder_above_field_ones_becomes
     assert "p03" not in json.loads(labels.read_text())["labels"]
 
 
+def test_field_twos_public_folders_are_walked_as_on_main_wherever_field_one_has_been(tmp_path):
+    """sol recheck 5: Harold's git rule restricts field 1 only. Field 2's files at a repository's top opened
+    no page (the .git check ran for every root), and a field 2 folder under a field 1 folder accepted earlier
+    in the same process was checked as field 1's after a git init above it. Both open their six pairs again;
+    field 1's walks are still refused."""
+    repo = fixtures.git("init", tmp_path / "repo")
+    fixtures.write_field(repo, 2)
+    assert len(gold.Review(2, repo.resolve(), "pairs", "harold").data()["items"]) == 6
+    pdfs = gold.private_path(1, tmp_path / "x" / "pdfs")  # field 1's PDFs folder, accepted
+    public = fixtures.write_field(pdfs / "public", 2).resolve()
+    fixtures.git("init", tmp_path / "x")
+    assert len(gold.Review(2, public, "pairs", "harold").data()["items"]) == 6
+    with pytest.raises(tier1.Refused, match="inside the repository"):
+        gold.pdf_bytes(1, pdfs, "a.pdf")
+
+
 def test_from_a_worktree_the_main_checkout_is_refused_too():
     git = ROOT / ".git"
     if not git.is_file():
