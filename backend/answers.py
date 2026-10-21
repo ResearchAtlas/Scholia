@@ -27,7 +27,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from backend import citations, governance
+from backend import citations, governance, provenance
 from backend.settings import load_settings, visible
 from backend.db import ContentCorruptError
 from backend.runs import AdmissionError
@@ -149,16 +149,21 @@ async def check(body: Check, request: Request):
             (body.run_id,)).fetchone()
         if row is None:
             raise AdmissionError(404, "not_found", "No such answer")
-        project_id, route, _ = row
+        project_id, route, held = row
         policy = governance.policy(conn, project_id)
         if policy is None or policy.locked:
             raise AdmissionError(403, "review_locked", "This project is review-locked")
+        # An answer one of whose papers is gone is never sent again (backend/provenance.py, option A).
+        held = json.loads(held or "[]")
+        if not provenance.carried(conn, held):
+            raise AdmissionError(409, "source_removed", "A paper this answer drew on was deleted")
         pairs = {}  # (sentence, passage) -> [citation ids, material]; a sentence gone with its source is not sent
         for cid, sentence, pid, material in cited(conn):
             if sentence:
                 pairs.setdefault((sentence, pid), [[], material])[0].append(cid)
-        # The papers each run's own request carries (backend/provenance.py): its passages' and those every
-        # sentence it sends cites, which are its scope and its dispatch check's, and its body's links.
+        # The papers each run's own request carries (backend/provenance.py): the answer's whole dependency set,
+        # its passages' and those every sentence it sends cites, which are its scope and its dispatch check's,
+        # and its body's links.
         cited_by = {}
         for sentence, material in conn.execute(
                 "SELECT json_extract(context, '$.sentence'), material_id FROM citations WHERE owner_kind = 'answer'"
@@ -174,7 +179,7 @@ async def check(body: Check, request: Request):
         provider, _, model = (route or ":").partition(":")
         keyed = {citations.sentence_key(sentence): sentence for sentence, _ in pairs}
         for run_id, batch in zip(ids, batches):
-            carried = sorted({m for key, _, m, _ in batch for m in (m, *cited_by.get(keyed[key], ()))})
+            carried = sorted({*held, *(m for key, _, m, _ in batch for m in (m, *cited_by.get(keyed[key], ())))})
             conn.execute(
                 "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
                 " VALUES (?, ?, 'background', 'citation_check', ?, ?)",

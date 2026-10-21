@@ -1556,7 +1556,7 @@ class Harness:
 
             def output(result):  # each citation's verdict with the pair it was given for, once every part is
                 found.update(verdicts(result, parts[-1]))  # judged; None (the run fails, writing nothing) if one
-                if len(found) < len(judged):  # is unanswered
+                if len(found) < sum(len(cids) for _, _, cids in judged):  # pair is unanswered (counted by citation)
                     return None
                 return {cid: list(verdict) for cid, verdict in found.items()}
 

@@ -15,6 +15,12 @@ carries, so the set is transitive. That one set is used everywhere:
 - Stored rows holding such text name their paper and lose the text with it: a citation's quote and
   sentence (db/deletion.py _SOURCE_REMOVED). Append-only events never hold it: they name citations and
   passages by id, and a citation check binds a verdict to its sentence by the sentence's hash.
+- An answer stays the conversation's record (turns.answer), but every copy derived from it follows its
+  whole dependency set (Harold, 2026-10-21, option A): once any of its papers is gone, every citation row
+  of the answer loses its quote and sentence, whichever paper it names (`forget`, from the deletion
+  service; `answer_carried` where the rows are written), and it is never sent again: not in history, and
+  /check refuses it (backend/answers.py); a check run carries the answer's papers, so its bodies and its
+  dispatch follow them too.
 """
 
 import json
@@ -31,3 +37,25 @@ def carried(conn, material_ids):
     """Whether text depending on these papers may be sent or kept: every one of them exists."""
     ids = set(material_ids)
     return existing(conn, ids) == ids
+
+
+def dependencies(conn, run_id):
+    """The papers run_id's request carried text of (inputs.context_materials), its history's included."""
+    row = conn.execute("SELECT json_extract(inputs, '$.context_materials') FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return json.loads(row[0]) if row and row[0] else []
+
+
+def answer_carried(conn, run_id):
+    """Whether the answer of run_id, and every copy derived from it, may still be sent or kept."""
+    return carried(conn, dependencies(conn, run_id))
+
+
+def forget(conn, doomed):
+    """Deletion's side of the rule (backend/db/deletion.py, in its transaction): every answer whose dependency
+    set holds a paper being deleted (doomed: an SQL query of their ids) loses the text of each of its citation
+    rows, whichever paper the row names."""
+    # ponytail: scans every run's context_materials per deletion; an index table if runs grow very large
+    conn.execute("UPDATE citations SET quote = NULL, context = json_remove(coalesce(context, '{}'), '$.sentence')"
+                 " WHERE owner_kind = 'answer' AND owner_id IN (SELECT r.id FROM runs r,"
+                 f" json_each(r.inputs, '$.context_materials') j WHERE j.value IN ({doomed}))"
+                 " AND (quote IS NOT NULL OR json_extract(context, '$.sentence') IS NOT NULL)")

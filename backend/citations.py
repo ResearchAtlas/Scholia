@@ -27,6 +27,7 @@ import hashlib
 import json
 import re
 
+from backend import provenance
 from backend.context import MESSAGE_FRAMING, REPLY_FRAMING, count
 from backend.evidence import CITATION
 from backend.search_index import readings, still_read
@@ -282,7 +283,10 @@ def apply_verdicts(checked, verdicts):
 
 
 def write_rows(conn, run_id, checked, checked_at):
-    """The answer's citation rows, each under its id (c["id"]), in the primary commit."""
+    """The answer's citation rows, each under its id (c["id"]), in the primary commit; with no quote or sentence
+    once a paper the answer depended on is gone (backend/provenance.py)."""
+    if not provenance.answer_carried(conn, run_id):
+        checked = [{**c, "quote": None, "sentence": None} for c in checked]
     for c in checked:
         conn.execute(
             "INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id, passage_id, quote,"

@@ -206,6 +206,7 @@
   "errors.internal": "Something went wrong. Try again.",
   "errors.unreachable": "Scholia's engine is not responding. Close Scholia and open it again.",
   "errors.body_removed": "This text was removed with a deleted paper.",
+  "errors.source_removed": "A paper this answer drew on was deleted, so it cannot be checked again.",
   "errors.part_not_loaded": "This part of Scholia could not be loaded. Try again reloads the window.",
   "errors.english_not_saved": "English is used in this window, but it could not be saved as the interface language, so Scholia will open in the saved language next time. Try again saves it once more.",
   "errors.active_run": "This conversation is still working. Wait for it, or stop it.",

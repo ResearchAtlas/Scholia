@@ -481,9 +481,10 @@ async def test_a_selected_paper_sharing_its_reading_with_another_is_searched_as_
         assert found["trace"]["keyword"] and found["trace"]["dense"]
 
 
-async def test_a_sentence_citing_a_deleted_paper_goes_from_its_other_papers_rows_and_their_check_still_runs(tmp_path):
-    # Internal review of b2: the sentence goes from every row holding it; a recheck of the other paper's own
-    # sentence carries only that paper, so it still runs.
+async def test_an_answer_depending_on_a_deleted_paper_loses_every_rows_text_and_is_never_checked_again(tmp_path):
+    # Harold, 2026-10-21 (option A): an answer's derived copies follow its whole dependency set. One of its two
+    # papers deleted, every citation row of the answer loses its quote and sentence, whichever paper it names,
+    # and /check refuses it.
     from test_search import CHINESE
     both = "Both papers report the same rise [S1.1] [S2.1]. The second paper alone reports more [S2.1]."
     provider = Provider(answer_text=both)
@@ -493,12 +494,10 @@ async def test_a_sentence_citing_a_deleted_paper_goes_from_its_other_papers_rows
         run_id = (await send(client, conversation, "minimum wages earnings 最低工资"))[0]["run_id"]
         [(first,)] = await rows(client, "SELECT material_id FROM citations WHERE json_extract(context, '$.marker') = '[S1.1]'")
         assert (await client.delete(f"/api/materials/{first}")).status_code == 200
-        assert await rows(client, "SELECT count(*) FROM citations WHERE context LIKE '%same rise%'") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM citations WHERE quote IS NOT NULL"
+                                  " OR json_extract(context, '$.sentence') IS NOT NULL") == [(0,)]
         response = await client.post("/api/citations/check", json={"run_id": run_id})
-        [check] = response.json()["run_ids"]
-        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", check)
-        assert first not in json.loads(inputs)["context_materials"]
-        assert (await run_finished(client, check))["status"] == "succeeded"
+        assert (response.status_code, response.json()["code"]) == (409, "source_removed")
 
 
 async def test_a_call_stopped_before_it_left_keeps_no_body(tmp_path, monkeypatch):
@@ -659,3 +658,51 @@ async def test_code_spans_and_fences_are_read_as_the_interfaces_renderer_reads_t
     cases = json.loads((Path(__file__).parents[1] / "frontend/tests/fixtures/code-markers.json").read_text())
     for case in cases:
         assert [m for _, m, _ in citations.markers(case["text"])] == case["markers"], case["text"]
+
+
+# Harold, 2026-10-21 (option A): the deletion class. An answer stays the conversation's record; every copy derived
+# from it follows its whole dependency set (inputs.context_materials), its history's papers included.
+
+async def test_a_paper_carried_through_history_and_cited_as_another_takes_every_copy_of_the_later_answer(tmp_path):
+    # b3 (1): paper A's text reaches a later answer through history while that answer cites paper B. Deleting A
+    # clears the later answer's citation sentence and quote (B's row), and /check refuses it, so nothing is
+    # sent and no new body is kept.
+    from test_search import CHINESE
+    rewrite = "The paper reports that minimum wages raise the earnings of low-paid workers [S1.1]."
+    provider = Provider(answer_text=QUOTING)
+    async with cited(tmp_path, provider) as client:
+        project, [a, b] = await with_papers(client, WAGES, CHINESE)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION, material_ids=[a])
+        provider.answer_text = rewrite
+        later = (await send(client, conversation, "最低工资 rewrite that", material_ids=[b]))[0]["run_id"]
+        [(cited_material, existence)] = await rows(client, "SELECT material_id, existence FROM citations WHERE owner_id = ?",
+                                                   later)
+        assert (cited_material, existence) == (b, "ok")
+        [(held,)] = await rows(client, "SELECT json_extract(inputs, '$.context_materials') FROM runs WHERE id = ?", later)
+        assert sorted(json.loads(held)) == sorted([a, b])  # its history carried A
+        assert (await client.delete(f"/api/materials/{a}")).status_code == 200
+        assert await rows(client, "SELECT quote, json_extract(context, '$.sentence') FROM citations WHERE owner_id = ?",
+                          later) == [(None, None)]
+        bodies, runs, judged = (await rows(client, "SELECT count(*) FROM run_bodies"), await rows(
+            client, "SELECT count(*) FROM runs"), len(provider.judged))
+        response = await client.post("/api/citations/check", json={"run_id": later})
+        assert (response.status_code, response.json()["code"]) == (409, "source_removed")
+        assert await rows(client, "SELECT count(*) FROM run_bodies") == bodies
+        assert await rows(client, "SELECT count(*) FROM runs") == runs and len(provider.judged) == judged
+        shown = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert shown[1]["answer"]["text"] == rewrite  # the answer stays the conversation's record
+        assert "low-paid" not in json.dumps(shown[1]["citations"])
+
+
+async def test_a_recheck_whose_judge_leaves_a_pair_unanswered_fails_when_another_pair_holds_two_citations(tmp_path):
+    # Internal review of b3: a pair answered for two citations does not stand in for a pair left unanswered.
+    provider = Provider(answer_text="Earnings rise [S1.1][S1.1]. Prices adjust [S1.1].")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        provider.verdicts = "1: unsupported"
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "failed"
+        assert await rows(client, "SELECT DISTINCT support FROM citations") == [("supported",)]  # nothing written

@@ -20,6 +20,7 @@ import json
 import logging
 import weakref
 
+from backend import provenance
 from backend.extraction import EXTRACTORS, extractor_of
 
 log = logging.getLogger(__name__)
@@ -309,6 +310,8 @@ def _delete(conn, kind, object_id, remove_all_trace):
                     AND (d.material_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})
                          OR d.material_version_id IN (SELECT id FROM material_versions WHERE rowid IN {_doomed('material_versions')})
                          OR d.passage_id IN (SELECT id FROM passages WHERE rowid IN {_doomed('passages')})))""")
+    # Harold, 2026-10-21 (option A): an answer that depended on a deleted paper loses every row's text.
+    provenance.forget(conn, f"SELECT id FROM materials WHERE rowid IN {_doomed('materials')}")
     for (child, column), (parent, key) in edges.items():
         action = ON_DELETE[child, column]
         if action is not DELETE:
