@@ -148,3 +148,21 @@ async def test_deleting_the_project_deletes_every_body_and_its_links(tmp_path):
         assert await rows(client, "SELECT count(*) FROM run_bodies") == [(0,)]
         assert await rows(client, "SELECT count(*) FROM run_body_materials") == [(0,)]
         assert await collected(client, shas)
+
+
+async def test_a_body_whose_file_goes_between_its_check_and_its_read_answers_removed_not_500(tmp_path, monkeypatch):
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        sha = next(iter(await bodies_of(client, run_id)))
+        content = client.state["content"]
+        real = content.read
+
+        def deleted_then_read(name):  # the deletion commits and collection removes the file in between
+            deletion.delete(client.state["db"], content, "material", material)
+            content.collect_garbage(datetime.now(UTC) + timedelta(hours=2))
+            return real(name)
+        monkeypatch.setattr(content, "read", deleted_then_read)
+        response = await client.get(f"/api/runs/{run_id}/trace/bodies/{sha}")
+        assert (response.status_code, response.json()["code"]) == (410, "body_removed")

@@ -203,6 +203,7 @@
   "errors.no_longer_duplicate": "问题等待期间这篇文献已有改动，不再与该记录重复，因此没有合并。",
   "errors.internal": "出了点问题，请重试。",
   "errors.unreachable": "Scholia 的引擎没有响应。请关闭 Scholia 后重新打开。",
+  "errors.body_removed": "这段文字已随删除的论文一并移除。",
   "errors.part_not_loaded": "Scholia 的这部分界面未能加载。点“重试”会重新载入窗口。",
   "errors.english_not_saved": "此窗口已使用英文，但未能将其保存为界面语言，因此下次打开 Scholia 时仍会使用已保存的语言。点“重试”会再保存一次。",
   "errors.active_run": "这个对话仍在处理中。请等待，或停止它。",

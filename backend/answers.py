@@ -25,6 +25,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from backend import governance
+from backend.db import ContentCorruptError
 from backend.runs import AdmissionError
 from backend.search_index import readings
 
@@ -69,6 +70,7 @@ async def trace(run_id: str, request: Request, after: int = -1, limit: int = PAG
 @router.get("/api/runs/{run_id}/trace/bodies/{sha256}")
 async def body(run_id: str, sha256: str, request: Request):
     state = _state(request)
+
     def find(conn):
         if conn.execute("SELECT 1 FROM run_bodies WHERE run_id = ? AND sha256 = ?", (run_id, sha256)).fetchone():
             return "kept"
@@ -76,12 +78,14 @@ async def body(run_id: str, sha256: str, request: Request):
                              " AND json_extract(data, '$.body') = ?", (run_id, sha256)).fetchone()
         return "removed" if named else None
     found = await asyncio.to_thread(state["db"].read, find)
-    if found == "removed":
+    if found == "kept":
+        try:
+            return Response(await asyncio.to_thread(state["content"].read, sha256), media_type="application/json")
+        except (OSError, ContentCorruptError):  # removed between that read and this one (a deletion, then collection)
+            found = await asyncio.to_thread(state["db"].read, find)
+    if found in ("removed", "kept"):
         raise AdmissionError(410, "body_removed", "This text was removed with a deleted paper")
-    if found is None:
-        raise AdmissionError(404, "not_found", "No such request body")
-    data = await asyncio.to_thread(state["content"].read, sha256)
-    return Response(data, media_type="application/json")
+    raise AdmissionError(404, "not_found", "No such request body")
 
 
 def resolve_now(conn, citation_ids):
