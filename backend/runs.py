@@ -1698,10 +1698,7 @@ class Harness:
                         **({"cut": "output_limit"} if result.cut else {})}  # stopped at its output limit
             # S1-19c: an agent step's reply is kept whole as it arrives (model-route rule 5: each assistant step stored
             # whole), beside its request body and under the same deletion links, whatever the turn does next.
-            reply = None
-            if request.tools and result.ok and isinstance(result.message, dict):
-                reply = await asyncio.to_thread(_stored, self.content, json.dumps(
-                    result.message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            kept_reply = {"ref": None}  # stored in the shielded recording below, so a Stop cannot skip the record
             if output is not None and result.ok:
                 finished["output"] = output(result)
 
@@ -1717,7 +1714,7 @@ class Harness:
                         _event(conn, active.run_id, "model_attempt", {
                             "step": call.step, "attempt": number, "route": route.key, **attempt.record(),
                             **_kept_body(conn, call, number, attempt.dispatched),
-                            **(_keep_reply(conn, call, number, reply) if answered else {})})
+                            **(_keep_reply(conn, call, number, kept_reply["ref"]) if answered else {})})
                 if result.dispatched:
                     _settle_attempts(conn, call.reservation_id, facts["rates"], result.attempts)
                     if rehold is not None and exists:  # the answer's unspent, held again for its judge (_reserve)
@@ -1730,6 +1727,9 @@ class Harness:
                     spending.release(conn, call.reservation_id)
 
             async def recording():
+                if request.tools and result.ok and isinstance(result.message, dict):
+                    kept_reply["ref"] = await asyncio.to_thread(_stored, self.content, json.dumps(
+                        result.message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
                 if rehold is None:
                     return await self._write(record)
                 # The answer's unspent is held again against the budgets read in this write: under settings_lock,

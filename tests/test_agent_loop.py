@@ -570,3 +570,19 @@ async def test_c1_review_the_agents_ask_is_shown_in_its_conversation_not_the_lib
         assert listing["asks"] == [] and QUOTE not in json.dumps(listing)  # only under the conversation's guard
         await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
         await sending
+
+
+@pytest.mark.asyncio
+async def test_c1_recheck_a_reply_removed_with_its_paper_is_said_removed(tmp_path):
+    provider = Scripted([call("list_materials")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Hello there")  # the pre-load holds the paper's text
+        run_id = (await rows(client, "SELECT id FROM runs WHERE conversation_id = ?", conversation))[0][0]
+        [(reply,), _] = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt = 1000"
+                                           " ORDER BY step", run_id)  # the tool step's reply, then the answer's
+        assert (await client.get(f"/api/runs/{run_id}/trace/bodies/{reply}")).status_code == 200
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        gone = await client.get(f"/api/runs/{run_id}/trace/bodies/{reply}")
+        assert (gone.status_code, gone.json()["code"]) == (410, "body_removed")

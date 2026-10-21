@@ -9,7 +9,7 @@ as an `ask_answered` event and audited without content. It is invalid once its r
 (cancelled, finished, revoked or deleted with its project) or the project's level or lock has
 changed since it was asked. The conversation, the Library panel and the background-run list all
 show the open asks this module lists, each naming its project, and answer them through the one
-endpoint.
+endpoint; a turn's asks (the agent's, S1-19c) only in their conversation, where their work started.
 """
 
 import asyncio

@@ -89,7 +89,8 @@ async def body(run_id: str, sha256: str, request: Request):
         if conn.execute("SELECT 1 FROM run_bodies WHERE run_id = ? AND sha256 = ?", (run_id, sha256)).fetchone():
             return "kept"
         named = conn.execute("SELECT 1 FROM run_events WHERE run_id = ? AND type = 'model_attempt'"
-                             " AND json_extract(data, '$.body') = ?", (run_id, sha256)).fetchone()
+                             " AND ? IN (json_extract(data, '$.body'), json_extract(data, '$.reply'))",
+                             (run_id, sha256)).fetchone()  # a request body, or an agent step's reply (S1-19c)
         return "removed" if named else None
     found = await asyncio.to_thread(state["db"].read, find)
     if found == "kept":
