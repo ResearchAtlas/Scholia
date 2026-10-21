@@ -13,7 +13,7 @@ the citation pairs, the second rater's sample and the agreement, the corrected s
 
 A field's files sit in one folder: field 2's in evals/gold/field2/ (public: the paper list, the sets, the
 samples and the labels Harold chooses to commit), field 1's in the folder given with --folder, outside the
-repository or under the git-ignored evals/local/, because they come from Harold's library. In it:
+repository and every other git work tree, because they come from Harold's library. In it:
 papers.json, questions.json, pairs.json, sample-<set>.json and labels/<set id>.<rater>.json. What is
 generated from whole papers (the worksheet, the check's report, a corrected set) goes to a git-ignored
 output folder: evals/out/field2/ for field 2, <folder>/out/ for field 1. Files the runner writes are
@@ -50,6 +50,7 @@ import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
+from datetime import date
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -65,7 +66,6 @@ from evals.tier1 import Refused, _key  # noqa: E402
 
 GOLD = HERE / "gold"
 FIELD2 = GOLD / "field2"
-LOCAL = HERE / "local"  # field 1's place inside the repository, ignored by git
 OUT = HERE / "out"  # generated files, ignored by git
 PAGE = HERE / "review_page"
 SETTINGS = GOLD / "settings.json"
@@ -92,40 +92,50 @@ RECALL = [{"name": "recall@8", "kind": "recall", "k": 8}]  # tier 2's metric (se
 
 def field_folder(field, folder=None):
     """The folder holding a field's files: field 2's committed folder by default; field 1's only as given,
-    and never inside the repository except under evals/local/ (git ignores it)."""
+    and never inside a git work tree."""
     if folder is None:
         if field == 1:
             raise Refused("field 1's files come from Harold's library: give --folder, outside the repository "
-                          "or under evals/local/")
+                          "and every other git work tree")
         return FIELD2
     return private_path(field, folder)
 
 
 def private_path(field, path):
     """A field's path, resolved; for field 1, refused anywhere inside a git work tree (this checkout, the main
-    checkout or any other worktree, or any other repository) except under that tree's evals/local/, and that
-    only where the tree's own .gitignore ignores evals/local/ (a checkout of a branch without S1-36 does not).
-    Checked for the folders given (--folder, --pdfs: each taken where it resolves, and walked from there) and
-    where a linked PDF leads; under a folder no link is followed at all (the files below)."""
+    checkout or any other worktree, or any other repository), ignored there or not (Harold, 2026-10-21: one
+    rule, no git asked). Checked for the folders given (--folder, --pdfs: each taken where it resolves, and
+    walked from there) and where a linked PDF leads; under a folder no link is followed at all (the files
+    below)."""
     path = Path(path).resolve()
-    if field == 1 and (top := work_tree(path)) is not None:
-        if not path.is_relative_to(top / "evals" / "local"):
+    if field == 1:
+        if (top := work_tree(path)) is not None:
             raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside "
-                          "it or under its evals/local/")
-        if not ignores_local(top):
-            raise Refused(f"{path} is under evals/local/ of the git work tree {top}, whose .gitignore does not ignore "
-                          "evals/local/: field 1's files stay outside it")
+                          "every git work tree")
+        path = Field1Path(path)
+        path.accepted = path
     return path
 
 
-def ignores_local(top):
-    """Whether the work tree's top-level .gitignore names evals/local/ (as this repository's does).
-    ponytail: the exact line only; a broader pattern or a global ignore file is not read, so it errs on refusing."""
-    try:
-        lines = (top / ".gitignore").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return False
-    return any(line.strip() in ("evals/local/", "/evals/local/") for line in lines)
+def field1(path):
+    """path as field 1's (a Field1Path): as given when it is one already (main's <folder>/pdfs, walked from
+    there, a link in it refused as a link), else as private_path accepts it."""
+    return path if isinstance(path, Field1Path) else private_path(1, path)
+
+
+class Field1Path(Path):
+    """A path of field 1's: made from a folder private_path accepted (accepted), so each walk from it knows it
+    serves field 1 (_open_dir): it checks the folders above accepted again (a git init there later counts) and
+    each folder it passes for .git. Paths made from it (folder / "labels") are field 1's too. Field 2's paths
+    are plain: field 2 is public, and its folders may sit in a repository. The commands, the page, check and
+    passages make field 1's folders so (field1); a library caller handing the walk helpers (read_bytes,
+    write_json, pdf_bytes) a plain path of field 1's gets field 2's walk, without these checks."""
+    accepted = None
+
+    def with_segments(self, *segments):
+        made = type(self)(*segments)
+        made.accepted = self.accepted
+        return made
 
 
 def work_tree(path):
@@ -169,8 +179,23 @@ def _step(fd, name, shown):
         raise
 
 
+def _not_a_work_tree(fd, shown):
+    """A folder at or below field 1's root holding a .git entry (a folder, or the file a worktree or submodule
+    has) is a git work tree: nothing in it is read or written (Harold, 2026-10-21: field 1 outside every git work
+    tree; private_path checks a root and what is above it, this each folder below)."""
+    try:
+        os.stat(".git", dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise Refused(f"{shown} is a git work tree (it holds .git): no gold-set file is read or written in one")
+
+
 def _open_dir(root, folder, create=False):
-    """An open descriptor of folder, reached from root one folder at a time; folders made 0700 when create."""
+    """An open descriptor of folder, reached from root one folder at a time; folders made 0700 when create.
+    For field 1 (a Field1Path root), none of them a git work tree, nor any folder above the accepted one."""
+    field1 = isinstance(root, Field1Path)
+    if field1:
+        private_path(1, root.accepted)  # the folders above field 1's, again: one may have become a git work tree since
     root, folder = Path(root), Path(folder)
     parts = folder.relative_to(root).parts
     if create:
@@ -178,12 +203,16 @@ def _open_dir(root, folder, create=False):
             made.mkdir(mode=0o700)
     fd = _step(None, str(root), root)
     try:
+        if field1:
+            _not_a_work_tree(fd, root)
         for n, name in enumerate(parts, start=1):
             if create:
                 with contextlib.suppress(FileExistsError):
                     os.mkdir(name, 0o700, dir_fd=fd)
             fd, before = _step(fd, name, root.joinpath(*parts[:n])), fd
             os.close(before)
+            if field1:
+                _not_a_work_tree(fd, root.joinpath(*parts[:n]))
     except BaseException:
         os.close(fd)
         raise
@@ -433,11 +462,20 @@ def check_papers(doc, field, settings):
             problems.append(f"{where}: license_checked is not a date")
     if not isinstance(doc["papers"], list):
         problems.append("papers.json: papers is not a list")
+    elif not doc["papers"]:  # else every set check would be skipped (they run once the paper list passes)
+        problems.append("papers.json: papers is empty")
     return problems
 
 
 def is_date(value):
-    return isinstance(value, str) and DATE.fullmatch(value) is not None
+    """A calendar date written YYYY-MM-DD (2026-02-31 is not one)."""
+    if not (isinstance(value, str) and DATE.fullmatch(value)):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def check_locator(where, loc, field, papers):
@@ -508,11 +546,18 @@ def check_question(item, field, papers):
         if not (isinstance(ev, list) and ev):
             problems.append(f"{where} evidence item {n}: not a list of passages")
             continue
+        valid = True
         for loc in ev:
             found = check_locator(f"{where} evidence item {n}", loc, field, papers)
             problems += found
+            valid = valid and not found
             if not found and papers[loc["paper"]]["document_language"] != item["document_language"]:
                 problems.append(f"{where}: document_language is not its evidence's papers'")
+        if not valid:
+            continue
+        ordinals = sorted(loc["ordinal"] for loc in ev)  # T1: tier 2 finds an item by any one of its passages
+        if len({loc["paper"] for loc in ev}) > 1 or ordinals != list(range(ordinals[0], ordinals[0] + len(ev))):
+            problems.append(f"{where} evidence item {n}: not one passage or the consecutive passages of one paper")
     return problems
 
 
@@ -565,12 +610,14 @@ def check_set(doc, kind, field, papers):
 CONTENT = ("text", "short_answer", "answerable", "evidence")  # a question's whole content, as an edit stores it
 
 
-def check_labels(doc, set_doc, papers, rater=None):
-    """A labels file's problems (L1, L3, L7): its header names this set and rater; each label that applies to
-    its item as it now is (applies) has the right fields and types (a question's edit holds the whole
-    question, its locators checked as a draft's); and the set as the labels leave it (effective_items) passes
-    every rule the drafts pass, set-wide ones (repeated ids or text) included. Labels that do not apply are
-    history and are not checked. The page's saves, `check`, `apply` and `agreement` all use this one check."""
+def check_labels(doc, set_doc, papers, rater=None, sample=None):
+    """A labels file's problems (L1, L3, L7): its header names this set and rater; a sample's labels (marked
+    sample: true, as the sample's page writes them) are for the recorded sample's items (sample: their ids)
+    only; each label that applies to its item as it now is (applies) has the right fields and types (a
+    question's edit holds the whole question, its locators checked as a draft's); and the set as the labels
+    leave it (effective_items) passes every rule the drafts pass, set-wide ones (repeated ids or text)
+    included. Labels that do not apply are history and are not checked. The page's saves, `check`, `apply`
+    and `agreement` all use this one check."""
     problems = _keys("labels", doc, ("set", "kind", "field", "rater", "set_sha256", "labels"), ("sample",))
     if problems:
         return problems
@@ -583,6 +630,14 @@ def check_labels(doc, set_doc, papers, rater=None):
     if not isinstance(doc["labels"], dict):
         return ["labels: labels is not an object"]
     items = {i["id"]: i for i in set_doc["items"]}
+    if "sample" in doc:
+        if doc["sample"] is not True:
+            return ["labels: sample is not true"]
+        if sample is None:
+            return ["labels: they are the sample's, and no sample of this set is recorded"]
+        # only labels that apply: history (its item changed or removed since) is never checked against the set (G8)
+        if outside := sorted(i for i, label in doc["labels"].items() if applies(items.get(i), label) and i not in sample):
+            return [f"labels: they are the sample's, and {', '.join(outside)} are not in the recorded sample"]
     for item, label in doc["labels"].items():
         if not applies(items.get(item), label):
             continue  # history (changed or removed since): kept as it is, never validated against the current set
@@ -847,6 +902,30 @@ def load_field(field, folder):
     return read_json(folder, folder / "papers.json"), sha256_of(folder, folder / "papers.json"), sets
 
 
+@contextlib.contextmanager
+def scratch(field, folder):
+    """The temporary folder a command's app runs in, removed after: field 2's under TMPDIR; field 1's inside
+    field 1's own folder, outside every git work tree as private_path holds it (Harold, 2026-10-21), with
+    TMPDIR pointed into it meanwhile, so the app's reading child and any library's scratch stay there too."""
+    if field != 1:
+        with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
+            yield Path(tmp)
+        return
+    with tempfile.TemporaryDirectory(prefix=".tmp-scholia-gold-", dir=folder) as tmp:
+        inner = Path(tmp) / "tmp"
+        inner.mkdir(mode=0o700)
+        saved = os.environ.get("TMPDIR"), tempfile.tempdir
+        os.environ["TMPDIR"] = tempfile.tempdir = str(inner)
+        try:
+            yield Path(tmp)
+        finally:
+            if saved[0] is None:
+                os.environ.pop("TMPDIR", None)
+            else:
+                os.environ["TMPDIR"] = saved[0]
+            tempfile.tempdir = saved[1]
+
+
 async def write_when_done(root, out, make):
     """The file at out says incomplete from the start, and holds the result only once it is all made (an
     interruption, refusal or failure leaves the incomplete marker with its reason)."""
@@ -866,6 +945,8 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
     output folder's check.json; `status: finished` and `problems` empty when everything holds."""
     settings = settings or load_settings()
     open_app = open_app or reading_app
+    if field == 1:  # field 1's walks, however called: from folders private_path accepted (Field1Path)
+        folder, pdfs = field1(folder), pdfs and field1(pdfs)
 
     async def make():
         doc, papers_sha256, sets = load_field(field, folder)
@@ -898,26 +979,29 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
                                     **mix(kind, set_doc["items"])}
             report["differences"] += [f"{kind}: {d}" for d in differences(kind, report["sets"][kind], settings)]
             items = {i["id"]: i for i in set_doc["items"]}
+            sample = None  # read first: a sample's labels are checked against it
+            if entry(folder, folder / f"sample-{kind}.json"):
+                drawn = read_json(folder, folder / f"sample-{kind}.json")
+                if not sample_of(drawn, set_doc, settings):
+                    problems.append(f"sample-{kind}.json: not a sample of this set")
+                else:
+                    sample = drawn["items"]
+                    report["samples"][kind] = len(sample)
             for path in [folder / "labels" / n for n in names(folder, folder / "labels")
                          if fnmatch.fnmatchcase(n, f"{set_doc['id']}.*.json")]:
                 labels = read_json(folder, path)
-                found = check_labels(labels, set_doc, papers)
+                rater = path.name[len(set_doc["id"]) + 1:-len(".json")]  # <set id>.<rater>.json: its header names it
+                found = check_labels(labels, set_doc, papers, rater, sample)
                 problems += [f"{path.name}: {p}" for p in found]
                 if not found:
                     report["labels"][path.name] = label_counts(items, labels)
                     edited[kind] += [(path.name, made) for i, label in labels["labels"].items()
                                      if i in items and label_state(items[i], label) == "done" and "evidence" in label
                                      and (made := labeled(items[i], label)) is not None]
-            if entry(folder, folder / f"sample-{kind}.json"):
-                sample = read_json(folder, folder / f"sample-{kind}.json")
-                if not sample_of(sample, set_doc):
-                    problems.append(f"sample-{kind}.json: not a sample of this set")
-                else:
-                    report["samples"][kind] = len(sample["items"])
         if pdfs is not None and not problems:
             verify_pdfs(doc["papers"], pdfs, field)
-            with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
-                async with open_app(Path(tmp) / "data") as (client, state):
+            with scratch(field, folder) as tmp:
+                async with open_app(tmp / "data") as (client, state):
                     read, _ = await read_papers(client, state, doc["papers"], pdfs, field)
             report["not_read_whole"] = {pid: r["reason"] for pid, r in sorted(read.items()) if r["state"] != "ready"}
             for kind, set_doc in sets.items():
@@ -941,14 +1025,16 @@ async def passages(field, folder, pdfs, open_app=None, settings=None):
     """The passage worksheet (D1): every listed paper read by the app, written to the output folder."""
     settings = settings or load_settings()
     open_app = open_app or reading_app
+    if field == 1:
+        folder, pdfs = field1(folder), field1(pdfs)
 
     async def make():
         doc, papers_sha256, _ = load_field(field, folder)
         if problems := check_papers(doc, field, settings):
             raise Refused("; ".join(problems[:5]))
         verify_pdfs(doc["papers"], pdfs, field)
-        with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
-            async with open_app(Path(tmp) / "data") as (client, state):
+        with scratch(field, folder) as tmp:
+            async with open_app(tmp / "data") as (client, state):
                 read, _ = await read_papers(client, state, doc["papers"], pdfs, field)
         return worksheet(field, doc, papers_sha256, read)
     return await write_when_done(out_root(folder), outputs(folder) / "worksheet.json", make)
@@ -996,12 +1082,12 @@ def labeled(item, label):
     return {**{k: v for k, v in item.items() if k not in CONTENT}, **{k: label[k] for k in CONTENT if k in label}}
 
 
-def apply(set_doc, labels, papers):
+def apply(set_doc, labels, papers, sample=None):
     """The corrected set (L5): each item a label is done for, as the label leaves it (dropped items out),
     `provisional: false`; every other item as drafted, `provisional: true`, never counted as gold; labels
     of items no longer in the set kept out and counted. Labels that do not pass check_labels are refused
-    whole: nothing invalid becomes gold."""
-    if problems := check_labels(labels, set_doc, papers):
+    whole: nothing invalid becomes gold. sample: the recorded sample's ids, for a sample's labels."""
+    if problems := check_labels(labels, set_doc, papers, sample=sample):
         raise Refused("the labels do not pass their check: " + "; ".join(problems[:5]))
     items, out = [], {"labeled": 0, "dropped": 0, "changed": 0, "provisional": 0}
     for item in set_doc["items"]:
@@ -1048,10 +1134,21 @@ def draw(set_doc, settings):
             "items": sorted(chosen)}
 
 
-def sample_of(sample, set_doc):
-    """Whether a sample file is a sample of this set: its set's id, and a list of its items' ids."""
-    return (isinstance(sample, dict) and same(sample.get("set"), set_doc["id"]) and isinstance(sample.get("items"), list)
-            and all(plain_id(i) for i in sample["items"]) and set(sample["items"]) <= {i["id"] for i in set_doc["items"]})
+def sample_of(sample, set_doc, settings):
+    """Whether a sample file is this set's sample: the very draw the settings make of it (H1), every field and
+    type the same, so an emptied, cut or hand-picked sample is refused."""
+    return isinstance(sample, dict) and item_sha256(sample) == item_sha256(draw(set_doc, settings))
+
+
+def recorded_sample(folder, set_doc, settings):
+    """The recorded sample's item ids (sample-<set>.json), or None when none is drawn; a file that is not
+    this set's draw is refused."""
+    path = folder / f"sample-{set_doc['kind']}.json"
+    if entry(folder, path) is None:
+        return None
+    if not sample_of(sample := read_json(folder, path), set_doc, settings):
+        raise Refused(f"{path.name}: not a sample of this set")
+    return sample["items"]
 
 
 def kappa(pairs, categories):
@@ -1072,13 +1169,14 @@ def _agreement(pairs, categories):
             "kappa": None if value is None else round(value, 4), "confusion": table}
 
 
-def agreement(set_doc, first, second):
-    """The agreement of two raters' labels on the items both labeled (H2). Pairs: percent agreement,
+def agreement(set_doc, first, second, sample):
+    """The agreement of two raters' labels on the recorded sample's items (sample: their ids) both labeled
+    (H2; spec section 14: the overlap sample), never on any other item either labeled. Pairs: percent agreement,
     Cohen's kappa over the three categories and the confusion table (rows the first rater's). Questions:
     the same for keep or drop, then over the items both kept, for answerable, and for evidence: both chose
     the same items, and the mean overlap of the passages they chose (shared over either's)."""
-    both = []
-    for item in set_doc["items"]:
+    both, sampled = [], set(sample)
+    for item in (i for i in set_doc["items"] if i["id"] in sampled):
         a, b = (labels["labels"].get(item["id"]) for labels in (first, second))
         if label_state(item, a) == "done" and label_state(item, b) == "done":
             both.append((item, a, b))
@@ -1106,18 +1204,25 @@ def agreement(set_doc, first, second):
 def tier2_queries(corrected, passage_of, project):
     """A corrected set's gold answerable questions as the queries tier1.run_arms takes, each its own
     group, with its query and document languages; each evidence item as the app's passage ids that make
-    it up (passage_of: {(paper, ordinal): passage id}), one annotator. Drafts are refused (held out)."""
+    it up (passage_of: {(paper, ordinal): the passage as read_papers gives it}), one annotator. Drafts are
+    refused (held out), and so is a locator whose passage in this reading is not its quote (letters and digits
+    compared, as resolve compares): after a reading moved it, its ordinal names another passage."""
     if corrected.get("corrected") is not True or corrected.get("kind") != "questions":
         raise Refused("tier 2 scores a corrected question set (gold.py apply), never the drafts")
     queries = []
     for item in corrected["items"]:
         if item["provisional"] or not item["answerable"]:  # provisional is not gold; unanswerable is the abstention row's
             continue
-        if missing := [loc for ev in item["evidence"] for loc in ev if (loc["paper"], loc["ordinal"]) not in passage_of]:
-            raise Refused(f"question {item['id']}: passage {missing[0]['ordinal']} of {missing[0]['paper']} is not in this reading")
+        for loc in (loc for ev in item["evidence"] for loc in ev):
+            found = passage_of.get((loc["paper"], loc["ordinal"]))
+            if found is None:
+                raise Refused(f"question {item['id']}: passage {loc['ordinal']} of {loc['paper']} is not in this reading")
+            if _key(found["text"]) != _key(loc["quote"]):
+                raise Refused(f"question {item['id']}: passage {loc['ordinal']} of {loc['paper']} is no longer its quote "
+                              "in this reading (check --pdfs reports where it moved)")
         queries.append({"key": item["id"], "text": item["text"], "group": len(queries), "project": project,
                         "query_language": item["query_language"], "document_language": item["document_language"],
-                        "annotators": [[[passage_of[(loc["paper"], loc["ordinal"])] for loc in ev]
+                        "annotators": [[[passage_of[(loc["paper"], loc["ordinal"])]["id"] for loc in ev]
                                         for ev in item["evidence"]]]})
     return queries
 
@@ -1176,6 +1281,8 @@ class Review:
             raise Refused("field 1's sample holds passages from Harold's library: its page is written only for a "
                           "colleague named with --colleague")
         self.field, self.kind, self.rater, self.lock = field, kind, rater, threading.Lock()
+        if field == 1:
+            folder = field1(folder)  # field 1's walks (Field1Path): checked again at each save (_open_dir)
         doc, papers_sha256, sets = load_field(field, folder)
         if kind not in sets:
             raise Refused(f"{kind}.json is not drafted yet")
@@ -1188,12 +1295,12 @@ class Review:
         order = list(self.items)
         if kind == "pairs" and settings["review"]["pair_order"] == "shuffled":
             random.Random(f"{settings['review']['order_seed']}:{self.set['id']}").shuffle(order)
-        self.sample = None
+        self.sample = None  # the recorded sample's ids, on the sample's page
         if sample:
-            self.sample = read_json(folder, folder / f"sample-{kind}.json")
-            if not sample_of(self.sample, self.set):
-                raise Refused(f"sample-{kind}.json is not a sample of this set")
-            order = [i for i in order if i in set(self.sample["items"])]
+            self.sample = recorded_sample(folder, self.set, settings)
+            if self.sample is None:
+                raise Refused(f"sample-{kind}.json is missing: draw it first (gold.py sample)")
+            order = [i for i in order if i in set(self.sample)]
         self.order = order
         self.show_category = settings["review"]["show_drafted_category"]
         self.passages = {}
@@ -1230,7 +1337,11 @@ class Review:
             labels = read_json(self.root, self.path)
         except (OSError, ValueError) as error:
             raise Refused(f"{self.path.name} cannot be read ({type(error).__name__}); it is left as it is") from None
-        if problems := check_labels(labels, self.set, self.papers, self.rater):
+        if isinstance(labels, dict) and ("sample" in labels) != (self.sample is not None):
+            raise Refused(f"{self.path.name}: " + ("these are the sample's labels: open the sample's page (--sample)"
+                                                   if self.sample is None else "these labels are not the sample's")
+                          + "; it is left as it is")
+        if problems := check_labels(labels, self.set, self.papers, self.rater, self.sample):
             raise Refused(f"{self.path.name}: " + "; ".join(problems[:5]) + "; it is left as it is")
         return labels["labels"]
 
@@ -1340,9 +1451,8 @@ class Review:
             raise ValueError("evidence_invalid")
         content["evidence"] = [[self.locator(c) for c in ev] for ev in chosen]
 
-        def plain(question):
-            return ({k: question[k] for k in ("text", "short_answer", "answerable") if k in question},
-                    [[(loc["paper"], loc["ordinal"]) for loc in ev] for ev in question["evidence"]])
+        def plain(question):  # whole locators: a passage picked again with another quote, page, kind or section is an edit
+            return {k: question[k] for k in ("text", "short_answer", "answerable", "evidence") if k in question}
         return {"decision": "keep"} if plain(content) == plain(item) else {"decision": "edit", **content}
 
     def save(self, body):
@@ -1369,7 +1479,7 @@ class Review:
             if problems := set_problems(self.set, labels, self.papers):
                 return 400, {"code": rule_code(problems[0]), "problem": problems[0]}
             doc = {"set": self.set["id"], "kind": self.kind, "field": self.field, "rater": self.rater,
-                   "set_sha256": self.set_sha256, **({"sample": True} if self.sample else {}),
+                   "set_sha256": self.set_sha256, **({"sample": True} if self.sample is not None else {}),
                    "labels": dict(sorted(labels.items()))}
             try:
                 write_json(self.root, self.path, doc)
@@ -1537,8 +1647,8 @@ def main(argv=None):
             papers_doc, _, sets = load_field(args.field, folder)
             if args.set not in sets:
                 raise Refused(f"{args.set}.json is not drafted yet")
-            set_doc = sets[args.set]
-            problems = check_papers(papers_doc, args.field, load_settings())
+            set_doc, settings = sets[args.set], load_settings()
+            problems = check_papers(papers_doc, args.field, settings)
             papers = {} if problems else {p["id"]: p for p in papers_doc["papers"]}
             if problems := problems or check_set(set_doc, args.set, args.field, papers):
                 raise Refused(f"{args.set}.json does not pass its check: " + "; ".join(problems[:5]))
@@ -1546,7 +1656,7 @@ def main(argv=None):
                 out = folder / f"sample-{args.set}.json"
                 if entry(folder, out):
                     raise Refused(f"{out.name} exists: a sample is drawn once, before anyone labels it")
-                write_json(folder, out, draw(set_doc, load_settings()))
+                write_json(folder, out, draw(set_doc, settings))
                 print(f"{out}: {len(read_json(folder, out)['items'])} items")
             else:
                 if not all(RATER.fullmatch(r) for r in (args.raters if args.command == "agreement" else [args.rater])):
@@ -1555,14 +1665,21 @@ def main(argv=None):
                 def labels_of(rater):
                     path = folder / "labels" / f"{set_doc['id']}.{rater}.json"
                     labels = read_json(folder, path)
-                    if problems := check_labels(labels, set_doc, papers, rater):
+                    if problems := check_labels(labels, set_doc, papers, rater, sample_if(labels)):
                         raise Refused(f"{path.name}: " + "; ".join(problems[:5]))
                     return labels
+
+                def sample_if(labels):  # the recorded sample, read only for a sample's labels
+                    return recorded_sample(folder, set_doc, settings) if isinstance(labels, dict) and "sample" in labels else None
                 if args.command == "agreement":
-                    print(json.dumps(agreement(set_doc, *map(labels_of, args.raters)), ensure_ascii=False, indent=1))
+                    first, second = map(labels_of, args.raters)
+                    if (sample := recorded_sample(folder, set_doc, settings)) is None:
+                        raise Refused("agreement is measured on the recorded sample: draw it first (gold.py sample)")
+                    print(json.dumps(agreement(set_doc, first, second, sample), ensure_ascii=False, indent=1))
                 else:
                     out = outputs(folder) / f"{set_doc['id']}.corrected.{args.rater}.json"
-                    corrected = apply(set_doc, labels_of(args.rater), papers)
+                    labels = labels_of(args.rater)
+                    corrected = apply(set_doc, labels, papers, sample_if(labels))
                     write_json(out_root(folder), out, corrected)
                     print(f"{out}: {corrected['counts']}")
     except (Refused, OSError, ValueError) as refused:
