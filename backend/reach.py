@@ -28,6 +28,7 @@ class Reach:
     problem: str | None = None  # why nothing can be reached: route_unverified, route_unpriced, route_unsupported
     output: int | None = None  # the smallest completion limit any of them lists, if one does
     unreported: bool = False  # one of them reports no window: a setting must give it (Harness._route_facts)
+    tools: bool = False  # every one of them takes tool calls (S1-19: a route without them runs as chat with the library)
 
 
 def _related(tag, pin):
@@ -62,7 +63,7 @@ def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -
     reach (rule 1). The window, the completion limit, the rates and Private's 8,192-token rule are all
     read from that same set, variants of a base slug included."""
     if not provider.is_openrouter:
-        return Reach((), (row or {}).get("context_length"), UNKNOWN_RATES)
+        return Reach((), (row or {}).get("context_length"), UNKNOWN_RATES, tools=(row or {}).get("supports_tools") is True)
     if listing is None:
         return Reach((), None, UNKNOWN_RATES, "route_unverified")
     routing = openrouter.routing(row, zdr_enabled=zero_retention, pin=pin, require=bool(needs))
@@ -99,7 +100,8 @@ def reach(provider, row, listing, *, zero_retention=False, pin=None, needs=()) -
                  "output": max(rates["output"], price["max_output_per_token"]),
                  "request": max(rates["request"], price["per_request_usd"])}
     return Reach(tuple(e["tag"] for e in found), min(windows) if windows else None, rates,
-                 output=min(caps) if caps else None, unreported=len(windows) < len(found))
+                 output=min(caps) if caps else None, unreported=len(windows) < len(found),
+                 tools=all("tools" in (e["supported_parameters"] or ()) for e in found))
 
 
 def _prices(value):

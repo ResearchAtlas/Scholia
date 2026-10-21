@@ -31,7 +31,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
-from backend import asks, materials
+from backend import answers, asks, materials
 from backend import references  # S1-14: reference file import and the merge confirmation
 from backend import local_helper
 from backend import search  # S1-17: the search index, index runs and the search model's offer
@@ -194,6 +194,7 @@ class Message(BaseModel):
     model: str | None = Field(default=None, max_length=512)  # as long as the model catalog accepts
     provider: str | None = None  # any configured provider's name; admission checks it is one
     effort: str | None = None
+    material_ids: list[str] | None = Field(default=None, max_length=50)  # S1-19: the papers it selects
 
 
 class Continue(BaseModel):
@@ -298,6 +299,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                                                             helper_urls=local_helper.urls(state)), transport=transport)
         harness = Harness(data_dir, db, gate, keyring_backend=keyring_backend)
         content = ContentStore(db)
+        harness.content = content  # S1-19: each model call's exact request body, for the trace
         # Local background work: reading materials and looking their identifiers up; full backups and exports.
         materials.register(harness, content)
         references.register(harness)  # S1-14: merging a reference file's duplicates
@@ -371,6 +373,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app.include_router(local_helper.router)  # the local model helper and its models, under Advanced
     app.include_router(search.router)  # S1-17: search, and the index's status and rebuild
     app.include_router(zotero.router)  # S1-15: Zotero's status, collections and items, and imports
+    app.include_router(answers.router)  # S1-19: a run's trace, and answers' citations resolved or checked
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)
@@ -1070,8 +1073,22 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 " t.accounting"
                 " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.conversation_id = ? ORDER BY t.seq",
                 (conversation_id,)).fetchall()
-            return row, turns
-        row, turns = await read(fetch)
+            cited = {}  # S1-19: each answer's citations, as its chips show them
+            for owner, cid, material, passage, quote, context, page, evidence, existence, support, retraction, title, \
+                    ordinal in conn.execute(
+                    "SELECT c.owner_id, c.id, c.material_id, c.passage_id, c.quote, c.context, c.page, c.evidence_type,"
+                    " c.existence, c.support, m.retraction, m.title, p.ordinal FROM citations c"
+                    " JOIN turns t ON t.run_id = c.owner_id LEFT JOIN materials m ON m.id = c.material_id"
+                    " LEFT JOIN passages p ON p.id = c.passage_id"
+                    " WHERE c.owner_kind = 'answer' AND t.conversation_id = ? ORDER BY c.rowid", (conversation_id,)):
+                context = json.loads(context or "{}")
+                cited.setdefault(owner, []).append({
+                    "id": cid, "material_id": material, "passage_id": passage, "quote": quote, "page": page,
+                    "evidence_type": evidence, "existence": existence, "support": support,
+                    "retracted": retraction == "retracted", "title": title, "ordinal": ordinal, "marker": context.get("marker"),
+                    "offset": context.get("offset"), "sentence": context.get("sentence")})
+            return row, turns, cited
+        row, turns, cited = await read(fetch)
         if row is None:
             raise ApiError(404, "not_found", "No such conversation")
         registry = harness().registry
@@ -1081,6 +1098,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             "status": derived_status(status, run_id, registry), "reason_code": reason, "cancel_reason": cancel,
             "cost_usd": cost, "accounting": json.loads(accounting) if accounting else None,
             "started_at": started, "finished_at": finished, "continues": retry_of,
+            "citations": cited.get(run_id, []),
         } for run_id, seq, author, message, answer, saved, reason, status, cancel, cost, started, finished, retry_of,
             accounting in turns]}
 
@@ -1180,7 +1198,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     @app.post("/api/conversations/{conversation_id}/message/stream")
     async def send_message(conversation_id: str, body: Message):
         claim = await harness().admit_turn(conversation_id, body.content, model=body.model,
-                                           provider=body.provider, effort=body.effort)
+                                           provider=body.provider, effort=body.effort, material_ids=body.material_ids)
         return stream(claim)
 
     def stream(claim):

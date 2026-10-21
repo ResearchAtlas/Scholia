@@ -77,3 +77,32 @@ async def test_a_file_attached_later_makes_an_imported_paper_full_text(tmp_path)
         await added(client, project, ("attach.md", b"# Attach\n\nIts full text.\n"), material_id=paper)
         [found] = await settled(client, project)
         assert found["evidence_type"] == "full_text" and found["extraction"]["passages"] > 0
+
+
+# S1-19: the answer side (C9). Abstracts and metadata are never passages (above), so they never enter a
+# request as evidence; every record a request carries says its evidence type, and the chip keeps it.
+
+async def test_an_answers_evidence_says_its_type_and_an_abstract_never_enters_it_as_full_text(tmp_path):
+    from cited import cited, conversation_in, with_papers
+    from scholia_app import send
+    from test_reference_import import imported, ris
+    from test_search import WAGES
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        await imported(client, project, ris(("Wage Abstract", "AB  - Minimum wages raise earnings Abstract-Only-Canary.\n")))
+        await settled(client, project)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "What do minimum wages do to earnings?")
+        [body] = client.provider.answers
+        evidence = body["messages"][0]["content"].split("## RESEARCH EVIDENCE")[1]
+        assert "Abstract-Only-Canary" not in str(body) and "Wage Abstract" not in evidence
+        assert "[S1.1] Wage Floors (" in evidence and "full text" in evidence.split("\n")[1]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert [c["evidence_type"] for c in turn["citations"]] == ["full_text"]
+
+
+async def test_an_abstract_or_metadata_record_is_labeled_as_such_never_as_full_text():
+    from backend import citations
+    for kind, label in (("abstract", "abstract"), ("metadata", "metadata"), ("full_text", "full text")):
+        [line] = citations.bundle({(1, 1): {"title": "T", "page": None, "evidence_type": kind, "text": "x"}})
+        assert line.startswith(f"[S1.1] T ({label})") and (kind == "full_text" or "full text" not in line)

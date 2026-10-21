@@ -191,12 +191,13 @@ def _readings_from(passage_ids=None):
             f" CROSS JOIN material_versions w ON {_reads_now('w', 'e')} CROSS JOIN materials m ON m.id = w.material_id")
 
 
-def readings(conn, project_id, passage_ids=None, references=True):
+def readings(conn, project_id, passage_ids=None, references=True, materials=None):
     """{passage id: (material id, title, section path, kind, text, page, ordinal, version id)} for the
     passages a current version of a material in the project reads now (its file read by this version
     of its type's extractor: the reading the Library shows, deletion._reads_now), all of them or those
-    of passage_ids; without references, never a reference passage. A passage two of the project's
-    materials read is given once, for the first added."""
+    of passage_ids; without references, never a reference passage; with materials, only those
+    materials' (S1-19: a selection). A passage two of the project's materials read is given once, for
+    the first added."""
     sql = (f"SELECT p.id, m.id, m.title, p.section_path, p.kind, p.text, p.page, p.ordinal, w.id"
            f" FROM {_readings_from(passage_ids)}"
            f" WHERE m.project_id = ?{'' if references else ' AND p.kind != ' + repr('reference')}")
@@ -204,6 +205,9 @@ def readings(conn, project_id, passage_ids=None, references=True):
     if passage_ids is not None:
         sql += " AND p.id IN (SELECT value FROM json_each(?))"
         args.append(json.dumps(list(passage_ids)))
+    if materials is not None:
+        sql += " AND m.id IN (SELECT value FROM json_each(?))"
+        args.append(json.dumps(list(materials)))
     found = {}
     for pid, material, title, path, kind, text, page, ordinal, version in conn.execute(
             sql + " ORDER BY m.created_at, m.id, p.ordinal", args):
@@ -975,25 +979,39 @@ class SearchIndex:
 
     # Search
 
-    def keyword(self, project_id, query, limit):
-        """BM25's top passage ids in the project for the typed query, best first, references left out."""
+    def keyword(self, project_id, query, limit, materials=None):
+        """BM25's top passage ids in the project for the typed query, best first, references left out;
+        with materials, only those papers' passages (S1-19: a selection)."""
         expression = match(query)
         if expression is None:
             return []
+        within = "" if materials is None else (" AND rowid IN (SELECT id FROM index_rows WHERE project_id = ?"
+                                               " AND material_id IN (SELECT value FROM json_each(?)))")
+        args = (expression, project_id, project_id, *(() if materials is None else (project_id, json.dumps(list(materials)))),
+                limit)
         return [pid for (pid,) in self._read(lambda conn: conn.execute(
             "SELECT passage_id FROM fts_passages WHERE fts_passages MATCH ? AND project_id = ?"
             " AND rowid NOT IN (SELECT id FROM index_rows WHERE project_id = ? AND kind = 'reference')"
-            " ORDER BY rank LIMIT ?", (expression, project_id, project_id, limit)).fetchall())]
+            + within + " ORDER BY rank LIMIT ?", args).fetchall())]
 
-    def dense(self, project_id, vector, limit):
-        """The nearest embedded passage ids in the project to vector, nearest first (references have none)."""
+    def dense(self, project_id, vector, limit, materials=None):
+        """The nearest embedded passage ids in the project to vector, nearest first (references have none);
+        with materials, the nearest of those papers' passages, among the project's nearest 4,096 (vec0's
+        largest k)."""
         if not self.vectors:
             return []
         if len(vector) != DIMENSIONS or not 0 <= limit <= 4096:  # refused before the read (vec0's largest k is 4096):
             raise ValueError(f"a query of {len(vector)} dimensions for {limit}")  # an error it met would be damage
+        if materials is None:
+            return [pid for (pid,) in self._read(lambda conn: conn.execute(
+                "SELECT passage_id FROM vec_passages WHERE embedding MATCH ? AND k = ? AND project_id = ? ORDER BY distance",
+                (sqlite_vec.serialize_float32(vector), limit, project_id)).fetchall())]
+        # ponytail: a selection's nearest from the project's 4,096 nearest; a partition key per paper if selections outgrow it
         return [pid for (pid,) in self._read(lambda conn: conn.execute(
-            "SELECT passage_id FROM vec_passages WHERE embedding MATCH ? AND k = ? AND project_id = ? ORDER BY distance",
-            (sqlite_vec.serialize_float32(vector), limit, project_id)).fetchall())]
+            "SELECT v.passage_id FROM vec_passages v JOIN index_rows r ON r.id = v.rowid"
+            " WHERE v.embedding MATCH ? AND v.k = 4096 AND v.project_id = ?"
+            " AND r.material_id IN (SELECT value FROM json_each(?)) ORDER BY v.distance LIMIT ?",
+            (sqlite_vec.serialize_float32(vector), project_id, json.dumps(list(materials)), limit)).fetchall())]
 
     def counts(self, project_id):
         """{material id: (indexed, embedded, embeddable, refused)} for the project's rows."""

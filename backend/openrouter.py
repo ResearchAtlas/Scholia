@@ -20,6 +20,7 @@ prompt, an answer, a key, a URL or a provider's error body.
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -87,6 +88,7 @@ class Attempt:
     usage: dict = field(default_factory=dict)  # tokens and cost as the provider reported them
     dispatched: bool = True  # False when the request certainly never reached the provider
     retention: dict | None = None  # the retention terms the outbound gate applied to it (Scholia)
+    body: bytes | None = field(default=None, repr=False)  # the exact request body sent (S1-19: the trace); never logged
 
     @property
     def reported_cost(self):
@@ -279,9 +281,11 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             return _failed("timeout", attempts, route)
         started = time.monotonic()
         sent.clear()
+        # Encoded here, as httpx would encode json=, so the trace keeps the exact bytes that went out (S1-19).
+        sending = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         try:
             response = await asyncio.wait_for(
-                client.post(route.provider.chat_url, headers=headers, json=payload, extensions=extensions,
+                client.post(route.provider.chat_url, headers=headers, content=sending, extensions=extensions,
                             timeout=httpx.Timeout(remaining, connect=connect_timeout_for(remaining))),
                 timeout=remaining,
             )
@@ -290,7 +294,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             # bound during the gate's check, or never connected, it did not.
             left = bool(sent) and not isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout))
             attempts.append(Attempt(classify_error(error), None, _ms(started), dispatched=left,
-                                    retention=sent[-1] if left else None))
+                                    retention=sent[-1] if left else None, body=sending if left else None))
             return _failed(attempts[-1].outcome, attempts, route)
         body = _json(response)
         usage = body.get("usage") if isinstance(body, dict) and isinstance(body.get("usage"), dict) else {}
@@ -299,7 +303,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             kind = "policy_block" if response.status_code == 403 and route.provider.is_openrouter \
                 else classify_status(response.status_code)
             attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
-                                    retention=sent[-1] if sent else None))
+                                    retention=sent[-1] if sent else None, body=sending))
             retry = (response.status_code == 400 and "reasoning" in payload and not route.provider.is_openrouter
                      and len(attempts) < MAX_ATTEMPTS)
             if retry:
@@ -317,9 +321,10 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
             # same prompt is never sent again (model-route rule 4).
             kind = refusal or ("output_limit" if _choice(body).get("finish_reason") == "length" else "malformed")
             attempts.append(Attempt(kind, response.status_code, _ms(started), usage,
-                                    retention=sent[-1] if sent else None))
+                                    retention=sent[-1] if sent else None, body=sending))
             return _failed(kind, attempts, route)
-        attempts.append(Attempt("ok", response.status_code, _ms(started), usage, retention=sent[-1] if sent else None))
+        attempts.append(Attempt("ok", response.status_code, _ms(started), usage, retention=sent[-1] if sent else None,
+                                body=sending))
         if len(attempts) > 1 and "reasoning" not in payload:
             _remember_no_reasoning(route, key)
         return ModelResult(content, reasoning, None, attempts, tool_calls,

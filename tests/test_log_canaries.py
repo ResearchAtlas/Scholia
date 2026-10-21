@@ -214,3 +214,37 @@ async def test_no_search_canary_reaches_the_log(tmp_path, caplog, monkeypatch):
     for canary in canaries:
         assert canary not in text, canary
         assert not any(canary in record.getMessage() for record in caplog.records), canary
+
+
+async def test_no_cited_answer_canary_reaches_the_log(tmp_path, caplog):
+    """S1-19b: the router, the evidence, the answer, its citations and the judge, failing too, log no
+    question, passage, answer, sentence, verdict or provider body."""
+    from backend import budget_router
+    from cited import Provider, cited, conversation_in, with_papers
+    from test_search import paper
+
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    caplog.set_level(logging.DEBUG, logger="backend")
+    canaries = ["CANARY-QUESTION", "CANARY-EVIDENCE", "CANARY-CITED", "CANARY-VERDICT", "CANARY-JUDGE-BODY",
+                "CANARY-PAPER", "金丝雀证据"]
+    replies = iter([(500, {"error": {"message": "CANARY-JUDGE-BODY"}}), "1: supported CANARY-VERDICT"])
+    provider = Provider(answer_text="CANARY-CITED earnings rise [S1.1].", verdicts=lambda body: next(replies))
+    try:
+        async with cited(tmp_path, provider) as client:
+            current = (await client.get("/api/settings")).json()
+            await client.put("/api/settings", json={"hash": current["hash"], "updates": {
+                "models.router": sorted(budget_router.RECOMMENDED)[0]}})
+            project, _ = await with_papers(client, paper("CANARY-PAPER", "CANARY-EVIDENCE earnings 金丝雀证据"))
+            conversation = await conversation_in(client, project)
+            for _ in range(2):  # the judge fails, then answers
+                await send(client, conversation, "CANARY-QUESTION earnings")
+            await background_idle(client)
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    for canary in canaries:
+        assert canary not in text, canary
+        assert not any(canary in record.getMessage() for record in caplog.records), canary
