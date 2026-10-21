@@ -43,8 +43,10 @@ import os
 import random
 import re
 import secrets
+import shutil
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -105,7 +107,7 @@ def field_folder(field, folder=None):
 def private_path(field, path):
     """A field's path, resolved; for field 1, refused anywhere inside a git work tree (this checkout, the main
     checkout or any other worktree, or any other repository) except under that tree's evals/local/, and that
-    only where the tree's own .gitignore ignores evals/local/ (a checkout of a branch without S1-36 does not).
+    only where git ignores evals/local/ there (a checkout of a branch without S1-36 does not).
     Checked for the folders given (--folder, --pdfs: each taken where it resolves, and walked from there) and
     where a linked PDF leads; under a folder no link is followed at all (the files below)."""
     path = Path(path).resolve()
@@ -114,19 +116,25 @@ def private_path(field, path):
             raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside "
                           "it or under its evals/local/")
         if not ignores_local(top):
-            raise Refused(f"{path} is under evals/local/ of the git work tree {top}, whose .gitignore does not ignore "
-                          "evals/local/: field 1's files stay outside it")
+            raise Refused(f"{path} is under evals/local/ of the git work tree {top}, where git does not ignore "
+                          "evals/local/ (or could not say): field 1's files stay outside it")
     return path
 
 
 def ignores_local(top):
-    """Whether the work tree's top-level .gitignore names evals/local/ (as this repository's does).
-    ponytail: the exact line only; a broader pattern or a global ignore file is not read, so it errs on refusing."""
-    try:
-        lines = (top / ".gitignore").read_text(encoding="utf-8").splitlines()
-    except OSError:
+    """Whether git ignores the work tree's evals/local/ as git itself decides (git check-ignore: a later
+    !evals/local/, another ignore file, a file tracked there all count as git counts them). Asked of the tree
+    at top, never of a repository the caller's GIT_* settings name; any error (no git, not a repository, a
+    timeout) is a no."""
+    git = shutil.which("git")
+    if git is None:
         return False
-    return any(line.strip() in ("evals/local/", "/evals/local/") for line in lines)
+    try:
+        done = subprocess.run([git, "-C", str(top), "check-ignore", "-q", "evals/local/"], capture_output=True,
+                              timeout=30, env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0  # 1: not ignored; 128: git failed
 
 
 def work_tree(path):
