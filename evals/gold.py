@@ -928,7 +928,7 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
                                      and (made := labeled(items[i], label)) is not None]
             if entry(folder, folder / f"sample-{kind}.json"):
                 sample = read_json(folder, folder / f"sample-{kind}.json")
-                if not sample_of(sample, set_doc):
+                if not sample_of(sample, set_doc, settings):
                     problems.append(f"sample-{kind}.json: not a sample of this set")
                 else:
                     report["samples"][kind] = len(sample["items"])
@@ -1066,10 +1066,10 @@ def draw(set_doc, settings):
             "items": sorted(chosen)}
 
 
-def sample_of(sample, set_doc):
-    """Whether a sample file is a sample of this set: its set's id, and a list of its items' ids."""
-    return (isinstance(sample, dict) and same(sample.get("set"), set_doc["id"]) and isinstance(sample.get("items"), list)
-            and all(plain_id(i) for i in sample["items"]) and set(sample["items"]) <= {i["id"] for i in set_doc["items"]})
+def sample_of(sample, set_doc, settings):
+    """Whether a sample file is this set's sample: the very draw the settings make of it (H1), every field and
+    type the same, so an emptied, cut or hand-picked sample is refused."""
+    return isinstance(sample, dict) and item_sha256(sample) == item_sha256(draw(set_doc, settings))
 
 
 def kappa(pairs, categories):
@@ -1216,7 +1216,7 @@ class Review:
         self.sample = None
         if sample:
             self.sample = read_json(folder, folder / f"sample-{kind}.json")
-            if not sample_of(self.sample, self.set):
+            if not sample_of(self.sample, self.set, settings):
                 raise Refused(f"sample-{kind}.json is not a sample of this set")
             order = [i for i in order if i in set(self.sample["items"])]
         self.order = order

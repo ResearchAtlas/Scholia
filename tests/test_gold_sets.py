@@ -576,6 +576,23 @@ def test_the_sample_is_a_fifth_stratified_and_the_same_for_the_same_seed():
     assert other["items"] != sample["items"] and len(other["items"]) == 20
 
 
+def test_a_sample_file_is_refused_unless_it_is_the_draw_the_settings_make(tmp_path):
+    """T5: any subset of the set's ids passed, so an emptied, cut or hand-picked sample opened the second
+    rater's page and was measured."""
+    folder = field(tmp_path, sample=True)
+    pairs = json.loads((folder / "pairs.json").read_text())
+    drawn = gold.draw(pairs, gold.load_settings())
+    others = [i["id"] for i in pairs["items"] if i["id"] not in drawn["items"]]
+    for changed in ({**drawn, "items": []}, {**drawn, "items": others[:1]}, {**drawn, "seed": drawn["seed"] + 1},
+                    {"set": drawn["set"], "items": drawn["items"]}):
+        write(folder / "sample-pairs.json", changed)
+        assert "sample-pairs.json: not a sample of this set" in problems_of(folder)[0], changed
+        with pytest.raises(gold.Refused, match="not a sample of this set"):
+            gold.Review(2, folder, "pairs", "lee", sample=True)
+    write(folder / "sample-pairs.json", drawn)
+    assert problems_of(folder)[0] == [] and gold.Review(2, folder, "pairs", "lee", sample=True).order == drawn["items"]
+
+
 def test_pair_agreement_gives_percent_kappa_and_the_confusion_table(tmp_path):
     doc = {"id": "s", "kind": "pairs", "field": 2,
            "items": [{"id": f"p{n}", "sentence": str(n)} for n in range(4)]}
