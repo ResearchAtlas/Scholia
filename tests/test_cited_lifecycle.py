@@ -706,3 +706,31 @@ async def test_a_recheck_whose_judge_leaves_a_pair_unanswered_fails_when_another
         [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
         assert (await run_finished(client, check))["status"] == "failed"
         assert await rows(client, "SELECT DISTINCT support FROM citations") == [("supported",)]  # nothing written
+
+
+async def test_deleting_a_conversation_while_its_judge_is_out_leaves_neither_held_amount_open(tmp_path):
+    # Internal review of b3: the share's rest and the answer's unspent, held apart while the judge runs, both
+    # go with a deletion, named by allowance_id and unspent_id.
+    release, judging = asyncio.Event(), asyncio.Event()
+
+    async def held(body):
+        judging.set()
+        await release.wait()
+        return Provider().answer("1: supported")
+    provider = Provider(answer_text="Earnings rise [S1.1]. Prices adjust [S1.1].", verdicts=held)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        await setting(client, "retrieval.judge_pairs", 1)
+        conversation = await conversation_in(client, project)
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": QUESTION}))
+        await asyncio.wait_for(judging.wait(), 10)
+        [(started,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'step_started'"
+                                          " AND json_extract(data, '$.phase') = 'judge'")
+        assert "unspent_id" in json.loads(started)  # the unspent's rest, held apart
+        assert (await client.delete(f"/api/conversations/{conversation}")).status_code == 200
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'"
+                                  " AND id <> ?", json.loads(started)["reservation_id"]) == [(0,)]
+        release.set()
+        await stream
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(0,)]

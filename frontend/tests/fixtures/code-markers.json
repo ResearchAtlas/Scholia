@@ -47,5 +47,71 @@
   "markers": [
    "[S1.1]"
   ]
+ },
+ {
+  "text": "> ~~~\n> example [S1.1]\n> ~~~\n\nPrices adjust [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "*   ~~~\n    x [S1.1]\n    ~~~\n\nPrices adjust [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "- item\n\n    ~~~\n    example [S2.1]\n    ~~~\n\nPrices adjust [S3.1].",
+  "markers": [
+   "[S3.1]"
+  ]
+ },
+ {
+  "text": "Intro.\n\n    example [S1.1]\n\nEnd [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "Intro line\n    still text [S1.1].",
+  "markers": [
+   "[S1.1]"
+  ]
+ },
+ {
+  "text": "Use \\`a [S1.1]\\` here.",
+  "markers": [
+   "[S1.1]"
+  ]
+ },
+ {
+  "text": "| a | b |\n|---|---|\n| `x [S1.1] | y` | z |",
+  "markers": [
+   "[S1.1]"
+  ]
+ },
+ {
+  "text": "text `a\n- b [S2.1] c` d",
+  "markers": [
+   "[S2.1]"
+  ]
+ },
+ {
+  "text": "# A `\n[S2.1] text `",
+  "markers": [
+   "[S2.1]"
+  ]
+ },
+ {
+  "text": "A span `across\na line [S1.1]` is code, then [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
+ },
+ {
+  "text": "Line one still `one [S1.1]` and [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
  }
 ]

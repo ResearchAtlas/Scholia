@@ -40,13 +40,21 @@ _MALFORMED = re.compile(r"\[S[^\]\n]{0,12}\]")
 _END = re.compile(r"(?<![.!?])[.!?]++(?=\s|$)|[。！？]++|\n")
 _LEADING = re.compile(r"^(?:[\s|]*\[S[^\]\n]{0,12}\])+")
 _EDGES = re.compile(r"^[\s|]+|[\s|]+$")  # a table row's cell bars and the space around a sentence
-# Code, where a marker is not a citation, read as the interface's Markdown renderer reads it (CommonMark, so
-# frontend/tests/fixtures/code-markers.json holds for both): a fence of three or more backticks or tildes at a
-# line's start (up to three spaces in), closed by a line of at least as many of the same character, or by the
-# text's end; and a code span, a run of backticks closed by a run of the same length within its paragraph.
+# Code, where a marker is not a citation, read as the interface's Markdown renderer reads it (CommonMark with
+# GitHub's tables; frontend/tests/fixtures/code-markers.json holds for both): a fence of three or more backticks
+# or tildes (up to three spaces in, within a block quote or a list item too), closed by a line of at least as many
+# of the same character or by the text's end; an indented code block (four spaces, not continuing a paragraph);
+# and a code span, a run of backticks not escaped, closed by a run of the same length within its paragraph (or
+# its table cell).
+# ponytail: a line scanner, not a full CommonMark parser (lazy continuations and nested lists are read
+# approximately); a parser if answers' Markdown outgrows it.
 _FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})([^\n]*)")
 _FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*$")
-_SPAN = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
+_QUOTE = re.compile(r" {0,3}> ?")
+_ITEM = re.compile(r" {0,3}(?:[-*+]|\d{1,9}[.)])(?: {1,4}|$)")
+_STARTS_BLOCK = re.compile(r" {0,3}(?:#{1,6}(?:[ \t]|$)|>|(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$))")
+_SPAN = re.compile(r"(?<![`\\])(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
+_CELL_SPAN = re.compile(r"(?<![`\\])(`+)(?!`)([^|]+?)(?<!`)\1(?!`)", re.DOTALL)
 VERDICTS = ("supported", "partly", "unsupported")
 QUOTE_CHARS = 500  # the part of a passage a citation keeps as its quote
 
@@ -105,28 +113,52 @@ def sentences(text):
     return [(at, sentence) for at, sentence in out if sentence.strip()]
 
 
+def _indent(line):
+    return len(line) - len(line.lstrip(" \t")) + 3 * line[:len(line) - len(line.lstrip(" \t"))].count("\t")
+
+
 def _code(text):
-    """The (start, end) ranges of text that are code: fenced blocks, then code spans outside them."""
-    fences, outside, fence, at = [], [], None, 0
-    for line in text.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        if fence is None:
-            m = _FENCE_OPEN.match(body)
-            if m and not (m[1][0] == "`" and "`" in m[2]):  # a backtick fence's info string has no backtick
-                fence = (m[1][0], len(m[1]), at)
-        else:
-            m = _FENCE_CLOSE.match(body)
-            if m and m[1][0] == fence[0] and len(m[1]) >= fence[1]:
-                fences.append((fence[2], at + len(line)))
+    """The (start, end) ranges of text that are code: fences and indented blocks, then code spans in the
+    paragraphs (and table cells) outside them."""
+    code, blocks = [], []  # blocks: [start, end, in a table] of inline text, one per paragraph or table row
+    fence, item, paragraph, at = None, 0, False, 0
+    for m in re.finditer(r"[^\n]*\n|[^\n]+$", text):  # lines end at \n only, as CommonMark's do
+        line, start = m.group(), m.start()
+        body, at = line.rstrip("\n"), m.end()
+        while (q := _QUOTE.match(body)):  # block quote markers
+            body = body[q.end():]
+        if fence is not None:
+            close = _FENCE_CLOSE.match(body[min(fence[3], _indent(body)):])
+            if close and close[1][0] == fence[0] and len(close[1]) >= fence[1]:
+                code.append((fence[2], at))
                 fence = None
-        at += len(line)
+            continue
+        if not body.strip():
+            paragraph = False
+            continue
+        if (marker := _ITEM.match(body)) and body.strip() not in "-*+":
+            item, body, paragraph = marker.end(), body[marker.end():], False  # a list item's content column
+        elif item and _indent(body) >= item:
+            body = body[item:]
+        elif item and not paragraph:
+            item = 0  # out of the list
+        opened = _FENCE_OPEN.match(body)
+        if opened and not (opened[1][0] == "`" and "`" in opened[2]):  # a backtick fence's info has no backtick
+            fence, paragraph = (opened[1][0], len(opened[1]), start, item), False
+            continue
+        if _indent(body) >= 4 and not paragraph:
+            code.append((start, at))
+            continue
+        table = body.lstrip().startswith("|")
+        if not paragraph or table or _STARTS_BLOCK.match(body) or blocks[-1][2]:
+            blocks.append([start, at, table])
+        blocks[-1][1] = at
+        paragraph = not body.lstrip().startswith("#")
     if fence is not None:  # an unclosed fence runs to the end
-        fences.append((fence[2], len(text)))
-    start = 0
-    for a, b in [*fences, (len(text), len(text))]:
-        outside += [(start + m.start(), start + m.end()) for m in _SPAN.finditer(text[start:a])]
-        start = b
-    return fences + outside
+        code.append((fence[2], len(text)))
+    for start, end, table in blocks:
+        code += [(start + s.start(), start + s.end()) for s in (_CELL_SPAN if table else _SPAN).finditer(text[start:end])]
+    return code
 
 
 def markers(text):
