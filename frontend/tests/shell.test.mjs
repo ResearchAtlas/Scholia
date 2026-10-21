@@ -125,6 +125,18 @@ test('an answer shown but not saved stays available by its run', async (t) => {
   assert.equal(unsavedAnswer('r1'), null);
 });
 
+test('an unsaved answer keeps its notices after the turn hands off', async (t) => {
+  // T6 (PR 41): what its retrieval and checks could not do stays said under the answer kept for the window.
+  const notices = ['unchecked', 'unchecked_budget', 'retracted', 'keyword_only', 'index_unavailable'];
+  t.mock.method(globalThis, 'fetch', async () => new Response(streamOf(
+    'data: {"type":"run_started","run_id":"r7"}\n\n',
+    `data: ${JSON.stringify({ type: 'chat_response', content: 'Kept', result_saved: false, notices })}\n\n`,
+    'data: {"type":"run_finished","status":"failed"}\n\n')));
+  await send('c7', '/x', {}, 'Q');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(unsavedAnswer('r7'), { text: 'Kept', cut: false, notices });
+});
+
 test('an unsaved answer cut at its output limit keeps its cut mark', async (t) => {
   // The connector's finding on PR 37: the save-failure fallback carries the mark, and the window keeps it.
   t.mock.method(globalThis, 'fetch', async () => new Response(streamOf(

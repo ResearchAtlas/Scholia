@@ -8,7 +8,7 @@ import { asksChanged } from './library.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
-const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut }, for this window
+const unsaved = new Map(); // run id -> an answer shown but not saved (backend/runs.py), { text, cut, notices }, for this window
 const listeners = new Set();
 
 function set(conversationId, turn, eventType) {
@@ -51,7 +51,7 @@ export function send(conversationId, path, body, text) {
       if (event.type === 'ask') asksChanged(conversationId); // S1-19c: the agent asks; the conversation shows it
       if (event.type === 'open_place') openPlace(event.place); // S1-19c: the help skill opens a place
       if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
-        unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut) });
+        unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
       }
       set(conversationId, turn, event.type);
       if (turn.runId) admitted();

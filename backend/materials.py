@@ -166,9 +166,15 @@ async def add_files(project_id: str, body: Upload, request: Request):
             raise _refused(404, "not_found", "No such material")
 
     await asyncio.to_thread(db.read, check)
+    with content.hold() as held:  # kept from collection until the records naming them commit (or are refused)
+        return await _added(project_id, body, files, content, harness, held, check)
+
+
+async def _added(project_id, body, files, content, harness, held, check):
+    """add_files once checked: the files stored, held, then the records naming them."""
     stored = []
-    for name, data, kind in files:  # stored before the records: a file no record names is collected later
-        stored.append((name, await asyncio.to_thread(content.put, data, kind), kind))
+    for name, data, kind in files:  # stored before the records: a file no record names is collected once idle
+        stored.append((name, await asyncio.to_thread(content.put, data, kind, held), kind))
 
     origin = {"conversation_id": body.conversation_id} if body.conversation_id else None
 
@@ -412,7 +418,8 @@ def register(harness, content):
         try:
             async with readings:
                 deadline = time.monotonic() + EXTRACTION_SECONDS
-                extracted = await harness.work(active, read)
+                with content.hold([sha256]):  # its paper deleted meanwhile, the file stays until it is read
+                    extracted = await harness.work(active, read)
         except _TimeLimit:
             raise RunOutcome("cancelled", "time_limit", "limit") from None
         except extraction.Unreadable as unreadable:
@@ -1284,8 +1291,9 @@ async def page_image(version_id: str, number: int, request: Request, scale: floa
         if harness.registry.closed:
             raise _Stop()
 
-    def render():
-        return reading.render(state["content"]._path(row[0]), row[0], number, max(0.5, min(scale, 3.0)), stop)
+    def render():  # its file held from collection while it is read (ContentStore.hold)
+        with state["content"].hold([row[0]]):
+            return reading.render(state["content"]._path(row[0]), row[0], number, max(0.5, min(scale, 3.0)), stop)
 
     ceiling = None
     try:

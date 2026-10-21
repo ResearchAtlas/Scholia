@@ -11,7 +11,7 @@ import pytest
 from backend import citations
 from cited import ANSWER, Provider, cited, conversation_in, events_of, rows, with_papers
 from scholia_app import run_finished, send
-from test_search import WAGES, paper
+from test_search import WAGES, paper, setting
 
 pytestmark = pytest.mark.asyncio
 QUESTION = "What do minimum wages do to earnings?"
@@ -70,6 +70,61 @@ async def test_a_citation_whose_passage_was_re_read_maps_by_its_quote_or_is_sour
         assert (removed["existence"], removed["passage_id"]) == ("source_removed", None)
 
 
+async def test_after_a_cited_papers_file_is_replaced_its_chip_reads_removed_not_found_and_supported(tmp_path):
+    # T7 (PR 41): the conversation read, and Details, give each citation's existence as it stands now: the
+    # replacement no longer holds the quote, so the stored "ok" and its verdict are not shown as current.
+    from test_materials import added
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (chip["existence"], chip["support"]) == ("ok", "supported") and chip["quote"]
+        await added(client, project, paper("Wage Floors", "Rents rose in the synthetic city."), material_id=material)
+        await idle(client, project)
+        [chip] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert (chip["existence"], chip["support"], chip["quote"], chip["passage_id"]) == (
+            "source_removed", "unchecked", None, None)
+        [check] = [e["data"] for e in (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+                   if e["type"] == "citation_checks"]
+        assert [(c["existence"], c["support"]) for c in check["citations"]] == [("source_removed", "unchecked")]
+
+
+async def test_a_paper_not_read_yet_keeps_its_chip_as_recorded_and_a_removed_one_is_not_found_again_by_a_read(tmp_path):
+    # Internal review of T7: a paper whose current file has no reading yet (just replaced, or read again by a
+    # newer extractor) is not removed; and the read only ever marks a found citation removed, never the reverse.
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        db = client.state["db"]
+        sha = await asyncio.to_thread(client.state["content"].put, b"# Wage Floors\n\nNot read yet.\n", "text/markdown")
+
+        def unread_version(conn):  # the state between a replacement's upload and its reading
+            conn.execute("UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material,))
+            conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
+                         " VALUES ('00000000-0000-4000-8000-0000000000a1', ?, 1, ?, 1, 'text/markdown')", (material, sha))
+        await asyncio.to_thread(db.write, unread_version)
+
+        async def chip():
+            [found] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+            [check] = [e["data"] for e in (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+                       if e["type"] == "citation_checks"]
+            return found, check["citations"][0]
+        found, checked = await chip()
+        assert (found["existence"], found["support"]) == ("ok", "supported") and found["quote"]
+        assert (checked["existence"], checked["support"]) == ("ok", "supported")
+
+        def read_again(conn):  # the old reading current again, and the citation recorded as removed meanwhile
+            conn.execute("DELETE FROM material_versions WHERE id = '00000000-0000-4000-8000-0000000000a1'")
+            conn.execute("UPDATE material_versions SET is_current = 1 WHERE material_id = ?", (material,))
+            conn.execute("UPDATE citations SET existence = 'source_removed', passage_id = NULL")
+        await asyncio.to_thread(db.write, read_again)
+        found, checked = await chip()
+        assert found["existence"] == "source_removed" and checked["existence"] == "source_removed"
+
+
 async def test_selected_papers_that_fit_are_read_whole_and_larger_ones_are_searched_within(tmp_path):
     other = paper("Rents", "Housing rents rose in the synthetic city.")
     async with cited(tmp_path) as client:
@@ -84,6 +139,29 @@ async def test_selected_papers_that_fit_are_read_whole_and_larger_ones_are_searc
         bad = await client.post(f"/api/conversations/{conversation}/message/stream",
                                 json={"content": "Summarize.", "material_ids": ["00000000-0000-4000-8000-000000000000"]})
         assert (bad.status_code, bad.json()["code"]) == (400, "selection_invalid")
+
+
+async def test_a_selection_whose_records_do_not_fit_with_their_framing_is_searched_within_not_cut(tmp_path):
+    # B40: the passages' text alone fits the evidence budget, but with each record's marker, title and evidence
+    # type it does not; the selection is searched within, so the last passage, which holds the answer, is sent
+    # rather than cut from the end.
+    from backend import context
+    from backend.search_index import readings
+    answer = "Zebra stripes confuse biting flies in the synthetic paddock."
+    filler = [f"Paragraph {i} describes the synthetic paddock's fences and gates." for i in range(12)]
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, paper("Stripes", *filler, answer))
+        texts = await asyncio.to_thread(client.state["db"].read, lambda conn: [
+            row[4] for row in readings(conn, project, references=False, materials=[material]).values()])
+        assert answer in texts[-1]
+        await setting(client, "context.research_evidence", sum(context.count(t) for t in texts) + 2)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "What do zebra stripes do to biting flies?", material_ids=[material])
+        assert stream[-1]["status"] == "succeeded"
+        [body] = client.provider.answers
+        assert answer in body["messages"][0]["content"]
+        [trace] = [d for kind, d, _ in await events_of(client, stream[0]["run_id"]) if kind == "retrieval_trace"]
+        assert trace["read_directly"] is False
 
 
 async def test_an_answer_with_no_evidence_states_it_and_a_keyword_only_search_says_so(tmp_path):
