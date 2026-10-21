@@ -114,12 +114,14 @@ class ContentStore:
                 "SELECT m.name, f.\"from\" FROM sqlite_schema m, pragma_foreign_key_list(m.name) f"
                 " WHERE m.type = 'table' AND f.\"table\" = 'content_files'"
             ).fetchall()
-            unreferenced = " AND ".join(
-                f'NOT EXISTS (SELECT 1 FROM "{table}" WHERE "{column}" = c.sha256)' for table, column in references
+            # Every reference read once (a correlated check per row would scan an unindexed column, such as
+            # run_events.body_ref, once per stored file), NULLs left out so NOT IN compares only hashes.
+            referenced = " UNION ALL ".join(
+                f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL' for table, column in references
             )
             candidates = [sha256 for (sha256,) in conn.execute(
                 "SELECT sha256 FROM content_files c"
-                f" WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch') AND {unreferenced}",
+                f" WHERE created_at < strftime('%Y-%m-%dT%H:%M:%fZ', ?, 'unixepoch') AND sha256 NOT IN ({referenced})",
                 (cutoff.timestamp(),),
             )]
             idle = [sha256 for sha256 in candidates if _idle(self._path(sha256), cutoff)]
