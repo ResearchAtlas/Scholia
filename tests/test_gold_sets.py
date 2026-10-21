@@ -883,8 +883,11 @@ async def test_the_check_resolves_evidence_a_rater_chose_as_it_resolves_drafted_
 
 
 @pytest.fixture
-def git_allowed():
-    """gold.ignores_local asks git (check-ignore), which makes no connection: allowed past the network block."""
+def git_allowed(tmp_path, monkeypatch):
+    """gold.ignores_local asks git (check-ignore), which makes no connection: allowed past the network block.
+    HOME is a new folder, so no global ignore file of this machine answers for the tests' repositories."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     with allow_subprocess(shutil.which("git")):
         yield
 
@@ -916,6 +919,10 @@ def test_field_one_is_refused_inside_any_git_work_tree_but_its_ignored_evals_loc
     assert gold.field_folder(1, plain / "x") == (plain / "x").resolve()
     (bare / ".git" / "info" / "exclude").write_text("/evals/local/\n")  # git's own exclude file counts as git counts it
     assert gold.field_folder(1, bare / "evals" / "local" / "x") == (bare / "evals" / "local" / "x").resolve()
+    (negated / ".gitignore").write_text("evals/local/*\n!evals/local/harold/\n")  # review 1: one level down
+    with pytest.raises(tier1.Refused, match="does not ignore"):
+        gold.field_folder(1, negated / "evals" / "local" / "harold")
+    assert gold.field_folder(1, negated / "evals" / "local" / "lee") == (negated / "evals" / "local" / "lee").resolve()
 
 
 def test_git_is_asked_about_the_tree_itself_and_any_failure_refuses(tmp_path, git_allowed, monkeypatch):
@@ -924,15 +931,16 @@ def test_git_is_asked_about_the_tree_itself_and_any_failure_refuses(tmp_path, gi
     (repo / ".gitignore").write_text("evals/local/\n")
     elsewhere = fixtures.git("init", tmp_path / "elsewhere")
     (elsewhere / ".gitignore").write_text("!evals/local/\n")
+    local = repo / "evals" / "local"
     monkeypatch.setenv("GIT_DIR", str(elsewhere / ".git"))
-    assert gold.ignores_local(repo)
+    assert gold.ignores_local(repo, local)
     monkeypatch.delenv("GIT_DIR")
 
     def timeout(*args, **kwargs):
         raise gold.subprocess.TimeoutExpired("git", 30)
     with monkeypatch.context() as patch:
         patch.setattr(gold.subprocess, "run", timeout)
-        assert not gold.ignores_local(repo)
+        assert not gold.ignores_local(repo, local)
     with monkeypatch.context() as patch:
         patch.setattr(gold.shutil, "which", lambda name: None)
         with pytest.raises(tier1.Refused, match="does not ignore"):
@@ -947,12 +955,12 @@ def test_from_a_worktree_the_main_checkout_is_refused_too(git_allowed):
     main = gitdir.parents[2]
     with pytest.raises(tier1.Refused, match="inside the repository"):
         gold.field_folder(1, main / "evals" / "field1-private")
-    if gold.ignores_local(main):  # once the main checkout's .gitignore carries evals/local/
+    if gold.ignores_local(main, main / "evals" / "local" / "x"):  # once the main checkout's .gitignore carries evals/local/
         assert gold.field_folder(1, main / "evals" / "local" / "x") == (main / "evals" / "local" / "x").resolve()
     else:
         with pytest.raises(tier1.Refused, match="does not ignore"):
             gold.field_folder(1, main / "evals" / "local" / "x")
-    assert gold.ignores_local(ROOT)  # this branch's .gitignore does
+    assert gold.ignores_local(ROOT, ROOT / "evals" / "local")  # this branch's .gitignore does
 
 
 def test_apply_and_agreement_check_the_drafts_before_any_labels(tmp_path):

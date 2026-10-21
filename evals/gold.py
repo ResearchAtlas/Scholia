@@ -115,22 +115,25 @@ def private_path(field, path):
         if not path.is_relative_to(top / "evals" / "local"):
             raise Refused(f"{path} is inside the repository (the git work tree {top}): field 1's files stay outside "
                           "it or under its evals/local/")
-        if not ignores_local(top):
+        if not ignores_local(top, path):
             raise Refused(f"{path} is under evals/local/ of the git work tree {top}, where git does not ignore "
                           "evals/local/ (or could not say): field 1's files stay outside it")
     return path
 
 
-def ignores_local(top):
-    """Whether git ignores the work tree's evals/local/ as git itself decides (git check-ignore: a later
-    !evals/local/, another ignore file, a file tracked there all count as git counts them). Asked of the tree
-    at top, never of a repository the caller's GIT_* settings name; any error (no git, not a repository, a
+def ignores_local(top, path):
+    """Whether git ignores path (under the work tree top's evals/local/) as git itself decides (git
+    check-ignore: a later !evals/local/ or !evals/local/harold/, another ignore file, a file tracked there all
+    count as git counts them). A folder (path, existing or not, unless it is a file) is asked as one, so all
+    that is written below it is ignored with it: git never looks inside an ignored folder. Asked of the tree at
+    top, never of a repository the caller's GIT_* settings name; any error (no git, not a repository, a
     timeout) is a no."""
     git = shutil.which("git")
     if git is None:
         return False
+    asked = path.relative_to(top).as_posix() + ("" if path.is_file() else "/")
     try:
-        done = subprocess.run([git, "-C", str(top), "check-ignore", "-q", "evals/local/"], capture_output=True,
+        done = subprocess.run([git, "-C", str(top), "check-ignore", "-q", "--", asked], capture_output=True,
                               timeout=30, env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
     except (OSError, subprocess.SubprocessError):
         return False
@@ -596,7 +599,8 @@ def check_labels(doc, set_doc, papers, rater=None, sample=None):
     only; each label that applies to its item as it now is (applies) has the right fields and types (a
     question's edit holds the whole question, its locators checked as a draft's); and the set as the labels
     leave it (effective_items) passes every rule the drafts pass, set-wide ones (repeated ids or text)
-    included. Labels that do not apply are history and are not checked. The page's saves, `check`, `apply` and `agreement` all use this one check."""
+    included. Labels that do not apply are history and are not checked. The page's saves, `check`, `apply`
+    and `agreement` all use this one check."""
     problems = _keys("labels", doc, ("set", "kind", "field", "rater", "set_sha256", "labels"), ("sample",))
     if problems:
         return problems
