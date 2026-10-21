@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 from pathlib import Path
 
@@ -20,7 +19,6 @@ import pytest
 import gold_fixtures as fixtures
 import synthetic_materials as synthetic
 from evals import gold, tier1
-from network_guard import allow_subprocess
 from scholia_app import started
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -470,13 +468,12 @@ def test_field_one_takes_the_same_format_without_licenses_and_with_chinese_docum
     assert stat.S_IMODE(gold.outputs(folder).stat().st_mode) == 0o700
 
 
-@pytest.mark.parametrize("where", ["evals/gold/field1", "tests/field1", "."])
-def test_field_one_refuses_a_folder_inside_the_repository_but_evals_local(where, git_allowed):
+@pytest.mark.parametrize("where", ["evals/gold/field1", "tests/field1", ".", "evals/local/harold"])
+def test_field_one_refuses_any_folder_inside_the_repository_evals_local_included(where):
     with pytest.raises(tier1.Refused, match="inside the repository"):
         gold.field_folder(1, ROOT / where)
     with pytest.raises(tier1.Refused, match="--folder"):
         gold.field_folder(1, None)
-    assert gold.field_folder(1, ROOT / "evals" / "local" / "harold") == ROOT / "evals" / "local" / "harold"
     with pytest.raises(SystemExit, match="inside the repository"):
         gold.main(["check", "--field", "1", "--folder", str(ROOT / where)])
     with pytest.raises(SystemExit, match="inside the repository"):
@@ -905,118 +902,35 @@ async def test_the_check_resolves_evidence_a_rater_chose_as_it_resolves_drafted_
                                   "of 2601.00011v1"]
 
 
-@pytest.fixture
-def git_allowed(tmp_path, monkeypatch):
-    """gold.ignores_local asks git (check-ignore), which makes no connection: allowed past the network block.
-    HOME is a new folder, so no global ignore file of this machine answers for the tests' repositories."""
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    with allow_subprocess(shutil.which("git")):
-        yield
-
-
-def test_field_one_is_refused_inside_any_git_work_tree_but_its_ignored_evals_local(tmp_path, git_allowed):
-    repo, worktree, plain, bare = tmp_path / "repo", tmp_path / "wt", tmp_path / "plain", tmp_path / "bare"
+def test_field_one_is_refused_inside_any_git_work_tree_ignored_there_or_not(tmp_path):
+    """Harold, 2026-10-21: field 1 lives outside every git work tree. A folder git ignores (evals/local/, the
+    S1-36 option this replaces) is refused like any other; no git is asked."""
+    repo, worktree, plain = tmp_path / "repo", tmp_path / "wt", tmp_path / "plain"
     fixtures.git("init", repo)
-    (repo / ".gitignore").write_text("# local\nevals/local/\n")
-    other = fixtures.git("init", tmp_path / "other")
+    (repo / ".gitignore").write_text("evals/local/\n")
     worktree.mkdir()
-    (worktree / ".git").write_text(f"gitdir: {other / '.git'}\n")  # a worktree's .git is a file
-    (worktree / ".gitignore").write_text("evals/local/\n")
-    fixtures.git("init", bare)  # a repository whose .gitignore does not ignore evals/local/
+    (worktree / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")  # a worktree's .git is a file
     nested = repo / "vendor" / "other"
-    fixtures.git("init", nested)  # a nested repository: its own rules decide
-    negated = fixtures.git("init", tmp_path / "negated")  # G13: a later line takes evals/local/ back
-    (negated / ".gitignore").write_text("evals/local/\n!evals/local/\n")
-    fake = tmp_path / "fake"
-    (fake / ".git").mkdir(parents=True)  # not a repository git can read: git fails, so refused
+    fixtures.git("init", nested)
     (plain / "x").mkdir(parents=True)
     (plain / "link").symlink_to(repo / "notes")  # a link into a work tree is checked where it leads
-    for inside in (repo / "evals" / "field1-private", repo / "notes" / "new", worktree / "evals" / "f1", repo,
-                   bare / "evals" / "local" / "x", nested / "evals" / "local" / "x", plain / "link" / "f1",
-                   negated / "evals" / "local" / "x", fake / "evals" / "local" / "x"):
-        with pytest.raises(tier1.Refused, match="inside the repository|does not ignore"):
+    for inside in (repo / "evals" / "local" / "harold", repo / "evals" / "local", repo / "notes" / "new", repo,
+                   worktree / "evals" / "local", nested / "evals" / "local" / "x", plain / "link" / "f1"):
+        with pytest.raises(tier1.Refused, match="inside the repository"):
             gold.field_folder(1, inside)
-    assert gold.field_folder(1, repo / "evals" / "local" / "harold") == (repo / "evals" / "local" / "harold").resolve()
-    assert gold.field_folder(1, worktree / "evals" / "local") == (worktree / "evals" / "local").resolve()
     assert gold.field_folder(1, plain / "x") == (plain / "x").resolve()
-    (bare / ".git" / "info" / "exclude").write_text("/evals/local/\n")  # git's own exclude file counts as git counts it
-    assert gold.field_folder(1, bare / "evals" / "local" / "x") == (bare / "evals" / "local" / "x").resolve()
-    (negated / ".gitignore").write_text("evals/local/*\n!evals/local/harold/\n")  # review 1: one level down
-    with pytest.raises(tier1.Refused, match="does not ignore"):
-        gold.field_folder(1, negated / "evals" / "local" / "harold")
-    assert gold.field_folder(1, negated / "evals" / "local" / "lee") == (negated / "evals" / "local" / "lee").resolve()
+    assert gold.field_folder(2, repo / "evals" / "local" / "x") == (repo / "evals" / "local" / "x").resolve()  # field 2 is public
 
 
-def test_git_is_asked_about_the_tree_itself_and_any_failure_refuses(tmp_path, git_allowed, monkeypatch):
-    """G13: the caller's GIT_DIR never answers for another tree; no git, or git timing out, is a refusal."""
-    repo = fixtures.git("init", tmp_path / "repo")
-    (repo / ".gitignore").write_text("evals/local/\n")
-    elsewhere = fixtures.git("init", tmp_path / "elsewhere")
-    (elsewhere / ".gitignore").write_text("!evals/local/\n")
-    local = repo / "evals" / "local"
-    monkeypatch.setenv("GIT_DIR", str(elsewhere / ".git"))
-    assert gold.ignores_local(repo, local)
-    monkeypatch.delenv("GIT_DIR")
-
-    def timeout(*args, **kwargs):
-        raise gold.subprocess.TimeoutExpired("git", 30)
-    with monkeypatch.context() as patch:
-        patch.setattr(gold.subprocess, "run", timeout)
-        assert not gold.ignores_local(repo, local)
-    with monkeypatch.context() as patch:
-        patch.setattr(gold.shutil, "which", lambda name: None)
-        with pytest.raises(tier1.Refused, match="does not ignore"):
-            gold.field_folder(1, repo / "evals" / "local" / "x")
-
-
-def test_each_file_written_under_field_ones_folder_in_a_work_tree_is_one_git_ignores(tmp_path, git_allowed):
-    """sol review 1 (P1): with harold/* then !harold/labels/, the folder passes (git ignores it as a folder) but
-    the labels file would not be ignored. Each file is asked by its own path before it is made: the page's
-    save and its lock, a written file and its part file are refused, and nothing is written there."""
-    repo = fixtures.git("init", tmp_path / "repo")
-    (repo / ".gitignore").write_text("evals/local/harold/*\n!evals/local/harold/labels/\n")
-    folder = gold.field_folder(1, repo / "evals" / "local" / "harold")  # the early, folder-level check passes
-    fixtures.write_field(folder, 1)  # its files and out/ are ignored
-    pairs = json.loads((folder / "pairs.json").read_text())
-    review = gold.Review(1, folder, "pairs", "harold")
-    for action in (review.data, lambda: review.save({"item": "p01", "base": 0, "label": {"category": "supported"}}),
-                   lambda: gold.write_json(folder, folder / "labels" / "field1-pairs.harold.json", labels_for(pairs, "harold", {}))):
-        with pytest.raises(tier1.Refused, match="where git does not ignore it"):
-            action()
-    assert fixtures.git("status", repo) == "?? .gitignore\n" and list((folder / "labels").iterdir()) == []
-    (repo / ".gitignore").write_text("evals/local/\n")  # where git ignores the whole folder, the page saves
-    assert gold.Review(1, folder, "pairs", "harold").save(
-        {"item": "p01", "base": 0, "label": {"category": "supported"}})[0] == 200
-    assert fixtures.git("status", repo) == "?? .gitignore\n"
-
-
-def test_a_deeper_rule_taking_back_one_output_file_refuses_that_write_alone(tmp_path, git_allowed):
-    repo = fixtures.git("init", tmp_path / "repo")
-    (repo / ".gitignore").write_text("evals/local/harold/*\n!evals/local/harold/out/\nevals/local/harold/out/*\n"
-                                     "!evals/local/harold/out/check.json\n")
-    folder = fixtures.write_field(gold.field_folder(1, repo / "evals" / "local" / "harold"), 1)  # out/worksheet.json: ignored
-    with pytest.raises(SystemExit, match="check.json is in the git work tree .* where git does not ignore it"):
-        gold.main(["check", "--field", "1", "--folder", str(folder)])
-    assert not (folder / "out" / "check.json").exists() and not (folder / "out" / "check.json.part").exists()
-    gold.write_json(folder, folder / "out" / "worksheet.json", {"status": "incomplete"})  # another output: ignored, written
-    assert fixtures.git("status", repo) == "?? .gitignore\n"
-
-
-def test_from_a_worktree_the_main_checkout_is_refused_too(git_allowed):
+def test_from_a_worktree_the_main_checkout_is_refused_too():
     git = ROOT / ".git"
     if not git.is_file():
         pytest.skip("this checkout is not a git worktree")
     gitdir = Path(git.read_text().split(":", 1)[1].strip())  # <main>/.git/worktrees/<name>
     main = gitdir.parents[2]
-    with pytest.raises(tier1.Refused, match="inside the repository"):
-        gold.field_folder(1, main / "evals" / "field1-private")
-    if gold.ignores_local(main, main / "evals" / "local" / "x"):  # once the main checkout's .gitignore carries evals/local/
-        assert gold.field_folder(1, main / "evals" / "local" / "x") == (main / "evals" / "local" / "x").resolve()
-    else:
-        with pytest.raises(tier1.Refused, match="does not ignore"):
-            gold.field_folder(1, main / "evals" / "local" / "x")
-    assert gold.ignores_local(ROOT, ROOT / "evals" / "local")  # this branch's .gitignore does
+    for inside in (main / "evals" / "field1-private", main / "evals" / "local" / "x"):
+        with pytest.raises(tier1.Refused, match="inside the repository"):
+            gold.field_folder(1, inside)
 
 
 def test_apply_and_agreement_check_the_drafts_before_any_labels(tmp_path):
