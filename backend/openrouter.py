@@ -20,6 +20,7 @@ prompt, an answer, a key, a URL or a provider's error body.
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -248,13 +249,14 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
 
 async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, timeout: float = 120.0,
                       effort: str | None = None, zdr_enabled: bool = False, max_tokens: int | None = None,
-                      model_entry=None, capability_records=None, on_dispatch=None) -> ModelResult:
+                      model_entry=None, capability_records=None, on_dispatch=None, on_body=None) -> ModelResult:
     """One chat completion. Never raises for a provider failure: the result carries
     the failure kind and every attempt. Cancellation propagates (the caller settles
     what the attempt in flight cost). The client must be the outbound gate's: its
     notice that a request went out is the only evidence that an attempt may be
     billed. on_dispatch, if given, is called with that notice, so a caller cancelled
-    before it knows nothing left.
+    before it knows nothing left. on_body, if given, is awaited with each attempt's exact request bytes
+    before they are sent (S1-19: the trace keeps them even for a call stopped in flight).
     """
     sent = []  # the gate's notices that the current attempt's request went out, with the terms it applied
 
@@ -274,6 +276,12 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
     deadline = time.monotonic() + timeout
     attempts = []
     while True:
+        # Encoded here, as httpx would encode json=, so the trace keeps the exact bytes that went out (S1-19).
+        sending = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if on_body is not None:
+            keeping = time.monotonic()
+            await on_body(sending)
+            deadline += time.monotonic() - keeping  # keeping the body does not spend the call's bound
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return _failed("timeout", attempts, route)
@@ -281,7 +289,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         sent.clear()
         try:
             response = await asyncio.wait_for(
-                client.post(route.provider.chat_url, headers=headers, json=payload, extensions=extensions,
+                client.post(route.provider.chat_url, headers=headers, content=sending, extensions=extensions,
                             timeout=httpx.Timeout(remaining, connect=connect_timeout_for(remaining))),
                 timeout=remaining,
             )

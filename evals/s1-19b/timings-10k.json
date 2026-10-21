@@ -1,0 +1,287 @@
+{
+  "workload": {
+    "name": "S1-17 search timings on QASPER v0.3",
+    "corpus": "QASPER v0.3 (Dasigi et al., 2021), AllenAI, CC BY 4.0: qasper-train-dev-v0.3.tgz SHA-256 a28fdf966db827bcee3d873107d6b6669864fb7ca8fbf73a192f5e39191bdb5a and qasper-test-and-evaluator-v0.3.tgz SHA-256 72a52a41193e2838b8074f80ac074b94f956b84886c36a61c58a7df4171bdd72, from https://qasper-dataset.s3.us-west-2.amazonaws.com/ (the URLs AllenAI's dataset script names)",
+    "cut": "one Markdown file per paper (title, abstract, sections with their paragraphs, figure and table captions), read by the app into passages by section 7.1: one paragraph, up to 2,000 characters, split at a sentence; indexed with the title and section path",
+    "sizes": {
+      "10k": "papers in order of their ids until about 10,000 passages",
+      "100k": "all 1,585 papers (about 85,000 passages: all QASPER has)"
+    },
+    "queries": "the first 200 of QASPER's questions on the papers indexed (by paper id, then question order), English; 20 Chinese development queries written for this run (cross-language: Chinese queries over English papers)",
+    "search": "POST /api/projects/{id}/search, limit 8 (keep), BM25 50, dense 50, RRF k 60, [retrieval] hybrid_ms as set; 10 warm-up searches first",
+    "machine": "the reference Mac: Apple M5, 24 GB, macOS 27.0.1 (ticket 70)",
+    "evidence_preparation": "S1-19: every query once, warm, after the searches: backend/pipeline.py's evidence (normalize, BM25 50 and dense 50 within hybrid_ms, RRF k 60, keep 8, the access check and the originals) and the answer step's request assembled with it (context.assemble, a 131,072-token window); without reranking, and with the pinned reranker (top 24 within rerank_ms) when --reranker is given, its first start timed apart"
+  },
+  "size": "10k",
+  "vectors": "helper",
+  "started_at": "2026-10-21T13:16:14+0800",
+  "load_average_start": [
+    4.39794921875,
+    4.7509765625,
+    3.97216796875
+  ],
+  "import_seconds": 0.61,
+  "papers": 164,
+  "build": {
+    "papers": 164,
+    "passages": 10046,
+    "embeddable": 10023,
+    "passage_chars": {
+      "n": 10046,
+      "median": 369.0,
+      "p95": 1098,
+      "min": 1,
+      "max": 1996
+    },
+    "passages_over_2000_chars": 0,
+    "read_seconds": 11.1,
+    "keyword_indexed_seconds": 11.6,
+    "embedded_seconds": 545.2,
+    "embedding_seconds": 533.6,
+    "passages_per_second": 18.78,
+    "sizes_before": {
+      "main_database_bytes": 481856,
+      "index_bytes": 160496,
+      "audit_rows": 2
+    },
+    "sizes_after": {
+      "main_database_bytes": 15898144,
+      "index_bytes": 61720384,
+      "audit_rows": 10051
+    },
+    "audit_rows_by_kind": [
+      [
+        "local_helper",
+        "allow",
+        10049
+      ]
+    ],
+    "index_queue_rows_left": 0
+  },
+  "hybrid_ms": 500,
+  "cold": [
+    {
+      "lang": "en",
+      "seconds": 0.505,
+      "mode": "keyword_only",
+      "reason": "deadline",
+      "next_seconds": 0.209,
+      "next_mode": "hybrid"
+    },
+    {
+      "lang": "en",
+      "seconds": 0.504,
+      "mode": "keyword_only",
+      "reason": "deadline",
+      "next_seconds": 0.16,
+      "next_mode": "hybrid"
+    },
+    {
+      "lang": "zh",
+      "seconds": 0.504,
+      "mode": "keyword_only",
+      "reason": "deadline",
+      "next_seconds": 0.174,
+      "next_mode": "hybrid"
+    }
+  ],
+  "helper_ready_seconds_last_start": 0.62,
+  "warm_search_seconds": {
+    "en": {
+      "n": 200,
+      "median": 0.0546,
+      "p95": 0.07,
+      "min": 0.0334,
+      "max": 0.0838
+    },
+    "zh": {
+      "n": 20,
+      "median": 0.0555,
+      "p95": 0.0787,
+      "min": 0.0413,
+      "max": 0.0807
+    }
+  },
+  "warm_search_seconds_all": {
+    "n": 220,
+    "median": 0.0548,
+    "p95": 0.0704,
+    "min": 0.0334,
+    "max": 0.0838
+  },
+  "warm_outcomes": {
+    "hybrid": 220
+  },
+  "warm_past_deadline": 0,
+  "warm_part_seconds": {
+    "keyword": {
+      "n": 220,
+      "median": 0.0065,
+      "p95": 0.0114,
+      "min": 0.0003,
+      "max": 0.0132
+    },
+    "query_embedding": {
+      "n": 220,
+      "median": 0.0405,
+      "p95": 0.0558,
+      "min": 0.0233,
+      "max": 0.0697
+    },
+    "dense_scan": {
+      "n": 220,
+      "median": 0.0154,
+      "p95": 0.021,
+      "min": 0.0121,
+      "max": 0.0287
+    },
+    "access_check_and_fetch": {
+      "n": 220,
+      "median": 0.0008,
+      "p95": 0.0011,
+      "min": 0.0005,
+      "max": 0.0082
+    }
+  },
+  "evidence_preparation": {
+    "target_seconds": 2.0,
+    "reranker_first_start_seconds": 1.270819041179493,
+    "without_reranking": {
+      "seconds": {
+        "en": {
+          "n": 200,
+          "median": 0.0594,
+          "p95": 0.0784,
+          "min": 0.0351,
+          "max": 0.1013
+        },
+        "zh": {
+          "n": 20,
+          "median": 0.0522,
+          "p95": 0.0686,
+          "min": 0.0396,
+          "max": 0.0717
+        }
+      },
+      "seconds_all": {
+        "n": 220,
+        "median": 0.058,
+        "p95": 0.0784,
+        "min": 0.0351,
+        "max": 0.1013
+      },
+      "outcomes": {
+        "hybrid": 220
+      },
+      "over_target": 0
+    },
+    "with_reranking": {
+      "seconds": {
+        "en": {
+          "n": 200,
+          "median": 1.3854,
+          "p95": 1.7109,
+          "min": 0.5748,
+          "max": 2.2641
+        },
+        "zh": {
+          "n": 20,
+          "median": 1.3202,
+          "p95": 1.5945,
+          "min": 1.225,
+          "max": 1.6276
+        }
+      },
+      "seconds_all": {
+        "n": 220,
+        "median": 1.3648,
+        "p95": 1.7103,
+        "min": 0.5748,
+        "max": 2.2641
+      },
+      "outcomes": {
+        "rerank_deadline": 220
+      },
+      "over_target": 1
+    }
+  },
+  "footprint_after_warm": {
+    "footprint_peak_bytes": 1823838744,
+    "resident_peak_bytes": 3106734080,
+    "samples": 1759,
+    "footprint_peak_by_process": {
+      "python3.13 69739": 160121888,
+      "llama-server 91407": 1044219776,
+      "llama-server 88168": 619497080
+    },
+    "pressure_level_max": 1,
+    "pressure_samples": 440,
+    "free_percent_min": 39
+  },
+  "sustained": {
+    "seconds": 60,
+    "searches": {
+      "n": 185,
+      "median": 0.07,
+      "p95": 0.1164,
+      "min": 0.0038,
+      "max": 0.1685
+    },
+    "outcomes": {
+      "hybrid": 185
+    },
+    "past_deadline": 0,
+    "rebuild_rows_seconds": 14.4,
+    "rebuild_progress_at_end": {
+      "done": 1024,
+      "total": 10023
+    },
+    "cancel_during_embeddings": {
+      "seconds": 0.024,
+      "status": "cancelled"
+    },
+    "cancel_during_rows": {
+      "seconds": 0.131,
+      "status": "cancelled"
+    }
+  },
+  "memory": {
+    "footprint_peak_bytes": 1823838744,
+    "resident_peak_bytes": 3106734080,
+    "samples": 1907,
+    "footprint_peak_by_process": {
+      "python3.13 69739": 160121888,
+      "llama-server 91407": 1044219776,
+      "llama-server 88168": 619497080
+    },
+    "pressure_level_max": 1,
+    "pressure_samples": 477,
+    "free_percent_min": 39,
+    "covers": "this backend process and its helper processes, from their launch",
+    "includes": "the QASPER files this tool read whole into the same Python process"
+  },
+  "vm_before": {
+    "Pageouts": 85127,
+    "Swapins": 956584,
+    "Swapouts": 2362620,
+    "swap_used": "total = 2048.00M  used = 1289.31M  free = 758.69M  (encrypted)"
+  },
+  "vm_after": {
+    "Pageouts": 85171,
+    "Swapins": 956592,
+    "Swapouts": 2362620,
+    "swap_used": "total = 2048.00M  used = 1289.31M  free = 758.69M  (encrypted)"
+  },
+  "helper_sockets": [
+    "127.0.0.1:63675 (LISTEN)"
+  ],
+  "not_loopback_sockets": [],
+  "load_average_end": [
+    2.65478515625,
+    3.63134765625,
+    4.00048828125
+  ],
+  "sqlite": {
+    "main": "3.53.1"
+  }
+}

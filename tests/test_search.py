@@ -47,6 +47,7 @@ class Remote:
         self.failing = False
         self.slow_queries = 0
         self.refuse, self.refused, self.counted, self.tokenizing, self.fail_on = None, [], [], None, None
+        self.rerank_scores, self.rerank_hold = None, None  # S1-19: reranking's scores, and an event it waits for
 
     def key(self, port):
         launches = self.fake.launches
@@ -69,6 +70,11 @@ class Remote:
         if request.url.path == "/tokenize":
             self.counted.append(body.get("content"))
             return httpx.Response(self.tokenizing) if self.tokenizing else tokenizer(request.url.path, body)
+        if request.url.path == "/v1/rerank":  # S1-19's rerank arm: 1 / (rank + 1) unless rerank_scores says
+            if self.rerank_hold is not None:
+                await self.rerank_hold.wait()
+            scores = self.rerank_scores or [1.0 / (i + 1) for i, _ in enumerate(body["documents"])]
+            return httpx.Response(200, json={"results": [{"index": i, "relevance_score": v} for i, v in enumerate(scores)]})
         if (refused := tokenizer(request.url.path, body, refuse=self.refuse)) is not None:
             self.refused.append(body["input"])
             return refused
@@ -274,8 +280,8 @@ async def test_a_passage_deleted_between_retrieval_and_fetch_is_dropped(tmp_path
         [hit] = [r["passage_id"] for r in (await find(client, project, "regional prices"))["results"]][:1]
         real = SearchIndex.keyword
 
-        def keyword(self, project_id, query, limit):
-            found = real(self, project_id, query, limit)
+        def keyword(self, project_id, query, limit, materials=None):
+            found = real(self, project_id, query, limit, materials)
             client.state["db"].write(lambda conn: conn.execute(  # deleted after retrieval, before the access check
                 "UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material["id"],)))
             return found

@@ -67,6 +67,7 @@ from backend.outbound_gate import OutboundDenied
 from backend.runs import (AdmissionError, RunOutcome, _event, _revoked, _running, _through, derived_status,
                           may_dispatch)
 from backend.settings import visible
+from backend.citations import QUOTE_CHARS  # S1-19b: a quote's cap
 from backend import reference_files  # S1-14: a reference file's paper is identified by its record
 
 log = logging.getLogger(__name__)
@@ -542,12 +543,17 @@ def _resolve(conn, sha256, extractor, extraction_id):
             (sha256,)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
-        found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
+        found = conn.execute("SELECT id, page, text FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
                              " ORDER BY page IS NOT ?, ordinal LIMIT 1", (extraction_id, quote, page)).fetchone()
         if found is not None:
+            # S1-19b: a support verdict was given for the passage's whole text; it stands only when the passage
+            # found is that text, which the quote shows only when it held the whole passage (shorter than its
+            # cap), else the citation is unchecked until checked again.
             conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page),"
-                         " existence = CASE existence WHEN 'not_found' THEN 'ok' ELSE existence END WHERE id = ?",
-                         (*found, citation))
+                         " existence = CASE existence WHEN 'not_found' THEN 'ok' ELSE existence END,"
+                         " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
+                         " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",
+                         (found[0], found[1], *[found[2] == quote and len(quote) < QUOTE_CHARS] * 2, citation))
 
 
 async def read_outdated(harness):

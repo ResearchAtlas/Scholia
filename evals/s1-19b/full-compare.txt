@@ -1,0 +1,49 @@
+qasper keyword_only: 1308 queries paired, rankings identical for 1308; fallbacks none
+  recall@8: difference +0.0000 [+0.0000, +0.0000] n=1308
+  ndcg@10: difference +0.0000 [+0.0000, +0.0000] n=1308
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=1308
+qasper rerank: not compared (an arm that did not run as named, or none in the baseline)
+qasper hybrid: 1308 queries paired, rankings identical for 1299; fallbacks none
+  recall@8: difference +0.0000 [+0.0000, +0.0000] n=1308
+  ndcg@10: difference +0.0000 [+0.0000, +0.0000] n=1308
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=1308
+scifact keyword_only: 300 queries paired, rankings identical for 300; fallbacks none
+  ndcg@10: difference +0.0000 [+0.0000, +0.0000] n=300
+  recall@10: difference +0.0000 [+0.0000, +0.0000] n=300
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=300
+scifact rerank: not compared (an arm that did not run as named, or none in the baseline)
+scifact hybrid: 300 queries paired, rankings identical for 298; fallbacks none
+  ndcg@10: difference +0.0000 [+0.0000, +0.0000] n=300
+  recall@10: difference +0.0000 [+0.0000, +0.0000] n=300
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=300
+nfcorpus keyword_only: 323 queries paired, rankings identical for 299; fallbacks none
+  ndcg@10: difference +0.0000 [+0.0000, +0.0000] n=323
+  recall@10: difference +0.0000 [+0.0000, +0.0000] n=323
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=323
+nfcorpus rerank: not compared (an arm that did not run as named, or none in the baseline)
+nfcorpus hybrid: 323 queries paired, rankings identical for 312; fallbacks none
+  ndcg@10: difference +0.0000 [+0.0000, +0.0000] n=323
+  recall@10: difference +0.0000 [+0.0000, +0.0000] n=323
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=323
+scidocs keyword_only: 1000 queries paired, rankings identical for 991; fallbacks none
+  ndcg@10: difference -0.0000 [-0.0000, +0.0000] n=1000
+  recall@10: difference +0.0000 [+0.0000, +0.0000] n=1000
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=1000
+scidocs rerank: not compared (an arm that did not run as named, or none in the baseline)
+scidocs hybrid: 1000 queries paired, rankings identical for 991; fallbacks none
+  ndcg@10: difference -0.0000 [-0.0000, +0.0000] n=1000
+  recall@10: difference +0.0000 [+0.0000, +0.0000] n=1000
+  mrr@10: difference +0.0000 [+0.0000, +0.0000] n=1000
+litsearch keyword_only: 597 queries paired, rankings identical for 597; fallbacks none
+  recall@5 (specific): difference +0.0000 [+0.0000, +0.0000] n=442
+  recall@20 (broad): difference +0.0000 [+0.0000, +0.0000] n=155
+  recall@20 (specific): difference +0.0000 [+0.0000, +0.0000] n=442
+  recall@5: difference +0.0000 [+0.0000, +0.0000] n=597
+  recall@20: difference +0.0000 [+0.0000, +0.0000] n=597
+litsearch rerank: not compared (an arm that did not run as named, or none in the baseline)
+litsearch hybrid: 597 queries paired, rankings identical for 584; fallbacks none
+  recall@5 (specific): difference +0.0000 [+0.0000, +0.0000] n=442
+  recall@20 (broad): difference +0.0000 [+0.0000, +0.0000] n=155
+  recall@20 (specific): difference +0.0000 [+0.0000, +0.0000] n=442
+  recall@5: difference +0.0000 [+0.0000, +0.0000] n=597
+  recall@20: difference +0.0000 [+0.0000, +0.0000] n=597

@@ -25,7 +25,8 @@ export function subscribe(listener) {
 export function apply(turn, event) {
   switch (event.type) {
     case 'run_started': return { ...turn, runId: event.run_id };
-    case 'chat_response': return { ...turn, answer: event.content, resultSaved: event.result_saved, ...(event.cut ? { cut: true } : {}) };
+    case 'chat_response': return { ...turn, answer: event.content, resultSaved: event.result_saved, ...(event.cut ? { cut: true } : {}),
+      ...(event.notices ? { notices: event.notices } : {}) }; // S1-19b: keyword-only, unchecked, no skills, retracted
     case 'error': return { ...turn, error: event.code };
     case 'limit_reached': return { ...turn, limit: true };
     case 'run_finished': return { ...turn, done: true };
@@ -80,3 +81,8 @@ export function clear(conversationId) {
 export function useLiveTurn(conversationId) {
   return useSyncExternalStore(subscribe, () => (conversationId ? turns.get(conversationId) ?? null : null));
 }
+
+// S1-19b: an answer's notices (backend/runs.py), as catalog keys: what the answer could not do, in words.
+export const NOTICES = { index_unavailable: 'turn.notice.indexUnavailable',
+  unchecked_budget: 'turn.notice.uncheckedBudget', keyword_only: 'turn.notice.keywordOnly', unchecked: 'turn.notice.unchecked',
+  skills_unavailable: 'turn.notice.noSkills', retracted: 'turn.notice.retracted' };

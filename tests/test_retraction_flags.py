@@ -93,3 +93,38 @@ async def test_a_reference_files_record_whose_doi_is_retracted_is_flagged(tmp_pa
         flagged = found["A Retracted Reference"]
         assert (flagged["retraction"], bool(flagged["retraction_checked_at"])) == ("retracted", True)
         assert found["Standing"]["retraction"] == "unknown"  # no identifier: never looked up
+
+
+# S1-19: a cited paper recorded as retracted is flagged in the answer and its chip (C10)
+
+async def test_a_cited_paper_recorded_as_retracted_is_flagged_in_the_evidence_the_answer_and_its_chip(tmp_path):
+    from cited import cited, conversation_in, with_papers
+    from scholia_app import send
+    from test_search import WAGES
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE materials SET retraction = 'retracted' WHERE id = ?", (material,)))
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "What do minimum wages do to earnings?")
+        [body] = client.provider.answers
+        assert "[S1.1] Wage Floors (" in body["messages"][0]["content"]
+        assert "RETRACTED)" in body["messages"][0]["content"].split("[S1.1] Wage Floors (")[1].split("\n")[0]
+        [response] = [e for e in stream if e["type"] == "chat_response"]
+        assert "retracted" in response["notices"]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert "retracted" in turn["answer"]["notices"] and [c["retracted"] for c in turn["citations"]] == [True]
+
+
+async def test_a_paper_that_is_not_retracted_carries_no_flag(tmp_path):
+    from cited import cited, conversation_in, with_papers
+    from scholia_app import send
+    from test_search import WAGES
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "What do minimum wages do to earnings?")
+        [body] = client.provider.answers
+        assert "RETRACTED" not in body["messages"][0]["content"].split("## RESEARCH EVIDENCE")[1]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert "retracted" not in turn["answer"].get("notices", []) and [c["retracted"] for c in turn["citations"]] == [False]

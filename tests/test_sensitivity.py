@@ -925,3 +925,37 @@ async def test_a_change_between_building_the_request_and_its_dispatch_sends_noth
                           else [("cancelled", "revoked")])
         assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'"
                                   " OR settled_usd IS NOT NULL") == [(0,)]
+
+
+@pytest.mark.parametrize("change", ["private", "local_only", "locked"])
+async def test_a_tightening_between_retrieval_and_the_answer_sends_nothing_and_continue_builds_under_it(
+        tmp_path, monkeypatch, change):
+    # L4 (S1-19b): the project tightens after its evidence is retrieved and before the answer's call.
+    from backend import pipeline
+    from cited import cited, conversation_in, with_papers
+    from test_search import WAGES
+    real = pipeline.evidence
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+
+        async def then_tighten(*args, **kwargs):
+            found = await real(*args, **kwargs)
+            if change == "locked":
+                response = await client.post(f"/api/projects/{project}/review-lock", json={"locked": True, "venue": "J"})
+            else:
+                response = await set_level(client, project, change)
+            assert response.status_code == 200, response.text
+            return found
+        monkeypatch.setattr(pipeline, "evidence", then_tighten)
+        stream = await send(client, conversation, "What do minimum wages do to earnings?")
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+        assert client.provider.answers == [] and client.provider.judged == []
+        assert await rows(client, "SELECT count(*) FROM citations") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'"
+                                  " OR settled_usd IS NOT NULL") == [(0,)]
+        monkeypatch.setattr(pipeline, "evidence", real)
+        again = await client.post(f"/api/runs/{stream[0]['run_id']}/continue", json={})
+        code = {"private": "private_route_not_allowed", "local_only": "route_not_allowed", "locked": "review_locked"}
+        assert (again.status_code, again.json()["code"]) == (403, code[change])  # under the current policy
+        assert client.provider.answers == []

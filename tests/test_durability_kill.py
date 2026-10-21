@@ -10,6 +10,7 @@ with no attempt left marked interrupted.
 """
 
 import asyncio
+import json
 import signal
 import subprocess
 import sys
@@ -25,10 +26,11 @@ pytestmark = pytest.mark.asyncio
 ROOT = Path(__file__).resolve().parents[1]
 
 CHILD = r"""
-import asyncio, json, os, signal, sys, time
+import asyncio, base64, json, os, signal, sys, time
 import httpx
 from backend import runs
 from backend.app import create_app
+from backend.citations import JUDGE_RULES
 
 data, scenario = sys.argv[1], sys.argv[2]
 ORIGIN = "http://127.0.0.1:8765"
@@ -79,13 +81,16 @@ async def answer(request):
         return found
     body = json.loads(request.content)
     title = body["messages"][0]["content"].startswith("Write a title")
-    if (scenario == "turn_model" and not title) or (scenario in ("title_model", "restart_title_model") and title):
+    judge = body["messages"][0]["content"].startswith(JUDGE_RULES)
+    if (scenario == "turn_model" and not title) or (scenario in ("title_model", "restart_title_model") and title) \
+            or (scenario == "cited_judge" and judge):
         crash()
-    text, cost = ("Crash test title", 0.0003) if title else ("An answer.", 0.002)
+    text, cost = ("Crash test title", 0.0003) if title else ("1: supported", 0.001) if judge else (
+        "Minimum wages raise earnings [S1.1]." if scenario.startswith("cited") else "An answer.", 0.002)
     return httpx.Response(200, json={"choices": [{"message": {"content": text}}], "usage": {"cost": cost}})
 
 
-if scenario == "turn_after_step":  # the step and its cost are recorded; the primary commit never runs
+if scenario in ("turn_after_step", "cited_after_judge"):  # the steps and costs are recorded; no primary commit
     runs.Harness._commit_answer = crash
 elif scenario in ("title_after_step", "restart_finish"):  # inside the finishing transaction, before COMMIT
     runs.Harness._finish_background = crash
@@ -94,6 +99,13 @@ elif scenario == "title_after_finish":  # after the finishing transaction commit
     def release_then_crash(self, active):
         release(self, active)
         if active.kind == "background":
+            crash()
+    runs.Registry.release = release_then_crash
+elif scenario == "cited_after_commit":  # after the turn's primary commit, before anything else
+    release = runs.Registry.release
+    def release_then_crash(self, active):
+        release(self, active)
+        if active.kind == "turn":
             crash()
     runs.Registry.release = release_then_crash
 
@@ -109,7 +121,22 @@ async def main():
                 async def after_commit(self):
                     crash()
                 runs.Harness.kick_background = after_commit  # after startup, which also starts background runs
-            if not scenario.startswith("restart"):
+            if scenario.startswith("cited"):  # S1-19b: a turn whose answer cites a paper and is judged
+                await client.post("/api/setup", json={"openrouter_key": "sk-or-test-not-a-real-key"})
+                project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+                paper = b"# Wage Floors\n\n## Findings\n\nMinimum wages raise the earnings of low-paid workers.\n"
+                await client.post(f"/api/projects/{project}/materials", json={"files": [
+                    {"name": "wages.md", "data": base64.b64encode(paper).decode()}]})
+                for _ in range(500):  # until it is read and indexed (keyword search: no helper here)
+                    runs_now = (await client.get("/api/activity")).json()["runs"]
+                    status = (await client.get(f"/api/projects/{project}/index")).json()
+                    if status["passages"]["indexed"] and not any(r["status"] == "running" for r in runs_now):
+                        break
+                    await asyncio.sleep(0.02)
+                conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
+                await client.post(f"/api/conversations/{conversation}/message/stream",
+                                  json={"content": "What do minimum wages do to earnings?"})
+            elif not scenario.startswith("restart"):
                 await client.post("/api/setup", json={"openrouter_key": "sk-or-test-not-a-real-key"})
                 conversation = (await client.post("/api/conversations", json={})).json()["id"]
                 await client.post(f"/api/conversations/{conversation}/message/stream",
@@ -163,7 +190,14 @@ async def test_killed_during_the_answer_call(tmp_path):
         assert turn == [("interrupted", 0)] and title == []
         [(status, settled, basis)] = spending
         assert (status, basis) == ("settled", "estimated") and settled > 0
-        assert attempts == 0  # the attempt in flight left no record: its cost stays unknown
+        # The attempt in flight is recorded at recovery from the body kept before it was sent (S1-19b), with
+        # its charge unknown: its cost stays its estimate.
+        assert attempts == 1
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'model_attempt'")
+        attempt = json.loads(data)
+        assert (attempt["outcome"], attempt["charge"], len(attempt["body"])) == ("interrupted", "unknown", 64)
+        [(kept,)] = await rows(client, "SELECT count(*) FROM run_bodies")
+        assert kept == 1  # its exact text, in the trace
         assert provider.chats == []
         [(conversation_id,)] = await rows(client, "SELECT id FROM conversations")
         assert (await send(client, conversation_id, "again"))[-1]["status"] == "succeeded"
@@ -203,9 +237,13 @@ async def test_killed_during_the_title_call_restarts_it_once(tmp_path):
         turn, title, conversation, spending, attempts = await state(client)
         assert turn == [("succeeded", 1)] and title == [("succeeded", 2)]
         assert len(provider.titles) == 1 and conversation == [("Recovered title", 1)]
-        # The first title attempt was in flight: its reservation settled at the estimate, no attempt record.
+        # The first title attempt was in flight: its reservation settled at the estimate, and recovery records
+        # it as interrupted from the body kept before it was sent (S1-19b).
         assert sorted(basis for _, _, basis in spending) == ["estimated", "reported", "reported"]
-        assert attempts == 2  # the answer's and the second title attempt's
+        assert attempts == 3  # the answer's, the interrupted first title attempt's and the second's
+        outcomes = sorted(json.loads(d)["outcome"] for (d,) in await rows(
+            client, "SELECT data FROM run_events WHERE type = 'model_attempt'"))
+        assert outcomes.count("interrupted") == 1
 
 
 async def test_killed_after_the_title_step_is_recorded_finishes_from_the_record(tmp_path):
@@ -255,3 +293,51 @@ async def test_killed_during_the_second_title_call_is_interrupted(tmp_path):
         assert provider.chats == [] and title == [("interrupted", 2)]
         assert conversation == [(None, 0)]
         assert sorted(basis for _, _, basis in spending) == ["estimated", "estimated", "reported"]
+
+
+# S1-19b: the support judge runs before the primary commit (L2, L6)
+
+async def cited_state(client):
+    turn = await rows(client, "SELECT r.status, t.answer IS NOT NULL FROM runs r JOIN turns t ON t.run_id = r.id")
+    citations = await rows(client, "SELECT existence, support FROM citations")
+    spending = sorted(await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations"
+                                         " WHERE run_id IN (SELECT run_id FROM turns) AND status != 'released'"))
+    # The judge's share held with the answer is released, not charged, after a crash (runs._release_allowances).
+    assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(0,)]
+    return turn, citations, spending
+
+
+async def test_killed_during_the_judge_call_leaves_no_answer_and_counts_the_answer_once(tmp_path):
+    data = tmp_path / "data"
+    run_child(data, "cited_judge")
+    provider, app = await restart(data)
+    async with app as client:
+        turn, citations, spending = await cited_state(client)
+        assert turn == [("interrupted", 0)] and citations == []  # nothing marked checked
+        [(answer_status, answer_cost, answer_basis), (judge_status, judge_cost, judge_basis)] = sorted(
+            spending, key=lambda r: r[2] != "reported")
+        assert (answer_status, answer_cost, answer_basis) == ("settled", 0.002, "reported")  # counted once
+        assert (judge_status, judge_basis) == ("settled", "estimated") and judge_cost > 0  # in flight: its estimate
+        assert provider.answers == [] and provider.chats == []  # recovery sends nothing
+
+
+async def test_killed_after_the_judge_and_before_the_commit_leaves_no_answer_marked_checked(tmp_path):
+    data = tmp_path / "data"
+    run_child(data, "cited_after_judge")
+    provider, app = await restart(data)
+    async with app as client:
+        turn, citations, spending = await cited_state(client)
+        assert turn == [("interrupted", 0)] and citations == []
+        assert sorted(spending) == [("settled", 0.001, "reported"), ("settled", 0.002, "reported")]
+        assert provider.chats == []
+
+
+async def test_killed_after_the_primary_commit_keeps_its_citations_once(tmp_path):
+    data = tmp_path / "data"
+    run_child(data, "cited_after_commit")
+    provider, app = await restart(data)
+    async with app as client:
+        await background_idle(client)
+        turn, citations, _ = await cited_state(client)
+        assert turn == [("succeeded", 1)] and citations == [("ok", "supported")]
+        assert provider.answers == []

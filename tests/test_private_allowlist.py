@@ -467,3 +467,44 @@ async def test_a_private_turn_is_bounded_by_a_zero_retention_variant_its_routing
                                            " ON r.id = b.run_id WHERE r.kind = 'turn'")
         assert estimate >= 1024 * 0.00003 > 0  # the variant's price, never $0
         await background_idle(client)
+
+
+async def test_a_private_turns_router_answer_and_judge_all_carry_the_private_controls(tmp_path):
+    # I10 (S1-19b): every call of a cited turn, the small router and the support judge included.
+    from cited import Provider, cited, conversation_in, is_judge, is_router, with_papers
+    from test_search import WAGES
+    provider = Provider(catalog=[ZDR_MODEL, PLAIN_MODEL], zero_retention=[ZDR_MODEL])
+    async with cited(tmp_path, provider) as client:
+        await save(client, {"providers.openrouter.models": "all", "models.router": ZDR_MODEL})
+        project, _ = await with_papers(client, WAGES)
+        response = await client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"})
+        assert response.status_code == 200, response.text
+        assert (await confirm_key(client)).status_code == 200
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "What does the panel show about earnings?", model=ZDR_MODEL)
+        assert stream[-1]["status"] == "succeeded"
+        roles = [("router" if is_router(b) else "judge" if is_judge(b) else "answer") for b in provider.chats
+                 if not b["messages"][0]["content"].startswith("Write a title")]
+        assert roles == ["router", "answer", "judge"]
+        for body, headers in zip(provider.chats, provider.chat_headers):
+            assert body["provider"]["zdr"] is True and body["provider"]["only"] == ["example"]
+            assert headers.get_list("x-openrouter-cache") == ["false"]
+            assert not {"plugins", "tools", "web_search_options"} & body.keys()
+
+
+async def test_a_private_turns_judge_set_to_a_model_the_project_does_not_allow_judges_nothing_and_says_so(tmp_path):
+    # Ticket 71: only an unset judge inherits the turn's route; one that is set but that the project's level
+    # does not allow judges nothing, no other model in its place, and the citations stay unchecked, said.
+    from cited import Provider, cited, conversation_in, with_papers
+    from test_search import WAGES
+    provider = Provider(catalog=[ZDR_MODEL, PLAIN_MODEL], zero_retention=[ZDR_MODEL])
+    async with cited(tmp_path, provider) as client:
+        await save(client, {"providers.openrouter.models": "all", "models.judge": PLAIN_MODEL})
+        project, _ = await with_papers(client, WAGES)
+        assert (await client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"})).status_code == 200
+        assert (await confirm_key(client)).status_code == 200
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "What do minimum wages do to earnings?", model=ZDR_MODEL)
+        assert provider.judged == [] and PLAIN_MODEL not in [b["model"] for b in provider.chats]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert "unchecked" in turn["answer"]["notices"] and all(c["support"] == "unchecked" for c in turn["citations"])

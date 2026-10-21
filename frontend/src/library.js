@@ -115,6 +115,57 @@ async function upload(projectId, files, { conversationId, materialId, replaces }
 export const libraryEvents = new EventTarget();
 export const libraryChanged = (projectId) => libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
 
+// S1-19b (Harold, 2026-10-21: no client-held derived state): which reads of a view may be shown after library
+// changes. libraryChanged() starts a new generation at once, in the change's own handler; ask() is called as a
+// read is asked and gives settle(ok), called when it ends, which says whether to show it: never for a read asked
+// before a later change. Only a read asked after the change ends it (changed()).
+export function readGuard() {
+  let generation = 0;
+  let changed = false;
+  return {
+    changed: () => changed,
+    libraryChanged() { generation += 1; changed = true; },
+    ask() {
+      const asked = generation;
+      return (ok) => {
+        if (asked !== generation) return false;
+        if (ok) changed = false;
+        return true;
+      };
+    },
+  };
+}
+
+// S1-19b: papers chosen for the next message (selected in the Library, or @-mentioned in the message
+// box), whose ids it sends: its answer reads only them. One project's at a time; cleared once sent.
+let chosen = { projectId: null, papers: [] };
+export const chosenPapers = (projectId) => (chosen.projectId === projectId ? chosen.papers : NONE);
+const NONE = [];
+export function choosePapers(projectId, papers) {
+  const seen = new Set();
+  chosen = { projectId, papers: papers.filter((paper) => !seen.has(paper.id) && seen.add(paper.id)).slice(0, MAX_CHOSEN) };
+  libraryEvents.dispatchEvent(new Event('chosen'));
+}
+export function watchChosen(listener) {
+  libraryEvents.addEventListener('chosen', listener);
+  return () => libraryEvents.removeEventListener('chosen', listener);
+}
+export const MAX_CHOSEN = 50; // as the backend takes them (backend/app.py Message.material_ids)
+
+// S1-19b: a cited paper opened at its passage, from an answer's chip: the Library shows it when it is
+// next drawn for its project, or at once when it is open.
+let opening = null;
+export function openPaperAt(projectId, materialId, target) {
+  opening = { projectId, id: materialId, target };
+  libraryEvents.dispatchEvent(new Event('open'));
+}
+export function takeOpening(projectId) {
+  if (opening?.projectId !== projectId) return null;
+  const found = opening;
+  opening = null;
+  return { id: found.id, target: found.target };
+}
+
 // A file's type as a catalog key.
 const TYPES = { 'application/pdf': 'pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
   'text/html': 'html', 'text/markdown': 'markdown', 'application/x-tex': 'latex' };

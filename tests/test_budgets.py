@@ -328,7 +328,7 @@ async def test_a_request_too_costly_for_the_budget_stops_at_the_limit_before_any
         await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
                                                 "updates": {"project.budget_usd": 0.03}})
         stream = await send(client, conversation, "Short?")
-        assert [e["type"] for e in stream] == ["run_started", "limit_reached", "run_finished"]
+        assert [e["type"] for e in stream] == ["run_started", "route", "limit_reached", "run_finished"]
         assert provider.chats == []
         assert await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
             "SELECT count(*) FROM budget_reservations").fetchone()) == (0,)

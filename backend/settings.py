@@ -101,7 +101,7 @@ _RETRIEVAL = {
     "rerank_top": (24, _int(1)),
     "keep": (8, _int(1)),
     "embedding_batch": (32, _int(1)),
-    "judge_pairs": (40, _int(1)),
+    "judge_pairs": (40, _int(1, 9999)),  # a judge request numbers its pairs and passages in four digits
     "rules_ms": (100, _int(1)),
     "router_ms": (2000, _int(1)),
     "memory_ms": (200, _int(1)),

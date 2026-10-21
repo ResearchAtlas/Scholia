@@ -4,7 +4,8 @@ rule), for S1-17.
     sandbox-exec -f tests/loopback-only.sb uv run --no-sync python -I tools/search_timings.py \\
         --helper <app>/Contents/MacOS/llama-server --model <Qwen3-Embedding-0.6B-Q8_0.gguf> \\
         [--corpus qasper --qasper <folder holding qasper-{train,dev,test}-v0.3.json> | --corpus synthetic] \\
-        --size 10k|100k [--vectors helper|synthetic] [--sustained SECONDS] [--desktop] [--out FILE]
+        --size 10k|100k [--vectors helper|synthetic] [--sustained SECONDS] [--desktop] \\
+        [--reranker <qwen3-reranker-0.6b-q8_0.gguf>] [--out FILE]
 
 The workload is named before anything runs (WORKLOAD, printed first and with the results): QASPER
 v0.3, AllenAI's public papers (CC BY 4.0), read as untrusted data from the folder given (downloaded
@@ -38,7 +39,11 @@ distribution, the audit rows indexing wrote and the main database's growth); war
 end to end through the search API (median and p95), with the keyword and dense parts timed apart; the
 first search after a cold helper (stopped, as after its idle stop or a launch); searches while a
 rebuild embeds (sustained); the share of searches past the hybrid deadline; peak memory, memory
-pressure and swap. Without --desktop, memory covers this process (the backend) and its helper
+pressure and swap. S1-19 adds ticket 70's evidence preparation: from the answer pipeline's entry to its
+assembled evidence (backend/pipeline.py's evidence, then the request the answer step sends with it), each
+query once warm, without reranking and, with --reranker, with the pinned Qwen3-Reranker-0.6B Q8_0 (its own
+helper, as S1-16's timings add it; no setting exposes it), the provisional target being a warm p95 of 2 s.
+Without --desktop, memory covers this process (the backend) and its helper
 processes only. With --desktop the whole application runs as the desktop entry runs it (S1-16's
 helper_timings.run_desktop: the backend, its window and the interface in it, on a new temporary data
 folder), the same workload is driven inside its backend, and memory covers the whole app: its
@@ -95,6 +100,11 @@ WORKLOAD = {
     "search": "POST /api/projects/{id}/search, limit 8 (keep), BM25 50, dense 50, RRF k 60, [retrieval] hybrid_ms "
               "as set; 10 warm-up searches first",
     "machine": "the reference Mac: Apple M5, 24 GB, macOS 27.0.1 (ticket 70)",
+    "evidence_preparation": "S1-19: every query once, warm, after the searches: backend/pipeline.py's evidence "
+                            "(normalize, BM25 50 and dense 50 within hybrid_ms, RRF k 60, keep 8, the access check "
+                            "and the originals) and the answer step's request assembled with it (context.assemble, "
+                            "a 131,072-token window); without reranking, and with the pinned reranker (top 24 within "
+                            "rerank_ms) when --reranker is given, its first start timed apart",
 }
 ZH_QUERIES = [
     "这篇论文用什么数据集评估模型？", "机器翻译的质量如何评估？", "模型在低资源语言上的表现如何？", "情感分析使用了哪些特征？",
@@ -116,6 +126,7 @@ SYNTHETIC = {
                "seed plus one)",
     "search": WORKLOAD["search"],
     "machine": WORKLOAD["machine"],
+    "evidence_preparation": WORKLOAD["evidence_preparation"],
 }
 
 
@@ -366,6 +377,7 @@ async def measure(args, state, client, data, processes):
         seconds, _ = await timed(read(lambda c: readings(c, project, ids, references=False)))
         parts["access_check_and_fetch"].append(seconds)
     results["warm_part_seconds"] = {name: summary(values) for name, values in parts.items()}
+    results["evidence_preparation"] = await preparation(state, project, queries, args.reranker)
     results["footprint_after_warm"] = memory.peak()
 
     # Sustained: searches back to back while a rebuild of the project embeds (helper vectors only); then
@@ -424,6 +436,41 @@ async def measure(args, state, client, data, processes):
     return results
 
 
+async def preparation(state, project, queries, reranker=None, target=2.0):
+    """S1-19's evidence preparation (ticket 70): each query once, from the pipeline's entry to the answer
+    step's assembled request, without reranking and, with reranker (the reranker's file), with it. Per
+    language and overall: the seconds (median, p95), the outcomes (mode or fallback), and how many passed
+    the provisional target."""
+    from backend import citations, context, pipeline
+    from backend.runs import SYSTEM_RULES
+    from backend.settings import load_settings
+    budgets = load_settings(state["data_dir"]).values["context"]
+    arms, out = {"without_reranking": None}, {"target_seconds": target}
+    if reranker is not None:
+        helper = state["local_helper"].add(local_helper.RERANKER_MODEL, Path(reranker))
+        out["reranker_first_start_seconds"], _ = await timed(helper.rerank("warm", ["warm"], deadline=60, project_id=project))
+        arms["with_reranking"] = lambda query, texts, deadline: helper.rerank(query, texts, deadline=deadline,
+                                                                             project_id=project)
+    for name, rerank in arms.items():
+        by_lang, outcomes = {}, {}
+        for lang, query in queries:
+            began = time.perf_counter()
+            found = await pipeline.evidence(state, project, query, rerank=rerank)
+            numbered = citations.sources(found["records"])
+            context.assemble("answer", window=131072, output=budgets["output_limit"], budgets=budgets,
+                             margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=query,
+                             sections={"research_evidence": citations.bundle(numbered),
+                                       "conflicts": citations.missing(numbered, mode=found["mode"], route="literature")})
+            by_lang.setdefault(lang, []).append(time.perf_counter() - began)
+            fallback = (found["trace"].get("rerank") or {}).get("fallback")
+            key = f"rerank_{fallback}" if fallback else found["reason"] or found["mode"]
+            outcomes[key] = outcomes.get(key, 0) + 1
+        every = [s for values in by_lang.values() for s in values]
+        out[name] = {"seconds": {lang: summary(values) for lang, values in by_lang.items()}, "seconds_all": summary(every),
+                     "outcomes": outcomes, "over_target": sum(1 for s in every if s > target)}
+    return out
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--helper", required=True)
@@ -435,8 +482,11 @@ def main(argv=None):
     parser.add_argument("--sustained", type=int, default=60)
     parser.add_argument("--papers", type=int, help="only this many papers: a quick check of the tool, not a measurement")
     parser.add_argument("--desktop", action="store_true", help="run the workload inside the desktop app")
+    parser.add_argument("--reranker", help="qwen3-reranker-0.6b-q8_0.gguf: evidence preparation with reranking too")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
+    if args.reranker and (problem := local_helper.mismatch(Path(args.reranker), local_helper.RERANKER_MODEL)):
+        parser.error(f"the reranker: {problem}")
     if args.corpus == "qasper" and not args.qasper:
         parser.error("--corpus qasper needs --qasper")
     print(json.dumps({"workload": SYNTHETIC if args.corpus == "synthetic" else WORKLOAD}, ensure_ascii=False, indent=2),

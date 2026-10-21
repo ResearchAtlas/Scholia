@@ -107,6 +107,8 @@ def populate(db, store, project, tag, paper=None):
             x["e1"], x["s1"] = conn.execute(
                 "SELECT e.id, p.id FROM extractions e JOIN passages p ON p.extraction_id = e.id WHERE e.file_sha256 = ?",
                 (paper,)).fetchone()
+        conn.execute("INSERT INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, 0, 0, ?)", (x["r1"], body))
+        conn.execute("INSERT INTO run_body_materials (sha256, material_id) VALUES (?, ?)", (body, x["m1"]))  # S1-19b
         conn.execute(
             "INSERT INTO candidates (id, run_id, project_id, source, material_id, status) VALUES (?, ?, ?, 'openalex', ?, 'added')",
             (x["k1"], x["r1"], project, x["m1"]))
@@ -375,7 +377,7 @@ def test_deleting_a_material_removes_its_versions_and_marks_citations_elsewhere(
     assert ids_in(db, "materials", [x["m1"]]) | ids_in(db, "material_versions", [x["v1"]]) == set()
     assert ids_in(db, "extractions", [x["e1"]]) | ids_in(db, "passages", [x["s1"]]) == set()
     assert one(db, "SELECT material_id, material_version_id, passage_id, existence, quote FROM citations WHERE id = ?",
-               x["ct1"]) == (None, None, None, "source_removed", "quote p")
+               x["ct1"]) == (None, None, None, "source_removed", None)  # S1-19b: no copy of the source's text
     assert one(db, "SELECT material_id, status FROM candidates WHERE id = ?", x["k1"]) == (None, "added")
     assert ids_in(db, "memory_records", [only_source]) == set()
     assert tombstones(db) == {(x["m1"], "material", "Paper p"), (only_source, "memory", None)}
