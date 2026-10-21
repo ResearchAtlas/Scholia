@@ -68,16 +68,23 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
     return () => { here.current = false; };
   }, []);
 
+  // Each library change starts a new generation: a read asked before it is dropped when it arrives, and
+  // until a read of the new one succeeds nothing read before it is shown (stale), its failure saying so.
+  const generation = useRef(0);
+  const [stale, setStale] = useState(false);
   const load = useCallback(async () => { // whether the conversation was read
     if (!id) return false;
+    const asked = generation.current;
     try {
       // The Markdown renderer loads beside the first read, so answers show formatted with their turns.
       const [read] = await Promise.all([get(`/api/conversations/${id}`), markdownReady()]);
+      if (asked !== generation.current) return false; // asked before the library changed: never shown
       setTurns(read.turns);
       setFailed(false);
+      setStale(false);
       return true;
     } catch {
-      setFailed(true);
+      if (asked === generation.current) setFailed(true);
       return false;
     } finally {
       setReads((n) => n + 1);
@@ -87,13 +94,26 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   useEffect(() => {
     load();
   }, [load]);
-  // A paper deleted changes what this conversation's citations may show: read it again, so a
-  // deleted paper's text never stays on screen (backend/provenance.py).
+  // A paper deleted changes what this conversation's citations may show (Harold, 2026-10-21: no client-held
+  // derived state): everything read before is dropped at once and read again, so a deleted paper's text never
+  // stays on screen (backend/provenance.py); a failed read is tried again after a pause.
   useEffect(() => {
-    const changed = (event) => { if (event.detail === projectId) load(); };
+    const changed = (event) => {
+      if (event.detail !== projectId) return;
+      generation.current += 1;
+      setTurns(null);
+      setStale(true);
+      setFailed(false);
+      load();
+    };
     libraryEvents.addEventListener('changed', changed);
     return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
+  useEffect(() => {
+    if (!(stale && failed)) return undefined;
+    const timer = setTimeout(load, POLL_MS);
+    return () => clearTimeout(timer);
+  }, [stale, failed, reads, load]);
 
   // A finished live turn hands over to its saved record once that is read, and a saved turn
   // that still reads running (its stream ended early, or it is stopping) is read again until
@@ -205,8 +225,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
 
       <div className="scroll-thin min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-3xl px-5 py-6">
-          {failed && <p role="alert" className="text-sm text-destructive">{t('conversation.loadFailed')}</p>}
-          {turns === null && !failed && <p className="text-sm text-muted-foreground" role="status">{t('common.loading')}</p>}
+          {failed && <p role="alert" className="text-sm text-destructive">{t(stale ? 'conversation.reloadFailed' : 'conversation.loadFailed')}</p>}
+          {turns === null && !failed && <p className="text-sm text-muted-foreground" role="status">{t(stale ? 'conversation.reloading' : 'common.loading')}</p>}
           {turns !== null && shown.length === 0 && !live && <Empty />}
           <ol className="space-y-8">
             {shown.map((turn) => (

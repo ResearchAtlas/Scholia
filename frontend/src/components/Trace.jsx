@@ -3,7 +3,7 @@
 // the route and how it was chosen, the retrieval, each step with its estimated cost ("about $x") and
 // what it was charged, the exact text each call sent, what was saved, and the full citation check.
 // Loaded when first opened (Parts.jsx).
-import { useContext, useEffect, useState } from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, getBlob } from '../api.js';
 import { errorText, money } from '../text.js';
@@ -21,17 +21,18 @@ export function Trace({ turn }) {
   const language = useContext(LanguageContext);
   const [trace, setTrace] = useState(null);
   const [problem, setProblem] = useState(null);
-  const [tries, setTries] = useState(0); // each read: a retry, or the library changed
-  useEffect(() => { // a paper deleted: read the trace again, and drop every text shown from it (its bodies)
-    const changed = () => { setTrace(null); setTries((n) => n + 1); }; // nothing old shown while it reads
-    libraryEvents.addEventListener('changed', changed);
-    return () => libraryEvents.removeEventListener('changed', changed);
+  const [tries, setTries] = useState(0); // each read (a generation): a retry, or the library changed
+  const changed = useRef(false); // the library changed since the last read that succeeded
+  useEffect(() => { // a paper deleted: drop everything shown at once (the bodies too) and read the trace again
+    const drop = () => { changed.current = true; setTrace(null); setTries((n) => n + 1); };
+    libraryEvents.addEventListener('changed', drop);
+    return () => libraryEvents.removeEventListener('changed', drop);
   }, []);
   useEffect(() => {
-    let live = true;
+    let live = true; // a read of an earlier generation is dropped when it arrives
     setProblem(null);
-    readTrace(turn.run_id).then((events) => live && setTrace(summarize(events)),
-      (error) => live && setProblem(error instanceof ApiError ? error.code : 'internal'));
+    readTrace(turn.run_id).then((events) => { if (live) { changed.current = false; setTrace(summarize(events)); } },
+      (error) => live && setProblem(changed.current ? 'library_changed' : error instanceof ApiError ? error.code : 'internal'));
     return () => { live = false; };
   }, [turn.run_id, tries]);
   if (!trace) return <LoadState problem={problem} onRetry={() => setTries((n) => n + 1)} />;
