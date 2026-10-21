@@ -139,7 +139,7 @@ test('Details sums up the trace from its events, read a page at a time', async (
       { seq: 5.5, type: 'model_attempt', data: { step: 1, outcome: 'ok', body: 'cc' }, body_ref: null, body_removed: true },
       { seq: 5.6, type: 'model_attempt', data: { step: 1, outcome: 'ok', body_unavailable: true }, body_ref: null },
       { seq: 6, type: 'citation_checks', data: { citations: [{ marker: '[S1.1]', existence: 'ok', support: 'unchecked' }],
-        over_limit: 3, cut_sentences: 2 }, body_ref: null },
+        pairs: { judged: 5, failed: 1, budget: 2 } }, body_ref: null },
       { seq: 7, type: 'run_finished', data: { status: 'succeeded' }, body_ref: null },
     ], next: null },
   };
@@ -154,7 +154,7 @@ test('Details sums up the trace from its events, read a page at a time', async (
     [['answer', 0.05, true, [['ok', 'aa']]], ['judge', 0.01, false, [['timeout', 'bb'], ['ok', null], ['ok', null]]]]);
   assert.deepEqual(found.steps[1].attempts.map((a) => [a.removed, a.unavailable]), [[false, false], [true, false], [false, true]]);
   assert.equal(found.checks.length, 1);
-  assert.deepEqual([found.overLimit, found.cutSentences], [3, 2]); // shown in Details apart
+  assert.deepEqual(found.pairs, { judged: 5, failed: 1, budget: 2 }); // every outcome, shown in Details
   assert.equal(found.finished, 'succeeded');
 });
 

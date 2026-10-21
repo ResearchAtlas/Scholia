@@ -48,8 +48,9 @@ KINDS = {
 
 DELETE = None
 # S1-19b (a deletion reaches every copy, slice 1 section 4.2): the citation keeps no quote of the source's text.
+# Its sentence too (the answer's own words, which can quote the source): backend/provenance.py's rule.
 _SOURCE_REMOVED = ("material_id = NULL, material_version_id = NULL, passage_id = NULL, quote = NULL,"
-                   " existence = 'source_removed'")
+                   " context = json_remove(coalesce(context, '{}'), '$.sentence'), existence = 'source_removed'")
 # For every foreign key into a table this service deletes from, what happens to a
 # referencing row when the row it references is deleted: DELETE, or the SET
 # clause that keeps the row and clears its link. A test checks that this covers
@@ -287,7 +288,8 @@ def _delete(conn, kind, object_id, remove_all_trace):
     conn.execute(
         "UPDATE budget_reservations SET status = 'released', settled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
         " WHERE status = 'open' AND id IN (SELECT json_extract(e.data, '$.allowance_id') FROM run_events e"
-        f" WHERE e.type = 'step_started' AND e.run_id IN (SELECT id FROM runs WHERE rowid IN {_doomed('runs')}))")
+        " WHERE e.type IN ('step_started', 'step_finished')"
+        f" AND e.run_id IN (SELECT id FROM runs WHERE rowid IN {_doomed('runs')}))")
     _queue_index_removals(conn)
     for tombstone_kind, (kind_table, title) in KINDS.items():
         conn.execute(

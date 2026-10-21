@@ -566,9 +566,9 @@ def fuse(ranked_lists, k):
     return sorted(scores, key=lambda pid: -scores[pid])
 
 
-async def _dense(state, index, project_id, text, depth, materials=None):
+async def _dense(state, index, project_id, text, depth, passages=None):
     [vector] = await local_helper.embed(state, [QUERY_INSTRUCTION + text], project_id=project_id, query=True)
-    return await asyncio.to_thread(index.dense, project_id, vector, depth, materials)
+    return await asyncio.to_thread(index.dense, project_id, vector, depth, passages)
 
 
 async def retrieve(state, project_id, text, values, *, materials=None, depth=None):
@@ -585,8 +585,12 @@ async def retrieve(state, project_id, text, values, *, materials=None, depth=Non
         return {**empty, "index": "unavailable"}
     if index.building:  # a whole rebuild asked for or under way: nothing is read until it is done (fail closed)
         return {**empty, "index": "building"}
+    # A selection's passages, as the main database's access check maps them to its papers (every paper reading
+    # a passage, not the one an index row names)
+    allowed = None if materials is None else set(await asyncio.to_thread(db.read, lambda conn: readings(
+        conn, project_id, references=False, materials=materials)))
     keyword = asyncio.ensure_future(asyncio.to_thread(
-        index.keyword, project_id, text, depth or values["bm25_candidates"], materials))
+        index.keyword, project_id, text, depth or values["bm25_candidates"], allowed))
     counts = await _counts(index, project_id)
     totals = _totals(counts)
     coverage = {"embedded": totals["embedded"], "total": totals["embeddable"], "refused": totals["refused"]}
@@ -594,7 +598,7 @@ async def retrieve(state, project_id, text, values, *, materials=None, depth=Non
     if mode == "hybrid" and coverage["embedded"]:
         try:  # the deadline covers the query's embedding: past it, keyword results, said; a helper start goes on
             dense = await asyncio.wait_for(_dense(state, index, project_id, text, min(
-                depth or values["dense_candidates"], DENSE_LIMIT), materials), values["hybrid_ms"] / 1000)
+                depth or values["dense_candidates"], DENSE_LIMIT), allowed), values["hybrid_ms"] / 1000)
         except TimeoutError:
             mode, reason = "keyword_only", "deadline"
         except HelperUnavailable as unavailable:
@@ -609,9 +613,8 @@ async def retrieve(state, project_id, text, values, *, materials=None, depth=Non
         keyword, mode, reason = [], "keyword_only", "index_unavailable"
     # Access is checked again in the main database before any passage is used, in the read that
     # fetches the originals: only passages a current version in this project reads now, no reference.
-    found = await asyncio.to_thread(db.read, lambda conn: readings(conn, project_id, {*keyword, *dense}, references=False))
-    if materials is not None:
-        found = {pid: row for pid, row in found.items() if row[0] in materials}
+    found = await asyncio.to_thread(db.read, lambda conn: readings(conn, project_id, {*keyword, *dense}, references=False,
+                                                                   materials=materials))
     return {"keyword": [p for p in keyword if p in found], "dense": [p for p in dense if p in found], "found": found,
             "mode": mode, "reason": reason, "index": "building" if index.building or index.damaged else "ready",
             "coverage": coverage}

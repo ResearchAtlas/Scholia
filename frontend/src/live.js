@@ -84,5 +84,5 @@ export function useLiveTurn(conversationId) {
 
 // S1-19b: an answer's notices (backend/runs.py), as catalog keys: what the answer could not do, in words.
 export const NOTICES = { index_unavailable: 'turn.notice.indexUnavailable',
-  citations_over_limit: 'turn.notice.citationsOverLimit', keyword_only: 'turn.notice.keywordOnly', unchecked: 'turn.notice.unchecked',
+  unchecked_budget: 'turn.notice.uncheckedBudget', keyword_only: 'turn.notice.keywordOnly', unchecked: 'turn.notice.unchecked',
   skills_unavailable: 'turn.notice.noSkills', retracted: 'turn.notice.retracted' };

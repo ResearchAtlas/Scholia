@@ -59,7 +59,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 
 from backend import (budget_router, citations, context, credentials, governance, openrouter, openrouter_client,
-                     providers, reach, router, spending)
+                     provenance, providers, reach, router, spending)
 from backend.evidence import historical_citations
 from backend.search_index import still_read
 from backend.db import new_id, utc_now
@@ -302,17 +302,19 @@ def may_dispatch(conn, run_id) -> bool:
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
         " r.source_turn_id IS NULL OR EXISTS (SELECT 1 FROM turns WHERE run_id = r.source_turn_id),"
-        " r.project_id, json_extract(r.inputs, '$.evidence')"
+        " r.project_id, json_extract(r.inputs, '$.evidence'), json_extract(r.inputs, '$.context_materials')"
         " FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?", (run_id,)).fetchone()
     if row is None:
         return False
-    status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence = row
+    status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence, held = row
     owners = has_conversation if kind in ("turn", "child") else has_source
     if not (status == "running" and cancel_reason is None and not locked and bool(owners)):
         return False
     # S1-19: every passage in the request's context is still read by the paper it is named under
     # (section 10, Revocation: each PR that adds a context source registers its records here).
     wanted = {tuple(pair) for pair in json.loads(evidence)} if evidence else set()
+    if held and not provenance.carried(conn, json.loads(held)):  # a paper whose text the request carries is gone
+        return False
     return not wanted or still_read(conn, project_id, wanted) == wanted
 
 
@@ -394,6 +396,14 @@ class Harness:
                     "SELECT id, cancel_reason = 'revoked' FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')"
             ).fetchall():
                 status = "cancelled" if revoked else "interrupted"  # a revoked run stays revoked
+                # S1-19b: a call in flight at the crash kept its exact request body (stored and linked before it
+                # was sent); its attempt is recorded now, naming it, with an unknown charge.
+                for step, sha in conn.execute(
+                        "SELECT b.step, b.sha256 FROM run_bodies b WHERE b.run_id = ? AND NOT EXISTS ("
+                        "SELECT 1 FROM run_events e WHERE e.run_id = b.run_id AND e.type = 'model_attempt'"
+                        " AND json_extract(e.data, '$.body') = b.sha256) ORDER BY b.step, b.attempt", (run_id,)).fetchall():
+                    _event(conn, run_id, "model_attempt", {"step": step, "outcome": "interrupted", "dispatched": None,
+                                                           "charge": "unknown", "body": sha})
                 _event(conn, run_id, "run_finished", {"status": status})
                 conn.execute(
                     "UPDATE runs SET status = ?, finished_at = ?, settled_cost_usd = ? WHERE id = ?",
@@ -660,17 +670,18 @@ class Harness:
             # Only succeeded turns' answers: a failed, cancelled or revoked turn's text never enters a
             # later request as the assistant's words (section 1.5). Newest first; an earlier answer's
             # citations are marked historical, not current evidence (the saved answer is unchanged).
-            # An earlier answer may quote the evidence its turn held: the papers whose text the earlier turns'
-            # requests carried (inputs.context_materials) are the history's too, for the bodies' deletion links.
-            earlier = conn.execute(
+            # An earlier answer may quote the evidence its turn held, so it is carried only while every paper
+            # its turn depended on (inputs.context_materials) exists, and those papers are this request's too
+            # (backend/provenance.py: the rule for what text may be sent once its source is deleted).
+            earlier = [(u, a, json.loads(held or "[]")) for u, a, held in conn.execute(
                 "SELECT t.user_message, t.answer, json_extract(r.inputs, '$.context_materials') FROM turns t"
                 " JOIN runs r ON r.id = t.run_id WHERE t.conversation_id = ? AND r.status = 'succeeded'"
-                " AND t.answer IS NOT NULL ORDER BY t.seq DESC", (claim.conversation_id,)).fetchall()
+                " AND t.answer IS NOT NULL ORDER BY t.seq DESC", (claim.conversation_id,))]
+            kept_turns = [turn for turn in earlier if provenance.carried(conn, turn[2])]
+            history_left_out = len(earlier) - len(kept_turns)  # traced with the answer's step
             history = [(json.loads(u).get("text", ""), historical_citations(json.loads(a).get("text", "")))
-                       for u, a, _ in earlier]
-            # newest first, as history is: each earlier turn's papers that still exist (a deleted one's text is gone)
-            history_materials = [[m for m in json.loads(held or "[]") if conn.execute(
-                "SELECT 1 FROM materials WHERE id = ?", (m,)).fetchone()] for _, _, held in earlier]
+                       for u, a, _ in kept_turns]
+            history_materials = [held for _, _, held in kept_turns]  # newest first, as history is
             if material_ids and conn.execute(
                     "SELECT count(*) FROM materials WHERE project_id = ? AND id IN (SELECT value FROM json_each(?))",
                     (project_id, json.dumps(material_ids))).fetchone()[0] != len(material_ids):
@@ -706,10 +717,11 @@ class Harness:
             _event(conn, claim.run_id, "route", {"route": route.key, "effort": facts["effort"], "plan": plan.to_dict(),
                                                  "window": facts["window"], "endpoints": facts["endpoints"],
                                                  "retrieval": decision})
-            return seq, request, history, decision, history_materials
+            return seq, request, history, decision, (history_materials, history_left_out)
 
         router_model = visible(personal.values["models"].get("router"))
-        (seq, request, history, decision, history_materials), cancelled = await self._write_through(admit)
+        (seq, request, history, decision, (history_materials, history_left_out)), cancelled = \
+            await self._write_through(admit)
         if cancelled:  # its request went away while the run was written: it never runs, as by Stop
             await _through(self._write(lambda conn: self._finish_turn(
                 conn, claim.run_id, "cancelled", "researcher", "cancelled")))
@@ -720,6 +732,7 @@ class Harness:
             "selection": material_ids, "decision": decision, "history": history, "budgets": budgets,
             "instructions": instructions, "personal": personal, "table": table, "policy": policy,
             "provider": provider_config, "router_model": router_model, "history_materials": history_materials,
+            "history_left_out": history_left_out,
         }
         claim.admitted = time.monotonic()
         return claim
@@ -774,28 +787,26 @@ class Harness:
             await self._register_context(claim, numbered)  # the dispatch check now covers its passages
             judge = await self._judge_route(ctx)
             # The judge's share is reserved with the answer: a budget that cannot hold both refuses the step
-            # before the answer call (section 6.2, final review F02; C5). It is an upper bound on every judge call
-            # the answer can lead to: at most judge_calls calls, each at most the plan's bound of input (the
-            # largest passages the request holds, each sentence cut to judge_sentence_units) at the least output
-            # limit, at the judge route's highest rate. The share is held until the judge's calls take it.
-            retrieval = ctx["personal"].values["retrieval"]
-            ctx["judge_plan"] = (0, 0, frozenset())
+            # before the answer call (section 6.2, final review F02; C5). The share is a typical check's cost
+            # (citations.typical_judge_input, Harold's option C of 2026-10-21) at the judge route's highest rate
+            # and the least output limit, held until the judge's calls take it; a check that needs more draws on
+            # the answer's unspent reservation, then the budget's room (_reserve).
             judge_estimate = 0.0
             if numbered and judge[1] is not None:
-                ctx["judge_plan"] = citations.judge_plan(
-                    [r["text"] for r in numbered.values()], window=judge[2]["window"],
-                    margin_percent=ctx["budgets"]["margin_percent"], pairs=retrieval["judge_pairs"],
-                    units=retrieval["judge_sentence_units"])
-                if ctx["judge_plan"][0]:
-                    judge_estimate = retrieval["judge_calls"] * budget_router.request_cost(
-                        judge[2]["rates"], ctx["judge_plan"][1], context.MIN_OUTPUT)
+                judge_estimate = budget_router.request_cost(judge[2]["rates"], citations.typical_judge_input(
+                    [r["text"] for r in numbered.values()], ctx["personal"].values["retrieval"]["judge_pairs"]),
+                    context.MIN_OUTPUT)
             estimate = budget_router.request_cost(ctx["facts"]["rates"], request.input_tokens, request.max_tokens)
             call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
                                        phase="answer", step={**_step(ctx["route"], ctx["facts"], request),
-                                                             "judge_estimate_usd": judge_estimate})
+                                                             "judge_estimate_usd": judge_estimate,
+                                                             # earlier answers left out: one of their papers is deleted
+                                                             **({"history_left_out": ctx["history_left_out"]}
+                                                                if ctx["history_left_out"] else {})})
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
-                                      zero_retention=ctx["zero_retention"], materials=ctx["context_materials"])
+                                      zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
+                                      rehold=(ctx, await self._budgets(ctx["project_id"])) if judge_estimate else None)
             if not result.ok or visible(result.content) is None:  # tool calls alone: no tools were offered
                 code = result.error_kind or "malformed"
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
@@ -807,13 +818,14 @@ class Harness:
             # The delivered answer's checks, before its primary commit: existence and mapping, then the judge.
             checked = await self._read(lambda conn: citations.check_existence(
                 conn, ctx["project_id"], result.content, numbered))
-            verdicts, judged, over, cut = await self._support(claim, ctx, checked, judge)
+            verdicts, outcome = await self._support(claim, ctx, checked, judge)
             ctx["cited"] = (result.content, numbered, verdicts)  # checked again in the primary commit
-            ctx["over_limit"], ctx["cut_sentences"] = over, cut
+            ctx["check_outcome"] = outcome
             unsearched = (found.get("trace") or {}).get("index") in ("building", "unavailable")
-            notices = [n for n, shown in (("index_unavailable", unsearched), ("citations_over_limit", over > 0),
+            notices = [n for n, shown in (("index_unavailable", unsearched),
                                           ("keyword_only", found["mode"] == "keyword_only" and not unsearched),
-                                          ("unchecked", not judged),
+                                          ("unchecked", outcome["failed"] > 0),
+                                          ("unchecked_budget", outcome["budget"] > 0),
                                           ("skills_unavailable", not ctx["facts"].get("tools")),
                                           ("retracted", any(c.get("retraction") == "retracted" for c in checked)))
                        if shown]
@@ -916,13 +928,17 @@ class Harness:
         # Existence and mapping again, in this transaction: a passage re-read or removed while the judge ran is
         # mapped by its quote or marked source_removed (its verdict then unchecked), never a row that fails.
         text, numbered, verdicts = ctx.get("cited") or ("", {}, {})
-        checked = citations.apply_verdicts(citations.check_existence(conn, ctx["project_id"], text, numbered), verdicts)
+        checked = [{**c, "id": new_id()} for c in citations.apply_verdicts(
+            citations.check_existence(conn, ctx["project_id"], text, numbered), verdicts)]
         now = utc_now()
-        citations.write_rows(conn, claim.run_id, checked, now, new_id)
+        citations.write_rows(conn, claim.run_id, checked, now)
+        # By id, never the sentence: an event cannot lose text when its source is deleted (backend/provenance.py);
+        # the trace reads each sentence from its citation row (backend/answers.py).
         _event(conn, claim.run_id, "citation_checks", {"citations": [
-            {k: c.get(k) for k in ("marker", "existence", "support", "passage_id", "sentence")} for c in checked],
-            **({"over_limit": ctx["over_limit"]} if ctx.get("over_limit") else {}),
-            **({"cut_sentences": ctx["cut_sentences"]} if ctx.get("cut_sentences") else {})})
+            {k: c.get(k) for k in ("id", "marker", "existence", "support", "passage_id")} for c in checked],
+            # every pair's outcome, counted: judged, failed (the judge failed, timed out, refused or left it
+            # unanswered, or it fits no judge window) and unchecked for budget
+            **({"pairs": ctx["check_outcome"]} if ctx.get("check_outcome") else {})})
         _event(conn, claim.run_id, "run_finished", {"status": "succeeded"})
         conn.execute("UPDATE turns SET answer = ?, result_saved = 1, phase = 'answer', memory_status = 'skipped',"
                      " accounting = ? WHERE run_id = ?",
@@ -964,10 +980,14 @@ class Harness:
         settings_lock). A cancellation during the write releases the reservation once it is written.
         allowance: an amount held beside the call, in the same transaction and against the same budgets,
         for a later call of the step (the support judge's share, reserved with its answer, final review
-        F02); from_allowance: a call that takes the allowance held (it is released and the call reserved
-        in one transaction, so nothing else can take it meanwhile), any rest being held again. No
-        reservation is ever written past a budget: one that does not fit raises BudgetExceeded, writing
-        nothing. An allowance left unspent is released when the turn ends (_release_allowances)."""
+        F02); from_allowance: a judge call, which takes what is held for it, in this order (Harold's
+        option C, 2026-10-21): the share, then the answer's unspent reservation (held again when the
+        answer settled, _call's rehold), then the budget's room; both held amounts are released and the
+        call reserved in one transaction, against the budgets, so nothing else can take them meanwhile;
+        any rest is held again, and its step records what funded it ("funded": share, answer_unspent or
+        budget). No reservation is ever written past a budget: one that does not fit raises
+        BudgetExceeded, writing nothing. An allowance left unspent is released when the turn ends
+        (_release_allowances)."""
         run_id = active.run_id
         context = active.context if active.context is not None else {}
 
@@ -980,22 +1000,27 @@ class Harness:
                                   (run_id,)).fetchone()
             budgets = {"project_budget_usd": project_budget,
                        "conversation_budget_usd": own if own is not None else default_budget}
-            held = 0.0
-            if from_allowance and context.get("allowance"):
-                row = conn.execute("SELECT estimate_usd FROM budget_reservations WHERE id = ? AND status = 'open'",
-                                   (context["allowance"],)).fetchone()
-                if row is not None and spending.release(conn, context["allowance"]):
-                    held = row[0]
+            held, funded = {}, {}
+            for name in ("allowance", "unspent") if from_allowance else ():
+                held_id = context.get(name)
+                row = held_id and conn.execute(
+                    "SELECT estimate_usd FROM budget_reservations WHERE id = ? AND status = 'open'", (held_id,)).fetchone()
+                if row and spending.release(conn, held_id):
+                    held[name] = row[0]
             reservation = spending.reserve(conn, run_id=run_id, step_seq=seq, project_id=project_id,
                                            paying_conversation_id=paying_conversation_id, estimate_usd=estimate,
                                            **budgets)
-            rest = allowance if not from_allowance else held - estimate
+            if from_allowance:
+                share, unspent = held.get("allowance", 0.0), held.get("unspent", 0.0)
+                funded = {"funded": "share" if estimate <= share else
+                          "answer_unspent" if estimate <= share + unspent else "budget"}
+            rest = allowance if not from_allowance else sum(held.values()) - estimate
             kept = None
             if rest > 0:
                 kept = spending.reserve(conn, run_id=run_id, step_seq=seq, project_id=project_id,
                                         paying_conversation_id=paying_conversation_id, estimate_usd=rest, **budgets)
             _event(conn, run_id, "step_started", {"step": seq, "phase": phase, "estimate_usd": estimate,
-                                                   "reservation_id": reservation, **step,
+                                                   "reservation_id": reservation, **step, **funded,
                                                    **({"allowance_id": kept, "allowance_usd": rest} if kept else {})})
             return _Call(run_id, seq, reservation), kept
 
@@ -1008,6 +1033,8 @@ class Harness:
         active.call = call
         if allowance or from_allowance:
             context["allowance"] = kept
+        if from_allowance:
+            context["unspent"] = None  # taken with the share
         if cancelled or active.cancel_requested.is_set():
             raise asyncio.CancelledError()
         return call
@@ -1021,21 +1048,20 @@ class Harness:
         forcing a tool choice. materials: the papers whose passages text holds. Returns the call's result, or
         None when the route cannot serve it (not allowed, unusable, too small for the request)."""
         # The turn's route and privacy controls, but not its reasoning effort: a role step's output limit is the
-        # least a step has, which reasoning tokens would use up.
-        given = facts  # the route's facts the caller planned with (the judge's share), used as they are
-        route, facts = ctx["route"], {**ctx["facts"], "effort": None}
+        # least a step has, which reasoning tokens would use up. Without reasoning the request reaches the
+        # endpoints a request without it reaches (no reasoning pin), so its facts are read for that request:
+        # given by the caller who planned with them (the judge's share, _judge_route), else read here.
+        route = ctx["route"]
         if model is not None:
             if ctx["policy"].problem(ctx["provider"], model, ctx["key"]) or \
                     _unusable(ctx["table"], ctx["provider"], model):
                 return None
             route = providers.Route(ctx["provider"], model)
-            if given is not None:
-                facts = {**given, "effort": None}
-            else:
-                problem, facts = await self._route_facts(route, ctx["key"], ctx["table"],
-                                                         zero_retention=ctx["zero_retention"], effort=None)
-                if problem:
-                    return None
+        if facts is None:
+            problem, facts = await self._route_facts(route, ctx["key"], ctx["table"],
+                                                     zero_retention=ctx["zero_retention"], effort=None)
+            if problem:
+                return None
         budgets = ctx["budgets"]
         try:
             request = context.assemble(function, window=facts["window"], output=_output(context.MIN_OUTPUT, facts),
@@ -1123,9 +1149,10 @@ class Harness:
         return dict(list(numbered.items())[:kept]), request
 
     async def _register_context(self, claim, numbered):
-        """Name the request's papers and passages on its run, before its dispatch: deleting one of the papers
-        revokes the run (deletion's scope links read inputs.material_ids), and the dispatch check refuses a
-        passage its paper no longer reads (may_dispatch reads inputs.evidence, [passage, paper] pairs)."""
+        """Name every paper whose text the request carries on its run, before its dispatch (backend/provenance.py):
+        its evidence's and its history's (inputs.context_materials, also its scope in inputs.material_ids, so
+        deleting one revokes the run), and its evidence's [passage, paper] pairs (inputs.evidence); the dispatch
+        check refuses a run when one of those papers is gone or no longer reads the passage."""
         papers = sorted({r["material_id"] for r in numbered.values()})
         pairs = sorted({(r["passage_id"], r["material_id"]) for r in numbered.values()})
         # every paper whose text the request carries: its evidence, and the earlier turns its history holds
@@ -1140,7 +1167,7 @@ class Harness:
                 raise _Cancelled()
             (inputs,) = conn.execute("SELECT inputs FROM runs WHERE id = ?", (claim.run_id,)).fetchone()
             inputs = json.loads(inputs or "{}")
-            inputs["material_ids"] = sorted({*inputs.get("material_ids", []), *papers})
+            inputs["material_ids"] = sorted({*inputs.get("material_ids", []), *held})
             inputs["evidence"] = [list(pair) for pair in pairs]
             inputs["context_materials"] = held
             conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(inputs), claim.run_id))
@@ -1155,8 +1182,10 @@ class Harness:
         run; (None, None, None) when it is set but cannot run here, so the citations stay unchecked, said
         in the answer, and no other model judges them in its place."""
         model = visible(ctx["personal"].values["models"].get("judge"))
-        if model is None:
-            return None, ctx["route"], ctx["facts"]
+        if model is None:  # the turn's route, read for the judge's own request (no reasoning: no reasoning pin)
+            problem, facts = await self._route_facts(ctx["route"], ctx["key"], ctx["table"],
+                                                     zero_retention=ctx["zero_retention"], effort=None)
+            return (None, ctx["route"], facts) if not problem else (None, None, None)
         if not ctx["policy"].problem(ctx["provider"], model, ctx["key"]) and \
                 not _unusable(ctx["table"], ctx["provider"], model):
             route = providers.Route(ctx["provider"], model)
@@ -1167,53 +1196,43 @@ class Harness:
         return None, None, None
 
     async def _support(self, claim, ctx, checked, judge):
-        """({(sentence, passage id): verdict}, whether every pair it was to judge was judged, how many pairs were
-        past the cap, how many judged sentences were cut). The judge's plan (ctx["judge_plan"], set with its
-        share) gives the pairs per call and the passages a call can hold; at most `judge_calls` calls are made,
-        so the pairs past judge_calls x that are left unchecked and counted (a fixed limit, said in the answer
-        apart, never a budget). Each call is shown the passage text the answer was given and each sentence cut
-        to `judge_sentence_units`, so its estimate never exceeds its part of the share; a cut sentence's
-        verdict is at most partly, since only part of it was judged. A call that fails, times out or refuses, a
-        pair it leaves unanswered, or one citing a passage too large for the judge's window, stays unchecked."""
+        """({(sentence, passage id): verdict}, {"judged", "failed", "budget": pairs}). Every pair is judged, up to
+        `judge_pairs` per call, a batch too large for the judge's window halved (section 7.5), each sentence as
+        delivered (section 6.2). Each call is reserved from the judge's share, then the answer's unspent
+        reservation, then the budget's room (_reserve, one transaction, against the budgets); a call none of
+        them covers is not made, and its pairs and the rest are unchecked for budget. A call that fails, times
+        out or refuses, a pair it leaves unanswered, or one too large for any window, is unchecked: failed."""
         wanted = citations.pairs(checked)
+        outcome = {"judged": 0, "failed": 0, "budget": 0}
         if not wanted:
-            return {}, True, 0, 0
+            return {}, outcome
         if judge[1] is None:  # a judge is set that cannot run here: unchecked, said, never another model
-            return {}, False, 0, 0
-        retrieval = ctx["personal"].values["retrieval"]
-        size, _, fitting = ctx["judge_plan"]
-        if not size:  # not one pair fits the judge's window
-            return {}, False, 0, 0
-        units = retrieval["judge_sentence_units"]
+            return {}, {**outcome, "failed": len(wanted)}
         texts = {c["passage_id"]: c["judged_text"] for c in checked if c["existence"] == "ok"}
         material_of = {c["passage_id"]: c["material_id"] for c in checked if c["existence"] == "ok"}
-        complete = all(texts[pid] in fitting for _, pid in wanted)
-        wanted = [pair for pair in wanted if texts[pair[1]] in fitting]
-        cap = retrieval["judge_calls"] * size
-        over, wanted = max(0, len(wanted) - cap), wanted[:cap]
-        verdicts, cut = {}, 0
-        for batch in citations.batches(wanted, size):
+        verdicts = {}
+        queue = citations.batches(wanted, ctx["personal"].values["retrieval"]["judge_pairs"])
+        while queue:
+            batch = queue.pop(0)
             try:
                 result = await self._role_call(claim, ctx, judge[0], "judge", citations.JUDGE_RULES,
-                                               citations.judge_request(batch, texts, units), timeout=JUDGE_SECONDS,
+                                               citations.judge_request(batch, texts), timeout=JUDGE_SECONDS,
                                                from_allowance=True, facts=judge[2],
                                                materials={*ctx["context_materials"], *(material_of[pid] for _, pid in batch)})
-            except spending.BudgetExceeded:  # unreachable: the share bounds every call; fails closed, unchecked
-                log.error("a judge call was refused past its share; its pairs are left unchecked")
-                complete = False
+            except spending.BudgetExceeded:  # neither the share, the answer's unspent nor the budget covers it
+                outcome["budget"] += len(batch) + sum(len(rest) for rest in queue)
+                break
+            if result is None and len(batch) > 1:  # too large for the judge's window: halved
+                queue[:0] = [batch[:len(batch) // 2], batch[len(batch) // 2:]]
                 continue
             if result is None or not result.ok:
-                complete = False
+                outcome["failed"] += len(batch)
                 continue
             found = citations.parse_verdicts(result.content, len(batch))
-            complete = complete and len(found) == len(batch)
-            for i, pair in enumerate(batch, start=1):
-                if i not in found:
-                    continue
-                shortened = citations.judge_view(pair[0], units) != pair[0]
-                cut += shortened
-                verdicts[pair] = "partly" if shortened and found[i] == "supported" else found[i]
-        return verdicts, complete, over, cut
+            outcome["judged"] += len(found)
+            outcome["failed"] += len(batch) - len(found)
+            verdicts.update({pair: found[i] for i, pair in enumerate(batch, start=1) if i in found})
+        return verdicts, outcome
 
     async def _general(self):
         return await self._read(lambda conn: conn.execute("SELECT id FROM projects WHERE kind = 'general'").fetchone()[0])
@@ -1257,7 +1276,7 @@ class Harness:
                       "endpoints": list(found.tags), "row": row, "output": found.output, "tools": found.tools}
 
     async def _call(self, active, call, route, key, request, facts, *, output=None, zero_retention=False, timeout=None,
-                    materials=()):
+                    materials=(), rehold=None):
         """The dispatch path: every model call goes through here, and nowhere else calls the provider
         adapter (tests/test_dispatch_path.py). It sends the request the context assembler built, for
         an admitted call (its reservation), through the gate with the dispatch check, and records it,
@@ -1284,8 +1303,12 @@ class Harness:
         def dispatched(terms=None):  # the gate let the request out: from here it may be billed
             call.dispatched, call.retention = True, terms
 
-        async def keep(body):  # stored before it is sent, so a call stopped in flight keeps it too
-            call.bodies.append(await asyncio.to_thread(_stored, self.content, body))
+        async def keep(body):  # stored, and linked to its papers, before it is sent: a stop or a crash keeps it
+            ref = await asyncio.to_thread(_stored, self.content, body)
+            number = len(call.bodies)
+            call.bodies.append(ref)
+            if ref is not None:
+                await self._write(lambda conn: _keep_body(conn, call, number, ref))
 
         call.materials = tuple(sorted(set(materials)))
 
@@ -1306,15 +1329,21 @@ class Harness:
             def record(conn):
                 # The receipt settles the reservation by its id even if the run was deleted
                 # meanwhile; the run's own record goes with the run.
-                if conn.execute("SELECT 1 FROM runs WHERE id = ?", (active.run_id,)).fetchone() is not None:
+                exists = conn.execute("SELECT 1 FROM runs WHERE id = ?", (active.run_id,)).fetchone() is not None
+                if exists:
                     for number, attempt in enumerate(result.attempts):
                         _event(conn, active.run_id, "model_attempt", {
                             "step": call.step, "route": route.key, **attempt.record(),
                             **_kept_body(conn, call, number, attempt.dispatched)})
-                    _event(conn, active.run_id, "step_finished", finished)
                 if result.dispatched:
                     _settle_attempts(conn, call.reservation_id, facts["rates"], result.attempts)
-                else:
+                    if rehold is not None and exists:  # the answer's unspent, held again for its judge (_reserve)
+                        held = _hold_unspent(conn, call, *rehold)
+                        if held:
+                            finished.update(allowance_id=held[0], allowance_usd=held[1])
+                if exists:
+                    _event(conn, active.run_id, "step_finished", finished)
+                if not result.dispatched:
                     spending.release(conn, call.reservation_id)
 
             # Recorded before the client closes, and to its end even if cancelled meanwhile.
@@ -1487,19 +1516,15 @@ class Harness:
             if check is None:
                 return None
             judged, texts = check
-            text = citations.judge_request([(s, p) for s, p, _ in judged], texts,
-                                           personal.values["retrieval"]["judge_sentence_units"])
+            text = citations.judge_request([(s, p) for s, p, _ in judged], texts)
             papers = inputs.get("context_materials") or ()
             rules = citations.JUDGE_RULES
-
-            units = personal.values["retrieval"]["judge_sentence_units"]
 
             def output(result):  # each citation's verdict with the pair it was given for; None (the run fails,
                 found = citations.parse_verdicts(result.content, len(judged))  # writing nothing) if one is unanswered
                 if len(found) < len(judged):
                     return None
-                return {cid: ["partly" if found[i] == "supported" and citations.judge_view(sentence, units) != sentence
-                              else found[i], pid, sentence]  # a sentence judged only in part: at most partly
+                return {cid: [found[i], pid, citations.sentence_key(sentence)]
                         for i, (sentence, pid, cids) in enumerate(judged, start=1) for cid in cids}
         try:  # a role step's output limit is the least a step has
             request = context.assemble(workflow, window=facts["window"], output=_output(context.MIN_OUTPUT, facts),
@@ -1699,12 +1724,13 @@ class Harness:
             status, output = "cancelled", None
             cancel_reason = "revoked" if revoked or active.cancel_reason == "revoked" else "researcher"
         if status == "succeeded" and output is not None and inputs.get("check"):
-            for cid, (verdict, pid, sentence) in output.items():  # S1-19: the answer's citations, checked again
-                # only a citation that still has the sentence and passage its verdict was given for
-                conn.execute("UPDATE citations SET support = ?, support_run_id = ?, checked_at = ?"
-                             " WHERE id = ? AND owner_id = ? AND existence = 'ok' AND passage_id = ?"
-                             " AND coalesce(json_extract(context, '$.sentence'), '') = ?",
-                             (verdict, run_id, utc_now(), cid, inputs["check"], pid, sentence))
+            for cid, (verdict, pid, key) in output.items():  # S1-19: the answer's citations, checked again
+                # only a citation that still has the sentence (by its hash) and passage its verdict was given for
+                row = conn.execute("SELECT json_extract(context, '$.sentence') FROM citations WHERE id = ? AND owner_id = ?"
+                                   " AND existence = 'ok' AND passage_id = ?", (cid, inputs["check"], pid)).fetchone()
+                if row is not None and citations.sentence_key(row[0]) == key:
+                    conn.execute("UPDATE citations SET support = ?, support_run_id = ?, checked_at = ? WHERE id = ?",
+                                 (verdict, run_id, utc_now(), cid))
         elif status == "succeeded" and output is not None:
             # The title is written only if nobody changed it since the run was queued.
             conn.execute(
@@ -1740,14 +1766,21 @@ def _output(setting, facts):
 
 def _check_request(conn, inputs):
     """For a citation_check run: ([(sentence, passage id, citation ids)] for the pairs its inputs name, their
-    passages' texts), or None (the run fails, writing nothing) when one of their passages is gone:
-    a check never reports success with a pair it did not judge."""
+    passages' texts), or None (the run fails, writing nothing) when one of their passages is gone or a pair's
+    sentence is no longer its citations' (its paper deleted, or the citation re-pointed): a check never
+    reports success with a pair it did not judge. Sentences are read from the citation rows, by the hash
+    the inputs keep (backend/provenance.py)."""
     pairs = inputs.get("pairs") or []
     texts = dict(conn.execute("SELECT id, text FROM passages WHERE id IN (SELECT value FROM json_each(?))",
                               (json.dumps(sorted({p for _, p, _, _ in pairs})),)).fetchall())
-    if not pairs or any(pid not in texts for _, pid, _, _ in pairs):
-        return None
-    return [(sentence, pid, cids) for sentence, pid, _, cids in pairs], texts
+    judged = []
+    for key, pid, _, cids in pairs:
+        found = conn.execute("SELECT json_extract(context, '$.sentence') FROM citations WHERE id = ? AND passage_id = ?",
+                             (cids[0], pid)).fetchone()
+        if pid not in texts or found is None or citations.sentence_key(found[0]) != key:
+            return None
+        judged.append((found[0] or "", pid, cids))
+    return (judged, texts) if judged else None
 
 
 def _stored(content, body):
@@ -1797,32 +1830,62 @@ def _settle_attempts(conn, reservation_id, rates, attempts):
         spending.settle(conn, reservation_id, None, estimated_usd=max(total, row[0]) if row else None)
 
 
+def _keep_body(conn, call, number, ref):
+    """Keep an attempt's exact request body, before it is sent, in run_bodies with the papers its text
+    holds (run_body_materials), so a deletion of one of them removes it: only while its run exists and every
+    one of those papers does (backend/provenance.py; a body of a paper deleted already is never kept)."""
+    if conn.execute("SELECT 1 FROM runs WHERE id = ?", (call.run_id,)).fetchone() is None or \
+            not provenance.carried(conn, call.materials):
+        return
+    conn.execute("INSERT OR IGNORE INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
+                 (call.run_id, call.step, number, ref))
+    conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
+                     [(ref, material) for material in call.materials])
+
+
 def _kept_body(conn, call, number, dispatched):
-    """What an attempt's model_attempt event says of its exact request body, keeping it in run_bodies with
-    the papers its text holds: {"body": sha256} when kept; {"body": sha256} with no row (so the trace says it
-    was removed) when one of those papers was deleted before this record; {"body_unavailable": True} when the
-    content store could not take it; nothing for an attempt that never left the machine."""
-    if not dispatched or not 0 <= number < len(call.bodies):
+    """What an attempt's model_attempt event says of its exact request body (kept by _keep_body before it
+    was sent): {"body": sha256} (the trace says it was removed when its row is gone with a deleted paper);
+    {"body_unavailable": True} when the content store could not take it; nothing for an attempt that never
+    left the machine, whose body is not kept."""
+    if not 0 <= number < len(call.bodies):
         return {}
     ref = call.bodies[number]
-    if ref is None:
-        return {"body_unavailable": True}
-    papers = list(call.materials)
-    if conn.execute("SELECT count(*) FROM materials WHERE id IN (SELECT value FROM json_each(?))",
-                    (json.dumps(papers),)).fetchone()[0] == len(papers):
-        conn.execute("INSERT OR IGNORE INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
-                     (call.run_id, call.step, number, ref))
-        conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
-                         [(ref, material) for material in papers])
-    return {"body": ref}
+    if not dispatched:
+        conn.execute("DELETE FROM run_bodies WHERE run_id = ? AND step = ? AND attempt = ?", (call.run_id, call.step, number))
+        conn.execute("DELETE FROM run_body_materials WHERE sha256 = ? AND NOT EXISTS ("
+                     "SELECT 1 FROM run_bodies WHERE sha256 = ?)", (ref, ref))
+        return {}
+    return {"body": ref} if ref is not None else {"body_unavailable": True}
+
+
+def _hold_unspent(conn, call, ctx, budgets):
+    """The answer's reservation less its settled cost, held again for its judge, in the transaction that settles
+    it, against the budgets (Harold's option C, 2026-10-21): (its id, its amount), which the answer's
+    step_finished event names (allowance_id), as _release_allowances and deletion read it; None when none is
+    left or a budget no longer holds it."""
+    row = conn.execute("SELECT run_id, step_seq, project_id, paying_conversation_id, estimate_usd - settled_usd"
+                       " FROM budget_reservations WHERE id = ? AND status = 'settled'", (call.reservation_id,)).fetchone()
+    if row is None or row[4] <= 0:
+        return None
+    (own,) = conn.execute("SELECT budget_usd FROM conversations WHERE id = ?", (row[3],)).fetchone() or (None,)
+    try:
+        held = spending.reserve(conn, run_id=row[0], step_seq=row[1], project_id=row[2], paying_conversation_id=row[3],
+                                estimate_usd=round(row[4], 9), project_budget_usd=budgets[0],
+                                conversation_budget_usd=own if own is not None else budgets[1])
+    except spending.BudgetExceeded:
+        return None
+    ctx["unspent"] = held
+    return held, round(row[4], 9)
 
 
 def _release_allowances(conn, run_id=None):
-    """Release the open allowances (Harness._reserve's held shares, each named by its step_started event's
-    allowance_id) of a run that ends, or of every run after a crash: no call was made against them."""
+    """Release the open allowances (the judge's share, named by the answer's step_started allowance_id, and the
+    answer's unspent held again, named by its step_finished) of a run that ends, or of every run after a crash:
+    no call was made against them."""
     for (reservation,) in conn.execute(
             "SELECT b.id FROM budget_reservations b JOIN run_events e ON e.run_id = b.run_id"
-            " AND e.type = 'step_started' AND json_extract(e.data, '$.allowance_id') = b.id"
+            " AND e.type IN ('step_started', 'step_finished') AND json_extract(e.data, '$.allowance_id') = b.id"
             " WHERE b.status = 'open' AND (? IS NULL OR b.run_id = ?)", (run_id, run_id)).fetchall():
         spending.release(conn, reservation)
 

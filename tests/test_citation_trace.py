@@ -119,7 +119,8 @@ async def test_the_citation_endpoints_resolve_existence_and_check_support_as_a_r
         [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", check_run)
         inputs = json.loads(inputs)
         assert (inputs["evidence"], inputs["material_ids"]) == ([[chip["passage_id"], material]], [material])
-        assert inputs["pairs"] == [[chip["sentence"], chip["passage_id"], material, [chip["id"]]]]
+        from backend.citations import sentence_key  # the sentence by its hash, never its text
+        assert inputs["pairs"] == [[sentence_key(chip["sentence"]), chip["passage_id"], material, [chip["id"]]]]
         done = await run_finished(client, check_run)
         assert done["status"] == "succeeded" and done["workflow"] == "citation_check"
         assert await rows(client, "SELECT support FROM citations WHERE id = ?", chip["id"]) == [("partly",)]

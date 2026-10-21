@@ -1142,7 +1142,7 @@
   },
   "turn.details": "Details",
   "turn.notice.indexUnavailable": "Your papers could not be searched: the library's search index is being built or is unavailable.",
-  "turn.notice.citationsOverLimit": "This answer has more citations than one check covers, so the ones past that are unchecked.",
+  "turn.notice.uncheckedBudget": "Some citations were not checked: the budget could not cover their check.",
   "turn.notice.keywordOnly": "Meaning search was unavailable, so this answer's evidence came from keyword search only.",
   "turn.notice.unchecked": "Some citations could not be checked against their passages.",
   "turn.notice.noSkills": "Skills are unavailable on this model, so Scholia answered from your library directly.",
@@ -1193,17 +1193,21 @@
   "trace.charged": "charged {cost}",
   "trace.bodyRemoved": "The exact text sent was removed with a deleted paper.",
   "trace.bodyUnavailable": "The exact text sent could not be kept.",
-  "trace.checksCut": {
-    "one": "{count} long sentence was judged on its beginning only, so it counts as partly supported at most.",
-    "other": "{count} long sentences were judged on their beginnings only, so each counts as partly supported at most."
-  },
-  "trace.checksOverLimit": {
-    "one": "{count} citation pair past what one check covers was left unchecked.",
-    "other": "{count} citation pairs past what one check covers were left unchecked."
-  },
   "trace.showSent": "Show the exact text sent",
   "trace.sent": "The exact text sent",
   "trace.checks": "Citation check",
+  "trace.pairsJudged": {
+    "one": "{count} citation pair judged",
+    "other": "{count} citation pairs judged"
+  },
+  "trace.pairsFailed": {
+    "one": "{count} could not be judged",
+    "other": "{count} could not be judged"
+  },
+  "trace.pairsBudget": {
+    "one": "{count} not checked: over budget",
+    "other": "{count} not checked: over budget"
+  },
   "trace.exists": "found",
   "library.choose": "Choose “{title}” for the next question",
   "library.chosen": {

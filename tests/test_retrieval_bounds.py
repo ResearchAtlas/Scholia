@@ -171,8 +171,8 @@ async def test_a_selections_dense_search_is_its_own_nearest_whatever_the_rest_of
                                  (rowid, project, f"near-{i}", sqlite_vec.serialize_float32(query)))
         finally:
             conn.close()
-        own = await asyncio.to_thread(index.dense, project, query, 50, {selected})
         mine = {pid for pid, in await asyncio.to_thread(index._read, lambda c: c.execute(
             "SELECT passage_id FROM index_rows WHERE material_id = ? AND embedded = 1", (selected,)).fetchall())}
+        own = await asyncio.to_thread(index.dense, project, query, 50, mine)
         assert own and set(own) == mine  # every embedded passage of the selection, none of the others
         assert len(await asyncio.to_thread(index.dense, project, query, 50)) == 50  # the project's own nearest

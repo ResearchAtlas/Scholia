@@ -58,8 +58,11 @@ export function Trace({ turn }) {
       {trace.checks.length > 0 && (
         <div className="space-y-1">
           <p className="font-medium">{t('trace.checks')}</p>
-          {trace.overLimit > 0 && <p className="text-muted-foreground">{t('trace.checksOverLimit', { count: trace.overLimit })}</p>}
-          {trace.cutSentences > 0 && <p className="text-muted-foreground">{t('trace.checksCut', { count: trace.cutSentences })}</p>}
+          {trace.pairs && <p className="text-muted-foreground">{[
+            t('trace.pairsJudged', { count: trace.pairs.judged }),
+            trace.pairs.failed > 0 && t('trace.pairsFailed', { count: trace.pairs.failed }),
+            trace.pairs.budget > 0 && t('trace.pairsBudget', { count: trace.pairs.budget }),
+          ].filter(Boolean).join(' · ')}</p>}
           <ul className="space-y-1">
             {trace.checks.map((check, i) => (
               <li key={i} className="grid gap-0.5">

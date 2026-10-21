@@ -124,9 +124,10 @@ async def test_the_judges_share_stays_held_until_the_judge_takes_it_and_no_reser
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, QUESTION)
         assert stream[-1]["status"] == "succeeded"
-        answer, allowance = seen["before"]
+        answer, allowance, unspent = seen["before"]
         assert answer[0] == "settled" and allowance == ("open", allowance[1]) and allowance[1] > 0  # held after the answer
-        assert seen["during"][1][0] == "released" and seen["during"][2][0] == "open"  # taken by the judge's own call
+        assert unspent[0] == "open" and unspent[1] > 0  # the answer's unspent, held again for its judge (option C)
+        assert [r[0] for r in seen["during"][1:4]] == ["released", "released", "open"]  # taken by the judge's call
         after = await rows(client, "SELECT status FROM budget_reservations ORDER BY rowid")
         assert ("open",) not in after  # any rest released when the turn ends
         [(started,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'step_started'"
@@ -159,9 +160,8 @@ async def test_a_judge_share_that_does_not_cover_the_judge_leaves_it_unchecked_n
         stream = await send(client, conversation, QUESTION)
         assert stream[-1]["status"] == "succeeded" and provider.judged == []
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
-        assert "unchecked" in turn["answer"]["notices"]
+        assert "unchecked_budget" in turn["answer"]["notices"]  # unchecked for budget, said apart (option C)
         assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE estimate_usd >= 10000") == [(0,)]
-        assert "a judge call was refused past its share" in caplog.text  # unreachable by design: logged, closed
 
 
 async def test_a_recheck_verdict_is_written_only_to_the_pair_it_was_given_for(tmp_path):
@@ -338,3 +338,144 @@ async def test_a_paper_deleted_earlier_does_not_cost_the_conversations_later_tur
         assert attempts and all(e["body_ref"] and not e.get("body_removed") for e in attempts)
         [(held,)] = await rows(client, "SELECT json_extract(inputs, '$.context_materials') FROM runs WHERE id = ?", later)
         assert wages not in json.loads(held or "[]")
+
+
+# Fix batch b2 (external recheck b2): backend/provenance.py's one rule for text whose source is deleted.
+
+TWIN = "00000000-0000-4000-8000-000000000001"
+
+
+def twin_of(material):
+    def twin(conn):  # a second paper of the project reading the same file, so the same passages
+        conn.execute("INSERT INTO materials (id, project_id, title, source) SELECT ?, project_id, 'Twin', source"
+                     " FROM materials WHERE id = ?", (TWIN, material))
+        conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
+                     " SELECT '00000000-0000-4000-8000-000000000002', ?, 0, file_sha256, 1, media_type"
+                     " FROM material_versions WHERE material_id = ? AND is_current = 1", (TWIN, material))
+    return twin
+
+
+QUOTING = "The paper reports that minimum wages raise the earnings of low-paid workers [S1.1]."
+
+
+async def test_an_earlier_answer_drawing_on_a_deleted_paper_is_left_out_of_later_requests_and_traced(tmp_path):
+    # b2 (1): the answer's text goes out of the history with its paper, not only its provenance link.
+    provider = Provider(answer_text=QUOTING)
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        later = (await send(client, conversation, "Rewrite your last answer more formally."))[0]["run_id"]
+        sent = json.dumps(provider.answers[-1], ensure_ascii=False)
+        assert "low-paid workers" not in sent  # the answer quoting the deleted paper is not carried
+        [(step,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_started'", later)
+        assert json.loads(step)["history_left_out"] == 1
+
+
+async def test_a_paper_deleted_after_a_history_only_request_is_registered_stops_its_dispatch(tmp_path, monkeypatch):
+    # b2 (2): the history's papers are the run's scope and the dispatch check's, as its evidence's are.
+    provider = Provider(answer_text=QUOTING)
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        real = runs_module.Harness._register_context
+
+        async def then_delete(self, claim, numbered):
+            await real(self, claim, numbered)
+            assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        monkeypatch.setattr(runs_module.Harness, "_register_context", then_delete)
+        before = len(provider.answers)
+        stream = await send(client, conversation, "Rewrite your last answer more formally.")
+        assert len(provider.answers) == before and stream[-1]["status"] in ("cancelled", "failed")
+
+
+async def test_deleting_a_paper_leaves_no_cited_sentence_in_rows_events_or_the_trace(tmp_path):
+    # b2 (3): the citation's sentence goes with its quote; events name citations by id and never hold the text.
+    provider = Provider(answer_text=QUOTING)
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "succeeded"
+        assert await rows(client, "SELECT count(*) FROM run_events WHERE data LIKE '%low-paid%'") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM runs WHERE inputs LIKE '%low-paid%'") == [(0,)]
+        trace = (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+        [checks] = [e for e in trace if e["type"] == "citation_checks"]
+        assert checks["data"]["citations"][0]["sentence"] == QUOTING  # read from the row while its paper exists
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        assert await rows(client, "SELECT count(*) FROM citations WHERE context LIKE '%low-paid%' OR quote IS NOT NULL") \
+            == [(0,)]
+        trace = (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+        [checks] = [e for e in trace if e["type"] == "citation_checks"]
+        assert checks["data"]["citations"][0]["sentence"] is None
+        shown = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+        assert "low-paid" not in json.dumps(shown)  # the answer itself stays the researcher's record
+
+
+async def test_an_inherited_judge_is_planned_and_reserved_on_the_facts_of_its_own_request(tmp_path, monkeypatch):
+    # b2 (4): no reasoning means no reasoning pin, so an inherited judge's facts are read for its own request
+    # (effort None): its window and rates, not the answer's, size its call and its share.
+    real = runs_module.Harness._judge_route
+    judged_facts = {}
+
+    async def route(self, ctx):  # the judge's own request (no reasoning) reaches other, dearer endpoints
+        model, judged, found = await real(self, ctx)
+        assert found is not ctx["facts"] and found["effort"] is None  # read for its own request
+        judged_facts.update({**found, "window": 65536, "rates": {k: v * 10 for k, v in found["rates"].items()}})
+        return model, judged, dict(judged_facts)
+    monkeypatch.setattr(runs_module.Harness, "_judge_route", route)
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, QUESTION)
+        steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events WHERE run_id = ?"
+                                                              " AND type = 'step_started' ORDER BY seq", stream[0]["run_id"])]
+        [answer] = [s for s in steps if s["phase"] == "answer"]
+        [judge] = [s for s in steps if s["phase"] == "judge"]
+        assert answer["window"] != 65536 and judge["window"] == 65536
+        assert judge["estimate_usd"] == runs_module.budget_router.request_cost(
+            judged_facts["rates"], judge["input_tokens"], judge["max_tokens"])
+
+
+async def test_a_remapped_citation_keeps_its_verdict_only_for_the_same_passage_text(tmp_path):
+    # b2 (5): a re-read whose passage keeps the quote but changes the text leaves the citation unchecked.
+    from backend import materials as materials_module
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        db = client.state["db"]
+
+        def remap(conn, suffix):
+            cid, pid, quote = conn.execute("SELECT id, passage_id, quote FROM citations").fetchone() or (None, None, None)
+            if pid is None:
+                pid = conn.execute("SELECT id FROM passages ORDER BY ordinal LIMIT 1 OFFSET 1").fetchone()[0]
+            conn.execute("UPDATE passages SET text = ? WHERE id = ?", (quote + suffix, pid))
+            conn.execute("UPDATE citations SET passage_id = NULL, existence = 'not_found', support = 'supported'"
+                         " WHERE id = ?", (cid,))
+            sha, kind, extraction = conn.execute(
+                "SELECT v.file_sha256, coalesce(v.media_type, f.media_type), p.extraction_id FROM material_versions v"
+                " JOIN content_files f ON f.sha256 = v.file_sha256 JOIN passages p ON p.id = ? WHERE v.material_id = ?",
+                (pid, material)).fetchone()
+            materials_module._resolve(conn, sha, materials_module.extraction.extractor_of(kind), extraction)
+            return conn.execute("SELECT existence, support, support_run_id FROM citations").fetchone()
+        same = await asyncio.to_thread(db.write, lambda conn: remap(conn, ""))
+        assert same[:2] == ("ok", "supported")  # the passage's text is the quote's: the verdict stands
+        changed = await asyncio.to_thread(db.write, lambda conn: remap(conn, " Except in winter, when it fell."))
+        assert changed == ("ok", "unchecked", None)
+
+
+async def test_a_selected_paper_sharing_its_reading_with_another_is_searched_as_itself(tmp_path):
+    # b2 (6): keyword, dense and the final fetch filter by the papers the access check maps a passage to.
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        await asyncio.to_thread(client.state["db"].write, twin_of(material))
+        from test_private_allowlist import save
+        await save(client, {"context.research_evidence": 1})  # too small to read the selection whole: searched
+        found = await pipeline.evidence(client.state, project, "minimum wages earnings", materials=[TWIN])
+        assert found["trace"]["read_directly"] is False
+        assert found["records"] and {r["material_id"] for r in found["records"]} == {TWIN}
+        assert found["trace"]["keyword"] and found["trace"]["dense"]

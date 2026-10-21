@@ -15,8 +15,8 @@ bodies it sent; and an answer's citations, resolved again or checked again.
   the project (workflow `citation_check`), one per batch of up to `[retrieval] judge_pairs` pairs, so
   every pair is judged: each admitted and reserved like any model call and listed with its cost; on
   `[models] judge` when it is set (a judge that cannot run fails the run, visibly), else the answer's
-  route. Each run names the exact (sentence, passage) pairs it judges, and a verdict is written only
-  to a citation that still has that sentence and passage. The passages it sends are registered with
+  route. Each run names the exact (sentence, passage) pairs it judges, by the sentence's hash and the
+  citations' ids, and a verdict is written only to a citation that still has that sentence and passage. The passages it sends are registered with
   the dispatch check, so one deleted or re-read before its dispatch stops it.
 """
 
@@ -59,11 +59,18 @@ async def trace(run_id: str, request: Request, after: int = -1, limit: int = PAG
         rows = conn.execute("SELECT seq, at, type, data FROM run_events WHERE run_id = ? AND seq > ?"
                             " ORDER BY seq LIMIT ?", (run_id, after, limit + 1)).fetchall()
         kept = {sha for (sha,) in conn.execute("SELECT sha256 FROM run_bodies WHERE run_id = ?", (run_id,))}
-        return rows, kept
-    rows, kept = await asyncio.to_thread(_state(request)["db"].read, read)
+        # A check's sentences come from the citation rows, which lose them when their paper is deleted;
+        # the event names each citation by id (backend/provenance.py).
+        sentences = dict(conn.execute(
+            "SELECT id, json_extract(context, '$.sentence') FROM citations WHERE owner_id = ?", (run_id,)).fetchall())
+        return rows, kept, sentences
+    rows, kept, sentences = await asyncio.to_thread(_state(request)["db"].read, read)
     events = []
     for seq, at, kind, data, in rows[:limit]:
         data = json.loads(data)
+        if kind == "citation_checks":
+            data["citations"] = [{**c, "sentence": sentences.get(c.get("id"))} if "id" in c else c
+                                 for c in data.get("citations", [])]
         sent = data.get("body") if kind == "model_attempt" else None
         events.append({"seq": seq, "at": at, "type": kind, "data": data,
                        "body_ref": sent if sent in kept else None, **({"body_removed": True} if sent and sent not in kept
@@ -151,7 +158,9 @@ async def check(body: Check, request: Request):
             pairs.setdefault((sentence or "", pid), [[], material])[0].append(cid)
         if not pairs:
             raise AdmissionError(409, "nothing_to_check", "The answer has no citation to check")
-        batches = citations.batches([[s, p, m, cids] for (s, p), (cids, m) in pairs.items()], size)
+        # Each pair named by its sentence's hash, never the text (backend/provenance.py)
+        batches = citations.batches([[citations.sentence_key(s), p, m, cids] for (s, p), (cids, m) in pairs.items()],
+                                    size)
         if len(batches) > len(ids):  # citations added since the count above: asked again
             raise AdmissionError(409, "changed", "The answer's citations changed; check again")
         provider, _, model = (route or ":").partition(":")

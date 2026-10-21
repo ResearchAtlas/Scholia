@@ -23,11 +23,11 @@ The answer's citations are `citations` rows (owner_kind `answer`, owner the turn
 primary commit with the answer.
 """
 
+import hashlib
 import json
-import math
 import re
 
-from backend.context import MESSAGE_FRAMING, MIN_OUTPUT, REPLY_FRAMING, count
+from backend.context import MESSAGE_FRAMING, REPLY_FRAMING, count
 from backend.evidence import CITATION
 from backend.search_index import readings, still_read
 
@@ -162,7 +162,7 @@ def check_existence(conn, project_id, text, numbered):
             kept = kept if "material_id" in kept else {}  # a deleted paper's citation keeps no link to the text
             out.append({**row, **found, "material_id": None, "material_version_id": None, "passage_id": None, **kept,
                         # its quote only while its paper is there, so a later reading holding it can resolve it
-                        **({} if kept else {"quote": None}), "existence": "source_removed"})
+                        **({} if kept else {"quote": None, "sentence": None}), "existence": "source_removed"})
     return out
 
 
@@ -183,56 +183,35 @@ JUDGE_RULES = (
     "some of it, or with conditions the sentence leaves out) or unsupported. Judge only from the passage. Reply "
     "with one line per pair, exactly in the form `N: verdict`, and nothing else."
 )
-# The most a label and its framing can add, counted (four-digit numbers, the blank line after each part).
+# The judge's share reserved with an answer (Harold, decided 2026-10-21, option C): the judge cost of a
+# typical answer's check, one call of judge_pairs pairs over every passage the request holds, each sentence
+# at TYPICAL_SENTENCE counted units (about a 40-word sentence, counted conservatively). It covers an
+# ordinary answer's check; a check that needs more draws on the answer's unspent reservation, then on the
+# budget's room (runs.Harness._reserve), and only a call neither covers is left unchecked, for budget, said.
+TYPICAL_SENTENCE = 120
 _PASSAGE_FRAME = count("Passage P9999: ") + 2
 _PAIR_FRAME = count("Pair 9999\nSentence: \nPassage: P9999") + 2
 
 
-def judge_view(sentence, units):
-    """The sentence as the judge is shown it: whole, or cut at a character so that it counts at most units."""
-    if count(sentence) <= units:
-        return sentence
-    cut = sentence
-    while cut and count(cut + "…") > units:
-        cut = cut[:max(0, min(len(cut) - 1, int(len(cut) * 0.9)))]
-    return cut + "…"
-
-
-def judge_request(batch, texts, units):
+def judge_request(batch, texts):
     """The judge's request text for a batch of (sentence, passage id) pairs: each passage the batch cites once,
-    labeled, then the pairs, each sentence cut to units (judge_view); texts maps a passage id to its text."""
+    labeled, then the pairs, each sentence as delivered (section 6.2: the wording actually delivered); texts
+    maps a passage id to its text."""
     labels = {}
     for _, pid in batch:
         labels.setdefault(pid, f"P{len(labels) + 1}")
     parts = [f"Passage {label}: {texts[pid]}" for pid, label in labels.items()]
-    parts += [f"Pair {i}\nSentence: {judge_view(sentence, units)}\nPassage: {labels[pid]}"
+    parts += [f"Pair {i}\nSentence: {sentence}\nPassage: {labels[pid]}"
               for i, (sentence, pid) in enumerate(batch, start=1)]
     return "\n\n".join(parts)
 
 
-def judge_bound(passages, pairs, units):
-    """An upper bound on the counted input of any judge request (context.serialized_tokens) of at most `pairs`
-    pairs over these passage texts: the rules, the `pairs` largest passages once each with their labels (a
-    request shows only the passages its pairs cite), each pair at its sentence's cut and its framing, the two
-    messages' framing and the reply's. Each part is counted on its own: context.count of their join is not above
-    the sum because judge_request joins them only at ": ", a line's end or a blank line, never letter to letter
-    (a join inside a run of ASCII letters could count more than its parts), and labels and pair numbers have at
-    most four digits ([retrieval] judge_pairs is at most 9999)."""
-    largest = sorted((count(text) + _PASSAGE_FRAME for text in passages), reverse=True)[:pairs]
-    return (count(JUDGE_RULES) + sum(largest) + pairs * (units + _PAIR_FRAME) + 2 * MESSAGE_FRAMING
-            + REPLY_FRAMING)
-
-
-def judge_plan(passages, *, window, margin_percent, pairs, units):
-    """(pairs per call, the input bound of one call, the passage texts a call can hold) for an answer whose
-    evidence is these passage texts, on a judge route of this window: only passages one pair of which fits
-    the window at the least output limit (a pair citing another is left unchecked); judge_pairs, halved until
-    a call of that many fits; (0, 0, ()) when no pair fits. The judge's share is calls x one call's bound."""
-    room = window - MIN_OUTPUT - math.ceil(window * margin_percent / 100)
-    fitting = [text for text in passages if judge_bound([text], 1, units) <= room]
-    while pairs >= 1 and judge_bound(fitting, pairs, units) > room:
-        pairs //= 2
-    return (pairs, judge_bound(fitting, pairs, units), frozenset(fitting)) if pairs and fitting else (0, 0, frozenset())
+def typical_judge_input(passages, pairs):
+    """The counted input of a typical judge call for an answer whose evidence is these passage texts: the
+    rules, every passage once with its label, `pairs` sentences of TYPICAL_SENTENCE units with their framing,
+    and the messages' framing (the share's rule, above)."""
+    return (count(JUDGE_RULES) + sum(count(text) + _PASSAGE_FRAME for text in passages)
+            + pairs * (TYPICAL_SENTENCE + _PAIR_FRAME) + 2 * MESSAGE_FRAMING + REPLY_FRAMING)
 
 
 def parse_verdicts(reply, count):
@@ -245,6 +224,12 @@ def parse_verdicts(reply, count):
     return found
 
 
+def sentence_key(sentence):
+    """What a citation check stores to bind a verdict to its sentence: the sentence's SHA-256, never the text
+    (backend/provenance.py: rows and events that cannot lose text when its source is deleted never hold it)."""
+    return hashlib.sha256((sentence or "").encode("utf-8")).hexdigest()
+
+
 def batches(items, size):
     return [items[i:i + size] for i in range(0, len(items), size)]
 
@@ -255,14 +240,14 @@ def apply_verdicts(checked, verdicts):
              if c["existence"] == "ok" else "unchecked"} for c in checked]
 
 
-def write_rows(conn, run_id, checked, checked_at, new_id):
-    """The answer's citation rows, in the primary commit."""
+def write_rows(conn, run_id, checked, checked_at):
+    """The answer's citation rows, each under its id (c["id"]), in the primary commit."""
     for c in checked:
         conn.execute(
             "INSERT INTO citations (id, owner_kind, owner_id, material_id, material_version_id, passage_id, quote,"
             " context, page, evidence_type, existence, support, support_run_id, checked_at)"
             " VALUES (?, 'answer', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (new_id(), run_id, c.get("material_id"), c.get("material_version_id"), c.get("passage_id"), c.get("quote"),
+            (c["id"], run_id, c.get("material_id"), c.get("material_version_id"), c.get("passage_id"), c.get("quote"),
              json.dumps({"marker": c["marker"], "offset": c["offset"], "sentence": c["sentence"],
                          "retraction": c.get("retraction")}),
              c.get("page"), c.get("evidence_type"), c["existence"], c.get("support", "unchecked"),

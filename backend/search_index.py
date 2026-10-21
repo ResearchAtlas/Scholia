@@ -990,38 +990,37 @@ class SearchIndex:
 
     # Search
 
-    def keyword(self, project_id, query, limit, materials=None):
+    def keyword(self, project_id, query, limit, passages=None):
         """BM25's top passage ids in the project for the typed query, best first, references left out;
-        with materials, only those papers' passages (S1-19: a selection)."""
+        with passages, only those (S1-19: a selection's, as the main database's access check maps them: an
+        index row names one of the papers reading its passage)."""
         expression = match(query)
         if expression is None:
             return []
-        within = "" if materials is None else (" AND rowid IN (SELECT id FROM index_rows WHERE project_id = ?"
-                                               " AND material_id IN (SELECT value FROM json_each(?)))")
-        args = (expression, project_id, project_id, *(() if materials is None else (project_id, json.dumps(list(materials)))),
-                limit)
+        within = "" if passages is None else " AND passage_id IN (SELECT value FROM json_each(?))"
+        args = (expression, project_id, project_id, *(() if passages is None else (json.dumps(sorted(passages)),)), limit)
         return [pid for (pid,) in self._read(lambda conn: conn.execute(
             "SELECT passage_id FROM fts_passages WHERE fts_passages MATCH ? AND project_id = ?"
             " AND rowid NOT IN (SELECT id FROM index_rows WHERE project_id = ? AND kind = 'reference')"
             + within + " ORDER BY rank LIMIT ?", args).fetchall())]
 
-    def dense(self, project_id, vector, limit, materials=None):
+    def dense(self, project_id, vector, limit, passages=None):
         """The nearest embedded passage ids in the project to vector, nearest first (references have none);
-        with materials, the nearest of those papers' own passages (S1-19: a selection), by the same cosine
-        distance, over every embedded passage of theirs."""
+        with passages, the nearest of those (S1-19: a selection's), by the same cosine distance, over every
+        embedded one of them."""
         if not self.vectors:
             return []
         if len(vector) != DIMENSIONS or not 0 <= limit <= 4096:  # refused before the read (vec0's largest k is 4096):
             raise ValueError(f"a query of {len(vector)} dimensions for {limit}")  # an error it met would be damage
-        if materials is None:
+        if passages is None:
             return [pid for (pid,) in self._read(lambda conn: conn.execute(
                 "SELECT passage_id FROM vec_passages WHERE embedding MATCH ? AND k = ? AND project_id = ? ORDER BY distance",
                 (sqlite_vec.serialize_float32(vector), limit, project_id)).fetchall())]
         return [pid for (pid,) in self._read(lambda conn: conn.execute(
             "SELECT v.passage_id FROM index_rows r JOIN vec_passages v ON v.rowid = r.id"
-            " WHERE r.project_id = ? AND r.material_id IN (SELECT value FROM json_each(?))"
+            " WHERE r.project_id = ? AND r.passage_id IN (SELECT value FROM json_each(?))"
             " ORDER BY vec_distance_cosine(v.embedding, ?), v.rowid LIMIT ?",
-            (project_id, json.dumps(list(materials)), sqlite_vec.serialize_float32(vector), limit)).fetchall())]
+            (project_id, json.dumps(sorted(passages)), sqlite_vec.serialize_float32(vector), limit)).fetchall())]
 
     def counts(self, project_id):
         """{material id: (indexed, embedded, embeddable, refused)} for the project's rows."""

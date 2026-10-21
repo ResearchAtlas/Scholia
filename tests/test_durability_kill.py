@@ -10,6 +10,7 @@ with no attempt left marked interrupted.
 """
 
 import asyncio
+import json
 import signal
 import subprocess
 import sys
@@ -189,7 +190,14 @@ async def test_killed_during_the_answer_call(tmp_path):
         assert turn == [("interrupted", 0)] and title == []
         [(status, settled, basis)] = spending
         assert (status, basis) == ("settled", "estimated") and settled > 0
-        assert attempts == 0  # the attempt in flight left no record: its cost stays unknown
+        # The attempt in flight is recorded at recovery from the body kept before it was sent (S1-19b), with
+        # its charge unknown: its cost stays its estimate.
+        assert attempts == 1
+        [(data,)] = await rows(client, "SELECT data FROM run_events WHERE type = 'model_attempt'")
+        attempt = json.loads(data)
+        assert (attempt["outcome"], attempt["charge"], len(attempt["body"])) == ("interrupted", "unknown", 64)
+        [(kept,)] = await rows(client, "SELECT count(*) FROM run_bodies")
+        assert kept == 1  # its exact text, in the trace
         assert provider.chats == []
         [(conversation_id,)] = await rows(client, "SELECT id FROM conversations")
         assert (await send(client, conversation_id, "again"))[-1]["status"] == "succeeded"

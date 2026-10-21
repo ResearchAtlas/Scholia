@@ -128,80 +128,101 @@ async def test_a_chinese_question_over_an_english_paper_is_cited_and_judged(tmp_
         assert json.loads(json.dumps(provider.judged[0]))["messages"][-1]["content"].count("Pair ") == 1
 
 
-# The judge's cap and its share (coordinator's reading B, 2026-10-21): at most judge_calls calls of judge_pairs
-# pairs; the pairs past that are unchecked, said; the share reserved with the answer bounds every judge call.
+# The judge's budget (Harold, decided 2026-10-21, option C): every pair judged, 40 to a call, each sentence as
+# delivered; a typical check's share reserved with the answer; more from the answer's unspent reservation, then
+# the budget's room; only a call neither covers is left unchecked, for budget, said and counted in Details.
 
-@pytest.mark.parametrize("pairs, over", [(80, 0), (81, 1)])
-async def test_eighty_pairs_are_judged_in_two_calls_and_the_eighty_first_is_left_unchecked_and_said(tmp_path, pairs, over):
-    text = " ".join(f"Claim {n} holds [S1.1]." for n in range(1, pairs + 1))
-    provider = Provider(answer_text=text)
+LONG = "and the effect held in every region, every year and every firm size of the synthetic panel " * 4
+
+
+def long_answer(pairs):
+    return " ".join(f"Claim {n} holds {LONG}[S1.1]." for n in range(1, pairs + 1))
+
+
+async def checked_turn(client, conversation, stream):
+    turn = await turn_of(client, conversation)
+    steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events WHERE run_id = ?"
+                                                          " AND type = 'step_started' ORDER BY seq", stream[0]["run_id"])]
+    [(checks,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'citation_checks'",
+                             stream[0]["run_id"])
+    return turn, steps, json.loads(checks)["pairs"]
+
+
+async def probe(client, text):
+    """The answer step's estimate and the judge's share for this answer, from a turn in a project of its own."""
+    project, _ = await with_papers(client, WAGES)
+    conversation = await conversation_in(client, project)
+    stream = await send(client, conversation, QUESTION)
+    _, steps, _ = await checked_turn(client, conversation, stream)
+    return steps[0]["estimate_usd"], steps[0]["allowance_usd"]
+
+
+async def project_with_budget(client, budget):
+    project, _ = await with_papers(client, WAGES)
+    current = (await client.get("/api/settings", params={"project_id": project})).json()
+    response = await client.put("/api/settings", json={"project_id": project, "hash": current["hash"],
+                                                       "updates": {"project.budget_usd": round(budget, 6)}})
+    assert response.status_code == 200, response.text
+    return project
+
+
+async def test_eighty_one_pairs_are_all_judged_in_calls_of_forty_and_a_long_sentence_whole(tmp_path):
+    provider = Provider(answer_text=long_answer(81))
     async with cited(tmp_path, provider) as client:
         project, _ = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, QUESTION)
-        assert [b["messages"][-1]["content"].count("Pair ") for b in provider.judged] == [40, 40]
-        turn = await turn_of(client, conversation)
-        supports = [c["support"] for c in turn["citations"]]
-        assert supports.count("supported") == 80 and supports.count("unchecked") == over
-        notices = turn["answer"].get("notices", [])
-        assert ("citations_over_limit" in notices) == bool(over) and "unchecked" not in notices  # distinct
-        [(checks,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'citation_checks'",
-                                 stream[0]["run_id"])
-        assert json.loads(checks).get("over_limit", 0) == over
-        steps = [json.loads(d) for (d,) in await rows(client, "SELECT data FROM run_events WHERE run_id = ?"
-                                                              " AND type = 'step_started' ORDER BY seq", stream[0]["run_id"])]
-        share = steps[0]["allowance_usd"]
-        assert sum(step["estimate_usd"] for step in steps if step["phase"] == "judge") <= share  # within the share
+        assert [b["messages"][-1]["content"].count("Pair ") for b in provider.judged] == [40, 40, 1]
+        assert f"Claim 81 holds {LONG}[S1.1]." in provider.judged[-1]["messages"][-1]["content"]  # whole, as delivered
+        turn, _, pairs = await checked_turn(client, conversation, stream)
+        assert {c["support"] for c in turn["citations"]} == {"supported"} and "notices" not in turn["answer"]
+        assert pairs == {"judged": 81, "failed": 0, "budget": 0}
 
 
-async def test_a_judge_calls_estimate_never_exceeds_its_part_of_the_share_at_the_caps_worst_case():
-    # The largest passages the evidence allows, the most pairs the cap allows, and sentences far past the cut
-    # in text our counting finds dearest (upper case, digits, punctuation, Han, emoji, space runs).
-    from backend import budget_router, context, settings
-    from backend.citations import JUDGE_RULES, batches, judge_plan, judge_request
-    retrieval = settings._RETRIEVAL
-    pairs, calls, units = retrieval["judge_pairs"][0], retrieval["judge_calls"][0], retrieval["judge_sentence_units"][0]
-    dear = "ABC 123 !? 工资 😀    " * 200
-    passages = {f"p{i}": dear[:2000 - i] for i in range(8)}
-    rates = {"input": 3e-6, "output": 15e-6, "request": 0.0}
-    for window in (8192, 16384, 32768, 131072):
-        size, bound, fitting = judge_plan(list(passages.values()), window=window, margin_percent=5, pairs=pairs,
-                                          units=units)
-        assert size >= 1
-        share = calls * budget_router.request_cost(rates, bound, context.MIN_OUTPUT)
-        usable = [pid for pid, text in passages.items() if text in fitting]
-        wanted = [(dear * 3 + f" {n}", usable[n % len(usable)]) for n in range(calls * size)]
-        spent = 0.0
-        for batch in batches(wanted, size):
-            request = context.assemble("judge", window=window, output=context.MIN_OUTPUT,
-                                       budgets={k: v[0] for k, v in settings._CONTEXT.items()},
-                                       margin_percent=5, system_rules=JUDGE_RULES,
-                                       request=judge_request(batch, passages, units))
-            assert request.input_tokens <= bound and request.max_tokens == context.MIN_OUTPUT
-            spent += budget_router.request_cost(rates, request.input_tokens, request.max_tokens)
-        assert spent <= share + 1e-12, window
-
-
-async def test_a_sentence_the_judge_sees_only_in_part_is_at_most_partly_supported_and_counted(tmp_path):
-    long = "Minimum wages raise earnings " + "and the effect holds across every region of the panel " * 20
-    provider = Provider(answer_text=f"{long}[S1.1]. Short claim [S1.1].")
+async def test_a_check_past_its_share_is_funded_from_the_answers_unspent_reservation(tmp_path):
+    provider = Provider(answer_text=long_answer(41))
     async with cited(tmp_path, provider) as client:
-        project, _ = await with_papers(client, WAGES)
-        await setting(client, "retrieval.judge_sentence_units", 40)
-        conversation = await conversation_in(client, project)
+        answer, share = await probe(client, None)
+        tight = await project_with_budget(client, answer + share)  # just the answer and the share
+        provider.judged.clear()
+        conversation = await conversation_in(client, tight)
         stream = await send(client, conversation, QUESTION)
-        [judged] = provider.judged
-        assert long not in judged["messages"][-1]["content"] and "…" in judged["messages"][-1]["content"]
-        turn = await turn_of(client, conversation)
-        assert [c["support"] for c in turn["citations"]] == ["partly", "supported"]
-        [(checks,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'citation_checks'",
-                                 stream[0]["run_id"])
-        assert json.loads(checks)["cut_sentences"] == 1
+        turn, steps, pairs = await checked_turn(client, conversation, stream)
+        judge_steps = [s for s in steps if s["phase"] == "judge"]
+        assert judge_steps[0]["estimate_usd"] > share and judge_steps[0]["funded"] == "answer_unspent"
+        assert pairs == {"judged": 41, "failed": 0, "budget": 0} and "notices" not in turn["answer"]
 
 
-async def test_a_passage_too_large_for_the_judges_window_leaves_only_its_own_pairs_unchecked():
-    from backend.citations import judge_plan
-    small, huge = "A short passage.", "x " * 20000
-    size, bound, fitting = judge_plan([small, huge], window=8192, margin_percent=5, pairs=40, units=300)
-    assert size >= 1 and fitting == {small} and bound < 8192
-    assert judge_plan([huge], window=8192, margin_percent=5, pairs=40, units=300) == (0, 0, frozenset())
+async def test_a_check_past_the_share_and_the_answers_unspent_is_funded_from_the_budgets_room(tmp_path):
+    provider = Provider(answer_text=long_answer(41))
+    async with cited(tmp_path, provider) as client:
+        answer, share = await probe(client, None)
+        provider.cost = answer  # the answer settles at its whole estimate: nothing unspent
+        roomy = await project_with_budget(client, 40 * answer)
+        conversation = await conversation_in(client, roomy)
+        stream = await send(client, conversation, QUESTION)
+        turn, steps, pairs = await checked_turn(client, conversation, stream)
+        assert [s for s in steps if s["phase"] == "judge"][0]["funded"] == "budget"
+        assert pairs == {"judged": 41, "failed": 0, "budget": 0}
+
+
+async def test_a_check_nothing_can_fund_is_left_unchecked_for_budget_and_said_never_past_the_budget(tmp_path):
+    provider = Provider(answer_text=long_answer(41))
+    async with cited(tmp_path, provider) as client:
+        answer, share = await probe(client, None)
+        provider.cost = answer  # nothing unspent
+        budget = answer + share
+        tight = await project_with_budget(client, budget)
+        provider.judged.clear()
+        conversation = await conversation_in(client, tight)
+        stream = await send(client, conversation, QUESTION)
+        assert stream[-1]["status"] == "succeeded" and provider.judged == []
+        turn, _, pairs = await checked_turn(client, conversation, stream)
+        assert pairs == {"judged": 0, "failed": 0, "budget": 41}
+        assert "unchecked_budget" in turn["answer"]["notices"] and "unchecked" not in turn["answer"]["notices"]
+        assert {c["support"] for c in turn["citations"]} == {"unchecked"}
+        [(spent,)] = await rows(client, "SELECT coalesce(sum(CASE status WHEN 'settled' THEN settled_usd WHEN 'open'"
+                                        " THEN estimate_usd ELSE 0 END), 0) FROM budget_reservations WHERE project_id = ?",
+                                tight)
+        assert spent <= budget + 1e-9 and await rows(
+            client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(0,)]

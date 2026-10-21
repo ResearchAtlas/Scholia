@@ -542,12 +542,16 @@ def _resolve(conn, sha256, extractor, extraction_id):
             (sha256,)).fetchall():
         if kind not in extraction.EXTRACTORS or extraction.extractor_of(kind) != extractor:  # not its reading
             continue
-        found = conn.execute("SELECT id, page FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
+        found = conn.execute("SELECT id, page, text FROM passages WHERE extraction_id = ? AND instr(text, ?) > 0"
                              " ORDER BY page IS NOT ?, ordinal LIMIT 1", (extraction_id, quote, page)).fetchone()
         if found is not None:
+            # S1-19b: a support verdict was given for the passage's whole text; it stands only when the passage
+            # found is that text (the quote held it all), else the citation is unchecked until checked again.
             conn.execute("UPDATE citations SET passage_id = ?, page = coalesce(?, page),"
-                         " existence = CASE existence WHEN 'not_found' THEN 'ok' ELSE existence END WHERE id = ?",
-                         (*found, citation))
+                         " existence = CASE existence WHEN 'not_found' THEN 'ok' ELSE existence END,"
+                         " support = CASE WHEN ? THEN support ELSE 'unchecked' END,"
+                         " support_run_id = CASE WHEN ? THEN support_run_id END WHERE id = ?",
+                         (found[0], found[1], found[2] == quote, found[2] == quote, citation))
 
 
 async def read_outdated(harness):
