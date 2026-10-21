@@ -319,9 +319,9 @@ class SyntheticProvider(MockProvider):
 
 
 VERDICTS = ("supported", "partly", "unsupported")
-CITED = ("The synthetic notes report that wage floors raised the earnings of low-paid workers {0}.",
-         "They report that employment fell slightly in the smallest firms {1}.",
-         "They also report that prices fell in every region {2}.")  # the judge finds this one unsupported
+CITED = ("The synthetic notes report that wage floors raised the earnings of low-paid workers {}.",
+         "They report that employment fell slightly in the smallest firms {}.",
+         "They also report that prices fell in every region {}.")  # the judge finds this one unsupported
 ABSTAIN = "Your library holds no evidence on this question, so I cannot answer it from your papers."
 
 
