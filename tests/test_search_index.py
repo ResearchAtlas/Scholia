@@ -2443,3 +2443,213 @@ async def test_a_damage_report_made_on_a_file_since_replaced_leaves_its_healthy_
         assert not index.unusable and not index.building and not index.damaged  # the replacement left alone
         assert index._rebuild_retry is None and os.stat(index.path).st_ino == inode
         assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+# PR 39 (findings 67 and 68), under the simplification after recheck 2 (findings 72 to 74): no other connection
+# holds the index file (the folder lock; only backend/search_index.py opens it), and a Rebuild or a Retry asked while
+# the index is unusable always leads to a whole rebuild
+
+
+def test_nothing_but_the_index_module_opens_the_index_file():
+    """Finding 68 and recheck 2's 72, as an invariant: the packaged app's data folder is held by one process
+    (backend/desktop.py's exclusive flock; the walkthrough, tools, evals and tests each use a folder of their own), and
+    in the app nothing but backend/search_index.py names the index file or opens it (backups, restore, the data-folder
+    chooser and the self-test included), so no other connection ever holds it. The only other mentions, a timing
+    tool's and an eval's, take its size, and neither opens a database. A line-by-line check: an import split over
+    lines or an aliased module would pass it, which the review of each change covers."""
+    assert "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)" in (ROOT / "backend" / "desktop.py").read_text()
+    names = re.compile(r"search\.sqlite3|search_index\.(FILE|connect)\b|from backend\.search_index import[^\n]*\b(FILE|connect)\b")
+    found = []
+    for path in [*(ROOT / "backend").rglob("*.py"), *(ROOT / "tools").rglob("*.py"), *(ROOT / "evals").rglob("*.py"),
+                 ROOT / "tests" / "walkthrough.py"]:
+        if path == ROOT / "backend" / "search_index.py":
+            continue
+        for line in path.read_text().splitlines():
+            if names.search(line):
+                found.append(path.relative_to(ROOT).as_posix())
+    assert sorted(found) == ["evals/tier1.py", "tools/search_timings.py"], found
+    for where in found:  # their sizes only: no database connection in either
+        text = (ROOT / where).read_text()
+        assert "apsw" not in text and "sqlite3.connect" not in text, where
+    module = (ROOT / "backend" / "search_index.py").read_text()
+    assert "BEGIN EXCLUSIVE" not in module  # no lock probing: nothing else holds the file
+
+
+@pytest.mark.parametrize("asked", ["rebuild", "retry"])
+@pytest.mark.asyncio
+async def test_a_rebuild_or_retry_asked_while_the_index_is_unusable_rebuilds_it_now_not_at_its_retry(tmp_path,
+                                                                                                    monkeypatch, asked):
+    """Finding 67: the index unusable (a rebuilt file damaged again: discarded, its retry armed far off). An index run
+    asked otherwise (as the runs a rebuild's success asks for) does not rebuild it: it fails, and the retry waits, so a
+    file damaged again after each rebuild never loops. A Rebuild, or a Retry of that failed run, rebuilds it at once,
+    its retry cancelled; search is answered again without waiting for the timer."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        index._fresh = True  # as a file this process rebuilt, no read of it succeeded yet
+        await asyncio.to_thread(index._damaged)  # damaged again: unusable, discarded, its retry armed
+        await _until(lambda: index._rebuild_retry is not None)
+        timer = index._rebuild_retry
+        assert index.unusable and not index.path.exists()
+        from backend.search import _request
+        run = await _request(client.state["harness"], project)  # asked otherwise
+        ended = await run_finished(client, run)
+        assert (ended["status"], index.unusable, index._rebuild_retry) == ("failed", True, timer)  # waits its retry
+        if asked == "rebuild":
+            assert (await client.post(f"/api/projects/{project}/index/rebuild")).status_code == 202
+        else:
+            assert (await client.post(f"/api/runs/{run}/retry")).status_code == 201
+        await _until(lambda: not index.unusable and not index.building, timeout=20)
+        assert timer.finished.is_set() and index._rebuild_retry is None  # its retry cancelled, not waited for
+        assert index.path.exists() and await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_asked_while_the_give_up_cleans_up_is_kept_and_asked_for_once_it_ends(tmp_path, monkeypatch):
+    """Review 1's P1-2: a rebuilt file found damaged again before any read: its give-up's discard waits for a read
+    admitted before. A Rebuild asked meanwhile (no retry armed yet) is kept, and the whole rebuild is asked for once,
+    as the cleanup ends: no retry is armed, and search is answered again without waiting for one."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        reading, go, rebuilt, real_all = threading.Event(), threading.Event(), [], SearchIndex._rebuild_all
+
+        def counted(self):
+            rebuilt.append(True)
+            return real_all(self)
+        monkeypatch.setattr(SearchIndex, "_rebuild_all", counted)
+
+        def held(conn):  # a read admitted before the damage, still running
+            reading.set()
+            go.wait(20)
+            return conn.execute("SELECT 1").fetchall()
+        reader = threading.Thread(target=index._read, args=(held,))
+        reader.start()
+        assert await asyncio.to_thread(reading.wait, 20)
+        index._fresh = True  # as a file this process rebuilt, no read of it succeeded yet
+        await asyncio.to_thread(index._damaged)  # damaged again: unusable, the give-up's discard waits for the read
+        assert index.unusable and index._rebuild_retry is None
+        assert (await client.post(f"/api/projects/{project}/index/rebuild")).status_code == 202
+        assert index._asked  # kept
+        go.set()
+        await asyncio.to_thread(reader.join, 20)
+        await _until(lambda: not index.unusable and not index.building, timeout=20)
+        assert rebuilt == [True] and index._rebuild_retry is None  # asked for once, no retry armed
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_asked_during_an_outage_survives_a_failed_retry_and_is_asked_for_once_it_fails(tmp_path,
+                                                                                                        monkeypatch):
+    """Recheck 2's 74 (and review 1's other window): the index unusable, its retry's rebuild under way. A Rebuild
+    asked meanwhile, whose run starts only after that rebuild has failed: the request counts from when it was asked
+    (no cutoff a failure moves), so the whole rebuild is asked for again at once as the failed one's give-up ends,
+    not at the next retry."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index, harness = client.state["index"], client.state["harness"]
+        index._fresh = True
+        await asyncio.to_thread(index._damaged)  # damaged again: unusable, its retry armed
+        await _until(lambda: index._rebuild_retry is not None)
+        started, go, attempts, real_all = threading.Event(), threading.Event(), [], SearchIndex._rebuild_all
+
+        def failing_once(self):
+            attempts.append(True)
+            if len(attempts) == 1:
+                started.set()
+                go.wait(20)
+                raise search_index.apsw.IOError("disk I/O error")
+            return real_all(self)
+        monkeypatch.setattr(SearchIndex, "_rebuild_all", failing_once)
+        real_run, held = harness.workflows["index"], asyncio.Event()
+
+        async def late(*args):  # the Rebuild's run starts only after the retry's rebuild has failed
+            await held.wait()
+            return await real_run(*args)
+        monkeypatch.setitem(harness.workflows, "index", late)
+        retry = index._rebuild_retry
+        retry.cancel()
+        await asyncio.to_thread(retry.function)  # the retry, now: its rebuild waits, then fails
+        assert await asyncio.to_thread(started.wait, 20)
+        assert index.unusable and index._rebuild_retry is None
+        assert (await client.post(f"/api/projects/{project}/index/rebuild")).status_code == 202
+        go.set()
+        await _until(lambda: len(attempts) == 2 and not index.unusable and not index.building, timeout=20)
+        assert index._rebuild_retry is None and not index._asked  # asked for at once, once; no retry armed
+        held.set()
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
+async def test_damage_and_a_retry_after_a_rebuild_is_ready_are_never_erased_by_that_rebuild(tmp_path, monkeypatch):
+    """Recheck 2's 73: a rebuild has published its file (reads admitted) and its writer is still finishing (what
+    followed publication there: the cleanup, which erased both). In that interval the new file is found damaged again (unusable, its give-up queued) and a Retry is
+    asked. Nothing of the finished rebuild erases either: the give-up asks for the whole rebuild at once, once, for
+    that Retry, and no retry is armed."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        attempts, real_all = [], SearchIndex._rebuild_all
+
+        def counted(self):  # right after the first rebuild has published its file, from the writer: the interval
+            attempts.append(True)
+            finished = real_all(self)
+            if len(attempts) == 1:
+                self._damaged()  # damaged again before any read succeeded: unusable, the give-up queued behind
+                assert self.unusable and self.retry_rebuild()  # a Retry: kept (no retry armed yet)
+            return finished
+        monkeypatch.setattr(SearchIndex, "_rebuild_all", counted)
+        index.rebuilt = None  # no run reads the new file first: it is still fresh in the interval
+        await asyncio.to_thread(index._damaged)  # damage found: rebuilt at once
+        await _until(lambda: len(attempts) == 2 and not index.unusable and not index.building, timeout=20)
+        assert index._rebuild_retry is None and not index._asked  # the Retry asked for it at once, once
+        assert await asyncio.to_thread(index.keyword, project, "wage", 5)
+
+
+@pytest.mark.asyncio
+async def test_a_request_a_successful_rebuild_served_leaves_nothing_for_a_later_outage(tmp_path, monkeypatch):
+    """Review 3, P3-1: a Rebuild asked while a retry's rebuild runs is kept; that rebuild succeeds, which serves it
+    (cleared as it publishes). The file damaged again later, before any read: that outage waits its retry (armed,
+    no rebuild at once), since nothing asked in it."""
+    monkeypatch.setattr(search_index, "RETRY_SECONDS", (60, 60))
+    async with app(tmp_path) as client:
+        project = await project_of(client)
+        await added(client, project, WAGES)
+        await idle(client, project)
+        index = client.state["index"]
+        index.rebuilt = None  # no run reads the new file: it stays fresh
+        index._fresh = True
+        await asyncio.to_thread(index._damaged)  # damaged again: unusable, its retry armed
+        await _until(lambda: index._rebuild_retry is not None)
+        started, go, attempts, real_all = threading.Event(), threading.Event(), [], SearchIndex._rebuild_all
+
+        def held(self):
+            attempts.append(True)
+            if len(attempts) == 1:
+                started.set()
+                go.wait(20)
+            return real_all(self)
+        monkeypatch.setattr(SearchIndex, "_rebuild_all", held)
+        retry = index._rebuild_retry
+        retry.cancel()
+        await asyncio.to_thread(retry.function)  # the retry, now: its rebuild waits, then succeeds
+        assert await asyncio.to_thread(started.wait, 20)
+        assert index.retry_rebuild() and index._asked  # a Retry meanwhile: kept
+        go.set()
+        await _until(lambda: not index.unusable and not index.building, timeout=20)
+        assert not index._asked  # served by that rebuild
+        await asyncio.to_thread(index._damaged)  # a later outage: the new file damaged again before any read
+        await _until(lambda: index._rebuild_retry is not None, timeout=20)
+        assert attempts == [True] and index.unusable  # its retry armed; nothing rebuilt at once

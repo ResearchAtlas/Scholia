@@ -1466,9 +1466,11 @@ async def retry_run(run_id: str, request: Request):
     state = _state(request)
 
     def again(conn, ids):
-        row = conn.execute("SELECT json_extract(inputs, '$.retried_by') FROM runs WHERE id = ?", (run_id,)).fetchone()
+        row = conn.execute("SELECT json_extract(inputs, '$.retried_by'), workflow FROM runs WHERE id = ?",
+                           (run_id,)).fetchone()
         if row is not None and row[0] is not None:  # tried again already: that run, started if no process holds it
             answered.append(row[0])
+            indexing.append(row[1] == "index")
             return row[0], []
         registry = state["harness"].registry
         retry, refusal = _retry(conn, run_id, registry)
@@ -1495,11 +1497,14 @@ async def retry_run(run_id: str, request: Request):
                      (retried, run_id))
         if retried != ids[0]:  # the project's run an index request answered with, not recorded here
             answered.append(retried)
+        indexing.append(workflow == "index")
         return retried, [ids[0]] if retried == ids[0] else []
 
-    registry, answered = state["harness"].registry, []
+    registry, answered, indexing = state["harness"].registry, [], []
 
     async def started(retried):  # once the Retry has committed, whatever becomes of its request (record_background)
+        if any(indexing):  # an unusable index rebuilt (search.recover)
+            search.recover(state)
         if answered:  # a run it did not record, which no process may hold (a failed terminal write left it running)
             await search._started(state["harness"], retried)
     try:

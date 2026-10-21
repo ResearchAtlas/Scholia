@@ -243,6 +243,14 @@ async def _started(harness, run_id):
     return run_id
 
 
+def recover(state):
+    """A Rebuild, or a Retry of an index run, committed: while the index is unusable, its whole rebuild
+    (SearchIndex.retry_rebuild), at once or as the one under way ends unusable."""
+    index = state.get("index")
+    if index is not None and index.unusable:
+        index.retry_rebuild()
+
+
 def _installed(state):
     """Whether the search model's file is in place (S1-16's check: its size; every launch checks its hash)."""
     local = state.get("local_helper")
@@ -683,5 +691,8 @@ async def rebuild(project_id: str, request: Request):
         (inputs,) = conn.execute("SELECT inputs FROM runs WHERE id = ?", (run_id,)).fetchone()
         return (run_id, not json.loads(inputs or "{}").get("rebuild")), [ids[0]] if run_id == ids[0] else []
 
-    run_id, pending = await harness.record_background(1, record, committed=lambda result: _started(harness, result[0]))
+    async def committed(result):
+        recover(_state(request))
+        return await _started(harness, result[0])
+    run_id, pending = await harness.record_background(1, record, committed=committed)
     return {"run_id": run_id, "rebuild_pending": pending}
