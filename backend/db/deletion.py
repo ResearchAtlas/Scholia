@@ -20,6 +20,7 @@ import json
 import logging
 import weakref
 
+from backend import provenance
 from backend.extraction import EXTRACTORS, extractor_of
 
 log = logging.getLogger(__name__)
@@ -47,7 +48,10 @@ KINDS = {
 }
 
 DELETE = None
-_SOURCE_REMOVED = "material_id = NULL, material_version_id = NULL, passage_id = NULL, existence = 'source_removed'"
+# S1-19b (a deletion reaches every copy, slice 1 section 4.2): the citation keeps no quote of the source's text.
+# Its sentence too (the answer's own words, which can quote the source): backend/provenance.py's rule.
+_SOURCE_REMOVED = ("material_id = NULL, material_version_id = NULL, passage_id = NULL, quote = NULL,"
+                   " context = json_remove(coalesce(context, '{}'), '$.sentence'), existence = 'source_removed'")
 # For every foreign key into a table this service deletes from, what happens to a
 # referencing row when the row it references is deleted: DELETE, or the SET
 # clause that keeps the row and clears its link. A test checks that this covers
@@ -72,6 +76,7 @@ ON_DELETE = {
     ("runs", "source_turn_id"): DELETE,
     ("runs", "dispatched_by_run_id"): "dispatched_by_run_id = NULL",
     ("run_events", "run_id"): DELETE,
+    ("run_bodies", "run_id"): DELETE,  # S1-19b: a run's exact request bodies go with it
     ("turns", "run_id"): DELETE,
     ("turns", "retry_of_run_id"): "retry_of_run_id = NULL",
     ("candidates", "run_id"): DELETE,
@@ -84,10 +89,11 @@ ON_DELETE = {
     ("comment_threads", "run_id"): "run_id = NULL",
     ("memory_records", "created_by_run_id"): "created_by_run_id = NULL",
     # A material's versions; extractions (readings, each shared by the versions that read
-    # it) go by RULES. A citation of a deleted source keeps its quote, loses every link to
-    # the source (a passage may live on in another project's material) and shows that the
-    # source was removed.
+    # it) go by RULES. A citation of a deleted source loses its quote (S1-19b: the source's text
+    # goes everywhere) and every link to the source (a passage may live on in another project's
+    # material), and shows that the source was removed.
     ("material_versions", "material_id"): DELETE,
+    ("run_body_materials", "material_id"): DELETE,  # and every body that holds its text goes (RULES)
     ("passages", "extraction_id"): DELETE,
     ("candidates", "material_id"): "material_id = NULL",
     ("citations", "material_id"): _SOURCE_REMOVED,
@@ -145,6 +151,16 @@ RULES = (
     SELECT 'citations', rowid FROM citations
     WHERE (owner_kind = 'answer' AND owner_id IN (SELECT run_id FROM turns WHERE rowid IN {_doomed('turns')}))
     OR (owner_kind = 'artifact' AND owner_id IN (SELECT id FROM artifacts WHERE rowid IN {_doomed('artifacts')}))""",
+    # S1-19b: a request body that holds a deleted paper's passages, in every run that sent it, and that
+    # body's links to its other papers; and a body's links once no run is left to name it.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'run_bodies', rowid FROM run_bodies
+    WHERE sha256 IN (SELECT sha256 FROM run_body_materials WHERE rowid IN {_doomed('run_body_materials')})""",
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'run_body_materials', b.rowid FROM run_body_materials b
+    WHERE b.sha256 IN (SELECT sha256 FROM run_body_materials WHERE rowid IN {_doomed('run_body_materials')})
+    OR (b.sha256 IN (SELECT sha256 FROM run_bodies WHERE rowid IN {_doomed('run_bodies')})
+        AND NOT EXISTS (SELECT 1 FROM run_bodies r WHERE r.sha256 = b.sha256 AND r.rowid NOT IN {_doomed('run_bodies')}))""",
     # A project's own memory.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', rowid FROM memory_records
@@ -268,6 +284,15 @@ def _delete(conn, kind, object_id, remove_all_trace):
     _close_over(conn, edges)
 
     revoked = _revoke(conn)
+    # S1-19b: a deleted turn's judge share and its answer's unspent held open (named by its step events'
+    # allowance_id and unspent_id) are released here, while its events still say which they are; the call's
+    # own reservation settles by its id when the call returns.
+    conn.execute(
+        "UPDATE budget_reservations SET status = 'released', settled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        " WHERE status = 'open' AND id IN (SELECT value FROM run_events e, json_each(json_array("
+        "json_extract(e.data, '$.allowance_id'), json_extract(e.data, '$.unspent_id')))"
+        " WHERE e.type IN ('step_started', 'step_finished')"
+        f" AND e.run_id IN (SELECT id FROM runs WHERE rowid IN {_doomed('runs')}))")
     _queue_index_removals(conn)
     for tombstone_kind, (kind_table, title) in KINDS.items():
         conn.execute(
@@ -276,6 +301,17 @@ def _delete(conn, kind, object_id, remove_all_trace):
             f" WHERE rowid IN {_doomed(kind_table)}",
             (tombstone_kind,),
         )
+    # S1-19b (backend/provenance.py): a sentence citing a deleted source goes from every citation row holding it,
+    # those of the answer's other papers too, before the rows of the deleted source lose theirs (ON_DELETE).
+    conn.execute(f"""UPDATE citations SET context = json_remove(context, '$.sentence')
+        WHERE rowid NOT IN {_doomed('citations')} AND json_extract(context, '$.sentence') IS NOT NULL
+        AND EXISTS (SELECT 1 FROM citations d WHERE d.owner_kind = citations.owner_kind AND d.owner_id = citations.owner_id
+                    AND json_extract(d.context, '$.sentence') = json_extract(citations.context, '$.sentence')
+                    AND (d.material_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})
+                         OR d.material_version_id IN (SELECT id FROM material_versions WHERE rowid IN {_doomed('material_versions')})
+                         OR d.passage_id IN (SELECT id FROM passages WHERE rowid IN {_doomed('passages')})))""")
+    # Harold, 2026-10-21 (option A): an answer that depended on a deleted paper loses every row's text.
+    provenance.forget(conn, f"SELECT id FROM materials WHERE rowid IN {_doomed('materials')}")
     for (child, column), (parent, key) in edges.items():
         action = ON_DELETE[child, column]
         if action is not DELETE:

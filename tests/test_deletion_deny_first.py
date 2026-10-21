@@ -187,3 +187,39 @@ async def test_a_deleted_reference_files_paper_is_read_back_nowhere_and_its_merg
         kept = await rows(client, "SELECT inputs FROM runs UNION ALL SELECT data FROM run_events")
         assert not any("A Paper Already Here" in (text or "") for (text,) in kept)
         assert (await client.get(f"/api/projects/{project}/materials")).json() == {"materials": [], "asks": [], "merging": 0}
+
+
+# S1-19: a turn's evidence (L3)
+
+@pytest.mark.parametrize("when", ["after_retrieval", "after_registration"])
+async def test_a_paper_deleted_between_retrieval_and_dispatch_reaches_no_request(tmp_path, monkeypatch, when):
+    # The turn's evidence names its papers and passages on its run before the answer is sent: deleting a
+    # paper once they are named revokes the run (deletion's scope links), and one deleted before they are
+    # named is refused by the dispatch check (its passages are gone); either way nothing deleted is sent.
+    from backend import pipeline, runs as runs_module
+    from cited import ANSWER, cited, conversation_in, with_papers
+    from scholia_app import send
+    from test_search import WAGES
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        if when == "after_retrieval":
+            real = pipeline.evidence
+
+            async def then_delete(*args, **kwargs):
+                found = await real(*args, **kwargs)
+                assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+                return found
+            monkeypatch.setattr(pipeline, "evidence", then_delete)
+        else:
+            real = runs_module.Harness._register_context
+
+            async def then_delete(self, claim, numbered):
+                await real(self, claim, numbered)
+                assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+            monkeypatch.setattr(runs_module.Harness, "_register_context", then_delete)
+        stream = await send(client, conversation, "What do minimum wages do to earnings?")
+        assert client.provider.answers == []  # nothing deleted reached a request
+        assert stream[-1]["status"] in ("cancelled", "failed")
+        assert await rows(client, "SELECT count(*) FROM citations") == [(0,)]
+        assert ANSWER not in str(await rows(client, "SELECT answer FROM turns"))

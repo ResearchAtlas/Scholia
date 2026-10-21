@@ -3,8 +3,8 @@
 The review-lock preset is Local only with the function lock. In M1 the lock fails closed:
 every generative function is refused in a locked project, whatever the venue, until the
 venue rules (S1-22) relax it. That covers the direct answer and its retries (Continue) and
-titles; the router, memory extraction and subagents do not exist yet and are added with
-their PRs, behind the same dispatch check. Locking applies at once and revokes running
+titles; S1-19b adds the router, the support judge and the citation check, behind the same
+dispatch check; memory extraction and subagents come with their PRs. Locking applies at once and revokes running
 work; lifting the lock needs confirmation; both are audited, without the venue.
 """
 
@@ -180,3 +180,75 @@ async def test_a_locked_projects_conversation_moves_only_to_another_locked_proje
         assert moved.status_code == 200 and moved.json()["project_id"] == other
         back = await client.post(f"/api/conversations/{conversation}/move", json={"project_id": unlocked})
         assert back.json()["code"] == "less_strict_project"
+
+
+# S1-19b: the router, the support judge and the citation check (I11)
+
+async def router_set(client):
+    from backend import budget_router
+    current = (await client.get("/api/settings")).json()
+    model = sorted(budget_router.RECOMMENDED)[0]
+    await client.put("/api/settings", json={"hash": current["hash"], "updates": {"models.router": model}})
+
+
+async def test_a_locked_project_refuses_the_router_and_the_citation_check_before_anything_is_sent(tmp_path):
+    from cited import cited, conversation_in, with_papers
+    from test_search import WAGES
+    async with cited(tmp_path) as client:
+        await router_set(client)
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        answered = await send(client, conversation, "What does the panel show?")  # routed by the small model
+        assert answered[-1]["status"] == "succeeded"
+        sent = len(client.provider.chats)
+        assert (await lock(client, project, venue="J")).status_code == 200
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                    json={"content": "What does the panel show?"})
+        assert (refused.status_code, refused.json()["code"]) == (403, "review_locked")
+        check = await client.post("/api/citations/check", json={"run_id": answered[0]["run_id"]})
+        assert (check.status_code, check.json()["code"]) == (403, "review_locked")
+        assert len(client.provider.chats) == sent  # neither a router, an answer nor a judge call
+
+
+async def test_a_project_locked_while_its_router_call_runs_sends_nothing_more(tmp_path):
+    from cited import Provider, cited, conversation_in, is_router, with_papers
+    from test_search import WAGES
+    release = asyncio.Event()
+    provider = Provider()
+    async with cited(tmp_path, provider) as client:
+        await router_set(client)
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {"retrieval.router_ms": 5000}})
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+
+        async def held(body):
+            await release.wait()
+            return provider.answer("literature")
+        provider.replies[:] = [held]
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": "What does the panel show?"}))
+        await wait_for(lambda: any(is_router(b) for b in provider.chats))
+        assert (await lock(client, project, venue="J")).status_code == 200
+        release.set()
+        finished = events(await stream)
+        assert (finished[-1]["status"], finished[-1]["cancel_reason"]) == ("cancelled", "revoked")
+        assert provider.answers == [] and provider.judged == []
+
+
+async def test_a_project_locked_between_the_answer_and_its_judge_sends_no_judge(tmp_path):
+    from cited import cited, conversation_in, with_papers
+    from test_search import WAGES
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        provider = client.provider
+
+        async def answer_then_lock(body):
+            provider.replies.append(provider._reply)
+            assert (await lock(client, project, venue="J")).status_code == 200
+            return provider.answer("Earnings rise [S1.1].")
+        provider.replies[:] = [answer_then_lock]
+        stream = await send(client, conversation, "What do minimum wages do to earnings?")
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")
+        assert provider.judged == [] and await rows(client, "SELECT count(*) FROM citations") == [(0,)]

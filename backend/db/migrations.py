@@ -597,4 +597,27 @@ _0006 = r"""
 ALTER TABLE materials ADD COLUMN lookup_filled TEXT;
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006)
+# S1-19b: each model call's exact request body (the trace's exact outbound text, slice-1 spec F11), named
+# by its run, step and attempt, and the papers whose passages it holds, written with the attempt's record.
+# Unlike run_events, these rows can go: deleting a paper deletes every body that holds its text, in
+# every run (backend/db/deletion.py RULES), and the content store then collects the file, since a
+# deletion reaches every copy (section 4.2). run_events.body_ref is left unused.
+_0007 = r"""
+CREATE TABLE run_bodies (
+    run_id TEXT NOT NULL REFERENCES runs (id),
+    step INTEGER NOT NULL CHECK (step >= 0),
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    sha256 TEXT NOT NULL REFERENCES content_files (sha256),
+    PRIMARY KEY (run_id, step, attempt)
+) STRICT;
+CREATE INDEX run_bodies_by_sha256 ON run_bodies (sha256);
+
+CREATE TABLE run_body_materials (
+    sha256 TEXT NOT NULL,
+    material_id TEXT NOT NULL REFERENCES materials (id),
+    PRIMARY KEY (sha256, material_id)
+) STRICT;
+CREATE INDEX run_body_materials_by_material ON run_body_materials (material_id);
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007)

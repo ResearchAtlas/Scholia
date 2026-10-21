@@ -1,0 +1,200 @@
+{"id": "en-001", "language": "en", "text": "What sample sizes do these papers use?", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-002", "language": "en", "text": "Summarize the main findings of the selected papers.", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-003", "language": "en", "text": "Which of these studies report effect sizes?", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-004", "language": "en", "text": "What datasets were used here?", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-005", "language": "en", "text": "List the limitations each of these papers admits.", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-006", "language": "en", "text": "How do these papers define burnout?", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-007", "language": "en", "text": "What statistical tests did they run?", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-008", "language": "en", "text": "Do any of these report null results?", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-009", "language": "en", "text": "Pull out the reported confidence intervals.", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-010", "language": "en", "text": "What populations were studied in these?", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "en-011", "language": "en", "text": "Rewrite this paragraph so it reads more formally: our results was significant across all groups.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-012", "language": "en", "text": "Please rephrase the following sentence for clarity: the model it performs good on small data.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-013", "language": "en", "text": "Tighten this abstract to 150 words: We present a study of ...", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-014", "language": "en", "text": "Polish my introduction below, keeping the citations as they are.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-015", "language": "en", "text": "Proofread this paragraph for grammar and typos.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-016", "language": "en", "text": "Translate this paragraph into Chinese: Participants completed the survey twice.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-017", "language": "en", "text": "Translate the following into English: 本研究采用纵向设计。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-018", "language": "en", "text": "Explain this sentence in plain words: heteroskedasticity-robust standard errors were clustered by school.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-019", "language": "en", "text": "Explain the following formula to a first-year student: y = a + bx + e.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-020", "language": "en", "text": "Rewrite my methods section in the past tense.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-021", "language": "en", "text": "Can you rephrase this so a policymaker would understand it?", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-022", "language": "en", "text": "Polish this cover letter paragraph for the editor.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-023", "language": "en", "text": "Tighten the wording of my research question: what are the effects that remote work has on the productivity of people.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-024", "language": "en", "text": "Proofread the following bullet points before I send them to my supervisor.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-025", "language": "en", "text": "Translate my figure caption into English: 图2 各组的平均得分。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "en-026", "language": "en", "text": "What did we decide last time about the exclusion criteria?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-027", "language": "en", "text": "Remind me why did I drop the 2015 cohort?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-028", "language": "en", "text": "Last time you suggested a mixed model; what was the reason?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-029", "language": "en", "text": "We decided on a cutoff of 0.05 earlier, right? Why?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-030", "language": "en", "text": "Earlier we agreed to exclude conference abstracts. Does that still hold?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-031", "language": "en", "text": "Why did I choose interviews over a survey?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-032", "language": "en", "text": "Previously we settled on three themes; which were they?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-033", "language": "en", "text": "What was the outcome measure we decided to use last time?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-034", "language": "en", "text": "Last time we talked about the coding scheme. Where did we leave it?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-035", "language": "en", "text": "Why did I decide to focus on secondary schools?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-036", "language": "en", "text": "We decided to report medians instead of means. Remind me why.", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-037", "language": "en", "text": "Earlier we said the review would stop at 2020. Why that year?", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "en-038", "language": "en", "text": "Find papers on sleep deprivation and working memory.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-039", "language": "en", "text": "Search for recent studies on microplastics in drinking water.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-040", "language": "en", "text": "Look for new literature on retrieval-augmented generation for science.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-041", "language": "en", "text": "Recommend me papers about minimum wage effects in China.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-042", "language": "en", "text": "What is the latest research on CRISPR off-target effects?", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-043", "language": "en", "text": "Find me more articles like the Smith review.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-044", "language": "en", "text": "Search for studies on bilingual children's reading development.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-045", "language": "en", "text": "Look for recent papers on carbon pricing and emissions.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-046", "language": "en", "text": "Recommend papers that replicate the marshmallow test.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-047", "language": "en", "text": "Find literature on peer review bias against women.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-048", "language": "en", "text": "Any latest research on long COVID and fatigue?", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-049", "language": "en", "text": "Search for papers on teacher turnover in rural schools.", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "en-050", "language": "en", "text": "Compare the two cohort studies on smoking and lung function.", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-051", "language": "en", "text": "How does the Lee model differ from the Chen model?", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-052", "language": "en", "text": "Contrast fixed effects versus random effects as used in my papers.", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-053", "language": "en", "text": "What is the difference between these two definitions of resilience?", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-054", "language": "en", "text": "Compare the sample sizes across my library's trials.", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-055", "language": "en", "text": "Survey versus interview: which did the studies in my library favor?", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-056", "language": "en", "text": "How do the findings on remote work differ between the 2019 and 2022 papers?", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-057", "language": "en", "text": "Compare the measurement instruments used for anxiety.", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-058", "language": "en", "text": "What are the differences between the European and US results?", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-059", "language": "en", "text": "Compare how the papers handle missing data.", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-060", "language": "en", "text": "BERT vs. GPT baselines: how do the papers compare them?", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-061", "language": "en", "text": "Compare the effect sizes reported for mindfulness interventions.", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "en-062", "language": "en", "text": "I'm curious about how people use citation managers.", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "en-063", "language": "en", "text": "Something about urban heat islands interests me.", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "en-064", "language": "en", "text": "I keep thinking about trust in automated systems.", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "en-065", "language": "en", "text": "Thinking about gut microbiome and mood.", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "en-066", "language": "en", "text": "I'd like to explore how classroom noise affects attention.", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "en-067", "language": "en", "text": "Wondering about the ethics of data donation.", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "en-068", "language": "en", "text": "Interested in how small farms adapt to drought.", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "en-069", "language": "en", "text": "I want to get into the topic of open peer review.", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "en-070", "language": "en", "text": "Does my discussion section overstate the effect?", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "en-071", "language": "en", "text": "Check whether the claims in my results section are supported by my sources.", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "en-072", "language": "en", "text": "Is my literature review section missing any key papers from my library?", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "en-073", "language": "en", "text": "In my introduction, which claims still need a citation?", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "en-074", "language": "en", "text": "Does section 3 of my draft agree with the papers I cite?", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "en-075", "language": "en", "text": "Help me strengthen the argument in my limitations section.", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "en-076", "language": "en", "text": "Critique my methods section like a strict reviewer.", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "en-077", "language": "en", "text": "Give me reviewer-style criticism of my draft's theory section.", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "en-078", "language": "en", "text": "What would a skeptical reviewer say about my sampling?", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "en-079", "language": "en", "text": "Critique the argument in my second chapter.", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "en-080", "language": "en", "text": "Play devil's advocate on my main hypothesis.", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "en-081", "language": "en", "text": "What do my papers say about the effect of class size on achievement?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-082", "language": "en", "text": "Which instruments measure loneliness in older adults?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-083", "language": "en", "text": "How was attrition handled in the panel studies?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-084", "language": "en", "text": "What is the reported prevalence of myopia in children?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-085", "language": "en", "text": "Does any paper find a dose-response relationship for exercise and depression?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-086", "language": "en", "text": "What are the main criticisms of the job demands-resources model?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-087", "language": "en", "text": "How do the authors operationalize social capital?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-088", "language": "en", "text": "What evidence is there that tutoring improves math scores?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-089", "language": "en", "text": "Which papers use propensity score matching?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-090", "language": "en", "text": "What did the trial find about vitamin D and fractures?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-091", "language": "en", "text": "Can you explain how the authors measured screen time?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-092", "language": "en", "text": "Is there evidence that green spaces reduce stress?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-093", "language": "en", "text": "What does the literature say about the replication crisis in psychology?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-094", "language": "en", "text": "How large was the effect of the nudge on savings?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-095", "language": "en", "text": "What were the inclusion criteria in the meta-analysis?", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "en-096", "language": "en", "text": "Hello!", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "en-097", "language": "en", "text": "Thanks, that was helpful.", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "en-098", "language": "en", "text": "What is a p-value, in one sentence?", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "en-099", "language": "en", "text": "How do I add a reference file to Scholia?", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "en-100", "language": "en", "text": "Write a haiku about deadlines.", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "zh-001", "language": "zh", "text": "这些论文的样本量分别是多少？", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-002", "language": "zh", "text": "总结一下所选论文的主要发现。", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-003", "language": "zh", "text": "这几项研究中哪些报告了效应量？", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-004", "language": "zh", "text": "这里用了哪些数据集？", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-005", "language": "zh", "text": "列出每篇论文承认的局限性。", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-006", "language": "zh", "text": "这些论文如何定义职业倦怠？", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-007", "language": "zh", "text": "他们用了哪些统计检验？", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-008", "language": "zh", "text": "其中有没有报告阴性结果的？", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-009", "language": "zh", "text": "把报告的置信区间都找出来。", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-010", "language": "zh", "text": "这些研究的对象是哪些人群？", "selected": true, "row": "selection", "route": "literature", "needs_retrieval": true}
+{"id": "zh-011", "language": "zh", "text": "帮我改写这段话，使它更正式：我们的结果在所有组里都挺显著的。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-012", "language": "zh", "text": "润色一下我的引言，引用保持不变。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-013", "language": "zh", "text": "把下面这段翻译成英文：本研究采用纵向设计，共随访三年。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-014", "language": "zh", "text": "翻译这句话：Participants completed the survey twice.", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-015", "language": "zh", "text": "解释一下这句话：标准误按学校聚类并对异方差稳健。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-016", "language": "zh", "text": "解释下面的公式，让本科一年级学生能看懂：y = a + bx + e。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-017", "language": "zh", "text": "改写我的方法部分，统一用过去时。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-018", "language": "zh", "text": "请润色这段投稿信。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-019", "language": "zh", "text": "把这段摘要压缩到两百字以内并润色。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-020", "language": "zh", "text": "帮我把图注翻译成英文：图2 各组的平均得分。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-021", "language": "zh", "text": "改写这个研究问题，让它更简洁：远程办公对人们的工作效率有什么样的影响。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-022", "language": "zh", "text": "翻译以下要点给我的导师看。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-023", "language": "zh", "text": "解释这段话的意思：效应在控制混杂因素后减弱。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-024", "language": "zh", "text": "润色下面这几条结论。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-025", "language": "zh", "text": "把这句话改写得更通俗一些：该干预具有统计学显著性。", "selected": false, "row": "rewrite", "route": "none", "needs_retrieval": false}
+{"id": "zh-026", "language": "zh", "text": "我们上次关于排除标准是怎么决定的？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-027", "language": "zh", "text": "之前为什么把2015年的队列去掉了？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-028", "language": "zh", "text": "上次你建议用混合模型，理由是什么？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-029", "language": "zh", "text": "我们决定用0.05作为阈值，为什么？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-030", "language": "zh", "text": "之前说过不纳入会议摘要，现在还这样吗？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-031", "language": "zh", "text": "上次讨论编码方案停在哪里了？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-032", "language": "zh", "text": "我们决定报告中位数而不是均值，提醒我一下原因。", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-033", "language": "zh", "text": "之前定下的三个主题是哪三个？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-034", "language": "zh", "text": "上次我们选的结局指标是什么？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-035", "language": "zh", "text": "我之前为什么决定只看中学？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-036", "language": "zh", "text": "我们决定综述只到2020年，为什么是这一年？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-037", "language": "zh", "text": "上次说要换问卷，后来怎么定的？", "selected": false, "row": "earlier_decision", "route": "memory", "needs_retrieval": false}
+{"id": "zh-038", "language": "zh", "text": "帮我找文献：睡眠剥夺与工作记忆。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-039", "language": "zh", "text": "关于饮用水中微塑料的最新研究有哪些？", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-040", "language": "zh", "text": "找文献，主题是检索增强生成在科研中的应用。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-041", "language": "zh", "text": "中国最低工资影响的最新研究。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-042", "language": "zh", "text": "帮我找论文，关于CRISPR脱靶效应。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-043", "language": "zh", "text": "找一些和史密斯那篇综述类似的论文。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-044", "language": "zh", "text": "双语儿童阅读发展方面的最新研究。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-045", "language": "zh", "text": "碳定价与排放，帮我找文献。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-046", "language": "zh", "text": "找论文：棉花糖实验的重复研究。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-047", "language": "zh", "text": "同行评审中性别偏见的最新研究有哪些？", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-048", "language": "zh", "text": "长新冠与疲劳，有什么最新研究？", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-049", "language": "zh", "text": "帮我找文献：农村学校教师流失。", "selected": false, "row": "find_papers", "route": "find_papers", "needs_retrieval": false}
+{"id": "zh-050", "language": "zh", "text": "比较这两项关于吸烟与肺功能的队列研究。", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-051", "language": "zh", "text": "李的模型和陈的模型有什么区别？", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-052", "language": "zh", "text": "固定效应和随机效应在我的论文里用法有什么区别？", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-053", "language": "zh", "text": "这两种韧性的定义有什么区别？", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-054", "language": "zh", "text": "比较一下我文献库里各项试验的样本量。", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-055", "language": "zh", "text": "问卷和访谈，文献库里的研究更倾向哪种？比较一下。", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-056", "language": "zh", "text": "2019年和2022年关于远程办公的研究结论有什么区别？", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-057", "language": "zh", "text": "比较测量焦虑所用的量表。", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-058", "language": "zh", "text": "欧洲和美国的结果有什么区别？", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-059", "language": "zh", "text": "比较各篇论文处理缺失数据的方法。", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-060", "language": "zh", "text": "对比一下论文里BERT和GPT基线的表现。", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-061", "language": "zh", "text": "比较正念干预报告的效应量。", "selected": false, "row": "comparison", "route": "memory_literature", "needs_retrieval": true}
+{"id": "zh-062", "language": "zh", "text": "我对人们怎么使用文献管理软件挺好奇的。", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "zh-063", "language": "zh", "text": "城市热岛这个话题让我感兴趣。", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "zh-064", "language": "zh", "text": "我一直在想人们对自动化系统的信任。", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "zh-065", "language": "zh", "text": "肠道菌群和情绪的关系，想了解一下。", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "zh-066", "language": "zh", "text": "想探索一下教室噪音对注意力的影响。", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "zh-067", "language": "zh", "text": "数据捐赠的伦理问题，我有点兴趣。", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "zh-068", "language": "zh", "text": "小农户如何适应干旱，这个方向感觉不错。", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "zh-069", "language": "zh", "text": "想入门开放同行评审这个话题。", "selected": false, "row": "interest", "route": "literature", "needs_retrieval": true}
+{"id": "zh-070", "language": "zh", "text": "我的讨论部分是不是夸大了效应？", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "zh-071", "language": "zh", "text": "检查我结果部分的论断有没有文献支持。", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "zh-072", "language": "zh", "text": "我的文献综述部分有没有漏掉文献库里的重要论文？", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "zh-073", "language": "zh", "text": "引言里哪些论断还需要引用？", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "zh-074", "language": "zh", "text": "我稿子第三节和我引用的论文一致吗？", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "zh-075", "language": "zh", "text": "帮我加强局限性部分的论证。", "selected": false, "row": "manuscript", "route": "literature", "needs_retrieval": true}
+{"id": "zh-076", "language": "zh", "text": "像严格的审稿人一样批评我的方法部分。", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "zh-077", "language": "zh", "text": "给我的理论部分提一些审稿式的批评。", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "zh-078", "language": "zh", "text": "持怀疑态度的审稿人会怎么评价我的抽样？", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "zh-079", "language": "zh", "text": "批评一下我第二章的论证。", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "zh-080", "language": "zh", "text": "对我的主要假设唱唱反调。", "selected": false, "row": "critique", "route": "literature", "needs_retrieval": true}
+{"id": "zh-081", "language": "zh", "text": "我的论文里关于班级规模对成绩影响是怎么说的？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-082", "language": "zh", "text": "哪些量表用于测量老年人的孤独感？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-083", "language": "zh", "text": "面板研究是怎么处理样本流失的？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-084", "language": "zh", "text": "儿童近视的报告患病率是多少？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-085", "language": "zh", "text": "有没有论文发现运动与抑郁之间存在剂量反应关系？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-086", "language": "zh", "text": "工作要求-资源模型的主要批评有哪些？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-087", "language": "zh", "text": "作者们如何操作化社会资本？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-088", "language": "zh", "text": "有什么证据表明辅导能提高数学成绩？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-089", "language": "zh", "text": "哪些论文用了倾向得分匹配？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-090", "language": "zh", "text": "那项试验关于维生素D与骨折的发现是什么？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-091", "language": "zh", "text": "作者是怎么测量屏幕使用时间的？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-092", "language": "zh", "text": "有证据表明绿地能减轻压力吗？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-093", "language": "zh", "text": "文献对心理学可重复性危机怎么看？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-094", "language": "zh", "text": "助推对储蓄的效应有多大？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-095", "language": "zh", "text": "那篇元分析的纳入标准是什么？", "selected": false, "row": "library_question", "route": "literature", "needs_retrieval": true}
+{"id": "zh-096", "language": "zh", "text": "你好！", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "zh-097", "language": "zh", "text": "谢谢，很有帮助。", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "zh-098", "language": "zh", "text": "用一句话说说什么是p值。", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "zh-099", "language": "zh", "text": "怎么在Scholia里添加参考文献文件？", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}
+{"id": "zh-100", "language": "zh", "text": "写一首关于截止日期的打油诗。", "selected": false, "row": "no_retrieval", "route": "none", "needs_retrieval": false}

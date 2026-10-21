@@ -65,10 +65,10 @@ async def test_a_message_runs_one_turn_through_its_commit_boundaries(tmp_path):
         conversation = await new_conversation(client)
         stream = await send(client, conversation)
 
-        assert [e["type"] for e in stream] == ["run_started", "step", "chat_response", "run_finished"]
+        assert [e["type"] for e in stream] == ["run_started", "route", "step", "chat_response", "run_finished"]
         run_id = stream[0]["run_id"]
-        assert stream[2]["content"] == "An answer." and stream[2]["result_saved"] is True
-        assert stream[3] == {"type": "run_finished", "run_id": run_id, "status": "succeeded", "cost_usd": 0.002,
+        assert stream[3]["content"] == "An answer." and stream[3]["result_saved"] is True
+        assert stream[4] == {"type": "run_finished", "run_id": run_id, "status": "succeeded", "cost_usd": 0.002,
                              "accounting": {"reported_usd": 0.002, "estimated_usd": 0, "unknown_attempts": 0,
                                             "complete": True}}
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
@@ -77,7 +77,8 @@ async def test_a_message_runs_one_turn_through_its_commit_boundaries(tmp_path):
         assert await rows(client, "SELECT status, settled_usd, basis FROM budget_reservations WHERE run_id = ?",
                           run_id) == [("settled", 0.002, "reported")]
         types = [t for (t,) in await rows(client, "SELECT type FROM run_events WHERE run_id = ? ORDER BY seq", run_id)]
-        assert types == ["route", "step_started", "model_attempt", "step_finished", "run_finished"]
+        assert types == ["route", "step_started", "dispatch", "model_attempt", "step_finished", "citation_checks",
+                         "run_finished"]
         [(attempt,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
                                   run_id)
         attempt = json.loads(attempt)
@@ -231,12 +232,15 @@ async def test_cancel_during_the_model_call_ends_the_turn_and_settles_its_estima
         assert (settled, basis) == (estimate, "estimated") and estimate > 0  # never shown as $0
         [(step,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_started'", run_id)
         assert json.loads(step)["estimate_usd"] == estimate  # the request-sized estimate, settled once (S1-19)
-        # The attempt cut off in flight is recorded, content-free, with an unknown charge.
+        # The attempt cut off in flight is recorded, content-free, with an unknown charge; it names the exact
+        # text it sent (S1-19b: stored before it was sent, in the content store, never in the event).
         [(attempt,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'model_attempt'",
                                   run_id)
-        assert json.loads(attempt) == {"step": 0, "route": json.loads(attempt)["route"], "outcome": "cancelled",
+        assert json.loads(attempt) == {"step": 0, "attempt": 0, "route": json.loads(attempt)["route"], "outcome": "cancelled",
                                        "http_status": None, "dispatched": True, "charge": "unknown",
-                                       "retention": {"level": "normal"}}  # the terms it was sent under
+                                       "retention": {"level": "normal"},  # the terms it was sent under
+                                       "body": json.loads(attempt)["body"]}
+        assert len(json.loads(attempt)["body"]) == 64
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert turn["accounting"] == {"reported_usd": 0, "estimated_usd": estimate, "unknown_attempts": 1,
                                       "complete": True}
@@ -345,8 +349,8 @@ async def test_a_step_that_does_not_fit_the_budget_is_refused_before_any_call(tm
         assert response.status_code == 200, response.text
         conversation = await new_conversation(client, project_id=project)
         stream = await send(client, conversation)
-        assert [e["type"] for e in stream] == ["run_started", "limit_reached", "run_finished"]
-        assert stream[1]["budget"] == "project" and stream[-1]["status"] == "cancelled"
+        assert [e["type"] for e in stream] == ["run_started", "route", "limit_reached", "run_finished"]
+        assert stream[2]["budget"] == "project" and stream[-1]["status"] == "cancelled"
         assert provider.chats == []
         assert (await counts(client))["budget_reservations"] == 0
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
@@ -664,6 +668,8 @@ async def test_the_turn_waits_for_its_reader_before_each_step(tmp_path):
         assert first["type"] == "run_started"
         await asyncio.sleep(0.2)  # the reader is busy with the first event
         assert (await counts(client))["budget_reservations"] == 0 and client.provider.chats == []
+        assert (await anext(events_))["type"] == "route"  # the route is decided before any reservation
+        assert (await counts(client))["budget_reservations"] == 0 and client.provider.chats == []
         second = await anext(events_)
         assert second["type"] == "step"
         await asyncio.sleep(0.2)
@@ -809,7 +815,7 @@ async def test_a_turn_whose_terminal_write_fails_reads_interrupted_once_released
             claim.task = asyncio.create_task(harness._turn(claim))
             harness._request_cancel(claim, "researcher")  # its cancellation handler writes the terminal record
         else:  # a reader pulls it to its first step, which does not fit
-            assert [event["type"] async for event in harness.events(claim)] == ["run_started"]
+            assert [event["type"] async for event in harness.events(claim)] == ["run_started", "route"]
         with pytest.raises(RuntimeError):
             await claim.task
         assert not harness.registry.is_active(claim.run_id) and claim.run_id not in harness.registry.finished
@@ -936,6 +942,7 @@ async def test_a_conversation_deleted_between_reservation_and_dispatch_sends_not
         claim = await harness.admit_turn(conversation, "never sent")
         stream = harness.events(claim)
         assert (await anext(stream))["type"] == "run_started"
+        assert (await anext(stream))["type"] == "route"
         assert (await anext(stream))["type"] == "step"  # reserved; it dispatches on the next pull
         cleaning, release = threading.Event(), threading.Event()
         real = ContentStore.collect_garbage
@@ -1131,3 +1138,68 @@ async def test_an_answer_cut_at_its_output_limit_that_cannot_be_saved_keeps_its_
         assert (response["content"], response["result_saved"], response["cut"]) == ("Half an ans", False, True)
         response = next(e for e in await send(client, conversation) if e["type"] == "chat_response")
         assert response["result_saved"] is False and "cut" not in response  # a whole answer carries no mark
+
+
+# S1-19b: cited turns
+
+async def test_stop_during_the_judge_call_settles_each_step_once_and_publishes_nothing(tmp_path):
+    # L1: the answer's attempt is settled as reported, the judge's in flight at its estimate; no answer.
+    from cited import Provider, cited, conversation_in, rows, with_papers
+    from test_search import WAGES
+    release, judging = asyncio.Event(), asyncio.Event()
+
+    async def held(body):
+        judging.set()
+        await release.wait()
+        return Provider().answer("1: supported")
+    provider = Provider(verdicts=held)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": "What do minimum wages do to earnings?"}))
+        await asyncio.wait_for(judging.wait(), 10)
+        [(run_id,)] = await rows(client, "SELECT id FROM runs WHERE kind = 'turn'")
+        assert (await client.post(f"/api/runs/{run_id}/cancel")).json()["status"] == "cancelled"
+        finished = events(await stream)
+        release.set()
+        assert (finished[-1]["status"], finished[-1]["cancel_reason"]) == ("cancelled", "researcher")
+        assert await rows(client, "SELECT answer FROM turns WHERE run_id = ?", run_id) == [(None,)]
+        assert await rows(client, "SELECT count(*) FROM citations") == [(0,)]
+        spending = sorted(await rows(client, "SELECT status, basis, settled_usd > 0 FROM budget_reservations"
+                                             " WHERE run_id = ? AND status != 'released'", run_id))  # the judge's share
+        assert spending == [("settled", "estimated", 1), ("settled", "reported", 1)]
+        again = await send(client, conversation, "What do minimum wages do to earnings?")  # a new turn
+        assert again[-1]["status"] == "succeeded"
+
+
+async def test_two_conversations_of_one_project_asking_at_once_keep_their_own_citations_and_reservations(tmp_path):
+    # G8: each turn's citations and reservations stay its own.
+    from cited import Provider, cited, conversation_in, rows, with_papers
+    from test_search import WAGES, paper
+    both = asyncio.Event()
+    count = 0
+
+    async def answer(body):
+        nonlocal count
+        count += 1
+        if count == 2:
+            both.set()
+        await asyncio.wait_for(both.wait(), 10)  # both answers are in flight together
+        question = body["messages"][-1]["content"]
+        return Provider().answer("Rents rose [S1.1]." if "rents" in question else "Earnings rise [S1.1].")
+    provider = Provider(answer_text=answer)
+    async with cited(tmp_path, provider) as client:
+        project, [wages, rents] = await with_papers(client, WAGES, paper("Rents", "Housing rents rose in the city."))
+        first, second = await conversation_in(client, project), await conversation_in(client, project)
+        streams = await asyncio.gather(
+            client.post(f"/api/conversations/{first}/message/stream",
+                        json={"content": "earnings?", "material_ids": [wages]}),
+            client.post(f"/api/conversations/{second}/message/stream",
+                        json={"content": "rents?", "material_ids": [rents]}))
+        assert [events(s)[-1]["status"] for s in streams] == ["succeeded", "succeeded"]
+        for conversation, material in ((first, wages), (second, rents)):
+            [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+            assert [c["material_id"] for c in turn["citations"]] == [material]
+            assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status != 'released'",
+                              turn["run_id"]) == [(2,)]  # the answer's and the judge's; the judge's share released

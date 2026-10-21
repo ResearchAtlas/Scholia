@@ -574,37 +574,39 @@ def fuse(ranked_lists, k):
     return sorted(scores, key=lambda pid: -scores[pid])
 
 
-async def _dense(state, index, project_id, text, depth):
+async def _dense(state, index, project_id, text, depth, passages=None):
     [vector] = await local_helper.embed(state, [QUERY_INSTRUCTION + text], project_id=project_id, query=True)
-    return await asyncio.to_thread(index.dense, project_id, vector, depth)
+    return await asyncio.to_thread(index.dense, project_id, vector, depth, passages)
 
 
-async def search(state, project_id, query, limit=None):
-    """A project's passages for a typed query (see the module's docstring)."""
-    text = visible(query)
-    if text is None:
-        raise AdmissionError(400, "query_needed", "Type something to search for")
-    text = unicodedata.normalize("NFKC", text)
+async def retrieve(state, project_id, text, values, *, materials=None, depth=None):
+    """BM25 and dense candidates for an NFKC-normalized query, run concurrently, the dense side within
+    `hybrid_ms` (its query's embedding included), each list checked in the main database in the read that
+    fetches the originals (passages a current version in the project reads now, never references), and
+    with materials, only those papers' passages (a selection). Returns {"keyword", "dense": ids best first,
+    "found": {id: readings row}, "mode", "reason", "index", "coverage"}; nothing is read while the index is
+    unavailable or being rebuilt (fail closed). The answer pipeline (backend/pipeline.py) and search share it."""
     db, index = state["db"], state.get("index")
-    if await asyncio.to_thread(db.read, lambda conn: conn.execute(
-            "SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone()) is None:
-        raise AdmissionError(404, "not_found", "No such project")
-    values = load_settings(state["data_dir"]).values["retrieval"]
-    limit = min(limit or values["keep"], MAX_LIMIT)  # the setting may be larger than the API allows
     mode, reason = search_mode(state)
+    empty = {"keyword": [], "dense": [], "found": {}, "mode": mode, "reason": reason, "coverage": None}
     if index is None or index.closed or index.unusable:  # not opened, being replaced, or its rebuild failed (retried)
-        return {"results": [], "mode": mode, "reason": reason, "index": "unavailable", "coverage": None}
+        return {**empty, "index": "unavailable"}
     if index.building:  # a whole rebuild asked for or under way: nothing is read until it is done (fail closed)
-        return {"results": [], "mode": mode, "reason": reason, "index": "building", "coverage": None}
-    keyword = asyncio.ensure_future(asyncio.to_thread(index.keyword, project_id, text, values["bm25_candidates"]))
+        return {**empty, "index": "building"}
+    # A selection's passages, as the main database's access check maps them to its papers (every paper reading
+    # a passage, not the one an index row names)
+    allowed = None if materials is None else set(await asyncio.to_thread(db.read, lambda conn: readings(
+        conn, project_id, references=False, materials=materials)))
+    keyword = asyncio.ensure_future(asyncio.to_thread(
+        index.keyword, project_id, text, depth or values["bm25_candidates"], allowed))
     counts = await _counts(index, project_id)
     totals = _totals(counts)
     coverage = {"embedded": totals["embedded"], "total": totals["embeddable"], "refused": totals["refused"]}
     dense = []
     if mode == "hybrid" and coverage["embedded"]:
         try:  # the deadline covers the query's embedding: past it, keyword results, said; a helper start goes on
-            dense = await asyncio.wait_for(_dense(state, index, project_id, text,
-                                                  min(values["dense_candidates"], DENSE_LIMIT)), values["hybrid_ms"] / 1000)
+            dense = await asyncio.wait_for(_dense(state, index, project_id, text, min(
+                depth or values["dense_candidates"], DENSE_LIMIT), allowed), values["hybrid_ms"] / 1000)
         except TimeoutError:
             mode, reason = "keyword_only", "deadline"
         except HelperUnavailable as unavailable:
@@ -619,13 +621,34 @@ async def search(state, project_id, query, limit=None):
         keyword, mode, reason = [], "keyword_only", "index_unavailable"
     # Access is checked again in the main database before any passage is used, in the read that
     # fetches the originals: only passages a current version in this project reads now, no reference.
-    found = await asyncio.to_thread(db.read, lambda conn: readings(conn, project_id, {*keyword, *dense}, references=False))
-    ranked = fuse([[p for p in keyword if p in found], [p for p in dense if p in found]], values["rrf_k"])[:limit]
-    results = [{"passage_id": pid, "material_id": r[0], "title": r[1], "section_path": r[2], "kind": r[3], "text": r[4],
-                "page": r[5], "ordinal": r[6], "version_id": r[7]} for pid in ranked for r in [found[pid]]]
-    return {"results": results, "mode": mode, "reason": reason,
-            "index": "building" if index.building or index.damaged else "ready",
+    found = await asyncio.to_thread(db.read, lambda conn: readings(conn, project_id, {*keyword, *dense}, references=False,
+                                                                   materials=materials))
+    return {"keyword": [p for p in keyword if p in found], "dense": [p for p in dense if p in found], "found": found,
+            "mode": mode, "reason": reason, "index": "building" if index.building or index.damaged else "ready",
             "coverage": coverage}
+
+
+def result(pid, row):
+    """A passage as search and the answer pipeline give it."""
+    return {"passage_id": pid, "material_id": row[0], "title": row[1], "section_path": row[2], "kind": row[3],
+            "text": row[4], "page": row[5], "ordinal": row[6], "version_id": row[7]}
+
+
+async def search(state, project_id, query, limit=None):
+    """A project's passages for a typed query (see the module's docstring)."""
+    text = visible(query)
+    if text is None:
+        raise AdmissionError(400, "query_needed", "Type something to search for")
+    text = unicodedata.normalize("NFKC", text)
+    if await asyncio.to_thread(state["db"].read, lambda conn: conn.execute(
+            "SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone()) is None:
+        raise AdmissionError(404, "not_found", "No such project")
+    values = load_settings(state["data_dir"]).values["retrieval"]
+    limit = min(limit or values["keep"], MAX_LIMIT)  # the setting may be larger than the API allows
+    found = await retrieve(state, project_id, text, values)
+    ranked = fuse([found["keyword"], found["dense"]], values["rrf_k"])[:limit]
+    return {"results": [result(pid, found["found"][pid]) for pid in ranked], "mode": found["mode"],
+            "reason": found["reason"], "index": found["index"], "coverage": found["coverage"]}
 
 
 @router.post("/api/projects/{project_id}/search")
