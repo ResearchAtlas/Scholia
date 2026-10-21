@@ -142,6 +142,7 @@ _REFUSED = {  # an admission refusal's English text, by code; the interface show
     "message_over_window": "The message is too large for this model's window",
     "instructions_over_window": "The project's instructions are too large for this model's window",
     "evidence_over_window": "The evidence this needs does not fit this model's window",
+    "tools_over_window": "This model's window is too small for Scholia's tools and skills; choose one with a larger window",
 }
 
 
@@ -695,7 +696,6 @@ class Harness:
         own = project_settings.values
         limits = {k: (own.get("limits") or {}).get(k) or personal.values["limits"][k]
                   for k in ("agent_steps", "tool_calls", "turn_minutes")}  # a project's own limits first
-        rules = {k: (own.get("tools") or {}).get(k) or () for k in ("deny", "ask", "allow")}
 
         def admit(conn):
             moved = conn.execute("SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone()
@@ -726,13 +726,13 @@ class Harness:
             history = [(json.loads(u).get("text", ""), historical_citations(json.loads(a).get("text", "")))
                        for u, a, _ in kept_turns]
             history_materials = [held for _, _, held in kept_turns]  # newest first, as history is
-            # The skills its earlier answered turns activated, most recently used first: ACTIVE SKILLS, each loaded
-            # once (a skill activated mid-turn joins it from the next turn; model-route rule 5).
+            # The skills its earlier turns activated, most recently used first: ACTIVE SKILLS, each loaded once. A skill
+            # activated mid-turn joins it from the next turn, however that turn ended (model-route rule 5; K4): an
+            # activation is in runs.skills only once it was recorded.
             used = []
             for (names,) in conn.execute("SELECT r.skills FROM turns t JOIN runs r ON r.id = t.run_id WHERE"
-                                         " t.conversation_id = ? AND r.status = 'succeeded' ORDER BY t.seq DESC",
-                                         (claim.conversation_id,)):
-                used += [n for n in reversed(json.loads(names or "[]")) if n not in used]
+                                         " t.conversation_id = ? ORDER BY t.seq DESC", (claim.conversation_id,)):
+                used += [n for n in reversed(json.loads(names or "[]")) if n not in used and n in loaded]
             skill_sections = {"skill_catalog": agent.catalog(loaded), "active_skills": agent.active(loaded, used)}
             if material_ids and conn.execute(
                     "SELECT count(*) FROM materials WHERE project_id = ? AND id IN (SELECT value FROM json_each(?))",
@@ -743,22 +743,17 @@ class Harness:
             decision = router.decide(message, selected=bool(material_ids), has_materials=has_materials,
                                      small_model=router_model is not None,
                                      deadline_ms=personal.values["retrieval"]["rules_ms"])
-            # The request without its evidence: one whose own parts do not fit is refused before anything is written.
-            # A window too small for the tool definitions and skill catalog beside them runs the turn as chat with the
-            # library, as a route without tool calls does, and says skills are unavailable (S1-19c).
-            for offered in ((tools, skill_sections), ([], {})) if tools else (([], {}),):
-                try:
-                    request = context.assemble(
-                        "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
-                        margin_percent=budgets["margin_percent"], system_rules=_rules(offered[0]), request=message,
-                        sections={"agents_md": [instructions] if instructions else [], **offered[1]}, history=history,
-                        tools=offered[0])
-                    break
-                except context.OverWindow as over:  # before anything is written or sent
-                    refused = over
-            else:
-                raise AdmissionError(400, refused.code, _REFUSED[refused.code]) from None
-            skill_sections = offered[1]
+            # The request without its evidence: one whose own parts (the tool definitions and the skill catalog on a
+            # route with tools) do not fit is refused before anything is written (section 8); only a route without
+            # tool calls runs as chat with the library (section 6.2).
+            try:
+                request = context.assemble(
+                    "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
+                    margin_percent=budgets["margin_percent"], system_rules=_rules(tools), request=message,
+                    sections={"agents_md": [instructions] if instructions else [], **skill_sections}, history=history,
+                    tools=tools)
+            except context.OverWindow as over:  # before anything is written or sent
+                raise AdmissionError(400, over.code, _REFUSED[over.code]) from None
             plan.predicted_cost = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
             conn.execute(
                 "INSERT INTO runs (id, project_id, conversation_id, kind, workflow, limits, inputs)"
@@ -778,10 +773,10 @@ class Harness:
             _event(conn, claim.run_id, "route", {"route": route.key, "effort": facts["effort"], "plan": plan.to_dict(),
                                                  "window": facts["window"], "endpoints": facts["endpoints"],
                                                  "retrieval": decision})
-            return seq, request, history, decision, (history_materials, history_left_out), offered
+            return seq, request, history, decision, (history_materials, history_left_out), (used, skill_sections)
 
         router_model = visible(personal.values["models"].get("router"))
-        (seq, request, history, decision, (history_materials, history_left_out), (tools, skill_sections)), cancelled = \
+        (seq, request, history, decision, (history_materials, history_left_out), (active, skill_sections)), cancelled = \
             await self._write_through(admit)
         if cancelled:  # its request went away while the run was written: it never runs, as by Stop
             await _through(self._write(lambda conn: self._finish_turn(
@@ -794,7 +789,7 @@ class Harness:
             "instructions": instructions, "personal": personal, "table": table, "policy": policy,
             "provider": provider_config, "router_model": router_model, "history_materials": history_materials,
             "history_left_out": history_left_out, "tools": tools, "skill_sections": skill_sections, "limits": limits,
-            "tool_rules": rules, "reusable": {},
+            "reusable": {}, "active": active,
         }
         claim.admitted = time.monotonic()
         return claim
@@ -833,6 +828,7 @@ class Harness:
             emit(event)
             await claim.wanted.wait()
 
+        ctx["turn_began"], ctx["waited"] = _clock(), 0.0  # its time limit runs from here, waiting left out (_reserve)
         try:
             if claim.cancel_requested.is_set():  # stopped before it began
                 raise asyncio.CancelledError()
@@ -851,14 +847,13 @@ class Harness:
             turn = agent.Turn(self, claim, agent.Evidence(numbered), emit)
             result = await self._agent_steps(claim, ctx, turn, found, decision, request, handed)
             numbered = turn.evidence.numbered  # every passage read in the run: the pre-load and the tools'
-            if isinstance(result, str):  # stopped at a turn limit (section 13): Continue is offered
+            if result == "stopped":  # the researcher chose to stop after three failed tool calls (section 6.6)
                 final, _ = await _through(self._write(lambda conn: self._finish_turn(
-                    conn, claim.run_id, "cancelled", "limit", result, limit={result: ctx["limits"].get(result, True)},
-                    claim=claim)))
-                if final.get("cancel_reason") == "limit":  # not a Stop that came first
-                    emit({"type": "limit_reached", "limit": result})
+                    conn, claim.run_id, "cancelled", "researcher", "tool_errors", claim=claim)))
                 emit({"type": "run_finished", **final})
                 return
+            if isinstance(result, str):  # stopped at a turn limit (section 13): Continue is offered
+                raise _LimitReached(result)
             if not result.ok or visible(result.content) is None:  # tool calls alone where none were offered
                 code = result.error_kind or "malformed"
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
@@ -904,6 +899,13 @@ class Harness:
             emit({"type": "run_finished", **final})
         except asyncio.CancelledError:
             final, _ = await _through(self._stop_turn(claim))
+            emit({"type": "run_finished", **final})
+        except _LimitReached as hit:  # a turn limit (section 13), before any further dispatch: Continue is offered
+            final, _ = await _through(self._write(lambda conn: self._finish_turn(
+                conn, claim.run_id, "cancelled", "limit", hit.code, limit={hit.code: ctx["limits"].get(hit.code, True)},
+                claim=claim)))
+            if final.get("cancel_reason") == "limit":  # not a Stop that came first
+                emit({"type": "limit_reached", "limit": hit.code})
             emit({"type": "run_finished", **final})
         except spending.BudgetExceeded as exceeded:  # stopped at a limit: Continue is offered once it is raised
             final, _ = await _through(self._write(lambda conn: self._finish_turn(
@@ -1044,6 +1046,8 @@ class Harness:
         (_release_allowances)."""
         run_id = active.run_id
         context = active.context if active.context is not None else {}
+        if _past_deadline(context):  # a turn's time limit holds before every model call it makes, its judge's included
+            raise _LimitReached("turn_minutes")
 
         def reserve(conn):
             if not _running(conn, run_id) or _revoked(conn, run_id):  # deleted, ended or revoked since it was admitted
@@ -1230,6 +1234,8 @@ class Harness:
                 history=ctx["history"], tools=ctx["tools"], chain=chain)
         request = assemble(lines, numbered)
         kept = len(lines) - request.cuts.get("research_evidence", 0)
+        # the skills ACTIVE SKILLS still carries: one cut for capacity can be activated again (section 8)
+        ctx["active_kept"] = ctx["active"][:len(ctx["active"]) - request.cuts.get("active_skills", 0)]
         ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)  # newest first, as they fit
         if lines and not kept:  # the window left no room for any of it: the request says so, not "none matched"
             request = assemble([], {}, cut=True)
@@ -1283,18 +1289,17 @@ class Harness:
 
     async def _agent_steps(self, claim, ctx, turn, found, decision, request, handed):
         """The turn's steps (section 6.2): the model answers, or calls tools, which are checked, run and answered
-        in the turn's chain, each assistant step kept whole and sent back unmodified, its reasoning blocks included
-        (model-route rule 5), until an answer. Returns the answer step's result (a failure included), or the name of
-        the limit that stopped the turn: agent_steps, tool_calls, turn_minutes (time waiting on the researcher left
-        out), tool_errors (3 failed calls in a row, section 6.6) or chain_over_window (the chain no longer fits the
-        window; it is never cut or rewritten). A route without tool calls offers none: its one step is its answer."""
+        in the turn's chain, each assistant step kept whole when it arrives (_call keeps its reply) and sent back
+        unmodified, its reasoning blocks included (model-route rule 5), until an answer. Returns the answer step's
+        result (a failure included), "stopped" when the researcher chose to stop after three failed tool calls in a
+        row (section 6.6: the run stops and asks), or the name of the limit that stopped the turn: agent_steps,
+        tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
+        time limit is checked before every model call (_reserve). A route without tool calls offers none: its one
+        step is its answer."""
         limits, tools = ctx["limits"], ctx["tools"]
-        tool_router = ToolRouter(agent.REGISTRY, **ctx["tool_rules"])
-        chain, calls_made, failures, began = [], 0, 0, _clock()
+        chain, calls_made, failures = [], 0, 0
         for number in range(limits["agent_steps"]):
             if number:
-                if _clock() - began - turn.waited > limits["turn_minutes"] * 60:
-                    return "turn_minutes"
                 try:
                     _, request = self._cited_request(ctx, found, decision, chain=chain, read=turn.evidence.numbered)
                 except context.OverWindow:
@@ -1322,63 +1327,93 @@ class Harness:
             for raw in result.tool_calls:
                 if calls_made >= limits["tool_calls"]:
                     return "tool_calls"
-                if _clock() - began - turn.waited > limits["turn_minutes"] * 60:
-                    return "turn_minutes"
+                if _past_deadline(ctx):
+                    raise _LimitReached("turn_minutes")
                 calls_made += 1
-                answered = await self._tool(tool_router, raw, turn)
-                chain.append({"role": "tool", "tool_call_id": answered.id,
+                answered = await self._tool(raw, turn)
+                raw_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else ""
+                chain.append({"role": "tool", "tool_call_id": raw_id,  # the provider's own id, in the chain only
                               "content": answered.text if answered.ok else json.dumps(
                                   {"error": answered.error.type, "message": answered.error.message})})
                 failures = 0 if answered.ok else failures + 1
-                if failures >= 3:  # compact errors: three failed calls in a row stop the run (section 6.6)
-                    return "tool_errors"
+                if failures >= 3:  # compact errors: after three failed calls in a row the run stops and asks (6.6)
+                    reply = await self._ask(turn, "choice", ["continue", "stop"], {"tool_errors": failures}, None)
+                    if not reply or reply.get("option") == "stop":
+                        return "stopped"
+                    failures = 0
+                    if "text" in reply:  # the researcher's own words, for the next step
+                        chain.append({"role": "user", "content": reply["text"]})
         return "agent_steps"
 
-    async def _tool(self, tool_router, raw, turn):
-        """One tool call of the model's: parsed, checked against the project's rules (deny, then ask, then allow)
-        and the tool's schema, run, and recorded (tool_call_started, tool_result: names, ids and counts, never
-        text). Every failure is a short structured error for the model."""
+    async def _tool_rules(self, ctx):
+        """The project's `[tools]` rules as its settings say now (deny, then ask, then allow): read for each call and
+        again when an approval is answered, so a rule changed meanwhile applies."""
+        own = (await asyncio.to_thread(load_settings, self.data_dir, ctx["project_id"])).values.get("tools") or {}
+        return {k: own.get(k) or () for k in ("deny", "ask", "allow")}
+
+    async def _tool(self, raw, turn):
+        """One tool call of the model's: parsed, checked against the project's rules as they are now (deny, then ask,
+        then allow) and the tool's schema, run, and recorded (tool_call_started, tool_result: a known name, the call's
+        id in its content-free form (agent.traced_id), argument lengths and result ids and counts, never text). The
+        tool itself is given the content-free id, so nothing it records can carry the provider's. A tool the rules
+        ask about waits for the researcher's approval, and a deny that lands meanwhile wins. Every failure is a short
+        structured error for the model."""
         claim, step = turn.claim, turn.step
         call, problem = ToolParser.parse_call(raw)
-        call_id = call.id if call else (raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else "")
+        call_id = agent.traced_id(call.id if call else raw.get("id") if isinstance(raw, dict) else None)
+        if call is not None:
+            call = call.model_copy(update={"id": call_id})
         name = agent.known_name(call.name) if call else None  # never the model's own text
-        await self._record(claim, "tool_call_started", {"step": step, "call_id": agent.traced_id(call_id), "name": name,
+        await self._record(claim, "tool_call_started", {"step": step, "call_id": call_id, "name": name,
                                                         **({"arguments": agent.traced_arguments(call.arguments)}
                                                            if call and not problem else {})})
-        turn.emit({"type": "tool_call", "name": name, "call_id": agent.traced_id(call_id)})
+        turn.emit({"type": "tool_call", "name": name, "call_id": call_id})
+        tool_router = ToolRouter(agent.REGISTRY, **await self._tool_rules(turn.ctx))
         if call is None:
             result = failed(call_id, "validation_error", "Not a function call this app can run.")
         elif problem:
-            result = failed(call.id, "validation_error", "The arguments must be one JSON object.")
+            result = failed(call_id, "validation_error", "The arguments must be one JSON object.")
         elif (error := tool_router.check(call)) is not None:
-            result = ToolResult(id=call.id, ok=False, error=error)
-        elif tool_router.rule(call.name) == "ask" and \
-                (await self._ask(turn, "choice", ["allow", "decline"], {"approval": call.name}, call.id) or {}).get(
-                    "option") != "allow":
-            result = failed(call.id, "denied", "The researcher did not allow this tool call.")
+            result = ToolResult(id=call_id, ok=False, error=error)
+        elif tool_router.rule(call.name) == "ask" and not await self._approved(turn, call):
+            result = failed(call_id, "denied", "The researcher did not allow this tool call.")
         else:
             try:
                 result = await tool_router.execute(call, turn)
-            except (asyncio.CancelledError, spending.BudgetExceeded):
+            except (asyncio.CancelledError, spending.BudgetExceeded, _LimitReached):
                 raise
             except Exception as error:  # a defect in the tool: a short error for the model, the turn goes on
                 log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
-                result = failed(call.id, "tool_error", "The tool failed.")
+                result = failed(call_id, "tool_error", "The tool failed.")
         await self._record(claim, "tool_result", {
-            "step": step, "call_id": agent.traced_id(call_id), "name": name, "ok": result.ok,
+            "step": step, "call_id": call_id, "name": name, "ok": result.ok,
             **({"error": result.error.type} if result.error else {}), **({"meta": result.meta} if result.meta else {})})
         if turn.listed or result.meta.get("passages"):  # what it gave the model is covered before the next dispatch
             await self._register_context(claim, turn.evidence.numbered, turn.listed)
         return result
 
-    async def _ask(self, turn, kind, options, params, call_id, question=None):
+    async def _approved(self, turn, call):
+        """Whether the researcher allowed a call the project's rules ask about: asked on the shared confirmation (an
+        approval is a choice of allow or decline, T71:24), withdrawn when the rules for the tool change while it
+        waits, and checked against the rules again once answered: a deny wins."""
+        async def still_asked():
+            return ToolRouter(agent.REGISTRY, **await self._tool_rules(turn.ctx)).rule(call.name) == "ask"
+        reply = await self._ask(turn, "choice", ["allow", "decline"], {"approval": call.name}, call.id,
+                                applies=still_asked)
+        rule = ToolRouter(agent.REGISTRY, **await self._tool_rules(turn.ctx)).rule(call.name)
+        return rule != "deny" and (rule == "allow" or (reply or {}).get("option") == "allow")
+
+    async def _ask(self, turn, kind, options, params, call_id, question=None, applies=None):
         """Raise a shared confirmation for the turn (backend/asks.py; ticket 71: the agent's way in) and wait for its
         answer, which only the ask endpoint gives: the answer's event (an option given as its label), or None when it
         was withdrawn because the project's protection changed. The run waits `ask` meanwhile; a Stop, deletion or
         revocation ends the wait, and the turn's end closes the ask (_finish_turn). The agent's own question and
         option labels (question given) are the model's text, which may quote a paper: the append-only ask event
         names its options by number only, and the text is held in the run's inputs (`held.ask`, asks.SHOWN shows it)
-        only while the run runs, taken out at its terminal record (_let_go; backend/provenance.py)."""
+        only while the run runs, taken out at its terminal record (_let_go; backend/provenance.py). applies, if given,
+        is awaited at each look: once it says the ask no longer applies (an approval whose tool's rule changed), the
+        ask is withdrawn (`tool_rules_changed`) and None returned, as for a change of protection. call_id is the
+        content-free id (agent.traced_id), or None for the harness's own ask."""
         from backend import asks  # it imports this module
         claim = turn.claim
         holder = {}
@@ -1386,7 +1421,8 @@ class Harness:
         keys = [str(i) for i in range(1, len(options) + 1)] if labels else list(options)
 
         def raise_ask(conn):
-            holder["ask_id"] = asks.raise_ask(conn, claim.run_id, kind, keys, {**params, "call_id": agent.traced_id(call_id)},
+            holder["ask_id"] = asks.raise_ask(conn, claim.run_id, kind, keys,
+                                              {**params, **({"call_id": call_id} if call_id else {})},
                                               origin={"conversation_id": claim.conversation_id})
             if labels:
                 conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.held.ask', json(?)) WHERE id = ?",
@@ -1412,16 +1448,24 @@ class Harness:
                 return None, True
             return None, False
 
+        def withdraw(conn):  # an answer that came meanwhile is taken; else the ask is withdrawn
+            answer, done = look(conn)
+            if not done:
+                asks.withdraw(conn, claim.run_id, ask_id, "tool_rules_changed")
+            return answer
+
         try:
             while True:
                 claim.answered.clear()
                 answer, done = await self._write(look)
                 if done:
                     return answer
+                if applies is not None and not await applies():
+                    return await self._write(withdraw)
                 with suppress(TimeoutError):
                     await asyncio.wait_for(claim.answered.wait(), agent.ANSWERED_POLL_SECONDS)
         finally:
-            turn.waited += _clock() - began
+            turn.ctx["waited"] = turn.ctx.get("waited", 0.0) + _clock() - began
 
     async def _skill_activated(self, claim, skill, step):
         """Record a skill's activation (skill_activated, runs.skills): it joins ACTIVE SKILLS from the next turn."""
@@ -1645,6 +1689,12 @@ class Harness:
                 model_entry=facts["row"])
             finished = {"step": call.step, "outcome": result.error_kind or "ok",
                         **({"cut": "output_limit"} if result.cut else {})}  # stopped at its output limit
+            # S1-19c: an agent step's reply is kept whole as it arrives (model-route rule 5: each assistant step stored
+            # whole), beside its request body and under the same deletion links, whatever the turn does next.
+            reply = None
+            if request.tools and result.ok and isinstance(result.message, dict):
+                reply = await asyncio.to_thread(_stored, self.content, json.dumps(
+                    result.message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
             if output is not None and result.ok:
                 finished["output"] = output(result)
 
@@ -1656,9 +1706,11 @@ class Harness:
                     _kept_body(conn, call, number, False)
                 if exists:
                     for number, attempt in enumerate(result.attempts):
+                        answered = number == len(result.attempts) - 1 and request.tools and result.ok
                         _event(conn, active.run_id, "model_attempt", {
                             "step": call.step, "attempt": number, "route": route.key, **attempt.record(),
-                            **_kept_body(conn, call, number, attempt.dispatched)})
+                            **_kept_body(conn, call, number, attempt.dispatched),
+                            **(_keep_reply(conn, call, number, reply) if answered else {})})
                 if result.dispatched:
                     _settle_attempts(conn, call.reservation_id, facts["rates"], result.attempts)
                     if rehold is not None and exists:  # the answer's unspent, held again for its judge (_reserve)
@@ -2220,6 +2272,25 @@ def _keep_body(conn, call, number, ref):
                      [(ref, material) for material in call.materials])
 
 
+REPLY_ATTEMPT = 1000  # run_bodies keeps an agent step's reply under its attempt's number plus this
+
+
+def _keep_reply(conn, call, number, ref):
+    """An agent step's reply (the assistant message as received, reasoning blocks included), kept in run_bodies under
+    REPLY_ATTEMPT + its attempt, with the papers its request held, so a deletion of one of them removes it, as it
+    does the request body (backend/provenance.py): {"reply": sha256}, or {"reply_unavailable": True} when the
+    content store could not take it; nothing is kept once one of those papers is gone."""
+    if ref is None:
+        return {"reply_unavailable": True}
+    if not provenance.carried(conn, call.materials):
+        return {}
+    conn.execute("INSERT OR IGNORE INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
+                 (call.run_id, call.step, REPLY_ATTEMPT + number, ref))
+    conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
+                     [(ref, material) for material in call.materials])
+    return {"reply": ref}
+
+
 def _kept_body(conn, call, number, dispatched):
     """What an attempt's model_attempt event says of its exact request body (kept by _keep_body before it
     was sent): {"body": sha256} (the trace says it was removed when its row is gone with a deleted paper);
@@ -2317,6 +2388,22 @@ def replay(events):
 def _rules(tools):
     """The system rules of a step: with the agent's rules when it offers tools."""
     return SYSTEM_RULES + AGENT_RULES if tools else SYSTEM_RULES
+
+
+class _LimitReached(Exception):
+    """A turn limit reached (section 13): the turn stops at it, cancelled with cancel_reason limit."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def _past_deadline(ctx):
+    """Whether a turn has used its time limit (`turn_minutes`), time waiting on the researcher left out; never for
+    work that is not a turn's (no `turn_began`)."""
+    if not ctx or ctx.get("turn_began") is None:
+        return False
+    return _clock() - ctx["turn_began"] - ctx.get("waited", 0.0) > ctx["limits"]["turn_minutes"] * 60
 
 
 def _clock():

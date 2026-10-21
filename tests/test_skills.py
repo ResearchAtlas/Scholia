@@ -193,3 +193,16 @@ async def test_use_skill_on_an_active_skill_does_not_load_its_body_again(tmp_pat
         later = tool_messages(provider.agent_steps[4])[-1]["content"]
         assert later.startswith("The help skill is already active")  # and once it is in ACTIVE SKILLS
         assert json.dumps(provider.agent_steps[4]).count("# Using Scholia") == 1
+
+
+def test_the_help_skill_says_exactly_what_each_protection_level_sends():
+    # c1 (10): spec section 6.4, F3a and ticket 71: Private also allows declared local servers (the researcher's
+    # assurance, no retention guarantee); Local only asks before an identifier lookup; review lock looks nothing up.
+    loaded = skills.load()[0]["help"]
+    english, chinese = loaded.body, loaded.zh["body"]
+    for wrong in ("sends nothing to the internet", "only to zero-retention routes"):
+        assert wrong not in english
+    for said in ("declared runs on this machine", "not a retention guarantee", "only after asking",
+                 "sending only the identifier", "looks no identifier up"):
+        assert said in english, said
+    assert "不向互联网发送任何内容" not in chinese and "已声明" in chinese and "不是留存保证" in chinese

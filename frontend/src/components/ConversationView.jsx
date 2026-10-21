@@ -16,8 +16,8 @@ import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
-import { ACCEPT, afterRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt, readGuard,
-  pollsAsks, readAsks, watchChosen } from '../library.js';
+import { ACCEPT, afterAsksRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt,
+  readGuard, readGuardedAsks, pollsAsks, watchChosen } from '../library.js';
 import { addTo } from './Library.jsx';
 import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
@@ -28,16 +28,29 @@ const ASKS_MS = 1500; // between reads of this conversation's questions, while f
 
 // The questions raised by work started in this conversation, read again while that work goes on, or
 // until a read succeeds after one failed (afterRead, pollsAsks). Only the newest read's answer is
-// shown, and a change of conversation clears what was shown.
-function useConversationAsks(conversationId, watching) {
+// shown, and a change of conversation clears what was shown. S1-19c: a library change drops every question shown
+// and every read asked before it, as for the conversation's own turns (readGuardedAsks).
+function useConversationAsks(conversationId, watching, projectId) {
   const [known, setKnown] = useState(NO_ASKS);
   const [reads, setReads] = useState(0);
   const [asked] = useState(newest);
-  const load = useCallback(() => readAsks(asked, conversationId, (found) => {
-    setKnown((current) => afterRead(current, found));
+  const guard = useRef(null);
+  if (guard.current === null) guard.current = readGuard();
+  const load = useCallback(() => readGuardedAsks(guard.current, asked, conversationId, (found, changed) => {
+    setKnown((current) => afterAsksRead(current, found, changed));
     setReads((n) => n + 1);
   }), [conversationId, asked]);
   useEffect(() => { setKnown(NO_ASKS); load(); }, [load]);
+  useEffect(() => {
+    const changed = (event) => {
+      if (event.detail !== projectId) return;
+      guard.current.libraryChanged(); // first: a read asked before this is dropped when it arrives
+      setKnown({ ...NO_ASKS, unsure: true }); // nothing shown until a read succeeds; looked at again meanwhile
+      load();
+    };
+    libraryEvents.addEventListener('changed', changed);
+    return () => libraryEvents.removeEventListener('changed', changed);
+  }, [projectId, load]);
   useEffect(() => followAsks(conversationId, load), [conversationId, load]); // files attached here were added
   const polls = pollsAsks(known, watching);
   useEffect(() => {
@@ -61,7 +74,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const end = useRef(null);
   const [attached, setAttached] = useState(null); // what the last attach said, and the lookup it started
   // Read for the conversation attach() tags its files with: a draft's too, before the window knows it.
-  const { asks, load: loadAsks } = useConversationAsks(id, attached?.lookup);
+  const { asks, load: loadAsks } = useConversationAsks(id, attached?.lookup, projectId);
   const here = useRef(false); // still shown: a draft admitted after the researcher left selects nothing
   useEffect(() => {
     here.current = true;

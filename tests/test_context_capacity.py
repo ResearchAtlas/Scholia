@@ -296,22 +296,13 @@ async def test_an_endpoint_that_reports_no_window_needs_a_setting_which_never_ra
 
 
 @pytest.mark.asyncio
-async def test_tool_definitions_and_the_skill_catalog_are_counted_and_a_window_too_small_for_them_has_no_tools(tmp_path):
-    # S1-19c (K1, section 8): an agent step's request counts its tool definitions and holds the SKILL CATALOG; at
-    # 4,096 the definitions leave no room, so the turn runs as chat with the library and says skills are unavailable.
+async def test_tool_definitions_and_the_skill_catalog_are_counted_on_a_tool_route(tmp_path):
+    # S1-19c (K1, section 8): an agent step's request counts its tool definitions and holds the SKILL CATALOG.
     model = "google/gemini-3.1-pro-preview"
-    provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 4096}]})
+    provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 131072}]})
     async with started(tmp_path / "data", provider) as client:
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
-        stream = await send(client, conversation, "hi", model=model)
-        assert stream[-1]["status"] == "succeeded"
-        [body] = provider.answers
-        assert "tools" not in body and "SKILL CATALOG" not in body["messages"][0]["content"]
-        assert [e for e in stream if e["type"] == "chat_response"][0]["notices"] == ["skills_unavailable"]
-        provider.endpoints[model] = [{"tag": "a", "context_length": 131072}]
-        from backend import openrouter_client
-        openrouter_client.forget_endpoints(provider_route(client), model)
-        await send(client, conversation, "hi again", model=model)
+        await send(client, conversation, "hi", model=model)
         body = provider.answers[-1]
         assert body["tools"] and "## SKILL CATALOG\n- help: " in body["messages"][0]["content"]
         [step] = [json.loads(d) for (d,) in await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
@@ -319,7 +310,18 @@ async def test_tool_definitions_and_the_skill_catalog_are_counted_and_a_window_t
         assert step["input_tokens"] == context.serialized_tokens(body["messages"], body["tools"])
 
 
-def provider_route(client):
-    from backend import providers
-    from backend.settings import load_settings
-    return providers.configured(client.state["data_dir"], load_settings(client.state["data_dir"]))["openrouter"]
+@pytest.mark.asyncio
+async def test_c1_8_a_tool_route_whose_window_cannot_hold_its_tools_is_refused_before_any_call(tmp_path):
+    # Section 8: protected parts that do not fit refuse the step before paid work; chat without tools is only for a
+    # route without tool calls (section 6.2).
+    model = "google/gemini-3.1-pro-preview"
+    provider = MockProvider(endpoints={model: [{"tag": "a", "context_length": 4096}]})
+    async with started(tmp_path / "data", provider) as client:
+        conversation = (await client.post("/api/conversations", json={})).json()["id"]
+        refused = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "hi",
+                                                                                               "model": model})
+        assert (refused.status_code, refused.json()["code"]) == (400, "tools_over_window")
+        assert provider.answers == []
+        reserved = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT count(*) FROM budget_reservations").fetchone())
+        assert reserved == (0,)

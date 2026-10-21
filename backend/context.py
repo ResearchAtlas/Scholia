@@ -152,6 +152,9 @@ def assemble(function, *, window, output, budgets, system_rules, request, sectio
         if sections.get(name):
             protected[name] = count(_block(LABELS[name], sections[name])) + 2
     if sum(protected.values()) > room:
+        if tools and sum(protected.values()) - protected.get("skill_catalog", 0) <= \
+                room + framing - 2 * MESSAGE_FRAMING - REPLY_FRAMING:
+            raise OverWindow("tools_over_window")  # it would fit but for the tool definitions and the skill catalog
         # Named by what is largest: the message, the instructions around it, or the turn's own chain.
         largest = max(protected, key=protected.get)
         raise OverWindow({"current_request": "message_over_window", "chain": "chain_over_window"}.get(

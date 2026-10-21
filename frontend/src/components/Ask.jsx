@@ -35,8 +35,10 @@ export function Ask({ ask, onAnswered }) {
   const asked = t(questionKey, { count: ask.params?.identifiers ?? 0, services });
   // S1-19c: a tool the project's rules ask about before it runs is asked in the app's words, naming the tool.
   const approval = ask.params?.approval;
+  const failures = ask.params?.tool_errors; // the run stopped after tool calls failed in a row (section 6.6)
   const question = approval ? t('ask.approval.question', { tool: toolName(t, approval) })
-    : asked === questionKey ? ask.params?.question ?? '' : asked;
+    : failures ? t('ask.toolErrors.question', { count: failures })
+      : asked === questionKey ? ask.params?.question ?? '' : asked;
   // A Local only lookup of a reference file's papers says so (S1-14): its answer covers those papers.
   // S1-15: so does a Zotero import's, and a Zotero item's merge question says the record is Zotero's.
   const zotero = ask.params?.batch === 'zotero' || ask.params?.from === 'zotero';
@@ -83,7 +85,8 @@ export function Ask({ ask, onAnswered }) {
             className={i === 0 ? 'bg-brand text-brand-foreground hover:bg-brand/90' : undefined}
             onClick={() => answer({ option })}>
             {ask.params?.labels?.[option] // S1-19c: the agent's options, by number, labeled while its run waits
-              ?? named(t, approval ? `ask.approval.option.${option}` : `ask.${ask.kind}.option.${option}`, option)}
+              ?? named(t, approval ? `ask.approval.option.${option}` : failures ? `ask.toolErrors.option.${option}`
+                : `ask.${ask.kind}.option.${option}`, option)}
           </Button>
         ))}
       </div>

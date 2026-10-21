@@ -1239,7 +1239,6 @@
   "turn.limitSteps": "This turn reached its limit of steps. Continue to go on.",
   "turn.limitToolCalls": "This turn reached its limit of tool calls. Continue to go on.",
   "turn.limitMinutes": "This turn reached its time limit. Continue to go on.",
-  "turn.limitToolErrors": "Three tool calls in a row failed, so this turn stopped. Continue to try again.",
   "turn.limitChain": "This turn's work no longer fits the model's context window, so it stopped.",
   "turn.usingTool": "{tool}…",
   "tool.list_materials": "Listing your papers",
@@ -1269,5 +1268,12 @@
   "trace.pairsReused": {
     "one": "{count} reused from the library answer's check",
     "other": "{count} reused from the library answer's check"
-  }
+  },
+  "ask.toolErrors.question": {
+    "one": "A tool call failed. Should Scholia keep going?",
+    "other": "{count} tool calls in a row failed. Should Scholia keep going?"
+  },
+  "ask.toolErrors.option.continue": "Keep going",
+  "ask.toolErrors.option.stop": "Stop",
+  "errors.tools_over_window": "This model's context window is too small for Scholia's tools and skills. Pick a model with a larger window."
 }

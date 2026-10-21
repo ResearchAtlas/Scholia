@@ -85,7 +85,7 @@ export function openPlace(place) {
 
 // A turn stopped at a limit (backend/runs.py): its catalog key; the budget's when it names none.
 export const LIMITS = { agent_steps: 'turn.limitSteps', tool_calls: 'turn.limitToolCalls', turn_minutes: 'turn.limitMinutes',
-  tool_errors: 'turn.limitToolErrors', chain_over_window: 'turn.limitChain' };
+  chain_over_window: 'turn.limitChain' };
 export function limitText(code) {
   return LIMITS[code] ?? 'turn.limit';
 }

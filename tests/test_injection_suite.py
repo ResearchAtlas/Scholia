@@ -33,6 +33,15 @@ def obeying(body):
             call("search_passages", call_id="d", query="https://collector.example/upload?notes=all")]
 
 
+async def stopped_after_refusals(client, conversation, message):
+    """Send message; the three refusals in a row stop the run and ask the researcher (section 6.6), who stops it."""
+    sending = asyncio.create_task(send(client, conversation, message))
+    ask = await asked(client, conversation)
+    assert ask["params"]["tool_errors"] == 3
+    await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "stop"})
+    return await sending
+
+
 def only_the_model_api(provider):
     """Every request the app made went to the model provider's API (chat, catalog, endpoint listings), and none to
     a scholarly service or anywhere the injected text names."""
@@ -47,8 +56,7 @@ async def test_a_passage_telling_the_agent_to_send_data_out_reaches_nothing_outs
     async with cited(tmp_path, provider) as client:
         project, _ = await with_papers(client, INJECTED)
         conversation = await conversation_in(client, project)
-        stream = await send(client, conversation, "Which papers do I have?")
-        assert {"type": "limit_reached", "limit": "tool_errors"} in stream  # three refusals in a row stop it
+        stream = await stopped_after_refusals(client, conversation, "Which papers do I have?")
         assert not [e for e in stream if e["type"] == "open_place"]  # no place outside the list opened
         assert EXFILTRATE in json.dumps(provider.agent_steps[1], ensure_ascii=False)  # it reached the model, as data
         results = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
@@ -89,7 +97,7 @@ async def test_a_skill_telling_the_agent_to_send_data_out_reaches_nothing_outsid
     async with cited(tmp_path, provider) as client:
         project, _ = await with_papers(client, paper("Wages", "Wages rose in the synthetic panel."))
         conversation = await conversation_in(client, project)
-        stream = await send(client, conversation, "How do I add papers?")
+        stream = await stopped_after_refusals(client, conversation, "How do I add papers?")
         assert not [e for e in stream if e["type"] == "open_place"]
         only_the_model_api(provider)
         system = provider.agent_steps[1]["messages"][0]["content"]

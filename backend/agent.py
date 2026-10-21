@@ -86,7 +86,6 @@ class Turn:
         self.step = step
         self.listed = set()
         self.activated = set()  # the skills activated in this turn
-        self.waited = 0.0  # seconds spent waiting on the researcher, which the turn's time limit leaves out
 
     async def read(self, fn):
         return await asyncio.to_thread(self.harness.db.read, fn)
@@ -296,8 +295,9 @@ async def use_skill(call, turn):
     skill = loaded.get(call.arguments["name"])
     if skill is None:
         return failed(call.id, "validation_error", "No enabled skill has that name; use a name from the SKILL CATALOG.")
-    active = "".join(turn.ctx["skill_sections"].get("active_skills") or ())
-    if skill.name in turn.activated or f'<skill name="{skill.name}">' in active:  # loaded once per conversation
+    # loaded once per conversation: in this turn's chain, or in what ACTIVE SKILLS still carried in the last request
+    # (one cut for capacity is activated again, section 8)
+    if skill.name in turn.activated or skill.name in turn.ctx.get("active_kept", ()):
         return ToolResult(id=call.id, ok=True, text=f"The {skill.name} skill is already active; its instructions are "
                                                     "above.", meta={"skill": skill.name, "already_active": True})
     turn.activated.add(skill.name)

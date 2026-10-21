@@ -391,3 +391,146 @@ def test_a_verdict_is_reused_only_for_a_sentence_unchanged_but_for_whitespace_an
     assert _normalized("Cells  doubled\n[S1.1].") == _normalized("Cells doubled [S1.1].")
     assert _normalized("Café [S1.1]") == _normalized("Café [S1.1]")  # composed the same
     assert _normalized("10⁹ cells") != _normalized("109 cells") and _normalized("CO₂") != _normalized("CO2")
+
+
+# Review c1 (gpt-6-astra, S1-19c)
+
+
+@pytest.mark.asyncio
+async def test_c1_1_a_quoted_call_id_reaches_no_event_from_any_tool(tmp_path):
+    # Every writer of a tool-call id into an event takes its content-free form: the tools are given only that.
+    provider = Scripted([call("search_passages", call_id=QUOTE, query="minimum wages")],
+                        [call("answer_from_library", call_id=QUOTE + " again", question=QUESTION)],
+                        [call("read_passage", call_id=QUOTE + " read", material_id="nothing")],
+                        "Done.", inner=["Wages rose [S1.1]."])
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert stream[-1]["status"] == "succeeded"
+        assert tool_messages(provider.agent_steps[1])[-1]["tool_call_id"] == QUOTE  # the chain keeps the provider's id
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        kept = await rows(client, "SELECT type FROM run_events WHERE data LIKE ?", "%synthetic panel%")
+        assert kept == []
+
+
+@pytest.mark.asyncio
+async def test_c1_3_a_deny_that_lands_while_an_approval_waits_wins(tmp_path, monkeypatch):
+    from backend import agent
+    monkeypatch.setattr(agent, "ANSWERED_POLL_SECONDS", 0.05)
+    provider = Scripted([call("list_materials")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+
+        async def rules(**updates):
+            settings = (await client.get(f"/api/settings?project_id={project}")).json()
+            saved = await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                            "updates": updates})
+            assert saved.status_code == 200, saved.text
+        await rules(**{"tools.ask": ["list_materials"]})
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        await rules(**{"tools.deny": ["list_materials"]})
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "allow"})  # or withdrawn first
+        stream = await sending
+        assert stream[-1]["status"] == "succeeded"
+        [result] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
+        assert (result["ok"], result["error"]) == (False, "denied")  # the tool never ran
+        assert json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])["error"] == "denied"
+
+
+@pytest.mark.asyncio
+async def test_c1_3_an_approval_is_withdrawn_when_its_tools_rule_changes(tmp_path, monkeypatch):
+    from backend import agent
+    monkeypatch.setattr(agent, "ANSWERED_POLL_SECONDS", 0.05)
+    provider = Scripted([call("list_materials")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"tools.ask": ["list_materials"]}})
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"tools.deny": ["list_materials"]}})
+        stream = await asyncio.wait_for(sending, 20)  # withdrawn, so the turn goes on
+        events = await events_of(client, stream[0]["run_id"])
+        assert [d.get("withdrawn") for k, d, _ in events if k == "ask_answered"] == ["tool_rules_changed"]
+        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "allow"})
+        assert late.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_c1_4_the_turns_deadline_holds_before_the_final_answers_judge(tmp_path, monkeypatch):
+    from backend import runs
+    clock = [1000.0]
+    monkeypatch.setattr(runs, "_clock", lambda: clock[0])
+    marked = {"done": False}
+
+    def slow_answer(body):  # the answer takes the turn past its 15 minutes, within its own call bound
+        clock[0] += 910
+        return "Minimum wages raise the earnings of low-paid workers [S1.1]."
+    provider = Scripted(slow_answer)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, QUESTION)
+        assert {"type": "limit_reached", "limit": "turn_minutes"} in stream
+        assert provider.judged == [] and stream[-1]["cancel_reason"] == "limit"  # no judge dispatched past it
+
+
+@pytest.mark.asyncio
+async def test_c1_5_each_assistant_step_is_kept_whole_as_it_arrives_even_the_last(tmp_path):
+    marker = "UNIQUE-LAST-STEP-TEXT"
+    provider = Scripted([call("list_materials")], {"calls": [call("list_materials", call_id="c2")], "content": marker,
+                                                   "reasoning_details": REASONING})
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"limits.agent_steps": 2}})
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert {"type": "limit_reached", "limit": "agent_steps"} in stream  # no further request carries it
+        run_id = stream[0]["run_id"]
+        kept = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= 1000 ORDER BY step", run_id)
+        replies = [json.loads(await asyncio.to_thread(client.state["content"].read, sha)) for (sha,) in kept]
+        assert len(replies) == 2 and replies[-1]["content"] == marker and replies[-1]["reasoning_details"] == REASONING
+        attempts = [d for k, d, _ in await events_of(client, run_id) if k == "model_attempt"]
+        assert [a.get("reply") for a in attempts] == [sha for (sha,) in kept]  # named by hash, never by text
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200  # the papers it held go, with it
+        assert await rows(client, "SELECT count(*) FROM run_bodies WHERE run_id = ? AND attempt >= 1000", run_id) == [(0,)]
+
+
+@pytest.mark.asyncio
+async def test_c1_6_a_skill_cut_from_active_skills_for_capacity_can_be_activated_again(tmp_path):
+    provider = Scripted([call("use_skill", name="help")], "First.", [call("use_skill", call_id="c2", name="help")],
+                        "Second.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "How do I add papers?")
+        current = (await client.get("/api/settings")).json()
+        await client.put("/api/settings", json={"hash": current["hash"], "updates": {"context.active_skills": 0}})
+        await send(client, conversation, "And Zotero?")
+        assert "## ACTIVE SKILLS" not in provider.agent_steps[2]["messages"][0]["content"]  # cut for capacity
+        again = tool_messages(provider.agent_steps[3])[-1]["content"]
+        assert again.startswith('<skill name="help">')  # activated again, its body given
+
+
+@pytest.mark.asyncio
+async def test_c1_7_a_skill_activated_in_a_turn_that_ended_at_a_limit_joins_active_skills(tmp_path):
+    provider = Scripted([call("use_skill", name="help")], [call("list_materials", call_id="c2")], "Next turn.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"limits.agent_steps": 2}})
+        conversation = await conversation_in(client, project)
+        first = await send(client, conversation, "How do I add papers?")
+        assert first[-1]["cancel_reason"] == "limit"
+        await send(client, conversation, "And Zotero?")
+        assert '<skill name="help">' in provider.agent_steps[-1]["messages"][0]["content"]
