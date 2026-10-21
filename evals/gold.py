@@ -1124,18 +1124,25 @@ def agreement(set_doc, first, second):
 def tier2_queries(corrected, passage_of, project):
     """A corrected set's gold answerable questions as the queries tier1.run_arms takes, each its own
     group, with its query and document languages; each evidence item as the app's passage ids that make
-    it up (passage_of: {(paper, ordinal): passage id}), one annotator. Drafts are refused (held out)."""
+    it up (passage_of: {(paper, ordinal): the passage as read_papers gives it}), one annotator. Drafts are
+    refused (held out), and so is a locator whose passage in this reading is not its quote (letters and digits
+    compared, as resolve compares): after a reading moved it, its ordinal names another passage."""
     if corrected.get("corrected") is not True or corrected.get("kind") != "questions":
         raise Refused("tier 2 scores a corrected question set (gold.py apply), never the drafts")
     queries = []
     for item in corrected["items"]:
         if item["provisional"] or not item["answerable"]:  # provisional is not gold; unanswerable is the abstention row's
             continue
-        if missing := [loc for ev in item["evidence"] for loc in ev if (loc["paper"], loc["ordinal"]) not in passage_of]:
-            raise Refused(f"question {item['id']}: passage {missing[0]['ordinal']} of {missing[0]['paper']} is not in this reading")
+        for loc in (loc for ev in item["evidence"] for loc in ev):
+            found = passage_of.get((loc["paper"], loc["ordinal"]))
+            if found is None:
+                raise Refused(f"question {item['id']}: passage {loc['ordinal']} of {loc['paper']} is not in this reading")
+            if _key(found["text"]) != _key(loc["quote"]):
+                raise Refused(f"question {item['id']}: passage {loc['ordinal']} of {loc['paper']} is no longer its quote "
+                              "in this reading (check --pdfs reports where it moved)")
         queries.append({"key": item["id"], "text": item["text"], "group": len(queries), "project": project,
                         "query_language": item["query_language"], "document_language": item["document_language"],
-                        "annotators": [[[passage_of[(loc["paper"], loc["ordinal"])] for loc in ev]
+                        "annotators": [[[passage_of[(loc["paper"], loc["ordinal"])]["id"] for loc in ev]
                                         for ev in item["evidence"]]]})
     return queries
 

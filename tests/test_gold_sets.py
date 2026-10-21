@@ -626,13 +626,28 @@ async def test_tier_two_takes_a_corrected_sets_gold_answerable_questions_in_tier
     papers = json.loads((folder / "papers.json").read_text())["papers"]
     async with opener()(tmp_path / "data") as (client, state):
         read, project = await gold.read_papers(client, state, papers, pdfs, 2)
-        passage_of = {(pid, p["ordinal"]): p["id"] for pid, r in read.items() for p in r["passages"]}
+        passage_of = {(pid, p["ordinal"]): p for pid, r in read.items() for p in r["passages"]}
         queries = gold.tier2_queries(corrected, passage_of, project)
         assert [q["key"] for q in queries] == ["q1"]  # q2 is provisional (unlabeled), q3 unanswerable
         out = await tier1.run_arms(state, {"keyword_only": tier1.keyword_only}, queries,
                                    lambda answer, query: [r["passage_id"] for r in answer["results"]])
     scores = gold.tier2_scores(queries, out["keyword_only"]["rankings"])
     assert scores["scores"] == [1.0] and scores["recall@8"]["query_language"] == {"en": {"mean": 1.0, "n": 1}}
+
+
+def test_tier_two_refuses_a_locator_whose_passage_in_this_reading_is_not_its_quote():
+    """T8: after a reading moved a passage, the stored ordinal names another passage; tier 2 scored the
+    question against it. It is refused; the quote's own letters and digits still match through spacing."""
+    quote = "Dense retrieval found the evidence passage for 71 of 100 questions."
+    corrected = {"corrected": True, "kind": "questions", "items": [
+        {"id": "q1", "text": "How many?", "query_language": "en", "document_language": "en", "answerable": True,
+         "short_answer": "71", "provisional": False, "evidence": [[{"paper": "a", "ordinal": 2, "quote": quote}]]}]}
+    moved = {("a", 2): {"id": "a:2", "text": "Keyword retrieval missed paraphrased questions."},
+             ("a", 3): {"id": "a:3", "text": quote}}
+    with pytest.raises(tier1.Refused, match="passage 2 of a is no longer its quote"):
+        gold.tier2_queries(corrected, moved, "p")
+    same = {("a", 2): {"id": "a:2", "text": quote.replace(" 71", "  71\ufffe")}}
+    assert gold.tier2_queries(corrected, same, "p")[0]["annotators"] == [[["a:2"]]]
 
 
 def test_tier_two_recall_at_eight_follows_tier_ones_item_rule_by_language():
