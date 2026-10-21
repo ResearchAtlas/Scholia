@@ -833,6 +833,47 @@ def test_a_sentinel_whose_child_is_ended_by_its_pid_before_it_stops_is_found_lef
     assert _stopped_left({child.pid}) == []
 
 
+def test_ending_a_child_ends_a_sentinel_its_groups_first_kill_missed(monkeypatch):
+    """reading._end: a sentinel the child makes just as its group's kill comes is not ended by that kill (on
+    macOS, 31 of 1,000 such kills, timed at random against a child forking without pause, left one stopped
+    for good). The group is ended again once the child has ended, before it is reaped, which ends
+    it. Here the first kill reaches the child alone, as that fork leaves it; the stand-in sentinel stops
+    once its child is gone."""
+    command = [sys.executable, "-c", "import os, signal, time\n"
+               "pid = os.fork()\n"
+               "if pid == 0:\n"
+               "    while os.getppid() != 1: time.sleep(0.01)\n"
+               "    os.kill(os.getpid(), signal.SIGSTOP); os._exit(0)\n"
+               "print(pid, flush=True); time.sleep(30)\n"]
+    with allow_command(*command):
+        child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, process_group=0)
+    reading.LIVE.started.append(child.pid)  # conftest's check reports it if this test does not end it
+    real, missed, stand_in, start = os.killpg, [], None, None
+
+    def killpg(group, sig):
+        if missed:
+            return real(group, sig)
+        missed.append(group)
+        os.kill(group, sig)  # the child alone
+
+    try:
+        stand_in = int(child.stdout.readline())
+        start = tuple(reading._info(stand_in).start)
+        monkeypatch.setattr(os, "killpg", killpg)
+        assert reading._end(child) == -signal.SIGKILL and missed == [child.pid]
+        monkeypatch.undo()
+        deadline = time.monotonic() + 5
+        while (info := reading._info(stand_in)) is not None and tuple(info.start) == start:
+            assert time.monotonic() < deadline, "the sentinel the first kill missed was left"
+            time.sleep(0.02)
+    finally:
+        monkeypatch.undo()
+        if start is not None and (info := reading._info(stand_in)) is not None and tuple(info.start) == start:
+            os.kill(stand_in, signal.SIGKILL)  # by its pid, while it is still that process; launchd reaps it
+        reading._end(child)
+        child.stdout.close()
+
+
 def test_a_sentinel_is_its_childs_stopped_child_in_its_group(monkeypatch):
     """A stopped process whose parent is the child and whose group is the child's; a pid taken by another
     process (another parent, or another group), one continued, and one with no record (a zombie) is not."""
