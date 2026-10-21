@@ -269,3 +269,53 @@ async def test_evidence_the_window_cut_is_said_to_be_cut_not_missing_from_the_li
         system = body["messages"][0]["content"]
         assert "none fits this model's context window" in system and "No passage in the researcher's library" not in system
         assert "## RESEARCH EVIDENCE" not in system
+
+
+async def test_deleting_a_conversation_while_its_answer_is_out_leaves_no_judge_share_open(tmp_path):
+    # Internal review of b1 (P2): the judge's share held beside the answer call is released by the deletion,
+    # never left open (counted against the project) with no run to release it.
+    release, answering = asyncio.Event(), asyncio.Event()
+
+    async def held():
+        answering.set()
+        await release.wait()
+        return provider.answer(ANSWER)
+    provider = Provider(answer_text=lambda body: held())
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": QUESTION}))
+        await asyncio.wait_for(answering.wait(), 10)
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(2,)]
+        assert (await client.delete(f"/api/conversations/{conversation}")).status_code == 200
+        release.set()
+        await stream
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(0,)]
+
+
+async def test_a_citation_whose_paper_is_still_there_keeps_its_quote_when_its_passage_is_not(tmp_path):
+    # Internal review of b1 (P3): only a deleted paper's citation loses its quote; one whose paper was re-read
+    # keeps it, so a later reading holding the text can resolve it (status.md, decided 2026-10-17 (8)).
+    from backend import citations
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        [(pid, text, version)] = await rows(client, "SELECT p.id, p.text, v.id FROM passages p JOIN material_versions v"
+                                                    " ON v.material_id = ? ORDER BY p.ordinal LIMIT 1", material)
+        record = {"material_id": material, "version_id": version, "passage_id": "gone", "text": "no reading holds this",
+                  "page": None, "evidence_type": "full_text", "title": "Wage Floors"}
+        [row] = await asyncio.to_thread(client.state["db"].read, lambda conn: citations.check_existence(
+            conn, project, "Wages rise [S1.1].", {(1, 1): record}))
+        assert (row["existence"], row["material_id"], row["quote"]) == ("source_removed", material, "no reading holds this")
+
+
+async def test_a_recheck_the_judge_leaves_partly_unanswered_fails_and_writes_nothing(tmp_path):
+    # Internal review of b1 (P3): never success with a pair unjudged; the earlier verdicts stand.
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        client.provider.verdicts = "I cannot tell."
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "failed"
+        assert await rows(client, "SELECT support FROM citations") == [("supported",)]

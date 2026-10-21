@@ -385,9 +385,9 @@ class Harness:
         startup, before serving requests."""
 
         def record(conn):
+            _release_allowances(conn)  # a held share no call was made against is not spent, nor in flight
             in_flight = {run_id for (run_id,) in conn.execute(
                 "SELECT DISTINCT run_id FROM budget_reservations WHERE status = 'open' AND run_id IS NOT NULL")}
-            _release_allowances(conn)  # a held share no call was made against is not spent
             spending.settle_left_open(conn)
             now = utc_now()
             for run_id, revoked in conn.execute(
@@ -771,8 +771,10 @@ class Harness:
             numbered, request = self._cited_request(ctx, found, decision)
             await self._register_context(claim, numbered)  # the dispatch check now covers its passages
             judge = await self._judge_route(ctx)
-            # The judge is reserved with the answer: a budget that cannot hold both refuses the step before
-            # the answer call (section 6.2, final review F02); the judge itself is then never skipped for budget.
+            # The judge's share is reserved with the answer: a budget that cannot hold both refuses the step
+            # before the answer call (section 6.2, final review F02). The share is held until the judge's own call
+            # takes it; a call it does not cover is refused like any other (no reservation skips a budget), and
+            # its pairs stay unchecked, said in the answer.
             judge_estimate = 0.0 if judge[1] is None else budget_router.request_cost(judge[2]["rates"], request.max_tokens + sum(
                 context.count(r["text"]) for r in numbered.values()) + context.count(citations.JUDGE_RULES),
                 context.MIN_OUTPUT) if numbered else 0.0
@@ -1457,10 +1459,12 @@ class Harness:
             papers = inputs.get("context_materials") or ()
             rules = citations.JUDGE_RULES
 
-            def output(result):  # each citation's verdict with the pair it was given for; unanswered: unchecked
-                found = citations.parse_verdicts(result.content, len(judged))
-                return {cid: [found.get(i, "unchecked"), pid, sentence]
-                        for i, (sentence, pid, cids) in enumerate(judged, start=1) for cid in cids}
+            def output(result):  # each citation's verdict with the pair it was given for; None (the run fails,
+                found = citations.parse_verdicts(result.content, len(judged))  # writing nothing) if one is unanswered
+                if len(found) < len(judged):
+                    return None
+                return {cid: [found[i], pid, sentence] for i, (sentence, pid, cids) in enumerate(judged, start=1)
+                        for cid in cids}
         try:  # a role step's output limit is the least a step has
             request = context.assemble(workflow, window=facts["window"], output=_output(context.MIN_OUTPUT, facts),
                                        budgets=budgets,

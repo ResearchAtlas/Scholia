@@ -122,7 +122,7 @@ def check_existence(conn, project_id, text, numbered):
     """The answer's citations, each with its existence, read in the transaction given: a list of dicts
     for citation rows, each with the sentence it sits in. A citation exists while the paper it names still
     reads its passage (still_read): a passage another paper also reads does not keep a deleted paper's
-    citation. A source removed keeps no quote of its text."""
+    citation. A citation whose paper was deleted keeps no quote of its text."""
     spans = sentences(text)
     cited = [n for _, _, n in markers(text) if n in numbered]
     current = still_read(conn, project_id, {(numbered[n]["passage_id"], numbered[n]["material_id"]) for n in cited})
@@ -158,7 +158,8 @@ def check_existence(conn, project_id, text, numbered):
                     if conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (v,)).fetchone()}
             kept = kept if "material_id" in kept else {}  # a deleted paper's citation keeps no link to the text
             out.append({**row, **found, "material_id": None, "material_version_id": None, "passage_id": None, **kept,
-                        "quote": None, "existence": "source_removed"})
+                        # its quote only while its paper is there, so a later reading holding it can resolve it
+                        **({} if kept else {"quote": None}), "existence": "source_removed"})
     return out
 
 

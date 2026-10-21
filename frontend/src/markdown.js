@@ -16,7 +16,7 @@ import { imageAsLink, safeHref } from './links.js';
 
 const MARKER = /\[S[^\]\n]{0,12}\]/g; // citations.py: CITATION, and _MALFORMED for one that does not parse
 const RUN_GAP = /^[ \t]*$/; // markers side by side ([S1.1][S1.2]) cite one sentence together
-const SENTENCE_END = /[.!?](?=\s)|[。！？]/g;
+const SENTENCE_END = /[.!?](?=\s)|[。！？]|\n/g; // as backend/citations.py: a line's end too
 
 // The citation for a marker at a place in the answer's text: the one recorded at that offset, else the
 // first not yet shown with the same marker (a text whose offsets moved, as an escape can make them).
@@ -63,23 +63,36 @@ function sentenceEnds(value, next) {
 // range. A run that follows its sentence's end ("Wages rose. [S1.1]", "| Wages rose. | [S1.1] |") cites the
 // sentence before it, as backend/citations.py reads it.
 function markBack(leaves, i, from, to) {
+  const added = []; // [leaf, [start, end]], from the run back to the sentence's start
   let seen = '';
   for (let j = i; j >= 0 && leaves[j].block === leaves[i].block; j -= 1) {
     const value = leaves[j].node.value;
     const [lower, upper] = j === i ? [from, to] : [0, value.length];
     const next = j + 1 < leaves.length ? leaves[j + 1].node.value.slice(0, 1) : '';
+    const cited = seen.replace(MARKERS_AND_BARS, '').trim(); // the cited sentence's text found so far
+    // An end at this leaf's end closes an earlier sentence once the cited one has text (`**Old.** New [S1.1]`);
+    // before that it is the cited sentence's own end (`**New.** [S1.1]`).
     const ends = sentenceEnds(value.slice(0, upper), j === i ? value.slice(upper, upper + 1) : next)
-      .filter((at) => at >= lower && at < upper);
-    for (const at of ends.reverse()) {
-      if ((value.slice(at, upper) + seen).replace(MARKERS_AND_BARS, '').trim()) {
-        const text = value.slice(at, upper);
-        leaves[j].marks.push([at + (text.length - text.trimStart().length), upper]);
-        return;
-      }
+      .filter((at) => at >= lower && (at < upper || (j < i && cited)));
+    const start = ends.reverse().find((at) => (value.slice(at, upper) + seen).replace(MARKERS_AND_BARS, '').trim());
+    if (start !== undefined) {
+      added.push([leaves[j], [start, upper]]);
+      break;
     }
-    leaves[j].marks.push([lower, upper]);
+    added.push([leaves[j], [lower, upper]]);
     seen = value.slice(lower, upper) + seen;
-    if (j === i && lower > 0) return; // within its text node a previous run ends the sentence's reach
+    if (j === i && lower > 0) break; // within its text node a previous run ends the sentence's reach
+  }
+  // The sentence starts at its first character, not the space after the sentence before it.
+  for (const [leaf, range] of added.reverse()) {
+    const text = leaf.node.value.slice(range[0], range[1]);
+    range[0] += text.length - text.trimStart().length;
+    if (range[1] > range[0]) {
+      break;
+    }
+  }
+  for (const [leaf, range] of added) {
+    if (leaf.node.value.slice(range[0], range[1]).trim()) leaf.marks.push(range); // never a mark of space alone
   }
 }
 
@@ -91,9 +104,11 @@ export function citationChips({ citations = [] } = {}) {
     const find = finder(citations);
     const leaves = [];
     const collect = (node, block, inLink) => {
+      let current = block;
       for (const child of node.children ?? []) {
-        if (child.type === 'text') leaves.push({ node: child, parent: node, block, inLink, marks: [], runs: [] });
-        else collect(child, BLOCKS.has(child.type) ? child : block, inLink || child.type === 'link' || child.type === 'linkReference');
+        if (child.type === 'break') current = child; // a hard line break ends a sentence, as a line's end does
+        else if (child.type === 'text') leaves.push({ node: child, parent: node, block: current, inLink, marks: [], runs: [] });
+        else collect(child, BLOCKS.has(child.type) ? child : current, inLink || child.type === 'link' || child.type === 'linkReference');
       }
     };
     collect(tree, tree, false);

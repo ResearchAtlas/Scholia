@@ -276,15 +276,15 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
     deadline = time.monotonic() + timeout
     attempts = []
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return _failed("timeout", attempts, route)
-        started = time.monotonic()
-        sent.clear()
         # Encoded here, as httpx would encode json=, so the trace keeps the exact bytes that went out (S1-19).
         sending = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if on_body is not None:
             await on_body(sending)
+        remaining = deadline - time.monotonic()  # the call's bound counts from after the body was kept
+        if remaining <= 0:
+            return _failed("timeout", attempts, route)
+        started = time.monotonic()
+        sent.clear()
         try:
             response = await asyncio.wait_for(
                 client.post(route.provider.chat_url, headers=headers, content=sending, extensions=extensions,

@@ -100,6 +100,18 @@ test('an unsupported sentence is underlined across bold text, a link and a table
   assert.doesNotMatch(html, /<span class="unsupported">First claim/);
 });
 
+test('the underline stops at the sentence before, whatever node or line it ended in', () => {
+  const under = (text) => [...render(text, [cite(text, '[S1.1]', { support: 'unsupported' })])
+    .matchAll(/<span class="unsupported">([^<]*)<\/span>/g)].map((m) => m[1]);
+  assert.deepEqual(under('**Bold.** Wages rose. [S1.1]'), ['Wages rose. ']);
+  assert.deepEqual(under('*Old claim.* Wages rose [S1.1].'), ['Wages rose ']);
+  assert.deepEqual(under('[Old claim.](https://e.com/x) Wages rose. [S1.1]'), ['Wages rose. ']);
+  assert.deepEqual(under('工资上涨。**物价**下跌。[S1.1]'), ['物价', '下跌。']);
+  assert.deepEqual(under('Prices fall\nEarnings rise [S1.1]'), ['Earnings rise ']);
+  assert.deepEqual(under('Prices fall  \nEarnings rise [S1.1]'), ['Earnings rise ']);
+  assert.deepEqual(under('**Earnings rise.** [S1.1]'), ['Earnings rise.']);
+});
+
 test('a citation that does not exist is never a chip, and an answer without its checks keeps its markers as text', () => {
   const text = 'Wages rise [S1.1]. Prices fall [S9.9]. Unclear [S1].';
   const html = render(text, [cite(text, '[S1.1]', { existence: 'source_removed' }), { ...cite(text, '[S9.9]'), existence: 'not_found' },
