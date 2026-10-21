@@ -13,8 +13,8 @@ for the walkthrough to add. Materials are read as the app reads them, each in a 
 scanned pages are read by this Mac's own OCR engine (Vision), whose first recognition of a page with
 dark ink fails once, so the walkthrough shows a failed reading and its retry (S1-20); and two
 synthetic files are stopped at the reading's ceilings, one taking memory without end and one
-silent past the time ceiling (lowered here to STEP_SECONDS), as crafted files would be. The local
-model helper's search model is a synthetic file with a pin
+silent past the time ceiling (lowered here to STEP_SECONDS, printed as "step ceiling"), as crafted
+files would be. The local model helper's search model is a synthetic file with a pin
 of its own, served by a test-owned download source (each source redirecting to the file host
 it uses, the file sent slowly so a download can be watched and cancelled), and written to an
 "offline" folder for the import flow, whose path is printed. The helper binary is a test-owned
@@ -32,8 +32,9 @@ JSON line each.
 
 S1-15: a test-owned Zotero (scholia_app.MockZotero) answers at Zotero's address behind the same transport,
 with made-up libraries, collections and items, whose PDFs are synthetic files in the materials folder.
-It reads its state from the file named by "zotero state": not_running, api_off, ready, or changed (ready,
-with one item's title and PDF changed since, for the re-import). Its requests go to the request log too,
+It reads its state from the file named by "zotero state": not_running, api_off, ready, changed (ready,
+with one item's title and PDF changed since, for the re-import), or pruned (ready, with the group "Synthetic
+Lab" and the collection "Linked files" gone since). Its requests go to the request log too,
 with their query ("target").
 
 tests/walkthrough_driver.mjs drives the rendered walkthrough against this server.
@@ -199,19 +200,23 @@ ZOTERO_ITEMS = {
 class WalkthroughZotero(MockZotero):
     """The walkthrough's Zotero: its state read from the control file at each request (see the module)."""
 
+    GROUPS = [(4711, "Synthetic Lab"), (4712, "合成课题组")]
+    COLLECTIONS = [{"key": "WAGECOL1", "name": "Wage studies"}, {"key": "LINKCOL2", "name": "Linked files", "parent": "WAGECOL1"}]
+
     def __init__(self, control, materials):
-        super().__init__(server_id="walkthrough-zotero", groups=[(4711, "Synthetic Lab"), (4712, "合成课题组")])
+        super().__init__(server_id="walkthrough-zotero", groups=self.GROUPS)
         # the folder by its own path: Scholia follows no link to an attachment (/var is one on macOS)
         self.control, self.materials = control, materials.resolve()
-        self.collections["users/0"] = [{"key": "WAGECOL1", "name": "Wage studies"},
-                                       {"key": "LINKCOL2", "name": "Linked files", "parent": "WAGECOL1"}]
+        self.collections["users/0"] = self.COLLECTIONS
         for key, (title, doi, pdf, linked, collection) in ZOTERO_ITEMS.items():
             path = pdf if pdf is None or pdf.startswith("file:") else self.materials / pdf
             self.item(key, title, doi=doi, pdf=path, linked=linked, collections=[collection] if collection else [])
 
     async def __call__(self, request):
         state = self.control.read_text().strip() if self.control.exists() else "not_running"
-        self.state = "ready" if state == "changed" else state
+        self.state = "ready" if state in ("changed", "pruned") else state
+        self.groups = self.GROUPS[1:] if state == "pruned" else self.GROUPS
+        self.collections["users/0"] = self.COLLECTIONS[:1] if state == "pruned" else self.COLLECTIONS
         if state == "changed":  # the Chinese item retitled in Zotero, its PDF replaced by a revised one
             item = self.items["users/0", "ZHAN0005"]
             item["data"]["title"] = item["csljson"]["title"] = ZOTERO_PDFS["zotero-hanzi-revised.pdf"][0]
@@ -313,7 +318,9 @@ def main(argv=None):
     child = [sys.executable, str(ROOT / "tests" / "reading_stub.py"), "walkthrough",
              tempfile.mkdtemp(prefix="scholia-walkthrough-reading-")]
     reading.command = lambda: child
-    reading.STEP_SECONDS = 5.0  # the silent file is stopped in seconds; the app's ceiling is longer
+    # The silent file is stopped in 20 s rather than the app's 60; a healthy reading's child on a loaded Mac
+    # (two test suites running) has gone 5 s without a word, so the ceiling stays well above that.
+    reading.STEP_SECONDS = 20.0
     provider = SyntheticProvider(zero_retention=[model["id"] for model in CATALOG[::2]],  # half have zero retention
                                  scholarly=RECORDS)
     provider.replies = [synthetic] * 1000
@@ -350,6 +357,7 @@ def main(argv=None):
     print(f"zotero state: {zotero_control}", flush=True)
     print(f"model file: {offline}", flush=True)
     print(f"helper control: {provider.control}", flush=True)
+    print(f"step ceiling: {reading.STEP_SECONDS:g}", flush=True)
     print(f"open: {origin}/" + ("" if args.dev else f"#session={session}"), flush=True)
     server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", log_level="warning"))
     with network_guard.allow_command(*child):  # the reading child alone, by its whole command

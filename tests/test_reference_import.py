@@ -533,6 +533,52 @@ async def test_keep_both_makes_the_record_its_own_paper_not_looked_up(tmp_path):
         assert len(client.provider.scholarly.requests) == requests
 
 
+async def first_project(client):
+    """The project listed first (after the general one): the one changed last."""
+    return [p["id"] for p in (await client.get("/api/projects")).json()["projects"] if p["kind"] != "general"][0]
+
+
+@pytest.mark.parametrize("option", ["merge", "keep_both"])
+async def test_an_answer_that_changes_the_papers_puts_the_project_first(tmp_path, option):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        _, ask = await with_duplicate(client, project)
+        other = await project_of(client, "Changed since")
+        assert await first_project(client) == other
+        assert (await answer(client, ask, option)).status_code == 200
+        await run_finished(client, ask["run_id"])
+        assert await first_project(client) == project
+
+
+async def test_a_merge_that_adds_nothing_leaves_the_projects_order(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        paper, ask = await with_duplicate(client, project, extra="T2  - A Venue\n")
+        # a venue given meanwhile: the merge has nothing left to add
+        assert (await client.patch(f"/api/materials/{paper}", json={"venue": "Its Own Venue"})).status_code == 200
+        other = await project_of(client, "Changed since")
+        assert (await answer(client, ask, "merge")).status_code == 200
+        assert (await run_finished(client, ask["run_id"]))["status"] == "succeeded"
+        assert await first_project(client) == other
+
+
+@pytest.mark.parametrize("edited", [False, True])
+async def test_a_lookup_answered_later_puts_the_project_first_only_when_it_fills_the_paper(tmp_path, edited):
+    async with started(tmp_path / "data", scholarly(openalex={DOI: openalex_work(DOI, "Resolved", retracted=True)})) as client:
+        project = await project_of(client, level="local_only")  # its lookup waits on the question
+        result = await imported(client, project, ris(("An Imported Paper", f"DO  - {DOI}\n")))
+        [ask] = await asks_of(client, project)
+        [paper] = result["imported"]
+        if edited:  # a paper the researcher edited takes nothing from a lookup, which checks its retraction alone
+            assert (await client.patch(f"/api/materials/{paper}", json={"title": "Edited, by me"})).status_code == 200
+        other = await project_of(client, "Changed since")
+        assert (await answer(client, ask, "lookup")).status_code == 200
+        assert (await run_finished(client, result["lookup_run_id"]))["status"] == "succeeded"
+        found = (await client.get(f"/api/materials/{paper}")).json()
+        assert found["retraction"] == "retracted" and ("author" in found["csl"]) is not edited
+        assert await first_project(client) == (other if edited else project)
+
+
 async def test_merge_runs_are_listed_with_their_paper_and_question_and_no_retry(tmp_path):
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
