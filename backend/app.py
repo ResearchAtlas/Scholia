@@ -36,7 +36,8 @@ from backend import references  # S1-14: reference file import and the merge con
 from backend import local_helper
 from backend import search  # S1-17: the search index, index runs and the search model's offer
 from backend import zotero  # S1-15: Zotero's library, read only
-from backend.db import ContentStore, Database, DatabaseCloseError, DatabaseClosedError, delete, new_id, utc_now
+from backend.db import (ContentStore, Database, DatabaseCloseError, DatabaseClosedError, close_failed, delete, new_id,
+                        utc_now)
 from backend.local_guard import LocalRequestGuard
 from backend.outbound_gate import OutboundGate, local_origin
 from backend import governance
@@ -333,34 +334,33 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
         # (backups.Gate) until a restore puts a backup in place; the backups router closes what
         # that opens.
         db = await backups.open_at_launch(state, maintenance)
-        if db is None:
-            try:
-                yield
-            finally:
-                state.clear()
-            return
         try:
-            await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
-            # The daily backup runs at launch, before the app accepts a request, so the
-            # database and the settings files it copies show one state. Backups while the app
-            # is open and idle are S1-12's.
-            with maintenance():
-                await asyncio.to_thread(_daily_backup, db)
-            # Background runs start only now, once that backup's full check has passed: on a
-            # database it found damaged (the app is then limited) nothing runs on its own.
-            if db.damaged is None:
-                await backups.start_background(state)
+            if db is not None:
+                await asyncio.to_thread(_sweep_deleted_project_folders, data_dir, db)
+                # The daily backup runs at launch, before the app accepts a request, so the
+                # database and the settings files it copies show one state. Backups while the app
+                # is open and idle are S1-12's.
+                with maintenance():
+                    await asyncio.to_thread(_daily_backup, db)
+                # Background runs start only now, once that backup's full check has passed: on a
+                # database it found damaged (the app is then limited) nothing runs on its own.
+                if db.damaged is None:
+                    await backups.start_background(state)
             yield
         finally:  # after a restore, the ones it opened (the backups router closes them too; both are idempotent)
-            if state.get("harness") is not None:
-                await state["harness"].shutdown()
+            running = await state["harness"].shutdown() if state.get("harness") is not None else 0
             # A close that fails is logged by it; the next launch's index open purges what it left
             if state.get("index") is not None:  # S1-17: closed by its database's close, once no write can commit
                 with contextlib.suppress(DatabaseCloseError):
                     await asyncio.to_thread(state.pop("index").db.close)
-            with contextlib.suppress(DatabaseCloseError):
-                await asyncio.to_thread(db.close)
+            if db is not None:
+                with contextlib.suppress(DatabaseCloseError):
+                    await asyncio.to_thread(db.close)
             state.clear()
+            # Only now, with no work left running and every close done (close_failed() never set in this process),
+            # is the data folder free: the desktop entry keeps its lock otherwise, until the process ends.
+            if not running and not close_failed():
+                state["closed"] = True
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.scholia = state  # the desktop entry reaches the harness through it at shutdown

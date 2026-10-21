@@ -291,13 +291,15 @@ def run(data_dir, open_window, *, keyring_backend=None, transport=None, listenin
     except UnsafeDataFolderError as error:
         os.close(lock)
         return _serve_limited(default, data_dir, "unsafe", str(error), open_window, listening)
-    backend = []  # the server's thread, once it starts
+    backend = []  # the app's state and its server's loop, once it starts (see _run_app)
     try:
         return _serve(data_dir, open_window, keyring_backend, transport, listening, backend)
     finally:
-        # A backend that outlived its bounded wait (_stop) may still write in the folder (the index's writer, say):
-        # the lock is then held until the process ends, which releases it, so no other launch opens the folder.
-        if not any(thread.is_alive() for thread in backend):
+        # Released only on positive evidence that nothing of this launch still uses the folder: the app closed
+        # everything (its harness, the search index with its writer, the database) and every worker it started
+        # ended. Otherwise (a backend that outlived its bounded wait, a close that failed, a server that ended
+        # abnormally) the lock is held until the process ends, which releases it, so no other launch opens the folder.
+        if all(state.get("closed") and loop.get("drained") for state, loop in backend):
             os.close(lock)
 
 
@@ -335,7 +337,8 @@ def _serve_limited(default, data_dir, problem, reason, open_window, listening):
 def _run_app(app_for, open_window, listening, backend):
     """Serve app_for(origin, session) on a loopback port, open the window on it, and stop
     the server once the window closes. Returns 0, or 1 when the server did not start. The
-    server's thread is added to backend as it starts: it may outlive the bounded wait."""
+    app's state and its server's loop are added to backend as it starts: they say whether it
+    ended cleanly (see run)."""
     import uvicorn
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -350,7 +353,7 @@ def _run_app(app_for, open_window, listening, backend):
         timeout_graceful_shutdown=5))
     loop = {}
     thread = threading.Thread(target=_run_server, args=(server, sock, loop), name="scholia-server", daemon=True)
-    backend.append(thread)
+    backend.append((app.app.state.scholia, loop))
     thread.start()
     if not _wait_started(server, thread, app.app.state.scholia):
         log.error("the backend did not start")
@@ -368,6 +371,8 @@ def _run_server(server, sock, loop):
     async def main():
         loop["loop"] = asyncio.get_running_loop()
         await server.serve(sockets=[sock])
+        await loop["loop"].shutdown_default_executor()  # every worker waited for: asyncio.run stops waiting after 300 s
+        loop["drained"] = True
 
     asyncio.run(main())
 
