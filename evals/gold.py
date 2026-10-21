@@ -43,6 +43,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import signal
 import stat
 import sys
@@ -920,21 +921,35 @@ def scratch(field, folder):
         return
     if SCRATCH_HOLDER[0] == threading.get_ident():
         raise Refused("another field 1 check or passages is running on this thread; run them one after another")
-    with SCRATCH_LOCK, tempfile.TemporaryDirectory(prefix=".tmp-scholia-gold-", dir=folder) as tmp:
-        inner = Path(tmp) / "tmp"
-        inner.mkdir(mode=0o700)
-        saved = os.environ.get("TMPDIR"), tempfile.tempdir
-        os.environ["TMPDIR"] = tempfile.tempdir = str(inner)
-        SCRATCH_HOLDER[0] = threading.get_ident()
+    with SCRATCH_LOCK:
+        # Field 1's folder checked again now this call runs (it may have changed while the call waited), and the
+        # temporary folder made in it as the walk reaches a folder: from the root, opened without following a link.
+        root = field1(folder)
+        fd = _open_dir(root, root)
+        name = f".tmp-scholia-gold-{secrets.token_hex(8)}"
         try:
-            yield Path(tmp)
+            os.mkdir(name, 0o700, dir_fd=fd)
+            made = _step(fd, name, root / name)
+            try:
+                os.mkdir("tmp", 0o700, dir_fd=made)
+            finally:
+                os.close(made)
+            saved = os.environ.get("TMPDIR"), tempfile.tempdir
+            os.environ["TMPDIR"] = tempfile.tempdir = str(Path(root, name, "tmp"))
+            SCRATCH_HOLDER[0] = threading.get_ident()
+            try:
+                yield Path(root, name)
+            finally:
+                if saved[0] is None:
+                    os.environ.pop("TMPDIR", None)
+                else:
+                    os.environ["TMPDIR"] = saved[0]
+                tempfile.tempdir = saved[1]
+                SCRATCH_HOLDER[0] = None
         finally:
-            if saved[0] is None:
-                os.environ.pop("TMPDIR", None)
-            else:
-                os.environ["TMPDIR"] = saved[0]
-            tempfile.tempdir = saved[1]
-            SCRATCH_HOLDER[0] = None
+            with contextlib.suppress(FileNotFoundError):  # not made, if its making failed
+                shutil.rmtree(name, dir_fd=fd)
+            os.close(fd)
 
 
 async def write_when_done(root, out, make):

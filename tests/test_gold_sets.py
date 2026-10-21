@@ -1023,6 +1023,47 @@ def test_two_overlapping_field_one_scratches_never_leave_its_folder_and_give_tmp
     assert os.environ["TMPDIR"] == str(tmp_path) and tempfile.tempdir is None
 
 
+def test_a_field_one_scratch_that_waited_refuses_a_folder_replaced_meanwhile_by_a_link_into_git(tmp_path, monkeypatch):
+    """fu2 sol review 1 (P1): check and passages accept field 1's folder before scratch waits its turn; a folder
+    renamed meanwhile and replaced by a link into a git work tree was followed, and the scratch made in the
+    repository. The folder is checked again once the turn comes, and the scratch made from its root without
+    following a link: the waiting call is refused, and nothing is made in the repository."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    repo = fixtures.git("init", tmp_path / "repo")
+    (repo / "inside").mkdir()
+    folder = tmp_path / "f1"
+    folder.mkdir()
+    root = gold.field1(folder)  # accepted, as check and passages accept it before scratch
+    inside, leave, outcome = threading.Event(), threading.Event(), {}
+
+    def first():
+        with gold.scratch(1, root):
+            inside.set()
+            leave.wait(10)
+
+    def second():
+        try:
+            with gold.scratch(1, root):
+                outcome["second"] = "made"
+        except tier1.Refused as refused:
+            outcome["second"] = str(refused)
+    first_thread = threading.Thread(target=first)
+    first_thread.start()
+    inside.wait(10)
+    second_thread = threading.Thread(target=second)
+    second_thread.start()  # it waits for the first's turn, with the folder as it was accepted
+    folder.rename(tmp_path / "f1-moved")
+    folder.symlink_to(repo / "inside")
+    leave.set()
+    first_thread.join()
+    second_thread.join()
+    assert "inside the repository" in outcome["second"]
+    assert list((repo / "inside").iterdir()) == [] and fixtures.git("status", repo) == ""
+    assert os.environ["TMPDIR"] == str(tmp_path) and tempfile.tempdir is None
+    assert not [p for p in (tmp_path / "f1-moved").iterdir() if p.name.startswith(".tmp-")]
+
+
 def test_a_folder_below_field_ones_that_is_a_git_work_tree_is_never_read_or_written(tmp_path):
     """sol recheck 3: field 1's folder is outside git, but its labels/ or out/ is itself a repository (or holds
     a worktree's .git file). The page saved a question and its quote there and apply wrote a corrected set
