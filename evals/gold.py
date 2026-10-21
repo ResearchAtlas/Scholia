@@ -105,8 +105,8 @@ def private_path(field, path):
     """A field's path, resolved; for field 1, refused anywhere inside a git work tree (this checkout, the main
     checkout or any other worktree, or any other repository) except under that tree's evals/local/, and that
     only where the tree's own .gitignore ignores evals/local/ (a checkout of a branch without S1-36 does not).
-    Checked for the folders given (--folder, --pdfs) and where a linked PDF leads; under a folder no link is
-    followed at all (the files below)."""
+    Checked for the folders given (--folder, --pdfs: each taken where it resolves, and walked from there) and
+    where a linked PDF leads; under a folder no link is followed at all (the files below)."""
     path = Path(path).resolve()
     if field == 1 and (top := work_tree(path)) is not None:
         if not path.is_relative_to(top / "evals" / "local"):
@@ -200,12 +200,18 @@ def _folder_of(root, path, create=False):
 
 
 def _open(fd, path, flags):
+    """The file path names in the folder fd, never through a link, and only a regular file (a FIFO or device is
+    refused, without waiting on it)."""
     try:
-        return os.open(Path(path).name, flags | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        f = os.open(Path(path).name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
     except OSError as error:
         if error.errno == errno.ELOOP:
             _link(path)
         raise
+    if not stat.S_ISREG(os.fstat(f).st_mode):
+        os.close(f)
+        raise Refused(f"{path} is not a plain file")
+    return f
 
 
 def entry(root, path):
@@ -254,10 +260,13 @@ def write_json(root, path, data):
     path = Path(path)
     part = path.with_name(path.name + ".part")
     with _folder_of(root, path, create=True) as fd:
-        entry(root, path)  # a link at the name itself is refused, never written through or replaced
-        f = _open(fd, part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+        entry(root, path)  # a link at the name itself or at its part file is refused, never written through
+        entry(root, part)
+        with contextlib.suppress(FileNotFoundError):  # a part file left by a cut-off save, or a hard link there:
+            os.unlink(part.name, dir_fd=fd)  # removed by name, never truncated through
+        f = _open(fd, part, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         with os.fdopen(f, "w", encoding="utf-8") as out:
-            os.fchmod(out.fileno(), 0o600)  # a part file left by an earlier cut-off save keeps its mode otherwise
+            os.fchmod(out.fileno(), 0o600)  # owner-only whatever the umask
             out.write(json.dumps(data, ensure_ascii=False, indent=1) + "\n")
             out.flush()
             os.fsync(out.fileno())
@@ -270,7 +279,10 @@ def pdf_bytes(field, pdfs, name):
     path = Path(pdfs) / name
     with _folder_of(pdfs, path) as fd:
         if stat.S_ISLNK(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
-            f = os.open(private_path(field, path), os.O_RDONLY)
+            f = os.open(private_path(field, path), os.O_RDONLY | os.O_NONBLOCK)
+            if not stat.S_ISREG(os.fstat(f).st_mode):
+                os.close(f)
+                raise Refused(f"{path} does not lead to a plain file")
         else:
             f = _open(fd, path, os.O_RDONLY)
     with os.fdopen(f, "rb") as file:
@@ -807,16 +819,20 @@ def resolve(kind, items, read, extractor):
 
 
 def qasper_ids(folder, settings):
-    """Every paper id in QASPER v0.3's three splits, each file checked against its pin first."""
-    from backend.local_helper import mismatch
+    """Every paper id in QASPER v0.3's three splits, each file checked against its pin first (read once, from
+    the folder as every file is: no link followed)."""
     ids = set()
     for pin in settings["qasper"]["files"]:
         path = Path(folder) / pin["path"]
-        if not path.is_file():
-            raise Refused(f"QASPER: {pin['path']} is missing under {folder}")
-        if problem := mismatch(path, pin):
-            raise Refused(f"QASPER: {problem}")
-        ids |= set(read_json(folder, path))
+        try:
+            data = read_bytes(folder, path)
+        except FileNotFoundError:
+            raise Refused(f"QASPER: {pin['path']} is missing under {folder}") from None
+        if len(data) != pin["size"]:
+            raise Refused(f"QASPER: {path.name}: {len(data)} bytes, expected {pin['size']}")
+        if (digest := hashlib.sha256(data).hexdigest()) != pin["sha256"]:
+            raise Refused(f"QASPER: {path.name}: SHA-256 {digest}, expected {pin['sha256']}")
+        ids |= set(json.loads(data.decode("utf-8")))
     return ids
 
 

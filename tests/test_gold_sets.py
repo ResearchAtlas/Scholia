@@ -954,3 +954,22 @@ def test_a_pdf_may_be_a_link_outside_any_git_work_tree_but_not_into_one_nor_its_
     linked.symlink_to(pdfs, target_is_directory=True)
     with pytest.raises(tier1.Refused, match="is a link"):
         gold.verify_pdfs(papers, linked, 1)
+
+
+def test_a_hard_link_or_fifo_at_a_part_file_or_a_read_file_is_never_written_through_or_waited_on(tmp_path):
+    """Internal review 6: a hard link at check.json.part to the drafts (O_NOFOLLOW does not stop one) was
+    truncated and written; a FIFO there or at a file read hung the command."""
+    folder = field(tmp_path)
+    drafts = (folder / "questions.json").read_bytes()
+    os.link(folder / "questions.json", gold.outputs(folder) / "check.json.part")
+    assert problems_of(folder)[0] == []
+    assert (folder / "questions.json").read_bytes() == drafts
+    os.mkfifo(gold.outputs(folder) / "check.json.part")
+    assert problems_of(folder)[0] == []  # the stale part name is removed, never opened
+    pairs = (folder / "pairs.json").read_bytes()
+    (folder / "pairs.json").unlink()
+    os.mkfifo(folder / "pairs.json")
+    with pytest.raises(tier1.Refused, match="not a plain file"):
+        asyncio.run(gold.check(2, folder, settings=gold.load_settings()))
+    (folder / "pairs.json").unlink()
+    (folder / "pairs.json").write_bytes(pairs)
