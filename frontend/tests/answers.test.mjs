@@ -77,6 +77,14 @@ test('abstract-only, record-only and retracted chips are marked, and an unsuppor
   assert.equal(html.replace(/<[^>]+>/g, '').includes('Earnings rise a lot'), true); // the text unchanged
 });
 
+test('a marker after the sentence\'s end cites the sentence before it, as the backend reads it', () => {
+  const text = 'Earnings rise. [S1.1] Prices fall. 收入上升。[S1.2]';
+  const html = render(text, [cite(text, '[S1.1]', { support: 'unsupported' }), cite(text, '[S1.2]', { support: 'unsupported' })]);
+  assert.match(html, /<span class="unsupported">Earnings rise\. <\/span><span class="cite group">/);
+  assert.match(html, /<span class="unsupported">收入上升。<\/span><span class="cite group">/);
+  assert.equal(html.replace(/<[^>]+>/g, '').includes('Prices fall.'), true);
+});
+
 test('a citation that does not exist is never a chip, and an answer without its checks keeps its markers as text', () => {
   const text = 'Wages rise [S1.1]. Prices fall [S9.9]. Unclear [S1].';
   const html = render(text, [cite(text, '[S1.1]', { existence: 'source_removed' }), { ...cite(text, '[S9.9]'), existence: 'not_found' },

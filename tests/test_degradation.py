@@ -140,17 +140,21 @@ async def test_a_project_of_metadata_only_papers_finds_no_evidence_and_says_so(t
         assert [c["existence"] for c in turn["citations"]] == ["not_found"] and stream[-1]["status"] == "succeeded"
 
 
-async def test_a_project_whose_index_is_still_building_answers_from_what_is_indexed(tmp_path):
-    from cited import cited, conversation_in
+async def test_a_project_whose_index_is_being_rebuilt_says_its_papers_could_not_be_searched(tmp_path):
+    # G5: an index being rebuilt searches nothing (fail closed); that is not the library holding no evidence.
+    from cited import cited, conversation_in, with_papers
     from scholia_app import send
     async with cited(tmp_path) as client:
-        project = await project_of(client)
-        await added(client, project, WAGES)  # not waited for: its reading and indexing may still be running
-        conversation = await conversation_in(client, project)
-        stream = await send(client, conversation, QUESTION)
+        project, _ = await with_papers(client, WAGES)
+        client.state["index"].building = True
+        try:
+            conversation = await conversation_in(client, project)
+            stream = await send(client, conversation, QUESTION)
+        finally:
+            client.state["index"].building = False
         assert stream[-1]["status"] == "succeeded"
         system = client.provider.answers[0]["messages"][0]["content"]
-        found = "## RESEARCH EVIDENCE" in system
-        assert found != ("No passage in the researcher's library matched" in system)
+        assert "search index is being built or is unavailable" in system
+        assert "No passage in the researcher's library matched" not in system
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
-        assert [c["existence"] for c in turn["citations"]] == ["ok" if found else "not_found"]
+        assert "index_unavailable" in turn["answer"]["notices"] and "keyword_only" not in turn["answer"]["notices"]

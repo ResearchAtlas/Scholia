@@ -31,9 +31,13 @@ from backend.search_index import readings
 
 # A marker that starts like a citation but does not parse ([S1], [S1.x], [S 2.3]): kept as not_found.
 _MALFORMED = re.compile(r"\[S[^\]\n]{0,12}\]")
-# A sentence ends at . ! ? before a space or the end, at 。！？, or at a line's end; a point inside a
-# marker or a number ([S1.2], 3.5) does not end it.
-_SENTENCE = re.compile(r"(?:[^.!?。！？\n]|[.!?]+(?=[^\s.!?]))+(?:[.!?]+(?=\s|$)|[。！？]+|\n|$)")
+# A sentence ends at a run of . ! ? before a space or the end, at 。！？, or at a line's end; a point inside
+# a marker or a number ([S1.2], 3.5) does not end it. The look-behind makes a long run of points cost what
+# its length does.
+_END = re.compile(r"(?<![.!?])[.!?]++(?=\s|$)|[。！？]++|\n")
+# Code, where a marker is not a citation (the interface draws it as code): fenced blocks and inline spans.
+_LEADING = re.compile(r"^(?:\s*\[S[^\]\n]{0,12}\])+")
+_CODE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
 VERDICTS = ("supported", "partly", "unsupported")
 QUOTE_CHARS = 500  # the part of a passage a citation keeps as its quote
 
@@ -58,15 +62,21 @@ def bundle(numbered):
     return lines
 
 
-def missing(numbered, *, mode, route):
-    """The conflicts and missing information section's records for this evidence."""
+def missing(numbered, *, mode, route, index="ready"):
+    """The conflicts and missing information section's records for this evidence. index is the search
+    index's state when it was searched: one being built or unavailable searched nothing, which is not the
+    library holding no evidence."""
     notes = []
-    if route in ("literature", "memory_literature") and not numbered:
+    if route in ("literature", "memory_literature") and index in ("building", "unavailable"):
+        notes.append("The library's search index is being built or is unavailable, so the researcher's papers could "
+                     "not be searched for this question. Say so; do not say the library holds no evidence, and do not "
+                     "answer from general knowledge as if it were cited.")
+    elif route in ("literature", "memory_literature") and not numbered:
         notes.append("No passage in the researcher's library matched this question. Say that the library holds no "
                      "evidence for it; do not answer from general knowledge as if it were cited.")
     if mode == "keyword_only":
         notes.append("Meaning search was unavailable, so the evidence came from keyword search only.")
-    if route in ("memory", "find_papers"):
+    if route in ("memory", "find_papers", "memory_literature"):
         notes.append("Earlier decisions, project state and new-paper search are not available yet; if the question "
                      "depends on them, say they could not be retrieved rather than inventing them.")
     return notes
@@ -74,15 +84,32 @@ def missing(numbered, *, mode, route):
 
 def sentences(text):
     """(start offset, sentence) for each sentence of an answer, as written."""
-    return [(m.start(), m.group()) for m in _SENTENCE.finditer(text) if m.group().strip()]
+    out, start = [], 0
+    for m in _END.finditer(text):
+        out.append((start, text[start:m.end()]))
+        start = m.end()
+    out.append((start, text[start:]))
+    return [(at, sentence) for at, sentence in out if sentence.strip()]
 
 
 def markers(text):
-    """[(offset, marker, (source, passage) or None)] for every citation-like marker, in order."""
+    """[(offset, marker, (source, passage) or None)] for every citation-like marker outside code, in order."""
+    code = [m.span() for m in _CODE.finditer(text)]
     found = {m.start(): (m.start(), m.group(), (int(m[1]), int(m[2]))) for m in CITATION.finditer(text)}
     for m in _MALFORMED.finditer(text):
         found.setdefault(m.start(), (m.start(), m.group(), None))
-    return [found[k] for k in sorted(found)]
+    return [found[k] for k in sorted(found) if not any(a <= k < b for a, b in code)]
+
+
+def _sentence_of(spans, text, offset):
+    """The sentence a marker at offset cites: the one it sits in, or, when only markers come before it in
+    that one ("Wages rose. [S1.1]", "工资上涨。[S1.1]"), the sentence before."""
+    for i, (start, sentence) in enumerate(spans):
+        if start <= offset < start + len(sentence):
+            if i and not _MALFORMED.sub("", text[start:offset]).strip():
+                sentence = spans[i - 1][1]
+            return _LEADING.sub("", sentence)  # without the markers that cite the sentence before it
+    return ""
 
 
 def check_existence(conn, project_id, text, numbered):
@@ -94,7 +121,7 @@ def check_existence(conn, project_id, text, numbered):
     by_material = {}
     out = []
     for offset, marker, number in markers(text):
-        sentence = next((s for start, s in spans if start <= offset < start + len(s)), "")
+        sentence = _sentence_of(spans, text, offset)
         row = {"marker": marker, "offset": offset, "sentence": sentence.strip(), "number": number}
         record = numbered.get(number) if number else None
         if record is None:

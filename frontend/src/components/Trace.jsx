@@ -33,7 +33,7 @@ export function Trace({ turn }) {
     <div className="space-y-3 rounded-md border bg-muted/30 p-3 text-xs">
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
         <dt className="text-muted-foreground">{t('trace.model')}</dt><dd className="break-all">{trace.route ?? '—'}</dd>
-        {trace.retrieval && <>
+        {trace.retrieval?.route && <>
           <dt className="text-muted-foreground">{t('trace.route')}</dt>
           <dd>{t(`trace.route.${trace.retrieval.route}`)} · {t(`trace.decided.${trace.retrieval.decided_by}`)}</dd>
         </>}

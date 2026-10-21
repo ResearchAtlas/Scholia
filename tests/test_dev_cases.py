@@ -49,6 +49,7 @@ async def test_each_set_runs_with_the_arms_and_reports_each_language_apart(tmp_p
     results = await dev_cases.run(manifest, files, out, opener(before_yield=reranking()), arms)
     assert results["status"] == "finished" and json.loads(out.read_text())["status"] == "finished"
     assert "do not establish the Chinese result" in results["note"]
+    assert results["gaps"] == [] and all(entry["zh"]["complete"] for entry in results["chinese_documents"]["arms"].values())
     part = results["cross_language"]
     assert part["cases"] == 2 and part["document_language"] == "en"
     for arm in arms:

@@ -30,11 +30,13 @@ function finder(citations) {
   };
 }
 
-// The text from the start of its sentence, within one text node, to a marker run.
+// The text from the start of its sentence, within one text node, to a marker run. A run that follows the
+// sentence's end ("Wages rose. [S1.1]") cites the sentence before it, as backend/citations.py reads it.
 function sentenceStart(before) {
-  let start = 0;
-  for (const match of before.matchAll(SENTENCE_END)) start = match.index + match[0].length;
-  return start;
+  const starts = [0, ...[...before.matchAll(SENTENCE_END)].map((match) => match.index + match[0].length)];
+  const last = starts.at(-1);
+  const start = before.slice(last).trim() || starts.length < 2 ? last : starts.at(-2);
+  return start + (before.slice(start).length - before.slice(start).trimStart().length); // not the space before it
 }
 
 // remark plugin: markers in text become `cite` elements naming their citation's index in the record, and

@@ -115,6 +115,8 @@ async def test_the_citation_endpoints_resolve_existence_and_check_support_as_a_r
         client.provider.verdicts = "1: partly"
         started_check = await client.post("/api/citations/check", json={"run_id": stream[0]["run_id"]})
         assert started_check.status_code == 202
+        [(inputs,)] = await rows(client, "SELECT inputs FROM runs WHERE id = ?", started_check.json()["run_id"])
+        assert (json.loads(inputs)["passage_ids"], json.loads(inputs)["material_ids"]) == ([chip["passage_id"]], [material])
         done = await run_finished(client, started_check.json()["run_id"])
         assert done["status"] == "succeeded" and done["workflow"] == "citation_check"
         assert await rows(client, "SELECT support FROM citations WHERE id = ?", chip["id"]) == [("partly",)]
@@ -152,8 +154,9 @@ async def test_a_route_whose_endpoints_all_take_tools_gives_no_skills_notice(tmp
         assert "skills_unavailable" not in turn["answer"].get("notices", [])
 
 
-async def test_a_citation_inside_a_table_list_or_code_span_is_found_and_checked(tmp_path):
-    # G3: a marker in Markdown structure is still a marker, at its offset in the text as written.
+async def test_a_citation_inside_a_table_or_list_is_found_and_checked_and_one_in_code_is_code(tmp_path):
+    # G3: a marker in Markdown structure is still a marker, at its offset in the text as written; one in code
+    # is code, as the interface draws it, so it is neither recorded nor judged.
     text = ("| Effect | Source |\n|---|---|\n| Earnings rise | [S1.1] |\n\n- Employment barely moves [S1.2]\n\n"
             "Written `[S1.1]` in code.")
     provider = Provider(answer_text=text)
@@ -162,13 +165,56 @@ async def test_a_citation_inside_a_table_list_or_code_span_is_found_and_checked(
         conversation = await conversation_in(client, project)
         await send(client, conversation, QUESTION)
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
-        assert [(c["marker"], c["existence"]) for c in turn["citations"]] == [
-            ("[S1.1]", "ok"), ("[S1.2]", "ok"), ("[S1.1]", "ok")]
-        assert [text[c["offset"]:c["offset"] + 6] for c in turn["citations"]] == ["[S1.1]", "[S1.2]", "[S1.1]"]
+        assert [(c["marker"], c["existence"]) for c in turn["citations"]] == [("[S1.1]", "ok"), ("[S1.2]", "ok")]
+        assert [text[c["offset"]:c["offset"] + 6] for c in turn["citations"]] == ["[S1.1]", "[S1.2]"]
         assert turn["answer"]["text"] == text
+        [judged] = provider.judged
+        assert judged["messages"][-1]["content"].count("Pair ") == 2
 
 
 async def test_a_point_inside_a_marker_or_a_number_does_not_end_a_sentence():
     text = "Earnings rose 3.5 percent [S1.1][S1.2]. Employment barely moved [S1.2]! 该论文报告 [S1.1]。"
     assert [s.strip() for _, s in citations.sentences(text)] == [
         "Earnings rose 3.5 percent [S1.1][S1.2].", "Employment barely moved [S1.2]!", "该论文报告 [S1.1]。"]
+
+
+async def test_a_marker_after_the_sentences_end_cites_the_sentence_before_it(tmp_path):
+    text = "Minimum wages raise earnings. [S1.1] 该论文报告了收入上升。[S1.1]"
+    provider = Provider(answer_text=text)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert [c["sentence"] for c in turn["citations"]] == ["Minimum wages raise earnings.", "该论文报告了收入上升。"]
+        [judged] = provider.judged
+        assert "Sentence: Minimum wages raise earnings.\n" in judged["messages"][-1]["content"]
+
+
+async def test_a_long_run_of_points_is_split_in_time_linear_in_its_length():
+    import time
+    began = time.monotonic()
+    citations.sentences("!" * 200_000 + "x")
+    assert time.monotonic() - began < 1.0
+
+
+async def test_a_passage_removed_while_the_judge_ran_is_saved_as_source_removed_not_a_failed_save(tmp_path):
+    db_holder = {}
+
+    async def verdicts(body):  # the cited paper's passage goes while the judge runs
+        db = db_holder["db"]
+        await asyncio.to_thread(db.write, lambda conn: (
+            conn.execute("PRAGMA defer_foreign_keys = ON"),
+            conn.execute("UPDATE citations SET passage_id = NULL"),
+            conn.execute("DELETE FROM passages")))
+        return provider.answer("1: supported")
+    provider = Provider(verdicts=verdicts)
+    async with cited(tmp_path, provider) as client:
+        db_holder["db"] = client.state["db"]
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, QUESTION)
+        assert stream[-1]["status"] == "succeeded"
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["result_saved"] and [(c["existence"], c["support"]) for c in turn["citations"]] == [
+            ("source_removed", "unchecked")]

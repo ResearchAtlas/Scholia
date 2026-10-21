@@ -1106,6 +1106,7 @@
     "other": "{count} 个 PDF 这次无法读取：{reason}对应文献保留原有文件。"
   },
   "turn.details": "详情",
+  "turn.notice.indexUnavailable": "无法检索你的论文：文献库的检索索引正在建立或不可用。",
   "turn.notice.keywordOnly": "语义检索不可用，这个回答的证据只来自关键词检索。",
   "turn.notice.unchecked": "部分引用未能与其段落核对。",
   "turn.notice.noSkills": "这个模型不支持技能，Scholia 直接根据你的资料库回答。",

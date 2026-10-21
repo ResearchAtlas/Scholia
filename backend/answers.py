@@ -11,7 +11,8 @@ bodies it sent; and an answer's citations, resolved again or checked again.
   2026-10-17 (8)), else `source_removed`. Nothing is written.
 - `POST /api/citations/check`: the support judge again on an answer's citations, as a background run of
   the project (workflow `citation_check`): admitted and reserved like any model call, listed with its
-  cost, up to `[retrieval] judge_pairs` pairs a run.
+  cost, up to `[retrieval] judge_pairs` pairs a run; the passages it sends are registered with the
+  dispatch check, so one deleted or re-read before its dispatch stops it.
 """
 
 import asyncio
@@ -105,14 +106,17 @@ async def check(body: Check, request: Request):
         policy = governance.policy(conn, project_id)
         if policy is None or policy.locked:
             raise AdmissionError(403, "review_locked", "This project is review-locked")
-        if conn.execute("SELECT 1 FROM citations WHERE owner_kind = 'answer' AND owner_id = ? AND existence = 'ok'",
-                        (body.run_id,)).fetchone() is None:
+        cited = conn.execute("SELECT passage_id, material_id FROM citations WHERE owner_kind = 'answer' AND owner_id = ?"
+                             " AND existence = 'ok' AND passage_id IS NOT NULL", (body.run_id,)).fetchall()
+        if not cited:
             raise AdmissionError(409, "nothing_to_check", "The answer has no citation to check")
         provider, _, model = (route or ":").partition(":")
         conn.execute("INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
                      " VALUES (?, ?, 'background', 'citation_check', ?, ?)",
-                     (ids[0], project_id, body.run_id, json.dumps({"check": body.run_id, "provider": provider,
-                                                                   "model": model})))
+                     (ids[0], project_id, body.run_id, json.dumps({"check": body.run_id, "provider": provider, "model": model,
+                                 # registered with the dispatch check and deletion's scope links, as a turn's are
+                                 "passage_ids": sorted({p for p, _ in cited}),
+                                 "material_ids": sorted({m for _, m in cited if m})})))
         return ids[0], [ids[0]]
 
     run_id = await harness.record_background(1, record)

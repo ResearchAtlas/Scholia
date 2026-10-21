@@ -40,10 +40,12 @@ def load(name):
     return json.loads((FOLDER / name).read_text(encoding="utf-8"))
 
 
-def _summary(specs, boot, scores, outcomes, groups):
-    """Each metric's mean, n and interval, and the arm's (mode, reason) outcomes counted."""
-    out = {"fallbacks": dict(tier1.Counter(o[1] or o[0] for o in outcomes if tuple(o) != ("hybrid", None)
-                                           and tuple(o) != ("keyword_only", "reference_arm")))}
+def _summary(arm, specs, boot, scores, outcomes, groups):
+    """Each metric's mean, n and interval, and the arm's (mode, reason) outcomes counted: complete when its
+    only fallbacks are the product's own (tier1.OWN_FALLBACKS), as tier 1 scores an arm."""
+    expected = tier1.EXPECTED.get(arm, ("hybrid", None))
+    fallbacks = dict(tier1.Counter(o[1] or o[0] for o in outcomes if tuple(o) != expected))
+    out = {"complete": set(fallbacks) <= tier1.OWN_FALLBACKS.get(arm, set()), "fallbacks": fallbacks}
     for spec in specs:
         values = [s[spec["name"]] for s in scores]
         interval = metrics.bootstrap(values, groups, boot["resamples"], boot["seed"], boot["level"])
@@ -74,7 +76,7 @@ async def cross_language(client, state, install, files, specs, boot, arms):
         for arm, result in out.items():
             scores = [tier1.score_qasper(r, q["annotators"], specs) for r, q in zip(result["rankings"], asked)]
             record["arms"].setdefault(arm, {})[language] = {
-                **_summary(specs, boot, scores, result["outcomes"], groups), "scores": scores}
+                **_summary(arm, specs, boot, scores, result["outcomes"], groups), "scores": scores}
     for arm, entry in record["arms"].items():  # the Chinese wording's paired cost, question by question
         entry["zh_minus_en"] = {}
         for spec in specs:
@@ -111,7 +113,7 @@ async def chinese_documents(client, state, install, specs, boot, arms):
               "arms": {}}
     for arm, result in out.items():
         scores = [tier1.score_qasper(r, q["annotators"], specs) for r, q in zip(result["rankings"], queries)]
-        record["arms"][arm] = {"zh": _summary(specs, boot, scores, result["outcomes"], [q["group"] for q in queries])}
+        record["arms"][arm] = {"zh": _summary(arm, specs, boot, scores, result["outcomes"], [q["group"] for q in queries])}
     return record
 
 
@@ -132,8 +134,11 @@ async def run(manifest, files, out, open_app, arms):
     except BaseException as error:
         tier1.write_atomic(out, {"status": "incomplete", "reason": f"{type(error).__name__}: {str(error)[:300]}"})
         raise
-    results.update(status="finished", finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                   load_average_end=tier1.os.getloadavg())
+    gaps = [f"{part} {arm} {language}: did not run as named ({entry['fallbacks']})"
+            for part in ("cross_language", "chinese_documents") for arm, by in results[part]["arms"].items()
+            for language, entry in by.items() if language in ("en", "zh") and not entry["complete"]]
+    results.update(status="incomplete" if gaps else "finished", gaps=gaps,
+                   finished_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), load_average_end=tier1.os.getloadavg())
     tier1.write_atomic(out, results)
     return results
 

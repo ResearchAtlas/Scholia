@@ -43,8 +43,10 @@ def run(items):
         decision = router.decide(item["text"], selected=item["selected"], has_materials=True, small_model=False)
         routed = decision["route"] in LIBRARY
         for key in (item["language"], "all"):
-            entry = out.setdefault(key, {"n": 0, "matched": 0, "missed": 0, "needless": 0, "by_row": Counter()})
+            entry = out.setdefault(key, {"n": 0, "matched": 0, "by_rule": 0, "missed": 0, "needless": 0,
+                                         "by_row": Counter()})
             entry["n"] += 1
+            entry["by_rule"] += decision["decided_by"] == "rules"
             entry["matched"] += decision["route"] == item["route"]
             entry["missed"] += item["needs_retrieval"] and not routed
             entry["needless"] += routed and not item["needs_retrieval"]
@@ -56,8 +58,9 @@ def report(out):
     lines = []
     for key, entry in sorted(out.items(), key=lambda item: item[0] == "all"):
         n = entry["n"]
-        lines.append(f"{key}: {n} requests; route as labeled {entry['matched'] / n:.1%}; missed retrieval "
-                     f"{entry['missed'] / n:.1%}; needless retrieval {entry['needless'] / n:.1%}")
+        lines.append(f"{key}: {n} requests; decided by a rule {entry['by_rule'] / n:.1%} (the rest by the fallback, "
+                     f"which the rows without a rule are labeled with); route as labeled {entry['matched'] / n:.1%}; "
+                     f"missed retrieval {entry['missed'] / n:.1%}; needless retrieval {entry['needless'] / n:.1%}")
     return lines
 
 

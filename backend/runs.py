@@ -787,8 +787,11 @@ class Harness:
             checked = await self._read(lambda conn: citations.check_existence(
                 conn, ctx["project_id"], result.content, numbered))
             verdicts, judged = await self._support(claim, ctx, checked, judge)
-            ctx["checked"] = citations.apply_verdicts(checked, verdicts)
-            notices = [n for n, shown in (("keyword_only", found["mode"] == "keyword_only"), ("unchecked", not judged),
+            ctx["cited"] = (result.content, numbered, verdicts)  # checked again in the primary commit
+            unsearched = (found.get("trace") or {}).get("index") in ("building", "unavailable")
+            notices = [n for n, shown in (("index_unavailable", unsearched),
+                                          ("keyword_only", found["mode"] == "keyword_only" and not unsearched),
+                                          ("unchecked", not judged),
                                           ("skills_unavailable", not ctx["facts"].get("tools")),
                                           ("retracted", any(c.get("retraction") == "retracted" for c in checked)))
                        if shown]
@@ -886,7 +889,10 @@ class Harness:
         if not _running(conn, claim.run_id) or _revoked(conn, claim.run_id):  # deleted, ended or revoked: nothing to publish
             raise _Cancelled()
         cost = spending.run_cost(conn, claim.run_id)
-        checked = ctx.get("checked") or []
+        # Existence and mapping again, in this transaction: a passage re-read or removed while the judge ran is
+        # mapped by its quote or marked source_removed (its verdict then unchecked), never a row that fails.
+        text, numbered, verdicts = ctx.get("cited") or ("", {}, {})
+        checked = citations.apply_verdicts(citations.check_existence(conn, ctx["project_id"], text, numbered), verdicts)
         now = utc_now()
         citations.write_rows(conn, claim.run_id, checked, now, new_id)
         _event(conn, claim.run_id, "citation_checks", {"citations": [
@@ -967,7 +973,9 @@ class Harness:
         turn's own route when None; on the project's allowed routes, through the dispatch path, never
         forcing a tool choice. Returns the call's result, or None when the route cannot serve it (not
         allowed, unusable, too small for the request)."""
-        route, facts = ctx["route"], ctx["facts"]
+        # The turn's route and privacy controls, but not its reasoning effort: a role step's output limit is the
+        # least a step has, which reasoning tokens would use up.
+        route, facts = ctx["route"], {**ctx["facts"], "effort": None}
         if model is not None:
             if ctx["policy"].problem(ctx["provider"], model, ctx["key"]) or \
                     _unusable(ctx["table"], ctx["provider"], model):
@@ -1044,13 +1052,20 @@ class Harness:
         numbered = citations.sources(found["records"])
         lines = citations.bundle(numbered)
         budgets, facts = ctx["budgets"], ctx["facts"]
-        request = context.assemble(
-            "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
-            margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=ctx["message"],
-            sections={"agents_md": [ctx["instructions"]] if ctx["instructions"] else [], "research_evidence": lines,
-                      "conflicts": citations.missing(numbered, mode=found["mode"], route=decision["route"])},
-            history=ctx["history"])
+        index = (found.get("trace") or {}).get("index", "ready")
+
+        def assemble(evidence, held):
+            return context.assemble(
+                "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
+                margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=ctx["message"],
+                sections={"agents_md": [ctx["instructions"]] if ctx["instructions"] else [], "research_evidence": evidence,
+                          "conflicts": citations.missing(held, mode=found["mode"], route=decision["route"], index=index)},
+                history=ctx["history"])
+        request = assemble(lines, numbered)
         kept = len(lines) - request.cuts.get("research_evidence", 0)
+        if lines and not kept:  # the window left no room for any of it: the request says it holds none
+            request = assemble([], {})
+            request.cuts["research_evidence"] = len(lines)
         return dict(list(numbered.items())[:kept]), request
 
     async def _register_context(self, claim, numbered):
@@ -1095,10 +1110,9 @@ class Harness:
         wanted = citations.pairs(checked)
         if not wanted:
             return {}, True
-        texts = {c["passage_id"]: c["quote"] for c in checked if c["existence"] == "ok"}
+        wanted_ids = sorted({pid for _, pid in wanted})
         texts = await self._read(lambda conn: {pid: text for pid, text in conn.execute(
-            "SELECT id, text FROM passages WHERE id IN (SELECT value FROM json_each(?))",
-            (json.dumps(sorted(texts)),))} or texts)
+            "SELECT id, text FROM passages WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(wanted_ids),))})
         verdicts, complete = {}, True
         size = ctx["personal"].values["retrieval"]["judge_pairs"]
         queue = citations.batches(wanted, size)

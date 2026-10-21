@@ -110,3 +110,10 @@ async def test_a_memory_route_preloads_nothing_and_says_so(tmp_path):
         [body] = provider.answers
         system = body["messages"][0]["content"]
         assert "## RESEARCH EVIDENCE" not in system and "could not be retrieved rather than inventing them" in system
+
+
+def test_a_comparison_route_says_its_memory_half_is_not_available_yet():
+    from backend import citations
+    notes = citations.missing({}, mode="hybrid", route="memory_literature")
+    assert any("could not be retrieved rather than inventing them" in note for note in notes)
+    assert not any("could not be retrieved" in note for note in citations.missing({}, mode="hybrid", route="literature"))

@@ -1140,6 +1140,7 @@
     "other": "{count} PDFs could not be read this time: {reason} Their papers keep the files they had."
   },
   "turn.details": "Details",
+  "turn.notice.indexUnavailable": "Your papers could not be searched: the library's search index is being built or is unavailable.",
   "turn.notice.keywordOnly": "Meaning search was unavailable, so this answer's evidence came from keyword search only.",
   "turn.notice.unchecked": "Some citations could not be checked against their passages.",
   "turn.notice.noSkills": "Skills are unavailable on this model, so Scholia answered from your library directly.",
