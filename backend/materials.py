@@ -850,10 +850,13 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
     file was replaced meanwhile keeps what its newer file gives (outcome replaced). A retraction
     check is about one DOI: a record of another DOI, or of none, that says nothing on retraction
     leaves the paper unchecked rather than keeping the old DOI's check. A changed title is indexed anew
-    (search.retitled), its project's index run requested with record (harness: its runs, for the request)."""
-    now = utc_now()
+    (search.retitled), its project's index run requested with record (harness: its runs, for the request).
+    A paper's details changed put its project first in the list, as an import does, however long the
+    lookup's question waited; a lookup that changes no detail (a retraction check alone, or a record the
+    paper carries already) does not."""
+    now, changed = utc_now(), False
     for material, version in pairs:
-        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title FROM materials m"
+        row = conn.execute("SELECT m.checked_by, v.id = ?, json_extract(m.csl, '$.DOI'), m.title, m.csl FROM materials m"
                            " JOIN material_versions v ON v.material_id = m.id AND v.is_current = 1"
                            " WHERE m.id = ? AND m.project_id = ?",
                            (version, material, project_id)).fetchone()
@@ -862,8 +865,10 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
         # S1-15: a record that gives another identifier now is not this lookup's to fill
         mine, result = (found, outcome) if row[1] and _gives(conn, material, version, (scheme, value)) else (None, "replaced")
         filled = _fill_imported(conn, material, mine) if mine is not None else None  # S1-14: its record stays
+        changed = changed or bool(filled)
         if mine is not None:
             if row[0] != "researcher" and filled is None:  # what the researcher edited stays
+                changed = changed or (mine.csl["title"], mine.csl) != (row[3], json.loads(row[4] or "null"))
                 conn.execute("UPDATE materials SET title = ?, csl = ?, source_key = ?, resolved_at = ?, checked_at = ?,"
                              " checked_by = 'lookup', updated_at = ? WHERE id = ?",
                              (mine.csl["title"], json.dumps(mine.csl), mine.source_key, now, now, now, material))
@@ -880,6 +885,8 @@ def _apply(conn, run_id, project_id, pairs, scheme, value, found, outcome, recor
         _event(conn, run_id, "step_finished", {"material_id": material, "identifier": f"{scheme}:{value}",
                                                "source": mine.source if mine else None, "outcome": result,
                                                **({"filled": filled} if filled else {})})
+    if changed:
+        conn.execute("UPDATE projects SET updated_at = ? WHERE id = ?", (now, project_id))
 
 
 def _fill_imported(conn, material, found):
@@ -1465,9 +1472,11 @@ async def retry_run(run_id: str, request: Request):
     state = _state(request)
 
     def again(conn, ids):
-        row = conn.execute("SELECT json_extract(inputs, '$.retried_by') FROM runs WHERE id = ?", (run_id,)).fetchone()
+        row = conn.execute("SELECT json_extract(inputs, '$.retried_by'), workflow FROM runs WHERE id = ?",
+                           (run_id,)).fetchone()
         if row is not None and row[0] is not None:  # tried again already: that run, started if no process holds it
             answered.append(row[0])
+            indexing.append(row[1] == "index")
             return row[0], []
         registry = state["harness"].registry
         retry, refusal = _retry(conn, run_id, registry)
@@ -1494,11 +1503,14 @@ async def retry_run(run_id: str, request: Request):
                      (retried, run_id))
         if retried != ids[0]:  # the project's run an index request answered with, not recorded here
             answered.append(retried)
+        indexing.append(workflow == "index")
         return retried, [ids[0]] if retried == ids[0] else []
 
-    registry, answered = state["harness"].registry, []
+    registry, answered, indexing = state["harness"].registry, [], []
 
     async def started(retried):  # once the Retry has committed, whatever becomes of its request (record_background)
+        if any(indexing):  # an unusable index rebuilt (search.recover)
+            search.recover(state)
         if answered:  # a run it did not record, which no process may hold (a failed terminal write left it running)
             await search._started(state["harness"], retried)
     try:

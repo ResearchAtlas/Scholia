@@ -225,6 +225,16 @@ class Registry:
         with self.lock:
             self.retired.discard(run_id)
 
+    def hand_over(self, active: ActiveRun) -> ActiveRun | None:
+        """The background run active holds, held at once by a new ActiveRun (to start again), in one step under
+        the lock, so no read sees it released between the two (it never reads interrupted meanwhile)."""
+        with self.lock:
+            if self.closed or self.runs.get(active.run_id) is not active:
+                return None
+            again = ActiveRun(active.run_id, "background", None)
+            self.runs[active.run_id] = again
+            return again
+
     def release(self, active: ActiveRun) -> None:
         with self.lock:  # from a write transaction's thread too (record_background)
             if self.runs.get(active.run_id) is active:
@@ -354,8 +364,8 @@ class Harness:
         # work began; S1-17: a project's index run, asked for again while it ran, runs once more).
         self.endings = {}
         self._tasks = set()  # detached tasks, kept referenced until they finish
-        # Index runs a kick started again after they were left running unheld (a terminal write that failed): once
-        # each, so a failure that lasts never makes a loop of them (the next trigger, Retry or launch takes it then)
+        # Index runs started again (handed over, _background) after a terminal write that failed: once each, so a
+        # failure that lasts never makes a loop of them (the next trigger, Retry or launch takes it then)
         self._started_again = set()
         # Orders settings saves with the budget reads of call admission: a lowered budget either
         # lands before a call reads it or after that call was admitted.
@@ -1460,16 +1470,21 @@ class Harness:
             # Released only after its terminal record committed (and it is in `finished`), or still
             # running in the record: left for the next start, or by a terminal write that raised, which
             # reads interrupted from here on. At no moment does a finished run read interrupted.
-            self.registry.release(active)
+            again = None
             if (index_run and active.run_id not in self.registry.finished and not active.cancel_requested.is_set()
                     and not self.registry.closed and active.run_id not in self._started_again):
-                # An index run left running in its record, held by no process (its terminal write failed) is started
-                # again in this session, once, and only it (start_again), so what it was asked to do (a rerun marked
-                # on it included) is never left waiting for an unrelated trigger or the next launch. Other runs keep
-                # their own rules (a reading so left reads interrupted, with Retry; a model call's run waits for the
-                # next start); a turn's end still kicks them all, as before.
+                # An index run left running in its record (its terminal write failed) is started again in this
+                # session, once, and only it, so what it was asked to do (a rerun marked on it included) is never left
+                # waiting for an unrelated trigger or the next launch. It stays held across the restart (hand_over):
+                # a poll meanwhile reads it running, never interrupted. Its new start reads its record again, and
+                # ends at once if that is no longer running. Other runs keep their own rules (a reading so left reads
+                # interrupted, with Retry; a model call's run waits for the next start); a turn's end still kicks them
+                # all, as before.
                 self._started_again.add(active.run_id)
-                self._detach(self.start_again(active.run_id))
+                again = self.registry.hand_over(active)
+            self.registry.release(active)  # nothing, once handed over
+            if again is not None:
+                again.task = asyncio.create_task(self._background(again))
             if active.follows:  # recorded mid-run by writes that committed (a run with no row ends at its start)
                 if self.registry.closed:
                     for held in active.follows:

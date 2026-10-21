@@ -133,6 +133,118 @@ def test_closing_the_window_interrupts_running_work_and_stops_the_server(tmp_pat
     os.close(fd)
 
 
+def test_a_backend_that_outlives_its_stop_keeps_the_data_folder_locked(tmp_path, monkeypatch):
+    from backend.search_index import SearchIndex
+    data, writing, taken = tmp_path / "data", threading.Event(), []
+    real_take_lock, real_close = desktop.take_lock, SearchIndex.close
+
+    def take_lock(data_dir):
+        taken.append(real_take_lock(data_dir))
+        return taken[-1]
+
+    def slow_close(self):  # a rebuild still running in the index's writer as the window closes
+        if not self.closed:  # a later close only waits for the first
+            self._writer.submit(writing.wait)
+        real_close(self)
+
+    monkeypatch.setattr(desktop, "take_lock", take_lock)
+    monkeypatch.setattr(SearchIndex, "close", slow_close)
+    monkeypatch.setattr(desktop, "STOP_SECONDS", 1)
+    seen = []
+    try:
+        assert desktop.run(data, _open_and_close(seen), keyring_backend=FakeKeyring(),
+                           listening=register_server) == 0
+        [server] = [t for t in threading.enumerate() if t.name == "scholia-server"]
+        assert seen == [True] and server.is_alive()  # its index's writer still runs
+        assert real_take_lock(data) is None  # so no second launch takes the folder (and replaces the index)
+    finally:
+        writing.set()
+        for thread in threading.enumerate():
+            if thread.name == "scholia-server":
+                thread.join(30)
+    assert real_take_lock(data) is None  # held until the process ends, which releases it
+    os.close(taken[0])
+    fd = real_take_lock(data)
+    assert fd is not None
+    os.close(fd)
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")  # the server's abnormal end
+@pytest.mark.filterwarnings("ignore:The executor did not finish")  # asyncio.run giving up on the index's close
+def test_a_server_that_ends_before_the_index_closed_keeps_the_data_folder_locked(tmp_path, monkeypatch):
+    import asyncio
+    import contextlib
+
+    import uvicorn
+
+    from backend.search_index import SearchIndex
+    data, closing, writing, taken, closers = tmp_path / "data", threading.Event(), threading.Event(), [], []
+    real_take_lock, real_close, real_serve = desktop.take_lock, SearchIndex.close, uvicorn.Server.serve
+
+    def take_lock(data_dir):
+        taken.append(real_take_lock(data_dir))
+        return taken[-1]
+
+    def slow_close(self):  # a rebuild still running in the index's writer as the app closes it
+        if not self.closed:  # a later close only waits for the first
+            closers.append(threading.current_thread())
+            self._writer.submit(writing.wait)
+            closing.set()
+        real_close(self)
+
+    async def failing_serve(self, sockets=None):  # the server ends abnormally while the index's close waits
+        serving = asyncio.ensure_future(real_serve(self, sockets=sockets))
+        while not closing.is_set():
+            await asyncio.sleep(0.01)
+        serving.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await serving
+        raise SystemExit(1)  # as uvicorn ends on a failure
+
+    monkeypatch.setattr(desktop, "take_lock", take_lock)
+    monkeypatch.setattr(SearchIndex, "close", slow_close)
+    monkeypatch.setattr(uvicorn.Server, "serve", failing_serve)
+    monkeypatch.setattr(asyncio.constants, "THREAD_JOIN_TIMEOUT", 0.05)  # asyncio.run's wait for its workers, shortened
+    seen = []
+    try:
+        assert desktop.run(data, _open_and_close(seen), keyring_backend=FakeKeyring(),
+                           listening=register_server) == 0
+        assert seen == [True]
+        assert not [t for t in threading.enumerate() if t.name == "scholia-server"]  # the server ended
+        assert closers[0].is_alive()  # but the index's close still waits for its writer
+        assert real_take_lock(data) is None  # so no second launch takes the folder (and replaces the index)
+    finally:
+        writing.set()
+        for thread in closers:
+            thread.join(30)
+    os.close(taken[0])
+
+
+@pytest.mark.parametrize("failed", ["a close", "a router's closing"])
+def test_a_close_that_failed_keeps_the_data_folder_locked(tmp_path, monkeypatch, failed):
+    from backend import app as app_module
+    from backend import local_helper
+    data, taken, real_take_lock = tmp_path / "data", [], desktop.take_lock
+
+    def take_lock(data_dir):
+        taken.append(real_take_lock(data_dir))
+        return taken[-1]
+
+    async def failing_close(self):
+        raise RuntimeError("the local helpers did not stop")
+
+    monkeypatch.setattr(desktop, "take_lock", take_lock)
+    if failed == "a close":
+        monkeypatch.setattr(app_module, "close_failed", lambda: True)  # what it left open may still be open
+    else:
+        monkeypatch.setattr(local_helper.Local, "close", failing_close)
+    seen = []
+    assert desktop.run(data, _open_and_close(seen), keyring_backend=FakeKeyring(), listening=register_server) == 0
+    assert seen == [True] and not [t for t in threading.enumerate() if t.name == "scholia-server"]
+    assert real_take_lock(data) is None  # held until the process ends
+    os.close(taken[0])
+
+
 def test_an_existing_data_folder_is_narrowed_to_owner_only(tmp_path):
     data = tmp_path / "data"
     (data / "projects" / "p").mkdir(parents=True)
