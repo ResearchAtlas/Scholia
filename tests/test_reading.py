@@ -809,7 +809,7 @@ def test_a_sentinel_whose_child_is_ended_by_its_pid_before_it_stops_is_found_lef
                "print(pid, flush=True); time.sleep(30)\n"]
     with allow_command(*command):
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, process_group=0)
-    reading.LIVE.started.append(child.pid)  # conftest's check ends it if this test does not
+    reading.LIVE.started.append(child.pid)  # conftest's check reports it if this test does not end it
     stand_in = start = None
     try:
         stand_in = int(child.stdout.readline())
