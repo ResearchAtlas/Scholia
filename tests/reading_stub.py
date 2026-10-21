@@ -125,7 +125,7 @@ class Out(reading._Out):
         if key == "done" and MODE == "done-then-stall":
             import ctypes
 
-            Path(ARGS[0], f"held-{os.getpid()}").write_text("done")
+            say(ARGS[0], "done")
             ctypes.PyDLL(None).sleep(60)
         if key == "done" and MODE == "after-done":
             if ARGS[0] == "exit":
@@ -140,10 +140,18 @@ def touch(mib):
     return block
 
 
+def say(folder, what):
+    """Say so by the file folder/held-<pid>, holding what: written beside it and renamed, so a reader never
+    finds it there empty (a child descheduled between the file's creation and its write)."""
+    beside = Path(folder, f".held-{os.getpid()}")
+    beside.write_text(str(what))
+    beside.rename(Path(folder, f"held-{os.getpid()}"))
+
+
 def hold(what, stop=lambda: None, progress=lambda done, total: None):
     folder = Path(ARGS[0])
     progress(0, 1)
-    (folder / f"held-{os.getpid()}").write_text(str(what))
+    say(folder, what)
     while not (folder / "go").exists():
         stop()
         time.sleep(0.01)
@@ -184,10 +192,10 @@ def before(what, stop, progress, data=b""):
     elif MODE == "gil-stall":
         import ctypes
 
-        Path(ARGS[0], f"held-{os.getpid()}").write_text(str(what))
+        say(ARGS[0], what)
         ctypes.PyDLL(None).sleep(int(ARGS[1]))  # PyDLL: the GIL is held through the call
     elif MODE == "chatter":
-        Path(ARGS[0], f"held-{os.getpid()}").write_text(str(what))
+        say(ARGS[0], what)
         for _ in range(30000):
             out.send("beat", 1)
             time.sleep(0.002)
@@ -251,7 +259,7 @@ def extractor_of(kind):
     if MODE == "gil-stall-before-ready":  # where the child is before it sends ready
         import ctypes
 
-        Path(ARGS[0], f"held-{os.getpid()}").write_text(kind)
+        say(ARGS[0], kind)
         ctypes.PyDLL(None).sleep(int(ARGS[1]))
     name, version = real_extractor_of(kind)
     return name, version + ("-other" if MODE == "version" else "")
@@ -293,7 +301,7 @@ if MODE == "sentinel-lost-at-once":
     def lost_at_once():
         pid = real_sentinel()
         os.kill(pid, getattr(signal, ARGS[1]))
-        Path(ARGS[0], f"held-{os.getpid()}").write_text(str(pid))
+        say(ARGS[0], pid)
         ctypes.PyDLL(None).sleep(60)
         return pid
 
@@ -305,7 +313,7 @@ if MODE == "finalize-stall":
 
     def stall():
         out.stream.close()  # as the real child's is once main returns (only this stub keeps it)
-        Path(ARGS[0], f"held-{os.getpid()}").write_text("finalizing")
+        say(ARGS[0], "finalizing")
         ctypes.PyDLL(None).sleep(60)
 
     atexit.register(stall)

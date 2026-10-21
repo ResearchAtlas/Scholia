@@ -43,6 +43,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import signal
 import stat
 import sys
@@ -902,28 +903,55 @@ def load_field(field, folder):
     return read_json(folder, folder / "papers.json"), sha256_of(folder, folder / "papers.json"), sets
 
 
+SCRATCH_LOCK = threading.Lock()  # field 1's scratch changes process-wide TMPDIR: one at a time in a process
+SCRATCH_HOLDER = [None]  # the thread holding it, so a second entry from that thread is refused, not a hang
+
+
 @contextlib.contextmanager
 def scratch(field, folder):
     """The temporary folder a command's app runs in, removed after: field 2's under TMPDIR; field 1's inside
     field 1's own folder, outside every git work tree as private_path holds it (Harold, 2026-10-21), with
-    TMPDIR pointed into it meanwhile, so the app's reading child and any library's scratch stay there too."""
+    TMPDIR pointed into it meanwhile, so the app's reading child and any library's scratch stay there too.
+    TMPDIR is the process's, so field 1's runs one at a time: a call from another thread waits for the one
+    running; one from the same thread (two tasks on one event loop) is refused, since waiting there would
+    stop the loop the running one needs."""
     if field != 1:
         with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
             yield Path(tmp)
         return
-    with tempfile.TemporaryDirectory(prefix=".tmp-scholia-gold-", dir=folder) as tmp:
-        inner = Path(tmp) / "tmp"
-        inner.mkdir(mode=0o700)
-        saved = os.environ.get("TMPDIR"), tempfile.tempdir
-        os.environ["TMPDIR"] = tempfile.tempdir = str(inner)
+    if SCRATCH_HOLDER[0] == threading.get_ident():
+        raise Refused("another field 1 check or passages is running on this thread; run them one after another")
+    with SCRATCH_LOCK:
+        # Field 1's folder checked again now this call runs (it may have changed while the call waited), and the
+        # temporary folder made in it as the walk reaches a folder: from the root, opened without following a link.
+        name = f".tmp-scholia-gold-{secrets.token_hex(8)}"
+        root = field1(folder)
+        fd = _open_dir(root, root)
         try:
-            yield Path(tmp)
+            os.mkdir(name, 0o700, dir_fd=fd)
+            made = _step(fd, name, root / name)
+            try:
+                os.mkdir("tmp", 0o700, dir_fd=made)
+            finally:
+                os.close(made)
+            saved = os.environ.get("TMPDIR"), tempfile.tempdir
+            os.environ["TMPDIR"] = tempfile.tempdir = str(Path(root, name, "tmp"))
+            SCRATCH_HOLDER[0] = threading.get_ident()
+            try:
+                yield Path(root, name)
+            finally:
+                if saved[0] is None:
+                    os.environ.pop("TMPDIR", None)
+                else:
+                    os.environ["TMPDIR"] = saved[0]
+                tempfile.tempdir = saved[1]
+                SCRATCH_HOLDER[0] = None
         finally:
-            if saved[0] is None:
-                os.environ.pop("TMPDIR", None)
-            else:
-                os.environ["TMPDIR"] = saved[0]
-            tempfile.tempdir = saved[1]
+            try:
+                with contextlib.suppress(FileNotFoundError):  # not made, if its making failed
+                    shutil.rmtree(name, dir_fd=fd)
+            finally:
+                os.close(fd)
 
 
 async def write_when_done(root, out, make):

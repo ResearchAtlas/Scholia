@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -976,6 +977,106 @@ async def test_field_ones_temporary_folder_is_removed_and_tmpdir_given_back_when
         await gold.passages(1, folder, pdfs, failing)
     assert not [p for p in folder.iterdir() if p.name.startswith(".tmp-")] and tempfile.tempdir is None
     assert os.environ.get("TMPDIR") == (None if tmpdir is None else str(tmp_path))
+
+
+def test_two_overlapping_field_one_scratches_never_leave_its_folder_and_give_tmpdir_back(tmp_path, monkeypatch):
+    """PR 42's connector thread: scratch() points the process's TMPDIR into field 1's folder, so two calls
+    overlapping in one process overwrote each other (the first to end gave TMPDIR back while the second ran).
+    They run one at a time: each sees its own folder from start to end, and TMPDIR is given back once both
+    end. One from the thread already inside (two tasks on one event loop) is refused, not left waiting."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    folder = tmp_path / "f1"
+    folder.mkdir()
+    first_in, second_in, first_out, seen = threading.Event(), threading.Event(), threading.Event(), {}
+
+    def run(name, inside):
+        with gold.scratch(1, folder) as tmp:
+            seen[name] = [(os.environ["TMPDIR"], tempfile.gettempdir())]
+            inside()
+            seen[name] = tmp, seen[name] + [(os.environ["TMPDIR"], tempfile.gettempdir())]
+        if name == "first":
+            first_out.set()
+
+    def first():
+        first_in.set()
+        second_in.wait(1)  # without the lock the second is inside by now; with it, it waits for this one to end
+
+    def second():
+        second_in.set()
+        first_out.wait(10)  # the first has ended: without the lock, it gave TMPDIR back while this one runs
+    first_thread = threading.Thread(target=run, args=("first", first))
+    first_thread.start()
+    first_in.wait()
+    second_thread = threading.Thread(target=run, args=("second", second))
+    second_thread.start()
+    first_thread.join()
+    second_thread.join()
+    for tmp, values in seen.values():
+        assert tmp.parent == folder and all(Path(v).parent == tmp for pair in values for v in pair)
+    assert seen["first"][0] != seen["second"][0]
+    assert os.environ["TMPDIR"] == str(tmp_path) and tempfile.tempdir is None
+    assert not [p for p in folder.iterdir() if p.name.startswith(".tmp-")]
+    with gold.scratch(1, folder), pytest.raises(tier1.Refused, match="one after another"):
+        with gold.scratch(1, folder):
+            pass
+    assert os.environ["TMPDIR"] == str(tmp_path) and tempfile.tempdir is None
+
+
+def test_a_field_one_scratch_that_waited_refuses_a_folder_replaced_meanwhile_by_a_link_into_git(tmp_path, monkeypatch):
+    """fu2 sol review 1 (P1): check and passages accept field 1's folder before scratch waits its turn; a folder
+    renamed meanwhile and replaced by a link into a git work tree was followed, and the scratch made in the
+    repository. The folder is checked again once the turn comes, and the scratch made from its root without
+    following a link: the waiting call is refused, and nothing is made in the repository."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    repo = fixtures.git("init", tmp_path / "repo")
+    (repo / "inside").mkdir()
+    folder = tmp_path / "f1"
+    folder.mkdir()
+    root = gold.field1(folder)  # accepted, as check and passages accept it before scratch
+    inside, leave, outcome = threading.Event(), threading.Event(), {}
+
+    def first():
+        with gold.scratch(1, root):
+            inside.set()
+            leave.wait(10)
+
+    def second():
+        try:
+            with gold.scratch(1, root):
+                outcome["second"] = "made"
+        except tier1.Refused as refused:
+            outcome["second"] = str(refused)
+    first_thread = threading.Thread(target=first)
+    first_thread.start()
+    inside.wait(10)
+    second_thread = threading.Thread(target=second)
+    second_thread.start()  # it waits for the first's turn, with the folder as it was accepted
+    folder.rename(tmp_path / "f1-moved")
+    folder.symlink_to(repo / "inside")
+    leave.set()
+    first_thread.join()
+    second_thread.join()
+    assert "inside the repository" in outcome["second"]
+    assert list((repo / "inside").iterdir()) == [] and fixtures.git("status", repo) == ""
+    assert os.environ["TMPDIR"] == str(tmp_path) and tempfile.tempdir is None
+    assert not [p for p in (tmp_path / "f1-moved").iterdir() if p.name.startswith(".tmp-")]
+
+
+def test_a_field_one_scratch_refuses_a_folder_replaced_since_its_check_by_a_link_outside_git(tmp_path):
+    """The same, for a link to a folder outside every git work tree: the root, opened without following a link,
+    is refused as a link, and nothing is made where it leads."""
+    folder, elsewhere = tmp_path / "f1", tmp_path / "elsewhere"
+    folder.mkdir()
+    elsewhere.mkdir()
+    root = gold.field1(folder)
+    folder.rename(tmp_path / "f1-moved")
+    folder.symlink_to(elsewhere)
+    with pytest.raises(tier1.Refused, match="is a link"):
+        with gold.scratch(1, root):
+            pass
+    assert list(elsewhere.iterdir()) == [] and gold.SCRATCH_HOLDER == [None] and not gold.SCRATCH_LOCK.locked()
 
 
 def test_a_folder_below_field_ones_that_is_a_git_work_tree_is_never_read_or_written(tmp_path):
