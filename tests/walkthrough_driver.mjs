@@ -1922,7 +1922,7 @@ async function s119(ctx) {
   const { page, L, P, C, step, check, get } = ctx;
   const { openSidebar } = navigation(ctx);
   const panel = () => page.getByRole('complementary', { name: L('panel.library') });
-  const box = () => page.getByRole('textbox', { name: L('composer.label') });
+  const box = () => page.locator('#composer'); // a combobox while the @ list is open, a textbox otherwise
   const name = C.lang === 'en' ? 'Cited answers (synthetic)' : '引用回答（合成数据）';
   const notes = 'Wage floors and employment';
   const chinese = '最低工资与就业笔记';
@@ -1996,7 +1996,7 @@ async function s119(ctx) {
   await panel().getByRole('button', { name: L('paper.back') }).click(); await page.waitForTimeout(500);
 
   await step('72-details', async () => {
-    const answer = page.locator('ol > li').last();
+    const answer = page.locator('li', { has: page.getByRole('button', { name: L('turn.details') }) }).last(); // the turn, not Details' own list
     await answer.getByRole('button', { name: L('turn.details') }).click();
     await answer.getByText(L('trace.phaseJudge'), { exact: true }).first().waitFor();
     check('Details shows each step\'s estimated cost as about', await answer.getByText(P('trace.about')).count() >= 2);
