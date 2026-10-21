@@ -8,6 +8,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, getBlob } from '../api.js';
 import { errorText, money } from '../text.js';
 import { readTrace, summarize } from '../trace.js';
+import { libraryEvents } from '../library.js';
 import { LoadState } from './fields.jsx';
 
 const SUPPORT = { supported: 'cite.supported', partly: 'cite.partly', unsupported: 'cite.unsupported', unchecked: 'cite.unchecked' };
@@ -20,7 +21,12 @@ export function Trace({ turn }) {
   const language = useContext(LanguageContext);
   const [trace, setTrace] = useState(null);
   const [problem, setProblem] = useState(null);
-  const [tries, setTries] = useState(0);
+  const [tries, setTries] = useState(0); // each read: a retry, or the library changed
+  useEffect(() => { // a paper deleted: read the trace again, and drop every text shown from it (its bodies)
+    const changed = () => setTries((n) => n + 1);
+    libraryEvents.addEventListener('changed', changed);
+    return () => libraryEvents.removeEventListener('changed', changed);
+  }, []);
   useEffect(() => {
     let live = true;
     setProblem(null);
@@ -57,7 +63,7 @@ export function Trace({ turn }) {
               {step.estimate !== null && <> · <span className="font-normal text-muted-foreground">{about(step.estimate)}</span></>}
               {FUNDED[step.funded] && <> · <span className="font-normal text-muted-foreground">{t(FUNDED[step.funded])}</span></>}</p>
             {step.cut && <p className="text-muted-foreground">{t('turn.cut')}</p>}
-            {step.attempts.map((attempt, j) => <Attempt key={j} runId={turn.run_id} attempt={attempt} />)}
+            {step.attempts.map((attempt, j) => <Attempt key={`${tries}:${j}`} runId={turn.run_id} attempt={attempt} />)}
           </li>
         ))}
       </ol>

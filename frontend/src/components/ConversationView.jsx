@@ -16,7 +16,7 @@ import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
-import { ACCEPT, afterRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, newest, NO_ASKS, openPaperAt,
+import { ACCEPT, afterRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt,
   pollsAsks, readAsks, watchChosen } from '../library.js';
 import { addTo } from './Library.jsx';
 import { Ask } from './Ask.jsx';
@@ -87,6 +87,13 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   useEffect(() => {
     load();
   }, [load]);
+  // A paper deleted (or read again) changes what this conversation's citations may show: read it again, so a
+  // deleted paper's text never stays on screen (backend/provenance.py).
+  useEffect(() => {
+    const changed = (event) => { if (event.detail === projectId) load(); };
+    libraryEvents.addEventListener('changed', changed);
+    return () => libraryEvents.removeEventListener('changed', changed);
+  }, [projectId, load]);
 
   // A finished live turn hands over to its saved record once that is read, and a saved turn
   // that still reads running (its stream ended early, or it is stopping) is read again until
