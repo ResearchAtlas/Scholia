@@ -237,9 +237,13 @@ async def test_killed_during_the_title_call_restarts_it_once(tmp_path):
         turn, title, conversation, spending, attempts = await state(client)
         assert turn == [("succeeded", 1)] and title == [("succeeded", 2)]
         assert len(provider.titles) == 1 and conversation == [("Recovered title", 1)]
-        # The first title attempt was in flight: its reservation settled at the estimate, no attempt record.
+        # The first title attempt was in flight: its reservation settled at the estimate, and recovery records
+        # it as interrupted from the body kept before it was sent (S1-19b).
         assert sorted(basis for _, _, basis in spending) == ["estimated", "reported", "reported"]
-        assert attempts == 2  # the answer's and the second title attempt's
+        assert attempts == 3  # the answer's, the interrupted first title attempt's and the second's
+        outcomes = sorted(json.loads(d)["outcome"] for (d,) in await rows(
+            client, "SELECT data FROM run_events WHERE type = 'model_attempt'"))
+        assert outcomes.count("interrupted") == 1
 
 
 async def test_killed_after_the_title_step_is_recorded_finishes_from_the_record(tmp_path):
