@@ -2261,6 +2261,44 @@ async function s119(ctx) {
   await page.getByRole('button', { name: P('picker.label') }).click();
   await page.getByRole('option', { name: new RegExp(`^${L('picker.auto')}`) }).first().click(); await page.waitForTimeout(500);
 
+  // S1-19c: the help skill opens the place it names (W4), and the agent's question is answered in the conversation (W5).
+  await step('73-help-skill', async () => {
+    if (await panel().count()) { await page.getByRole('button', { name: L('panel.library'), exact: true }).click(); await page.waitForTimeout(500); }
+    check('the Library is closed before the question', !(await panel().count()));
+    const turn = await ask(C.lang === 'en' ? 'How do I add a reference file?' : '如何添加参考文献文件？');
+    await panel().waitFor();
+    check('open_place opened the Library', await panel().isVisible());
+    const events = (await get(`/api/runs/${turn.run_id}/trace`)).body.events;
+    check('the trace names the skill', events.some((e) => e.type === 'skill_activated' && e.data.name === 'help'));
+    check('the trace names each tool call, never its text', JSON.stringify(events.filter((e) => e.type === 'tool_call_started')
+      .map((e) => e.data.name)) === JSON.stringify(['use_skill', 'open_place']));
+    const answer = page.locator('li', { has: page.getByRole('button', { name: L('turn.details') }) }).last();
+    await answer.getByRole('button', { name: L('turn.details') }).click();
+    await answer.getByText(L('trace.skills')).waitFor();
+    check('Details lists the skill and the tool calls', (await answer.innerText()).includes('help')
+      && await answer.getByText(L('tool.use_skill'), { exact: false }).count() > 0);
+  });
+  await step('74-ask', async () => {
+    const question = C.lang === 'en' ? 'Which outcome should the summary focus on?' : '摘要应侧重哪个结果？';
+    const option = C.lang === 'en' ? 'Employment' : '就业';
+    await box().fill(question);
+    await page.getByRole('button', { name: L('composer.send'), exact: true }).click();
+    const card = page.getByRole('group', { name: L('ask.label') });
+    await card.waitFor();
+    check('the question shows its options in the conversation', (await card.innerText()).includes(question)
+      && await card.getByRole('button', { name: option, exact: true }).count() === 1);
+    const waiting = await latest();
+    check('the run waits on the question', waiting.status === 'running');
+    await card.getByRole('button', { name: option, exact: true }).click();
+    const turn = await until('the answer saved', async () => { const t = await latest(); return t?.status === 'succeeded' && t; });
+    check('the run went on with the researcher\'s answer', turn.answer.text.includes(option));
+    const events = (await get(`/api/runs/${turn.run_id}/trace`)).body.events;
+    check('the ask and its answer are recorded', events.some((e) => e.type === 'ask')
+      && events.some((e) => e.type === 'ask_answered' && e.data.by === 'researcher' && e.data.option === option));
+    await page.waitForTimeout(1500);
+    check('the question is gone once answered', !(await card.count()));
+  });
+
   // Harold, 2026-10-21 (option A): a deleted paper's text leaves the open conversation and its open Details
   // without a reload: the exact text sent, the citations' quotes and sentences.
   await step('77-deleted-paper', async () => {
