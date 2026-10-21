@@ -1215,6 +1215,9 @@ class Harness:
         lines = citations.bundle(numbered)
         budgets, facts = ctx["budgets"], ctx["facts"]
         index = (found.get("trace") or {}).get("index", "ready")
+        # the turn has read passages beyond its pre-load (its tools found some): the pre-load's notes on an index not
+        # searched or evidence cut for the window no longer say what the request holds
+        beyond = bool(read) and bool({r["passage_id"] for r in read.values()} - {r["passage_id"] for r in found["records"]})
 
         def assemble(evidence, held, cut=False):
             return context.assemble(
@@ -1222,7 +1225,8 @@ class Harness:
                 margin_percent=budgets["margin_percent"], system_rules=_rules(ctx["tools"]), request=ctx["message"],
                 sections={"agents_md": [ctx["instructions"]] if ctx["instructions"] else [], "research_evidence": evidence,
                           "conflicts": citations.missing(read or held, mode=found["mode"], route=decision["route"],
-                                                         index=index, cut=cut), **ctx["skill_sections"]},
+                                                         **({} if beyond else {"index": index, "cut": cut})),
+                          **ctx["skill_sections"]},
                 history=ctx["history"], tools=ctx["tools"], chain=chain)
         request = assemble(lines, numbered)
         kept = len(lines) - request.cuts.get("research_evidence", 0)
@@ -1338,10 +1342,10 @@ class Harness:
         call, problem = ToolParser.parse_call(raw)
         call_id = call.id if call else (raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else "")
         name = agent.known_name(call.name) if call else None  # never the model's own text
-        await self._record(claim, "tool_call_started", {"step": step, "call_id": call_id, "name": name,
+        await self._record(claim, "tool_call_started", {"step": step, "call_id": agent.traced_id(call_id), "name": name,
                                                         **({"arguments": agent.traced_arguments(call.arguments)}
                                                            if call and not problem else {})})
-        turn.emit({"type": "tool_call", "name": name, "call_id": call_id})
+        turn.emit({"type": "tool_call", "name": name, "call_id": agent.traced_id(call_id)})
         if call is None:
             result = failed(call_id, "validation_error", "Not a function call this app can run.")
         elif problem:
@@ -1361,7 +1365,7 @@ class Harness:
                 log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
                 result = failed(call.id, "tool_error", "The tool failed.")
         await self._record(claim, "tool_result", {
-            "step": step, "call_id": call_id, "name": name, "ok": result.ok,
+            "step": step, "call_id": agent.traced_id(call_id), "name": name, "ok": result.ok,
             **({"error": result.error.type} if result.error else {}), **({"meta": result.meta} if result.meta else {})})
         if turn.listed or result.meta.get("passages"):  # what it gave the model is covered before the next dispatch
             await self._register_context(claim, turn.evidence.numbered, turn.listed)
@@ -1382,7 +1386,7 @@ class Harness:
         keys = [str(i) for i in range(1, len(options) + 1)] if labels else list(options)
 
         def raise_ask(conn):
-            holder["ask_id"] = asks.raise_ask(conn, claim.run_id, kind, keys, {**params, "call_id": call_id},
+            holder["ask_id"] = asks.raise_ask(conn, claim.run_id, kind, keys, {**params, "call_id": agent.traced_id(call_id)},
                                               origin={"conversation_id": claim.conversation_id})
             if labels:
                 conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.held.ask', json(?)) WHERE id = ?",

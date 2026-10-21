@@ -275,7 +275,8 @@ async def test_no_event_keeps_model_text_given_in_a_tool_calls_arguments_or_name
     provider = Scripted([call("use_skill", call_id="a", name=QUOTE), call("read_passage", call_id="b", material_id=QUOTE),
                          call("list_materials", call_id="ok"),  # a success between, so the failures do not stop it
                          call("search_passages", call_id="c", query="wages", material_ids=[QUOTE]),
-                         {"id": "d", "type": "function", "function": {"name": QUOTE, "arguments": "{}"}}],
+                         {"id": "d", "type": "function", "function": {"name": QUOTE, "arguments": "{}"}},
+                         call("list_materials", call_id=QUOTE)],  # an id the model wrote
                         [call("ask", call_id="e", question=f"The paper says: {QUOTE} Go on?", options=[QUOTE[:90], "No"])],
                         "Done.")
     async with cited(tmp_path, provider) as client:
@@ -304,7 +305,9 @@ async def test_a_later_step_is_not_told_the_library_matched_nothing_once_its_own
     async def first_finds_nothing(state, project_id, query, **options):  # the pre-load matches nothing; the tool's search does
         found = await real(state, project_id, query, **options)
         calls.append(query)
-        return {**found, "records": []} if len(calls) == 1 else found
+        if len(calls) == 1:  # and its index was still being built then
+            return {**found, "records": [], "trace": {**found["trace"], "index": "building"}}
+        return found
     monkeypatch.setattr(pipeline, "evidence", first_finds_nothing)
     provider = Scripted([call("search_passages", query="minimum wages earnings")], "Done.")
     async with cited(tmp_path, provider) as client:
@@ -312,8 +315,8 @@ async def test_a_later_step_is_not_told_the_library_matched_nothing_once_its_own
         conversation = await conversation_in(client, project)
         await send(client, conversation, "Quasars at radio wavelengths?")  # the pre-load matches nothing
         first, second = (b["messages"][0]["content"] for b in provider.agent_steps)
-        assert "No passage in the researcher's library matched" in first
-        assert "No passage in the researcher's library matched" not in second
+        assert "search index is being built" in first
+        assert "search index is being built" not in second and "No passage in the researcher's library" not in second
 
 
 @pytest.mark.asyncio

@@ -20,7 +20,9 @@ its non-text arguments and its result's ids and counts, never the text (section 
 """
 
 import asyncio
+import hashlib
 import json
+import re
 
 from fastapi import APIRouter
 
@@ -360,6 +362,17 @@ async def open_place(call, turn):
 
 def definitions():
     return REGISTRY.to_request_format()
+
+
+def traced_id(call_id):
+    """A tool call's id as the trace keeps it: as given when it is a plain token, else its hash, since a provider
+    may let the model write it (backend/provenance.py: no model text in an append-only event)."""
+    if isinstance(call_id, str) and _PLAIN_ID.fullmatch(call_id):
+        return call_id
+    return "sha256:" + hashlib.sha256(str(call_id).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+_PLAIN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 
 def known_name(name):
