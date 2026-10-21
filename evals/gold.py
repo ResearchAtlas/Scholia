@@ -518,11 +518,18 @@ def check_question(item, field, papers):
         if not (isinstance(ev, list) and ev):
             problems.append(f"{where} evidence item {n}: not a list of passages")
             continue
+        valid = True
         for loc in ev:
             found = check_locator(f"{where} evidence item {n}", loc, field, papers)
             problems += found
+            valid = valid and not found
             if not found and papers[loc["paper"]]["document_language"] != item["document_language"]:
                 problems.append(f"{where}: document_language is not its evidence's papers'")
+        if not valid:
+            continue
+        ordinals = sorted(loc["ordinal"] for loc in ev)  # T1: tier 2 finds an item by any one of its passages
+        if len({loc["paper"] for loc in ev}) > 1 or ordinals != list(range(ordinals[0], ordinals[0] + len(ev))):
+            problems.append(f"{where} evidence item {n}: not one passage or the consecutive passages of one paper")
     return problems
 
 

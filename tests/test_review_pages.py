@@ -295,6 +295,21 @@ def test_the_evidence_picker_offers_a_papers_usable_passages_and_refuses_any_oth
     assert pairs.get("/api/passages?paper=2601.00001v1")[0] == 404
 
 
+def test_an_evidence_item_is_one_passage_or_the_consecutive_passages_of_one_paper(tmp_path, pages):
+    """T1: one item mixing papers, or one paper's passages with a gap, was saved; tier 2 would count either
+    found by any one of its passages."""
+    folder = field(tmp_path)
+    page = pages(folder, "questions")
+    a, b = "2601.00001v1", "2601.00002v2"
+    for item in ([pick(page, a, 4), pick(page, b, 1)], [pick(page, a, 2), pick(page, a, 4)],
+                 [pick(page, b, 1), pick(page, b, 1)]):
+        status, answer = page.send("q02", evidence=[item])
+        assert status == 400 and answer["code"] == "evidence_invalid" and "consecutive passages" in answer["problem"]
+    assert not labels_file(folder, "questions").exists()  # nothing saved
+    status, saved = page.send("q02", evidence=[[pick(page, a, 4)], [pick(page, b, 2), pick(page, b, 1)]])
+    assert status == 200 and saved["label"]["decision"] == "edit"  # picked in either order: one item
+
+
 @pytest.mark.parametrize("changes, code", [
     ({"text": "   "}, "text_blank"),
     ({"text": "\u200b\u200b"}, "text_blank"),

@@ -367,6 +367,13 @@ def test_the_synthetic_sets_pass_and_the_report_gives_their_mix(tmp_path):
     ("questions", lambda items: items[0].update(id=["q01"]), "questions item ['q01']: id is not a plain name"),
     ("questions", lambda items: items[0]["evidence"][0][0].update(ordinal=True), "evidence item 1: ordinal is not a passage's"),
     ("questions", lambda items: items[0]["evidence"][0][0].update(page=True), "evidence item 1: page is not a page number"),
+    # T1: an evidence item is one passage or the consecutive passages of one paper
+    ("questions", lambda items: items[1]["evidence"][0].append(items[1]["evidence"][1][0]),
+     "question q02 evidence item 1: not one passage or the consecutive passages of one paper"),
+    ("questions", lambda items: items[1]["evidence"][0].append(items[0]["evidence"][0][0]),
+     "question q02 evidence item 1: not one passage or the consecutive passages of one paper"),
+    ("questions", lambda items: items[1]["evidence"][1].append(items[1]["evidence"][1][0]),
+     "question q02 evidence item 2: not one passage or the consecutive passages of one paper"),
     # G11: an id is text of the allowed shape, kept as validated (a number is not its text)
     ("pairs", lambda items: items[0].update(id=123), "pairs item 123: id is not a plain name"),
     ("pairs", lambda items: items[0].update(id=True), "pairs item True: id is not a plain name"),
