@@ -1738,15 +1738,17 @@ class Harness:
                     spending.release(conn, call.reservation_id)
 
             async def recording():
-                if request.tools and result.ok and isinstance(result.message, dict):
-                    kept_reply["ref"] = await asyncio.to_thread(_stored, self.content, json.dumps(
-                        result.message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-                if rehold is None:
-                    return await self._write(record)
-                # The answer's unspent is held again against the budgets read in this write: under settings_lock,
-                # as every reservation is, so a budget save lands wholly before or after it (option C).
-                async with self.settings_lock:
-                    return await self._write(record)
+                # The reply is held from collection until the record that links it commits (as request bodies are).
+                with self.content.hold() if self.content is not None else nullcontext([]) as held:
+                    if request.tools and result.ok and isinstance(result.message, dict):
+                        kept_reply["ref"] = await asyncio.to_thread(_stored, self.content, json.dumps(
+                            result.message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), held)
+                    if rehold is None:
+                        return await self._write(record)
+                    # The answer's unspent is held again against the budgets read in this write: under settings_lock,
+                    # as every reservation is, so a budget save lands wholly before or after it (option C).
+                    async with self.settings_lock:
+                        return await self._write(record)
 
             # Recorded before the client closes, and to its end even if cancelled meanwhile.
             _, cancelled = await _through(recording())
