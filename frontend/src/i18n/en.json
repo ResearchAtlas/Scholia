@@ -42,6 +42,8 @@
   "conversation.you": "You",
   "conversation.scholia": "Scholia",
   "conversation.loadFailed": "This conversation could not be loaded.",
+  "conversation.reloading": "The library changed; reading this conversation again…",
+  "conversation.reloadFailed": "The library changed and this conversation could not be read again yet. Trying again…",
   "conversation.attached": {
     "one": "{count} file added to the library.",
     "other": "{count} files added to the library."
@@ -206,6 +208,7 @@
   "errors.internal": "Something went wrong. Try again.",
   "errors.unreachable": "Scholia's engine is not responding. Close Scholia and open it again.",
   "errors.body_removed": "This text was removed with a deleted paper.",
+  "errors.library_changed": "The library changed and Details could not be read again.",
   "errors.source_removed": "A paper this answer drew on was deleted, so it cannot be checked again.",
   "errors.part_not_loaded": "This part of Scholia could not be loaded. Try again reloads the window.",
   "errors.english_not_saved": "English is used in this window, but it could not be saved as the interface language, so Scholia will open in the saved language next time. Try again saves it once more.",

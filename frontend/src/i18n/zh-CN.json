@@ -42,6 +42,8 @@
   "conversation.you": "你",
   "conversation.scholia": "Scholia",
   "conversation.loadFailed": "无法加载这个对话。",
+  "conversation.reloading": "文献库已变更，正在重新读取这个对话…",
+  "conversation.reloadFailed": "文献库已变更，暂时无法重新读取这个对话。正在重试…",
   "conversation.attached": {
     "other": "已将 {count} 个文件添加到文献库。"
   },
@@ -204,6 +206,7 @@
   "errors.internal": "出了点问题，请重试。",
   "errors.unreachable": "Scholia 的引擎没有响应。请关闭 Scholia 后重新打开。",
   "errors.body_removed": "这段文字已随删除的论文一并移除。",
+  "errors.library_changed": "文献库已变更，无法重新读取详情。",
   "errors.source_removed": "这个回答依据的一篇论文已被删除，因此不能再次核对。",
   "errors.part_not_loaded": "Scholia 的这部分界面未能加载。点“重试”会重新载入窗口。",
   "errors.english_not_saved": "此窗口已使用英文，但未能将其保存为界面语言，因此下次打开 Scholia 时仍会使用已保存的语言。点“重试”会再保存一次。",

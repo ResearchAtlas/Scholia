@@ -2271,17 +2271,29 @@ async function s119(ctx) {
     await first.getByText(L('trace.phaseJudge'), { exact: true }).first().waitFor();
     if (!(await first.getByLabel(L('trace.sent')).count())) await first.getByRole('button', { name: L('trace.showSent') }).first().click();
     await first.getByLabel(L('trace.sent')).first().waitFor();
+    const quote = cited.citations[0].quote.slice(0, 40);
     await first.locator('.cite-chip').first().click();
+    // The conversation's next reads fail at first: what it showed is dropped all the same, never shown again.
+    const failing = (route) => (route.request().method() === 'GET' ? route.fulfill({ status: 500, body: '{}' }) : route.continue());
+    await page.route('**/api/conversations/*', failing);
     await panel().getByRole('button', { name: L('common.delete'), exact: true }).click();
     await page.getByRole('dialog').getByRole('button', { name: L('common.delete'), exact: true }).click();
     await until('the paper deleted', async () => !(await get(`/api/projects/${id}/materials`)).body.materials.some((m) => m.id === notesId));
-    await until('the open Details drops the text it showed', async () => (await first.getByLabel(L('trace.sent')).count()) === 0);
-    check('Details says the text sent was removed with the paper', await first.getByText(L('trace.bodyRemoved')).count() > 0);
-    await until('the answer\'s chips say their source was removed', async () => (await first.locator('.cite-chip').count()) === 0
-      && (await first.locator('.cite-missing').count()) === 3);
-    check('no cited quote is left on screen', (await first.locator('.cite-card').count()) === 0
-      && !(await first.innerText()).includes(cited.citations[0].quote.slice(0, 40)));
-    check('the answer stays the conversation\'s record', (await first.locator('.prose-answer').innerText()).length > 0);
+    await page.getByText(L('conversation.reloadFailed')).waitFor();
+    check('a failed reload shows the change, never what was read before', !(await page.getByLabel(L('trace.sent')).count())
+      && !(await page.locator('.cite-card').count()) && !(await page.locator('body').innerText()).includes(quote));
+    await page.unroute('**/api/conversations/*', failing);
+    await until('the conversation read again', async () => (await page.locator('.prose-answer').count()) > 0);
+    const again = page.locator('li', { has: page.getByRole('button', { name: L('turn.details') }) }).first();
+    await until('the answer\'s chips say their source was removed', async () => (await again.locator('.cite-chip').count()) === 0
+      && (await again.locator('.cite-missing').count()) === 3);
+    await again.getByRole('button', { name: L('turn.details') }).click();
+    await again.getByText(L('trace.phaseJudge'), { exact: true }).first().waitFor();
+    check('Details says the text sent was removed with the paper', await again.getByText(L('trace.bodyRemoved')).count() > 0
+      && !(await again.getByRole('button', { name: L('trace.showSent') }).count()));
+    check('no cited quote is left on screen', (await again.locator('.cite-card').count()) === 0
+      && !(await again.innerText()).includes(quote));
+    check('the answer stays the conversation\'s record', (await again.locator('.prose-answer').innerText()).length > 0);
   });
 }
 
