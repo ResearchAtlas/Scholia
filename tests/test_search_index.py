@@ -626,7 +626,8 @@ async def test_a_whole_rebuild_that_keeps_failing_leaves_search_unavailable_neve
         first, second = await project_of(client, "First"), await project_of(client, "Second")
         await added(client, first, WAGES)
         await added(client, second, CHINESE)
-        await until_embedded(client, second)
+        for project in (first, second):  # each index run here ended, so the next launch records none interrupted
+            await until_embedded(client, project)
         path = client.state["index"].path
     await _unfinished(path)
     attempts = _failing_rebuilds(monkeypatch, max(first, second), failures=10_000)  # after the other's rows
