@@ -17,7 +17,7 @@ from backend.outbound_gate import _ZOTERO_CALLS
 import synthetic_materials as synthetic
 from scholia_app import MockProvider, MockScholarly, MockZotero, background_idle, openalex_work, run_finished, started
 from test_materials import listing, project_of, rows, settled
-from test_reference_import import answer, asks_of, imported as imported_references, merge_asks, ris
+from test_reference_import import answer, asks_of, first_project, imported as imported_references, merge_asks, ris
 
 pytestmark = pytest.mark.asyncio
 
@@ -454,6 +454,23 @@ async def test_merge_fills_the_paper_from_the_zotero_record(tmp_path):
         await run_finished(client, ask["run_id"])
         [paper] = (await listing(client, project))["materials"]
         assert paper["source"] == "reference_file" and paper["csl"]["author"] == [{"family": "Example", "given": "Ana"}]
+
+
+@pytest.mark.parametrize("option", ["merge", "keep_both"])
+async def test_a_zotero_items_answer_that_changes_the_papers_puts_the_project_first(tmp_path, option):
+    mock = library(tmp_path)
+    async with started(tmp_path / "data", provider(mock)) as client:
+        project = await project_of(client)
+        await imported_references(client, project, ris(("Synthetic Wages in Small Towns", f"DO  - {DOI}\n")))
+        await imported(client, project, KEYS[:1])
+        [ask] = await merge_asks(client, project)
+        other = await project_of(client, "Changed since")
+        assert await first_project(client) == other
+        assert (await answer(client, ask, option)).status_code == 200
+        await run_finished(client, ask["run_id"])
+        await background_idle(client, 60)  # Keep both: the item's own import run adds it
+        assert len((await listing(client, project))["materials"]) == (2 if option == "keep_both" else 1)
+        assert await first_project(client) == project
 
 
 async def test_a_pdf_already_in_the_project_is_reported_already_there(tmp_path):

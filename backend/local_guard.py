@@ -135,9 +135,13 @@ class LocalRequestGuard:
                     t.replace(b" ", b"") for t in _JSON}:
                 return 415, "json_required"
             lengths = headers.get(b"content-length", [])
+            # ASCII digits only (a header is bytes, whose isdigit takes no other digits); its leading zeros left
+            # out, one with more digits than MAX_BODY's is over it, never given to int(), which refuses past
+            # 4,300 digits.
             if len(lengths) != 1 or not lengths[0].isdigit():
                 return 411, "length_required"
-            if int(lengths[0]) > MAX_BODY:
+            digits = lengths[0].lstrip(b"0")
+            if len(digits) > len(str(MAX_BODY)) or int(digits or b"0") > MAX_BODY:
                 return 413, "request_too_large"
         return None
 

@@ -11,8 +11,8 @@ import { ApiError } from '../api.js';
 import { errorText } from '../text.js';
 import { followRun, runOutcome } from '../runs.js';
 import { libraryChanged } from '../library.js';
-import { appendPage, chosenFor, collectionTree, importZotero, MAX_ITEMS, reportParts, statusKey, zoteroCollections, zoteroItems,
-  zoteroStatus } from '../zotero.js';
+import { appendPage, chosenFor, collectionIn, collectionTree, importZotero, libraryIn, MAX_ITEMS, reportParts, statusKey,
+  zoteroCollections, zoteroItems, zoteroStatus } from '../zotero.js';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
@@ -37,6 +37,8 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const check = useCallback(async () => {
     setStatus(null);
+    setCollections(null); // refreshed with the status: a collection chosen is kept only if the new list has it
+    setPage(null); // and its items, so no further page is asked of a collection that may be gone
     setProblem(null);
     try {
       setStatus(await zoteroStatus());
@@ -50,6 +52,15 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
   }, [open, check]);
 
   const ready = status?.state === 'ready';
+  // A library or collection the refreshed Zotero no longer lists is left while rendering, before any effect
+  // can send a request for it: the library for My Library (or the first listed), the collection for all items.
+  if (ready && libraryIn(library, status.libraries) !== library) {
+    setLibrary(libraryIn(library, status.libraries));
+    setCollection(null);
+    setChosen([]);
+  } else if (collectionIn(collection, collections) !== collection) {
+    setCollection(null);
+  }
   const chosenUnder = useRef(null); // the server id the items were chosen under
   useEffect(() => { // a Zotero answering with another server id since: its items are not the ones chosen
     if (!ready) return;
@@ -62,19 +73,20 @@ export function ZoteroBrowser({ open, project, onOpenChange }) {
     let live = true;
     setCollections(null);
     zoteroCollections(library).then((found) => { if (live) setCollections(found.collections); })
-      .catch((error) => { if (live) { setCollections([]); setProblem(codeOf(error)); } });
+      .catch((error) => { if (live) { setCollections(false); setProblem(codeOf(error)); } }); // failed: not a list, so a chosen collection is kept
     return () => { live = false; };
   }, [ready, library]);
   const generation = useRef(0); // each list shown has its own: a page asked for another one is dropped
+  const confirming = collection !== null && collections === null; // the chosen collection, until its list says it is there
   useEffect(() => { // the first page of the library's (or the collection's) items
-    if (!ready) return undefined;
+    if (!ready || confirming) return undefined;
     let live = true;
     const shown = { library, collection, generation: ++generation.current };
     setPage(null);
     zoteroItems(library, collection).then((found) => { if (live) setPage({ ...found, ...shown }); })
       .catch((error) => { if (live) { setPage({ items: [], total: 0, next: null }); setProblem(codeOf(error)); } });
     return () => { live = false; };
-  }, [ready, library, collection]);
+  }, [ready, library, collection, confirming]);
 
   async function more() {
     const asked = { library, collection, generation: generation.current, start: page.next };
