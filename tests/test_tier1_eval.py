@@ -311,6 +311,7 @@ async def test_the_rerank_arm_reorders_the_hybrid_top_and_is_paired_with_the_hyb
     results = await running
     assert results["status"] == "finished" and results["arms"] == ["keyword_only", "rerank", "hybrid"]
     assert results["rerank_model"]["file"] == "qwen3-reranker-0.6b-q8_0.gguf"
+    assert results["rerank_ms"] == 500  # the rerank step's deadline, recorded
     assert results["model_settings"]["reranker"] is None  # the hybrid arms' settings, like for like with the baseline
     arm = results["benchmarks"]["scifact"]["arms"]["rerank"]
     assert arm["complete"] and arm["fallbacks"] == {} and "minus_hybrid" in arm  # rule E's paired difference

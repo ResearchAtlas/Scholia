@@ -693,11 +693,12 @@ def model_settings(state, values):
 
 
 @contextlib.asynccontextmanager
-async def desktop_app(data_dir, helper, model, reranker=None):
+async def desktop_app(data_dir, helper, model, reranker=None, rerank_ms=None):
     """The app on a new data folder as the desktop runs it; yields (client, state, install), install
     importing the embedding model through the API. With reranker (the pinned Qwen3-Reranker-0.6B Q8_0's
     file, checked by check_models), a helper of its own for the rerank arm (local_helper.Local.add, as
-    S1-16's timings do): no setting or offer exposes it."""
+    S1-16's timings do): no setting or offer exposes it. rerank_ms, if given, replaces the rerank step's deadline
+    in this run's own data folder (a measurement of the reranker apart from its budget)."""
     import httpx
     from backend import local_helper
     from backend.app import create_app
@@ -711,6 +712,9 @@ async def desktop_app(data_dir, helper, model, reranker=None):
                             {"model": local_helper.EMBEDDING, "path": str(Path(model).resolve())}, 200)
             if reranker is not None:
                 app.app.state.scholia["local_helper"].add(local_helper.RERANKER_MODEL, Path(reranker).resolve())
+            if rerank_ms is not None:
+                current = (await client.get("/api/settings")).json()
+                await client.put("/api/settings", json={"hash": current["hash"], "updates": {"retrieval.rerank_ms": rerank_ms}})
             yield client, app.app.state.scholia, install
 
 
@@ -751,6 +755,8 @@ async def run(manifest, level_name, names, files, out, open_app, arms=None):
                 async with open_app(data) as (client, state, install):
                     values = (await client.get("/api/settings")).json()["values"]["retrieval"]
                     settings = model_settings(state, values)
+                    if "rerank" in arms:  # the rerank step's deadline in this run (500 ms unless --rerank-ms)
+                        results.setdefault("rerank_ms", values["rerank_ms"])
                     if "model_settings" not in results:
                         results["model_settings"] = settings
                         results["like_for_like"] = settings == manifest["model_settings"]
@@ -918,6 +924,8 @@ def main(argv=None):
     go.add_argument("--helper", required=True, help="the bundle's llama-server")
     go.add_argument("--model", required=True, help="Qwen3-Embedding-0.6B-Q8_0.gguf")
     go.add_argument("--reranker", help="qwen3-reranker-0.6b-q8_0.gguf: adds S1-19's rerank arm")
+    go.add_argument("--rerank-ms", type=int, help="with --reranker: the rerank step's deadline for this run (a "
+                                                    "measurement apart from the 500 ms budget)")
     go.add_argument("--benchmarks", nargs="+", help="only these of the level's benchmarks")
     go.add_argument("--out", type=Path, required=True)
     against = sub.add_parser("compare")
@@ -925,6 +933,8 @@ def main(argv=None):
     against.add_argument("current", type=Path)
     sub.add_parser("report").add_argument("results", type=Path)
     args = parser.parse_args(argv)
+    if getattr(args, "rerank_ms", None) is not None and not args.reranker:
+        parser.error("--rerank-ms needs --reranker")
     manifest = load_manifest()
     if args.command == "report":
         print("\n".join(report(load_manifest(args.results))))
@@ -954,7 +964,7 @@ def main(argv=None):
         task = asyncio.current_task()
         asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, task.cancel)  # cleaned up as for Ctrl-C
         return await run(manifest, args.level, names, files, args.out,
-                         lambda data: desktop_app(data, args.helper, args.model, args.reranker),
+                         lambda data: desktop_app(data, args.helper, args.model, args.reranker, args.rerank_ms),
                          RERANK_ARMS if args.reranker else ARMS)
     results = asyncio.run(main_task())
     print(json.dumps({name: {arm: entry.get("metrics") for arm, entry in bench["arms"].items()}
