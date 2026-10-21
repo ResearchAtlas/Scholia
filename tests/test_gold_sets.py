@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -920,6 +921,38 @@ def test_field_one_is_refused_inside_any_git_work_tree_ignored_there_or_not(tmp_
             gold.field_folder(1, inside)
     assert gold.field_folder(1, plain / "x") == (plain / "x").resolve()
     assert gold.field_folder(2, repo / "evals" / "local" / "x") == (repo / "evals" / "local" / "x").resolve()  # field 2 is public
+
+
+@pytest.mark.asyncio
+async def test_field_ones_temporary_app_never_writes_under_tmpdir_even_inside_a_git_work_tree(tmp_path, monkeypatch):
+    """sol recheck 2 (H2): the passages tools' temporary app wrote its data folder (content files, databases,
+    backups: a PDF byte for byte) under TMPDIR, which may sit in a git work tree. Field 1's is made inside its
+    own folder, TMPDIR pointed there meanwhile, and removed after; field 2's stays under TMPDIR."""
+    repo = fixtures.git("init", tmp_path / "repo")
+    (repo / "tmp").mkdir()
+    monkeypatch.setenv("TMPDIR", str(repo / "tmp"))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    during = []
+
+    def watching(open_app):
+        @contextlib.asynccontextmanager
+        async def watched(data):
+            async with open_app(data) as opened:
+                yield opened
+                during.append((data, os.environ["TMPDIR"], sorted(p for p in repo.rglob("*") if ".git" not in p.parts)))
+        return watched
+    (tmp_path / "f1").mkdir()
+    (tmp_path / "f2").mkdir()
+    folder, pdfs = pdf_field(tmp_path / "f1", 1)
+    sheet = await gold.passages(1, folder, pdfs, watching(opener()))
+    assert sheet["status"] == "finished"
+    data, tmpdir, found = during[0]
+    assert data.is_relative_to(folder) and Path(tmpdir).is_relative_to(folder) and found == [repo / "tmp"]
+    assert fixtures.git("status", repo) == "" and not [p for p in folder.iterdir() if p.name.startswith(".tmp-")]
+    assert os.environ["TMPDIR"] == str(repo / "tmp")  # given back
+    folder, pdfs = pdf_field(tmp_path / "f2", 2)
+    await gold.passages(2, folder, pdfs, watching(opener()))
+    assert during[1][0].is_relative_to(repo / "tmp")  # field 2 is public: TMPDIR as before
 
 
 def test_from_a_worktree_the_main_checkout_is_refused_too():

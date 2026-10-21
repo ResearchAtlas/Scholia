@@ -859,6 +859,30 @@ def load_field(field, folder):
     return read_json(folder, folder / "papers.json"), sha256_of(folder, folder / "papers.json"), sets
 
 
+@contextlib.contextmanager
+def scratch(field, folder):
+    """The temporary folder a command's app runs in, removed after: field 2's under TMPDIR; field 1's inside
+    field 1's own folder, outside every git work tree as private_path holds it (Harold, 2026-10-21), with
+    TMPDIR pointed into it meanwhile, so the app's reading child and any library's scratch stay there too."""
+    if field != 1:
+        with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
+            yield Path(tmp)
+        return
+    with tempfile.TemporaryDirectory(prefix=".tmp-scholia-gold-", dir=folder) as tmp:
+        inner = Path(tmp) / "tmp"
+        inner.mkdir(mode=0o700)
+        saved = os.environ.get("TMPDIR"), tempfile.tempdir
+        os.environ["TMPDIR"] = tempfile.tempdir = str(inner)
+        try:
+            yield Path(tmp)
+        finally:
+            if saved[0] is None:
+                os.environ.pop("TMPDIR", None)
+            else:
+                os.environ["TMPDIR"] = saved[0]
+            tempfile.tempdir = saved[1]
+
+
 async def write_when_done(root, out, make):
     """The file at out says incomplete from the start, and holds the result only once it is all made (an
     interruption, refusal or failure leaves the incomplete marker with its reason)."""
@@ -931,8 +955,8 @@ async def check(field, folder, pdfs=None, qasper=None, open_app=None, settings=N
                                      and (made := labeled(items[i], label)) is not None]
         if pdfs is not None and not problems:
             verify_pdfs(doc["papers"], pdfs, field)
-            with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
-                async with open_app(Path(tmp) / "data") as (client, state):
+            with scratch(field, folder) as tmp:
+                async with open_app(tmp / "data") as (client, state):
                     read, _ = await read_papers(client, state, doc["papers"], pdfs, field)
             report["not_read_whole"] = {pid: r["reason"] for pid, r in sorted(read.items()) if r["state"] != "ready"}
             for kind, set_doc in sets.items():
@@ -962,8 +986,8 @@ async def passages(field, folder, pdfs, open_app=None, settings=None):
         if problems := check_papers(doc, field, settings):
             raise Refused("; ".join(problems[:5]))
         verify_pdfs(doc["papers"], pdfs, field)
-        with tempfile.TemporaryDirectory(prefix="scholia-gold-") as tmp:
-            async with open_app(Path(tmp) / "data") as (client, state):
+        with scratch(field, folder) as tmp:
+            async with open_app(tmp / "data") as (client, state):
                 read, _ = await read_papers(client, state, doc["papers"], pdfs, field)
         return worksheet(field, doc, papers_sha256, read)
     return await write_when_done(out_root(folder), outputs(folder) / "worksheet.json", make)
