@@ -2260,6 +2260,29 @@ async function s119(ctx) {
   });
   await page.getByRole('button', { name: P('picker.label') }).click();
   await page.getByRole('option', { name: new RegExp(`^${L('picker.auto')}`) }).first().click(); await page.waitForTimeout(500);
+
+  // Harold, 2026-10-21 (option A): a deleted paper's text leaves the open conversation and its open Details
+  // without a reload: the exact text sent, the citations' quotes and sentences.
+  await step('77-deleted-paper', async () => {
+    const first = page.locator('li', { has: page.getByRole('button', { name: L('turn.details') }) }).first();
+    if (!(await first.getByText(L('trace.phaseJudge'), { exact: true }).count())) {
+      await first.getByRole('button', { name: L('turn.details') }).click();
+    }
+    await first.getByText(L('trace.phaseJudge'), { exact: true }).first().waitFor();
+    if (!(await first.getByLabel(L('trace.sent')).count())) await first.getByRole('button', { name: L('trace.showSent') }).first().click();
+    await first.getByLabel(L('trace.sent')).first().waitFor();
+    await first.locator('.cite-chip').first().click();
+    await panel().getByRole('button', { name: L('common.delete'), exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: L('common.delete'), exact: true }).click();
+    await until('the paper deleted', async () => !(await get(`/api/projects/${id}/materials`)).body.materials.some((m) => m.id === notesId));
+    await until('the open Details drops the text it showed', async () => (await first.getByLabel(L('trace.sent')).count()) === 0);
+    check('Details says the text sent was removed with the paper', await first.getByText(L('trace.bodyRemoved')).count() > 0);
+    await until('the answer\'s chips say their source was removed', async () => (await first.locator('.cite-chip').count()) === 0
+      && (await first.locator('.cite-missing').count()) === 3);
+    check('no cited quote is left on screen', (await first.locator('.cite-card').count()) === 0
+      && !(await first.innerText()).includes(cited.citations[0].quote.slice(0, 40)));
+    check('the answer stays the conversation\'s record', (await first.locator('.prose-answer').innerText()).length > 0);
+  });
 }
 
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
