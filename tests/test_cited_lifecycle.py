@@ -957,3 +957,4 @@ async def test_each_reply_line_is_exactly_a_pair_and_a_verdict_or_its_pair_is_un
     for lead in ["- 1: unsupported", "**1: unsupported**", "Pair 1 is unsupported"]:
         assert parse(f"{lead}\n1: supported", 1) == {}, lead
     assert parse("9" * 5000 + ": supported\n1: partly", 1) == {1: "partly"}  # no number is read past six digits
+    assert parse("\uff11: unsupported\n1: supported", 1) == {}  # a fullwidth 1 is no verdict, but it names pair 1

@@ -282,10 +282,11 @@ def typical_judge_input(passages, pairs):
             + pairs * (TYPICAL_SENTENCE + _PAIR_FRAME) + 2 * MESSAGE_FRAMING + REPLY_FRAMING)
 
 
-# ASCII digits, at most six: no other numbering is a pair's, and no digit run is converted past that.
+# A verdict's pair number is ASCII digits, at most six; any digits (fullwidth, Arabic-Indic) still count as a
+# mention that puts a pair in doubt. No digit run is converted past six.
 _VERDICT_LINE = re.compile(r"\s*(?:pair\s*)?(\d{1,6})\s*[:.)-]\s*(supported|partly|unsupported)\s*",
                            re.IGNORECASE | re.ASCII)
-_NUMBER = re.compile(r"(?<!\d)\d{1,6}(?!\d)", re.ASCII)
+_NUMBER = re.compile(r"(?<!\d)\d{1,6}(?!\d)")
 
 
 def parse_verdicts(reply, count):
