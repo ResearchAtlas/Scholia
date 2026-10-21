@@ -115,6 +115,27 @@ async function upload(projectId, files, { conversationId, materialId, replaces }
 export const libraryEvents = new EventTarget();
 export const libraryChanged = (projectId) => libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
 
+// S1-19b (Harold, 2026-10-21: no client-held derived state): which reads of a view may be shown after library
+// changes. libraryChanged() starts a new generation at once, in the change's own handler; ask() is called as a
+// read is asked and gives settle(ok), called when it ends, which says whether to show it: never for a read asked
+// before a later change. Only a read asked after the change ends it (changed()).
+export function readGuard() {
+  let generation = 0;
+  let changed = false;
+  return {
+    changed: () => changed,
+    libraryChanged() { generation += 1; changed = true; },
+    ask() {
+      const asked = generation;
+      return (ok) => {
+        if (asked !== generation) return false;
+        if (ok) changed = false;
+        return true;
+      };
+    },
+  };
+}
+
 // S1-19b: papers chosen for the next message (selected in the Library, or @-mentioned in the message
 // box), whose ids it sends: its answer reads only them. One project's at a time; cleared once sent.
 let chosen = { projectId: null, papers: [] };

@@ -282,18 +282,26 @@ def typical_judge_input(passages, pairs):
             + pairs * (TYPICAL_SENTENCE + _PAIR_FRAME) + 2 * MESSAGE_FRAMING + REPLY_FRAMING)
 
 
+_NAMES_PAIR = re.compile(r"\s*(?:pair\s*)?(\d+)\s*[:.)-]", re.IGNORECASE)  # a line that answers a pair
+_VERDICT_LINE = re.compile(r"\s*(?:pair\s*)?(\d+)\s*[:.)-]\s*(supported|partly|unsupported)\s*", re.IGNORECASE)
+
+
 def parse_verdicts(reply, count):
-    """{pair number: verdict} from the judge's reply; a pair it does not answer clearly, or answers more than
-    once, is left out (unchecked), and a verdict for a pair it was not given is not taken."""
-    found, twice = {}, set()
+    """{pair number: verdict} from the judge's reply, read strictly (JUDGE_RULES: one line per pair, exactly
+    `N: verdict`): a line is a verdict only when it is exactly a pair number and one of the verdicts, whitespace,
+    case and the separator aside. A pair named by a line that is not exactly that, or by more than one line, is
+    left out (unchecked); a pair it was not given is not taken; lines that name no pair are not read."""
+    found, spoiled = {}, set()
     for line in (reply or "").splitlines():
-        m = re.match(r"\s*(?:pair\s*)?(\d+)\s*[:.)-]\s*(supported|partly|unsupported)\b", line, re.IGNORECASE)
-        if m and 1 <= int(m[1]) <= count:
-            pair = int(m[1])
-            if pair in found:
-                twice.add(pair)
-            found[pair] = m[2].lower()
-    return {pair: verdict for pair, verdict in found.items() if pair not in twice}
+        named = _NAMES_PAIR.match(line)
+        if not named or not 1 <= int(named[1]) <= count:
+            continue
+        pair, exact = int(named[1]), _VERDICT_LINE.fullmatch(line)
+        if exact is None or pair in found:
+            spoiled.add(pair)
+        else:
+            found[pair] = exact[2].lower()
+    return {pair: verdict for pair, verdict in found.items() if pair not in spoiled}
 
 
 def sentence_key(sentence):

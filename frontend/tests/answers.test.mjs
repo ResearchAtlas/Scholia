@@ -12,7 +12,7 @@ import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import Answer, { Chip } from '../src/markdown.js';
 import { readTrace, summarize } from '../src/trace.js';
-import { MAX_CHOSEN, choosePapers, chosenPapers, openPaperAt, takeOpening, watchChosen } from '../src/library.js';
+import { MAX_CHOSEN, choosePapers, chosenPapers, openPaperAt, readGuard, takeOpening, watchChosen } from '../src/library.js';
 import { NOTICES } from '../src/live.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
 import zhCN from '../src/i18n/zh-CN.json' with { type: 'json' };
@@ -221,4 +221,23 @@ test('every notice, chip and Details string is in both catalogs', () => {
   for (const value of ['literature', 'memory_literature', 'none', 'memory', 'find_papers']) assert.ok(en[`trace.route.${value}`], value);
   for (const value of ['rules', 'router', 'fallback']) assert.ok(en[`trace.decided.${value}`], value);
   for (const value of ['hybrid', 'keyword_only', 'selection']) assert.ok(en[`trace.mode.${value}`], value);
+});
+
+test('a read asked before a library change is never shown, and only a read asked after it ends the change', () => {
+  // b5 (1), the reviewer's order: Details' read is out; the library changes; that old read arrives first; the
+  // reload then fails. The old read is dropped and the failure says the library changed.
+  const guard = readGuard();
+  const before = guard.ask();
+  guard.libraryChanged();
+  const reload = guard.ask();
+  assert.equal(before(true), false); // arrived after the change: not shown
+  assert.equal(guard.changed(), true); // and it does not end the change
+  assert.equal(reload(false), true); // the reload's failure is shown, as the change's
+  assert.equal(guard.changed(), true);
+  const again = guard.ask();
+  assert.equal(again(true), true);
+  assert.equal(guard.changed(), false); // a read asked after the change ends it
+  const late = guard.ask();
+  guard.libraryChanged();
+  assert.equal(late(false), false); // a failure of a read asked before a later change is not shown either
 });

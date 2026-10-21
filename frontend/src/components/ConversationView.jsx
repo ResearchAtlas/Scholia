@@ -16,7 +16,7 @@ import { errorText, money } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
-import { ACCEPT, afterRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt,
+import { ACCEPT, afterRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt, readGuard,
   pollsAsks, readAsks, watchChosen } from '../library.js';
 import { addTo } from './Library.jsx';
 import { Ask } from './Ask.jsx';
@@ -70,21 +70,22 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
 
   // Each library change starts a new generation: a read asked before it is dropped when it arrives, and
   // until a read of the new one succeeds nothing read before it is shown (stale), its failure saying so.
-  const generation = useRef(0);
+  const guard = useRef(null); // which reads may be shown (library.js readGuard)
+  if (guard.current === null) guard.current = readGuard();
   const [stale, setStale] = useState(false);
   const load = useCallback(async () => { // whether the conversation was read
     if (!id) return false;
-    const asked = generation.current;
+    const settle = guard.current.ask();
     try {
       // The Markdown renderer loads beside the first read, so answers show formatted with their turns.
       const [read] = await Promise.all([get(`/api/conversations/${id}`), markdownReady()]);
-      if (asked !== generation.current) return false; // asked before the library changed: never shown
+      if (!settle(true)) return false; // asked before the library changed: never shown
       setTurns(read.turns);
       setFailed(false);
       setStale(false);
       return true;
     } catch {
-      if (asked === generation.current) setFailed(true);
+      if (settle(false)) setFailed(true);
       return false;
     } finally {
       setReads((n) => n + 1);
@@ -100,7 +101,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   useEffect(() => {
     const changed = (event) => {
       if (event.detail !== projectId || !id) return; // a conversation not yet created has read nothing
-      generation.current += 1;
+      guard.current.libraryChanged(); // first: every read asked before this is dropped when it arrives
       setTurns(null);
       setStale(true);
       setFailed(false);

@@ -8,7 +8,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, getBlob } from '../api.js';
 import { errorText, money } from '../text.js';
 import { readTrace, summarize } from '../trace.js';
-import { libraryEvents } from '../library.js';
+import { libraryEvents, readGuard } from '../library.js';
 import { LoadState } from './fields.jsx';
 
 const SUPPORT = { supported: 'cite.supported', partly: 'cite.partly', unsupported: 'cite.unsupported', unchecked: 'cite.unchecked' };
@@ -21,18 +21,22 @@ export function Trace({ turn }) {
   const language = useContext(LanguageContext);
   const [trace, setTrace] = useState(null);
   const [problem, setProblem] = useState(null);
-  const [tries, setTries] = useState(0); // each read (a generation): a retry, or the library changed
-  const changed = useRef(false); // the library changed since the last read that succeeded
+  const [tries, setTries] = useState(0); // each read: a retry, or the library changed
+  const guard = useRef(null); // which reads may be shown (library.js readGuard)
+  if (guard.current === null) guard.current = readGuard();
   useEffect(() => { // a paper deleted: drop everything shown at once (the bodies too) and read the trace again
-    const drop = () => { changed.current = true; setTrace(null); setTries((n) => n + 1); };
+    const drop = () => { guard.current.libraryChanged(); setTrace(null); setTries((n) => n + 1); };
     libraryEvents.addEventListener('changed', drop);
     return () => libraryEvents.removeEventListener('changed', drop);
   }, []);
   useEffect(() => {
-    let live = true; // a read of an earlier generation is dropped when it arrives
+    let live = true; // this turn's read, still wanted
+    const settle = guard.current.ask(); // never shown once the library changed after it was asked
     setProblem(null);
-    readTrace(turn.run_id).then((events) => { if (live) { changed.current = false; setTrace(summarize(events)); } },
-      (error) => live && setProblem(changed.current ? 'library_changed' : error instanceof ApiError ? error.code : 'internal'));
+    readTrace(turn.run_id).then((events) => { if (live && settle(true)) setTrace(summarize(events)); },
+      (error) => {
+        if (live && settle(false)) setProblem(guard.current.changed() ? 'library_changed' : error instanceof ApiError ? error.code : 'internal');
+      });
     return () => { live = false; };
   }, [turn.run_id, tries]);
   if (!trace) return <LoadState problem={problem} onRetry={() => setTries((n) => n + 1)} />;

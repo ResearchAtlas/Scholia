@@ -921,3 +921,34 @@ async def test_recovery_records_no_attempt_for_a_step_whose_call_was_recorded(tm
                                   " AND json_extract(data, '$.outcome') = 'interrupted'", run_id) == [(0,)]
         release.set()
         await stream
+
+
+# Fix batch b5 (external recheck b5, finding 2): the judge's reply format is strict.
+
+@pytest.mark.parametrize("reply", ["1: supported; 1: unsupported", "1: supported\n1: unchecked"])
+async def test_a_judge_reply_naming_a_pair_ambiguously_leaves_it_unchecked(tmp_path, reply):
+    provider = Provider(verdicts=reply)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert [c["support"] for c in turn["citations"]] == ["unchecked"] and "unchecked" in turn["answer"]["notices"]
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "failed"
+        assert await rows(client, "SELECT support FROM citations") == [("unchecked",)]
+
+
+async def test_each_reply_line_is_exactly_a_pair_and_a_verdict_or_its_pair_is_unchecked():
+    from backend import citations
+    parse = citations.parse_verdicts
+    assert parse("1: supported\n2: partly\n3: unsupported", 3) == {1: "supported", 2: "partly", 3: "unsupported"}
+    assert parse("  Pair 1 : Supported  \n2) partly\n3. unsupported\n4 - supported", 4) == {
+        1: "supported", 2: "partly", 3: "unsupported", 4: "supported"}  # whitespace, case and the separators aside
+    assert parse("Here are the verdicts.\n1: supported\nThanks.", 1) == {1: "supported"}  # prose names no pair
+    for spoiled in ["1: supported.", "1: supported because it says so", "1: supported, mostly", "1: unsupported?",
+                    "1: supported (partly)", "1: supportedly", "1:", "1: maybe"]:
+        assert parse(f"{spoiled}\n2: partly", 2) == {2: "partly"}, spoiled
+    assert parse("1: supported\n1: supported", 1) == {}  # a second line for a pair, even the same
+    assert parse("1: supported\n7: unsupported", 1) == {1: "supported"}  # a pair it was not given: not taken
+    assert parse("", 2) == {} and parse(None, 2) == {}
