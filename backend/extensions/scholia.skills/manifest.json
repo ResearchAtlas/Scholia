@@ -1,0 +1,21 @@
+{
+  "extension": "scholia.skills",
+  "skills": {
+    "help": {
+      "files": {
+        "SKILL.md": "78159c9eebe0155f1bd5c51b8cda775777b816b26fac9ee268e8fdb0727e8094",
+        "SKILL.zh-CN.md": "ff12e75d6d5e974d9ab468ee797234dd982652c2f743b76da02dd499451235b7"
+      }
+    },
+    "literature-review": {
+      "files": {
+        "LICENSE.md": "09b02a3c9df3053c55531d503357a9c7cde275970e6c3ceaa1ddf5f0e90b40c1",
+        "NOTICE.md": "1038988b4af55cc2418034862631ddee9d137bcce5aa27b8009b39cd2e178adf",
+        "SKILL.md": "0fbb9cba1bfc26016d8dd5f47f20466e00936446aa26be1edb7d2bfe0fd22e98",
+        "SKILL.zh-CN.md": "93bd60e1088ffb158fd715cd8cad91d12c6097634c1f0890c85da57905bf7995",
+        "references/screening.md": "166893ecbed2bba2ac669295e0455970b551076edfb56f122ddbbf4ade605bca",
+        "references/synthesis.md": "a7cb6648f265e69db7397eda5ddaef4370010afae35dffd72761131b63828851"
+      }
+    }
+  }
+}

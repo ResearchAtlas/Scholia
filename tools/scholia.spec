@@ -50,6 +50,8 @@ a = Analysis(
     datas=notice_datas(DISTRIBUTIONS + [NPM + name for name in npm_packages()])
     # the reasoning-capability record and the Private allowlist, which their modules read beside them
     + [(str(ROOT / "backend/reasoning_capabilities.json"), "backend"), (str(ROOT / "backend/private_routes.json"), "backend")]
+    # S1-19c: the first-party skills, read-only and hash-checked on each load (backend/skills.py)
+    + [(str(ROOT / "backend/extensions/scholia.skills"), "backend/extensions/scholia.skills")]
     # the built interface, which the desktop entry serves from here (backend/desktop.py)
     + [(str(ROOT / "frontend/dist"), "frontend")],
 )

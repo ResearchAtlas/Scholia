@@ -493,6 +493,16 @@ def check_references() -> dict:
     return {"formats": [kind, other]}
 
 
+def check_skills() -> dict:
+    """The first-party skills are in this build, every file matching its pinned hash (backend/skills.py; S1-19c)."""
+    from backend import skills
+
+    loaded, problems = skills.load()
+    if problems or set(loaded) != {"help", "literature-review"}:
+        raise RuntimeError(f"the bundled skills did not load: {problems or sorted(loaded)}")
+    return {"skills": sorted(loaded)}
+
+
 def run(helper: Path, model: Path) -> dict:
     checks = {
         "sqlite": check_sqlite,
@@ -503,6 +513,7 @@ def run(helper: Path, model: Path) -> dict:
         "materials": check_materials,
         "reading_ceiling": check_reading_ceiling,
         "references": check_references,  # S1-14
+        "skills": check_skills,  # S1-19c
         "embedding": lambda: check_embedding(helper, model),
         "ocr": check_ocr,
     }

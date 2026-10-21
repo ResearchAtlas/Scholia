@@ -5,3 +5,4 @@ Scholia grows out of [AI Advisory Board](https://github.com/HaroldZhong/ai-advis
 - **Council** comes from that original work: several models answer a question, review and rank each other's answers anonymously, and a chairman model writes the final response.
 - **Carried-over code.** Some modules come from AI Advisory Board, and each names its source path and commit in its header.
 - **Third-party notices** for bundled components are added with the components that need them.
+- **The `literature-review` skill** is adapted from the literature-review skill of K-Dense's [Scientific Agent Skills](https://github.com/K-Dense-AI/scientific-agent-skills) (MIT), version 1.11; its license and notice ship with it (`backend/extensions/scholia.skills/literature-review/`).

@@ -93,6 +93,8 @@ CPYTHON_EMBEDDED = {
 
 # Third-party libraries: (license, notice). A notice is a list of license files that
 # must ship in licenses/<name>/, or a name CPython's shipped license document covers.
+KDENSE = "K-Dense scientific-agent-skills"  # S1-19c: the literature-review skill's adapted text (MIT)
+KDENSE_FILES = "backend/extensions/scholia.skills/literature-review/"
 LIBRARIES = {
     "OpenSSL": ("Apache-2.0", "OpenSSL"),
     "expat": ("MIT", "expat"),
@@ -102,6 +104,7 @@ LIBRARIES = {
     "xz": ("0BSD OR LicenseRef-Public-Domain", []),  # liblzma: public domain before 5.6, then 0BSD
     "BLAKE2": ("CC0-1.0 OR OpenSSL OR Apache-2.0", []),
     "HACL-star": ("MIT", [ROOT / "tools/notices/HACL-star/LICENSE"]),
+    KDENSE: ("MIT", [ROOT / KDENSE_FILES / "LICENSE.md", ROOT / KDENSE_FILES / "NOTICE.md"]),
     # llama.cpp b11146's server and libraries. Reviewed: ggml and llama.cpp (MIT) with
     # cpp-httplib (MIT), nlohmann/json (MIT) and BoringSSL (Apache-2.0), whose notices the
     # release prints with `llama licenses` (build_app.sh checks the file matches), and
@@ -480,6 +483,8 @@ def assign_file(bundle: Path, rel: str, problems: list[str]):
         if len(parts) == 1 or not built.is_file() or built.read_bytes() != path.read_bytes():
             return None
         return ["Scholia", *(NPM + name for name in npm_packages())]
+    if inner.startswith(KDENSE_FILES) and (ROOT / inner).is_file():
+        return ["Scholia", KDENSE]  # adapted from K-Dense's literature-review (MIT), its notice shipped
     if parts[0] == "backend" and not _is_macho(path) and (ROOT / inner).is_file():
         return ["Scholia"]  # a data file of Scholia's own backend, such as its reasoning record
     owner = _record_owners().get(inner)
