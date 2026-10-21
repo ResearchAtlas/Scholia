@@ -6,14 +6,16 @@ test-owned mock and the local helper is S1-16's stand-in; nothing leaves the pro
 
 import asyncio
 import json
+import os
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from backend import backups, runs as runs_module
+from backend import app as app_module, backups, runs as runs_module
 from backend.db import deletion
 from cited import Provider, cited, conversation_in, rows, with_papers
-from scholia_app import send
+from scholia_app import send, started
 from test_search import CHINESE, WAGES
 
 pytestmark = pytest.mark.asyncio
@@ -117,6 +119,79 @@ async def test_a_failed_cleanup_after_the_deletion_commits_still_removes_the_bod
         assert found and all(status == 410 for status, _, _ in found.values())
         monkeypatch.setattr(content, "collect_garbage", real)
         assert await collected(client, found)  # the next collection removes the files
+
+
+async def aged(client, shas):
+    """Make the bodies' rows and files older than the content store's idle window."""
+    await asyncio.to_thread(client.state["db"].write, lambda conn: conn.executemany(
+        "UPDATE content_files SET created_at = '2020-01-01T00:00:00.000Z' WHERE sha256 = ?", [(s,) for s in shas]))
+    old = time.time() - 2 * 3600
+    for sha in shas:
+        os.utime(client.state["content"].root / sha[:2] / sha, (old, old))
+
+
+async def until(check, timeout=5.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not check():
+        assert asyncio.get_running_loop().time() < deadline, "timed out"
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.parametrize("orphan", ["deleted_before_link", "never_sent"])
+async def test_a_body_left_unlinked_is_collected_by_the_scheduled_pass_once_idle_without_another_deletion(
+        tmp_path, monkeypatch, orphan):
+    # T8 (PR 41): a body stored before dispatch and left unlinked (its paper deleted between the store and the
+    # link, or the attempt never sent) is collected by the app's own pass once past the idle window, not only
+    # by a later deletion; the idle window still protects it before then.
+    from backend import openrouter
+    monkeypatch.setattr(app_module, "COLLECT_SECONDS", 0.05, raising=False)
+    stored, holder, real_stored = [], {}, runs_module._stored
+
+    def storing(content, body):
+        ref = real_stored(content, body)
+        stored.append(ref)
+        if orphan == "deleted_before_link" and len(stored) == 1:
+            deletion.delete(holder["client"].state["db"], content, "material", holder["material"])
+        return ref
+    monkeypatch.setattr(runs_module, "_stored", storing)
+    if orphan == "never_sent":
+        real = openrouter.query_model
+
+        async def stop_after_keeping(*args, on_body=None, **kwargs):
+            async def keep_then_stop(body):
+                await on_body(body)
+                raise asyncio.CancelledError()
+            return await real(*args, on_body=keep_then_stop, **kwargs)
+        monkeypatch.setattr(openrouter, "query_model", stop_after_keeping)
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        holder.update(client=client, material=material)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, QUESTION)
+        assert stream[-1]["status"] in ("cancelled", "failed")
+        sha = stored[0]
+        content = client.state["content"]
+        path = content.root / sha[:2] / sha
+        assert await rows(client, "SELECT count(*) FROM run_bodies") == [(0,)] and path.exists()
+        passes, real_collect = [], content.collect_garbage
+        monkeypatch.setattr(content, "collect_garbage", lambda now=None: passes.append(1) or real_collect(now))
+        await until(lambda: len(passes) >= 2)
+        assert path.exists()  # not idle yet: kept
+        await aged(client, [sha])
+        await until(lambda: not path.exists())
+        assert await rows(client, "SELECT count(*) FROM content_files WHERE sha256 = ?", sha) == [(0,)]
+
+
+async def test_unreferenced_content_past_the_idle_window_is_collected_at_launch(tmp_path):
+    # T8: the first pass runs as the app opens, before any deletion or timer.
+    async with started(tmp_path) as client:
+        sha = await asyncio.to_thread(client.state["content"].put, b'{"orphan": true}', "application/json")
+        await aged(client, [sha])
+        path = client.state["content"].root / sha[:2] / sha
+    assert path.exists()
+    async with started(tmp_path) as client:
+        await until(lambda: not path.exists())
+        assert await rows(client, "SELECT count(*) FROM content_files WHERE sha256 = ?", sha) == [(0,)]
 
 
 # Success paths
