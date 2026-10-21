@@ -41,7 +41,9 @@ its database (Database.closing), its timers cancelled and its writer drained. Ev
 reads the file, applies the queue and removes every row of a passage the main database no longer grants,
 then truncates the WAL (_purge): what a close that failed, or a crash, left of a deletion is gone before
 the first read (fail closed). A close that fails holds file replacement off for the rest of the process
-(backend.db.close_failed).
+(backend.db.close_failed). No other process holds the file: the data folder is held by one process (its lock,
+backend.desktop), and in it nothing but this module opens the file; within it the file is replaced only once its
+reads and writer are drained.
 Nothing here logs text, a title, a query or a path.
 """
 
@@ -121,7 +123,7 @@ class _Stopped(Exception):
 class Unavailable(Exception):
     """Nothing is read from the file now: a whole rebuild of it is asked for or under way (the old file is never
     read unpurged, nor a partial one), or one failed (nothing is read from or written to the partial file until
-    one succeeds; it is tried again, SearchIndex._rebuild_later), or a file this process rebuilt was found damaged
+    one succeeds; it is tried again, SearchIndex._arm_retry), or a file this process rebuilt was found damaged
     again before any read of it succeeded (the same, SearchIndex._damaged)."""
 
 
@@ -302,6 +304,9 @@ class SearchIndex:
         self._owed = False
         self.unusable = False  # a whole rebuild failed: its partial file is neither read nor written (Unavailable)
         self._rebuild_retry, self._rebuild_failures = None, 0  # the same, for a whole rebuild
+        # A Rebuild or a Retry asked while the index is unusable and no retry is armed (the give-up's cleanup, or a
+        # retry's rebuild under way): one more rebuild is asked for as that ends unusable (retry_rebuild).
+        self._asked = False
         # This process rebuilt the file and no read of it has succeeded yet: damage found now makes the index unusable
         # (its retry later) rather than rebuilding it again at once (_damaged), so a file that keeps failing never loops.
         self._fresh = False
@@ -354,7 +359,7 @@ class SearchIndex:
         """fn(conn) on an idle read connection, in one read transaction. Refused (Unavailable) from the moment damage
         is found or a whole rebuild is asked for, while one is under way, or after one failed. Reads are the index's own
         fixed queries, so an APSW error one meets, opening its connection or in its query, is the file's: damage
-        (_damaged), unless the file is only busy or locked (another connection holds it), which refuses the read and
+        (_damaged), unless the file is only busy or locked (by the index's own writer: no other connection opens it), which refuses the read and
         rebuilds nothing. Admitted, given its connection (an idle one, or a new one to the file as it is then), and that
         connection given back to the idle ones, all under _lock: so a file that replaces this one, or its removal, waits
         for the reads admitted before (_quiet), and no read admitted before reaches a file made after; close() refuses
@@ -560,10 +565,6 @@ class SearchIndex:
                 log.error("rebuilding the search index failed (%s); it is tried again", type(error).__name__)
                 self._give_up()
                 return
-            with self._lock:  # the failures in a row are counted until a read of the new file succeeds (_read)
-                if self._rebuild_retry is not None:
-                    self._rebuild_retry.cancel()
-                    self._rebuild_retry = None
             if then is not None and not self.closed:  # once the file is ready, whatever the pass after it meets
                 then()
             try:
@@ -602,33 +603,60 @@ class SearchIndex:
             raise failed
 
     def _give_up(self):
-        """In the writer: the file discarded and the index left unusable, another whole rebuild armed for later."""
+        """In the writer: the file discarded and the index left unusable, another whole rebuild armed for later, or
+        asked for now if a Rebuild or a Retry asked for one meanwhile (retry_rebuild), once."""
         try:
             self._discard()
-        finally:  # whatever the discard meets, a retry is armed
-            self._rebuild_later()
+        finally:  # whatever the discard meets, a rebuild is asked for, now or later: decided and armed in one
+            with self._lock:  # lock section, so a request meanwhile finds the retry armed, or is the one served now
+                asked, self._asked = self._asked and not self.closed, False
+                if not asked:
+                    self._arm_retry()
+            if asked:
+                try:
+                    self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
+                except RuntimeError:  # the writer stopped meanwhile (closing)
+                    pass
 
-    def _rebuild_later(self):
+    def _arm_retry(self):
         """Another whole rebuild after a delay that doubles with each failure in a row (RETRY_SECONDS), one at
-        a time, none once the index is closed (close cancels it)."""
+        a time, none once the index is closed (close cancels it). Called under _lock."""
         def again():
             with self._lock:
-                self._rebuild_retry = None
-                if self.closed:
+                if self._rebuild_retry is not timer or self.closed:  # taken meanwhile (retry_rebuild, a success)
                     return
+                self._rebuild_retry = None
             try:
                 self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
             except RuntimeError:  # the writer stopped meanwhile (closing)
                 pass
+        if self.closed or self._rebuild_retry is not None:
+            return
+        delay = min(RETRY_SECONDS[0] * 2 ** self._rebuild_failures, RETRY_SECONDS[1])
+        self._rebuild_failures += 1
+        timer = threading.Timer(delay, again)
+        timer.daemon = True
+        self._rebuild_retry = timer  # held before it starts, so close() always finds it to cancel
+        timer.start()
+
+    def retry_rebuild(self):
+        """A Rebuild or a Retry asked while the index is unusable: always a whole rebuild. With its retry armed, at
+        once (the retry cancelled); else (the give-up's cleanup, or a retry's rebuild under way) one more as that
+        ends unusable (_give_up), none if it succeeds. Only these ask: the runs a rebuild's success asks for wait the
+        retry, so a file damaged again after each rebuild never loops. Returns whether the index was unusable."""
         with self._lock:
-            if self.closed or self._rebuild_retry is not None:
-                return
-            delay = min(RETRY_SECONDS[0] * 2 ** self._rebuild_failures, RETRY_SECONDS[1])
-            self._rebuild_failures += 1
-            timer = threading.Timer(delay, again)
-            timer.daemon = True
-            self._rebuild_retry = timer  # held before it starts, so close() always finds it to cancel
-            timer.start()
+            if self.closed or not self.unusable:
+                return False
+            timer, self._rebuild_retry = self._rebuild_retry, None
+            if timer is None:
+                self._asked = True
+                return True
+        timer.cancel()
+        try:
+            self._rebuild_soon(lambda: self.rebuilt and self.rebuilt())
+        except RuntimeError:  # the writer stopped meanwhile (closing)
+            pass
+        return True
 
     def _rebuild_all(self):
         """Replace the file with a new one built from the main database's current readings, project by
@@ -670,16 +698,20 @@ class SearchIndex:
         with self._conn:
             self._meta(state="ready", last_seq=last)
         self._prune(last)  # what it read leaves the queue (no pass applies rows at or below last)
-        self._fresh = True
-        self.damaged = self.unusable = False
-        self.building = False
+        with self._lock:  # ready, and what was asked or armed before served, in one step: damage found or a Retry asked
+            # after it (reads are admitted from here) belongs to a new outage, which nothing of this rebuild touches
+            self._fresh = True
+            self.damaged = self.unusable = self.building = self._asked = False
+            timer, self._rebuild_retry = self._rebuild_retry, None
+        if timer is not None:
+            timer.cancel()
         return True
 
     def _damaged(self, generation=None):
         """A read or a pass found the file damaged: it is replaced and rebuilt in the writer, once, and its
         vectors are wanted again (self.rebuilt), as when a launch rebuilds it. A file this process rebuilt that no
         read has yet succeeded on is not rebuilt again at once: the index is unusable, its file discarded, and the
-        rebuild tried later (_rebuild_later, its delay doubling while it keeps failing so), as after a failed one.
+        rebuild tried later (_arm_retry, its delay doubling while it keeps failing so), as after a failed one.
         A read gives the generation of the file it was admitted to: once that file has been replaced or removed
         (_close_readers counts each), its report is about a file that is gone, and does nothing."""
         with self._lock:
