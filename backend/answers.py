@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from backend import citations, governance, provenance
 from backend.settings import load_settings, visible
 from backend.db import ContentCorruptError
+from backend.db.deletion import _reads_now
 from backend.runs import AdmissionError
 from backend.search_index import readings
 
@@ -65,8 +66,8 @@ async def trace(run_id: str, request: Request, after: int = -1, limit: int = PAG
                    for cid, existence, support, sentence in conn.execute(
                        "SELECT id, existence, support, json_extract(context, '$.sentence') FROM citations"
                        " WHERE owner_id = ?", (run_id,))}
-        for cid, existence in resolve_now(conn, list(current)).items():  # as it stands now (T7)
-            if existence != current[cid]["existence"]:
+        for cid, existence in resolve_now(conn, list(current)).items():  # as it stands now (T7): removed since
+            if current[cid]["existence"] == "ok" and existence == "source_removed":
                 current[cid].update(existence=existence, support="unchecked")
         return rows, kept, current
     rows, kept, current = await asyncio.to_thread(_state(request)["db"].read, read)
@@ -111,7 +112,9 @@ async def body(run_id: str, sha256: str, request: Request):
 
 
 def resolve_now(conn, citation_ids):
-    """{citation id: existence} as it stands now, for the citations given."""
+    """{citation id: existence} as it stands now, for the citations given. A paper whose current file is not
+    read yet by this app's extractor (its file just replaced, or a newer extractor reading it again) has no
+    reading to judge by: its citations keep their stored existence until it is read."""
     rows = conn.execute(
         "SELECT c.id, c.passage_id, c.material_id, c.quote, c.existence, m.project_id FROM citations c"
         " LEFT JOIN materials m ON m.id = c.material_id WHERE c.id IN (SELECT value FROM json_each(?))",
@@ -121,11 +124,16 @@ def resolve_now(conn, citation_ids):
         if existence in ("not_found", "not_read_in_run") or project is None:
             found[cid] = existence if existence in ("not_found", "not_read_in_run") else "source_removed"
             continue
+        if pid and readings(conn, project, [pid], references=False, materials=[material]):
+            found[cid] = "ok"  # its passage is read now: no need to load the paper
+            continue
         if material not in read:  # each paper's current reading once, however many of its citations
-            read[material] = readings(conn, project, references=False, materials=[material])
-        current = read[material]
-        found[cid] = "ok" if pid in current or (quote and any(quote in r[4] for r in current.values())) \
-            else "source_removed"
+            read[material] = (readings(conn, project, references=False, materials=[material]),
+                              conn.execute(f"SELECT 1 FROM material_versions w JOIN extractions e ON {_reads_now('w', 'e')}"
+                                           " WHERE w.material_id = ? LIMIT 1", (material,)).fetchone() is not None)
+        current, is_read = read[material]
+        found[cid] = "ok" if quote and any(quote in r[4] for r in current.values()) \
+            else "source_removed" if is_read else existence
     return found
 
 

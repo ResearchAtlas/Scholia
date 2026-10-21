@@ -1120,10 +1120,11 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                     "retracted": retraction == "retracted", "title": title, "ordinal": ordinal, "marker": context.get("marker"),
                     "offset": context.get("offset"), "sentence": context.get("sentence")})
             # Each citation's existence as it stands now, in this read (T7): a passage the paper's current reading
-            # no longer holds, as after its file is replaced, is removed, with no verdict or quote shown as current.
+            # no longer holds, as after its file is replaced and read, is removed, with no verdict or quote shown as
+            # current. Only found citations are checked again; one stored as missing stays as recorded.
             now = answers.resolve_now(conn, [c["id"] for chips in cited.values() for c in chips])
             for chip in (c for chips in cited.values() for c in chips):
-                if now.get(chip["id"], chip["existence"]) != chip["existence"]:
+                if chip["existence"] == "ok" and now.get(chip["id"]) == "source_removed":
                     chip.update(existence=now[chip["id"]], support="unchecked", quote=None, passage_id=None, ordinal=None)
             return row, turns, cited
         row, turns, cited = await read(fetch)

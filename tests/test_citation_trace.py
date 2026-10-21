@@ -91,6 +91,40 @@ async def test_after_a_cited_papers_file_is_replaced_its_chip_reads_removed_not_
         assert [(c["existence"], c["support"]) for c in check["citations"]] == [("source_removed", "unchecked")]
 
 
+async def test_a_paper_not_read_yet_keeps_its_chip_as_recorded_and_a_removed_one_is_not_found_again_by_a_read(tmp_path):
+    # Internal review of T7: a paper whose current file has no reading yet (just replaced, or read again by a
+    # newer extractor) is not removed; and the read only ever marks a found citation removed, never the reverse.
+    async with cited(tmp_path) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        db = client.state["db"]
+        sha = await asyncio.to_thread(client.state["content"].put, b"# Wage Floors\n\nNot read yet.\n", "text/markdown")
+
+        def unread_version(conn):  # the state between a replacement's upload and its reading
+            conn.execute("UPDATE material_versions SET is_current = 0 WHERE material_id = ?", (material,))
+            conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
+                         " VALUES ('00000000-0000-4000-8000-0000000000a1', ?, 1, ?, 1, 'text/markdown')", (material, sha))
+        await asyncio.to_thread(db.write, unread_version)
+
+        async def chip():
+            [found] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][0]["citations"]
+            [check] = [e["data"] for e in (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+                       if e["type"] == "citation_checks"]
+            return found, check["citations"][0]
+        found, checked = await chip()
+        assert (found["existence"], found["support"]) == ("ok", "supported") and found["quote"]
+        assert (checked["existence"], checked["support"]) == ("ok", "supported")
+
+        def read_again(conn):  # the old reading current again, and the citation recorded as removed meanwhile
+            conn.execute("DELETE FROM material_versions WHERE id = '00000000-0000-4000-8000-0000000000a1'")
+            conn.execute("UPDATE material_versions SET is_current = 1 WHERE material_id = ?", (material,))
+            conn.execute("UPDATE citations SET existence = 'source_removed', passage_id = NULL")
+        await asyncio.to_thread(db.write, read_again)
+        found, checked = await chip()
+        assert found["existence"] == "source_removed" and checked["existence"] == "source_removed"
+
+
 async def test_selected_papers_that_fit_are_read_whole_and_larger_ones_are_searched_within(tmp_path):
     other = paper("Rents", "Housing rents rose in the synthetic city.")
     async with cited(tmp_path) as client:
