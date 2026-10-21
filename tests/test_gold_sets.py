@@ -947,6 +947,39 @@ def test_git_is_asked_about_the_tree_itself_and_any_failure_refuses(tmp_path, gi
             gold.field_folder(1, repo / "evals" / "local" / "x")
 
 
+def test_each_file_written_under_field_ones_folder_in_a_work_tree_is_one_git_ignores(tmp_path, git_allowed):
+    """sol review 1 (P1): with harold/* then !harold/labels/, the folder passes (git ignores it as a folder) but
+    the labels file would not be ignored. Each file is asked by its own path before it is made: the page's
+    save and its lock, a written file and its part file are refused, and nothing is written there."""
+    repo = fixtures.git("init", tmp_path / "repo")
+    (repo / ".gitignore").write_text("evals/local/harold/*\n!evals/local/harold/labels/\n")
+    folder = gold.field_folder(1, repo / "evals" / "local" / "harold")  # the early, folder-level check passes
+    fixtures.write_field(folder, 1)  # its files and out/ are ignored
+    pairs = json.loads((folder / "pairs.json").read_text())
+    review = gold.Review(1, folder, "pairs", "harold")
+    for action in (review.data, lambda: review.save({"item": "p01", "base": 0, "label": {"category": "supported"}}),
+                   lambda: gold.write_json(folder, folder / "labels" / "field1-pairs.harold.json", labels_for(pairs, "harold", {}))):
+        with pytest.raises(tier1.Refused, match="where git does not ignore it"):
+            action()
+    assert fixtures.git("status", repo) == "?? .gitignore\n" and list((folder / "labels").iterdir()) == []
+    (repo / ".gitignore").write_text("evals/local/\n")  # where git ignores the whole folder, the page saves
+    assert gold.Review(1, folder, "pairs", "harold").save(
+        {"item": "p01", "base": 0, "label": {"category": "supported"}})[0] == 200
+    assert fixtures.git("status", repo) == "?? .gitignore\n"
+
+
+def test_a_deeper_rule_taking_back_one_output_file_refuses_that_write_alone(tmp_path, git_allowed):
+    repo = fixtures.git("init", tmp_path / "repo")
+    (repo / ".gitignore").write_text("evals/local/harold/*\n!evals/local/harold/out/\nevals/local/harold/out/*\n"
+                                     "!evals/local/harold/out/check.json\n")
+    folder = fixtures.write_field(gold.field_folder(1, repo / "evals" / "local" / "harold"), 1)  # out/worksheet.json: ignored
+    with pytest.raises(SystemExit, match="check.json is in the git work tree .* where git does not ignore it"):
+        gold.main(["check", "--field", "1", "--folder", str(folder)])
+    assert not (folder / "out" / "check.json").exists() and not (folder / "out" / "check.json.part").exists()
+    gold.write_json(folder, folder / "out" / "worksheet.json", {"status": "incomplete"})  # another output: ignored, written
+    assert fixtures.git("status", repo) == "?? .gitignore\n"
+
+
 def test_from_a_worktree_the_main_checkout_is_refused_too(git_allowed):
     git = ROOT / ".git"
     if not git.is_file():

@@ -121,17 +121,18 @@ def private_path(field, path):
     return path
 
 
-def ignores_local(top, path):
-    """Whether git ignores path (under the work tree top's evals/local/) as git itself decides (git
-    check-ignore: a later !evals/local/ or !evals/local/harold/, another ignore file, a file tracked there all
-    count as git counts them). A folder (path, existing or not, unless it is a file) is asked as one, so all
-    that is written below it is ignored with it: git never looks inside an ignored folder. Asked of the tree at
+def ignores_local(top, path, file=False):
+    """Whether git ignores path (in the work tree top) as git itself decides (git check-ignore: a later
+    !evals/local/ or !evals/local/harold/, another ignore file, a file tracked there all count as git counts
+    them). A folder (path, existing or not, unless it is a file or file is given) is asked as one. That is the
+    early refusal only: a rule can take back what is below an ignored folder's contents (harold/* then
+    !harold/labels/), so each file written is asked again by its own path (_may_create). Asked of the tree at
     top, never of a repository the caller's GIT_* settings name; any error (no git, not a repository, a
     timeout) is a no."""
     git = shutil.which("git")
     if git is None:
         return False
-    asked = path.relative_to(top).as_posix() + ("" if path.is_file() else "/")
+    asked = path.relative_to(top).as_posix() + ("" if file or path.is_file() else "/")
     try:
         done = subprocess.run([git, "-C", str(top), "check-ignore", "-q", "--", asked], capture_output=True,
                               timeout=30, env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
@@ -211,9 +212,23 @@ def _folder_of(root, path, create=False):
         os.close(fd)
 
 
+def _may_create(path):
+    """G13: a file S1-36 makes inside a git work tree (a written file, its part file, a lock file) is one git
+    ignores, asked of that exact path right before it is made; else it is refused and nothing is made. Field
+    2's own folders (its committed folder and evals/out/) belong to the repository and are not asked."""
+    path = Path(path)
+    if path.is_relative_to(FIELD2) or path.is_relative_to(OUT) or (top := work_tree(path)) is None:
+        return
+    if not ignores_local(top, path, file=True):
+        raise Refused(f"{path} is in the git work tree {top}, where git does not ignore it (or could not say): "
+                      "nothing was written; field 1's files stay where git ignores them")
+
+
 def _open(fd, path, flags):
     """The file path names in the folder fd, never through a link, and only a regular file (a FIFO or device is
-    refused, without waiting on it)."""
+    refused, without waiting on it). Every file S1-36 makes is made here (O_CREAT), so each is asked first."""
+    if flags & os.O_CREAT:
+        _may_create(path)
     try:
         f = os.open(Path(path).name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
     except OSError as error:
@@ -268,9 +283,11 @@ def sha256_of(root, path):
 def write_json(root, path, data):
     """Written whole, as tier1.write_atomic writes (a part file in the file's own folder, synced, then renamed
     onto the name itself), and owner-only from its creation: the part file is made 0600, every folder made
-    here 0700. A link at the name, at its part file or at any folder from root down refuses it."""
+    here 0700. A link at the name, at its part file or at any folder from root down refuses it. The name the
+    part file is renamed onto is asked as the part file is (_may_create), before anything is made."""
     path = Path(path)
     part = path.with_name(path.name + ".part")
+    _may_create(path)
     with _folder_of(root, path, create=True) as fd:
         entry(root, path)  # a link at the name itself or at its part file is refused, never written through
         entry(root, part)
