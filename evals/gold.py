@@ -50,6 +50,7 @@ import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
+from datetime import date
 from difflib import SequenceMatcher
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -437,7 +438,14 @@ def check_papers(doc, field, settings):
 
 
 def is_date(value):
-    return isinstance(value, str) and DATE.fullmatch(value) is not None
+    """A calendar date written YYYY-MM-DD (2026-02-31 is not one)."""
+    if not (isinstance(value, str) and DATE.fullmatch(value)):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def check_locator(where, loc, field, papers):

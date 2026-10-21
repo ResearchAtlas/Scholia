@@ -426,6 +426,8 @@ def test_drafts_are_provisional_and_a_set_names_its_own_kind_and_field(tmp_path)
     (lambda p: p.update(file="/elsewhere/a.pdf"), "file is not a file name"),
     (lambda p: p.update(license_checked="２０２６-１０-０１"), "license_checked is not a date"),  # full-width digits
     (lambda p: p.update(submitted=["2026-01-05"]), "is outside 2026-01-01 to 2026-09-30"),
+    (lambda p: p.update(submitted="2026-02-31"), "is outside 2026-01-01 to 2026-09-30"),  # T12: no such day
+    (lambda p: p.update(license_checked="2026-99-99"), "license_checked is not a date"),
 ])
 def test_the_paper_list_holds_only_versions_meeting_the_criteria(tmp_path, change, expected):
     folder = field(tmp_path)
