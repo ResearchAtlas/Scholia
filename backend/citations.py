@@ -125,8 +125,12 @@ def _code(text):
     for m in re.finditer(r"[^\n]*\n|[^\n]+$", text):  # lines end at \n only, as CommonMark's do
         line, start = m.group(), m.start()
         body, at = line.rstrip("\n").removesuffix("\r"), m.end()  # a CRLF line ends as an LF one
+        depth = 0
         while (q := _QUOTE.match(body)):  # block quote markers
-            body = body[q.end():]
+            body, depth = body[q.end():], depth + 1
+        if fence is not None and depth < fence[4]:  # its block quote ended: so does the fence, before this line
+            code.append((fence[2], start))
+            fence = None
         if fence is not None:
             close = _FENCE_CLOSE.match(body[min(fence[3], _indent(body)):])
             if close and close[1][0] == fence[0] and len(close[1]) >= fence[1]:
@@ -144,7 +148,7 @@ def _code(text):
             item = 0  # out of the list
         opened = _FENCE_OPEN.match(body)
         if opened and not (opened[1][0] == "`" and "`" in opened[2]):  # a backtick fence's info has no backtick
-            fence, paragraph = (opened[1][0], len(opened[1]), start, item), False
+            fence, paragraph = (opened[1][0], len(opened[1]), start, item, depth), False
             continue
         if _indent(body) >= 4 and not paragraph:
             code.append((start, at))
@@ -279,13 +283,17 @@ def typical_judge_input(passages, pairs):
 
 
 def parse_verdicts(reply, count):
-    """{pair number: verdict} from the judge's reply; a pair it does not answer clearly is left out."""
-    found = {}
+    """{pair number: verdict} from the judge's reply; a pair it does not answer clearly, or answers more than
+    once, is left out (unchecked), and a verdict for a pair it was not given is not taken."""
+    found, twice = {}, set()
     for line in (reply or "").splitlines():
         m = re.match(r"\s*(?:pair\s*)?(\d+)\s*[:.)-]\s*(supported|partly|unsupported)\b", line, re.IGNORECASE)
         if m and 1 <= int(m[1]) <= count:
-            found.setdefault(int(m[1]), m[2].lower())
-    return found
+            pair = int(m[1])
+            if pair in found:
+                twice.add(pair)
+            found[pair] = m[2].lower()
+    return {pair: verdict for pair, verdict in found.items() if pair not in twice}
 
 
 def sentence_key(sentence):

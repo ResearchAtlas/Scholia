@@ -734,3 +734,113 @@ async def test_deleting_a_conversation_while_its_judge_is_out_leaves_neither_hel
         release.set()
         await stream
         assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE status = 'open'") == [(0,)]
+
+
+# Fix batch b4 (external recheck b4): findings 2, 4, 6 and 7, each a test that failed before its fix.
+
+@pytest.mark.parametrize("tightening", ["local_only", "review_lock"])
+async def test_an_earlier_answer_whose_papers_project_was_tightened_is_left_out_after_the_conversation_moved(
+        tmp_path, tightening):
+    # b4 (2): a history dependency passes the current access check evidence does: its project's level and lock
+    # allow at least what the request's project does, else the answer it carried is left out.
+    from test_materials import project_of
+    provider = Provider(answer_text=QUOTING)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        other = await project_of(client, "Other")
+        assert (await client.post(f"/api/conversations/{conversation}/move", json={"project_id": other})).status_code == 200
+        response = await (client.post(f"/api/projects/{project}/sensitivity", json={"level": "local_only"})
+                          if tightening == "local_only" else
+                          client.post(f"/api/projects/{project}/review-lock", json={"locked": True}))
+        assert response.status_code == 200, response.text
+        provider.answer_text = "A plain rewrite."
+        later = (await send(client, conversation, "Rewrite your last answer more formally."))
+        assert later[-1]["status"] == "succeeded"
+        assert "low-paid workers" not in json.dumps(provider.answers[-1], ensure_ascii=False)
+        [(step,)] = await rows(client, "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_started'"
+                                       " AND json_extract(data, '$.phase') = 'answer'", later[0]["run_id"])
+        assert json.loads(step)["history_left_out"] == 1
+
+
+async def test_a_history_dependency_tightened_after_registration_stops_the_dispatch(tmp_path, monkeypatch):
+    # b4 (2): the dispatch check applies the same access check to the run's dependencies.
+    from test_materials import project_of
+    provider = Provider(answer_text=QUOTING)
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, QUESTION)
+        other = await project_of(client, "Other")
+        assert (await client.post(f"/api/conversations/{conversation}/move", json={"project_id": other})).status_code == 200
+        real = runs_module.Harness._register_context
+
+        async def then_tighten(self, claim, numbered):
+            await real(self, claim, numbered)
+            response = await client.post(f"/api/projects/{project}/sensitivity", json={"level": "local_only"})
+            assert response.status_code == 200
+        monkeypatch.setattr(runs_module.Harness, "_register_context", then_tighten)
+        before = len(provider.answers)
+        stream = await send(client, conversation, "Rewrite your last answer more formally.")
+        assert len(provider.answers) == before and stream[-1]["status"] in ("cancelled", "failed")
+
+
+async def test_the_answers_unspent_is_held_again_in_order_with_a_budget_save(tmp_path, monkeypatch):
+    # b4 (4): a budget save cannot land between the settlement's budget read and the reservation it makes.
+    import threading
+    loop = asyncio.get_running_loop()
+    paused, resume, armed, seen = asyncio.Event(), threading.Event(), [], {}
+    real = runs_module._budgets_now
+
+    def budgets(data_dir, project_id):
+        found = real(data_dir, project_id)
+        if armed:
+            armed.clear()
+            loop.call_soon_threadsafe(paused.set)
+            resume.wait(5)
+        return found
+    monkeypatch.setattr(runs_module, "_budgets_now", budgets)
+    async with cited(tmp_path) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+
+        async def arm_then_answer(body):
+            armed.append(1)
+            return client.provider.answer(ANSWER)
+        client.provider.answer_text = arm_then_answer
+        stream = asyncio.create_task(client.post(f"/api/conversations/{conversation}/message/stream",
+                                                 json={"content": QUESTION}))
+        await asyncio.wait_for(paused.wait(), 10)
+        current = (await client.get("/api/settings", params={"project_id": project})).json()
+        save = asyncio.create_task(client.put("/api/settings", json={"project_id": project, "hash": current["hash"],
+                                                                     "updates": {"project.budget_usd": 0.001}}))
+        await asyncio.wait([save], timeout=1.0)
+        seen["saved_meanwhile"] = save.done()
+        resume.set()
+        assert (await save).status_code == 200
+        events(await stream)
+        assert seen["saved_meanwhile"] is False  # the save waited for the settlement's reservation
+
+
+async def test_a_judge_reply_with_two_verdicts_for_a_pair_leaves_it_unchecked(tmp_path):
+    # b4 (6): contradictory output is not a verdict, for the turn's check and for /check.
+    provider = Provider(verdicts="1: supported\n1: unsupported")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        run_id = (await send(client, conversation, QUESTION))[0]["run_id"]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert [c["support"] for c in turn["citations"]] == ["unchecked"] and "unchecked" in turn["answer"]["notices"]
+        provider.verdicts = "1: unsupported\n1: supported"
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE citations SET support = 'supported'"))
+        [check] = (await client.post("/api/citations/check", json={"run_id": run_id})).json()["run_ids"]
+        assert (await run_finished(client, check))["status"] == "failed"
+        assert await rows(client, "SELECT support FROM citations") == [("supported",)]  # nothing written
+
+
+async def test_judge_verdicts_for_a_pair_twice_or_an_unknown_pair_are_not_taken():
+    from backend import citations
+    assert citations.parse_verdicts("1: supported\n2: partly\n2: partly\n3: unsupported\n7: supported", 3) == {
+        1: "supported", 3: "unsupported"}

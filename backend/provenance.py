@@ -7,9 +7,10 @@ depends on, `inputs.context_materials`: its evidence's papers and those of every
 carries, so the set is transitive. That one set is used everywhere:
 
 - History: an earlier answer is carried in a later request only while every paper its turn depended on
-  exists (`carried`); one that is not is left out, and the step's trace says how many were.
+  exists and its project allows the request as its evidence would be allowed (`sendable`); one that is
+  not is left out, and the step's trace says how many were.
 - Revocation: the set is the run's scope (`inputs.material_ids`, deletion's scope links) and the dispatch
-  check refuses a run any of whose papers is gone (runs.may_dispatch).
+  check refuses a run any of whose papers is gone or no longer `sendable` (runs.may_dispatch).
 - Stored request bodies (the trace's exact outbound text) are linked to it (run_body_materials) when they
   are stored, before they are sent, and go with any of its papers (db/deletion.py RULES).
 - Stored rows holding such text name their paper and lose the text with it: a citation's quote and
@@ -37,6 +38,24 @@ def carried(conn, material_ids):
     """Whether text depending on these papers may be sent or kept: every one of them exists."""
     ids = set(material_ids)
     return existing(conn, ids) == ids
+
+
+def sendable(conn, project_id, material_ids):
+    """Whether text depending on these papers may go out in a request of project_id now: every paper exists
+    (`carried`), and its project passes the current access check its evidence would (slice-1 spec section 10):
+    not review-locked, and at a level no stricter than project_id's. The levels allow nested sets of routes
+    (Local only within Private within Normal; governance.Policy.problem), so a route the gate allows
+    project_id's request is allowed for every such paper too. A conversation moved to another project keeps
+    its earlier answers' papers where they are; this is what keeps a tightened project's text in."""
+    from backend.governance import LEVELS
+    ids = set(material_ids)
+    if not ids:
+        return True
+    rows = conn.execute("SELECT p.sensitivity, p.review_lock FROM materials m JOIN projects p ON p.id = m.project_id"
+                        " WHERE m.id IN (SELECT value FROM json_each(?))", (json.dumps(sorted(ids)),)).fetchall()
+    own = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
+    return own is not None and len(rows) == len(ids) and all(
+        not locked and LEVELS.index(level) <= LEVELS.index(own[0]) for level, locked in rows)
 
 
 def dependencies(conn, run_id):

@@ -323,8 +323,8 @@ def may_dispatch(conn, run_id) -> bool:
     # S1-19: every passage in the request's context is still read by the paper it is named under
     # (section 10, Revocation: each PR that adds a context source registers its records here).
     wanted = {tuple(pair) for pair in json.loads(evidence)} if evidence else set()
-    if held and not provenance.carried(conn, json.loads(held)):  # a paper whose text the request carries is gone
-        return False
+    if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
+        return False  # gone, or its project no longer allows this request (tightened, or review-locked)
     return not wanted or still_read(conn, project_id, wanted) == wanted
 
 
@@ -690,7 +690,7 @@ class Harness:
                 "SELECT t.user_message, t.answer, json_extract(r.inputs, '$.context_materials') FROM turns t"
                 " JOIN runs r ON r.id = t.run_id WHERE t.conversation_id = ? AND r.status = 'succeeded'"
                 " AND t.answer IS NOT NULL ORDER BY t.seq DESC", (claim.conversation_id,))]
-            kept_turns = [turn for turn in earlier if provenance.carried(conn, turn[2])]
+            kept_turns = [turn for turn in earlier if provenance.sendable(conn, project_id, turn[2])]
             history_left_out = len(earlier) - len(kept_turns)  # traced with the answer's step
             history = [(json.loads(u).get("text", ""), historical_citations(json.loads(a).get("text", "")))
                        for u, a, _ in kept_turns]
@@ -1371,8 +1371,16 @@ class Harness:
                 if not result.dispatched:
                     spending.release(conn, call.reservation_id)
 
+            async def recording():
+                if rehold is None:
+                    return await self._write(record)
+                # The answer's unspent is held again against the budgets read in this write: under settings_lock,
+                # as every reservation is, so a budget save lands wholly before or after it (option C).
+                async with self.settings_lock:
+                    return await self._write(record)
+
             # Recorded before the client closes, and to its end even if cancelled meanwhile.
-            _, cancelled = await self._write_through(record)
+            _, cancelled = await _through(recording())
         active.call = None
         if cancelled:
             raise asyncio.CancelledError()
@@ -1934,8 +1942,8 @@ def _budgets_now(data_dir, project_id):
 
 def _hold_unspent(conn, call, ctx, data_dir):
     """The answer's reservation less its settled cost, held again for its judge, in the transaction that settles
-    it, against the budgets as they are then (Harold's option C, 2026-10-21: every new reservation respects the
-    current budget): (its id, its amount), which the answer's step_finished event names (unspent_id), as
+    it, against the budgets as they are then, read under settings_lock (_call's recording; Harold's option C,
+    2026-10-21: every new reservation respects the current budget): (its id, its amount), which the answer's step_finished event names (unspent_id), as
     _release_allowances and deletion read it; None when none is left, a budget no longer holds it, or the
     budgets cannot be read (nothing is held)."""
     row = conn.execute("SELECT run_id, step_seq, project_id, paying_conversation_id, estimate_usd - settled_usd"

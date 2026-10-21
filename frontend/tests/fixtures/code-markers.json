@@ -125,5 +125,17 @@
   "markers": [
    "[S1.2]"
   ]
+ },
+ {
+  "text": "> ~~~\n> code\n\nEarnings rise [S1.1].",
+  "markers": [
+   "[S1.1]"
+  ]
+ },
+ {
+  "text": "> ```\n> code [S1.1]\nEarnings rise [S1.2].",
+  "markers": [
+   "[S1.2]"
+  ]
  }
 ]
