@@ -155,8 +155,20 @@ def _step(fd, name, shown):
         raise
 
 
+def _not_a_work_tree(fd, shown):
+    """A folder at or below a root holding a .git entry (a folder, or the file a worktree or submodule has) is a
+    git work tree: nothing in it is read or written (Harold, 2026-10-21: field 1 outside every git work tree;
+    private_path checks a root and what is above it, this each folder below)."""
+    try:
+        os.stat(".git", dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise Refused(f"{shown} is a git work tree (it holds .git): no gold-set file is read or written in one")
+
+
 def _open_dir(root, folder, create=False):
-    """An open descriptor of folder, reached from root one folder at a time; folders made 0700 when create."""
+    """An open descriptor of folder, reached from root one folder at a time, none of them a git work tree;
+    folders made 0700 when create."""
     root, folder = Path(root), Path(folder)
     parts = folder.relative_to(root).parts
     if create:
@@ -164,12 +176,14 @@ def _open_dir(root, folder, create=False):
             made.mkdir(mode=0o700)
     fd = _step(None, str(root), root)
     try:
+        _not_a_work_tree(fd, root)
         for n, name in enumerate(parts, start=1):
             if create:
                 with contextlib.suppress(FileExistsError):
                     os.mkdir(name, 0o700, dir_fd=fd)
             fd, before = _step(fd, name, root.joinpath(*parts[:n])), fd
             os.close(before)
+            _not_a_work_tree(fd, root.joinpath(*parts[:n]))
     except BaseException:
         os.close(fd)
         raise

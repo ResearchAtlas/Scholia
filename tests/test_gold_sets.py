@@ -978,6 +978,34 @@ async def test_field_ones_temporary_folder_is_removed_and_tmpdir_given_back_when
     assert os.environ.get("TMPDIR") == (None if tmpdir is None else str(tmp_path))
 
 
+def test_a_folder_below_field_ones_that_is_a_git_work_tree_is_never_read_or_written(tmp_path):
+    """sol recheck 3: field 1's folder is outside git, but its labels/ or out/ is itself a repository (or holds
+    a worktree's .git file). The page saved a question and its quote there and apply wrote a corrected set
+    there. The walk from the root refuses any folder holding a .git entry: nothing is written."""
+    folder = field(tmp_path, 1)
+    questions = json.loads((folder / "questions.json").read_text())
+    page = gold.Review(1, folder, "questions", "harold")
+    fixtures.git("init", folder / "labels")  # made a repository after the page opened
+    with pytest.raises(tier1.Refused, match="git work tree"):
+        page.save({"item": "q01", "base": 0, "label": {"decision": "drop"}})
+    with pytest.raises(tier1.Refused, match="git work tree"):
+        gold.Review(1, folder, "questions", "harold")
+    assert fixtures.git("status", folder / "labels") == ""
+    other = field(tmp_path / "other", 1)
+    gold.write_json(other, other / "labels" / f"{questions['id']}.harold.json", labels_for(questions, "harold", {}))
+    fixtures.git("init", other / "out")
+    before = sorted(p.name for p in (other / "out").iterdir())
+    with pytest.raises(SystemExit, match="git work tree"):
+        gold.main(["apply", "--field", "1", "--folder", str(other), "--set", "questions", "--rater", "harold"])
+    assert sorted(p.name for p in (other / "out").iterdir()) == before
+    third = field(tmp_path / "third", 1)
+    (third / "out" / ".git").write_text("gitdir: /somewhere/.git/worktrees/out\n")  # a worktree's .git is a file
+    before = sorted(p.name for p in (third / "out").iterdir())
+    with pytest.raises(SystemExit, match="git work tree"):
+        gold.main(["check", "--field", "1", "--folder", str(third)])
+    assert sorted(p.name for p in (third / "out").iterdir()) == before
+
+
 def test_from_a_worktree_the_main_checkout_is_refused_too():
     git = ROOT / ".git"
     if not git.is_file():

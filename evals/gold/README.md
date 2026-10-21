@@ -3,7 +3,7 @@
 The gold sets measure Scholia's retrieval on papers of two research fields, and its support judge on labeled citation pairs (slice 1 section 14; tickets 17, 22, 70 and 72). They are built by `evals/gold.py` (S1-36). Every set here is a draft until a rater has reviewed it.
 
 - **Field 2** (AI and NLP): recent arXiv cs.CL and cs.AI papers whose specific version is licensed CC BY 4.0 or CC0 1.0, leaving out QASPER's papers. Its files are public and live in `field2/`.
-- **Field 1** (social science, English and Chinese papers): Harold's own papers. Its files never enter this repository. They stay in a folder given with `--folder`, outside every git work tree (this repository's checkouts and worktrees included, their `evals/local/` too), and are written owner-only. No link is followed in it or in the output folders: a link at or below the folder (its `labels/` or `out/`, a set, a written file) refuses the command. The one exception is a PDF in the PDFs folder, which may link to storage outside every git work tree (Zotero's, say).
+- **Field 1** (social science, English and Chinese papers): Harold's own papers. Its files never enter this repository. They stay in a folder given with `--folder`, outside every git work tree (this repository's checkouts and worktrees included, their `evals/local/` too), and are written owner-only. No link is followed in it or in the output folders: a link at or below the folder (its `labels/` or `out/`, a set, a written file) refuses the command, and so does a folder there that is itself a git work tree (it holds `.git`). The one exception is a PDF in the PDFs folder, which may link to storage outside every git work tree (Zotero's, say).
 
 ## Held out and provisional
 
