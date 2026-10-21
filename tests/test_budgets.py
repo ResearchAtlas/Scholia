@@ -312,7 +312,9 @@ async def test_a_turn_reserves_from_its_counted_request_and_output_limit_at_the_
         for step, body in zip(steps, provider.answers):
             # 4e-6 a prompt token (b's long-context override), 1.2e-5 an output one (b's completion).
             assert step["estimate_usd"] == pytest.approx(step["input_tokens"] * 4e-6 + step["max_tokens"] * 1.2e-5)
-            assert step["input_tokens"] == context.serialized_tokens(body["messages"]) and body["max_tokens"] == 8000
+            # counted with the tool definitions it carries (S1-19c: the agent loop's)
+            assert step["input_tokens"] == context.serialized_tokens(body["messages"], body.get("tools", ())) \
+                and body["max_tokens"] == 8000
 
 
 @pytest.mark.asyncio
@@ -332,3 +334,58 @@ async def test_a_request_too_costly_for_the_budget_stops_at_the_limit_before_any
         assert provider.chats == []
         assert await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
             "SELECT count(*) FROM budget_reservations").fetchone()) == (0,)
+
+
+# S1-19c: the agent loop's steps and tools (lifecycle L1, L9)
+
+
+@pytest.mark.asyncio
+async def test_a_step_the_budget_cannot_hold_stops_the_loop_at_its_limit_and_starts_nothing_more(tmp_path):
+    from agentic import Scripted, call, steps_reply
+    from cited import cited, conversation_in, rows, with_papers
+    from scholia_app import send
+    from test_search import WAGES
+    provider = Scripted(lambda body: steps_reply(provider, [call("list_materials")], cost=0.03), "Never.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE conversations SET budget_usd = 0.08 WHERE id = ?", (conversation,)))
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert {"type": "limit_reached", "budget": "conversation"} in stream
+        assert stream[-1]["cancel_reason"] == "limit" and len(provider.agent_steps) == 1  # the admitted step finished
+        reservations = await rows(client, "SELECT status, settled_usd FROM budget_reservations WHERE run_id = ?",
+                                  stream[0]["run_id"])
+        assert ("settled", 0.03) in reservations and not [r for r in reservations if r[0] == "open"]
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_a_tool_call_settles_its_model_call_once_and_publishes_nothing(tmp_path):
+    from agentic import Scripted, call
+    from cited import cited, conversation_in, rows, with_papers
+    from scholia_app import send
+    from test_search import WAGES
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def held(body):
+        started.set()
+        await release.wait()
+        return "Never delivered [S1.1]."
+    provider = Scripted([call("answer_from_library", question="What do minimum wages do?")], "Never.", inner=[held])
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await started.wait()  # the tool's own answer step is in flight
+        run_id = (await rows(client, "SELECT id FROM runs WHERE conversation_id = ?", conversation))[0][0]
+        assert (await client.post(f"/api/runs/{run_id}/cancel")).json()["status"] == "cancelled"
+        release.set()
+        stream = await sending
+        assert stream[-1]["status"] == "cancelled" and not [e for e in stream if e["type"] == "chat_response"]
+        reservations = await rows(client, "SELECT status, basis FROM budget_reservations WHERE run_id = ?", run_id)
+        assert not [r for r in reservations if r[0] == "open"]
+        attempts = await rows(client, "SELECT json_extract(data, '$.outcome') FROM run_events WHERE run_id = ?"
+                                      " AND type = 'model_attempt'", run_id)
+        assert attempts.count(("cancelled",)) == 1  # the call in flight, settled once at its estimate
+        assert await rows(client, "SELECT answer FROM turns WHERE run_id = ?", run_id) == [(None,)]

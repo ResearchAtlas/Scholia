@@ -32,6 +32,11 @@ with cancel_reason revoked, keeping its settled costs and applying no effect.
 Admission checks what the project allows (backend/governance.py) and refuses a
 route it does not, before anything is written.
 
+S1-19c: on a route whose endpoints all take tool calls a turn is an agent run (Harness._agent_steps): each
+step is a model call as above; tool calls are checked, run and recorded (backend/agent.py) and answered in the
+turn's chain until the model answers, the run waits on an ask, or a limit or the budget stops it. The delivered
+answer gets the same checks and primary commit as any other.
+
 Background runs (titles) run outside any turn, so the conversation accepts its
 next message at once. Each model call they start is counted in `attempts`, in its
 own transaction, before the call. On every start, including after a crash, a
@@ -55,16 +60,20 @@ import logging
 import threading
 import time
 import traceback
+import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass, field
 
-from backend import (budget_router, citations, context, credentials, governance, openrouter, openrouter_client,
-                     provenance, providers, reach, router, spending)
+from backend import (agent, budget_router, citations, context, credentials, governance, openrouter,
+                     openrouter_client, provenance, providers, reach, router, skills, spending)
 from backend.evidence import historical_citations
 from backend.search_index import still_read
 from backend.db import new_id, utc_now
 from backend.openrouter_client import catalog_read, catalog_status, get_model_metadata
 from backend.settings import load_instructions, load_settings, visible
+from backend.tools.parser import ToolParser
+from backend.tools.router import ToolRouter, failed
+from backend.tools.types import ToolResult
 
 log = logging.getLogger(__name__)
 
@@ -420,7 +429,7 @@ class Harness:
                     "SELECT id, cancel_reason = 'revoked' FROM runs WHERE status = 'running' AND kind IN ('turn', 'child')"
             ).fetchall():
                 status = "cancelled" if revoked else "interrupted"  # a revoked run stays revoked
-                _event(conn, run_id, "run_finished", {"status": status})
+                _event(conn, run_id, "run_finished", {"status": status, **({"cancel_reason": "revoked"} if revoked else {})})
                 conn.execute(
                     "UPDATE runs SET status = ?, finished_at = ?, settled_cost_usd = ? WHERE id = ?",
                     (status, now, spending.run_cost(conn, run_id), run_id))
@@ -668,6 +677,15 @@ class Harness:
             raise AdmissionError(400, problem, _REFUSED[problem])
         instructions, _ = await asyncio.to_thread(load_instructions, self.data_dir, project_id)
         budgets = personal.values["context"]
+        # S1-19c: a route whose endpoints all take tool calls runs the agent loop, with the skill catalog, the skills
+        # active in the conversation and the tool definitions in every step's request; one without runs as chat with
+        # the library (section 6.2), with none of them.
+        loaded = (await asyncio.to_thread(skills.load))[0] if facts["tools"] else {}
+        tools = agent.definitions() if facts["tools"] else []
+        own = project_settings.values
+        limits = {k: (own.get("limits") or {}).get(k) or personal.values["limits"][k]
+                  for k in ("agent_steps", "tool_calls", "turn_minutes")}  # a project's own limits first
+        rules = {k: (own.get("tools") or {}).get(k) or () for k in ("deny", "ask", "allow")}
 
         def admit(conn):
             moved = conn.execute("SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone()
@@ -698,6 +716,14 @@ class Harness:
             history = [(json.loads(u).get("text", ""), historical_citations(json.loads(a).get("text", "")))
                        for u, a, _ in kept_turns]
             history_materials = [held for _, _, held in kept_turns]  # newest first, as history is
+            # The skills its earlier answered turns activated, most recently used first: ACTIVE SKILLS, each loaded
+            # once (a skill activated mid-turn joins it from the next turn; model-route rule 5).
+            used = []
+            for (names,) in conn.execute("SELECT r.skills FROM turns t JOIN runs r ON r.id = t.run_id WHERE"
+                                         " t.conversation_id = ? AND r.status = 'succeeded' ORDER BY t.seq DESC",
+                                         (claim.conversation_id,)):
+                used += [n for n in reversed(json.loads(names or "[]")) if n not in used]
+            skill_sections = {"skill_catalog": agent.catalog(loaded), "active_skills": agent.active(loaded, used)}
             if material_ids and conn.execute(
                     "SELECT count(*) FROM materials WHERE project_id = ? AND id IN (SELECT value FROM json_each(?))",
                     (project_id, json.dumps(material_ids))).fetchone()[0] != len(material_ids):
@@ -707,13 +733,22 @@ class Harness:
             decision = router.decide(message, selected=bool(material_ids), has_materials=has_materials,
                                      small_model=router_model is not None,
                                      deadline_ms=personal.values["retrieval"]["rules_ms"])
-            try:  # the request without its evidence: one whose own parts do not fit is refused before anything is written
-                request = context.assemble(
-                    "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
-                    margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=message,
-                    sections={"agents_md": [instructions] if instructions else []}, history=history)
-            except context.OverWindow as over:  # before anything is written or sent
-                raise AdmissionError(400, over.code, _REFUSED[over.code]) from None
+            # The request without its evidence: one whose own parts do not fit is refused before anything is written.
+            # A window too small for the tool definitions and skill catalog beside them runs the turn as chat with the
+            # library, as a route without tool calls does, and says skills are unavailable (S1-19c).
+            for offered in ((tools, skill_sections), ([], {})) if tools else (([], {}),):
+                try:
+                    request = context.assemble(
+                        "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
+                        margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=message,
+                        sections={"agents_md": [instructions] if instructions else [], **offered[1]}, history=history,
+                        tools=offered[0])
+                    break
+                except context.OverWindow as over:  # before anything is written or sent
+                    refused = over
+            else:
+                raise AdmissionError(400, refused.code, _REFUSED[refused.code]) from None
+            skill_sections = offered[1]
             plan.predicted_cost = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
             conn.execute(
                 "INSERT INTO runs (id, project_id, conversation_id, kind, workflow, limits, inputs)"
@@ -733,10 +768,10 @@ class Harness:
             _event(conn, claim.run_id, "route", {"route": route.key, "effort": facts["effort"], "plan": plan.to_dict(),
                                                  "window": facts["window"], "endpoints": facts["endpoints"],
                                                  "retrieval": decision})
-            return seq, request, history, decision, (history_materials, history_left_out)
+            return seq, request, history, decision, (history_materials, history_left_out), offered
 
         router_model = visible(personal.values["models"].get("router"))
-        (seq, request, history, decision, (history_materials, history_left_out)), cancelled = \
+        (seq, request, history, decision, (history_materials, history_left_out), (tools, skill_sections)), cancelled = \
             await self._write_through(admit)
         if cancelled:  # its request went away while the run was written: it never runs, as by Stop
             await _through(self._write(lambda conn: self._finish_turn(
@@ -748,7 +783,8 @@ class Harness:
             "selection": material_ids, "decision": decision, "history": history, "budgets": budgets,
             "instructions": instructions, "personal": personal, "table": table, "policy": policy,
             "provider": provider_config, "router_model": router_model, "history_materials": history_materials,
-            "history_left_out": history_left_out,
+            "history_left_out": history_left_out, "tools": tools, "skill_sections": skill_sections, "limits": limits,
+            "tool_rules": rules, "reusable": {},
         }
         claim.admitted = time.monotonic()
         return claim
@@ -801,29 +837,19 @@ class Harness:
                 found = await self._evidence(claim, ctx)
             numbered, request = self._cited_request(ctx, found, decision)
             await self._register_context(claim, numbered)  # the dispatch check now covers its passages
-            judge = await self._judge_route(ctx)
-            # The judge's share is reserved with the answer: a budget that cannot hold both refuses the step
-            # before the answer call (section 6.2, final review F02; C5). The share is a typical check's cost
-            # (citations.typical_judge_input, Harold's option C of 2026-10-21) at the judge route's highest rate
-            # and the least output limit, held until the judge's calls take it; a check that needs more draws on
-            # the answer's unspent reservation, then the budget's room (_reserve).
-            judge_estimate = 0.0
-            if numbered and judge[1] is not None:
-                judge_estimate = budget_router.request_cost(judge[2]["rates"], citations.typical_judge_input(
-                    [r["text"] for r in numbered.values()], ctx["personal"].values["retrieval"]["judge_pairs"]),
-                    context.MIN_OUTPUT)
-            estimate = budget_router.request_cost(ctx["facts"]["rates"], request.input_tokens, request.max_tokens)
-            call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
-                                       phase="answer", step={**_step(ctx["route"], ctx["facts"], request),
-                                                             "judge_estimate_usd": judge_estimate,
-                                                             # earlier answers left out: one of their papers is deleted
-                                                             **({"history_left_out": ctx["history_left_out"]}
-                                                                if ctx["history_left_out"] else {})})
-            await handed({"type": "step", "seq": call.step, "phase": "answer"})
-            result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
-                                      zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
-                                      rehold=ctx if judge_estimate else None)
-            if not result.ok or visible(result.content) is None:  # tool calls alone: no tools were offered
+            judge = ctx["judge"] = await self._judge_route(ctx)
+            turn = agent.Turn(self, claim, agent.Evidence(numbered), emit)
+            result = await self._agent_steps(claim, ctx, turn, found, decision, request, handed)
+            numbered = turn.evidence.numbered  # every passage read in the run: the pre-load and the tools'
+            if isinstance(result, str):  # stopped at a turn limit (section 13): Continue is offered
+                final, _ = await _through(self._write(lambda conn: self._finish_turn(
+                    conn, claim.run_id, "cancelled", "limit", result, limit={result: ctx["limits"].get(result, True)},
+                    claim=claim)))
+                if final.get("cancel_reason") == "limit":  # not a Stop that came first
+                    emit({"type": "limit_reached", "limit": result})
+                emit({"type": "run_finished", **final})
+                return
+            if not result.ok or visible(result.content) is None:  # tool calls alone where none were offered
                 code = result.error_kind or "malformed"
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
                                                                           code, claim=claim))
@@ -842,7 +868,7 @@ class Harness:
                                           ("keyword_only", found["mode"] == "keyword_only" and not unsearched),
                                           ("unchecked", outcome["failed"] > 0),
                                           ("unchecked_budget", outcome["budget"] > 0),
-                                          ("skills_unavailable", not ctx["facts"].get("tools")),
+                                          ("skills_unavailable", not ctx["tools"]),  # no tools here
                                           ("retracted", any(c.get("retraction") == "retracted" for c in checked)))
                        if shown]
             answer = {"text": result.content, **({"reasoning": result.reasoning} if result.reasoning else {}),
@@ -916,10 +942,12 @@ class Harness:
             status, cancel_reason, reason_code, limit = "cancelled", "revoked", "cancelled", None
         _release_allowances(conn, run_id)
         if _running(conn, run_id):
+            _close_asks(conn, run_id)  # an ask outlives no run: a late answer changes nothing (asks.answer refuses it)
             if limit is not None:
                 _event(conn, run_id, "limit_hit", limit)
             cost = spending.run_cost(conn, run_id)
-            _event(conn, run_id, "run_finished", {"status": status, "reason": reason_code})
+            _event(conn, run_id, "run_finished", {"status": status, "reason": reason_code,
+                                                  **({"cancel_reason": cancel_reason} if cancel_reason else {})})
             conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, finished_at = ?, settled_cost_usd = ?"
                          " WHERE id = ?", (status, cancel_reason, utc_now(), cost, run_id))
             conn.execute("UPDATE turns SET reason_code = ?, memory_status = 'skipped', result_saved = 0,"
@@ -1139,21 +1167,37 @@ class Harness:
                      "trace": {"index": "unavailable"}}
         else:
             found = await pipeline.evidence(state, ctx["project_id"], ctx["message"], materials=ctx["selection"])
+        await self._trace_retrieval(claim, found)
+        return found
 
+    async def _trace_retrieval(self, claim, found, call_id=None):
+        """Record a retrieval's trace (the router's pre-load, or a tool's: call_id). A tool's query is the model's
+        text, which may quote a paper, so its trace keeps only its length (backend/provenance.py: events hold no
+        text drawn from a paper)."""
+        trace = found["trace"] if not call_id else {**found["trace"], "query": {"chars": len(found["trace"]["query"])},
+                                                    "tool_call_id": call_id}
+        await self._record(claim, "retrieval_trace", {**trace, "mode": found["mode"], "reason": found["reason"]})
+
+    async def _record(self, claim, kind, data, also=None):
+        """One event of a running turn (none when kind is None), and also(conn), if given, in its transaction; a
+        run deleted, ended or revoked meanwhile is cancelled instead."""
         def record(conn):
             if not _running(conn, claim.run_id) or _revoked(conn, claim.run_id):
                 raise _Cancelled()
-            _event(conn, claim.run_id, "retrieval_trace", {**found["trace"], "mode": found["mode"],
-                                                           "reason": found["reason"]})
+            if kind is not None:
+                _event(conn, claim.run_id, kind, data)
+            if also is not None:
+                also(conn)
         try:
             await self._write(record)
         except _Cancelled:
             raise asyncio.CancelledError() from None
-        return found
 
-    def _cited_request(self, ctx, found, decision):
+    def _cited_request(self, ctx, found, decision, chain=()):
         """The answer step's request with its evidence and notes, and the evidence records it holds,
-        numbered as the request numbers them (records the capacity policy left out are not in it)."""
+        numbered as the request numbers them (records the capacity policy left out are not in it). On an agent
+        route it carries the skill catalog, the active skills and the tool definitions, and after its first step
+        the turn's chain (S1-19c)."""
         numbered = citations.sources(found["records"])
         lines = citations.bundle(numbered)
         budgets, facts = ctx["budgets"], ctx["facts"]
@@ -1165,8 +1209,8 @@ class Harness:
                 margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=ctx["message"],
                 sections={"agents_md": [ctx["instructions"]] if ctx["instructions"] else [], "research_evidence": evidence,
                           "conflicts": citations.missing(held, mode=found["mode"], route=decision["route"], index=index,
-                                                         cut=cut)},
-                history=ctx["history"])
+                                                         cut=cut), **ctx["skill_sections"]},
+                history=ctx["history"], tools=ctx["tools"], chain=chain)
         request = assemble(lines, numbered)
         kept = len(lines) - request.cuts.get("research_evidence", 0)
         ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)  # newest first, as they fit
@@ -1176,16 +1220,17 @@ class Harness:
             ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)
         return dict(list(numbered.items())[:kept]), request
 
-    async def _register_context(self, claim, numbered):
+    async def _register_context(self, claim, numbered, listed=()):
         """Name every paper whose text the request carries on its run, before its dispatch (backend/provenance.py):
         its evidence's and its history's (inputs.context_materials, also its scope in inputs.material_ids, so
         deleting one revokes the run), and its evidence's [passage, paper] pairs (inputs.evidence); the dispatch
         check refuses a run when one of those papers is gone or no longer reads the passage."""
-        papers = sorted({r["material_id"] for r in numbered.values()})
+        papers = sorted({r["material_id"] for r in numbered.values()} | set(listed))  # listed: titles a tool gave
         pairs = sorted({(r["passage_id"], r["material_id"]) for r in numbered.values()})
-        # every paper whose text the request carries: its evidence, and the earlier turns its history holds
+        # every paper whose text the request carries: its evidence, and the earlier turns its history holds; in an
+        # agent turn, what its earlier steps carried too (its chain is never cut)
         shown = claim.context["history_materials"][:claim.context.get("history_kept", 0)]
-        held = sorted({*papers, *(m for turn in shown for m in turn)})
+        held = sorted({*papers, *(m for turn in shown for m in turn), *claim.context.get("context_materials", ())})
         claim.context["context_materials"] = held
         if not held:
             return
@@ -1203,6 +1248,214 @@ class Harness:
             await self._write(record)
         except _Cancelled:
             raise asyncio.CancelledError() from None
+
+    # S1-19c: the agent loop
+
+    def _judge_estimate(self, ctx, numbered):
+        """The judge's share reserved with an answer step whose request holds this evidence: a budget that cannot
+        hold both refuses the step before the call (section 6.2, final review F02; C5). The share is a typical
+        check's cost (citations.typical_judge_input, Harold's option C of 2026-10-21) at the judge route's highest
+        rate and the least output limit, held until the judge's calls take it; a check that needs more draws on the
+        answer's unspent reservation, then the budget's room (_reserve)."""
+        judge = ctx["judge"]
+        if not numbered or judge[1] is None:
+            return 0.0
+        return budget_router.request_cost(judge[2]["rates"], citations.typical_judge_input(
+            [r["text"] for r in numbered.values()], ctx["personal"].values["retrieval"]["judge_pairs"]),
+            context.MIN_OUTPUT)
+
+    async def _agent_steps(self, claim, ctx, turn, found, decision, request, handed):
+        """The turn's steps (section 6.2): the model answers, or calls tools, which are checked, run and answered
+        in the turn's chain, each assistant step kept whole and sent back unmodified, its reasoning blocks included
+        (model-route rule 5), until an answer. Returns the answer step's result (a failure included), or the name of
+        the limit that stopped the turn: agent_steps, tool_calls, turn_minutes (time waiting on the researcher left
+        out), tool_errors (3 failed calls in a row, section 6.6) or chain_over_window (the chain no longer fits the
+        window; it is never cut or rewritten). A route without tool calls offers none: its one step is its answer."""
+        limits, tools = ctx["limits"], ctx["tools"]
+        tool_router = ToolRouter(agent.REGISTRY, **ctx["tool_rules"])
+        chain, calls_made, failures, began = [], 0, 0, _clock()
+        for number in range(limits["agent_steps"]):
+            if number:
+                if _clock() - began - turn.waited > limits["turn_minutes"] * 60:
+                    return "turn_minutes"
+                try:
+                    _, request = self._cited_request(ctx, found, decision, chain=chain)
+                except context.OverWindow:
+                    return "chain_over_window"
+                await self._register_context(claim, turn.evidence.numbered, turn.listed)
+            judge_estimate = self._judge_estimate(ctx, turn.evidence.numbered)
+            estimate = budget_router.request_cost(ctx["facts"]["rates"], request.input_tokens, request.max_tokens)
+            call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
+                                       phase="answer", step={**_step(ctx["route"], ctx["facts"], request),
+                                                             "judge_estimate_usd": judge_estimate,
+                                                             # earlier answers left out: one of their papers is deleted
+                                                             **({"history_left_out": ctx["history_left_out"]}
+                                                                if ctx["history_left_out"] and not number else {})})
+            await handed({"type": "step", "seq": call.step, "phase": "answer"})
+            result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
+                                      zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
+                                      rehold=ctx if judge_estimate else None)
+            turn.step = call.step
+            if not result.ok or not tools or not result.tool_calls:
+                return result
+            await self._release_held(claim)  # this step called tools: its judge share and unspent go back
+            chain.append({"role": "assistant", **result.message} if "role" not in result.message else result.message)
+            for raw in result.tool_calls:
+                if calls_made >= limits["tool_calls"]:
+                    return "tool_calls"
+                if _clock() - began - turn.waited > limits["turn_minutes"] * 60:
+                    return "turn_minutes"
+                calls_made += 1
+                answered = await self._tool(tool_router, raw, turn)
+                chain.append({"role": "tool", "tool_call_id": answered.id,
+                              "content": answered.text if answered.ok else json.dumps(
+                                  {"error": answered.error.type, "message": answered.error.message})})
+                failures = 0 if answered.ok else failures + 1
+                if failures >= 3:  # compact errors: three failed calls in a row stop the run (section 6.6)
+                    return "tool_errors"
+        return "agent_steps"
+
+    async def _tool(self, tool_router, raw, turn):
+        """One tool call of the model's: parsed, checked against the project's rules (deny, then ask, then allow)
+        and the tool's schema, run, and recorded (tool_call_started, tool_result: names, ids and counts, never
+        text). Every failure is a short structured error for the model."""
+        claim, step = turn.claim, turn.step
+        call, problem = ToolParser.parse_call(raw)
+        call_id = call.id if call else (raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else "")
+        name = call.name[:100] if call else None
+        await self._record(claim, "tool_call_started", {"step": step, "call_id": call_id, "name": name,
+                                                        **({"arguments": agent.traced_arguments(call.arguments)}
+                                                           if call and not problem else {})})
+        turn.emit({"type": "tool_call", "name": name, "call_id": call_id})
+        if call is None:
+            result = failed(call_id, "validation_error", "Not a function call this app can run.")
+        elif problem:
+            result = failed(call.id, "validation_error", "The arguments must be one JSON object.")
+        elif (error := tool_router.check(call)) is not None:
+            result = ToolResult(id=call.id, ok=False, error=error)
+        elif tool_router.rule(call.name) == "ask" and \
+                (await self._ask(turn, "choice", ["allow", "decline"], {"approval": call.name}, call.id) or {}).get(
+                    "option") != "allow":
+            result = failed(call.id, "denied", "The researcher did not allow this tool call.")
+        else:
+            try:
+                result = await tool_router.execute(call, turn)
+            except (asyncio.CancelledError, spending.BudgetExceeded):
+                raise
+            except Exception as error:  # a defect in the tool: a short error for the model, the turn goes on
+                log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
+                result = failed(call.id, "tool_error", "The tool failed.")
+        await self._record(claim, "tool_result", {
+            "step": step, "call_id": call_id, "name": name, "ok": result.ok,
+            **({"error": result.error.type} if result.error else {}), **({"meta": result.meta} if result.meta else {})})
+        if turn.listed or result.meta.get("passages"):  # what it gave the model is covered before the next dispatch
+            await self._register_context(claim, turn.evidence.numbered, turn.listed)
+        return result
+
+    async def _ask(self, turn, kind, options, params, call_id):
+        """Raise a shared confirmation for the turn (backend/asks.py; ticket 71: the agent's way in) and wait for its
+        answer, which only the ask endpoint gives: the answer's event, or None when it was withdrawn because the
+        project's protection changed. The run waits `ask` meanwhile; a Stop, deletion or revocation ends the wait,
+        and the turn's end closes the ask (_finish_turn)."""
+        from backend import asks  # it imports this module
+        claim = turn.claim
+        holder = {}
+
+        def raise_ask(conn):
+            holder["ask_id"] = asks.raise_ask(conn, claim.run_id, kind, options, {**params, "call_id": call_id},
+                                              origin={"conversation_id": claim.conversation_id})
+        await self._record(claim, None, None, also=raise_ask)
+        ask_id = holder["ask_id"]
+        turn.emit({"type": "ask", "ask_id": ask_id})
+        began = _clock()
+
+        def look(conn):  # (the answer, or None, and whether the wait is over); a policy changed withdraws it
+            asked, answer = asks.asked(conn, claim.run_id)
+            if asked is None or asked["ask_id"] != ask_id:
+                return None, True
+            if answer is not None:
+                return (answer if answer.get("by") == "researcher" else None), True
+            if asks._current_policy(conn, asked["project_id"]) != asked["policy"]:
+                asks.withdraw(conn, claim.run_id, ask_id, "policy_changed")
+                return None, True
+            return None, False
+
+        try:
+            while True:
+                claim.answered.clear()
+                answer, done = await self._write(look)
+                if done:
+                    return answer
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(claim.answered.wait(), agent.ANSWERED_POLL_SECONDS)
+        finally:
+            turn.waited += _clock() - began
+
+    async def _skill_activated(self, claim, skill, step):
+        """Record a skill's activation (skill_activated, runs.skills): it joins ACTIVE SKILLS from the next turn."""
+        await self._record(claim, "skill_activated", {"step": step, "name": skill.name, "sha256": skill.sha256},
+                           also=lambda conn: conn.execute(
+                               "UPDATE runs SET skills = json_insert(skills, '$[#]', ?) WHERE id = ? AND NOT EXISTS"
+                               " (SELECT 1 FROM json_each(skills) WHERE value = ?)", (skill.name, claim.run_id, skill.name)))
+
+    async def _release_held(self, claim):
+        """Release the judge's share and the answer's unspent held for a step that turned out not to answer."""
+        held = [claim.context.pop(name, None) for name in ("allowance", "unspent")]
+        if any(held):
+            await self._write(lambda conn: [spending.release(conn, rid) for rid in held if rid])
+
+    async def _answer_from_library(self, turn, call_id, question, selection):
+        """The answer_from_library tool (section 6.2: a tested pipeline kept whole): the retrieval pipeline, one
+        answer step over its evidence, and the delivered-answer checks (existence and mapping, then the support
+        judge), each call through the dispatch path with its reservation, the judge's share reserved with the
+        answer. Its verdicts are kept for the turn: the delivered answer reuses one only for a sentence it
+        delivers unchanged (after Unicode and whitespace normalization) with the same passage (reading 6)."""
+        from backend import pipeline, search  # search imports this module
+        claim, ctx = turn.claim, turn.ctx
+        state = search._STATES.get(self)
+        if state is None:
+            return failed(call_id, "tool_error", "The library's search index is unavailable.")
+        found = await pipeline.evidence(state, ctx["project_id"], question, materials=selection)
+        await self._trace_retrieval(claim, found, call_id)
+        keys = list(dict.fromkeys(turn.evidence.add(found["records"])))
+        await self._register_context(claim, turn.evidence.numbered, turn.listed)
+        held = {k: turn.evidence.numbered[k] for k in keys}
+        if not held:
+            return ToolResult(id=call_id, ok=True, text="No passage in the library matched this question: the library "
+                                                       "holds no evidence for it.", meta={"passages": []})
+        budgets, facts, lines = ctx["budgets"], ctx["facts"], citations.bundle(held)
+        try:  # a pipeline needing evidence refuses when too little room is left for it (section 8, final review F15)
+            request = context.assemble(
+                "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
+                margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=question,
+                sections={"research_evidence": lines, "conflicts": citations.missing(
+                    held, mode=found["mode"], route="literature", index=(found.get("trace") or {}).get("index", "ready"))},
+                needs_evidence=True)
+        except context.OverWindow:
+            return failed(call_id, "over_window", "The evidence this needs does not fit this model's window.")
+        held = dict(list(held.items())[:len(lines) - request.cuts.get("research_evidence", 0)])
+        judge_estimate = self._judge_estimate(ctx, held)
+        estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
+        call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
+                                   phase="answer_from_library", step={**_step(ctx["route"], facts, request),
+                                                                      "judge_estimate_usd": judge_estimate,
+                                                                      "tool_call_id": call_id})
+        result = await self._call(claim, call, ctx["route"], ctx["key"], request, facts,
+                                  zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
+                                  rehold=ctx if judge_estimate else None)
+        try:
+            if not result.ok or visible(result.content) is None:
+                return failed(call_id, "tool_error", "The answer step failed.")
+            checked = await self._read(lambda conn: citations.check_existence(conn, ctx["project_id"], result.content, held))
+            verdicts, outcome = await self._support(claim, ctx, checked, ctx["judge"])
+        finally:
+            await self._release_held(claim)
+        ctx["reusable"].update({(_normalized(sentence), pid): verdict for (sentence, pid), verdict in verdicts.items()})
+        checks = [f"- {c['marker']} {c['existence'] if c['existence'] != 'ok' else verdicts.get((c['sentence'], c['passage_id']), 'unchecked')}"
+                  for c in checked]
+        return ToolResult(id=call_id, ok=True,
+                          text=result.content + ("\n\nCitation checks, in order:\n" + "\n".join(checks) if checks else ""),
+                          meta={"passages": [r["passage_id"] for r in held.values()], "pairs": outcome})
 
     async def _judge_route(self, ctx):
         """(model or None, route, facts) for the support judge: the turn's own route and privacy controls
@@ -1234,11 +1487,19 @@ class Harness:
         outcome = {"judged": 0, "failed": 0, "budget": 0}
         if not wanted:
             return {}, outcome
+        # S1-19c: answer_from_library's own verdict, for a sentence delivered unchanged with the same passage (reading 6)
+        reusable = ctx.get("reusable") or {}
+        verdicts = {pair: reusable[(_normalized(pair[0]), pair[1])] for pair in wanted
+                    if (_normalized(pair[0]), pair[1]) in reusable}
+        if verdicts:
+            outcome["reused"] = len(verdicts)
+            wanted = [pair for pair in wanted if pair not in verdicts]
+            if not wanted:
+                return verdicts, outcome
         if judge[1] is None:  # a judge is set that cannot run here: unchecked, said, never another model
-            return {}, {**outcome, "failed": len(wanted)}
+            return verdicts, {**outcome, "failed": len(wanted)}
         texts = {c["passage_id"]: c["judged_text"] for c in checked if c["existence"] == "ok"}
         material_of = {c["passage_id"]: c["material_id"] for c in checked if c["existence"] == "ok"}
-        verdicts = {}
         queue = citations.batches(wanted, ctx["personal"].values["retrieval"]["judge_pairs"],
                                   _judge_fits(judge[2], ctx["budgets"], texts))
         while queue:
@@ -1343,6 +1604,7 @@ class Harness:
             result = await openrouter.query_model(
                 client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
                 max_tokens=request.max_tokens, zdr_enabled=zero_retention, on_dispatch=dispatched, on_body=keep,
+                tools=request.tools or None,  # S1-19c: the agent loop's function tools, counted with the request
                 # The catalog row the route's facts were read from, so the request is the one they
                 # describe; a Private call is limited to the endpoints it lists, as the gate checks.
                 model_entry=facts["row"])
@@ -1983,6 +2245,48 @@ def _release_allowances(conn, run_id=None):
             " AND b.id IN (json_extract(e.data, '$.allowance_id'), json_extract(e.data, '$.unspent_id'))"
             " WHERE b.status = 'open' AND (? IS NULL OR b.run_id = ?)", (run_id, run_id)).fetchall():
         spending.release(conn, reservation)
+
+
+def _close_asks(conn, run_id):
+    """Close the run's open ask, if any, as its run ends without an answer."""
+    from backend import asks  # it imports this module
+    asked, answer = asks.asked(conn, run_id)
+    if asked is not None and answer is None:
+        asks.withdraw(conn, run_id, asked["ask_id"], "run_ended")
+
+
+def replay(events):
+    """A turn's state from its recorded events alone (section 6.6, stateless reducers; test_replay_reducers.py):
+    {"status", "cancel_reason", "waiting", "skills", "steps", "tool_calls", "limit"}, events being (type, data) in
+    order. Pure: the same events give the same state, however often replayed."""
+    state = {"status": "running", "cancel_reason": None, "waiting": None, "skills": [], "steps": 0, "tool_calls": 0,
+             "limit": None}
+    for kind, data in events:
+        if kind == "step_started":
+            state["steps"] += 1
+        elif kind == "tool_call_started":
+            state["tool_calls"] += 1
+        elif kind == "skill_activated" and data["name"] not in state["skills"]:
+            state["skills"] = [*state["skills"], data["name"]]
+        elif kind == "ask" and "options" in data:
+            state["waiting"] = "ask"
+        elif kind == "ask_answered":
+            state["waiting"] = None
+        elif kind == "limit_hit":
+            state["limit"] = next(iter(data), None)
+        elif kind == "run_finished":
+            state.update(status=data["status"], cancel_reason=data.get("cancel_reason"), waiting=None)
+    return state
+
+
+def _clock():
+    """The turn limit's clock (section 13: 15 minutes a turn, time waiting on the researcher left out)."""
+    return time.monotonic()
+
+
+def _normalized(sentence):
+    """A sentence as a judge verdict is reused for it: Unicode NFKC, whitespace collapsed (reading 6)."""
+    return " ".join(unicodedata.normalize("NFKC", sentence or "").split())
 
 
 def _close_call(conn, call):

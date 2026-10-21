@@ -6,7 +6,8 @@
 # reasoning is sent only for a model whose capability record says how. S1-19: a request
 # requires the output limit and any reasoning it sends (provider.require_parameters); a refusal or a
 # provider's policy block is its own outcome; a reply of tool calls alone is an answer;
-# attempts keep the cache counts the provider reports.
+# attempts keep the cache counts the provider reports. S1-19c: the agent loop's function tools are sent,
+# and the reply's message is kept whole for the next step.
 """The provider adapter: one chat completion against a model route.
 
 `query_model` makes at most two HTTP attempts: the second only when an
@@ -122,6 +123,9 @@ class ModelResult:
     attempts: list = field(default_factory=list)
     tool_calls: list = field(default_factory=list)  # as the provider sent them; with or without content
     cut: bool = False  # the answer stopped at the request's output limit (finish_reason "length")
+    # S1-19c: the assistant message as the provider sent it (its reasoning blocks included), which the agent loop
+    # sends back unmodified in the turn's next request (model-route rule 5)
+    message: dict | None = None
 
     @property
     def ok(self) -> bool:
@@ -223,13 +227,15 @@ def routing(model_entry, *, zdr_enabled=False, pin=None, require=False) -> dict:
 
 
 def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens=None, model_entry=None,
-                  capability_records=None) -> dict:
+                  capability_records=None, tools=None) -> dict:
     """The request body. Raises ValueError for zero-retention routing off OpenRouter,
     before any request is prepared: the `provider` field means nothing elsewhere, so
     content would go out unprotected while the caller believed it protected."""
     if zdr_enabled and not route.provider.is_openrouter:
         raise ValueError("zero-retention routing requires OpenRouter")
     payload = {"model": route.model, "messages": messages}
+    if tools:  # S1-19c: client function tools the agent loop offers; never a forced tool choice (rule 4)
+        payload["tools"] = tools
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     reasoning, pin = resolve_model_reasoning(route, effort, model_entry=model_entry,
@@ -249,7 +255,7 @@ def build_payload(route, messages, *, effort=None, zdr_enabled=False, max_tokens
 
 async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, timeout: float = 120.0,
                       effort: str | None = None, zdr_enabled: bool = False, max_tokens: int | None = None,
-                      model_entry=None, capability_records=None, on_dispatch=None, on_body=None) -> ModelResult:
+                      model_entry=None, capability_records=None, on_dispatch=None, on_body=None, tools=None) -> ModelResult:
     """One chat completion. Never raises for a provider failure: the result carries
     the failure kind and every attempt. Cancellation propagates (the caller settles
     what the attempt in flight cost). The client must be the outbound gate's: its
@@ -267,7 +273,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
 
     extensions = {DISPATCHED: dispatched}
     payload = build_payload(route, messages, effort=effort, zdr_enabled=zdr_enabled, max_tokens=max_tokens,
-                            model_entry=model_entry, capability_records=capability_records)
+                            model_entry=model_entry, capability_records=capability_records, tools=tools)
     if "reasoning" in payload and _skips_reasoning(route, key):
         del payload["reasoning"]
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -331,7 +337,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         if len(attempts) > 1 and "reasoning" not in payload:
             _remember_no_reasoning(route, key)
         return ModelResult(content, reasoning, None, attempts, tool_calls,
-                           cut=_choice(body).get("finish_reason") == "length")
+                           cut=_choice(body).get("finish_reason") == "length", message=_choice(body).get("message"))
 
 
 def _count(value):

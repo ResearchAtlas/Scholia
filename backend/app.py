@@ -31,7 +31,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
-from backend import answers, asks, materials
+from backend import agent, answers, asks, materials
 from backend import references  # S1-14: reference file import and the merge confirmation
 from backend import local_helper
 from backend import search  # S1-17: the search index, index runs and the search model's offer
@@ -377,6 +377,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app.include_router(search.router)  # S1-17: search, and the index's status and rebuild
     app.include_router(zotero.router)  # S1-15: Zotero's status, collections and items, and imports
     app.include_router(answers.router)  # S1-19: a run's trace, and answers' citations resolved or checked
+    app.include_router(agent.router)  # S1-19c: the skill catalog
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)

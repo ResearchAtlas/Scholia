@@ -5,7 +5,9 @@ Every model call's request comes from `assemble`, and the harness sends only wha
 labeled sections in the decided order: the system rules first, then AGENTS.md, the SKILL
 CATALOG, ACTIVE SKILLS, PROJECT STATE, USER MEMORY, RESEARCH EVIDENCE, MODEL-GENERATED
 INFERENCE and the conflicts list, all in the system message; then the history, oldest first;
-then the current request. A section with nothing in it is left out.
+then the current request; then, in an agent turn, the turn's own chain so far (each assistant step
+whole, with its tool calls and reasoning blocks, and each tool result), never cut or rewritten. A
+section with nothing in it is left out.
 
 The capacity policy (section 8) sizes it for the route's window W: the output limit, then the
 framing and the margin, then the protected sections (never cut; over capacity, the step is
@@ -131,7 +133,7 @@ def _take(records, room):
 
 
 def assemble(function, *, window, output, budgets, system_rules, request, sections=None, history=(),
-             tools=(), needs_evidence=False, margin_percent=5) -> Request:
+             tools=(), needs_evidence=False, margin_percent=5, chain=()) -> Request:
     """Build a request for a route of this window (W) under the capacity policy, or raise OverWindow.
 
     output is the step's output setting; budgets the [context] settings; sections maps a section
@@ -144,13 +146,16 @@ def assemble(function, *, window, output, budgets, system_rules, request, sectio
     framing = 2 * MESSAGE_FRAMING + REPLY_FRAMING + (count(json.dumps(tools, ensure_ascii=False)) if tools else 0)
     room = window - max_tokens - framing - math.ceil(window * margin_percent / 100)
     protected = {"system_rules": count(system_rules), "current_request": count(request)}
+    if chain:
+        protected["chain"] = serialized_tokens(list(chain)) - REPLY_FRAMING
     for name in PROTECTED:
         if sections.get(name):
             protected[name] = count(_block(LABELS[name], sections[name])) + 2
     if sum(protected.values()) > room:
-        # Named by what is largest: the message, or the instructions around it.
-        raise OverWindow("message_over_window" if max(protected, key=protected.get) == "current_request"
-                         else "instructions_over_window")
+        # Named by what is largest: the message, the instructions around it, or the turn's own chain.
+        largest = max(protected, key=protected.get)
+        raise OverWindow({"current_request": "message_over_window", "chain": "chain_over_window"}.get(
+            largest, "instructions_over_window"))
     room -= sum(protected.values())
     kept, cuts = {name: sections[name] for name in PROTECTED if sections.get(name)}, {}
 
@@ -189,6 +194,7 @@ def assemble(function, *, window, output, budgets, system_rules, request, sectio
     for message, answer in reversed(turns):
         messages += [{"role": "user", "content": message}, {"role": "assistant", "content": answer}]
     messages.append({"role": "user", "content": request})
+    messages += list(chain)
     tokens = serialized_tokens(messages, tools)
     if tokens + max_tokens > window:  # the policy above makes this impossible; never send one that does not fit
         raise OverWindow("message_over_window")
@@ -196,7 +202,14 @@ def assemble(function, *, window, output, budgets, system_rules, request, sectio
 
 
 def serialized_tokens(messages, tools=()) -> int:
-    """The counted size of a serialized request: each message's content and framing, the reply's
-    framing and the tool definitions."""
-    return (sum(count(m["content"]) + MESSAGE_FRAMING for m in messages) + REPLY_FRAMING
+    """The counted size of a serialized request: each message's content and framing (and any other field it
+    carries, such as an assistant step's tool calls and reasoning blocks, as serialized), the reply's framing
+    and the tool definitions."""
+    return (sum(_message_tokens(m) for m in messages) + REPLY_FRAMING
             + (count(json.dumps(list(tools), ensure_ascii=False)) if tools else 0))
+
+
+def _message_tokens(message):
+    extra = {k: v for k, v in message.items() if k not in ("role", "content")}
+    return (count(message.get("content") or "") + MESSAGE_FRAMING
+            + (count(json.dumps(extra, ensure_ascii=False)) if extra else 0))
