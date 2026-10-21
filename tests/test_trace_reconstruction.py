@@ -34,7 +34,7 @@ async def test_a_cited_answer_is_rebuilt_from_its_record_alone(tmp_path):
         answer_step, judge_step = [d for kind, d, _ in events if kind == "step_started"]
         assert (answer_step["phase"], judge_step["phase"]) == ("answer", "judge")
         assert answer_step["route"] == route["route"] and "input_tokens" in answer_step and "estimate_usd" in answer_step
-        attempts = [(d, ref) for kind, d, ref in events if kind == "model_attempt"]
+        attempts = [(d, d.get("body")) for kind, d, _ in events if kind == "model_attempt"]
         assert all(d["charge"] == "reported" and d["cost_usd"] > 0 and "elapsed_ms" in d for d, _ in attempts)
         # The answer's request, from the content store: the evidence it held is the passages the trace selected.
         sent = json.loads(await asyncio.to_thread(client.state["content"].read, attempts[0][1]))

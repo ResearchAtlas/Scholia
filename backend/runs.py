@@ -246,10 +246,10 @@ def derived_status(status: str, run_id: str, registry: Registry) -> str:
     return status
 
 
-def _event(conn, run_id, event_type, data, body_ref=None):
+def _event(conn, run_id, event_type, data):
     (seq,) = conn.execute("SELECT coalesce(max(seq) + 1, 0) FROM run_events WHERE run_id = ?", (run_id,)).fetchone()
-    conn.execute("INSERT INTO run_events (run_id, seq, type, data, body_ref) VALUES (?, ?, ?, ?, ?)",
-                 (run_id, seq, event_type, json.dumps(data), body_ref))
+    conn.execute("INSERT INTO run_events (run_id, seq, type, data) VALUES (?, ?, ?, ?)",
+                 (run_id, seq, event_type, json.dumps(data)))
 
 
 def _where(error: BaseException) -> str:
@@ -774,7 +774,8 @@ class Harness:
                                                              "judge_estimate_usd": judge_estimate})
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
-                                      zero_retention=ctx["zero_retention"])
+                                      zero_retention=ctx["zero_retention"],
+                                      materials={r["material_id"] for r in numbered.values()})
             if not result.ok or visible(result.content) is None:  # tool calls alone: no tools were offered
                 code = result.error_kind or "malformed"
                 final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
@@ -968,11 +969,11 @@ class Harness:
 
     # S1-19: the router's small model, the evidence, the cited request and the support judge
 
-    async def _role_call(self, claim, ctx, model, function, rules, text, *, timeout=None, admitted=False):
+    async def _role_call(self, claim, ctx, model, function, rules, text, *, timeout=None, admitted=False, materials=()):
         """One role call (the router's small model, the support judge) on the turn's provider: model, or the
         turn's own route when None; on the project's allowed routes, through the dispatch path, never
-        forcing a tool choice. Returns the call's result, or None when the route cannot serve it (not
-        allowed, unusable, too small for the request)."""
+        forcing a tool choice. materials: the papers whose passages text holds. Returns the call's result, or
+        None when the route cannot serve it (not allowed, unusable, too small for the request)."""
         # The turn's route and privacy controls, but not its reasoning effort: a role step's output limit is the
         # least a step has, which reasoning tokens would use up.
         route, facts = ctx["route"], {**ctx["facts"], "effort": None}
@@ -996,7 +997,7 @@ class Harness:
         call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, phase=function,
                                    step=_step(route, facts, request), admitted=admitted)
         return await self._call(claim, call, route, ctx["key"], request, facts, zero_retention=ctx["zero_retention"],
-                                timeout=timeout)
+                                timeout=timeout, materials=materials)
 
     async def _router_step(self, claim, ctx):
         """The small model's route, within `router_ms` (section 7.3); on failure, timeout or refusal, the
@@ -1114,6 +1115,7 @@ class Harness:
         texts = await self._read(lambda conn: {pid: text for pid, text in conn.execute(
             "SELECT id, text FROM passages WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(wanted_ids),))})
         verdicts, complete = {}, True
+        material_of = {c["passage_id"]: c["material_id"] for c in checked if c["existence"] == "ok"}
         size = ctx["personal"].values["retrieval"]["judge_pairs"]
         queue = citations.batches(wanted, size)
         while queue:
@@ -1122,7 +1124,8 @@ class Harness:
                 complete = False
                 continue
             result = await self._role_call(claim, ctx, judge[0], "judge", citations.JUDGE_RULES,
-                                           citations.judge_request(batch, texts), timeout=JUDGE_SECONDS, admitted=True)
+                                           citations.judge_request(batch, texts), timeout=JUDGE_SECONDS, admitted=True,
+                                           materials={material_of[pid] for _, pid in batch})
             if result is None and len(batch) > 1:  # too large for its window: halved
                 queue[:0] = [batch[:len(batch) // 2], batch[len(batch) // 2:]]
                 continue
@@ -1175,7 +1178,8 @@ class Harness:
         return None, {"window": window["in_use"], "rates": found.rates, "effort": effort,
                       "endpoints": list(found.tags), "row": row, "output": found.output, "tools": found.tools}
 
-    async def _call(self, active, call, route, key, request, facts, *, output=None, zero_retention=False, timeout=None):
+    async def _call(self, active, call, route, key, request, facts, *, output=None, zero_retention=False, timeout=None,
+                    materials=()):
         """The dispatch path: every model call goes through here, and nowhere else calls the provider
         adapter (tests/test_dispatch_path.py). It sends the request the context assembler built, for
         an admitted call (its reservation), through the gate with the dispatch check, and records it,
@@ -1184,7 +1188,10 @@ class Harness:
         recorded with the retention terms the gate applied when it let it out. output(result), if
         given, is recorded on the finished step, so a run can later finish from the record. timeout bounds
         the call (MODEL_CALL_SECONDS by default). Each attempt's exact request body goes to the content store
-        (owner-only), named by its model_attempt event (body_ref), for the trace's exact outbound text."""
+        (owner-only), for the trace's exact outbound text: its model_attempt event names it (body), and a
+        run_bodies row keeps it with the papers whose passages it holds (materials, run_body_materials), so
+        deleting one of them deletes it (backend/db/deletion.py). A body of a paper deleted before it is
+        recorded is not kept."""
         if not isinstance(request, context.Request):
             raise TypeError("a model request is built by the context assembler")
         if context.serialized_tokens(request.messages, request.tools) + request.max_tokens > request.window:
@@ -1214,13 +1221,22 @@ class Harness:
                 finished["output"] = output(result)
             refs = [await asyncio.to_thread(_stored, self.content, attempt.body) for attempt in result.attempts]
 
+            papers = sorted(set(materials))
+
             def record(conn):
                 # The receipt settles the reservation by its id even if the run was deleted
                 # meanwhile; the run's own record goes with the run.
                 if conn.execute("SELECT 1 FROM runs WHERE id = ?", (active.run_id,)).fetchone() is not None:
-                    for attempt, ref in zip(result.attempts, refs):
-                        _event(conn, active.run_id, "model_attempt",
-                               {"step": call.step, "route": route.key, **attempt.record()}, body_ref=ref)
+                    kept = conn.execute("SELECT count(*) FROM materials WHERE id IN (SELECT value FROM json_each(?))",
+                                        (json.dumps(papers),)).fetchone()[0] == len(papers)
+                    for number, (attempt, ref) in enumerate(zip(result.attempts, refs)):
+                        _event(conn, active.run_id, "model_attempt", {"step": call.step, "route": route.key,
+                                                                      **attempt.record(), **({"body": ref} if ref else {})})
+                        if ref and kept:
+                            conn.execute("INSERT INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
+                                         (active.run_id, call.step, number, ref))
+                            conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
+                                             [(ref, material) for material in papers])
                     _event(conn, active.run_id, "step_finished", finished)
                 if result.dispatched:
                     _settle_attempts(conn, call.reservation_id, facts["rates"], result.attempts)
@@ -1388,13 +1404,14 @@ class Harness:
         if problem:
             return None
         budgets = personal.values["context"]
+        papers = ()  # the papers whose passages the request holds
         if workflow == "title":
             rules, text, output = TITLE_RULES, inputs["message"], lambda result: _clean_title(result.content)
         else:
             check = await self._read(lambda conn: _check_request(conn, inputs, personal.values["retrieval"]["judge_pairs"]))
             if check is None:
                 return None
-            groups, text = check
+            groups, text, papers = check
             rules = citations.JUDGE_RULES
             output = lambda result: {cid: verdict for i, verdict in citations.parse_verdicts(  # noqa: E731
                 result.content, len(groups)).items() for cid in groups[i - 1]}
@@ -1430,7 +1447,7 @@ class Harness:
         if cancelled:
             raise asyncio.CancelledError()
         result = await self._call(active, call, route, key, request, facts, zero_retention=zero_retention,
-                                  output=output)
+                                  output=output, materials=papers)
         return (output(result) or None) if result.ok else None
 
     # Local background work
@@ -1634,29 +1651,34 @@ def _output(setting, facts):
 
 
 def _check_request(conn, inputs, size):
-    """For a citation_check run: ([citation ids per pair], the judge's request text) over its answer's
-    citations that exist, up to size pairs; None when none is left to check."""
+    """For a citation_check run: ([citation ids per pair], the judge's request text, the papers it holds)
+    over its answer's citations that exist, up to size pairs; None when none is left to check."""
     rows = conn.execute(
-        "SELECT c.id, json_extract(c.context, '$.sentence'), c.passage_id, p.text FROM citations c"
+        "SELECT c.id, json_extract(c.context, '$.sentence'), c.passage_id, p.text, c.material_id FROM citations c"
         " JOIN passages p ON p.id = c.passage_id WHERE c.owner_kind = 'answer' AND c.owner_id = ?"
         " AND c.existence = 'ok' ORDER BY c.rowid", (inputs["check"],)).fetchall()
-    pairs, groups, texts = [], [], {}
-    for cid, sentence, pid, text in rows:
+    pairs, groups, texts, material_of = [], [], {}, {}
+    for cid, sentence, pid, text, material in rows:
         key = (sentence or "", pid)
-        texts[pid] = text
+        texts[pid], material_of[pid] = text, material
         if key in pairs:
             groups[pairs.index(key)].append(cid)
         elif len(pairs) < size:
             pairs.append(key)
             groups.append([cid])
-    return (groups, citations.judge_request(pairs, texts)) if pairs else None
+    return (groups, citations.judge_request(pairs, texts), {material_of[pid] for _, pid in pairs}) if pairs else None
 
 
 def _stored(content, body):
-    """The content store's name for an attempt's request body, or None (no body, or no store)."""
+    """The content store's name for an attempt's request body, or None (no body, no store, or a store that
+    could not take it: the attempt's receipt is recorded and settled all the same)."""
     if content is None or body is None:
         return None
-    return content.put(body, "application/json")
+    try:
+        return content.put(body, "application/json")
+    except Exception as error:
+        log.warning("a request body could not be kept for the trace (%s)", type(error).__name__)
+        return None
 
 
 def _step(route, facts, request):

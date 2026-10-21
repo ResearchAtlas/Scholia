@@ -1154,6 +1154,7 @@
   "trace.outcomeOk": "已回答",
   "trace.outcomeFailed": "失败：{reason}",
   "trace.charged": "实际花费 {cost}",
+  "trace.bodyRemoved": "发送的原文已随删除的论文一并移除。",
   "trace.showSent": "显示发送的原文",
   "trace.sent": "发送的原文",
   "trace.checks": "引用核对",

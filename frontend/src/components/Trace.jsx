@@ -93,6 +93,7 @@ function Attempt({ runId, attempt }) {
     <div className="space-y-1 pl-3">
       <p className="text-muted-foreground">{attempt.outcome === 'ok' ? t('trace.outcomeOk')
         : t('trace.outcomeFailed', { reason: errorText(t, attempt.outcome) })}{charged ? ` · ${t('trace.charged', { cost: charged })}` : ''}</p>
+      {attempt.removed && <p className="text-muted-foreground">{t('trace.bodyRemoved')}</p>}
       {attempt.body && text === null && (
         <button type="button" onClick={show}
           className="rounded-sm text-brand underline-offset-2 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring">

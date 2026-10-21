@@ -72,6 +72,7 @@ ON_DELETE = {
     ("runs", "source_turn_id"): DELETE,
     ("runs", "dispatched_by_run_id"): "dispatched_by_run_id = NULL",
     ("run_events", "run_id"): DELETE,
+    ("run_bodies", "run_id"): DELETE,  # S1-19b: a run's exact request bodies go with it
     ("turns", "run_id"): DELETE,
     ("turns", "retry_of_run_id"): "retry_of_run_id = NULL",
     ("candidates", "run_id"): DELETE,
@@ -88,6 +89,7 @@ ON_DELETE = {
     # the source (a passage may live on in another project's material) and shows that the
     # source was removed.
     ("material_versions", "material_id"): DELETE,
+    ("run_body_materials", "material_id"): DELETE,  # and every body that holds its text goes (RULES)
     ("passages", "extraction_id"): DELETE,
     ("candidates", "material_id"): "material_id = NULL",
     ("citations", "material_id"): _SOURCE_REMOVED,
@@ -145,6 +147,16 @@ RULES = (
     SELECT 'citations', rowid FROM citations
     WHERE (owner_kind = 'answer' AND owner_id IN (SELECT run_id FROM turns WHERE rowid IN {_doomed('turns')}))
     OR (owner_kind = 'artifact' AND owner_id IN (SELECT id FROM artifacts WHERE rowid IN {_doomed('artifacts')}))""",
+    # S1-19b: a request body that holds a deleted paper's passages, in every run that sent it, and that
+    # body's links to its other papers; and a body's links once no run is left to name it.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'run_bodies', rowid FROM run_bodies
+    WHERE sha256 IN (SELECT sha256 FROM run_body_materials WHERE rowid IN {_doomed('run_body_materials')})""",
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'run_body_materials', b.rowid FROM run_body_materials b
+    WHERE b.sha256 IN (SELECT sha256 FROM run_body_materials WHERE rowid IN {_doomed('run_body_materials')})
+    OR (b.sha256 IN (SELECT sha256 FROM run_bodies WHERE rowid IN {_doomed('run_bodies')})
+        AND NOT EXISTS (SELECT 1 FROM run_bodies r WHERE r.sha256 = b.sha256 AND r.rowid NOT IN {_doomed('run_bodies')}))""",
     # A project's own memory.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', rowid FROM memory_records

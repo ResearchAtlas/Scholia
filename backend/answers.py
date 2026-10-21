@@ -5,7 +5,9 @@ bodies it sent; and an answer's citations, resolved again or checked again.
   step_started, model_attempt, step_finished, citation_checks, run_finished, ...), a page at a time.
   A deleted run's trace is gone with it.
 - `GET /api/runs/{id}/trace/bodies/{sha256}`: the exact text one of the run's calls sent, from the
-  content store (owner-only files); only a body one of the run's own events names.
+  content store (owner-only files); only a body the run keeps (run_bodies). A body removed because a
+  paper whose passages it held was deleted answers 410 `body_removed`, and the trace marks its attempt
+  (`body_removed`), never its text.
 - `POST /api/citations/resolve`: each citation's existence now (a batch existence check): its passage
   still read by its paper, or its quote held by a current reading of the paper (status.md, decided
   2026-10-17 (8)), else `source_removed`. Nothing is written.
@@ -49,20 +51,34 @@ async def trace(run_id: str, request: Request, after: int = -1, limit: int = PAG
     def read(conn):
         if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is None:
             raise AdmissionError(404, "not_found", "No such run")
-        return conn.execute("SELECT seq, at, type, data, body_ref FROM run_events WHERE run_id = ? AND seq > ?"
+        rows = conn.execute("SELECT seq, at, type, data FROM run_events WHERE run_id = ? AND seq > ?"
                             " ORDER BY seq LIMIT ?", (run_id, after, limit + 1)).fetchall()
-    rows = await asyncio.to_thread(_state(request)["db"].read, read)
-    events = [{"seq": seq, "at": at, "type": kind, "data": json.loads(data), "body_ref": ref}
-              for seq, at, kind, data, ref in rows[:limit]]
+        kept = {sha for (sha,) in conn.execute("SELECT sha256 FROM run_bodies WHERE run_id = ?", (run_id,))}
+        return rows, kept
+    rows, kept = await asyncio.to_thread(_state(request)["db"].read, read)
+    events = []
+    for seq, at, kind, data, in rows[:limit]:
+        data = json.loads(data)
+        sent = data.get("body") if kind == "model_attempt" else None
+        events.append({"seq": seq, "at": at, "type": kind, "data": data,
+                       "body_ref": sent if sent in kept else None, **({"body_removed": True} if sent and sent not in kept
+                                                                     else {})})
     return {"events": events, "next": events[-1]["seq"] if len(rows) > limit else None}
 
 
 @router.get("/api/runs/{run_id}/trace/bodies/{sha256}")
 async def body(run_id: str, sha256: str, request: Request):
     state = _state(request)
-    named = await asyncio.to_thread(state["db"].read, lambda conn: conn.execute(
-        "SELECT 1 FROM run_events WHERE run_id = ? AND body_ref = ?", (run_id, sha256)).fetchone())
-    if named is None:
+    def find(conn):
+        if conn.execute("SELECT 1 FROM run_bodies WHERE run_id = ? AND sha256 = ?", (run_id, sha256)).fetchone():
+            return "kept"
+        named = conn.execute("SELECT 1 FROM run_events WHERE run_id = ? AND type = 'model_attempt'"
+                             " AND json_extract(data, '$.body') = ?", (run_id, sha256)).fetchone()
+        return "removed" if named else None
+    found = await asyncio.to_thread(state["db"].read, find)
+    if found == "removed":
+        raise AdmissionError(410, "body_removed", "This text was removed with a deleted paper")
+    if found is None:
         raise AdmissionError(404, "not_found", "No such request body")
     data = await asyncio.to_thread(state["content"].read, sha256)
     return Response(data, media_type="application/json")

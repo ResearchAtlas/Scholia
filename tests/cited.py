@@ -91,7 +91,8 @@ async def conversation_in(client, project):
 
 async def events_of(client, run_id):
     rows = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
-        "SELECT type, data, body_ref FROM run_events WHERE run_id = ? ORDER BY seq", (run_id,)).fetchall())
+        "SELECT type, data, json_extract(data, '$.body') FROM run_events WHERE run_id = ? ORDER BY seq",
+        (run_id,)).fetchall())
     return [(kind, json.loads(data), ref) for kind, data, ref in rows]
 
 

@@ -109,6 +109,7 @@ test('Details sums up the trace from its events, read a page at a time', async (
       { seq: 3.5, type: 'step_finished', data: { step: 0, cut: 'output_limit' }, body_ref: null }, // saved, cut
       { seq: 4, type: 'step_started', data: { step: 1, phase: 'judge', estimate_usd: 0.01 }, body_ref: null },
       { seq: 5, type: 'model_attempt', data: { step: 1, outcome: 'timeout' }, body_ref: 'bb' },
+      { seq: 5.5, type: 'model_attempt', data: { step: 1, outcome: 'ok', body: 'cc' }, body_ref: null, body_removed: true },
       { seq: 6, type: 'citation_checks', data: { citations: [{ marker: '[S1.1]', existence: 'ok', support: 'unchecked' }] }, body_ref: null },
       { seq: 7, type: 'run_finished', data: { status: 'succeeded' }, body_ref: null },
     ], next: null },
@@ -121,7 +122,8 @@ test('Details sums up the trace from its events, read a page at a time', async (
   assert.deepEqual(found.retrieval, { route: 'literature', decided_by: 'fallback' });
   assert.deepEqual(found.search, { mode: 'hybrid', reason: null, passages: 2, rerank: 'fallback' });
   assert.deepEqual(found.steps.map((s) => [s.phase, s.estimate, s.cut, s.attempts.map((a) => [a.outcome, a.body])]),
-    [['answer', 0.05, true, [['ok', 'aa']]], ['judge', 0.01, false, [['timeout', 'bb']]]]);
+    [['answer', 0.05, true, [['ok', 'aa']]], ['judge', 0.01, false, [['timeout', 'bb'], ['ok', null]]]]);
+  assert.deepEqual(found.steps[1].attempts.map((a) => a.removed), [false, true]); // its text went with a deleted paper
   assert.equal(found.checks.length, 1);
   assert.equal(found.finished, 'succeeded');
 });
