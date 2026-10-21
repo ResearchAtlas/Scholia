@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title data-i18n="page.title"></title>
+<link rel="stylesheet" href="page.css">
+<script src="page.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <h1 id="title"></h1>
+  <p id="progress" aria-live="polite"></p>
+  <p id="keys" class="hint"></p>
+</header>
+<p id="notice" class="notice" role="note" hidden></p>
+<div class="layout">
+  <nav id="nav" data-i18n-aria="nav.label"><ol id="list"></ol></nav>
+  <main id="main">
+    <div class="moves">
+      <button type="button" id="prev" data-i18n="nav.previous"></button>
+      <button type="button" id="next" data-i18n="nav.next"></button>
+      <button type="button" id="nextOpen" data-i18n="nav.nextOpen"></button>
+    </div>
+    <section id="card" aria-labelledby="itemHeading">
+      <h2 id="itemHeading" tabindex="-1"></h2>
+      <p id="itemState" class="state"></p>
+      <div id="body"></div>
+      <div id="statusLine" class="status-line"><p id="status" role="status" aria-live="polite"></p></div>
+    </section>
+  </main>
+</div>
+</body>
+</html>
