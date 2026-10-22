@@ -43,6 +43,10 @@ CANDIDATE_CHARS = 1000  # of an earlier answer offered by a bare "save this"
 MAX_CANDIDATES = 10  # records one extraction may write
 RELATED = 20  # records an extraction is shown to deduplicate against
 STATE_NOTES = 5  # progress records and agent notes each in PROJECT STATE
+# The missing-information section's line when a turn asks about an earlier decision and memory holds none (ticket 31:
+# missing memory is said, never invented)
+MISSING = ("No memory record holds an earlier decision or conversation for this: say that it cannot be found in memory, "
+           "and never invent one.")
 
 EXTRACT_RULES = (
     "You extract memory records from one turn of a research conversation: the researcher's message, and the "

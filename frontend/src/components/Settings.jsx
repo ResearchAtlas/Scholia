@@ -21,6 +21,7 @@ import { libraryChanged } from '../library.js';
 import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { IndexSection } from './SearchIndex.jsx'; // S1-17
 import { offerOutcome, runCounts, runReason } from '../search.js'; // S1-17
+import { MemorySection } from './Memory.jsx'; // S1-21a: the memory views
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
@@ -35,6 +36,7 @@ const EFFORT_SUGGESTIONS = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const LIMITS = ['agent_steps', 'tool_calls', 'turn_minutes'];
 WORKFLOWS.merge = 'settings.workflowMerge'; // S1-14: a reference file's record merged into a paper
 WORKFLOWS.zotero_import = 'settings.workflowZotero'; // S1-15: importing from Zotero
+WORKFLOWS.memory = 'settings.workflowMemory'; // S1-21a: a memory extraction after an answer
 const ROLES = ['council', 'chairman', 'router', 'judge', 'extractor'];
 const MAX_SUBAGENT_MODELS = 5;
 
@@ -337,6 +339,13 @@ function ThisProject({ project, onProjectChanged, onOpenAdvanced }) {
             placeholder={t('project.citationStyleAuto')} onCommit={(value) => own.save({ 'project.citation_style': value })} />
         </Field>
       </div>
+      <Field label={t('memory.enabled')} hint={t('memory.enabledHint')}>
+        <div>
+          <Segmented label={t('memory.enabled')} value={values.memory?.enabled === false ? 'off' : 'on'}
+            options={[{ value: 'on', label: t('memory.on') }, { value: 'off', label: t('memory.off') }]}
+            onChange={(value) => own.save({ 'memory.enabled': value === 'on' })} />
+        </div>
+      </Field>
       <Field label={t('project.budget')} htmlFor="project-budget" hint={t('project.budgetHint')}>
         <div className="max-w-40">
           <CommitField id="project-budget" type="number" above={0} value={values.project.budget_usd}
@@ -418,6 +427,7 @@ function Advanced({ health, project }) {
       <Section title={t('settings.limits')} hint={t('settings.limitsHint')}>
         <LimitFields file={personal} onProblem={setProblem} prefix="limit" />
       </Section>
+      <MemorySection project={project} />
       <Section title={t('settings.localServers')} hint={t('settings.localServersHint')} />
       <LocalHelperSection project={project} />
       <PrivateAllowlist />

@@ -164,3 +164,16 @@ async def test_recall_ranks_by_meaning_when_the_search_model_answers_and_a_forgo
         assert trace["mode"] == "similarity" and trace["records"][0] == wages["id"]
         assert (await client.delete(f"/api/memory/{wages['id']}")).json() == {"ok": True}
         assert await asyncio.to_thread(index.memory_embedded, [wages["id"]]) == set()  # removed, checked gone
+
+
+async def test_an_earlier_decision_memory_lacks_is_said_missing_never_invented(tmp_path):
+    # R3: the missing-information section says so; that the answer never invents one is [PAID]
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Why did I drop the pilot? We decided last time.")
+        assert memory.MISSING in section(provider.answers[-1], "CONFLICTS AND MISSING INFORMATION")
+        await entered(client, project, "We dropped the pilot because of cost.")
+        await send(client, conversation, "Why did I drop the pilot? We decided last time.")
+        assert memory.MISSING not in system(provider.answers[-1])

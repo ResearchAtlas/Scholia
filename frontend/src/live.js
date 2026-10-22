@@ -32,6 +32,7 @@ export function apply(turn, event) {
     case 'limit_reached': return { ...turn, limit: event.limit ?? 'budget' }; // S1-19c: a turn limit, or the budget
     case 'tool_call': return { ...turn, tool: event.name }; // S1-19c: the tool the agent is using now
     case 'skill': return { ...turn, skills: [...(turn.skills ?? []), event.name] };
+    case 'memory': return { ...turn, memory: [...(turn.memory ?? []), { action: event.action, count: event.count }] }; // S1-21a
     case 'run_finished': return { ...turn, done: true };
     default: return turn;
   }

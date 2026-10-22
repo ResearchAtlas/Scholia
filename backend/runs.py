@@ -1297,8 +1297,9 @@ class Harness:
                 "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
                 margin_percent=budgets["margin_percent"], system_rules=_rules(ctx["tools"]), request=ctx["message"],
                 sections={"agents_md": [ctx["instructions"]] if ctx["instructions"] else [], "research_evidence": evidence,
-                          "conflicts": citations.missing(read or held, mode=found["mode"], route=decision["route"],
-                                                         **({} if beyond else {"index": index, "cut": cut})),
+                          "conflicts": [*citations.missing(read or held, mode=found["mode"], route=decision["route"],
+                                                           **({} if beyond else {"index": index, "cut": cut})),
+                                        *ctx.get("memory_missing", ())],  # S1-21a: an earlier decision memory lacks
                           **ctx["skill_sections"], **ctx.get("memory_sections", {})},
                 history=ctx["history"], tools=ctx["tools"], chain=chain)
         request = assemble(lines, numbered)
@@ -1461,6 +1462,8 @@ class Harness:
                         reason = "unavailable"
                 chosen = memory.ranked(candidates, nearest)
                 sections["user_memory"] += [memory.memory_line(r) for r in chosen]
+                if not chosen and decision.get("rule") == "earlier_decision":  # said, never invented (ticket 31)
+                    ctx["memory_missing"] = [memory.MISSING]
                 ids += [r["id"] for r in chosen]
                 traced.update(records=[r["id"] for r in chosen], mode=mode, **({"reason": reason} if reason else {}))
         ctx["memory_sections"] = sections

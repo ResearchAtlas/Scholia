@@ -51,6 +51,7 @@ async def test_every_governance_change_is_audited_without_content(tmp_path):
         other = (await client.post("/api/projects", json={"name": SECRET, "sensitivity": "private"})).json()["id"]
         conversation = (await client.post("/api/conversations", json={"project_id": project, "title": SECRET})).json()["id"]
         await send(client, conversation, content=SECRET)
+        await background_idle(client)  # S1-21a: its memory extraction, which a move waits for
         await client.post(f"/api/conversations/{conversation}/move", json={"project_id": other})
         await client.post(f"/api/projects/{project}/sensitivity", json={"level": "private"})
         await confirm_change(client, "POST", f"/api/projects/{project}/sensitivity", {"level": "normal"})
@@ -93,7 +94,7 @@ async def test_the_view_pages_the_log_by_project_and_counts_what_left_this_mac(t
         everything = first["entries"] + rest["entries"]
         assert {e["project_id"] for e in everything} == {project}
         assert [e["event"] for e in everything][-1] == "project_created"
-        assert first["allowed_off_this_mac"] == 2  # the answer and the title, to OpenRouter
+        assert first["allowed_off_this_mac"] == 3  # the answer, the title and the memory extraction, to OpenRouter
         whole = (await client.get("/api/audit")).json()
         assert whole["allowed_off_this_mac"] is None and len(whole["entries"]) > len(everything)
 

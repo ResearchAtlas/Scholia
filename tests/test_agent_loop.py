@@ -34,7 +34,7 @@ async def test_a_turn_runs_tool_calls_until_the_model_answers_and_records_each_c
         first, second = provider.agent_steps
         assert {t["function"]["name"] for t in first["tools"]} == {
             "list_materials", "search_passages", "read_passage", "answer_from_library", "use_skill", "read_skill_file",
-            "ask", "open_place"}
+            "ask", "open_place", "read_project_state", "read_memory", "update_progress"}  # S1-21a's three
         assert "tool_choice" not in first  # never forced (model-route rule 4)
         [result] = tool_messages(second)
         assert result["tool_call_id"] == "call_search_passages" and "[S1.1] Wage Floors" in result["content"]
@@ -242,7 +242,8 @@ def test_every_tool_declares_section_six_three_s_facts_and_a_closed_argument_sch
     assert declared <= set(ToolDefinition.model_fields)
     tools = agent.REGISTRY.list_tools()
     assert {t.name for t in tools} == {"list_materials", "search_passages", "read_passage", "answer_from_library",
-                                       "use_skill", "read_skill_file", "ask", "open_place"}  # section 6.3, S1-19's
+                                       "use_skill", "read_skill_file", "ask", "open_place",  # section 6.3, S1-19's
+                                       "read_project_state", "read_memory", "update_progress"}  # and S1-21a's
     for tool in tools:
         assert all(getattr(tool, name) is not None for name in declared), tool.name
         assert tool.args_schema["type"] == "object" and tool.args_schema["additionalProperties"] is False

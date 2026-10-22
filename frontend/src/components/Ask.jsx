@@ -78,6 +78,14 @@ export function Ask({ ask, onAnswered }) {
         </form>
       )}
       {ask.kind === 'merge' && <MergeComparison ask={ask} />}
+      {ask.params?.candidate && ( // S1-21a: what a bare "save this" would save, read when the question is listed
+        <blockquote className="whitespace-pre-wrap break-words rounded-lg border bg-background/70 px-3 py-2">{ask.params.candidate}</blockquote>
+      )}
+      {ask.params?.records?.length > 0 && ( // S1-21a: the records an update or a forget means, as they are now
+        <ul className="grid gap-1 rounded-lg border bg-background/70 px-3 py-2">
+          {ask.params.records.map((record) => <li key={record.id} className="break-words">{record.content}</li>)}
+        </ul>
+      )}
       {problem && <p role="alert" className="text-destructive">{problem}</p>}
       <div className="flex flex-wrap gap-2">
         {ask.options.map((option, i) => (

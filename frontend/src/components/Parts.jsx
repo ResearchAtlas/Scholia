@@ -110,6 +110,12 @@ export function Markdown(props) {
 
 // S1-19b: an answer's Details (its trace), loaded when first opened.
 const LazyTrace = part(() => import('./Trace.jsx'), 'Trace');
+const LazyLeftOff = part(() => import('./LeftOff.jsx'), 'LeftOff'); // S1-21a: Where we left off
+
+// Shown only when there is something to show: nothing while it loads, or if it cannot load.
+export function LeftOff(props) {
+  return <Boundary fallback={null} failed={null}><LazyLeftOff {...props} /></Boundary>;
+}
 
 export function Trace(props) {
   return <Boundary fallback={<Pending />} failed={<Unavailable />}><LazyTrace {...props} /></Boundary>;
