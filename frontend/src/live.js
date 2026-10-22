@@ -31,6 +31,7 @@ export function apply(turn, event) {
     case 'error': return { ...turn, error: event.code };
     case 'limit_reached': return { ...turn, limit: event.limit ?? 'budget' }; // S1-19c: a turn limit, or the budget
     case 'tool_call': return { ...turn, tool: event.name }; // S1-19c: the tool the agent is using now
+    case 'step': { const { tool, ...rest } = turn; return rest; } // the next model call: no tool is in use (CT3)
     case 'skill': return { ...turn, skills: [...(turn.skills ?? []), event.name] };
     case 'run_finished': return { ...turn, done: true };
     default: return turn;
@@ -49,7 +50,10 @@ export function send(conversationId, path, body, text) {
     stream(path, body, (event) => {
       turn = apply(turn, event);
       if (event.type === 'ask') asksChanged(conversationId); // S1-19c: the agent asks; the conversation shows it
-      if (event.type === 'open_place') openPlace(event.place); // S1-19c: the help skill opens a place
+      // S1-19c: the help skill opens a place, only while its turn's conversation and project are shown (CT4)
+      if (event.type === 'open_place' && shown?.conversationId === conversationId && shown.projectId === event.project_id) {
+        openPlace(event.place);
+      }
       if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
         unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
       }
@@ -79,6 +83,13 @@ export async function stop(conversationId, runId) {
 export const PLACES = ['library', 'settings.general', 'settings.providers', 'settings.subagents', 'settings.project',
   'settings.advanced'];
 export const places = new EventTarget();
+let shown = null; // the conversation the window shows now and its project (ConversationView), or null
+// Says which conversation the window shows; returns what says it is no longer shown.
+export function showing(projectId, conversationId) {
+  const now = conversationId ? { projectId, conversationId } : null;
+  shown = now;
+  return () => { if (shown === now) shown = null; };
+}
 export function openPlace(place) {
   if (PLACES.includes(place)) places.dispatchEvent(new CustomEvent('open', { detail: place }));
 }

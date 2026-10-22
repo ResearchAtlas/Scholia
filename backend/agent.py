@@ -147,18 +147,19 @@ def _shown(turn, call_id, keys, meta=None):
 async def list_materials(call, turn):
     rows = await turn.read(lambda conn: conn.execute(
         "SELECT m.id, m.title, json_extract(m.csl, '$.issued.\"date-parts\"[0][0]'), coalesce(m.evidence_type, 'full_text'),"
-        " m.retraction FROM materials m WHERE m.project_id = ? ORDER BY m.created_at, m.id LIMIT ?",
-        (turn.ctx["project_id"], LIST_LIMIT)).fetchall())
+        " m.retraction, count(*) OVER () FROM materials m WHERE m.project_id = ? ORDER BY m.created_at, m.id LIMIT ?",
+        (turn.ctx["project_id"], LIST_LIMIT)).fetchall())  # each row also counts every paper, past the limit too
     lines, used, shown = [], 0, []
-    for material, title, year, kind, retraction in rows:
+    for material, title, year, kind, retraction, _ in rows:
         line = " | ".join(str(x) for x in (material, title or "(untitled)", year or "n.d.", kind.replace("_", " "),
                                             "RETRACTED" if retraction == "retracted" else None) if x)
         if used + len(line) + 1 > 7000:
-            lines.append(f"({len(rows) - len(shown)} more papers not shown.)")
             break
         lines.append(line)
         shown.append(material)
         used += len(line) + 1
+    if rows and rows[0][5] > len(shown):
+        lines.append(f"({rows[0][5] - len(shown)} more papers not shown.)")
     turn.listed.update(shown)
     return ToolResult(id=call.id, ok=True, text="\n".join(lines) if lines else "The library has no papers yet.",
                       meta={"materials": shown})
@@ -308,13 +309,13 @@ async def use_skill(call, turn):
     # (one cut for capacity is activated again, section 8)
     files = "\n".join(f"- {file_id}: {path}" for file_id, path, _ in skill.files)
     listed = f"\n\nFiles (read with read_skill_file):\n{files}" if files else ""
-    if skill.name in turn.activated or skill.name in turn.ctx.get("active_kept", ()):
+    if _active(turn, skill.name):
         # its body is already in the request; its files' ids are given again, since ACTIVE SKILLS holds the body only
         return ToolResult(id=call.id, ok=True, text=f"The {skill.name} skill is already active; its instructions are "
                                                     f"above.{listed}", meta={"skill": skill.name, "already_active": True,
                                                                              "files": [f[0] for f in skill.files]})
-    turn.activated.add(skill.name)
     await turn.harness._skill_activated(turn.claim, skill, turn.step)
+    turn.activated.add(skill.name)  # active once its activation is recorded, never before (a failed write leaves it not)
     turn.emit({"type": "skill", "name": skill.name})
     return ToolResult(id=call.id, ok=True, text=_wrapped(skill) + listed,
                       meta={"skill": skill.name, "files": [f[0] for f in skill.files]})
@@ -327,6 +328,10 @@ async def use_skill(call, turn):
      "additionalProperties": False},
     read_only=True, repeat_safe=True, network=False, output_chars=8000, tool_class="agent_control", spends=False)
 async def read_skill_file(call, turn):
+    # only a skill active in the conversation (enabled, and use_skill recorded its activation): spec section 7.2
+    if not _active(turn, str(call.arguments["file_id"]).partition("#")[0]):
+        return failed(call.id, "validation_error", "Not a file of an active skill: activate the skill with use_skill, "
+                                                   "then give a file id it listed.")
     try:
         text, sha = await asyncio.to_thread(skills.read_file, call.arguments["file_id"])
     except ValueError as error:
@@ -334,6 +339,12 @@ async def read_skill_file(call, turn):
             "Not a file id use_skill listed; give the id, not a path."
         return failed(call.id, "validation_error" if str(error) != "changed" else "tool_error", message)
     return ToolResult(id=call.id, ok=True, text=text, meta={"file_id": call.arguments["file_id"], "sha256": sha})
+
+
+def _active(turn, name):
+    """Whether a skill is active in the conversation: activated in this turn, or carried in ACTIVE SKILLS (which holds
+    only enabled skills; one cut for capacity is not)."""
+    return name in turn.activated or name in turn.ctx.get("active_kept", ())
 
 
 @REGISTRY.register(
@@ -366,7 +377,8 @@ async def ask(call, turn):
      "additionalProperties": False},
     read_only=True, repeat_safe=True, network=False, output_chars=200, tool_class="agent_control", spends=False)
 async def open_place(call, turn):
-    turn.emit({"type": "open_place", "place": call.arguments["place"]})
+    # its project: the window opens it only while this conversation and project are shown (frontend/src/live.js)
+    turn.emit({"type": "open_place", "place": call.arguments["place"], "project_id": turn.ctx["project_id"]})
     return ToolResult(id=call.id, ok=True, text=f"Opened {call.arguments['place']} for the researcher.",
                       meta={"place": call.arguments["place"]})
 
