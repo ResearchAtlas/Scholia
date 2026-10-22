@@ -685,4 +685,6 @@ async def test_an_extraction_restating_a_tightened_projects_personal_proposal_st
         written = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
             {"type": "preference", "content": "I prefer short answers", "status": "confirmed",
              "span": "i prefer short answers", "replaces": ""}]))
-        assert written is not None
+        assert written["counts"]["confirmed"] == 1  # the researcher's words, saved here as with a command
+        assert await rows(client, "SELECT project_id, status FROM memory_records WHERE project_id = ?", b) == [
+            (b, "confirmed")]

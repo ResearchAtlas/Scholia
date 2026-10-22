@@ -586,12 +586,14 @@ def apply_extraction(conn, run_id, candidates):
             status = "proposed"
         late = late_anywhere if scope == "personal" else late_project
         pending = in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
-        same = next((r for r in pending if normalized(r["content"]) == normalized(candidate["content"])), None)
+        same = next((r for r in pending if normalized(r["content"]) == normalized(candidate["content"]) and not (
+            r["scope"] == "personal" and r["status"] == "proposed" and not _normal(conn, r["project_id"]))), None)
+        # (a personal proposal whose own project is stricter now can be kept from nowhere: as with a command, the
+        # researcher's words are written here as their own record)
         if same is not None:
             counts["duplicates"] += 1
             if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"] \
-                    and (same["scope"] == "project" or (personal and _normal(conn, same["project_id"]))):
-                # never a personal one from a stricter project, nor one whose own project is stricter now
+                    and (same["scope"] == "project" or personal):  # never a personal one from a stricter project
                 keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
             continue
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
