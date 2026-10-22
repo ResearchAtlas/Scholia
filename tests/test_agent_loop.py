@@ -688,3 +688,55 @@ async def test_c2_4_an_active_skills_file_ids_are_given_whenever_it_is_active(tm
         assert again.startswith("The literature-review skill is already active")
         assert "literature-review#1: references/screening.md" in again and "literature-review#2" in again
 
+
+# Recheck c3 (gpt-6-astra, S1-19c)
+
+
+@pytest.mark.asyncio
+async def test_c3_a_stop_after_a_tools_result_is_stored_never_discards_it(tmp_path, monkeypatch):
+    import time
+    from backend import runs
+    provider = Scripted([call("list_materials")], "Never.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        harness, loop, real = client.state["harness"], asyncio.get_running_loop(), runs._stored
+
+        def stopping(content, body, hold=None):  # the Stop lands once the result's bytes are stored, before their link
+            ref = real(content, body, hold)
+            if body and b'"role":"tool"' in body:
+                active = next(a for a in list(harness.registry.runs.values()) if a.kind == "turn")
+                loop.call_soon_threadsafe(harness._request_cancel, active, "researcher")
+                time.sleep(0.2)
+            return ref
+        monkeypatch.setattr(runs, "_stored", stopping)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert stream[-1]["status"] == "cancelled" and len(provider.agent_steps) == 1
+        run_id = stream[0]["run_id"]
+        [done] = [d for k, d, _ in await events_of(client, run_id) if k == "tool_result"]
+        kept = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= 2000", run_id)
+        assert kept == [(done["result"],)]  # recorded and linked, whole
+
+
+@pytest.mark.asyncio
+async def test_c3_a_nested_calls_settlement_failure_reaches_the_turns_cleanup_not_the_model(tmp_path, monkeypatch):
+    from backend import runs
+    real, settled = runs._settle_attempts, []
+
+    def failing(conn, reservation_id, rates, attempts):  # the tool's own answer step's settlement write fails
+        settled.append(reservation_id)
+        if len(settled) == 2:
+            raise RuntimeError("the settlement write failed")
+        return real(conn, reservation_id, rates, attempts)
+    monkeypatch.setattr(runs, "_settle_attempts", failing)
+    provider = Scripted([call("answer_from_library", question=QUESTION)], "Done.", inner=["Wages rose [S1.1]."])
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert (stream[-1]["status"], len(provider.agent_steps)) == ("failed", 1)  # no other call replaced it
+        run_id = stream[0]["run_id"]
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status = 'open'",
+                          run_id) == [(0,)]
+        turn = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1]
+        assert turn["accounting"]["unknown_attempts"] == 1  # the sent call's charge is unknown, not lost

@@ -1401,24 +1401,32 @@ class Harness:
                 result = await tool_router.execute(call, turn)
             except (asyncio.CancelledError, spending.BudgetExceeded, _LimitReached):
                 raise
-            except Exception as error:  # a defect in the tool: a short error for the model, the turn goes on
+            except Exception as error:
+                if claim.call is not None:  # a model call the tool made is still unrecorded or unsettled: never a tool
+                    raise  # error; the turn's cleanup settles it (or marks its attempt unknown) before any other call
                 log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
-                result = failed(call_id, "tool_error", "The tool failed.")
-        if turn.listed or result.meta.get("passages"):  # what it gave the model is covered before the next dispatch
-            await self._register_context(claim, turn.evidence.numbered, turn.listed)
+                result = failed(call_id, "tool_error", "The tool failed.")  # a defect in the tool; the turn goes on
         raw_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else ""
         message = {"role": "tool", "tool_call_id": raw_id,  # the provider's own id, in the chain (and its stored copy) only
                    "content": result.text if result.ok else json.dumps({"error": result.error.type,
                                                                         "message": result.error.message})}
-        materials = tuple(sorted(turn.ctx.get("context_materials") or ()))
-        with self.content.hold() if self.content is not None else nullcontext([]) as held:
-            ref = await asyncio.to_thread(_stored, self.content, json.dumps(
-                message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), held)
-            await self._record(claim, "tool_result", {
-                "step": step, "call_id": call_id, "name": name, "ok": result.ok,
-                **({"error": result.error.type} if result.error else {}), **({"meta": result.meta} if result.meta else {}),
-                **({"result": ref} if ref else {"result_unavailable": True})},
-                also=lambda conn: _keep_result(conn, claim.run_id, step, number, ref, materials))
+
+        async def keeping():  # registered, stored, linked and recorded to its end, whatever cancellation comes meanwhile
+            if turn.listed or result.meta.get("passages"):  # what it gave the model is covered before the next dispatch
+                await self._register_context(claim, turn.evidence.numbered, turn.listed)
+            materials = tuple(sorted(turn.ctx.get("context_materials") or ()))
+            with self.content.hold() if self.content is not None else nullcontext([]) as held:
+                ref = await asyncio.to_thread(_stored, self.content, json.dumps(
+                    message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), held)
+                await self._record(claim, "tool_result", {
+                    "step": step, "call_id": call_id, "name": name, "ok": result.ok,
+                    **({"error": result.error.type} if result.error else {}),
+                    **({"meta": result.meta} if result.meta else {}),
+                    **({"result": ref} if ref else {"result_unavailable": True})},
+                    also=lambda conn: _keep_result(conn, claim.run_id, step, number, ref, materials))
+        _, cancelled = await _through(keeping())  # a Stop never discards a completed result (model-route rule 5)
+        if cancelled:
+            raise asyncio.CancelledError()
         return result, message
 
     async def _approved(self, turn, call):
