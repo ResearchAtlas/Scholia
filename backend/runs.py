@@ -1374,13 +1374,13 @@ class Harness:
             turn.step = call.step
             if not result.ok or not tools or not result.tool_calls:
                 return result
-            if number + 1 >= limits["agent_steps"]:  # no step is left to read their results: they are not run
-                return "agent_steps"
             # a call with no id, or one another call has, its result could answer: no continuation an endpoint would
-            # take can carry it (CT5)
+            # take can carry it (CT5); checked before the step limit, so the last step's reply is classed too
             ids = [raw.get("id") if isinstance(raw, dict) else None for raw in result.tool_calls]
             if not all(isinstance(i, str) and i for i in ids) or len(set(ids)) != len(ids):
                 return "malformed"
+            if number + 1 >= limits["agent_steps"]:  # no step is left to read their results: they are not run
+                return "agent_steps"
             await self._release_held(claim)  # this step called tools: its judge share and unspent go back
             chain.append({"role": "assistant", **result.message} if "role" not in result.message else result.message)
             said = []  # the researcher's words given at a tool-errors ask, after the step's tool results

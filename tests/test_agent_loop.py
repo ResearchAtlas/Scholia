@@ -880,3 +880,21 @@ async def test_ct5_a_tool_call_with_no_usable_id_ends_the_turn_and_sends_no_cont
                           run_id) == [(1,)]
         [finished] = [d for k, d, _ in await events_of(client, run_id) if k == "run_finished"]
         assert finished == {"status": "failed", "reason": "malformed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", ["", "ok"])
+async def test_ct5_a_tool_call_with_no_usable_id_on_the_last_allowed_step_ends_the_turn_malformed(tmp_path, bad_id):
+    provider = Scripted([call("list_materials", call_id="first")],
+                        [call("list_materials", call_id="ok"), {**call("list_materials", call_id="x"), "id": bad_id}])
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"limits.agent_steps": 2}})
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("failed", None)  # not a limit: no Continue
+        assert {"type": "error", "code": "malformed"} in stream and not [e for e in stream if e["type"] == "limit_reached"]
+        [finished] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "run_finished"]
+        assert finished == {"status": "failed", "reason": "malformed"}
