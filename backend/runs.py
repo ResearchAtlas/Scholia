@@ -1612,11 +1612,11 @@ class Harness:
             return failed(call_id, "over_window", "The evidence this needs does not fit this model's window.")
         held = dict(list(held.items())[:len(lines) - request.cuts.get("research_evidence", 0)])
         turn.evidence.keep(keys, held, before)  # what its answer step was not given is not read in the run
-        registered = ctx.get("context_materials", [])
+        registered, committed = ctx.get("context_materials", []), False
 
         async def undo():  # its answer step's request reached no model: none of its passages is read in the run, and
             turn.evidence.keep(keys, (), before)  # no answer depends on their papers (its registration taken back)
-            if ctx.get("context_materials", []) != registered:
+            if committed:  # its papers and its [passage, paper] pairs, a paper earlier reads registered too
                 ctx["context_materials"] = registered
                 try:
                     await self._register_context(claim, turn.evidence.numbered, turn.listed, taken_back=True)
@@ -1624,6 +1624,7 @@ class Harness:
                     log.error("a registration could not be taken back (%s at %s)", type(error).__name__, _where(error))
         try:
             await self._register_context(claim, turn.evidence.numbered, turn.listed)
+            committed = True
             judge_estimate = self._judge_estimate(ctx, held)
             estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
             call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate,

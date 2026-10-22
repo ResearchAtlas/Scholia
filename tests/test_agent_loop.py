@@ -1001,3 +1001,33 @@ async def test_ct5_a_malformed_tool_calls_list_ends_the_turn_malformed_not_as_an
         assert (stream[-1]["status"], len(provider.agent_steps)) == ("failed", 1)
         assert {"type": "error", "code": "malformed"} in stream
         assert not [e for e in stream if e["type"] == "chat_response"]  # the preamble is never saved as the answer
+
+
+@pytest.mark.asyncio
+async def test_ct1_sweep_a_registration_taken_back_keeps_only_what_earlier_reads_registered(tmp_path, monkeypatch):
+    from backend import runs
+    _no_preload(monkeypatch)
+    real = runs.Harness._reserve
+
+    async def failing(self, claim, *args, phase=None, **options):
+        if phase == "answer_from_library":
+            raise RuntimeError("the reservation's transaction failed")
+        return await real(self, claim, *args, phase=phase, **options)
+    monkeypatch.setattr(runs.Harness, "_reserve", failing)
+    async with cited(tmp_path, Scripted(after="Never.")) as client:
+        project, [material] = await with_papers(client, WAGES)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"limits.tool_calls": 2}})
+        [(first,)] = await rows(client, "SELECT min(ordinal) FROM passages")
+        [(passage,)] = await rows(client, "SELECT id FROM passages WHERE ordinal = ?", first)
+        client.provider.script += [[call("read_passage", material_id=material, ordinal=first),
+                                    call("answer_from_library", call_id="c2", question=QUESTION),
+                                    call("list_materials", call_id="c3")]]  # the third: the turn ends at its limit
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert {"type": "limit_reached", "limit": "tool_calls"} in stream  # no later registration rewrote the record
+        (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
+        inputs = json.loads(inputs)
+        assert inputs["evidence"] == [[passage, material]]  # the read passage's pair only: the tool's taken back
+        assert inputs["context_materials"] == [material]  # what the earlier read registered stays
