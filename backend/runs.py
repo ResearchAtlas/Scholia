@@ -1346,7 +1346,8 @@ class Harness:
         unmodified, its reasoning blocks included (model-route rule 5), until an answer. Returns the answer step's
         result (a failure included), "stopped" when the researcher chose to stop after three failed tool calls in a
         row (section 6.6: the run stops and asks), "malformed" when a tool call has no usable id or shares one (none
-        is run), or the name of the limit that stopped the turn: agent_steps, tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
+        is run), or the name of the limit that stopped the turn: agent_steps,
+        tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
         time limit binds every model call in the dispatch check (may_dispatch). A route without tool calls offers none: its one
         step is its answer."""
         limits, tools = ctx["limits"], ctx["tools"]
