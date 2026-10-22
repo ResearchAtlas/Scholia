@@ -1068,3 +1068,30 @@ async def test_ct1_sweep_a_take_back_whose_write_failed_is_written_by_the_next_r
         inputs = json.loads(inputs)
         assert (inputs["context_materials"], inputs["evidence"]) == ([], [])  # repaired before the answer's dispatch
         assert material not in await _depends_on(client, stream[0]["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_ct6_a_taken_back_paper_leaves_the_turns_revocation_scope(tmp_path, monkeypatch):
+    from backend import runs
+    _no_preload(monkeypatch)
+    real = runs.Harness._reserve
+
+    async def failing(self, claim, *args, phase=None, **options):
+        if phase == "answer_from_library":
+            raise RuntimeError("the reservation's transaction failed")
+        return await real(self, claim, *args, phase=phase, **options)
+    monkeypatch.setattr(runs.Harness, "_reserve", failing)
+    holder = {}
+
+    async def deleting_meanwhile(body):  # the paper no request carried is deleted while the turn runs
+        assert (await holder["client"].delete(f"/api/materials/{holder['material']}")).status_code == 200
+        return holder["client"].provider.answer("Minimum wages raise earnings.")
+    provider = Scripted([call("answer_from_library", question=QUESTION)], deleting_meanwhile)
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        holder.update(client=client, material=material)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("succeeded", None)  # not revoked
+        (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
+        assert material not in (json.loads(inputs).get("material_ids") or [])  # its scope taken back with it

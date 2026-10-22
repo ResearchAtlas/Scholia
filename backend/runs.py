@@ -1319,7 +1319,8 @@ class Harness:
                 raise _Cancelled()
             (inputs,) = conn.execute("SELECT inputs FROM runs WHERE id = ?", (claim.run_id,)).fetchone()
             inputs = json.loads(inputs or "{}")
-            inputs["material_ids"] = sorted({*inputs.get("material_ids", []), *held})
+            # its scope: the message's selection and what is carried, so a registration taken back leaves it too (CT6)
+            inputs["material_ids"] = sorted({*(claim.context.get("selection") or ()), *held})
             inputs["evidence"] = [list(pair) for pair in pairs]
             inputs["context_materials"] = held
             conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(inputs), claim.run_id))
