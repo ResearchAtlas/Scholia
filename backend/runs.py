@@ -1296,19 +1296,20 @@ class Harness:
             ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)
         return dict(list(numbered.items())[:kept]), request
 
-    async def _register_context(self, claim, numbered, listed=()):
+    async def _register_context(self, claim, numbered, listed=(), taken_back=False):
         """Name every paper whose text the request carries on its run, before its dispatch (backend/provenance.py):
         its evidence's and its history's (inputs.context_materials, also its scope in inputs.material_ids, so
         deleting one revokes the run), and its evidence's [passage, paper] pairs (inputs.evidence); the dispatch
-        check refuses a run when one of those papers is gone or no longer reads the passage."""
+        check refuses a run when one of those papers is gone or no longer reads the passage. taken_back: written even
+        when it names none, since it replaces a registration whose request reached no model (_answer_from_library)."""
         papers = sorted({r["material_id"] for r in numbered.values()} | set(listed))  # listed: titles a tool gave
         pairs = sorted({(r["passage_id"], r["material_id"]) for r in numbered.values()})
         # every paper whose text the request carries: its evidence, and the earlier turns its history holds; in an
         # agent turn, what its earlier steps carried too (its chain is never cut)
         shown = claim.context["history_materials"][:claim.context.get("history_kept", 0)]
         held = sorted({*papers, *(m for turn in shown for m in turn), *claim.context.get("context_materials", ())})
-        claim.context["context_materials"] = held
-        if not held:
+        if not held and not taken_back:
+            claim.context["context_materials"] = held
             return
 
         def record(conn):
@@ -1324,6 +1325,7 @@ class Harness:
             await self._write(record)
         except _Cancelled:
             raise asyncio.CancelledError() from None
+        claim.context["context_materials"] = held  # once recorded: a failed write leaves the turn's set as it was
 
     # S1-19c: the agent loop
 
@@ -1610,6 +1612,16 @@ class Harness:
             return failed(call_id, "over_window", "The evidence this needs does not fit this model's window.")
         held = dict(list(held.items())[:len(lines) - request.cuts.get("research_evidence", 0)])
         turn.evidence.keep(keys, held, before)  # what its answer step was not given is not read in the run
+        registered = ctx.get("context_materials", [])
+
+        async def undo():  # its answer step's request reached no model: none of its passages is read in the run, and
+            turn.evidence.keep(keys, (), before)  # no answer depends on their papers (its registration taken back)
+            if ctx.get("context_materials", []) != registered:
+                ctx["context_materials"] = registered
+                try:
+                    await self._register_context(claim, turn.evidence.numbered, turn.listed, taken_back=True)
+                except Exception as error:  # the turn's own set is right again; a later registration rewrites the record
+                    log.error("a registration could not be taken back (%s at %s)", type(error).__name__, _where(error))
         try:
             await self._register_context(claim, turn.evidence.numbered, turn.listed)
             judge_estimate = self._judge_estimate(ctx, held)
@@ -1621,11 +1633,11 @@ class Harness:
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, facts,
                                       zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
                                       rehold=ctx if judge_estimate else None)
-        except Exception:  # its answer step's request reached no model: none of its passages is read in the run
-            turn.evidence.keep(keys, (), before)
+        except Exception:
+            await undo()
             raise
-        if not result.dispatched:  # refused before it left, or never connected: likewise
-            turn.evidence.keep(keys, (), before)
+        if not result.dispatched:  # refused before it left, or never connected
+            await undo()
         try:
             if not result.ok or visible(result.content) is None:
                 return failed(call_id, "tool_error", "The answer step failed.")

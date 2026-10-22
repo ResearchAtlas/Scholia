@@ -914,14 +914,21 @@ async def test_ct1_sweep_passages_answer_from_library_could_not_register_are_not
 
     async def failing_in_the_tool(self, claim, numbered, listed=()):
         calls.append(len(numbered))
-        if len(calls) == 2:  # the tool's own registration, before its answer step (the turn's came first)
+        if len(calls) != 2:
+            return await real(self, claim, numbered, listed)
+
+        async def failing(fn):  # the tool's own registration (the turn's came first): its write fails
             raise RuntimeError("the registration's write failed")
-        return await real(self, claim, numbered, listed)
+        self._write = failing
+        try:
+            return await real(self, claim, numbered, listed)
+        finally:
+            del self._write
     monkeypatch.setattr(runs.Harness, "_register_context", failing_in_the_tool)
     provider = Scripted([call("answer_from_library", question=QUESTION)],
                         "Minimum wages raise the earnings of low-paid workers [S1.1].")
     async with cited(tmp_path, provider) as client:
-        project, _ = await with_papers(client, WAGES)
+        project, [material] = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "Hello there")  # nothing pre-loaded: the tool numbers S1
         assert json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])["error"] == "tool_error"
@@ -929,6 +936,13 @@ async def test_ct1_sweep_passages_answer_from_library_could_not_register_are_not
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert calls[0] == 0 and calls[1] and len(searched) == 2  # the tool numbered its passages, then failed to register
         assert stream[-1]["status"] == "succeeded" and turn["citations"][0]["existence"] != "ok"  # not read in the run
+        assert material not in await _depends_on(client, stream[0]["run_id"])  # nor does the answer depend on it
+
+
+async def _depends_on(client, run_id):
+    """The papers a run's answer depends on (inputs.context_materials, backend/provenance.py)."""
+    (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", run_id)
+    return json.loads(inputs).get("context_materials") or []
 
 
 def _no_preload(monkeypatch):
@@ -965,13 +979,14 @@ async def test_ct1_sweep_passages_whose_answer_step_reached_no_model_are_not_rea
     provider = Scripted([call("answer_from_library", question=QUESTION)],
                         "Minimum wages raise the earnings of low-paid workers [S1.1].", inner=[_connect_error])
     async with cited(tmp_path, provider) as client:
-        project, _ = await with_papers(client, WAGES)
+        project, [material] = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "Hello there")
         assert json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])["error"] == "tool_error"
         assert "Wage Floors" not in json.dumps(provider.agent_steps[1]["messages"])  # no outer step was given them
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert stream[-1]["status"] == "succeeded" and turn["citations"][0]["existence"] != "ok"  # not read in the run
+        assert material not in await _depends_on(client, stream[0]["run_id"])  # its registration was taken back
 
 
 @pytest.mark.asyncio
