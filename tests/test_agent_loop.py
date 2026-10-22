@@ -806,9 +806,11 @@ async def test_c4_a_deletion_clears_the_agents_held_question_in_its_own_transact
     async with cited(tmp_path, provider) as client:
         project, [material] = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
-        other = (await with_papers(client, paper("Unrelated", "Rents rose in another synthetic city.")))[1][0]
+        from cited import added
         sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
         ask = await asked(client, conversation)
+        # a paper of the same project added after the question, so outside the run's dependency set
+        [other] = [m["id"] for m in (await added(client, project, paper("Unrelated", "Rents rose elsewhere.")))["materials"]]
         assert (await client.delete(f"/api/materials/{other}")).status_code == 200  # outside its dependency set
         assert (await asked(client, conversation))["params"]["question"].endswith("Go on?")  # still asked, still shown
 
