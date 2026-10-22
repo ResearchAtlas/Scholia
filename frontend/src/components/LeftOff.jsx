@@ -3,11 +3,12 @@
 // away from its project (backend/memory.py left_off), the last things done, open questions, one suggested next step
 // whose button puts it in the message box (nothing is sent until Send), and Things to confirm: each pending proposal
 // with Keep, Edit or Forget, at the version shown. Shown once per return; loaded when first drawn (Parts.jsx).
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { History, X } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { openPlace } from '../live.js';
-import { dismissLeftOff, fillComposer, leftOffDismissed, readLeftOff, recordText, review } from '../memory.js';
+import { libraryEvents, readGuard } from '../library.js';
+import { dismissLeftOff, fillComposer, leftOffDismissed, memoryChanged, memoryEvents, readLeftOff, recordText, review } from '../memory.js';
 import { Proposal } from './Memory.jsx';
 import { Button } from '@/components/ui/button';
 
@@ -15,8 +16,29 @@ export function LeftOff({ projectId }) {
   const t = useT();
   const [found, setFound] = useState(null);
   const [hidden, setHidden] = useState(false);
-  const load = useCallback(() => readLeftOff(projectId).then(setFound, () => setFound(null)), [projectId]);
+  const guard = useRef(null); // which reads may be shown (library.js readGuard)
+  if (guard.current === null) guard.current = readGuard();
+  const load = useCallback(() => {
+    const settle = guard.current.ask();
+    return readLeftOff(projectId).then((read) => { if (settle(true)) setFound(read); }, () => { if (settle(false)) setFound(null); });
+  }, [projectId]);
   useEffect(() => { setFound(null); setHidden(false); load(); }, [load]);
+  // A paper deleted or memory changed anywhere: what it shows is dropped at once, and read again (no client-held
+  // derived state); a read asked before the change is never shown, nor is its next step put in the box.
+  useEffect(() => {
+    const changed = (event) => {
+      if (event.detail !== null && event.detail !== projectId) return;
+      guard.current.libraryChanged();
+      setFound(null);
+      load();
+    };
+    libraryEvents.addEventListener('changed', changed);
+    memoryEvents.addEventListener('changed', changed);
+    return () => {
+      libraryEvents.removeEventListener('changed', changed);
+      memoryEvents.removeEventListener('changed', changed);
+    };
+  }, [projectId, load]);
   if (!found?.show || hidden || leftOffDismissed(projectId, found.latest_turn_at)) return null;
   const empty = !found.done.length && !found.questions.length && !found.next_step && !found.to_confirm.length && !found.notice;
   if (empty) return null;
@@ -46,7 +68,7 @@ export function LeftOff({ projectId }) {
         <div className="grid gap-2">
           <h3 className="text-xs font-medium text-muted-foreground">{t('leftOff.confirm')}</h3>
           <ul className="grid gap-2">
-            {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal} onChanged={load} />)}
+            {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal} onChanged={() => memoryChanged(projectId)} />)}
           </ul>
         </div>
       )}
@@ -57,7 +79,7 @@ export function LeftOff({ projectId }) {
             {t('leftOff.chooseExtractor')}</Button>
           <Button size="sm" variant="ghost" className="h-7" onClick={async () => {
             await review({ project_id: projectId, dismiss: 'allowance_notice' }).catch(() => {});
-            load();
+            memoryChanged(projectId);
           }}>{t('leftOff.dismissNotice')}</Button>
         </div>
       )}

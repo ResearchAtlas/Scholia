@@ -331,7 +331,7 @@ def may_dispatch(conn, run_id, past_deadline=None):
     conversation and source turn are no deletion); its project is not review-locked; and every
     passage its request holds (inputs.evidence, S1-19's [passage id, material id] pairs) is still read
     by the paper the request names it under, and every memory record it holds (inputs.memory_ids, S1-21a) still
-    exists. The project's current level and the route it allows are
+    exists and is still allowed in it (memory.allowed). The project's current level and the route it allows are
     the gate's own checks there. past_deadline(), if given, is a turn's time limit (section 13), checked here, in
     the gate's decision transaction just before the request is sent, whatever it waited for before (its body's
     storage, the gate, the stream's reader): past it the request is refused, "turn_deadline"."""
@@ -340,12 +340,11 @@ def may_dispatch(conn, run_id, past_deadline=None):
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
         " r.source_turn_id IS NULL OR EXISTS (SELECT 1 FROM turns WHERE run_id = r.source_turn_id),"
         " r.project_id, json_extract(r.inputs, '$.evidence'), json_extract(r.inputs, '$.context_materials'),"
-        " (SELECT count(*) FROM json_each(r.inputs, '$.memory_ids') j WHERE NOT EXISTS"
-        "  (SELECT 1 FROM memory_records m WHERE m.id = j.value))"
+        " json_extract(r.inputs, '$.memory_ids')"
         " FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?", (run_id,)).fetchone()
     if row is None:
         return False
-    status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence, held, forgotten = row
+    status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence, held, remembered = row
     owners = has_conversation if kind in ("turn", "child") else has_source
     if not (status == "running" and cancel_reason is None and not locked and bool(owners)):
         return False
@@ -356,7 +355,9 @@ def may_dispatch(conn, run_id, past_deadline=None):
     # S1-19: every passage in the request's context is still read by the paper it is named under
     # (section 10, Revocation: each PR that adds a context source registers its records here).
     wanted = {tuple(pair) for pair in json.loads(evidence)} if evidence else set()
-    if forgotten:  # S1-21a: a memory record the request holds was forgotten (deleted) since it was assembled
+    # S1-21a: every memory record the request holds still exists and is still allowed in it (memory.allowed: a
+    # personal record whose project was tightened or locked since it was recalled is not)
+    if remembered and not memory.allowed(conn, project_id, json.loads(remembered)):
         return False
     if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
         return False  # gone, or its project no longer allows this request (tightened, or review-locked)
@@ -1350,6 +1351,10 @@ class Harness:
 
     # S1-21a: memory commands and recall
 
+    async def memory_on(self, project_id):
+        """Whether memory is on in the project now, from its settings as they are (never a snapshot taken earlier)."""
+        return memory.enabled((await asyncio.to_thread(load_settings, self.data_dir, project_id)).values)
+
     async def _memory_command(self, claim, ctx, turn):
         """An explicit memory command in the researcher's message (memory.command), applied before any model call:
         a save, update or correction that carries its text is written at once, confirmed (the researcher's own
@@ -1363,13 +1368,13 @@ class Harness:
         asked = ctx.get("command")
         if asked is None:
             return
+        ctx["memory_on"] = await self.memory_on(ctx["project_id"])  # the switch as it is now, not at admission
         action, text, project_id = asked["action"], asked["text"], ctx["project_id"]
 
         async def done(what, data=None, count=0, line=None, change=None):
             # change(conn) -> (what it did, ids) or ids: the outcome is what the record says, never what was asked
             outcome = {"what": what, "ids": []}
-            if change is not None and not memory.enabled(  # switched off while its ask waited: nothing written
-                    (await asyncio.to_thread(load_settings, self.data_dir, project_id)).values):
+            if change is not None and not await self.memory_on(project_id):  # switched off while its ask waited
                 what, change, line = "memory_off", None, "Memory is off in this project: nothing was saved, changed or forgotten."
                 outcome["what"] = what
 
@@ -1411,7 +1416,7 @@ class Harness:
                 reply = await self._ask(turn, "memory_forget", ["forget", "not_now"], {"records": ids}, None)
                 if (reply or {}).get("option") != "forget":
                     return await done("declined", line="Nothing was forgotten: the researcher chose not now.")
-            if not memory.enabled((await asyncio.to_thread(load_settings, self.data_dir, project_id)).values):
+            if not await self.memory_on(project_id):
                 return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
             count = 0
             for record in ids:
@@ -1454,6 +1459,7 @@ class Harness:
         from backend import search  # search imports this module
         sections = {"user_memory": list(ctx.get("memory_notes") or [])}
         traced, ids = {}, []
+        ctx["memory_on"] = await self.memory_on(ctx["project_id"])  # read as it is used
         if ctx["memory_on"]:
             wants_state, wants_memory = memory.wants(decision)
             if wants_state:
@@ -1516,6 +1522,8 @@ class Harness:
         chain, calls_made, failures = [], 0, 0
         for number in range(limits["agent_steps"]):
             if number:
+                if ctx.get("memory_sections") and not await self.memory_on(ctx["project_id"]):
+                    ctx["memory_sections"], ctx["memory_missing"] = {}, []  # switched off mid-turn: recalled no more
                 try:
                     _, request = self._cited_request(ctx, found, decision, chain=chain, read=turn.evidence.numbered)
                 except context.OverWindow:
@@ -1978,7 +1986,9 @@ class Harness:
                         held = _hold_unspent(conn, call, rehold, self.data_dir)
                         if held:
                             finished.update(unspent_id=held[0], unspent_usd=held[1])
-                if hold and "output" in finished and exists:
+                if hold and "output" in finished and exists and not provenance.carried(conn, call.materials):
+                    finished["output"] = None  # a paper it drew on was deleted meanwhile: none of its text is kept
+                if hold and finished.get("output") is not None and exists:
                     conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.held.output', json(?))"
                                  " WHERE id = ?", (json.dumps(finished["output"]), active.run_id))
                     finished["output"] = "held"

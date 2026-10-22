@@ -34,6 +34,11 @@ const dismissed = new Set();
 export const leftOffDismissed = (projectId, latest) => dismissed.has(`${projectId}:${latest}`);
 export const dismissLeftOff = (projectId, latest) => dismissed.add(`${projectId}:${latest}`);
 
+// Memory changed (a record saved, kept, edited or forgotten, here or by a turn): every view of it drops what it shows
+// and reads again (Harold, 2026-10-21: no client-held derived state). detail: the project, or null for any.
+export const memoryEvents = new EventTarget();
+export const memoryChanged = (projectId = null) => memoryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
+
 // The message box's text, put there by the next-step button: the conversation's composer takes it.
 export const composerFill = new EventTarget();
 export function fillComposer(text) {

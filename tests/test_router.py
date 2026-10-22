@@ -102,18 +102,20 @@ async def test_a_slow_router_falls_back_and_the_fallback_is_recorded(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_memory_route_preloads_nothing_and_says_so(tmp_path):
+async def test_a_memory_route_with_nothing_remembered_says_so(tmp_path):  # S1-21a: memory is recalled now
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
         conversation = (await client.post("/api/conversations", json={"title": "t"})).json()["id"]
         await send(client, conversation, "What did we decide last time about sampling?")
         [body] = provider.answers
         system = body["messages"][0]["content"]
-        assert "## RESEARCH EVIDENCE" not in system and "could not be retrieved rather than inventing them" in system
+        assert "## RESEARCH EVIDENCE" not in system and "cannot be found in memory, and never invent one" in system
+        assert "not available yet" not in system
 
 
-def test_a_comparison_route_says_its_memory_half_is_not_available_yet():
+def test_only_new_paper_search_is_said_unavailable():  # S1-21a: memory and project state are recalled
     from backend import citations
-    notes = citations.missing({}, mode="hybrid", route="memory_literature")
-    assert any("could not be retrieved rather than inventing them" in note for note in notes)
-    assert not any("could not be retrieved" in note for note in citations.missing({}, mode="hybrid", route="literature"))
+    assert not any("not available yet" in note for route in ("memory", "memory_literature", "literature")
+                   for note in citations.missing({}, mode="hybrid", route=route))
+    assert any("New-paper search is not available yet" in note
+               for note in citations.missing({}, mode="hybrid", route="find_papers"))

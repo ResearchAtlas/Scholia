@@ -138,7 +138,8 @@ async def test_a_turn_admitted_across_a_move_is_refused_rather_than_run_under_th
 
 async def test_a_moved_conversation_takes_the_project_records_drawn_only_from_it(tmp_path):
     # S1-21a (scope notes reading 4; checklist G9): its words stay under the stricter project; a record another
-    # conversation also stands behind stays, and so does a personal one.
+    # conversation also stands behind stays; a personal record resting on its turns becomes the stricter project's own
+    # (fix batch 1: nothing of a stricter project stays personal).
     async with started(tmp_path / "data") as client:
         first = (await client.post("/api/projects", json={"name": "First"})).json()["id"]
         second = (await client.post("/api/projects", json={"name": "Second"})).json()["id"]
@@ -158,5 +159,5 @@ async def test_a_moved_conversation_takes_the_project_records_drawn_only_from_it
         assert sorted(await rows(client, "SELECT content, scope, project_id, sensitivity FROM memory_records"
                                          " WHERE type != 'progress'")) == sorted([
             ("the sample is 30 nurses", "project", second, "private"),
-            ("I prefer short answers", "personal", first, "normal"),
+            ("I prefer short answers", "project", second, "private"),
             ("the deadline is in March", "project", first, "normal")])

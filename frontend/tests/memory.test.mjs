@@ -76,3 +76,17 @@ test('there is no separate review list: Things to confirm is in Where we left of
     || readFileSync(join(SRC, 'components', name), 'utf8').includes('<Proposal'));
   assert.deepEqual(using.sort(), ['LeftOff.jsx', 'Memory.jsx']);
 });
+
+// Fix batch 1 (gpt-6-astra review 1, finding 7): no client-held derived state. Where we left off and the memory views
+// drop what they show at once when the library or memory changes anywhere (a paper deleted, a note forgotten), read
+// again under a guard, so an older read never restores it; the next-step button only fills the box with what is shown.
+test('Where we left off and the memory views drop what they show when the library or memory changes', () => {
+  for (const name of ['LeftOff.jsx', 'Memory.jsx']) {
+    const source = readFileSync(join(SRC, 'components', name), 'utf8');
+    assert.match(source, /libraryEvents\.addEventListener\('changed'/, name);
+    assert.match(source, /memoryEvents\.addEventListener\('changed'/, name);
+    assert.match(source, /readGuard\(\)/, name);
+  }
+  const live = readFileSync(join(SRC, 'live.js'), 'utf8');
+  assert.match(live, /if \(event\.type === 'memory'\) memoryChanged\(/); // a turn's command or note changes memory
+});

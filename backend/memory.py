@@ -164,6 +164,38 @@ def personal_allowed(conn, project_id):
     return _normal(conn, project_id)
 
 
+def restrict(conn, project_id):
+    """The project just became Private, Local only or review-locked (or took a conversation that did): its personal
+    records, and the personal records resting on its turns or runs, become its own project records, in the same
+    transaction, so nothing of it stays or comes back as personal memory (deleted with it, if it is). Their vectors
+    leave the personal partition."""
+    ids = [m for (m,) in conn.execute(
+        "SELECT id FROM memory_records WHERE scope = 'personal' AND (project_id = ? OR id IN (SELECT s.memory_id"
+        " FROM memory_sources s JOIN runs r ON r.id = s.source_id WHERE s.source_kind IN ('turn', 'run')"
+        " AND r.project_id = ?))", (project_id, project_id))]
+    for record in ids:
+        conn.execute("UPDATE memory_records SET scope = 'project', project_id = ?, sensitivity = (SELECT sensitivity"
+                     " FROM projects WHERE id = ?), updated_at = ? WHERE id = ?", (project_id, project_id, utc_now(), record))
+        conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('memory', ?, ?, 'remove')",
+                     (record, project_id))
+    return ids
+
+
+def allowed(conn, project_id, record_ids):
+    """Whether every one of these records may still be in a request of project_id (section 10, at dispatch): it exists;
+    a project record is project_id's own; a personal record may still reach any project (_personal_still); and the
+    papers whose text it may carry pass the request's access check."""
+    for record in record_ids:
+        found = row(conn, record)
+        if found is None or (found["scope"] == "project" and found["project_id"] != project_id):
+            return False
+        if found["scope"] == "personal" and not _personal_still(conn, found):
+            return False
+        if not _sendable(conn, project_id, record):
+            return False
+    return True
+
+
 def scope_for(conn, project_id, kind):
     """Personal for profile and preference, unless the project is Private or Local only: its records stay its own
     (nothing from it reaches another project's request)."""
@@ -482,13 +514,16 @@ def _latest_turn(conn, record):
     return found or record["created_at"]
 
 
-def _command_since(conn, project_id, started_at):
-    """Whether an explicit command was applied in the project's scope after a turn that started then (when it was
-    applied: a bare command's ask may be answered long after its turn began)."""
+def _command_since(conn, project_id, started_at, anywhere=False):
+    """Whether the researcher changed memory in the scope after a turn that started then: an explicit command applied
+    (when it was applied: a bare command's ask may be answered long after its turn began), or a record forgotten in the
+    views; in the project's scope, or anywhere (anywhere: the personal scope every project shares)."""
     return conn.execute(
         "SELECT 1 FROM run_events e JOIN runs r ON r.id = e.run_id WHERE e.type = 'memory_proposed'"
         " AND json_extract(e.data, '$.command') IS NOT NULL AND json_extract(e.data, '$.applied') = 1"
-        " AND r.project_id = ? AND e.at > ? LIMIT 1", (project_id, started_at)).fetchone() is not None
+        " AND (?3 OR r.project_id = ?1) AND e.at > ?2"
+        " UNION ALL SELECT 1 FROM audit_log WHERE event = 'deletion' AND json_extract(data, '$.kind') = 'memory'"
+        " AND (?3 OR project_id = ?1) AND at > ?2 LIMIT 1", (project_id, started_at, int(anywhere))).fetchone() is not None
 
 
 def _head(conn, record):
@@ -524,11 +559,14 @@ def apply_extraction(conn, run_id, candidates):
         return None
     message, author, project_id, turn, turn_started, run_started = found
     message = (json.loads(message) or {}).get("text", "")
-    late = _command_since(conn, project_id, turn_started)
+    late_project = _command_since(conn, project_id, turn_started)
+    late_anywhere = _command_since(conn, project_id, turn_started, anywhere=True)
     # every paper its request carried text of (the answer's, and the related records' it was shown), registered as
     # the run's dependencies before its dispatch (backend/runs.py _extraction_call)
     held = conn.execute("SELECT json_extract(inputs, '$.context_materials') FROM runs WHERE id = ?", (run_id,)).fetchone()
     carried = papers({*provenance.dependencies(conn, turn), *json.loads((held and held[0]) or "[]")})
+    if not provenance.carried(conn, [i for _, i in carried]):  # a paper it drew on was deleted: nothing of it is kept
+        return None
     personal = personal_allowed(conn, project_id)
     counts = {"confirmed": 0, "inferred": 0, "proposed": 0, "replaced": 0, "duplicates": 0}
     written = []
@@ -536,11 +574,15 @@ def apply_extraction(conn, run_id, candidates):
         status = cap(candidate, message, author)
         kind = candidate["type"]
         scope = scope_for(conn, project_id, kind)
+        if scope == "personal" and status == "inferred":  # ticket 31: a personal inference waits to be confirmed
+            status = "proposed"
+        late = late_anywhere if scope == "personal" else late_project
         pending = in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
         same = next((r for r in pending if normalized(r["content"]) == normalized(candidate["content"])), None)
         if same is not None:
             counts["duplicates"] += 1
-            if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"]:
+            if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"] \
+                    and (same["scope"] == "project" or personal):  # never a personal one from a stricter project
                 keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
             continue
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
@@ -551,6 +593,10 @@ def apply_extraction(conn, run_id, candidates):
         sources = [("turn", turn), ("run", run_id), *carried]
         if target is not None:
             sources += [(k, i) for k, i in sources_of(conn, target["id"]) if k == "material"]  # what it was written from
+            if target["scope"] == "personal":
+                late = late_anywhere
+                if status == "inferred":
+                    status = "proposed"
             authoritative = status == "confirmed" or (status == "inferred" and target["status"] in ("inferred", "proposed"))
             newer = turn_started > _latest_turn(conn, target)
             untouched = target["updated_at"] <= run_started

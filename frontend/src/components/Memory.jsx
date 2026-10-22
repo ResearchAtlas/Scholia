@@ -3,12 +3,13 @@
 // this project's apart, each record with its type, status, sources and since when it holds; Confirm, Edit (a new version
 // that supersedes it, at the version shown) and Forget (its content deleted). Pending proposals are Things to confirm,
 // kept or forgotten here too. Loaded with Settings.
-import { useCallback, useContext, useEffect, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
-import { changeRecord, forgetRecord, readMemory, recordText, review } from '../memory.js';
+import { changeRecord, forgetRecord, memoryChanged, memoryEvents, readMemory, recordText, review } from '../memory.js';
+import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -17,16 +18,30 @@ export function MemorySection({ project }) {
   const t = useT();
   const [found, setFound] = useState(null);
   const [problem, setProblem] = useState(null);
-  const load = useCallback(() => readMemory(project?.id).then((data) => { setFound(data); setProblem(null); },
-    (error) => setProblem(error instanceof ApiError ? error.code : 'internal')), [project?.id]);
+  const guard = useRef(null); // which reads may be shown (library.js readGuard)
+  if (guard.current === null) guard.current = readGuard();
+  const load = useCallback(() => {
+    const settle = guard.current.ask();
+    return readMemory(project?.id).then((data) => { if (settle(true)) { setFound(data); setProblem(null); } },
+      (error) => { if (settle(false)) setProblem(error instanceof ApiError ? error.code : 'internal'); });
+  }, [project?.id]);
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { // a paper deleted or memory changed anywhere: dropped at once, and read again
+    const changed = () => { guard.current.libraryChanged(); setFound(null); load(); };
+    libraryEvents.addEventListener('changed', changed);
+    memoryEvents.addEventListener('changed', changed);
+    return () => {
+      libraryEvents.removeEventListener('changed', changed);
+      memoryEvents.removeEventListener('changed', changed);
+    };
+  }, [load]);
   return (
     <Section title={t('memory.title')} hint={t('memory.hint')}>
       {!found ? <LoadState problem={problem} onRetry={load} /> : (
         <div className="grid gap-6">
           {found.memory_enabled === false && <p className="text-sm text-muted-foreground">{t('memory.offNote')}</p>}
-          <Records title={t('memory.personal')} records={found.personal} onChanged={load} />
-          {project && <Records title={t('memory.project')} records={found.project} onChanged={load} />}
+          <Records title={t('memory.personal')} records={found.personal} onChanged={() => memoryChanged(project?.id ?? null)} />
+          {project && <Records title={t('memory.project')} records={found.project} onChanged={() => memoryChanged(project.id)} />}
         </div>
       )}
     </Section>

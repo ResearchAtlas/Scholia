@@ -403,7 +403,7 @@ def _within(lines):
     {"type": "object", "properties": {}, "additionalProperties": False},
     read_only=True, repeat_safe=True, network=False, output_chars=8000, tool_class="read_library", spends=False)
 async def read_project_state(call, turn):
-    if not turn.ctx.get("memory_on", True):
+    if not await turn.harness.memory_on(turn.ctx["project_id"]):  # the switch as it is now
         return ToolResult(id=call.id, ok=True, text="Memory is off in this project: there is no project state to read.",
                           meta={"memory": []})
 
@@ -426,7 +426,7 @@ async def read_project_state(call, turn):
     {"type": "object", "properties": {"query": {"type": "string", "maxLength": 1000}}, "additionalProperties": False},
     read_only=True, repeat_safe=True, network=False, output_chars=8000, tool_class="read_library", spends=False)
 async def read_memory(call, turn):
-    if not turn.ctx.get("memory_on", True):
+    if not await turn.harness.memory_on(turn.ctx["project_id"]):
         return ToolResult(id=call.id, ok=True, text="Memory is off in this project: nothing is recalled.",
                           meta={"memory": []})
     query = visible(call.arguments.get("query"))
@@ -457,7 +457,7 @@ async def update_progress(call, turn):
     text = visible(call.arguments["text"])
     if text is None:
         return failed(call.id, "validation_error", "The note is empty.")
-    if not turn.ctx.get("memory_on", True):
+    if not await turn.harness.memory_on(turn.ctx["project_id"]):
         return ToolResult(id=call.id, ok=True, text="Memory is off in this project: the note was not kept.",
                           meta={"memory": []})
     written = []

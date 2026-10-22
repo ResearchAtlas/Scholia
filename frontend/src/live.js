@@ -5,6 +5,7 @@
 import { useSyncExternalStore } from 'react';
 import { post, stream } from './api.js';
 import { asksChanged } from './library.js';
+import { memoryChanged } from './memory.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
@@ -50,6 +51,7 @@ export function send(conversationId, path, body, text) {
     stream(path, body, (event) => {
       turn = apply(turn, event);
       if (event.type === 'ask') asksChanged(conversationId); // S1-19c: the agent asks; the conversation shows it
+      if (event.type === 'memory') memoryChanged(null); // S1-21a: a command or the agent's note changed memory
       if (event.type === 'open_place') openPlace(event.place); // S1-19c: the help skill opens a place
       if (event.type === 'chat_response' && event.result_saved === false && turn.runId) {
         unsaved.set(turn.runId, { text: event.content, cut: Boolean(event.cut), ...(event.notices ? { notices: event.notices } : {}) });
