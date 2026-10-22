@@ -11,7 +11,7 @@ import { Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, limitText, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
+import { NOTICES, clear, limitText, send, showing, stop, unsavedAnswer, useLiveTurn } from '../live.js';
 import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
@@ -67,6 +67,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const [draft, setDraft] = useState(null); // a new conversation, made at its first message
   const id = conversation?.id ?? draft;
   const live = useLiveTurn(id);
+  useEffect(() => showing(projectId, id), [projectId, id]); // a turn opens a place only while shown here (live.js)
   const [turns, setTurns] = useState(conversation ? null : []);
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);

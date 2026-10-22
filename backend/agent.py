@@ -377,7 +377,8 @@ async def ask(call, turn):
      "additionalProperties": False},
     read_only=True, repeat_safe=True, network=False, output_chars=200, tool_class="agent_control", spends=False)
 async def open_place(call, turn):
-    turn.emit({"type": "open_place", "place": call.arguments["place"]})
+    # its project: the window opens it only while this conversation and project are shown (frontend/src/live.js)
+    turn.emit({"type": "open_place", "place": call.arguments["place"], "project_id": turn.ctx["project_id"]})
     return ToolResult(id=call.id, ok=True, text=f"Opened {call.arguments['place']} for the researcher.",
                       meta={"place": call.arguments["place"]})
 

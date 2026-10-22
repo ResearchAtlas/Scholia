@@ -142,7 +142,8 @@ async def test_open_place_opens_one_place_from_its_list_and_nothing_else(tmp_pat
         project, _ = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "How do I add a reference file?")
-        assert [e for e in stream if e["type"] == "open_place"] == [{"type": "open_place", "place": "library"}]
+        assert [e for e in stream if e["type"] == "open_place"] == [{"type": "open_place", "place": "library",
+                                                                      "project_id": project}]  # the window checks it
         opened, refused = tool_messages(provider.agent_steps[2])[-2:]
         assert opened["content"].startswith("Opened library") and json.loads(refused["content"])["error"] == \
             "validation_error"

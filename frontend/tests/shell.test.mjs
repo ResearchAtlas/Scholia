@@ -7,7 +7,7 @@ import { SESSION_KEY, takeSession } from '../src/session.js';
 import { EventReader } from '../src/sse.js';
 import { continuable, moveTargets, projectName } from '../src/projects.js';
 import { errorText, money, visible } from '../src/text.js';
-import { PLACES, apply, limitText, openPlace, places, send, subscribe, unsavedAnswer } from '../src/live.js';
+import { PLACES, apply, limitText, openPlace, places, send, showing, subscribe, unsavedAnswer } from '../src/live.js';
 import { packageRoot, record } from '../licenses.mjs';
 import { saveSettings } from '../src/api.js';
 
@@ -181,6 +181,29 @@ test('open_place opens only a place from its list (S1-19c)', () => {
   assert.deepEqual(opened, ['library', 'settings.project']);
   assert.deepEqual(PLACES, ['library', 'settings.general', 'settings.providers', 'settings.subagents', 'settings.project',
     'settings.advanced']); // backend/agent.py PLACES
+});
+
+test('a turn opens a place only while its conversation and project are shown (CT4)', async (t) => {
+  const opened = [];
+  const listen = (event) => opened.push(event.detail);
+  places.addEventListener('open', listen);
+  t.after(() => places.removeEventListener('open', listen));
+  t.mock.method(globalThis, 'fetch', async () => new Response(streamOf(
+    'data: {"type":"run_started","run_id":"r9"}\n\n',
+    'data: {"type":"open_place","place":"settings.project","project_id":"p1"}\n\n',
+    'data: {"type":"run_finished","status":"succeeded"}\n\n')));
+  const turn = async () => { await send('c9', '/x', {}, 'Q'); await new Promise((resolve) => setTimeout(resolve, 10)); };
+  const shownNow = [['p1', 'c9', true], ['p1', 'c10', false], ['p2', 'c9', false], [null, null, false]];
+  for (const [projectId, conversationId, opens] of shownNow) {
+    const hide = showing(projectId, conversationId);
+    opened.length = 0;
+    await turn();
+    hide();
+    assert.deepEqual(opened, opens ? ['settings.project'] : [], `${projectId} ${conversationId}`);
+  }
+  showing('p1', 'c9')();
+  await turn();
+  assert.deepEqual(opened, []); // no longer shown
 });
 
 function streamOf(...chunks) {
