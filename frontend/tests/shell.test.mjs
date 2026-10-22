@@ -165,6 +165,13 @@ test('a live turn follows its events', () => {
     ['help', 'literature-review']);
 });
 
+test('the tool indicator clears when the next step starts (CT3)', () => {
+  const using = apply({ text: 'Q', runId: 'r1' }, { type: 'tool_call', name: 'search_passages' });
+  const next = apply(using, { type: 'step', seq: 2, phase: 'answer' });
+  assert.equal(next.tool, undefined);
+  assert.deepEqual(next, { text: 'Q', runId: 'r1' });
+});
+
 test('open_place opens only a place from its list (S1-19c)', () => {
   const opened = [];
   const listen = (event) => opened.push(event.detail);

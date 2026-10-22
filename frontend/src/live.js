@@ -31,6 +31,7 @@ export function apply(turn, event) {
     case 'error': return { ...turn, error: event.code };
     case 'limit_reached': return { ...turn, limit: event.limit ?? 'budget' }; // S1-19c: a turn limit, or the budget
     case 'tool_call': return { ...turn, tool: event.name }; // S1-19c: the tool the agent is using now
+    case 'step': { const { tool, ...rest } = turn; return rest; } // the next model call: no tool is in use (CT3)
     case 'skill': return { ...turn, skills: [...(turn.skills ?? []), event.name] };
     case 'run_finished': return { ...turn, done: true };
     default: return turn;
