@@ -887,10 +887,12 @@ async def test_a_turn_stopped_before_its_response_starts_never_reads_interrupted
         await wait_for(lambda: claim.closing is not None)
         reading = (await client.get(f"/api/conversations/{conversation}")).json()
         assert reading["running"] is False and reading["turns"][0]["status"] == "running"  # never interrupted
-        harness.registry.release(harness.registry.claim_turn(conversation))  # a new message may be sent at once
+        newer = harness.registry.claim_turn(conversation)  # a new message may be sent at once
         gate.set()
         ended = await (stopped if stopped is not None else claim.closing)
         assert (ended["status"], ended["cancel_reason"]) == ("cancelled", "researcher")
+        assert harness.registry.turns[conversation] is newer  # the old run's release leaves the newer claim held
+        harness.registry.release(newer)
         assert [status for run, status in seen if run == claim.run_id] == ["running"]
         assert not harness.registry.is_active(claim.run_id)
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
