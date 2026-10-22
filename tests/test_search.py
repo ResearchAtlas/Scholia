@@ -356,7 +356,8 @@ async def test_a_deletion_whose_index_cleanup_fails_keeps_its_removals_and_searc
         assert (await client.delete(f"/api/materials/{material['id']}")).status_code == 200
         await asyncio.sleep(0.2)  # tried again meanwhile, and failing still
         assert len(await index_rows(client, project)) == 4  # the pass rolled back: still there
-        assert await rows(client, "SELECT count(*) FROM index_queue WHERE op = 'remove'") == [(4,)]  # still queued
+        assert await rows(client, "SELECT count(*) FROM index_queue WHERE op = 'remove' AND target = 'passage'") == [
+            (4,)]  # still queued
         assert (await find(client, project, "earnings"))["results"] == []  # the access check keeps it out
         monkeypatch.setattr(SearchIndex, "_verify", real)
         deadline = asyncio.get_running_loop().time() + 5

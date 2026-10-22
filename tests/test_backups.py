@@ -1409,7 +1409,8 @@ async def test_a_cancel_while_a_refused_restore_still_stops_a_title_run_ends_it(
         conversation = (await client.post("/api/conversations", json={})).json()["id"]
         await send(client, conversation)
         await calling.wait()
-        [run_id] = [run for run, active in client.state["harness"].registry.runs.items() if active.kind == "background"]
+        [(run_id,)] = await asyncio.to_thread(client.state["db"].read, lambda conn: conn.execute(
+            "SELECT id FROM runs WHERE workflow = 'title'").fetchall())  # S1-21a: an extraction runs beside it
         real = Harness.shutdown
         monkeypatch.setattr(Harness, "shutdown", lambda self, timeout=10.0: real(self, 0.1))
         response = await client.post("/api/backups/restore", json={"generation": backup})
@@ -1592,3 +1593,26 @@ async def test_after_a_failed_close_a_restore_is_refused_before_it_stops_anythin
         with pytest.raises(backups_module.ReplacementRefused):
             backups_module._back_from_journal(data)
         assert not (data / "backups" / ".aside-test").exists() and not (data / "backups" / backups_module.JOURNAL).exists()
+
+
+async def test_a_project_export_holds_its_memory_unless_left_out_and_never_personal_records(tmp_path):
+    # S1-21a (ticket 31: "Exports include memory unless the researcher leaves it out"; checklist V4)
+    data, destination = tmp_path / "data", tmp_path / "chosen"
+    destination.mkdir()
+    async with started(data) as client:
+        project = await new_project(client)
+        own = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                       "content": "We use interviews"})).json()
+        await client.post("/api/memory", json={"project_id": project, "type": "preference", "scope": "personal",
+                                               "content": "I prefer tables"})
+        kept = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination)})
+        left = await archived_run(client, f"/api/projects/{project}/export", {"destination": str(destination),
+                                                                             "memory": False})
+        assert kept.status == left.status == "succeeded"
+    with_memory = destination / kept.result["file"].rsplit("/", 1)[1]
+    [record] = json.loads(read(with_memory, "memory.json"))
+    assert (record["id"], record["content"], record["status"]) == (own["id"], "We use interviews", "confirmed")
+    assert record["sources"] == [{"kind": "researcher", "id": "views"}]
+    assert not any(b"I prefer tables" in read(with_memory, name) for name in names(with_memory))
+    without = destination / left.result["file"].rsplit("/", 1)[1]
+    assert "memory.json" not in names(without) and left.result["memory"] == 0

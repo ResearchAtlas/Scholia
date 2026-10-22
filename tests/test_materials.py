@@ -241,7 +241,8 @@ async def test_one_projects_deletion_revokes_only_its_own_reading_of_a_file_anot
         [ready] = await settled(client, theirs)
         assert ready["state"] == "ready"
         assert await rows(client, "SELECT count(*) FROM extractions") == [(1,)]
-        assert {p for (p,) in await rows(client, "SELECT DISTINCT project_id FROM index_queue")} == {theirs}
+        assert {p for (p,) in await rows(client, "SELECT DISTINCT project_id FROM index_queue"
+                                               " WHERE target = 'passage'")} == {theirs}  # S1-21a: progress's apart
 
 
 async def test_deleting_the_project_while_its_material_is_read_leaves_nothing_of_it(tmp_path, reading_stub):
@@ -267,7 +268,8 @@ async def test_deleting_a_read_material_queues_its_removals_after_its_additions(
         version = ready["version"]["id"]
         passages = (await client.get(f"/api/material-versions/{version}/passages")).json()["passages"]
         assert (await client.delete(f"/api/materials/{paper['id']}")).status_code == 200
-        queued = await rows(client, "SELECT target_id, op, project_id FROM index_queue ORDER BY seq")
+        queued = await rows(client, "SELECT target_id, op, project_id FROM index_queue WHERE target = 'passage'"
+                                    " ORDER BY seq")  # S1-21a: the progress record's removal is memory's
         ids = sorted(p["id"] for p in passages)
         assert sorted(t for t, op, _ in queued if op == "add") == ids == sorted(t for t, op, _ in queued if op == "remove")
         assert [op for _, op, _ in queued] == ["add"] * len(ids) + ["remove"] * len(ids)  # removals come after

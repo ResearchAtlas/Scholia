@@ -147,6 +147,30 @@ NO_TEXT.add("merge")
 SHOWN = {"choice": _agents_question}
 
 
+# S1-21a: a memory command's asks (backend/runs.py Harness._memory_command) name what they are about by id: the
+# earlier answer a bare "save this" would save, while it may still be kept, and the records an update or a forget
+# means, as they are now (one forgotten meanwhile is not shown). Never kept in the ask itself.
+def _memory_candidates(conn, run_id):
+    from backend import memory
+    ask, _ = asked(conn, run_id)
+    params = (ask or {}).get("params") or {}
+    shown = {}
+    if params.get("turn"):
+        found = conn.execute("SELECT answer FROM turns WHERE run_id = ?", (params["turn"],)).fetchone()
+        from backend import provenance
+        if found is not None and provenance.answer_carried(conn, params["turn"]):
+            text = (json.loads(found[0] or "{}") or {}).get("text") or ""
+            shown["candidate"] = text[:memory.CANDIDATE_CHARS] + ("…" if len(text) > memory.CANDIDATE_CHARS else "")
+    if params.get("records"):
+        shown["records"] = [{k: r[k] for k in ("id", "type", "status", "content")}
+                            for r in (memory.row(conn, i) for i in params["records"]) if r is not None]
+    return shown
+
+
+NO_TEXT.add("memory_forget")
+SHOWN.update(memory_save=_memory_candidates, memory_update=_memory_candidates, memory_forget=_memory_candidates)
+
+
 def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
     """The asks that can be answered now: of running runs waiting on them, under the policy they were
     asked under; for a project, a conversation they were raised from, or a run. Each names its

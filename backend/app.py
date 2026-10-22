@@ -31,7 +31,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend import APP_VERSION, credentials, openrouter, openrouter_client, providers
 from backend import backups
-from backend import agent, answers, asks, materials
+from backend import agent, answers, asks, materials, memory
 from backend import references  # S1-14: reference file import and the merge confirmation
 from backend import local_helper
 from backend import search  # S1-17: the search index, index runs and the search model's offer
@@ -378,6 +378,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
     app.include_router(zotero.router)  # S1-15: Zotero's status, collections and items, and imports
     app.include_router(answers.router)  # S1-19: a run's trace, and answers' citations resolved or checked
     app.include_router(agent.router)  # S1-19c: the skill catalog
+    app.include_router(memory.router)  # S1-21a: the memory views, Things to confirm and Where we left off
     app.add_middleware(backups.Gate, state=state)  # restore only when damaged; no change during a restore
 
     @app.exception_handler(ApiError)
@@ -1074,9 +1075,21 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             turns = conn.execute(
                 "SELECT t.run_id, t.seq, t.author, t.user_message, t.answer, t.result_saved, t.reason_code,"
                 " r.status, r.cancel_reason, r.settled_cost_usd, r.started_at, r.finished_at, t.retry_of_run_id,"
-                " t.accounting"
+                " t.accounting, t.memory_status"
                 " FROM turns t JOIN runs r ON r.id = t.run_id WHERE t.conversation_id = ? ORDER BY t.seq",
                 (conversation_id,)).fetchall()
+            # S1-21a: what each turn's memory command or tool did, read back from the records as they are now (one
+            # forgotten since is not shown); the events name records by id only
+            remembered = {}
+            for owner, data in conn.execute(
+                    "SELECT e.run_id, e.data FROM run_events e JOIN turns t ON t.run_id = e.run_id"
+                    " WHERE t.conversation_id = ? AND e.type = 'memory_proposed' ORDER BY e.run_id, e.seq",
+                    (conversation_id,)):
+                data = json.loads(data)
+                found = [memory.row(conn, i) for i in data.get("records", [])]
+                remembered.setdefault(owner, []).append({
+                    "action": data.get("action") or "noted", "count": data.get("count") or len(data.get("records", [])),
+                    "records": [{k: r[k] for k in ("id", "type", "status", "content", "scope")} for r in found if r]})
             cited = {}  # S1-19: each answer's citations, as its chips show them
             for owner, cid, material, passage, quote, context, page, evidence, existence, support, retraction, title, \
                     ordinal in conn.execute(
@@ -1098,8 +1111,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             for chip in (c for chips in cited.values() for c in chips):
                 if chip["existence"] == "ok" and now.get(chip["id"]) == "source_removed":
                     chip.update(existence=now[chip["id"]], support="unchecked", quote=None, passage_id=None, ordinal=None)
-            return row, turns, cited
-        row, turns, cited = await read(fetch)
+            return row, turns, cited, remembered
+        row, turns, cited, remembered = await read(fetch)
         if row is None:
             raise ApiError(404, "not_found", "No such conversation")
         registry = harness().registry
@@ -1109,9 +1122,9 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             "status": derived_status(status, run_id, registry), "reason_code": reason, "cancel_reason": cancel,
             "cost_usd": cost, "accounting": json.loads(accounting) if accounting else None,
             "started_at": started, "finished_at": finished, "continues": retry_of,
-            "citations": cited.get(run_id, []),
+            "citations": cited.get(run_id, []), "memory_status": memory_status, "memory": remembered.get(run_id, []),
         } for run_id, seq, author, message, answer, saved, reason, status, cancel, cost, started, finished, retry_of,
-            accounting in turns]}
+            accounting, memory_status in turns]}
 
     @app.put("/api/conversations/{conversation_id}")
     async def rename_conversation(conversation_id: str, body: Rename):
@@ -1164,6 +1177,16 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 "UPDATE runs SET project_id = ? WHERE conversation_id = ?"
                 " OR source_turn_id IN (SELECT run_id FROM turns WHERE conversation_id = ?)",
                 (body.project_id, conversation_id, conversation_id))
+            # S1-21a: the project's memory records drawn only from this conversation (every turn or run they name is
+            # one of its turns or their post-answer runs) move with it, so its words stay under the stricter project
+            conn.execute(
+                "UPDATE memory_records SET project_id = ?, sensitivity = ?, updated_at = ? WHERE scope = 'project'"
+                " AND project_id = ? AND EXISTS (SELECT 1 FROM memory_sources s WHERE s.memory_id = memory_records.id"
+                " AND s.source_kind IN ('turn', 'run')) AND NOT EXISTS (SELECT 1 FROM memory_sources s"
+                " WHERE s.memory_id = memory_records.id AND s.source_kind IN ('turn', 'run') AND s.source_id NOT IN"
+                " (SELECT run_id FROM turns WHERE conversation_id = ?5 UNION SELECT r.id FROM runs r JOIN turns t"
+                " ON t.run_id = r.source_turn_id WHERE t.conversation_id = ?5))",
+                (body.project_id, target[0], now, source, conversation_id))
             conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('conversation_moved', ?, ?)",
                          (body.project_id, json.dumps({"conversation_id": conversation_id, "from": source})))
             return True

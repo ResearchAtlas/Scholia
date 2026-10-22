@@ -173,6 +173,20 @@ RULES = (
     WHERE m.id IN (SELECT memory_id FROM memory_sources WHERE rowid IN {_doomed('memory_sources')})
     AND NOT EXISTS (SELECT 1 FROM memory_sources s
                     WHERE s.memory_id = m.id AND s.rowid NOT IN {_doomed('memory_sources')})""",
+    # S1-21a (backend/provenance.py): a record that may carry a paper's text (a `material` source) goes with any one of
+    # its papers, not only its last source.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'memory_records', m.rowid FROM memory_records m JOIN memory_sources s ON s.memory_id = m.id
+    WHERE s.source_kind = 'material' AND s.source_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
+    # S1-21a: Forget deletes the content (F10), so the earlier versions a deleted record replaced go with it.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'memory_records', o.rowid FROM memory_records o
+    WHERE o.status = 'superseded' AND o.id IN (SELECT supersedes_id FROM memory_records
+                                               WHERE rowid IN {_doomed('memory_records')})""",
+    # A deleted record's sources go with it.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'memory_sources', rowid FROM memory_sources
+    WHERE memory_id IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
 )
 
 # The seam for scope links the schema does not record yet. Each entry is a SELECT
@@ -185,6 +199,13 @@ SCOPE_LINKS: tuple[str, ...] = (
     # materials it works on in its inputs (backend/materials.py).
     f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.material_ids') j
     WHERE r.status = 'running' AND j.value IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
+)
+
+# S1-21a: a run whose request holds a memory record (a turn's USER MEMORY or PROJECT STATE, an extraction's related
+# records: inputs.memory_ids) is revoked when the record is deleted (section 10: "material, passage and memory record").
+SCOPE_LINKS += (
+    f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.memory_ids') j
+    WHERE r.status = 'running' AND j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
 )
 
 # S1-15: a Zotero import names its items (inputs.library and inputs.items), not the papers it will make,
@@ -313,6 +334,12 @@ def _delete(conn, kind, object_id, remove_all_trace):
     # Harold, 2026-10-21 (option A): a run that depended on a deleted paper loses every copy of model-written text it
     # keeps: its answer's citation rows' text, and an agent's question held while it waits (S1-19c).
     provenance.forget(conn, f"SELECT id FROM materials WHERE rowid IN {_doomed('materials')}")
+    # S1-21a: what's done, from AAB's own records: papers removed from a project that stays (no title is kept)
+    from backend import memory
+    for removed_from, count in conn.execute(
+            f"SELECT project_id, count(*) FROM materials WHERE rowid IN {_doomed('materials')} AND project_id NOT IN"
+            f" (SELECT id FROM projects WHERE rowid IN {_doomed('projects')}) GROUP BY project_id").fetchall():
+        memory.materials_removed(conn, removed_from, count)
     for (child, column), (parent, key) in edges.items():
         action = ON_DELETE[child, column]
         if action is not DELETE:

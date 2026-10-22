@@ -620,4 +620,37 @@ CREATE TABLE run_body_materials (
 CREATE INDEX run_body_materials_by_material ON run_body_materials (material_id);
 """
 
-MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007)
+# S1-21a: memory records take only the types and statuses slice 1 section 4.1 lists (Harold's MemoryRecord with
+# progress and agent_note; Forget deletes, so no row is ever left 'deleted'), and their sources only the kinds the
+# app writes: a turn, a run, a paper whose text the record may carry (`material`: deleted with any one of them,
+# backend/db/deletion.py), a paper it only counts (`paper`: progress, deleted with the last of them), the project, or
+# the researcher's own entry in the memory views. A STRICT table's CHECK
+# cannot be added in place, so triggers refuse the rest; the indexes serve recall and deletion's source rule.
+_0008 = r"""
+CREATE TRIGGER memory_records_valid BEFORE INSERT ON memory_records
+WHEN NEW.type NOT IN ('profile', 'project_state', 'decision', 'event', 'preference', 'progress', 'agent_note')
+    OR NEW.status NOT IN ('confirmed', 'inferred', 'proposed', 'superseded')
+    OR (NEW.scope = 'project' AND NEW.project_id IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'a memory record of a type, status or scope not allowed');
+END;
+
+CREATE TRIGGER memory_records_valid_update BEFORE UPDATE OF type, status, scope ON memory_records
+WHEN NEW.type NOT IN ('profile', 'project_state', 'decision', 'event', 'preference', 'progress', 'agent_note')
+    OR NEW.status NOT IN ('confirmed', 'inferred', 'proposed', 'superseded')
+BEGIN
+    SELECT RAISE(ABORT, 'a memory record of a type or status not allowed');
+END;
+
+CREATE TRIGGER memory_sources_valid BEFORE INSERT ON memory_sources
+WHEN NEW.source_kind NOT IN ('turn', 'run', 'material', 'paper', 'project', 'researcher')
+BEGIN
+    SELECT RAISE(ABORT, 'a memory source of a kind not allowed');
+END;
+
+CREATE INDEX memory_records_by_project ON memory_records (project_id, status);
+CREATE INDEX memory_records_by_supersedes ON memory_records (supersedes_id);
+CREATE INDEX memory_sources_by_source ON memory_sources (source_id);
+"""
+
+MIGRATIONS: tuple[str, ...] = (_0001, _0002, _0003, _0004, _0005, _0006, _0007, _0008)

@@ -140,11 +140,11 @@ def populate(db, store, project, tag, paper=None):
 
         conn.execute(
             "INSERT INTO memory_records (id, scope, project_id, type, content, status, created_by_run_id)"
-            " VALUES (?, 'project', ?, 'fact', ?, 'inferred', ?)",
+            " VALUES (?, 'project', ?, 'event', ?, 'inferred', ?)",
             (x["mr1"], project, f"fact {tag}", x["r4"]))
         conn.execute(
             "INSERT INTO memory_records (id, scope, project_id, type, content, status, supersedes_id, created_by_run_id)"
-            " VALUES (?, 'project', ?, 'fact', ?, 'proposed', ?, ?)",
+            " VALUES (?, 'project', ?, 'event', ?, 'proposed', ?, ?)",
             (x["mr2"], project, f"newer fact {tag}", x["mr1"], x["r4"]))
         conn.execute(
             "INSERT INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'turn', ?), (?, 'turn', ?), (?, 'turn', ?)",
@@ -368,7 +368,7 @@ def test_deleting_a_material_removes_its_versions_and_marks_citations_elsewhere(
     x = populate(db, store, add_project(db, "Thesis"), "p")
     only_source = new_id()
     db.write(lambda conn: conn.execute(
-        "INSERT INTO memory_records (id, scope, project_id, type, content, status) VALUES (?, 'project', ?, 'fact', 'x', 'inferred')",
+        "INSERT INTO memory_records (id, scope, project_id, type, content, status) VALUES (?, 'project', ?, 'event', 'x', 'inferred')",
         (only_source, x["project"])) and conn.execute(
         "INSERT INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'material', ?)", (only_source, x["m1"])))
 
@@ -508,7 +508,7 @@ NEW_ROW = {  # kind: a row for that table, with id :id, in project :project wher
     "conversation": "INTO conversations (id, project_id) VALUES (:id, :project)",
     "material": "INTO materials (id, project_id, source) VALUES (:id, :project, 'upload')",
     "artifact": "INTO artifacts (id, project_id, title, doc) VALUES (:id, :project, 'Back', '{}')",
-    "memory": "INTO memory_records (id, scope, type, content, status) VALUES (:id, 'personal', 'fact', 'x', 'confirmed')",
+    "memory": "INTO memory_records (id, scope, type, content, status) VALUES (:id, 'personal', 'event', 'x', 'confirmed')",
 }
 FIXTURE_NAME = {"conversation": "c1", "material": "m1", "artifact": "a1", "memory": "mr1"}
 assert set(NEW_ROW) == set(KINDS) == set(FIXTURE_NAME) | {"project"}

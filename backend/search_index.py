@@ -9,7 +9,10 @@ thread makes every change, in order; searches read on connections of their own.
   (its material's title, its section path, then its text), tokenized by `scholia` (`tokens`),
   registered on every connection; `project_id` and `passage_id` unindexed.
 - `vec_passages`: vec0, partitioned by project, each passage's embedding (1024 float32, cosine).
-- `vec_memory`: memory embeddings, partitioned by scope, written from S1-21.
+- `vec_memory`: memory embeddings, partitioned by scope (`personal`, or `project:<id>`), S1-21a: each active recalled
+  record's content (backend/memory.py), keyed by `memory_rows` (its rowid, the record's id and scope; no text). Written by
+  index runs (backend/search.py), removed through the queue (target `memory`) with the deletion's or replacement's
+  commit, checked gone; at open, every row of a record the main database no longer holds active goes (_purge).
 - `index_rows`: the rowid the two share for one project's passage, its material and kind, a digest
   of its index text and whether it is embedded (1), not yet (0), or refused by the helper (-1: not
   asked for again while its text and the model are unchanged; a changed text or dropped vectors set it
@@ -109,6 +112,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS vec_passages USING vec0(
     project_id TEXT PARTITION KEY, +passage_id TEXT, embedding float[{DIMENSIONS}] distance_metric=cosine);
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(
     scope TEXT PARTITION KEY, +memory_id TEXT, embedding float[{DIMENSIONS}] distance_metric=cosine);
+CREATE TABLE IF NOT EXISTS memory_rows (id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL) STRICT;
 """
 
 
@@ -528,6 +533,15 @@ class SearchIndex:
                                                  (project,)).fetchall():
                     if pid not in grants[project]:
                         removed += self._remove(project, pid)
+        if self.vectors:  # S1-21a: a memory record's vector, of a record no longer held active in the main database
+            held = [m for (m,) in self._conn.execute("SELECT memory_id FROM memory_rows")]
+            active = self.db.read(lambda conn: {m for (m,) in conn.execute(
+                "SELECT id FROM memory_records WHERE status IN ('confirmed', 'inferred')"
+                " AND id IN (SELECT value FROM json_each(?))", (json.dumps(held),))}) if held else set()
+            with self._conn:
+                for memory_id in held:
+                    if memory_id not in active:
+                        removed += self._remove_memory(memory_id)
         if removed or self._truncate:
             self._checkpoint()
         if self._truncate:  # old WAL frames may hold what was removed: not read until the truncation is done
@@ -551,7 +565,8 @@ class SearchIndex:
         """Every vector goes (from another model, revision, quantization, runtime or dimension)."""
         with self._conn:
             if self.vectors:
-                self._conn.execute("DROP TABLE IF EXISTS vec_passages; DROP TABLE IF EXISTS vec_memory")
+                self._conn.execute("DROP TABLE IF EXISTS vec_passages; DROP TABLE IF EXISTS vec_memory;"
+                                   " DROP TABLE IF EXISTS memory_rows")
                 self._conn.execute(VECTORS)
             self._conn.execute("UPDATE index_rows SET embedded = 0")
             self._meta(**self.identity)
@@ -836,8 +851,10 @@ class SearchIndex:
             removed, replaced = [], False
             with self._conn:
                 for _, target, pid, project, op in rows:
-                    if target != "passage":
-                        continue  # memory: S1-21's
+                    if target == "memory":  # S1-21a: an addition waits for an index run's embedding
+                        if op == "remove":
+                            removed += self._remove_memory(pid)
+                        continue
                     if op == "remove":
                         removed += self._remove(project, pid)
                     elif (reading := found[project].get(pid)) is not None:
@@ -860,12 +877,12 @@ class SearchIndex:
         open purges the file and truncates its WAL before anything reads it)."""
         last = int(self._conn.execute("SELECT value FROM index_meta WHERE key = 'last_seq'").fetchone()[0])
         rows = self.db.read(lambda conn: conn.execute(
-            "SELECT target_id, project_id FROM index_queue WHERE seq > ? AND target = 'passage'"
-            " ORDER BY seq", (last,)).fetchall())
+            "SELECT target_id, project_id, target FROM index_queue WHERE seq > ? ORDER BY seq", (last,)).fetchall())
         removed = []
         if rows:
             with self._conn:
-                removed = [rowid for pid, project in rows for rowid in self._remove(project, pid)]
+                removed = [rowid for pid, project, target in rows
+                           for rowid in (self._remove(project, pid) if target == "passage" else self._remove_memory(pid))]
         if removed or self._truncate:
             self._checkpoint()
         if self._truncate:
@@ -913,6 +930,20 @@ class SearchIndex:
             self._conn.execute("DELETE FROM vec_passages WHERE rowid = ?", (row[0],))
         self._conn.execute("DELETE FROM index_rows WHERE id = ?", (row[0],))
         self._verify(row[0])
+        return [row[0]]
+
+    def _remove_memory(self, memory_id):
+        """A memory record's vector and row, in the pass's transaction, checked gone (rowids are never reused)."""
+        if not self.vectors:
+            return []
+        row = self._conn.execute("SELECT id FROM memory_rows WHERE memory_id = ?", (memory_id,)).fetchone()
+        if row is None:
+            return []
+        self._conn.execute("DELETE FROM vec_memory WHERE rowid = ?", (row[0],))
+        self._conn.execute("DELETE FROM memory_rows WHERE id = ?", (row[0],))
+        if self._conn.execute("SELECT (SELECT count(*) FROM vec_memory WHERE rowid = ?1)"
+                              " + (SELECT count(*) FROM memory_rows WHERE id = ?1)", (row[0],)).fetchone()[0]:
+            raise CleanupFailed()
         return [row[0]]
 
     def _verify(self, rowid):
@@ -1019,6 +1050,52 @@ class SearchIndex:
                 self._conn.execute("UPDATE index_rows SET embedded = 1 WHERE id = ?", (rowid,))
                 written += 1
         return written
+
+    # Memory (S1-21a)
+
+    def memory_embedded(self, memory_ids):
+        """The ones of memory_ids that have a vector."""
+        if not self.vectors:
+            return set()
+        return {m for (m,) in self._read(lambda conn: conn.execute(
+            "SELECT memory_id FROM memory_rows WHERE memory_id IN (SELECT value FROM json_each(?))",
+            (json.dumps(sorted(memory_ids)),)).fetchall())}
+
+    def store_memory(self, embedded, still=None):
+        """Write [(memory id, scope, vector)] in one transaction, each only while still(memory id) holds (asked of the
+        main database in the writer: the record is active) and it has none. Returns how many were written."""
+        return self._write(self._store_memory, embedded, still)
+
+    def _store_memory(self, embedded, still):
+        if self.unusable:
+            raise Unavailable()
+        if not self.vectors or self.building:
+            return 0
+        alive = still([m for m, _, _ in embedded]) if still is not None else {m for m, _, _ in embedded}
+        written = 0
+        with self._conn:
+            for memory_id, scope, vector in embedded:
+                if memory_id not in alive or len(vector) != DIMENSIONS or self._conn.execute(
+                        "SELECT 1 FROM memory_rows WHERE memory_id = ?", (memory_id,)).fetchone():
+                    continue
+                self._conn.execute("INSERT INTO memory_rows (memory_id, scope) VALUES (?, ?)", (memory_id, scope))
+                self._conn.execute("INSERT INTO vec_memory (rowid, scope, memory_id, embedding) VALUES (?, ?, ?, ?)",
+                                   (self._conn.last_insert_rowid(), scope, memory_id, sqlite_vec.serialize_float32(vector)))
+                written += 1
+        return written
+
+    def memory_dense(self, scopes, vector, limit):
+        """The memory ids in these scopes nearest to vector, nearest first."""
+        if not self.vectors:
+            return []
+        if len(vector) != DIMENSIONS or not 0 <= limit <= 4096:
+            raise ValueError(f"a query of {len(vector)} dimensions for {limit}")
+        found = []
+        for scope in scopes:
+            found += self._read(lambda conn, scope=scope: conn.execute(
+                "SELECT memory_id, distance FROM vec_memory WHERE embedding MATCH ? AND k = ? AND scope = ?"
+                " ORDER BY distance", (sqlite_vec.serialize_float32(vector), limit, scope)).fetchall())
+        return [m for m, _ in sorted(found, key=lambda pair: pair[1])][:limit]
 
     # Search
 

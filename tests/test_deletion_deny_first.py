@@ -2,7 +2,7 @@
 builds: once a material is deleted, nothing of it is read back (its record, versions, passages and
 page images), its passages leave its project's index after they were added, and a file shared with
 another project stays there. Deletion while a material is read or looked up is in test_materials.py
-and test_identifier_lookup.py; memory and the index's own checks come with S1-17 and S1-21."""
+and test_identifier_lookup.py; the index's own checks come with S1-17, memory's with S1-21a (below)."""
 
 import asyncio
 
@@ -31,7 +31,8 @@ async def test_a_deleted_material_is_read_back_nowhere_and_leaves_its_projects_i
             assert (await client.get(path)).status_code == 404, path
         listed = await client.get(f"/api/projects/{mine}/materials")
         assert listed.json()["materials"] == [], listed.text
-        removed = await rows(client, "SELECT project_id, count(*) FROM index_queue WHERE op = 'remove' GROUP BY 1")
+        removed = await rows(client, "SELECT project_id, count(*) FROM index_queue WHERE op = 'remove'"
+                                     " AND target = 'passage' GROUP BY 1")  # S1-21a: its progress record's too, apart
         assert removed == [(mine, len(passages))]  # only its own project's rows; the other keeps the shared file
         # The shared extraction is the other project's still: readable there.
         assert (await client.get(f"/api/material-versions/{kept['version']['id']}/passages")).json()["total"] == len(passages)
@@ -223,3 +224,88 @@ async def test_a_paper_deleted_between_retrieval_and_dispatch_reaches_no_request
         assert stream[-1]["status"] in ("cancelled", "failed")
         assert await rows(client, "SELECT count(*) FROM citations") == [(0,)]
         assert ANSWER not in str(await rows(client, "SELECT answer FROM turns"))
+
+
+# S1-21a: memory (slice-1 spec sections 10 and 14: "Deleted or inaccessible sources stay out of context and memory")
+
+
+async def test_a_record_forgotten_while_a_request_holds_it_revokes_the_run_and_is_never_sent_again(tmp_path):
+    # L3 (c): the dispatch check covers every memory record in the request's context; the run ends revoked, and
+    # Continue builds without it.
+    import json as _json
+
+    from scholia_app import MockProvider, send
+    from test_memory import conversation_in
+    provider = MockProvider()
+    held = asyncio.Event()
+    forgotten = asyncio.Event()
+
+    async def answering(body):
+        held.set()
+        await forgotten.wait()
+        return provider.answer("An answer.")
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We dropped the pilot study"})).json()
+        conversation = await conversation_in(client, project)
+        provider.replies.append(answering)
+        provider.replies.append(provider.answer("A second answer."))
+        provider.hold = None
+        sending = asyncio.create_task(send(client, conversation, "What did we decide last time?"))
+        await held.wait()  # the first attempt holds the record; its retry must not
+        assert (await client.delete(f"/api/memory/{record['id']}")).json() == {"ok": True}
+        forgotten.set()
+        stream = await sending
+        assert stream[-1]["status"] == "cancelled" and stream[-1]["cancel_reason"] == "revoked"
+        again = await client.post(f"/api/runs/{stream[0]['run_id']}/continue")
+        assert again.status_code == 200
+        for body in provider.answers[1:]:
+            assert "We dropped the pilot study" not in _json.dumps(body)
+
+
+async def test_a_deleted_papers_memory_and_its_extractions_held_reply_go_in_the_deletions_transaction(tmp_path):
+    # L3 (b): a record that may carry a paper's text goes with the paper (any one of them), its vector is queued
+    # for removal; an extraction holding a reply drawn on it loses that reply at once.
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, ("notes.md", b"# Notes\n\nWages rose.\n")))["materials"]
+        [other] = (await added(client, project, ("more.md", b"# More\n\nPrices fell.\n")))["materials"]
+
+        def seeded(conn):
+            record = memory.write(conn, project_id=project, scope="project", kind="event", content="Wages rose, it says",
+                                  status="confirmed", sources=[("material", paper["id"]), ("material", other["id"])])
+            run = memory.new_id()
+            conn.execute("INSERT INTO runs (id, project_id, kind, workflow, inputs) VALUES (?, ?, 'background', 'x', ?)",
+                         (run, project, '{"context_materials": ["%s"], "held": {"output": [{"content": "Wages rose"}]}}'
+                          % paper["id"]))
+            return record, run
+        record, run = await asyncio.to_thread(client.state["db"].write, seeded)
+        assert (await client.delete(f"/api/materials/{other['id']}")).status_code == 200  # any one of its papers
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", record) == [(0,)]
+        assert (await client.delete(f"/api/materials/{paper['id']}")).status_code == 200
+        assert await rows(client, "SELECT json_extract(inputs, '$.held.output') FROM runs WHERE id = ?", run) == [(None,)]
+
+
+async def test_the_dispatch_check_refuses_a_request_holding_a_memory_record_that_is_gone(tmp_path):
+    import json as _json
+
+    from backend import memory, runs
+    from test_memory import conversation_in
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "Held"})).json()["id"]
+        run = memory.new_id()
+        db = client.state["db"]
+        await asyncio.to_thread(db.write, lambda conn: conn.execute(
+            "INSERT INTO runs (id, project_id, conversation_id, kind, workflow, inputs) VALUES (?, ?, ?, 'turn', 'agent', ?)",
+            (run, project, conversation, _json.dumps({"memory_ids": [record]}))))
+        assert await asyncio.to_thread(db.read, lambda conn: runs.may_dispatch(conn, run)) is True
+        assert (await client.delete(f"/api/memory/{record}")).json() == {"ok": True}
+        assert await rows(client, "SELECT cancel_reason FROM runs WHERE id = ?", run) == [("revoked",)]  # SCOPE_LINKS
+        await asyncio.to_thread(db.write, lambda conn: conn.execute("UPDATE runs SET cancel_reason = NULL WHERE id = ?",
+                                                                    (run,)))
+        assert await asyncio.to_thread(db.read, lambda conn: runs.may_dispatch(conn, run)) is False  # gone, whatever else

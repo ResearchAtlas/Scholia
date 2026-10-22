@@ -11,7 +11,7 @@ import pytest
 from backend import pipeline, runs as runs_module
 from backend.db import deletion
 from cited import ANSWER, Provider, cited, conversation_in, rows, with_papers
-from scholia_app import events, run_finished, send
+from scholia_app import background_idle, events, run_finished, send
 from test_search import WAGES, paper, setting
 
 pytestmark = pytest.mark.asyncio
@@ -749,6 +749,7 @@ async def test_an_earlier_answer_whose_papers_project_was_tightened_is_left_out_
         project, _ = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         await send(client, conversation, QUESTION)
+        await background_idle(client)  # S1-21a: its extraction runs keyed to its turn, which a move waits for
         other = await project_of(client, "Other")
         assert (await client.post(f"/api/conversations/{conversation}/move", json={"project_id": other})).status_code == 200
         response = await (client.post(f"/api/projects/{project}/sensitivity", json={"level": "local_only"})
@@ -772,6 +773,7 @@ async def test_a_history_dependency_tightened_after_registration_stops_the_dispa
         project, _ = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         await send(client, conversation, QUESTION)
+        await background_idle(client)  # S1-21a: its extraction runs keyed to its turn, which a move waits for
         other = await project_of(client, "Other")
         assert (await client.post(f"/api/conversations/{conversation}/move", json={"project_id": other})).status_code == 200
         real = runs_module.Harness._register_context

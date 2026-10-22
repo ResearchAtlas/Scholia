@@ -205,6 +205,7 @@ class Export(BaseModel):
     destination: str = Field(min_length=1, max_length=4096)
     passphrase: str | None = Field(default=None, max_length=1024)
     language: Literal[i18n.LANGUAGES] = "en"  # the interface's, for the headings the export writes
+    memory: bool = True  # S1-21a: the project's memory records, unless the researcher leaves them out (T31:102)
 
 
 @contextlib.asynccontextmanager
@@ -574,7 +575,7 @@ def register(harness, state):
                 if inputs.get("project_id"):  # an export; else a full backup
                     write = lambda: _export(db, inputs["project_id"], destination, passphrase,  # noqa: E731
                                             inputs.get("language", "en"), state["archives"], stop, progress,
-                                            state.get("content"))
+                                            state.get("content"), memory=inputs.get("memory", True))
                 else:
                     write = lambda: _full_backup(db, destination, passphrase, state["archives"], stop,  # noqa: E731
                                                  progress, state.get("content"))
@@ -1376,20 +1377,24 @@ async def export_project(project_id: str, body: Export, request: Request):
         raise BackupError(400, "passphrase_required", "A Private or Local only project needs a passphrase")
     run_id = await _to_end(state["harness"].start_local(
         project_id, "project_export", {"project_id": project_id, "destination": str(destination),
-                                       "encrypted": bool(body.passphrase), "language": body.language},
+                                       "encrypted": bool(body.passphrase), "language": body.language,
+                                       **({} if body.memory else {"memory": False})},
         {"passphrase": body.passphrase or None}))
     return {"run_id": run_id}
 
 
-def _export(db, project_id, destination, passphrase, language, archives, stop=None, progress=None, store=None):
+def _export(db, project_id, destination, passphrase, language, archives, stop=None, progress=None, store=None,
+            memory=True):
     with _written(), _watched(archives, {project_id}, passphrase) as archive, contextlib.ExitStack() as held:
-        return _write_export(db, project_id, destination, passphrase, language, archive, stop, progress, store, held)
+        return _write_export(db, project_id, destination, passphrase, language, archive, stop, progress, store, held,
+                             memory=memory)
 
 
 def _write_export(db, project_id, destination, passphrase, language, archive, stop=None, progress=None, store=None,
-                  held=None):
-    """store and held: as for _write_full_backup."""
-    data = db.read(lambda conn: _project_records(conn, project_id))
+                  held=None, memory=True):
+    """store and held: as for _write_full_backup. memory: the project's memory records go in memory.json (its personal
+    records never do)."""
+    data = db.read(lambda conn: _project_records(conn, project_id, memory))
     if data is None:
         raise BackupError(404, "not_found", "No such project")
     if store is not None and held is not None:  # the papers' files, read later: none is collected meanwhile
@@ -1419,6 +1424,8 @@ def _write_export(db, project_id, destination, passphrase, language, archive, st
                 else:
                     version["file"] = None  # metadata only, or the file is missing
         entries.append(("materials.json", _json(data["materials"])))
+    if data.get("memory"):
+        entries.append(("memory.json", _json(data["memory"])))
     folder = db.data_dir / "projects" / project_id
     for name in SETTINGS_FILES:
         path = folder / name
@@ -1429,7 +1436,7 @@ def _write_export(db, project_id, destination, passphrase, language, archive, st
                 entries.append((f"settings/{name}", raw))
     record = {"encrypted": passphrase is not None, "conversations": len(data["conversations"]),
               "turns": sum(len(c["turns"]) for c in data["conversations"]), "artifacts": len(data["artifacts"]),
-              "materials": len(data["materials"])}
+              "materials": len(data["materials"]), "memory": len(data.get("memory") or [])}
     path = _write_zip(destination, f"scholia-project-{project_id[:8]}", entries, passphrase,
                       stop=stop or (lambda: db.closed), archive=archive, progress=progress,
                       audit=lambda file: db.write(lambda conn: conn.execute(  # its destination, never content
@@ -1447,8 +1454,9 @@ def _write_export(db, project_id, destination, passphrase, language, archive, st
     return {"ok": True, "file": str(path), **record, "size": path.stat().st_size}
 
 
-def _project_records(conn, project_id):
-    """Everything an export holds from the database, read in one transaction, or None."""
+def _project_records(conn, project_id, memory=True):
+    """Everything an export holds from the database, read in one transaction, or None. memory: the project's own memory
+    records, every version, with their sources (S1-21a)."""
     def rows(sql, *args):
         cursor = conn.execute(sql, args)
         names = [column[0] for column in cursor.description]
@@ -1483,7 +1491,15 @@ def _project_records(conn, project_id):
                      " created_at, updated_at FROM artifacts WHERE project_id = ? ORDER BY created_at, id", project_id)
     for artifact in artifacts:
         artifact["authors"], artifact["doc"] = json.loads(artifact["authors"]), json.loads(artifact["doc"])
-    return {"project": projects[0], "conversations": conversations, "materials": materials, "artifacts": artifacts}
+    records = rows("SELECT id, type, content, structured, status, valid_from, valid_to, version, supersedes_id,"
+                   " created_at, updated_at FROM memory_records WHERE scope = 'project' AND project_id = ?"
+                   " ORDER BY created_at, id", project_id) if memory else []
+    for record in records:
+        record["structured"] = json.loads(record["structured"]) if record["structured"] else None
+        record["sources"] = rows("SELECT source_kind AS kind, source_id AS id FROM memory_sources WHERE memory_id = ?"
+                                 " ORDER BY source_kind, source_id", record["id"])
+    return {"project": projects[0], "conversations": conversations, "materials": materials, "artifacts": artifacts,
+            "memory": records}
 
 
 def _conversation_markdown(conversation, language="en"):

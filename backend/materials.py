@@ -60,7 +60,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from backend import asks, backups, extraction, lookup, reading, search
+from backend import asks, backups, extraction, lookup, memory, reading, search
 from backend.db import ContentCorruptError, delete, new_id, utc_now
 from backend.db.deletion import supersede
 from backend.outbound_gate import OutboundDenied
@@ -256,6 +256,8 @@ def add_version(conn, harness, project_id, material, sha256, kind, origin, recor
             conn.execute("UPDATE materials SET evidence_type = 'full_text', updated_at = ? WHERE id = ?",
                          (utc_now(), material))  # a file read from now on: a reference file's paper has its text
             _forget_file_lookup(conn, material)
+    else:  # S1-21a: a paper new to the project is what's done (project state's progress, from AAB's own records)
+        memory.materials_added(conn, project_id, [material])
     version = new_id()
     conn.execute("INSERT INTO material_versions (id, material_id, seq, file_sha256, is_current, media_type)"
                  " VALUES (?, ?, ?, ?, 1, ?)", (version, material, seq, sha256, kind))

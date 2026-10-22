@@ -97,7 +97,8 @@ async def test_a_turn_whose_search_is_keyword_only_says_so_in_its_request_trace_
         client.remote.failing = cause == "request_failed"
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, QUESTION)
-        [trace] = [d for kind, d, _ in await events_of(client, stream[0]["run_id"]) if kind == "retrieval_trace"]
+        [trace] = [d for kind, d, _ in await events_of(client, stream[0]["run_id"])
+                   if kind == "retrieval_trace" and "memory" not in d]  # S1-21a: memory's trace apart
         assert (trace["mode"], trace["reason"]) == ("keyword_only", cause)
         [body] = client.provider.answers
         assert "keyword search only" in body["messages"][0]["content"]

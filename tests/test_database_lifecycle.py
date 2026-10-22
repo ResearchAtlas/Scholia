@@ -140,9 +140,12 @@ def test_an_existing_database_at_version_zero_is_backed_up_before_migrating(tmp_
     conn.close()
 
     Database(data).close()
-    generation, *later_ones = generations(data)
-    assert len(later_ones) == len(MIGRATIONS) - 1  # one backup before each migration
-    backup = sqlite3.connect((data / "backups" / "daily" / generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
+    # one backup before each migration; past the daily ones kept, the oldest is promoted to weekly (S1-21a's 0008
+    # made them eight)
+    found = sorted([(name, "weekly") for name in generations(data, "weekly")] + [(name, "daily") for name in generations(data)])
+    assert len(found) == len(MIGRATIONS)
+    generation, kind = found[0]
+    backup = sqlite3.connect((data / "backups" / kind / generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
     try:
         assert backup.execute("PRAGMA user_version").fetchone()[0] == 0
         assert backup.execute("SELECT text FROM notes").fetchall() == [("kept",)]

@@ -574,6 +574,7 @@ async def test_a_receipt_is_recorded_even_if_stop_comes_while_the_client_closes(
 
     async with started(tmp_path / "data") as client:
         await send(client, await new_conversation(client, title="t"))  # the catalog and endpoints, read once
+        await background_idle(client)  # S1-21a: its extraction's client closes before this test's does
         conversation = await new_conversation(client, title="t")
         monkeypatch.setattr(httpx.AsyncClient, "__aexit__", slow_exit)
         stream = asyncio.create_task(send(client, conversation))

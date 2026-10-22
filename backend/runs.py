@@ -64,11 +64,11 @@ import unicodedata
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 
-from backend import (agent, budget_router, citations, context, credentials, governance, openrouter,
+from backend import (agent, budget_router, citations, context, credentials, governance, memory, openrouter,
                      openrouter_client, provenance, providers, reach, router, skills, spending)
 from backend.evidence import historical_citations
 from backend.search_index import still_read
-from backend.db import new_id, utc_now
+from backend.db import deletion, new_id, utc_now
 from backend.openrouter_client import catalog_read, catalog_status, get_model_metadata
 from backend.settings import load_instructions, load_settings, visible
 from backend.tools.parser import ToolParser
@@ -330,7 +330,8 @@ def may_dispatch(conn, run_id, past_deadline=None):
     work's project and source turn; project background work's project alone, whose missing
     conversation and source turn are no deletion); its project is not review-locked; and every
     passage its request holds (inputs.evidence, S1-19's [passage id, material id] pairs) is still read
-    by the paper the request names it under. The project's current level and the route it allows are
+    by the paper the request names it under, and every memory record it holds (inputs.memory_ids, S1-21a) still
+    exists. The project's current level and the route it allows are
     the gate's own checks there. past_deadline(), if given, is a turn's time limit (section 13), checked here, in
     the gate's decision transaction just before the request is sent, whatever it waited for before (its body's
     storage, the gate, the stream's reader): past it the request is refused, "turn_deadline"."""
@@ -338,11 +339,13 @@ def may_dispatch(conn, run_id, past_deadline=None):
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
         " r.source_turn_id IS NULL OR EXISTS (SELECT 1 FROM turns WHERE run_id = r.source_turn_id),"
-        " r.project_id, json_extract(r.inputs, '$.evidence'), json_extract(r.inputs, '$.context_materials')"
+        " r.project_id, json_extract(r.inputs, '$.evidence'), json_extract(r.inputs, '$.context_materials'),"
+        " (SELECT count(*) FROM json_each(r.inputs, '$.memory_ids') j WHERE NOT EXISTS"
+        "  (SELECT 1 FROM memory_records m WHERE m.id = j.value))"
         " FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?", (run_id,)).fetchone()
     if row is None:
         return False
-    status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence, held = row
+    status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence, held, forgotten = row
     owners = has_conversation if kind in ("turn", "child") else has_source
     if not (status == "running" and cancel_reason is None and not locked and bool(owners)):
         return False
@@ -353,6 +356,8 @@ def may_dispatch(conn, run_id, past_deadline=None):
     # S1-19: every passage in the request's context is still read by the paper it is named under
     # (section 10, Revocation: each PR that adds a context source registers its records here).
     wanted = {tuple(pair) for pair in json.loads(evidence)} if evidence else set()
+    if forgotten:  # S1-21a: a memory record the request holds was forgotten (deleted) since it was assembled
+        return False
     if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
         return False  # gone, or its project no longer allows this request (tightened, or review-locked)
     return not wanted or still_read(conn, project_id, wanted) == wanted
@@ -720,6 +725,7 @@ class Harness:
         own = project_settings.values
         limits = {k: (own.get("limits") or {}).get(k) or personal.values["limits"][k]
                   for k in ("agent_steps", "tool_calls", "turn_minutes")}  # a project's own limits first
+        memory_on = memory.enabled(own)  # S1-21a: unset means on; off stops extraction, recall and Things to confirm
 
         def admit(conn):
             moved = conn.execute("SELECT project_id FROM conversations WHERE id = ?", (claim.conversation_id,)).fetchone()
@@ -813,7 +819,8 @@ class Harness:
             "instructions": instructions, "personal": personal, "table": table, "policy": policy,
             "provider": provider_config, "router_model": router_model, "history_materials": history_materials,
             "history_left_out": history_left_out, "tools": tools, "skill_sections": skill_sections, "limits": limits,
-            "reusable": {}, "active": active,
+            "reusable": {}, "active": active, "memory_on": memory_on, "command": memory.command(message),
+            "extractor": visible(personal.values["models"].get("extractor")),
         }
         claim.admitted = time.monotonic()
         return claim
@@ -858,17 +865,21 @@ class Harness:
                 raise asyncio.CancelledError()
             await handed({"type": "run_started", "run_id": claim.run_id, "conversation_id": claim.conversation_id,
                           "seq": ctx["seq"]})
+            turn = agent.Turn(self, claim, agent.Evidence({}), emit)
+            # S1-21a: an explicit memory command takes effect now, before any model call (section 8; F10)
+            await self._memory_command(claim, ctx, turn)
             decision = ctx["decision"]
             if decision["decided_by"] == "router":  # no rule fired, and a small model is set
                 decision = await self._router_step(claim, ctx)
             await handed({"type": "route", "route": decision["route"], "decided_by": decision["decided_by"]})
+            await self._recall(claim, ctx, decision)  # S1-21a: PROJECT STATE and USER MEMORY, by the route
             found = {"records": [], "mode": None, "reason": None}
             if decision["route"] in RETRIEVAL_ROUTES:
                 found = await self._evidence(claim, ctx, decision)
             numbered, request = self._cited_request(ctx, found, decision)
             await self._register_context(claim, numbered)  # the dispatch check now covers its passages
             judge = ctx["judge"] = await self._judge_route(ctx)
-            turn = agent.Turn(self, claim, agent.Evidence(numbered), emit)
+            turn.evidence = agent.Evidence(numbered)
             result = await self._agent_steps(claim, ctx, turn, found, decision, request, handed)
             numbered = turn.evidence.numbered  # every passage read in the run: the pre-load and the tools'
             if result == "stopped":  # the researcher chose to stop after three failed tool calls (section 6.6)
@@ -1055,6 +1066,18 @@ class Harness:
                     "conversation_id": claim.conversation_id, "title_rev": untitled[0],
                     "provider": ctx["route"].provider.name, "model": ctx["route"].model,
                 })))  # content-free: the message is read from the source turn when the run calls
+        # S1-21a: memory extraction, detached the same way (section 6.1, Post-answer work): one run keyed by the turn,
+        # on the extractor model (`[models] extractor`, on the turn's provider) or, unset, the turn's own route and
+        # privacy controls, read again before it calls; none while memory is off in the project, and none for a turn whose
+        # message was an explicit command, which code applied already (extracting it again could undo a forget).
+        if ctx.get("memory_on") and ctx.get("command") is None:
+            conn.execute(
+                "INSERT INTO runs (id, project_id, kind, workflow, source_turn_id, inputs)"
+                " VALUES (?, ?, 'background', 'memory', ?, ?)",
+                (new_id(), ctx["project_id"], claim.run_id, json.dumps({
+                    "conversation_id": claim.conversation_id, "provider": ctx["route"].provider.name,
+                    "model": ctx.get("extractor") or ctx["route"].model, "inherited": not ctx.get("extractor")})))
+            conn.execute("UPDATE turns SET memory_status = 'pending' WHERE run_id = ?", (claim.run_id,))
         return {"run_id": claim.run_id, "status": "succeeded", "cost_usd": cost,
                 "accounting": _accounting(conn, claim.run_id)}
 
@@ -1276,7 +1299,7 @@ class Harness:
                 sections={"agents_md": [ctx["instructions"]] if ctx["instructions"] else [], "research_evidence": evidence,
                           "conflicts": citations.missing(read or held, mode=found["mode"], route=decision["route"],
                                                          **({} if beyond else {"index": index, "cut": cut})),
-                          **ctx["skill_sections"]},
+                          **ctx["skill_sections"], **ctx.get("memory_sections", {})},
                 history=ctx["history"], tools=ctx["tools"], chain=chain)
         request = assemble(lines, numbered)
         kept = len(lines) - request.cuts.get("research_evidence", 0)
@@ -1299,9 +1322,13 @@ class Harness:
         # every paper whose text the request carries: its evidence, and the earlier turns its history holds; in an
         # agent turn, what its earlier steps carried too (its chain is never cut)
         shown = claim.context["history_materials"][:claim.context.get("history_kept", 0)]
-        held = sorted({*papers, *(m for turn in shown for m in turn), *claim.context.get("context_materials", ())})
+        # S1-21a: the memory records the request holds (USER MEMORY, PROJECT STATE, read_memory and read_project_state)
+        # and the papers whose text they may carry
+        remembered = sorted(claim.context.get("memory_ids", ()))
+        held = sorted({*papers, *(m for turn in shown for m in turn), *claim.context.get("context_materials", ()),
+                       *claim.context.get("memory_materials", ())})
         claim.context["context_materials"] = held
-        if not held:
+        if not held and not remembered:
             return
 
         def record(conn):
@@ -1312,11 +1339,135 @@ class Harness:
             inputs["material_ids"] = sorted({*inputs.get("material_ids", []), *held})
             inputs["evidence"] = [list(pair) for pair in pairs]
             inputs["context_materials"] = held
+            if remembered:
+                inputs["memory_ids"] = remembered
             conn.execute("UPDATE runs SET inputs = ? WHERE id = ?", (json.dumps(inputs), claim.run_id))
         try:
             await self._write(record)
         except _Cancelled:
             raise asyncio.CancelledError() from None
+
+    # S1-21a: memory commands and recall
+
+    async def _memory_command(self, claim, ctx, turn):
+        """An explicit memory command in the researcher's message (memory.command), applied before any model call:
+        a save, update or correction that carries its text is written at once, confirmed (the researcher's own
+        words); a forget whose text names one record clearly deletes it through the deletion service; a bare "save
+        this", "update this" or "forget this", or a forget naming no record clearly, asks first on the shared
+        confirmation, and only the researcher's answer saves or forgets (section 8, Words that count). With memory
+        off nothing is written. Each outcome is a content-free `memory_proposed` event (`command`; `applied` 1 when
+        something changed), a `memory` stream event, and a line in USER MEMORY telling the model what was done, so
+        its answer confirms it; the conversation shows it read back from the record."""
+        ctx["memory_notes"] = []
+        asked = ctx.get("command")
+        if asked is None:
+            return
+        action, text, project_id = asked["action"], asked["text"], ctx["project_id"]
+
+        async def done(what, data=None, count=0, line=None, change=None):
+            def apply(conn):
+                ids = change(conn) if change is not None else None
+                ids = [i for i in (ids or []) if i]
+                _event(conn, claim.run_id, "memory_proposed", {"command": action, "applied": int(bool(ids or count)),
+                                                               "action": what, **({"records": ids} if ids else {}),
+                                                               **({"count": count} if count else {}), **(data or {})})
+                return ids
+            ids = []
+
+            def keep(conn):
+                ids.extend(apply(conn))
+            await self._record(claim, None, None, also=keep)
+            turn.emit({"type": "memory", "action": what, "count": count or len(ids)})
+            if line:
+                ctx["memory_notes"].append(line)
+
+        if not ctx["memory_on"]:
+            return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
+        previous = await self._read(lambda conn: memory.previous_answer(conn, claim.conversation_id, claim.run_id))
+        if text is not None and action != "forget":
+            return await done("saved" if action == "save" else "updated", change=lambda conn: memory.save_command(
+                conn, project_id=project_id, run_id=claim.run_id, action=action, text=text)[1],
+                line=f"{'Saved to' if action == 'save' else 'Updated in'} memory at the researcher's request, confirmed: {text}")
+        if action == "forget":
+            scored = await self._read(lambda conn: memory.forget_candidates(conn, project_id, text, previous and previous[0]))
+            ids = [r["id"] for _, r in scored]
+            if text is not None and memory.clear(scored):
+                ids = ids[:1]
+            elif not ids:
+                return await done("no_match", line="The researcher asked to forget something, but no memory record "
+                                                    "matches it: nothing was forgotten.")
+            else:
+                reply = await self._ask(turn, "memory_forget", ["forget", "not_now"], {"records": ids}, None)
+                if (reply or {}).get("option") != "forget":
+                    return await done("declined", line="Nothing was forgotten: the researcher chose not now.")
+            count = 0
+            for record in ids:
+                with suppress(LookupError):  # forgotten meanwhile
+                    await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
+                                            on_committed=self.revoke)
+                    count += 1
+            return await done("forgotten", count=count, line=f"Forgotten at the researcher's request: {count} memory "
+                                                             f"record{'s' if count != 1 else ''}. Do not use it.")
+        if action == "save":
+            if previous is None:
+                return await done("no_candidate", line="The researcher asked to save something, but there is no "
+                                                       "earlier answer to save: nothing was saved.")
+            reply = await self._ask(turn, "memory_save", ["save", "not_now"], {"turn": previous[0]}, None)
+            if reply is None or (reply.get("option") != "save" and "text" not in reply):
+                return await done("declined", line="Nothing was saved: the researcher chose not now.")
+            return await done("saved", change=lambda conn: [memory.save_answer(
+                conn, project_id=project_id, run_id=claim.run_id, previous=previous[0], text=reply.get("text"))],
+                line="Saved to memory at the researcher's request, confirmed: "
+                     + (reply.get("text") or "the earlier answer"))
+        candidates = await self._read(lambda conn: [r for r in memory.in_scope(conn, project_id)][:1])
+        if not candidates:
+            return await done("no_match", line="The researcher asked to change a memory record, but there is none: "
+                                                "nothing was changed.")
+        reply = await self._ask(turn, "memory_update", ["not_now"], {"records": [candidates[0]["id"]]}, None)
+        if reply is None or "text" not in reply:
+            return await done("declined", line="Nothing was changed: the researcher chose not now.")
+        return await done("updated", change=lambda conn: memory.save_command(
+            conn, project_id=project_id, run_id=claim.run_id, action=action, text=reply["text"],
+            replaces=candidates[0]["id"])[1], line=f"Updated in memory at the researcher's request, confirmed: {reply['text']}")
+
+    async def _recall(self, claim, ctx, decision):
+        """PROJECT STATE and USER MEMORY for the turn, by its route (memory.wants), unless memory is off: the project
+        state, what's done and the agent's notes; and at most 10 records, the nearest in meaning first when the search
+        model answers within `[retrieval] memory_ms`, else the newest (said in the trace). Each record joins the
+        request's context (the dispatch check, and the papers it may carry); the trace names them by id."""
+        from backend import search  # search imports this module
+        sections = {"user_memory": list(ctx.get("memory_notes") or [])}
+        traced, ids = {}, []
+        if ctx["memory_on"]:
+            wants_state, wants_memory = memory.wants(decision)
+            if wants_state:
+                lines, state_ids = await self._read(lambda conn: memory.project_state(conn, ctx["project_id"]))
+                sections["project_state"], ids, traced["state"] = lines, [*state_ids], state_ids
+            if wants_memory:
+                candidates = await self._read(lambda conn: memory.recall_candidates(
+                    conn, ctx["project_id"], locked=ctx["policy"].locked))
+                nearest, mode, reason = None, "recency", None
+                state = search._STATES.get(self)
+                if candidates and state is not None:
+                    try:
+                        nearest = await asyncio.wait_for(search.nearest_memory(state, ctx["project_id"], ctx["message"]),
+                                                         ctx["personal"].values["retrieval"]["memory_ms"] / 1000)
+                        mode = "similarity" if nearest is not None else "recency"
+                        reason = None if nearest is not None else "unavailable"
+                    except TimeoutError:
+                        reason = "deadline"
+                    except Exception as error:  # the helper or the index failed: the newest, said
+                        log.warning("memory similarity failed (%s)", type(error).__name__)
+                        reason = "unavailable"
+                chosen = memory.ranked(candidates, nearest)
+                sections["user_memory"] += [memory.memory_line(r) for r in chosen]
+                ids += [r["id"] for r in chosen]
+                traced.update(records=[r["id"] for r in chosen], mode=mode, **({"reason": reason} if reason else {}))
+        ctx["memory_sections"] = sections
+        ctx["memory_ids"] = sorted(set(ids))
+        ctx["memory_materials"] = await self._read(lambda conn: memory.materials_of(conn, ids)) if ids else []
+        if ids:  # what the request holds of memory, by id; nothing when it holds none
+            await self._record(claim, "retrieval_trace", {"memory": traced})
 
     # S1-19c: the agent loop
 
@@ -1444,7 +1595,8 @@ class Harness:
                                                                         "message": result.error.message})}
 
         async def keeping():  # registered, stored, linked and recorded to its end, whatever cancellation comes meanwhile
-            if turn.listed or result.meta.get("passages"):  # what it gave the model is covered before the next dispatch
+            if turn.listed or result.meta.get("passages") or result.meta.get("memory"):  # what it gave the model is
+                # covered before the next dispatch (S1-21a: memory records too)
                 await self._register_context(claim, turn.evidence.numbered, turn.listed)
             materials = tuple(sorted(turn.ctx.get("context_materials") or ()))
             with self.content.hold() if self.content is not None else nullcontext([]) as held:
@@ -1727,7 +1879,7 @@ class Harness:
                       "endpoints": list(found.tags), "row": row, "output": found.output, "tools": found.tools}
 
     async def _call(self, active, call, route, key, request, facts, *, output=None, zero_retention=False, timeout=None,
-                    materials=(), rehold=None):
+                    materials=(), rehold=None, hold=False):
         """The dispatch path: every model call goes through here, and nowhere else calls the provider
         adapter (tests/test_dispatch_path.py). It sends the request the context assembler built, for
         an admitted call (its reservation), through the gate with the dispatch check, and records it,
@@ -1739,7 +1891,9 @@ class Harness:
         (owner-only), for the trace's exact outbound text: its model_attempt event names it (body), and a
         run_bodies row keeps it with the papers whose passages it holds (materials, run_body_materials), so
         deleting one of them deletes it (backend/db/deletion.py). A body of a paper deleted before it is
-        recorded is not kept."""
+        recorded is not kept. hold (S1-21a): the output is model text that may quote a paper, so it is kept in the run's
+        inputs (`held.output`, taken out at its terminal record and by a deletion of one of its papers,
+        provenance.forget) and the finished step names it only ("output": "held")."""
         if not isinstance(request, context.Request):
             raise TypeError("a model request is built by the context assembler")
         if context.serialized_tokens(request.messages, request.tools) + request.max_tokens > request.window:
@@ -1805,6 +1959,10 @@ class Harness:
                         held = _hold_unspent(conn, call, rehold, self.data_dir)
                         if held:
                             finished.update(unspent_id=held[0], unspent_usd=held[1])
+                if hold and "output" in finished and exists:
+                    conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.held.output', json(?))"
+                                 " WHERE id = ?", (json.dumps(finished["output"]), active.run_id))
+                    finished["output"] = "held"
                 if exists:
                     _event(conn, active.run_id, "step_finished", finished)
                 if not result.dispatched:
@@ -1888,13 +2046,16 @@ class Harness:
                 index_run = workflow == "index"
                 await self._local(active, project_id, workflow, inputs)
                 return
-            inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
+            if workflow != "memory":  # an extraction reads its turn itself (memory.extraction_input)
+                inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
             recorded = await self._read(lambda conn: conn.execute(
                 "SELECT data FROM run_events WHERE run_id = ? AND type = 'step_finished' ORDER BY seq DESC LIMIT 1",
                 (active.run_id,)).fetchone())
             if recorded is not None:  # rule 2: finish from the record, whatever it says, with no model call
                 step = json.loads(recorded[0])
                 output = step.get("output") if step.get("outcome") == "ok" else None
+                if output == "held":  # held in the run's inputs, not the append-only event (_call's hold)
+                    output = (inputs.get("held") or {}).get("output")
             elif attempts < BACKGROUND_ATTEMPTS:  # rule 3: another model call
                 output = await self._background_call(active, project_id, workflow, inputs)
             else:  # rule 4
@@ -1922,6 +2083,10 @@ class Harness:
                 await _through(self._ended(active, cancelled))
         except spending.BudgetExceeded:
             await _through(self._ended(active, lambda conn: self._finish_background(conn, active, "failed", None, None)))
+        except RunOutcome as ended:  # S1-21a: an extraction skipped (its allowance, the budget, memory off, the lock)
+            await _through(self._ended(active, lambda conn: self._finish_background(
+                conn, active, ended.status, None, None, cancel_reason=ended.cancel_reason,
+                summary={"reason": ended.reason} if ended.reason else None)))
         except Exception as error:  # its record still says running: kept for the next start
             log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
         finally:
@@ -1960,6 +2125,8 @@ class Harness:
         `title`, and `citation_check` (S1-19: POST /api/citations/check, the support judge run again on the
         exact (sentence, passage) pairs its inputs name, one batch of up to `judge_pairs` a run; its output
         binds each verdict to the pair judged)."""
+        if workflow == "memory":
+            return await self._extraction_call(active, project_id, inputs)
         if workflow not in ("title", "citation_check"):
             raise ValueError(f"unknown background workflow {workflow!r}")
         if not inputs.get("message"):  # its source turn is gone: nothing to title or check
@@ -2062,6 +2229,92 @@ class Harness:
                     return None
                 found.update(got)
         return output(result) or None
+
+    async def _extraction_call(self, active, project_id, inputs):
+        """S1-21a: one memory extraction call (section 8; section 13: 1 step, 60 seconds, $0.02). Its route is the
+        extractor model on the turn's provider, or the turn's own when unset, under the project's policy now (the
+        gate checks it again at dispatch). Its request holds the researcher's message, the delivered answer labeled
+        as model output and the related records, and asks for JSON in plain text, parsed strictly (memory.parse:
+        malformed, no memory). Before each attempt, in the transaction that counts it: the call's bound (its
+        request's estimate, times the HTTP attempts one call may make) must fit what is left of the allowance after
+        the attempts before it, and the project's budget; else it is skipped, with its reason. The request's papers
+        (the answer's and the related records') and records are the run's scope and pass the dispatch check.
+        Returns the candidates, or None (failed); raises RunOutcome when it is skipped."""
+        if not memory.enabled((await asyncio.to_thread(load_settings, self.data_dir, project_id)).values):
+            raise RunOutcome("cancelled", "memory_off")
+        policy = await self._read(lambda conn: governance.policy(conn, project_id))
+        if policy is None:
+            return None
+        if policy.locked:  # a review-locked project refuses every generative function before dispatch (until S1-22)
+            raise RunOutcome("cancelled", "review_locked")
+        async with self.settings_lock:  # the provider snapshot, as for a turn (see _admit)
+            active.provider = inputs.get("provider")
+            route = await asyncio.to_thread(providers.resolve_route, self.data_dir, inputs.get("provider"),
+                                            inputs.get("model"))
+            personal = await asyncio.to_thread(load_settings, self.data_dir)
+            table = ((personal.values.get("providers") or {}).get(route.provider.name) or {}) if route else {}
+        key = route and await asyncio.to_thread(credentials.load_key, self.data_dir, route.provider.name,
+                                                self.keyring_backend)
+        if route is None or key is None:
+            raise RunOutcome("failed", "provider_key_missing" if route else "unknown_provider")
+        zero_retention = policy.zero_retention and route.provider.is_openrouter
+        if (zero_retention and catalog_status(route.provider, key)["stale"]) or not catalog_read(route):
+            await self.catalog(route.provider, key)
+        if (problem := _unusable(table, route.provider, route.model) or policy.problem(route.provider, route.model, key)):
+            raise RunOutcome("failed", problem)
+        problem, facts = await self._route_facts(route, key, table, zero_retention=zero_retention, effort=None)
+        if problem:
+            raise RunOutcome("failed", problem)
+        found = await self._read(lambda conn: memory.extraction_input(conn, active.run_id))
+        if found is None:  # its source turn is gone: nothing to extract, nothing written
+            return None
+        message, answer, _, related, held = found
+        budgets = personal.values["context"]
+        try:  # a role step's output limit is the least a step has
+            request = context.assemble("extract_memory", window=facts["window"], output=_output(context.MIN_OUTPUT, facts),
+                                       budgets=budgets, margin_percent=budgets["margin_percent"],
+                                       system_rules=memory.EXTRACT_RULES,
+                                       request=memory.extraction_request(message, answer, related))
+        except context.OverWindow as over:
+            raise RunOutcome("failed", over.code) from None
+        estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
+        bound = estimate * openrouter.MAX_ATTEMPTS
+        remembered = [r[0] for r in related]
+
+        def start(conn):
+            if not _running(conn, active.run_id) or _revoked(conn, active.run_id):
+                raise _Cancelled()
+            if bound > memory.ALLOWANCE_USD - spending.run_cost(conn, active.run_id) + 1e-12:
+                raise RunOutcome("cancelled", "allowance", "limit")  # retries count within the allowance
+            conn.execute(  # counted before the call; its scope (papers and records) registered before its dispatch
+                "UPDATE runs SET attempts = attempts + 1, inputs = json_set(coalesce(inputs, '{}'),"
+                " '$.context_materials', json(?), '$.material_ids', json(?), '$.memory_ids', json(?)) WHERE id = ?",
+                (json.dumps(held), json.dumps(held), json.dumps(remembered), active.run_id))
+            (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
+                                   (active.run_id,)).fetchone()
+            try:
+                reservation = spending.reserve(conn, run_id=active.run_id, step_seq=step, project_id=project_id,
+                                               paying_conversation_id=None, estimate_usd=estimate,
+                                               project_budget_usd=budget, conversation_budget_usd=None)
+            except spending.BudgetExceeded:
+                raise RunOutcome("cancelled", "budget", "limit") from None  # skipped, never asked about (S1-33)
+            _event(conn, active.run_id, "step_started", {"step": step, "phase": "extract_memory", "estimate_usd": estimate,
+                                                          "reservation_id": reservation, **_step(route, facts, request)})
+            return _Call(active.run_id, step, reservation)
+
+        async with self.settings_lock:  # the project's budget as it is now
+            budget, _ = await self._budgets(project_id)
+            try:
+                call, cancelled = await self._write_through(start)
+            except _Cancelled:
+                raise asyncio.CancelledError() from None
+        active.call = call
+        if cancelled:
+            raise asyncio.CancelledError()
+        result = await self._call(active, call, route, key, request, facts, zero_retention=zero_retention,
+                                  timeout=memory.EXTRACTION_SECONDS, materials=held,
+                                  output=lambda result: memory.parse(result.content), hold=True)
+        return memory.parse(result.content) if result.ok else None
 
     # Local background work
 
@@ -2213,7 +2466,7 @@ class Harness:
         if (ending := self.endings.get(workflow)) is not None:
             ending(conn, active, project_id)
 
-    def _finish_background(self, conn, active, status, output, inputs, cancel_reason=None):
+    def _finish_background(self, conn, active, status, output, inputs, cancel_reason=None, summary=None):
         """The run's effect, terminal status and settled cost, in one transaction. A cancel
         requested before this transaction checks for it wins, on every path: the run ends
         cancelled, with no effect. One that comes later finds the run ended, and the cancel
@@ -2233,6 +2486,18 @@ class Harness:
                 if row is not None and citations.sentence_key(row[0]) == key:
                     conn.execute("UPDATE citations SET support = ?, support_run_id = ?, checked_at = ? WHERE id = ?",
                                  (verdict, run_id, utc_now(), cid))
+        elif (workflow := conn.execute("SELECT workflow, project_id FROM runs WHERE id = ?", (run_id,)).fetchone())[0] \
+                == "memory":  # S1-21a: the extraction's records, by section 8's rules; the turn's memory_status says how
+            if status == "succeeded" and output is not None:
+                applied = memory.apply_extraction(conn, run_id, output)
+                if applied is not None:  # ids and counts only: an event holds no text
+                    _event(conn, run_id, "memory_proposed", {"counts": applied["counts"], "records": applied["records"]})
+                    summary = {"counts": applied["counts"]}
+            if (summary or {}).get("reason") == "allowance":  # the quiet notice, once per project
+                memory.record_notice(conn, workflow[1])
+            conn.execute("UPDATE turns SET memory_status = ? WHERE run_id = (SELECT source_turn_id FROM runs WHERE id = ?)",
+                         ({"succeeded": "indexed", "failed": "failed", "interrupted": "interrupted"}.get(status, "skipped"),
+                          run_id))
         elif status == "succeeded" and output is not None:
             # The title is written only if nobody changed it since the run was queued.
             conn.execute(
@@ -2240,10 +2505,12 @@ class Harness:
                 " updated_at = ? WHERE id = ? AND title_rev = ? AND coalesce(title_source, '') <> 'researcher'",
                 (output, utc_now(), inputs["conversation_id"], inputs["title_rev"]))
         _let_go(conn, run_id)
-        _event(conn, run_id, "run_finished", {"status": status})
+        _event(conn, run_id, "run_finished", {"status": status, **({"reason": summary["reason"]}
+                                                                     if (summary or {}).get("reason") else {})})
         conn.execute("UPDATE runs SET status = ?, cancel_reason = ?, waiting = NULL, finished_at = ?,"
-                     " settled_cost_usd = ? WHERE id = ?",
-                     (status, cancel_reason, utc_now(), spending.run_cost(conn, run_id), run_id))
+                     " settled_cost_usd = ?, summary = coalesce(?, summary) WHERE id = ?",
+                     (status, cancel_reason, utc_now(), spending.run_cost(conn, run_id),
+                      json.dumps(summary) if summary else None, run_id))
         self._ending(conn, active)  # a local run cancelled before its work began ends here too
 
 

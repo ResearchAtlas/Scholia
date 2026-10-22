@@ -476,7 +476,8 @@ async def _index_run(state, harness, active, project_id, inputs):
                 vectors.append((rowid, pid, mark, vector))
             embedded += await drained(index.store, project_id, vectors, stop) or 0
             await counted({})
-        return await counted({"mode": "hybrid", "embedded": embedded}), None
+        remembered = await _embed_memory(state, harness, active, project_id, drained)
+        return await counted({"mode": "hybrid", "embedded": embedded, **({"memory": remembered} if remembered else {})}), None
 
 
 async def _offer_run(state, harness, active, project_id, inputs):
@@ -562,6 +563,59 @@ async def _counts(index, project_id):
     except Exception as error:
         log.warning("the search index could not be read (%s)", type(error).__name__)
         return {}
+
+
+# S1-21a: memory embeddings (vec_memory). An index run embeds the active recalled records of its project and the
+# personal ones that lack a vector, each request carrying the run's dispatch check (the record still active); recall
+# asks for the nearest within `[retrieval] memory_ms` (backend/runs.py Harness._recall), else takes the newest.
+
+
+def memory_scopes(project_id):
+    return ["personal", f"project:{project_id}"]
+
+
+def _active_memory(conn, ids):
+    from backend import memory
+    return {m for (m,) in conn.execute(
+        "SELECT id FROM memory_records WHERE status IN ('confirmed', 'inferred') AND type IN (SELECT value FROM json_each(?))"
+        " AND id IN (SELECT value FROM json_each(?))", (json.dumps(list(memory.RECALLED)), json.dumps(list(ids))))}
+
+
+async def _embed_memory(state, harness, active, project_id, drained):
+    from backend import memory
+    index, db, run_id = state.get("index"), harness.db, active.run_id
+
+    def wanted(conn):
+        return [(r["id"], "personal" if r["scope"] == "personal" else f"project:{project_id}", r["content"])
+                for r in memory.in_scope(conn, project_id, kinds=memory.RECALLED)]
+    records = await asyncio.to_thread(db.read, wanted)
+    have = await asyncio.to_thread(index.memory_embedded, [m for m, _, _ in records]) if records else set()
+    stored = 0
+    for memory_id, scope, content in (r for r in records if r[0] not in have):
+        def admit(conn, memory_id=memory_id):
+            row = conn.execute("SELECT status, cancel_reason FROM runs WHERE id = ?", (run_id,)).fetchone()
+            return tuple(row or ()) == ("running", None) and memory_id in _active_memory(conn, [memory_id])
+        try:
+            [vector] = await local_helper.embed(state, [content], project_id=project_id, admit=admit)
+        except InputRefused:
+            continue
+        except HelperUnavailable:  # refused by the check (forgotten meanwhile) or the helper stopped: the next run
+            continue
+        if len(vector) == DIMENSIONS:
+            stored += await drained(index.store_memory, [(memory_id, scope, vector)],
+                                    lambda ids: db.read(lambda conn: _active_memory(conn, ids))) or 0
+    return stored
+
+
+async def nearest_memory(state, project_id, text):
+    """The project's memory ids nearest in meaning to text (personal ones included), nearest first, or None when the
+    search model cannot answer now (keyword-only)."""
+    index = state.get("index")
+    mode, _ = search_mode(state)
+    if mode != "hybrid" or index is None:
+        return None
+    [vector] = await local_helper.embed(state, [QUERY_INSTRUCTION + text], project_id=project_id, query=True)
+    return await asyncio.to_thread(index.memory_dense, memory_scopes(project_id), vector, 50)
 
 
 def fuse(ranked_lists, k):

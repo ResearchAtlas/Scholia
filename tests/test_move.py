@@ -134,3 +134,29 @@ async def test_a_turn_admitted_across_a_move_is_refused_rather_than_run_under_th
             await client.state["harness"].admit_turn(conversation, "hi")
         assert (await move).status_code == 200
         assert await rows(client, "SELECT count(*) FROM runs WHERE kind = 'turn'") == [(0,)]
+
+
+async def test_a_moved_conversation_takes_the_project_records_drawn_only_from_it(tmp_path):
+    # S1-21a (scope notes reading 4; checklist G9): its words stay under the stricter project; a record another
+    # conversation also stands behind stays, and so does a personal one.
+    async with started(tmp_path / "data") as client:
+        first = (await client.post("/api/projects", json={"name": "First"})).json()["id"]
+        second = (await client.post("/api/projects", json={"name": "Second"})).json()["id"]
+        await level(client, second, "private")
+        moving = (await client.post("/api/conversations", json={"project_id": first})).json()["id"]
+        staying = (await client.post("/api/conversations", json={"project_id": first})).json()["id"]
+        await send(client, moving, "Remember: the sample is 30 nurses")
+        await send(client, moving, "Remember: I prefer short answers")
+        await send(client, staying, "Remember: the deadline is in March")
+        [(both,)] = await rows(client, "SELECT id FROM memory_records WHERE content = 'the deadline is in March'")
+        [(turn,)] = await rows(client, "SELECT run_id FROM turns WHERE conversation_id = ? LIMIT 1", moving)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "INSERT INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'turn', ?)", (both, turn)))
+        await background_idle(client)
+        moved = await client.post(f"/api/conversations/{moving}/move", json={"project_id": second})
+        assert moved.status_code == 200, moved.text
+        assert sorted(await rows(client, "SELECT content, scope, project_id, sensitivity FROM memory_records"
+                                         " WHERE type != 'progress'")) == sorted([
+            ("the sample is 30 nurses", "project", second, "private"),
+            ("I prefer short answers", "personal", first, "normal"),
+            ("the deadline is in March", "project", first, "normal")])

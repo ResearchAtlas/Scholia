@@ -1,4 +1,4 @@
-"""A process killed at each commit boundary of a turn and of its title run.
+"""A process killed at each commit boundary of a turn, of its title run and of its memory extraction (S1-21a).
 
 A child process runs the app on a data folder, with model calls answered by an
 in-process mock (it opens no socket), and kills itself with SIGKILL at the point
@@ -31,6 +31,7 @@ import httpx
 from backend import runs
 from backend.app import create_app
 from backend.citations import JUDGE_RULES
+from backend.memory import EXTRACT_RULES
 
 data, scenario = sys.argv[1], sys.argv[2]
 ORIGIN = "http://127.0.0.1:8765"
@@ -82,9 +83,14 @@ async def answer(request):
     body = json.loads(request.content)
     title = body["messages"][0]["content"].startswith("Write a title")
     judge = body["messages"][0]["content"].startswith(JUDGE_RULES)
-    if (scenario == "turn_model" and not title) or (scenario in ("title_model", "restart_title_model") and title) \
-            or (scenario == "cited_judge" and judge):
+    extraction = body["messages"][0]["content"].startswith(EXTRACT_RULES)
+    if (scenario == "turn_model" and not title and not extraction) or (scenario in ("title_model", "restart_title_model") and title) \
+            or (scenario == "cited_judge" and judge) or (scenario == "memory_model" and extraction):
         crash()
+    if extraction:  # S1-21a: one record, resting on the researcher's own words
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"records": [{
+            "type": "project_state", "content": "We use interviews.", "status": "confirmed", "span": "we use interviews",
+            "replaces": ""}]})}}], "usage": {"cost": 0.001}})
     text, cost = ("Crash test title", 0.0003) if title else ("1: supported", 0.001) if judge else (
         "Minimum wages raise earnings [S1.1]." if scenario.startswith("cited") else "An answer.", 0.002)
     return httpx.Response(200, json={"choices": [{"message": {"content": text}}], "usage": {"cost": cost}})
@@ -92,9 +98,9 @@ async def answer(request):
 
 if scenario in ("turn_after_step", "cited_after_judge"):  # the steps and costs are recorded; no primary commit
     runs.Harness._commit_answer = crash
-elif scenario in ("title_after_step", "restart_finish"):  # inside the finishing transaction, before COMMIT
+elif scenario in ("title_after_step", "restart_finish", "memory_after_step"):  # inside the finishing transaction
     runs.Harness._finish_background = crash
-elif scenario == "title_after_finish":  # after the finishing transaction committed
+elif scenario in ("title_after_finish", "memory_after_finish"):  # after the finishing transaction committed
     release = runs.Registry.release
     def release_then_crash(self, active):
         release(self, active)
@@ -112,18 +118,25 @@ elif scenario == "cited_after_commit":  # after the turn's primary commit, befor
 app = create_app(data, origin=ORIGIN, keyring_backend=Keyring(), transport=httpx.MockTransport(answer))
 
 
+async def memory_off(client, project):  # S1-21a: a title's or a turn's kill points, with no extraction beside them
+    found = (await client.get(f"/api/settings?project_id={project}")).json()
+    await client.put("/api/settings", json={"project_id": project, "hash": found["hash"],
+                                            "updates": {"memory.enabled": False}})
+
+
 async def main():
     inner = app.app
     async with inner.router.lifespan_context(inner):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=ORIGIN,
                                      headers={"X-Scholia-Client": "local"}) as client:
-            if scenario == "turn_after_commit":  # the answer and the title run are committed; nothing after
+            if scenario in ("turn_after_commit", "memory_after_commit"):  # the answer and its runs are committed
                 async def after_commit(self):
                     crash()
                 runs.Harness.kick_background = after_commit  # after startup, which also starts background runs
             if scenario.startswith("cited"):  # S1-19b: a turn whose answer cites a paper and is judged
                 await client.post("/api/setup", json={"openrouter_key": "sk-or-test-not-a-real-key"})
                 project = (await client.post("/api/projects", json={"name": "Thesis"})).json()["id"]
+                await memory_off(client, project)
                 paper = b"# Wage Floors\n\n## Findings\n\nMinimum wages raise the earnings of low-paid workers.\n"
                 await client.post(f"/api/projects/{project}/materials", json={"files": [
                     {"name": "wages.md", "data": base64.b64encode(paper).decode()}]})
@@ -136,8 +149,15 @@ async def main():
                 conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
                 await client.post(f"/api/conversations/{conversation}/message/stream",
                                   json={"content": "What do minimum wages do to earnings?"})
+            elif scenario.startswith("memory"):  # S1-21a: a named conversation, so no title run beside it
+                await client.post("/api/setup", json={"openrouter_key": "sk-or-test-not-a-real-key"})
+                conversation = (await client.post("/api/conversations", json={"title": "Named"})).json()["id"]
+                await client.post(f"/api/conversations/{conversation}/message/stream",
+                                  json={"content": "For this project we use interviews"})
             elif not scenario.startswith("restart"):
                 await client.post("/api/setup", json={"openrouter_key": "sk-or-test-not-a-real-key"})
+                general = [p for p in (await client.get("/api/projects")).json()["projects"] if p["kind"] == "general"]
+                await memory_off(client, general[0]["id"])
                 conversation = (await client.post("/api/conversations", json={})).json()["id"]
                 await client.post(f"/api/conversations/{conversation}/message/stream",
                                   json={"content": "What is a cohort study?"})
@@ -293,6 +313,74 @@ async def test_killed_during_the_second_title_call_is_interrupted(tmp_path):
         assert provider.chats == [] and title == [("interrupted", 2)]
         assert conversation == [(None, 0)]
         assert sorted(basis for _, _, basis in spending) == ["estimated", "estimated", "reported"]
+
+
+# S1-21a: a memory extraction's kill points (slice-1 spec section 14, test_durability_kill.py: proposals appear exactly
+# once and stay reviewable, recorded costs count once, an in-flight attempt's cost stays unknown; checklist L2)
+
+async def memory_state(client):
+    found = await rows(client, "SELECT content, status FROM memory_records WHERE type = 'project_state'")
+    run = await rows(client, "SELECT status, attempts FROM runs WHERE workflow = 'memory'")
+    spending = sorted(await rows(client, "SELECT b.status, b.settled_usd, b.basis FROM budget_reservations b"
+                                         " JOIN runs r ON r.id = b.run_id WHERE r.workflow = 'memory'"))
+    status = await rows(client, "SELECT memory_status FROM turns")
+    return found, run, spending, status
+
+
+def restarted_extraction(provider):
+    provider.memory_replies.append(provider.answer(json.dumps({"records": [{
+        "type": "project_state", "content": "We use interviews.", "status": "confirmed", "span": "we use interviews",
+        "replaces": ""}]}), cost=0.0011))
+
+
+async def test_killed_after_the_primary_commit_the_extraction_runs_once_at_the_next_launch(tmp_path):
+    data = tmp_path / "data"
+    run_child(data, "memory_after_commit")
+    provider, app = await restart(data)
+    restarted_extraction(provider)
+    async with app as client:
+        await background_idle(client)
+        found, run, spending, status = await memory_state(client)
+        assert found == [("We use interviews.", "confirmed")] and run == [("succeeded", 1)]
+        assert spending == [("settled", 0.0011, "reported")] and status == [("indexed",)]
+        assert len(provider.extractions) == 1
+
+
+async def test_killed_during_the_extraction_call_restarts_it_once_and_writes_its_records_once(tmp_path):
+    data = tmp_path / "data"
+    run_child(data, "memory_model")
+    provider, app = await restart(data)
+    restarted_extraction(provider)
+    async with app as client:
+        await background_idle(client)
+        found, run, spending, _ = await memory_state(client)
+        assert found == [("We use interviews.", "confirmed")] and run == [("succeeded", 2)]
+        # the attempt in flight: settled at its estimate, its charge unknown; the second as reported
+        assert sorted(basis for _, _, basis in spending) == ["estimated", "reported"]
+
+
+async def test_killed_after_the_extraction_step_is_recorded_finishes_from_the_record(tmp_path):
+    data = tmp_path / "data"
+    run_child(data, "memory_after_step")
+    provider, app = await restart(data)
+    async with app as client:
+        await background_idle(client)
+        found, run, spending, status = await memory_state(client)
+        assert provider.extractions == []  # no model call: its reply was held in its run until the effect
+        assert found == [("We use interviews.", "confirmed")] and run == [("succeeded", 1)]
+        assert spending == [("settled", 0.001, "reported")] and status == [("indexed",)]
+        assert await rows(client, "SELECT json_extract(inputs, '$.held') FROM runs WHERE workflow = 'memory'") == [(None,)]
+
+
+async def test_killed_after_the_extractions_terminal_write_it_never_runs_again(tmp_path):
+    data = tmp_path / "data"
+    run_child(data, "memory_after_finish")
+    provider, app = await restart(data)
+    async with app as client:
+        await background_idle(client)
+        found, run, spending, _ = await memory_state(client)
+        assert provider.extractions == [] and found == [("We use interviews.", "confirmed")]
+        assert run == [("succeeded", 1)] and spending == [("settled", 0.001, "reported")]
 
 
 # S1-19b: the support judge runs before the primary commit (L2, L6)
