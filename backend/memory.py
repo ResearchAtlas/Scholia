@@ -166,15 +166,16 @@ def personal_allowed(conn, project_id):
 
 def restrict(conn, project_id):
     """The project just became Private, Local only or review-locked (or took a conversation that did): its personal
-    records, the personal records resting on its turns or runs, and every record that may restate its memory (an
-    `origin` source), become its own project records, in the same
+    records, and the personal records resting on its turns or runs or that may restate its memory (an `origin` source),
+    become its own project records, in the same
     transaction, so nothing of it stays or comes back as personal memory (deleted with it, if it is). Their vectors
     leave the personal partition."""
     ids = [m for (m,) in conn.execute(
         "SELECT id FROM memory_records WHERE scope = 'personal' AND (project_id = ?1 OR id IN (SELECT s.memory_id"
         " FROM memory_sources s JOIN runs r ON r.id = s.source_id WHERE s.source_kind IN ('turn', 'run')"
-        " AND r.project_id = ?1)) UNION SELECT memory_id FROM memory_sources WHERE source_kind = 'origin'"
-        " AND source_id = ?1", (project_id,))]  # and every record that may restate its memory, wherever it is
+        " AND r.project_id = ?1) OR id IN (SELECT memory_id FROM memory_sources WHERE source_kind = 'origin'"
+        " AND source_id = ?1))", (project_id,))]  # and the personal ones that may restate its memory (another
+    # project's own records stay its own: valid() hides them while this project is stricter, or gone)
     for record in ids:
         conn.execute("UPDATE memory_records SET scope = 'project', project_id = ?, sensitivity = (SELECT sensitivity"
                      " FROM projects WHERE id = ?), updated_at = ? WHERE id = ?", (project_id, project_id, utc_now(), record))
@@ -303,7 +304,7 @@ def edit(conn, record, version, *, content=None, confirm=False):
                  structured=structured or None)
 
 
-def keep(conn, proposal, version, edited=False):
+def keep(conn, proposal, version, edited=False, own_words=False):
     """Keep (confirm) a proposal: it replaces the record it names (supersedes_id) only if that record is still at
     the version the proposal saw; else it stays proposed and is marked out of date (section 8), in this transaction, and
     None is returned. Returns its id, or raises LookupError or ValueError("changed")."""
@@ -330,6 +331,8 @@ def keep(conn, proposal, version, edited=False):
                  (json.dumps(structured) if structured else None, now, proposal))
     conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'researcher', 'views')",
                  (proposal,))
+    if own_words:  # kept by the researcher's own words: they no longer restate another record's text
+        conn.execute("DELETE FROM memory_sources WHERE memory_id = ? AND source_kind IN ('origin', 'memory')", (proposal,))
     if found["type"] in RECALLED:
         conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('memory', ?, ?, 'add')",
                      (proposal, found["project_id"]))
@@ -371,7 +374,7 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
         if same and same[0]["status"] == "confirmed":
             return "saved", [same[0]["id"]]
         if same and same[0]["status"] == "proposed":  # the researcher's own words keep a pending proposal
-            kept = keep(conn, same[0]["id"], None)
+            kept = keep(conn, same[0]["id"], None, own_words=True)
             if kept is not None:
                 return "saved", [kept]
             same = []  # out of date: saved as its own record below
@@ -422,7 +425,8 @@ def save_answer(conn, *, project_id, run_id, previous, text=None):
         return write(conn, project_id=project_id, scope=scope_for(conn, project_id, kind), kind=kind, content=text,
                      status="confirmed", sources=[("turn", run_id)], run_id=run_id, structured={"command": "save"})
     found = conn.execute("SELECT answer FROM turns WHERE run_id = ?", (previous,)).fetchone()
-    if found is None or not provenance.answer_carried(conn, previous):
+    if found is None or not provenance.answer_carried(conn, previous) \
+            or not restated_ok(conn, project_id, _recalled(conn, previous)):
         return None
     answer = (json.loads(found[0]) or {}).get("text") or ""
     answer = answer[:CANDIDATE_CHARS] + ("…" if len(answer) > CANDIDATE_CHARS else "")
@@ -570,7 +574,7 @@ def apply_extraction(conn, run_id, candidates):
     # case: its candidates then wait as proposals)
     shown = conn.execute("SELECT json_extract(inputs, '$.memory_ids') FROM runs WHERE id = ?", (run_id,)).fetchone()
     shown = json.loads((shown and shown[0]) or "[]")
-    if not all((found := row(conn, i)) is not None and valid(conn, project_id, found) for i in shown):
+    if not restated_ok(conn, project_id, [*shown, *_recalled(conn, turn)]):  # its request's records, and its turn's
         return None
     # what a proposal (text the model wrote, not the researcher's words) may restate: the records the extraction was
     # shown and those its source turn's requests held
@@ -591,7 +595,7 @@ def apply_extraction(conn, run_id, candidates):
             counts["duplicates"] += 1
             if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"] \
                     and (same["scope"] == "project" or personal):  # never a personal one from a stricter project
-                keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
+                keep(conn, same["id"], None, own_words=True)  # the researcher's own words confirm what was only proposed
             continue
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
         target = next((r for r in pending if r["id"] == head and r["status"] in ACTIVE
@@ -655,11 +659,12 @@ def origins(conn, record_ids, project_id):
     researcher's own words takes none."""
     found = set()
     for record in set(record_ids):
-        item = row(conn, record)
+        item = row(conn, record)  # one already gone or no longer allowed: the caller writes nothing (restated_ok)
         if item is None:
             continue
-        if item["scope"] == "personal" and item["project_id"] and item["project_id"] != project_id:
+        if item["project_id"] and item["project_id"] != project_id:  # another project's, whatever its scope now
             found.add(("origin", item["project_id"]))
+        found.add(("memory", record))  # and the record itself: forgetting it takes what may restate it
         for kind, source in sources_of(conn, record):
             if kind == "material" or kind == "origin":
                 found.add((kind, source))
@@ -670,13 +675,19 @@ def origins(conn, record_ids, project_id):
     return sorted(found)
 
 
+def restated_ok(conn, project_id, record_ids):
+    """Whether model-written text that may restate these records may still be written in project_id: every one exists
+    and is valid there now."""
+    return all((found := row(conn, i)) is not None and valid(conn, project_id, found) for i in set(record_ids))
+
+
 def _recalled(conn, run_id):
     """The memory records a run's requests held (inputs.memory_ids)."""
     held = conn.execute("SELECT json_extract(inputs, '$.memory_ids') FROM runs WHERE id = ?", (run_id,)).fetchone()
     return json.loads((held and held[0]) or "[]")
 
 
-def valid(conn, project_id, record, _depth=0):
+def valid(conn, project_id, record):
     """Whether a record's text may be in a request of project_id now (S1-21a; Harold's retrieval and memory spec,
     source validity: an inaccessible source invalidates the memory derived from it). The one rule every reader of
     memory applies (recall, PROJECT STATE, the memory tools, an extraction's related records) and the dispatch check
@@ -695,7 +706,7 @@ def valid(conn, project_id, record, _depth=0):
     if not personal and record["project_id"] != project_id:
         return False
     level = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
-    if level is None or _depth > 5:
+    if level is None:
         return False
     if personal:
         own = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (record["project_id"],)).fetchone()
@@ -711,9 +722,10 @@ def valid(conn, project_id, record, _depth=0):
                                  " WHERE r.id = ?", (source,)).fetchone()
             if where is not None and (where[1] or LEVELS.index(where[0]) > ceiling):
                 return False
-        elif kind == "origin":  # a project whose memory it may restate: still no stricter, and not locked
+        elif kind == "origin":  # a project whose memory it may restate: still there, no stricter, and not locked (one
+            # deleted may have been stricter first: what it restated stays hidden)
             where = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (source,)).fetchone()
-            if where is not None and (where[1] or LEVELS.index(where[0]) > ceiling):
+            if where is None or where[1] or LEVELS.index(where[0]) > ceiling:
                 return False
     return provenance.sendable(conn, project_id, materials)
 
@@ -773,7 +785,10 @@ def materials_of(conn, record_ids):
 
 def note(conn, *, project_id, run_id, kind, text, materials):
     """An agent's note (update_progress): an open question or a next step, marked as the agent's, inferred, never
-    confirmed; carrying the papers the turn's request held."""
+    confirmed; carrying the papers the turn's request held and what its recalled memory came from; None (nothing
+    written) when a record it may restate is gone or no longer allowed here."""
+    if not restated_ok(conn, project_id, _recalled(conn, run_id)):
+        return None
     return write(conn, project_id=project_id, scope="project", kind="agent_note", content=text, status="inferred",
                  sources=[("run", run_id), *papers(materials), *origins(conn, _recalled(conn, run_id), project_id)],
                  run_id=run_id, structured={"kind": kind})

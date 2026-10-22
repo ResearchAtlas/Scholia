@@ -173,13 +173,18 @@ RULES = (
     SELECT 'memory_records', m.rowid FROM memory_records m
     WHERE m.id IN (SELECT memory_id FROM memory_sources WHERE rowid IN {_doomed('memory_sources')})
     AND NOT EXISTS (SELECT 1 FROM memory_sources s
-                    WHERE s.memory_id = m.id AND s.source_kind NOT IN ('material', 'origin')
+                    WHERE s.memory_id = m.id AND s.source_kind NOT IN ('material', 'origin', 'memory')
                     AND s.rowid NOT IN {_doomed('memory_sources')})""",
     # S1-21a (backend/provenance.py): a record that may carry a paper's text (a `material` source) goes with any one of
     # its papers, not only its last source.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', m.rowid FROM memory_records m JOIN memory_sources s ON s.memory_id = m.id
     WHERE s.source_kind = 'material' AND s.source_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
+    # S1-21a: model-written text that may restate a deleted record (a proposal, an agent's note, a saved answer: a
+    # `memory` source; never a record confirmed from the researcher's own words) goes with it.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'memory_records', m.rowid FROM memory_records m JOIN memory_sources s ON s.memory_id = m.id
+    WHERE s.source_kind = 'memory' AND s.source_id IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
     # S1-21a: Forget deletes the content (F10), so the earlier versions a deleted record replaced go with it.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', o.rowid FROM memory_records o

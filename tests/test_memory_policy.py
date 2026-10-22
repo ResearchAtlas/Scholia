@@ -421,3 +421,66 @@ async def test_an_earlier_decision_question_keeps_its_cannot_be_found_line_besid
                                                "content": "Our research question is about wages"})
         await send(client, await conversation_in(client, project), "Which sampling method did we decide on last time?")
         assert memory.MISSING in provider.answers[-1]["messages"][0]["content"]
+
+
+# Fix batch 2, internal recheck
+
+
+async def test_tightening_a_project_never_moves_another_projects_records_into_it(tmp_path):
+    async with started(tmp_path / "data") as client:
+        a, b = await project_of(client, "A"), await project_of(client, "B")
+        source = await personal(client, a)
+        run = await turn_in(client, b, "x")
+
+        def noted(conn):
+            turn = conn.execute("SELECT source_turn_id FROM runs WHERE id = ?", (run,)).fetchone()[0]
+            conn.execute("UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?)) WHERE id = ?",
+                         (json.dumps([source]), turn))
+            return memory.note(conn, project_id=b, run_id=turn, kind="next_step", text="Ask Alice", materials=())
+        note = await asyncio.to_thread(client.state["db"].write, noted)
+        await tighten(client, a, "lock")
+        assert await rows(client, "SELECT project_id FROM memory_records WHERE id = ?", note) == [(b,)]
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, b, [note])) is False
+        await client.delete(f"/api/projects/{a}")  # still hidden once the project it restates is gone
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, b, [note])) is False
+
+
+async def test_nothing_restating_a_record_already_converted_is_written_or_allowed(tmp_path):
+    async with started(tmp_path / "data") as client:
+        a, b = await project_of(client, "A"), await project_of(client, "B")
+        source = await personal(client, a)
+        run = await turn_in(client, b, "x")
+        turn = (await rows(client, "SELECT source_turn_id FROM runs WHERE id = ?", run))[0][0]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?)) WHERE id = ?", (json.dumps([source]), turn)))
+        await tighten(client, a, "private")  # A's record is A's project record now
+        written = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
+            {"type": "event", "content": "Alice prefers tables", "status": "proposed", "span": "", "replaces": ""}]))
+        assert written is None
+        assert await asyncio.to_thread(client.state["db"].write, lambda conn: memory.note(
+            conn, project_id=b, run_id=turn, kind="next_step", text="Ask Alice", materials=())) is None
+
+
+async def test_keeping_a_proposal_by_the_researchers_own_words_drops_what_it_restated(tmp_path):
+    async with started(tmp_path / "data") as client:
+        a, b = await project_of(client, "A"), await project_of(client, "B")
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=b, scope="project", kind="decision", content="we sample thirty nurses", status="proposed",
+            sources=[("project", b), ("origin", a)]))
+        await send(client, await conversation_in(client, b), "Remember: we sample thirty nurses")
+        await tighten(client, a, "private")
+        assert await rows(client, "SELECT status, project_id FROM memory_records WHERE id = ?", proposal) == [("confirmed", b)]
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, b, [proposal])) is True
+
+
+async def test_forgetting_a_record_takes_the_proposals_and_notes_that_may_restate_it(tmp_path):
+    async with started(tmp_path / "data") as client:
+        a, b = await project_of(client, "A"), await project_of(client, "B")
+        source = await personal(client, a)
+        run = await turn_in(client, b, "x")
+        await extraction_shown(client, b, "y", [source], [
+            {"type": "event", "content": "Alice prefers tables", "status": "proposed", "span": "", "replaces": ""}])
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE content = 'Alice prefers tables'") == [(1,)]
+        assert (await client.delete(f"/api/memory/{source}")).json() == {"ok": True}
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE content = 'Alice prefers tables'") == [(0,)]
+        assert run
