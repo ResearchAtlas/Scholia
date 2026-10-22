@@ -333,3 +333,12 @@ async def test_a_time_bound_reached_during_the_gates_check_is_not_dispatched():
     client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
     result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, timeout=0.2)
     assert (result.error_kind, result.dispatched) == ("timeout", False)
+
+
+async def test_a_retry_the_gate_refuses_is_recorded_as_not_sent_beside_the_attempt_that_left(takes_reasoning):
+    # S1-19c: a turn past its time limit has its retry refused at dispatch ("turn_deadline", backend/runs.py)
+    client, sent = client_for(httpx.Response(400, json={"error": "unknown field reasoning"}),
+                              OutboundDenied("turn_deadline", None))
+    result = await openrouter.query_model(client, LOCAL, "key", MESSAGES, effort="high")
+    assert [(a.outcome, a.dispatched) for a in result.attempts] == [("request", True), ("refused", False)]
+    assert result.error_kind == "refused" and result.dispatched  # the first attempt left, and settles

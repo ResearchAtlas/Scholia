@@ -906,7 +906,7 @@ class Harness:
             final, _ = await _through(self._stop_turn(claim))
             emit({"type": "run_finished", **final})
         except _LimitReached as hit:  # a turn limit (section 13), before any further dispatch: Continue is offered
-            call = claim.call  # a call stopped at the deadline before it left: its reservation is released
+            call = claim.call  # usually None (a call refused at dispatch is recorded first); any other is closed once
 
             def limited(conn):
                 _close_call(conn, call)
@@ -1314,7 +1314,7 @@ class Harness:
         result (a failure included), "stopped" when the researcher chose to stop after three failed tool calls in a
         row (section 6.6: the run stops and asks), or the name of the limit that stopped the turn: agent_steps,
         tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
-        time limit is checked before every model call (_reserve). A route without tool calls offers none: its one
+        time limit binds every model call in the dispatch check (may_dispatch). A route without tool calls offers none: its one
         step is its answer."""
         limits, tools = ctx["limits"], ctx["tools"]
         chain, calls_made, failures = [], 0, 0
@@ -1751,7 +1751,7 @@ class Harness:
                 # The catalog row the route's facts were read from, so the request is the one they
                 # describe; a Private call is limited to the endpoints it lists, as the gate checks.
                 model_entry=facts["row"])
-            finished = {"step": call.step, "outcome": result.error_kind or "ok",
+            finished = {"step": call.step, "outcome": "turn_deadline" if call.declined else result.error_kind or "ok",
                         **({"cut": "output_limit"} if result.cut else {})}  # stopped at its output limit
             # S1-19c: an agent step's reply is kept whole as it arrives (model-route rule 5: each assistant step stored
             # whole), beside its request body and under the same deletion links, whatever the turn does next.

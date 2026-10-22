@@ -56,7 +56,8 @@ exact origins count there, and nothing else does. Names are never resolved, so
 A client may also carry a dispatch check (`admit`), which the harness gives every
 model call: it is read in the same decision transaction, so a run revoked by a
 deletion or a tightened project, or one in a review-locked project, sends nothing
-more, retries and same-origin redirect hops included ("revoked").
+more, retries and same-origin redirect hops included ("revoked"); nor does a turn past its time limit
+("turn_deadline", S1-19c).
 
 No request enters the transport after a revocation commits. Every write that revokes
 a project's runs or takes away a route (a tightened or review-locked project; for every
@@ -512,7 +513,7 @@ class OutboundGate:
                     except Exception as caught:  # refused, and chained to it
                         error, admitted = caught, False
                     if admitted is not True:  # the dispatch check's own reason when it names one (a turn's deadline)
-                        reason = admitted if isinstance(admitted, str) else "revoked"
+                        reason = admitted if isinstance(admitted, str) and admitted else "revoked"
             shown = _shown(conn, target, kind, link, providers, helpers)
             _record(conn, request, scope, level, kind, shown, reason)
             # What was applied, as decided here: for the run's record (ticket 18's provenance).
