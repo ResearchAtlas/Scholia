@@ -1610,7 +1610,11 @@ class Harness:
             return failed(call_id, "over_window", "The evidence this needs does not fit this model's window.")
         held = dict(list(held.items())[:len(lines) - request.cuts.get("research_evidence", 0)])
         turn.evidence.keep(keys, held, before)  # what its answer step was not given is not read in the run
-        await self._register_context(claim, turn.evidence.numbered, turn.listed)
+        try:
+            await self._register_context(claim, turn.evidence.numbered, turn.listed)
+        except Exception:  # not registered, so no model is given them: none is read in the run either
+            turn.evidence.keep(keys, (), before)
+            raise
         judge_estimate = self._judge_estimate(ctx, held)
         estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
         call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
