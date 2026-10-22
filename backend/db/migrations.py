@@ -624,10 +624,8 @@ CREATE INDEX run_body_materials_by_material ON run_body_materials (material_id);
 # progress and agent_note; Forget deletes, so no row is ever left 'deleted'), and their sources only the kinds the
 # app writes: a turn, a run, a paper whose text the record may carry (`material`: deleted with any one of them,
 # backend/db/deletion.py), a paper it only counts (`paper`: progress, deleted with the last of them), the project, or
-# the researcher's own entry in the memory views, or a project whose memory a model-written record may restate
-# (`origin`: it stays allowed only while that project is no stricter than the request's and not locked), and each
-# record it may restate (`memory`: forgetting that record takes it). A STRICT table's CHECK
-# cannot be added in place, so triggers refuse the rest; the indexes serve recall and deletion's source rule.
+# the researcher's own entry in the memory views. A STRICT table's CHECK cannot be added in place, so triggers refuse
+# the rest; the indexes serve recall and deletion's source rule.
 _0008 = r"""
 CREATE TRIGGER memory_records_valid BEFORE INSERT ON memory_records
 WHEN NEW.type NOT IN ('profile', 'project_state', 'decision', 'event', 'preference', 'progress', 'agent_note')
@@ -645,7 +643,7 @@ BEGIN
 END;
 
 CREATE TRIGGER memory_sources_valid BEFORE INSERT ON memory_sources
-WHEN NEW.source_kind NOT IN ('turn', 'run', 'material', 'paper', 'origin', 'memory', 'project', 'researcher')
+WHEN NEW.source_kind NOT IN ('turn', 'run', 'material', 'paper', 'project', 'researcher')
 BEGIN
     SELECT RAISE(ABORT, 'a memory source of a kind not allowed');
 END;

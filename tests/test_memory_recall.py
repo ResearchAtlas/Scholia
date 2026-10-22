@@ -190,14 +190,15 @@ async def test_ranking_puts_a_record_written_since_the_last_vector_first():
     assert [r["id"] for r in memory.ranked(candidates, None)] == ["new", *[f"r{i}" for i in range(19, 10, -1)]]
 
 
-async def test_a_personal_record_another_project_may_not_see_is_not_shown_to_an_extraction_either(tmp_path):
+async def test_a_personal_record_stays_shown_to_another_projects_extraction_after_its_project_tightens(tmp_path):
+    # fix batch 3 (Harold's decision of 2026-10-23): a later tightening never retracts a personal record
     provider = MockProvider()
     async with started(tmp_path / "data", provider) as client:
         first, other = await project_of(client, "First"), await project_of(client, "Other")
         await entered(client, first, "I prefer answers about participant Alice", kind="preference", scope="personal")
         await client.post(f"/api/projects/{first}/sensitivity", json={"level": "private"})  # its own project tightened
         found = await asyncio.to_thread(client.state["db"].read, lambda conn: memory.recall_candidates(conn, other))
-        assert found == []
+        assert [r["content"] for r in found] == ["I prefer answers about participant Alice"]
         await send(client, await conversation_in(client, other), "Hello")
         await background_idle(client)
-        assert provider.extractions and "Alice" not in json.dumps(provider.extractions[-1])
+        assert provider.extractions and "Alice" in json.dumps(provider.extractions[-1])

@@ -832,8 +832,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             conn.execute("UPDATE projects SET sensitivity = ?, updated_at = ? WHERE id = ?",
                          (body.level, utc_now(), project_id))
             revoked = [] if looser else governance.revoke_running(conn, project_id)
-            if not looser:  # S1-21a: nothing of a stricter project stays personal memory
-                memory.restrict(conn, project_id)
             governance.record(conn, "sensitivity_changed", project_id, **{"from": level, "to": body.level},
                               revoked_runs=len(revoked))
             return revoked
@@ -865,8 +863,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             conn.execute("UPDATE projects SET sensitivity = ?, review_lock = ?, review_venue = ?, updated_at = ?"
                          " WHERE id = ?", ("local_only", int(body.locked), venue, utc_now(), project_id))
             revoked = governance.revoke_running(conn, project_id) if body.locked and not locked else []
-            if body.locked:  # S1-21a: nor of a review-locked one
-                memory.restrict(conn, project_id)
             governance.record(conn, "review_lock_changed", project_id, locked=body.locked, **{"from": level},
                               venue_set=venue is not None, revoked_runs=len(revoked))
             return revoked
@@ -1191,8 +1187,6 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 " (SELECT run_id FROM turns WHERE conversation_id = ?5 UNION SELECT r.id FROM runs r JOIN turns t"
                 " ON t.run_id = r.source_turn_id WHERE t.conversation_id = ?5))",
                 (body.project_id, target[0], now, source, conversation_id))
-            if target[0] != "normal" or target[1]:  # its turns' personal records stay with them, under the stricter one
-                memory.restrict(conn, body.project_id)
             conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('conversation_moved', ?, ?)",
                          (body.project_id, json.dumps({"conversation_id": conversation_id, "from": source})))
             return True

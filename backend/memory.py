@@ -159,34 +159,16 @@ def _normal(conn, project_id):
 
 
 def personal_allowed(conn, project_id):
-    """Whether a personal record may be written from project_id: only from a Normal project, so nothing of a Private or
-    Local only project's can reach another project's request (scope notes reading 4)."""
+    """Whether a personal record may be written from project_id: only from a Normal, unlocked project (a review lock
+    keeps its project Local only), so nothing of a Private or Local only project's reaches another project's request
+    (scope notes reading 4; Harold's decision of 2026-10-23, point 1)."""
     return _normal(conn, project_id)
-
-
-def restrict(conn, project_id):
-    """The project just became Private, Local only or review-locked (or took a conversation that did): its personal
-    records, and the personal records resting on its turns or runs or that may restate its memory (an `origin` source),
-    become its own project records, in the same
-    transaction, so nothing of it stays or comes back as personal memory (deleted with it, if it is). Their vectors
-    leave the personal partition."""
-    ids = [m for (m,) in conn.execute(
-        "SELECT id FROM memory_records WHERE scope = 'personal' AND (project_id = ?1 OR id IN (SELECT s.memory_id"
-        " FROM memory_sources s JOIN runs r ON r.id = s.source_id WHERE s.source_kind IN ('turn', 'run')"
-        " AND r.project_id = ?1) OR id IN (SELECT memory_id FROM memory_sources WHERE source_kind = 'origin'"
-        " AND source_id = ?1))", (project_id,))]  # and the personal ones that may restate its memory (another
-    # project's own records stay its own: valid() hides them while this project is stricter, or gone)
-    for record in ids:
-        conn.execute("UPDATE memory_records SET scope = 'project', project_id = ?, sensitivity = (SELECT sensitivity"
-                     " FROM projects WHERE id = ?), updated_at = ? WHERE id = ?", (project_id, project_id, utc_now(), record))
-        conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('memory', ?, ?, 'remove')",
-                     (record, project_id))
-    return ids
 
 
 def allowed(conn, project_id, record_ids):
     """Whether every one of these records may still be in a request of project_id (section 10, at dispatch): it exists,
-    is current (never superseded: an edit since it was assembled means its old text may not leave), and is valid."""
+    is current (never superseded: an edit since it was assembled means its old text may not leave; a proposal's edit
+    makes a new record, edit), and is valid there now (its scope, the request's project's lock, its papers)."""
     for record in record_ids:
         found = row(conn, record)
         if found is None or found["status"] == "superseded" or not valid(conn, project_id, found):
@@ -293,8 +275,8 @@ def edit(conn, record, version, *, content=None, confirm=False):
     if code_written and confirm:
         raise ValueError("not_confirmable")
     if old["status"] == "proposed":
-        if content is not None:
-            conn.execute("UPDATE memory_records SET content = ?, updated_at = ? WHERE id = ?", (content, utc_now(), record))
+        if content is not None and content != old["content"]:
+            record = _renewed(conn, record, content)
         return keep(conn, record, None)
     structured = {k: v for k, v in old["structured"].items() if k in ("kind", "event", "count", "date")}
     return write(conn, project_id=old["project_id"], scope=old["scope"], kind=old["type"],
@@ -304,7 +286,22 @@ def edit(conn, record, version, *, content=None, confirm=False):
                  structured=structured or None)
 
 
-def keep(conn, proposal, version, edited=False, own_words=False):
+def _renewed(conn, proposal, content):
+    """A pending proposal with new content, as a new record (its next version) that takes its place, its sources and
+    the record it would replace: a request that held the old text names an id that no longer exists (allowed), and
+    the old text is not kept (S1-21a fix batch 3, R3). Returns the new id."""
+    record = new_id()
+    conn.execute(
+        "INSERT INTO memory_records (id, scope, project_id, type, content, structured, status, valid_from, sensitivity,"
+        " version, supersedes_id, created_by_run_id, created_at) SELECT ?, scope, project_id, type, ?, structured,"
+        " status, valid_from, sensitivity, version + 1, supersedes_id, created_by_run_id, created_at"
+        " FROM memory_records WHERE id = ?", (record, content, proposal))
+    conn.execute("UPDATE memory_sources SET memory_id = ? WHERE memory_id = ?", (record, proposal))
+    conn.execute("DELETE FROM memory_records WHERE id = ?", (proposal,))
+    return record
+
+
+def keep(conn, proposal, version, edited=False):
     """Keep (confirm) a proposal: it replaces the record it names (supersedes_id) only if that record is still at
     the version the proposal saw; else it stays proposed and is marked out of date (section 8), in this transaction, and
     None is returned. Returns its id, or raises LookupError or ValueError("changed")."""
@@ -331,8 +328,6 @@ def keep(conn, proposal, version, edited=False, own_words=False):
                  (json.dumps(structured) if structured else None, now, proposal))
     conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'researcher', 'views')",
                  (proposal,))
-    if own_words:  # kept by the researcher's own words: they no longer restate another record's text
-        conn.execute("DELETE FROM memory_sources WHERE memory_id = ? AND source_kind IN ('origin', 'memory')", (proposal,))
     if found["type"] in RECALLED:
         conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('memory', ?, ?, 'add')",
                      (proposal, found["project_id"]))
@@ -374,7 +369,7 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
         if same and same[0]["status"] == "confirmed":
             return "saved", [same[0]["id"]]
         if same and same[0]["status"] == "proposed":  # the researcher's own words keep a pending proposal
-            kept = keep(conn, same[0]["id"], None, own_words=True)
+            kept = keep(conn, same[0]["id"], None)
             if kept is not None:
                 return "saved", [kept]
             same = []  # out of date: saved as its own record below
@@ -425,14 +420,12 @@ def save_answer(conn, *, project_id, run_id, previous, text=None):
         return write(conn, project_id=project_id, scope=scope_for(conn, project_id, kind), kind=kind, content=text,
                      status="confirmed", sources=[("turn", run_id)], run_id=run_id, structured={"command": "save"})
     found = conn.execute("SELECT answer FROM turns WHERE run_id = ?", (previous,)).fetchone()
-    if found is None or not provenance.answer_carried(conn, previous) \
-            or not restated_ok(conn, project_id, _recalled(conn, previous)):
+    if found is None or not provenance.answer_carried(conn, previous):
         return None
     answer = (json.loads(found[0]) or {}).get("text") or ""
     answer = answer[:CANDIDATE_CHARS] + ("…" if len(answer) > CANDIDATE_CHARS else "")
     return write(conn, project_id=project_id, scope="project", kind="event", content=answer, status="confirmed",
-                 sources=[("turn", run_id), ("turn", previous), *papers(provenance.dependencies(conn, previous)),
-                          *origins(conn, _recalled(conn, previous), project_id)],  # what that answer may restate
+                 sources=[("turn", run_id), ("turn", previous), *papers(provenance.dependencies(conn, previous))],
                  run_id=run_id, structured={"command": "save", "from": "answer"})
 
 
@@ -569,23 +562,22 @@ def apply_extraction(conn, run_id, candidates):
     carried = papers({*provenance.dependencies(conn, turn), *json.loads((held and held[0]) or "[]")})
     if not provenance.carried(conn, [i for _, i in carried]):  # a paper it drew on was deleted: nothing of it is kept
         return None
-    # the records its request was shown: what it writes may carry their text, so it depends on them, and nothing is
-    # written when one of them is gone or no longer allowed in this project since (one replaced since is section 8's
-    # case: its candidates then wait as proposals)
+    # the records its request was shown: nothing is written when one of them was forgotten since (Forget also takes
+    # an output held for it, backend/db/deletion.py); one replaced since is section 8's case: its candidates wait
     shown = conn.execute("SELECT json_extract(inputs, '$.memory_ids') FROM runs WHERE id = ?", (run_id,)).fetchone()
-    shown = json.loads((shown and shown[0]) or "[]")
-    if not restated_ok(conn, project_id, [*shown, *_recalled(conn, turn)]):  # its request's records, and its turn's
+    if conn.execute("SELECT 1 FROM json_each(?) WHERE value NOT IN (SELECT id FROM memory_records)",
+                    ((shown and shown[0]) or "[]",)).fetchone() is not None:
         return None
-    # what a proposal (text the model wrote, not the researcher's words) may restate: the records the extraction was
-    # shown and those its source turn's requests held
-    derived = origins(conn, [*shown, *_recalled(conn, turn)], project_id)
     personal = personal_allowed(conn, project_id)
     counts = {"confirmed": 0, "inferred": 0, "proposed": 0, "replaced": 0, "duplicates": 0}
     written = []
     for candidate in candidates:
         status = cap(candidate, message, author)
         kind = candidate["type"]
-        scope = scope_for(conn, project_id, kind)
+        own = cap({**candidate, "status": "confirmed"}, message, author) == "confirmed"
+        # a personal record holds only the researcher's own words, never text the model drew from the answer (Harold's
+        # decision of 2026-10-23, point 1): such a candidate is the project's
+        scope = scope_for(conn, project_id, kind) if own else "project"
         if scope == "personal" and status == "inferred":  # ticket 31: a personal inference waits to be confirmed
             status = "proposed"
         late = late_anywhere if scope == "personal" else late_project
@@ -595,16 +587,16 @@ def apply_extraction(conn, run_id, candidates):
             counts["duplicates"] += 1
             if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"] \
                     and (same["scope"] == "project" or personal):  # never a personal one from a stricter project
-                keep(conn, same["id"], None, own_words=True)  # the researcher's own words confirm what was only proposed
+                keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
             continue
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
-        target = next((r for r in pending if r["id"] == head and r["status"] in ACTIVE
-                       and (r["scope"] == "project" or personal)), None)  # never into personal from a stricter project
-        own = cap({**candidate, "status": "confirmed"}, message, author) == "confirmed"
+        target = next((r for r in pending if r["id"] == head and r["status"] in ACTIVE and (
+            r["scope"] == "project" or (personal and own))), None)  # a personal one: the researcher's own words only
         structured = {"source": "researcher" if own else "answer"}
-        sources = [("turn", turn), ("run", run_id), *carried]
+        sources = [("turn", turn), ("run", run_id)]  # a personal record carries no paper (point 1)
         if target is not None:
-            sources += [(k, i) for k, i in sources_of(conn, target["id"]) if k == "material"]  # what it was written from
+            if target["scope"] == "project":  # the papers it may carry text of, and those it was written from
+                sources += [*carried, *((k, i) for k, i in sources_of(conn, target["id"]) if k == "material")]
             if target["scope"] == "personal":
                 late = late_anywhere
                 if status == "inferred":
@@ -614,14 +606,13 @@ def apply_extraction(conn, run_id, candidates):
             untouched = target["updated_at"] <= run_started
             if authoritative and newer and untouched and not late:
                 written.append(write(conn, project_id=project_id, scope=target["scope"], kind=target["type"],
-                                     content=candidate["content"], status=status,
-                                     sources=sources + (derived if status == "proposed" else []), run_id=run_id,
+                                     content=candidate["content"], status=status, sources=sources, run_id=run_id,
                                      replaces=target["id"], structured=structured))
                 counts["replaced"] += 1
                 counts[status] += 1
                 continue
             written.append(write(conn, project_id=project_id, scope=target["scope"], kind=target["type"],
-                                 content=candidate["content"], status="proposed", sources=sources + derived, run_id=run_id,
+                                 content=candidate["content"], status="proposed", sources=sources, run_id=run_id,
                                  replaces=None, structured={**structured, "seen": target["version"],
                                                             **({"older": True} if not newer else {})}))
             conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (target["id"], written[-1]))
@@ -630,7 +621,7 @@ def apply_extraction(conn, run_id, candidates):
         if late and status != "proposed":
             status = "proposed"
         written.append(write(conn, project_id=project_id, scope=scope, kind=kind, content=candidate["content"],
-                             status=status, sources=sources + (derived if status == "proposed" else []), run_id=run_id,
+                             status=status, sources=sources + (carried if scope == "project" else []), run_id=run_id,
                              structured=structured))
         counts[status] += 1
     return {"counts": counts, "records": written}
@@ -651,83 +642,23 @@ def wants(decision):
     return True, True
 
 
-def origins(conn, record_ids, project_id):
-    """What model-written text that may restate these records depends on, flat (never a chain of records): the
-    projects their text came from (a personal record's own project, the projects of their turns and runs, other than
-    project_id), their papers, and their own origins. Recorded as sources of a proposal an extraction draws from the
-    answer, an agent's note, or a saved answer, so the record follows them (valid); a record confirmed from the
-    researcher's own words takes none."""
-    found = set()
-    for record in set(record_ids):
-        item = row(conn, record)  # one already gone or no longer allowed: the caller writes nothing (restated_ok)
-        if item is None:
-            continue
-        if item["project_id"] and item["project_id"] != project_id:  # another project's, whatever its scope now
-            found.add(("origin", item["project_id"]))
-        found.add(("memory", record))  # and the record itself: forgetting it takes what may restate it
-        for kind, source in sources_of(conn, record):
-            if kind == "material" or kind == "origin":
-                found.add((kind, source))
-            elif kind in ("turn", "run"):
-                where = conn.execute("SELECT project_id FROM runs WHERE id = ?", (source,)).fetchone()
-                if where is not None and where[0] != project_id:
-                    found.add(("origin", where[0]))
-    return sorted(found)
-
-
-def restated_ok(conn, project_id, record_ids):
-    """Whether model-written text that may restate these records may still be written in project_id: every one exists
-    and is valid there now."""
-    return all((found := row(conn, i)) is not None and valid(conn, project_id, found) for i in set(record_ids))
-
-
-def _recalled(conn, run_id):
-    """The memory records a run's requests held (inputs.memory_ids)."""
-    held = conn.execute("SELECT json_extract(inputs, '$.memory_ids') FROM runs WHERE id = ?", (run_id,)).fetchone()
-    return json.loads((held and held[0]) or "[]")
-
-
 def valid(conn, project_id, record):
-    """Whether a record's text may be in a request of project_id now (S1-21a; Harold's retrieval and memory spec,
-    source validity: an inaccessible source invalidates the memory derived from it). The one rule every reader of
-    memory applies (recall, PROJECT STATE, the memory tools, an extraction's related records) and the dispatch check
-    (allowed), over every source kind:
-    - its scope: a project record is project_id's own; a personal record was written in a Normal project that is still
-      Normal and unlocked;
-    - `turn` and `run`: the project the turn or run is in now passes the check a paper's would: not review-locked, and
-      no stricter than project_id's (for a personal record: Normal);
+    """Whether a record's text may be in a request of project_id now (S1-21a; Harold's decision of 2026-10-23: a
+    record's scope and validity are fixed when it is written). The one rule every reader of memory applies (recall,
+    PROJECT STATE, the memory tools, an extraction's related records) and the dispatch check (allowed):
+    - its scope: a project record is project_id's own; a personal record any project's but a review-locked one's;
     - `material`: every paper whose text it may carry exists and passes the request's access check
-      (provenance.sendable);
-    - `origin`: a project whose memory a model-written record may restate (origins) passes the check a turn's does;
-    - `paper`, `project`, `researcher`: carry no text of another source."""
+      (provenance.sendable; a personal record carries none).
+    A later tightening, lock or move of another project, or of the one it was written in, retracts nothing written."""
     from backend import provenance
-    from backend.governance import LEVELS
-    personal = record["scope"] == "personal"
-    if not personal and record["project_id"] != project_id:
-        return False
-    level = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
-    if level is None:
-        return False
-    if personal:
-        own = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (record["project_id"],)).fetchone()
-        if record.get("sensitivity") not in (None, "normal") or (own is not None and (own[0] != "normal" or own[1])):
+    if record["scope"] == "project":
+        if record["project_id"] != project_id:
             return False
-    ceiling = 0 if personal else LEVELS.index(level[0])
-    materials = []
-    for kind, source in sources_of(conn, record["id"]):
-        if kind == "material":
-            materials.append(source)
-        elif kind in ("turn", "run"):
-            where = conn.execute("SELECT p.sensitivity, p.review_lock FROM runs r JOIN projects p ON p.id = r.project_id"
-                                 " WHERE r.id = ?", (source,)).fetchone()
-            if where is not None and (where[1] or LEVELS.index(where[0]) > ceiling):
-                return False
-        elif kind == "origin":  # a project whose memory it may restate: still there, no stricter, and not locked (one
-            # deleted may have been stricter first: what it restated stays hidden)
-            where = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (source,)).fetchone()
-            if where is None or where[1] or LEVELS.index(where[0]) > ceiling:
-                return False
-    return provenance.sendable(conn, project_id, materials)
+    else:
+        locked = conn.execute("SELECT review_lock FROM projects WHERE id = ?", (project_id,)).fetchone()
+        if locked is None or locked[0]:
+            return False
+    return provenance.sendable(conn, project_id, materials_of(conn, [record["id"]]))
 
 
 def recall_candidates(conn, project_id, locked=False, now=None):
@@ -785,13 +716,9 @@ def materials_of(conn, record_ids):
 
 def note(conn, *, project_id, run_id, kind, text, materials):
     """An agent's note (update_progress): an open question or a next step, marked as the agent's, inferred, never
-    confirmed; carrying the papers the turn's request held and what its recalled memory came from; None (nothing
-    written) when a record it may restate is gone or no longer allowed here."""
-    if not restated_ok(conn, project_id, _recalled(conn, run_id)):
-        return None
+    confirmed; carrying the papers the turn's request held."""
     return write(conn, project_id=project_id, scope="project", kind="agent_note", content=text, status="inferred",
-                 sources=[("run", run_id), *papers(materials), *origins(conn, _recalled(conn, run_id), project_id)],
-                 run_id=run_id, structured={"kind": kind})
+                 sources=[("run", run_id), *papers(materials)], run_id=run_id, structured={"kind": kind})
 
 
 def _progress(conn, project_id, event, count, sources, wording):

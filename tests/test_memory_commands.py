@@ -225,7 +225,8 @@ async def test_a_correction_never_replaces_a_record_that_shares_only_common_word
 
 async def test_nothing_of_a_private_project_becomes_or_changes_personal_memory(tmp_path):
     # review 1 (P1): an update from a Private project never rewrites a personal record; the views refuse a personal
-    # record there; a personal record whose turn moved to a stricter project is recalled nowhere
+    # record there; a personal record whose turn moved to a stricter project stays personal (fix batch 3, Harold's
+    # decision of 2026-10-23: a record's scope and validity are fixed when it is written)
     from backend import memory
     async with started(tmp_path / "data") as client:
         normal = await project_of(client)
@@ -244,7 +245,7 @@ async def test_nothing_of_a_private_project_becomes_or_changes_personal_memory(t
             r["content"] for r in memory.recall_candidates(conn, other)])
         assert await recalled() == ["I prefer short answers"]
         await client.post(f"/api/conversations/{conversation}/move", json={"project_id": private})
-        assert await recalled() == []  # its turn is the Private project's now
+        assert await recalled() == ["I prefer short answers"]  # never retracted
 
 
 async def test_saving_what_was_only_inferred_confirms_it(tmp_path):

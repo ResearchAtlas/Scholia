@@ -462,17 +462,12 @@ async def update_progress(call, turn):
                           meta={"memory": []})
     written = []
 
-    def keep(conn):  # None: a record the note may restate is no longer allowed here; nothing is written
+    def keep(conn):
         written.append(memory.note(conn, project_id=turn.ctx["project_id"], run_id=turn.claim.run_id,
                                    kind=call.arguments["kind"], text=text, materials=turn.ctx.get("context_materials") or ()))
-        if written[-1] is None:
-            return
         from backend.runs import _event  # it imports this module
         _event(conn, turn.claim.run_id, "memory_proposed", {"tool": "update_progress", "records": list(written)})
     await turn.harness._record(turn.claim, None, None, also=keep)
-    if written[0] is None:
-        return ToolResult(id=call.id, ok=True, text="The note was not kept: memory it may restate is no longer allowed "
-                                                    "here.", meta={"memory": []})
     turn.emit({"type": "memory", "action": "noted", "count": 1})
     return ToolResult(id=call.id, ok=True, text="Noted in the project state as your note.", meta={"noted": written[0]})
 

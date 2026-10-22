@@ -173,18 +173,13 @@ RULES = (
     SELECT 'memory_records', m.rowid FROM memory_records m
     WHERE m.id IN (SELECT memory_id FROM memory_sources WHERE rowid IN {_doomed('memory_sources')})
     AND NOT EXISTS (SELECT 1 FROM memory_sources s
-                    WHERE s.memory_id = m.id AND s.source_kind NOT IN ('material', 'origin', 'memory')
+                    WHERE s.memory_id = m.id AND s.source_kind != 'material'
                     AND s.rowid NOT IN {_doomed('memory_sources')})""",
     # S1-21a (backend/provenance.py): a record that may carry a paper's text (a `material` source) goes with any one of
     # its papers, not only its last source.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', m.rowid FROM memory_records m JOIN memory_sources s ON s.memory_id = m.id
     WHERE s.source_kind = 'material' AND s.source_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
-    # S1-21a: model-written text that may restate a deleted record (a proposal, an agent's note, a saved answer: a
-    # `memory` source; never a record confirmed from the researcher's own words) goes with it.
-    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
-    SELECT 'memory_records', m.rowid FROM memory_records m JOIN memory_sources s ON s.memory_id = m.id
-    WHERE s.source_kind = 'memory' AND s.source_id IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
     # S1-21a: Forget deletes the content (F10), so the earlier versions a deleted record replaced go with it.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', o.rowid FROM memory_records o
@@ -341,6 +336,11 @@ def _delete(conn, kind, object_id, remove_all_trace):
     # Harold, 2026-10-21 (option A): a run that depended on a deleted paper loses every copy of model-written text it
     # keeps: its answer's citation rows' text, and an agent's question held while it waits (S1-19c).
     provenance.forget(conn, f"SELECT id FROM materials WHERE rowid IN {_doomed('materials')}")
+    # S1-21a fix batch 3 (R5): a memory extraction's reply held until its effect is written goes with any record its
+    # request was shown (inputs.memory_ids), in this transaction, not at the run's own end
+    conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.held.output')"
+                 " WHERE json_type(inputs, '$.held.output') IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(runs.inputs,"
+                 f" '$.memory_ids') j WHERE j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')}))")
     # S1-21a: what's done, from AAB's own records: papers removed from a project that stays (no title is kept)
     from backend import memory
     for removed_from, count in conn.execute(

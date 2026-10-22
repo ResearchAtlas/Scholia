@@ -323,7 +323,7 @@ def _let_go(conn, run_id):
                  " AND json_type(inputs, '$.held') IS NOT NULL", (run_id,))
 
 
-def may_dispatch(conn, run_id, past_deadline=None):
+def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
     """The check before every dispatch (slice-1 spec section 10, Revocation), which the outbound
     gate reads in its decision transaction, so retries are covered too: the run is still running
     and not revoked; every owner it has still exists (a turn's project and conversation; detached
@@ -334,7 +334,9 @@ def may_dispatch(conn, run_id, past_deadline=None):
     exists and is still allowed in it (memory.allowed). The project's current level and the route it allows are
     the gate's own checks there. past_deadline(), if given, is a turn's time limit (section 13), checked here, in
     the gate's decision transaction just before the request is sent, whatever it waited for before (its body's
-    storage, the gate, the stream's reader): past it the request is refused, "turn_deadline"."""
+    storage, the gate, the stream's reader): past it the request is refused, "turn_deadline". memory_off(), if given,
+    reads the project's memory switch as it is now (S1-21a fix batch 3, R4): a request holding memory is refused once it
+    is off, whichever step of the run sends it (a nested tool's included)."""
     row = conn.execute(
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
@@ -357,7 +359,8 @@ def may_dispatch(conn, run_id, past_deadline=None):
     wanted = {tuple(pair) for pair in json.loads(evidence)} if evidence else set()
     # S1-21a: every memory record the request holds still exists and is still allowed in it (memory.allowed: a
     # personal record whose project was tightened or locked since it was recalled is not)
-    if remembered and not memory.allowed(conn, project_id, json.loads(remembered)):
+    if remembered and json.loads(remembered) and (
+            not memory.allowed(conn, project_id, json.loads(remembered)) or (memory_off is not None and memory_off())):
         return False
     if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
         return False  # gone, or its project no longer allows this request (tightened, or review-locked)
@@ -376,6 +379,7 @@ class _Call:
     bodies: list = field(default_factory=list)  # S1-19: each attempt's request body as stored (its sha256, or None)
     materials: tuple = ()  # the papers whose text its request holds, for the bodies' deletion links
     declined: bool = False  # S1-19c: an attempt refused at dispatch because the turn's time limit had passed
+    memory_off: bool = False  # S1-21a: an attempt holding memory refused at dispatch because memory was switched off
 
 
 class Harness:
@@ -1522,14 +1526,6 @@ class Harness:
         chain, calls_made, failures = [], 0, 0
         for number in range(limits["agent_steps"]):
             if number:
-                if ctx.get("memory_ids") and not await self.memory_on(ctx["project_id"]):
-                    # Switched off mid-turn after the turn's requests held memory (recalled, or a memory tool's result in
-                    # its chain, which is never cut or rewritten: model-route rule 5): no later request may carry it, so
-                    # the turn ends here as a change to its project ends a run (section 10): cancelled, revoked, with
-                    # Continue, which builds the next turn with memory off.
-                    claim.cancel_reason = "revoked"
-                    claim.cancel_requested.set()
-                    raise asyncio.CancelledError()
                 try:
                     _, request = self._cited_request(ctx, found, decision, chain=chain, read=turn.evidence.numbered)
                 except context.OverWindow:
@@ -1956,7 +1952,11 @@ class Harness:
             call.declined = call.declined or _past_deadline(active.context)
             return call.declined
 
-        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past),
+        def off():  # the project's memory switch, read by the dispatch check of a request that holds memory
+            call.memory_off = not memory.enabled(load_settings(self.data_dir, project_id[0]).values)
+            return call.memory_off
+
+        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past, off),
                                           provider=route.provider.name) as client:
             result = await openrouter.query_model(
                 client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
@@ -1992,8 +1992,10 @@ class Harness:
                         held = _hold_unspent(conn, call, rehold, self.data_dir)
                         if held:
                             finished.update(unspent_id=held[0], unspent_usd=held[1])
-                if hold and "output" in finished and exists and not provenance.carried(conn, call.materials):
-                    finished["output"] = None  # a paper it drew on was deleted meanwhile: none of its text is kept
+                if hold and "output" in finished and exists and (not provenance.carried(conn, call.materials) or conn.execute(
+                        "SELECT 1 FROM runs r, json_each(r.inputs, '$.memory_ids') j WHERE r.id = ?"
+                        " AND j.value NOT IN (SELECT id FROM memory_records)", (active.run_id,)).fetchone()):
+                    finished["output"] = None  # a paper it drew on, or a record it was shown, was deleted meanwhile
                 if hold and finished.get("output") is not None and exists:
                     conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.held.output', json(?))"
                                  " WHERE id = ?", (json.dumps(finished["output"]), active.run_id))
@@ -2023,6 +2025,14 @@ class Harness:
             raise asyncio.CancelledError()
         if call.declined:  # refused at dispatch for the turn's time limit: recorded and settled, the turn stops there
             raise _LimitReached("turn_minutes")
+        if call.memory_off:
+            # Refused at dispatch: memory was switched off while the run's requests held it (recalled, or a memory
+            # tool's result in a chain that is never cut or rewritten: model-route rule 5). The run ends here as a
+            # change to its project ends a run (section 10): cancelled, revoked; a turn offers Continue, which builds
+            # the next turn with memory off.
+            active.cancel_reason = "revoked"
+            active.cancel_requested.set()
+            raise asyncio.CancelledError()
         return result
 
     # Background runs
