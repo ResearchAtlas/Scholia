@@ -1118,3 +1118,36 @@ async def test_ct6_a_take_back_keeps_the_messages_selection_in_the_turns_revocat
         (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
         scope = json.loads(inputs)["material_ids"]
         assert chinese in scope and wages not in scope  # the message's selection stays; the taken-back paper goes
+
+
+@pytest.mark.asyncio
+async def test_ct6_a_dispatched_call_whose_settlement_failed_keeps_its_paper_registered(tmp_path, monkeypatch):
+    from backend import runs
+    _no_preload(monkeypatch)
+    real_settle, settled, holder = runs._settle_attempts, [], {}
+
+    def failing(conn, reservation_id, rates, attempts):  # the tool's own answer step was sent; its settlement fails
+        settled.append(reservation_id)
+        if len(settled) == 2:
+            raise RuntimeError("the settlement write failed")
+        return real_settle(conn, reservation_id, rates, attempts)
+    real_stop = runs.Harness._stop_turn
+
+    async def deleting_first(self, claim, **options):  # the paper it sent is deleted before the turn's terminal write
+        (inputs,), = await rows(holder["client"], "SELECT inputs FROM runs WHERE id = ?", claim.run_id)
+        holder["inputs"] = json.loads(inputs)
+        assert (await holder["client"].delete(f"/api/materials/{holder['material']}")).status_code == 200
+        return await real_stop(self, claim, **options)
+    monkeypatch.setattr(runs, "_settle_attempts", failing)
+    monkeypatch.setattr(runs.Harness, "_stop_turn", deleting_first)
+    provider = Scripted([call("answer_from_library", question=QUESTION)], "Never.", inner=["Wages rose [S1.1]."])
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        holder.update(client=client, material=material)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert len(provider.inners) == 1  # its request was sent: the paper's text reached a model
+        inputs = holder["inputs"]
+        assert material in inputs["material_ids"] and material in inputs["context_materials"]  # never taken back
+        assert {m for _, m in inputs["evidence"]} == {material}  # nor its evidence
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")  # its deletion revokes

@@ -1616,7 +1616,7 @@ class Harness:
             return failed(call_id, "over_window", "The evidence this needs does not fit this model's window.")
         held = dict(list(held.items())[:len(lines) - request.cuts.get("research_evidence", 0)])
         turn.evidence.keep(keys, held, before)  # what its answer step was not given is not read in the run
-        registered, committed = ctx.get("context_materials", []), False
+        registered, committed, call = ctx.get("context_materials", []), False, None
 
         async def undo():  # its answer step's request reached no model: none of its passages is read in the run, and
             turn.evidence.keep(keys, (), before)  # no answer depends on their papers (its registration taken back)
@@ -1639,7 +1639,8 @@ class Harness:
                                       zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
                                       rehold=ctx if judge_estimate else None)
         except Exception:
-            await undo()
+            if call is None or not call.dispatched:  # an exception after the gate let it out takes nothing back
+                await undo()
             raise
         if not result.dispatched:  # refused before it left, or never connected
             await undo()
