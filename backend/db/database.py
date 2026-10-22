@@ -178,6 +178,8 @@ class Database:
         back and the exception propagates. fn must not commit or roll back.
         committed, if given, is called on the writer thread right after COMMIT,
         whatever becomes of the caller meanwhile, and never after a rollback.
+        It must be quick and must not raise: an error from it would reach the
+        caller although the transaction has committed.
         """
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
