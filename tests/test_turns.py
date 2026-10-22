@@ -858,6 +858,66 @@ async def test_a_read_taken_before_a_turns_terminal_record_commits_never_reads_i
         await background_idle(client)
 
 
+@pytest.mark.parametrize("by", ["stop", "disconnect"])
+async def test_a_turn_stopped_before_its_response_starts_never_reads_interrupted(tmp_path, monkeypatch, by):
+    """PR 46 review: a claim whose response never started was released before its terminal write, so a read meanwhile,
+    or one taken before that write committed, read it interrupted. Its conversation is free at once, as before; the run
+    stays held until its terminal record commits, and is known finished from then on."""
+    from backend.runs import Registry, derived_status
+    real_release, real_finish, seen, gate = Registry.release, runs_module.Harness._finish_turn, [], threading.Event()
+
+    def release(self, active):  # the moment after its hold is released, as a read taken before its commit reads it
+        real_release(self, active)
+        if active.kind == "turn":
+            seen.append((active.run_id, derived_status("running", active.run_id, self)))
+
+    def finish(self, conn, *args, **kwargs):  # its terminal write waits until the reads below are done
+        gate.wait(10)
+        return real_finish(self, conn, *args, **kwargs)
+
+    monkeypatch.setattr(Registry, "release", release)
+    monkeypatch.setattr(runs_module.Harness, "_finish_turn", finish)
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "never started")
+        stopped = asyncio.create_task(harness.cancel(claim.run_id)) if by == "stop" else None
+        if stopped is None:
+            harness.stream_closed(claim)  # its response ended before it started
+        await wait_for(lambda: claim.closing is not None)
+        reading = (await client.get(f"/api/conversations/{conversation}")).json()
+        assert reading["running"] is False and reading["turns"][0]["status"] == "running"  # never interrupted
+        harness.registry.release(harness.registry.claim_turn(conversation))  # a new message may be sent at once
+        gate.set()
+        ended = await (stopped if stopped is not None else claim.closing)
+        assert (ended["status"], ended["cancel_reason"]) == ("cancelled", "researcher")
+        assert [status for run, status in seen if run == claim.run_id] == ["running"]
+        assert not harness.registry.is_active(claim.run_id)
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert (turn["status"], turn["cancel_reason"]) == ("cancelled", "researcher")
+        await background_idle(client)
+
+
+async def test_a_turn_stopped_before_its_response_starts_whose_terminal_write_fails_reads_interrupted(tmp_path,
+                                                                                                    monkeypatch):
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "never started")
+
+        def failing(*args, **kwargs):  # the terminal write raises, so nothing of it commits
+            raise RuntimeError("the terminal write failed")
+
+        monkeypatch.setattr(runs_module.Harness, "_finish_turn", failing)
+        harness.stream_closed(claim)
+        with pytest.raises(RuntimeError):
+            await claim.closing
+        assert not harness.registry.is_active(claim.run_id) and claim.run_id not in harness.registry.finished
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["status"] == "interrupted"  # its record says running and nothing here holds it
+        await background_idle(client)
+
+
 async def test_an_admission_stopped_by_shutdown_writes_no_run(tmp_path, monkeypatch):
     async with started(tmp_path / "data") as client:
         conversation = await new_conversation(client)

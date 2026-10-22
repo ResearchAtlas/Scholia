@@ -242,6 +242,12 @@ class Registry:
             if active.conversation_id is not None and self.turns.get(active.conversation_id) is active:
                 del self.turns[active.conversation_id]
 
+    def free_conversation(self, active: ActiveRun) -> None:
+        """Let a new turn claim the conversation a turn holds, the run itself still held (see release)."""
+        with self.lock:
+            if active.conversation_id is not None and self.turns.get(active.conversation_id) is active:
+                del self.turns[active.conversation_id]
+
     def is_active(self, run_id: str) -> bool:
         return run_id in self.runs
 
@@ -466,7 +472,8 @@ class Harness:
         is never interrupted. A background run stopping for a shutdown it would restart after
         (a refused restore) is the exception: a later Cancel or revocation becomes its reason,
         without interrupting its cleanup, so it ends instead. A claim whose response never
-        started has run nothing: it is released and recorded at once. A background run whose
+        started has run nothing: its conversation is freed and it is recorded at once, and it
+        is released once that write has ended. A background run whose
         task is still to come (its record being written, see record_background) stays held:
         its task sees the request as it starts, and ends it."""
         if active.cancel_requested.is_set():
@@ -480,11 +487,20 @@ class Harness:
                 active.task.cancel()
             # else it sees the request as it starts, and ends through its own cleanup
         elif active.kind == "turn" and self.registry.runs.get(active.run_id) is active:
-            self.registry.release(active)
+            # Its conversation is free at once, so a new message may be sent; the run stays held until its
+            # terminal write ends, and is known finished once that has committed, so no read takes it for
+            # interrupted meanwhile. One whose write fails reads interrupted once released.
+            self.registry.free_conversation(active)
             status = "interrupted" if reason == "shutdown" else "cancelled"
             cancel_reason = None if status == "interrupted" else ("revoked" if reason == "revoked" else "researcher")
-            active.closing = self._detach(self._write(
-                lambda conn: self._finish_turn(conn, active.run_id, status, cancel_reason, status)))
+
+            async def close():
+                try:
+                    return await self._ended(active, self._write(
+                        lambda conn: self._finish_turn(conn, active.run_id, status, cancel_reason, status)))
+                finally:
+                    self.registry.release(active)
+            active.closing = self._detach(close())
 
     def stream_closed(self, claim: ActiveRun) -> None:
         """A turn's response ended, however it ended: a turn still running, or one that
