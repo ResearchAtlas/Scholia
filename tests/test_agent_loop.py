@@ -1095,3 +1095,26 @@ async def test_ct6_a_taken_back_paper_leaves_the_turns_revocation_scope(tmp_path
         assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("succeeded", None)  # not revoked
         (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
         assert material not in (json.loads(inputs).get("material_ids") or [])  # its scope taken back with it
+
+
+@pytest.mark.asyncio
+async def test_ct6_a_take_back_keeps_the_messages_selection_in_the_turns_revocation_scope(tmp_path, monkeypatch):
+    from backend import runs
+    from test_search import CHINESE
+    _no_preload(monkeypatch)
+    real = runs.Harness._reserve
+
+    async def failing(self, claim, *args, phase=None, **options):
+        if phase == "answer_from_library":
+            raise RuntimeError("the reservation's transaction failed")
+        return await real(self, claim, *args, phase=phase, **options)
+    monkeypatch.setattr(runs.Harness, "_reserve", failing)
+    async with cited(tmp_path, Scripted(after="Done.")) as client:
+        project, [wages, chinese] = await with_papers(client, WAGES, CHINESE)
+        client.provider.script.append([call("answer_from_library", question=QUESTION, material_ids=[wages])])
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there", material_ids=[chinese])
+        assert stream[-1]["status"] == "succeeded"
+        (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
+        scope = json.loads(inputs)["material_ids"]
+        assert chinese in scope and wages not in scope  # the message's selection stays; the taken-back paper goes
