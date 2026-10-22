@@ -855,8 +855,8 @@ class Harness:
             result = await self._agent_steps(claim, ctx, turn, found, decision, request, handed)
             numbered = turn.evidence.numbered  # every passage read in the run: the pre-load and the tools'
             if result == "stopped":  # the researcher chose to stop after three failed tool calls (section 6.6)
-                final, _ = await _through(self._write(lambda conn: self._finish_turn(
-                    conn, claim.run_id, "cancelled", "researcher", "tool_errors", claim=claim)))
+                final = await self._end_turn(claim, lambda conn: self._finish_turn(
+                    conn, claim.run_id, "cancelled", "researcher", "tool_errors", claim=claim))
                 emit({"type": "run_finished", **final})
                 return
             if isinstance(result, str):  # stopped at a turn limit (section 13): Continue is offered
@@ -914,7 +914,7 @@ class Harness:
                 _close_call(conn, call)
                 return self._finish_turn(conn, claim.run_id, "cancelled", "limit", hit.code,
                                          limit={hit.code: ctx["limits"].get(hit.code, True)}, claim=claim)
-            final, _ = await _through(self._write(limited))
+            final = await self._end_turn(claim, limited)
             if final.get("cancel_reason") == "limit":  # not a Stop that came first
                 emit({"type": "limit_reached", "limit": hit.code})
             emit({"type": "run_finished", **final})
@@ -934,6 +934,12 @@ class Harness:
             claim.events.put_nowait(None)
             if not self.registry.closed:
                 self._detach(self.kick_background())
+
+    async def _end_turn(self, claim, fn):
+        """A turn's terminal write fn(conn) -> its final state, to its end whatever cancellations arrive meanwhile: the
+        one way the agent loop's own endings (a turn limit, a stop after tool errors) are written (S1-19c)."""
+        final, _ = await _through(self._write(fn))
+        return final
 
     async def _stop_turn(self, claim, *, status=None, reason=None):
         """End a turn that did not reach its primary commit, settling its open call once."""
