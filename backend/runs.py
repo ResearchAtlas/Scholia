@@ -901,9 +901,13 @@ class Harness:
             final, _ = await _through(self._stop_turn(claim))
             emit({"type": "run_finished", **final})
         except _LimitReached as hit:  # a turn limit (section 13), before any further dispatch: Continue is offered
-            final, _ = await _through(self._write(lambda conn: self._finish_turn(
-                conn, claim.run_id, "cancelled", "limit", hit.code, limit={hit.code: ctx["limits"].get(hit.code, True)},
-                claim=claim)))
+            call = claim.call  # a call stopped at the deadline before it left: its reservation is released
+
+            def limited(conn):
+                _close_call(conn, call)
+                return self._finish_turn(conn, claim.run_id, "cancelled", "limit", hit.code,
+                                         limit={hit.code: ctx["limits"].get(hit.code, True)}, claim=claim)
+            final, _ = await _through(self._write(limited))
             if final.get("cancel_reason") == "limit":  # not a Stop that came first
                 emit({"type": "limit_reached", "limit": hit.code})
             emit({"type": "run_finished", **final})
@@ -1340,11 +1344,8 @@ class Harness:
                 if _past_deadline(ctx):
                     raise _LimitReached("turn_minutes")
                 calls_made += 1
-                answered = await self._tool(raw, turn)
-                raw_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else ""
-                chain.append({"role": "tool", "tool_call_id": raw_id,  # the provider's own id, in the chain only
-                              "content": answered.text if answered.ok else json.dumps(
-                                  {"error": answered.error.type, "message": answered.error.message})})
+                answered, message = await self._tool(raw, turn, calls_made)
+                chain.append(message)
                 failures = 0 if answered.ok else failures + 1
                 if failures >= 3:  # compact errors: after three failed calls in a row the run stops and asks (6.6)
                     # Asked again if a change of protection withdrew it; a Stop, deletion or revocation ends the turn.
@@ -1365,13 +1366,16 @@ class Harness:
         own = (await asyncio.to_thread(load_settings, self.data_dir, ctx["project_id"])).values.get("tools") or {}
         return {k: own.get(k) or () for k in ("deny", "ask", "allow")}
 
-    async def _tool(self, raw, turn):
+    async def _tool(self, raw, turn, number):
         """One tool call of the model's: parsed, checked against the project's rules as they are now (deny, then ask,
         then allow) and the tool's schema, run, and recorded (tool_call_started, tool_result: a known name, the call's
         id in its content-free form (agent.traced_id), argument lengths and result ids and counts, never text). The
         tool itself is given the content-free id, so nothing it records can carry the provider's. A tool the rules
         ask about waits for the researcher's approval, and a deny that lands meanwhile wins. Every failure is a short
-        structured error for the model."""
+        structured error for the model. Returns (the result, the chain's tool message), the message kept whole as it is
+        produced (model-route rule 5: tool calls stored with their results): in run_bodies under its call's number
+        (TOOL_RESULT_SLOT + number) with the papers the turn's request then carries, held from collection until that
+        link commits, deleted with any of them; its tool_result event names it by hash only."""
         claim, step = turn.claim, turn.step
         call, problem = ToolParser.parse_call(raw)
         call_id = agent.traced_id(call.id if call else raw.get("id") if isinstance(raw, dict) else None)
@@ -1399,12 +1403,22 @@ class Harness:
             except Exception as error:  # a defect in the tool: a short error for the model, the turn goes on
                 log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
                 result = failed(call_id, "tool_error", "The tool failed.")
-        await self._record(claim, "tool_result", {
-            "step": step, "call_id": call_id, "name": name, "ok": result.ok,
-            **({"error": result.error.type} if result.error else {}), **({"meta": result.meta} if result.meta else {})})
         if turn.listed or result.meta.get("passages"):  # what it gave the model is covered before the next dispatch
             await self._register_context(claim, turn.evidence.numbered, turn.listed)
-        return result
+        raw_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else ""
+        message = {"role": "tool", "tool_call_id": raw_id,  # the provider's own id, in the chain (and its stored copy) only
+                   "content": result.text if result.ok else json.dumps({"error": result.error.type,
+                                                                        "message": result.error.message})}
+        materials = tuple(sorted(turn.ctx.get("context_materials") or ()))
+        with self.content.hold() if self.content is not None else nullcontext([]) as held:
+            ref = await asyncio.to_thread(_stored, self.content, json.dumps(
+                message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), held)
+            await self._record(claim, "tool_result", {
+                "step": step, "call_id": call_id, "name": name, "ok": result.ok,
+                **({"error": result.error.type} if result.error else {}), **({"meta": result.meta} if result.meta else {}),
+                **({"result": ref} if ref else {"result_unavailable": True})},
+                also=lambda conn: _keep_result(conn, claim.run_id, step, number, ref, materials))
+        return result, message
 
     async def _approved(self, turn, call):
         """Whether the researcher allowed a call the project's rules ask about: asked on the shared confirmation (an
@@ -1507,7 +1521,22 @@ class Harness:
         state = search._STATES.get(self)
         if state is None:
             return failed(call_id, "tool_error", "The library's search index is unavailable.")
-        found = await pipeline.evidence(state, ctx["project_id"], question, materials=selection)
+        budgets, facts = ctx["budgets"], ctx["facts"]
+
+        def assembled(held, found):  # its answer step's request, for the window its route accepts
+            return context.assemble(
+                "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
+                margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=question,
+                sections={"research_evidence": citations.bundle(held), "conflicts": citations.missing(
+                    held, mode=found["mode"], route="literature", index=(found.get("trace") or {}).get("index", "ready"))},
+                needs_evidence=True)
+
+        def whole(records):  # B40: a selection is read directly only when its answer step's request holds it whole
+            try:
+                return not assembled(citations.sources(records), {"mode": "selection"}).cuts.get("research_evidence")
+            except context.OverWindow:
+                return False
+        found = await pipeline.evidence(state, ctx["project_id"], question, materials=selection, whole=whole)
         await self._trace_retrieval(claim, found, call_id)
         before = set(turn.evidence.numbered)
         keys = list(dict.fromkeys(turn.evidence.add(found["records"])))
@@ -1515,14 +1544,9 @@ class Harness:
         if not held:
             return ToolResult(id=call_id, ok=True, text="No passage in the library matched this question: the library "
                                                        "holds no evidence for it.", meta={"passages": []})
-        budgets, facts, lines = ctx["budgets"], ctx["facts"], citations.bundle(held)
+        lines = citations.bundle(held)
         try:  # a pipeline needing evidence refuses when too little room is left for it (section 8, final review F15)
-            request = context.assemble(
-                "answer", window=facts["window"], output=_output(budgets["output_limit"], facts), budgets=budgets,
-                margin_percent=budgets["margin_percent"], system_rules=SYSTEM_RULES, request=question,
-                sections={"research_evidence": lines, "conflicts": citations.missing(
-                    held, mode=found["mode"], route="literature", index=(found.get("trace") or {}).get("index", "ready"))},
-                needs_evidence=True)
+            request = assembled(held, found)
         except context.OverWindow:
             turn.evidence.keep(keys, (), before)
             return failed(call_id, "over_window", "The evidence this needs does not fit this model's window.")
@@ -1686,6 +1710,10 @@ class Harness:
             call.dispatched, call.retention = True, terms
 
         async def keep(body):  # stored, and linked to its papers, before it is sent: a stop or a crash keeps it
+            # The last moment before the request leaves, whatever it waited for (the stream's reader, a retry): a turn
+            # past its time limit sends nothing (section 13); the call is closed, released, by the turn's limit path.
+            if not call.bodies and _past_deadline(active.context):  # its first attempt; a retry is the same call
+                raise _LimitReached("turn_minutes")
             # Held from collection until its link commits (or is skipped: then collected once idle).
             with self.content.hold() if self.content is not None else nullcontext([]) as held:
                 ref = await asyncio.to_thread(_stored, self.content, body, held)
@@ -2309,6 +2337,20 @@ def _keep_reply(conn, call, number, ref):
     conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
                      [(ref, material) for material in call.materials])
     return {"reply": ref}
+
+
+TOOL_RESULT_SLOT = 2000  # run_bodies keeps a tool result under its call's number in the turn plus this
+
+
+def _keep_result(conn, run_id, step, number, ref, materials):
+    """A tool result's chain message, kept in run_bodies (step, TOOL_RESULT_SLOT + its call's number) with the papers
+    the turn's request carries, so a deletion of one of them removes it; nothing once one of them is gone."""
+    if ref is None or not provenance.carried(conn, materials):
+        return
+    conn.execute("INSERT OR IGNORE INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
+                 (run_id, step, TOOL_RESULT_SLOT + number, ref))
+    conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
+                     [(ref, material) for material in materials])
 
 
 def _kept_body(conn, call, number, dispatched):

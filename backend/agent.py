@@ -184,7 +184,9 @@ async def search_passages(call, turn):
     state = search._STATES.get(turn.harness)
     if state is None:
         return failed(call.id, "tool_error", "The library's search index is unavailable.")
-    found = await pipeline.evidence(state, turn.ctx["project_id"], query, materials=selection or None)
+    # B40: a selection is read directly only when its passages fit this result's preview whole; else searched within
+    found = await pipeline.evidence(state, turn.ctx["project_id"], query, materials=selection or None,
+                                    whole=lambda records: _preview_fits(citations.bundle(citations.sources(records))))
     await turn.harness._trace_retrieval(turn.claim, found, call.id)
     before = set(turn.evidence.numbered)
     keys = list(dict.fromkeys(turn.evidence.add(found["records"])))
@@ -193,7 +195,7 @@ async def search_passages(call, turn):
     shown, used = [], 0
     for key in keys:  # whole passages, best first, within the output preview
         size = len(turn.evidence.lines([key])[0]) + 2
-        if shown and used + size > 7000:
+        if shown and used + size > PREVIEW_ROOM:
             break
         shown.append(key)
         used += size
@@ -247,6 +249,14 @@ async def read_passage(call, turn):
     return result
 
 
+PREVIEW_ROOM = 7000  # characters of whole passages a search result shows, within the 8,000-character preview
+_MARKER_SLACK = 8  # a marker the turn numbers ([S12.30]) may be longer than one numbered from 1
+
+
+def _preview_fits(lines):
+    return sum(len(line) + 2 + _MARKER_SLACK for line in lines) <= PREVIEW_ROOM
+
+
 def _ranges(numbers):
     out, start = [], None
     for i, n in enumerate(numbers):
@@ -296,15 +306,17 @@ async def use_skill(call, turn):
         return failed(call.id, "validation_error", "No enabled skill has that name; use a name from the SKILL CATALOG.")
     # loaded once per conversation: in this turn's chain, or in what ACTIVE SKILLS still carried in the last request
     # (one cut for capacity is activated again, section 8)
+    files = "\n".join(f"- {file_id}: {path}" for file_id, path, _ in skill.files)
+    listed = f"\n\nFiles (read with read_skill_file):\n{files}" if files else ""
     if skill.name in turn.activated or skill.name in turn.ctx.get("active_kept", ()):
+        # its body is already in the request; its files' ids are given again, since ACTIVE SKILLS holds the body only
         return ToolResult(id=call.id, ok=True, text=f"The {skill.name} skill is already active; its instructions are "
-                                                    "above.", meta={"skill": skill.name, "already_active": True})
+                                                    f"above.{listed}", meta={"skill": skill.name, "already_active": True,
+                                                                             "files": [f[0] for f in skill.files]})
     turn.activated.add(skill.name)
     await turn.harness._skill_activated(turn.claim, skill, turn.step)
     turn.emit({"type": "skill", "name": skill.name})
-    files = "\n".join(f"- {file_id}: {path}" for file_id, path, _ in skill.files)
-    return ToolResult(id=call.id, ok=True, text=_wrapped(skill) + (f"\n\nFiles (read with read_skill_file):\n{files}"
-                                                                   if files else ""),
+    return ToolResult(id=call.id, ok=True, text=_wrapped(skill) + listed,
                       meta={"skill": skill.name, "files": [f[0] for f in skill.files]})
 
 

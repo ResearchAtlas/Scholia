@@ -498,13 +498,14 @@ async def test_c1_5_each_assistant_step_is_kept_whole_as_it_arrives_even_the_las
         stream = await send(client, conversation, "Which papers do I have?")
         assert {"type": "limit_reached", "limit": "agent_steps"} in stream  # no further request carries it
         run_id = stream[0]["run_id"]
-        kept = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= 1000 ORDER BY step", run_id)
+        kept = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt BETWEEN 1000 AND 1999"
+                                  " ORDER BY step", run_id)
         replies = [json.loads(await asyncio.to_thread(client.state["content"].read, sha)) for (sha,) in kept]
         assert len(replies) == 2 and replies[-1]["content"] == marker and replies[-1]["reasoning_details"] == REASONING
         attempts = [d for k, d, _ in await events_of(client, run_id) if k == "model_attempt"]
         assert [a.get("reply") for a in attempts] == [sha for (sha,) in kept]  # named by hash, never by text
         assert (await client.delete(f"/api/materials/{material}")).status_code == 200  # the papers it held go, with it
-        assert await rows(client, "SELECT count(*) FROM run_bodies WHERE run_id = ? AND attempt >= 1000", run_id) == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM run_bodies WHERE run_id = ? AND attempt >= 1000", run_id) == [(0,)]  # replies and tool results
 
 
 @pytest.mark.asyncio
@@ -586,3 +587,103 @@ async def test_c1_recheck_a_reply_removed_with_its_paper_is_said_removed(tmp_pat
         assert (await client.delete(f"/api/materials/{material}")).status_code == 200
         gone = await client.get(f"/api/runs/{run_id}/trace/bodies/{reply}")
         assert (gone.status_code, gone.json()["code"]) == (410, "body_removed")
+
+
+# Recheck c2 (gpt-6-astra, S1-19c)
+
+MODEL = "google/gemini-3.1-pro-preview"
+
+
+@pytest.mark.asyncio
+async def test_c2_1_no_model_call_leaves_after_the_deadline_however_long_the_reader_waited(tmp_path, monkeypatch):
+    from backend import runs
+    clock = [1000.0]
+    monkeypatch.setattr(runs, "_clock", lambda: clock[0])
+    provider = Scripted("Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "Which papers do I have?")
+        seen = []
+        async for event in harness.events(claim):  # the turn waits for the reader after each handed event
+            seen.append(event)
+            if event["type"] == "step":
+                clock[0] += 901  # the reader stalls past the turn's 15 minutes, its step reserved
+        assert provider.agent_steps == []  # nothing left the machine
+        assert {"type": "limit_reached", "limit": "turn_minutes"} in seen
+        reservations = await rows(client, "SELECT status FROM budget_reservations WHERE run_id = ?", claim.run_id)
+        assert reservations and all(status == "released" for (status,) in reservations)
+
+
+@pytest.mark.asyncio
+async def test_c2_2_each_tool_result_is_kept_whole_as_it_is_produced(tmp_path):
+    provider = Scripted([call("list_materials", call_id="a"), call("list_materials", call_id="b")], "Never.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"limits.tool_calls": 1}})
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert {"type": "limit_reached", "limit": "tool_calls"} in stream  # no further request carries the result
+        run_id = stream[0]["run_id"]
+        kept = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= 2000", run_id)
+        results = [json.loads(await asyncio.to_thread(client.state["content"].read, sha)) for (sha,) in kept]
+        assert len(results) == 1 and results[0]["role"] == "tool" and "Wage Floors" in results[0]["content"]
+        assert results[0]["tool_call_id"] == "a"  # with the call it answers
+        [done] = [d for k, d, _ in await events_of(client, run_id) if k == "tool_result"]
+        assert done["result"] == kept[0][0]  # named by hash, never by text
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        assert await rows(client, "SELECT count(*) FROM run_bodies WHERE run_id = ? AND attempt >= 2000", run_id) == [(0,)]
+
+
+def long_panel():
+    filler = [f"Background paragraph {i}: " + "the synthetic panel describes ordinary household budgets " * 12
+              for i in range(14)]
+    return paper("Long Selected Panel", *filler, "Zorblax tariffs halved import prices in the synthetic panel.")
+
+
+@pytest.mark.asyncio
+async def test_c2_3_answer_from_library_searches_a_selection_its_answer_step_cannot_hold_whole(tmp_path):
+    provider = Scripted([call("answer_from_library", question="What did zorblax tariffs do?")], "Done.",
+                        inner=["Zorblax tariffs halved prices [S1.1]."],
+                        endpoints={MODEL: [{"tag": "a", "context_length": 8192}]})  # holds the evidence budget, not the paper
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, long_panel())
+        conversation = await conversation_in(client, project)
+        response = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                     json={"content": "Tell me about it", "material_ids": [material], "model": MODEL})
+        assert response.status_code == 200
+        [inner] = provider.inners
+        assert "Zorblax tariffs halved import prices" in inner["messages"][0]["content"]  # the answer-bearing passage
+        traces = [d for k, d, _ in await events_of(client, json.loads(response.text.split("data: ")[1])["run_id"])
+                  if k == "retrieval_trace" and d.get("tool_call_id")]
+        assert traces and traces[0]["read_directly"] is False  # searched within the selection
+
+
+@pytest.mark.asyncio
+async def test_c2_3_search_passages_searches_a_selection_its_result_cannot_show_whole(tmp_path):
+    provider = Scripted([call("search_passages", query="zorblax tariffs")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, long_panel())
+        conversation = await conversation_in(client, project)
+        response = await client.post(f"/api/conversations/{conversation}/message/stream",
+                                     json={"content": "Tell me about it", "material_ids": [material]})
+        assert response.status_code == 200
+        [found] = tool_messages(provider.agent_steps[1])
+        assert "Zorblax tariffs halved import prices" in found["content"]
+
+
+@pytest.mark.asyncio
+async def test_c2_4_an_active_skills_file_ids_are_given_whenever_it_is_active(tmp_path):
+    provider = Scripted([call("use_skill", name="literature-review")], "First.",
+                        [call("use_skill", call_id="c2", name="literature-review")], "Second.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Review my papers")
+        await send(client, conversation, "Go on with the review")
+        again = tool_messages(provider.agent_steps[3])[-1]["content"]
+        assert again.startswith("The literature-review skill is already active")
+        assert "literature-review#1: references/screening.md" in again and "literature-review#2" in again
