@@ -488,10 +488,13 @@ def parse(text):
     return candidates
 
 
+_NEGATING = re.compile(r"\b(?:not|no|never|without)\b|n['’]t\b|[不没沒别別勿]")
+
+
 def _negations(text):
-    """The negating words a text holds, which _terms leaves out as common: a record saying the opposite of the
-    researcher's words is never theirs (S1-21a fix batch 3, internal review)."""
-    return set(re.findall(r"[^\W_]+", normalized(text))) & {"not", "no"}
+    """The negating words a text holds (several of which _terms leaves out as common): a record whose negations are
+    not the researcher's words' own says something else, so it is never theirs (S1-21a fix batch 3)."""
+    return sorted(m.replace("’", "'") for m in _NEGATING.findall(normalized(text)))
 
 
 def cap(candidate, message, author):
@@ -500,9 +503,10 @@ def cap(candidate, message, author):
     candidate (fix batch 2: a confirmed record never restates another record's text), and the turn is the researcher's; else proposed, whatever the extractor said (section 8,
     Where memory comes from: a decision planted in a paper and echoed in the answer never becomes active)."""
     span = normalized(candidate["span"])
-    terms, said = _terms(candidate["content"]) | _negations(candidate["content"]), _terms(span) | _negations(span)
+    terms, said = _terms(candidate["content"]), _terms(span)
     own = (author == "researcher" and len(said) >= 2 and span in normalized(message)
-           and terms <= said)  # every term it holds is the researcher's own (nothing restated from another record)
+           and terms <= said  # every term it holds is the researcher's own (nothing restated from another record)
+           and _negations(candidate["content"]) == _negations(span))  # and it negates exactly what they negated
     return candidate["status"] if own else "proposed"
 
 

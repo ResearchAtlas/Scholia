@@ -567,3 +567,20 @@ async def test_an_extraction_holding_no_record_is_refused_at_dispatch_once_memor
         assert provider.extractions == []
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
             ("cancelled", "revoked")]
+
+
+# Fix batch 3, internal recheck: the negation compared both ways, and never the second word
+
+
+@pytest.mark.parametrize("content, said", [
+    ("I like short answers", "I do not like short answers"), ("I want summaries", "I don't want summaries"),
+    ("I want summaries", "I want no summaries"), ("Prefer tabs", "Prefer tabs, no spaces"),
+    ("I want summaries", "I never want summaries"), ("我喜欢摘要", "我不喜欢摘要"), ("Python", "not Python"),
+    ("tables", "no tables")])
+async def test_a_record_dropping_the_researchers_negation_is_never_theirs(content, said):
+    assert memory.cap({"content": content, "span": said, "status": "confirmed"}, said, "researcher") == "proposed"
+
+
+async def test_the_researchers_own_negated_words_stay_theirs():
+    said = "I do not want summaries in every answer"
+    assert memory.cap({"content": said, "span": said, "status": "confirmed"}, said, "researcher") == "confirmed"
