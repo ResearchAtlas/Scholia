@@ -860,3 +860,23 @@ async def test_ct2_list_materials_past_its_read_limit_reports_every_paper_it_lef
         [done] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
         omitted = extra + 1 - len(done["meta"]["materials"])
         assert tool_messages(provider.agent_steps[1])[-1]["content"].endswith(f"({omitted} more papers not shown.)")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", [None, "", 7])
+async def test_ct5_a_tool_call_with_no_usable_id_ends_the_turn_and_sends_no_continuation(tmp_path, bad_id):
+    nameless = {**call("list_materials", call_id="x"), "id": bad_id}
+    provider = Scripted([call("list_materials", call_id="ok"), nameless], "Never.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert (stream[-1]["status"], len(provider.agent_steps)) == ("failed", 1)  # no request with an empty id
+        assert {"type": "error", "code": "malformed"} in stream and not [e for e in stream if e["type"] == "tool_call"]
+        run_id = stream[0]["run_id"]
+        assert await rows(client, "SELECT status FROM budget_reservations WHERE run_id = ? AND status = 'open'",
+                          run_id) == []  # the step's reservation settled, the turn's allowances released
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status = 'settled'",
+                          run_id) == [(1,)]
+        [finished] = [d for k, d, _ in await events_of(client, run_id) if k == "run_finished"]
+        assert finished == {"status": "failed", "reason": "malformed"}

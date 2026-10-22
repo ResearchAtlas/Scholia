@@ -876,6 +876,13 @@ class Harness:
                     conn, claim.run_id, "cancelled", "researcher", "tool_errors", claim=claim))
                 emit({"type": "run_finished", **final})
                 return
+            if result == "malformed":  # a tool call with no usable id: the turn ends failed, before any tool runs
+                final = await self._end_turn(claim, lambda conn: self._finish_turn(
+                    conn, claim.run_id, "failed", None, "malformed", claim=claim))
+                if final["status"] == "failed":  # not a Stop that came first
+                    emit({"type": "error", "code": "malformed"})
+                emit({"type": "run_finished", **final})
+                return
             if isinstance(result, str):  # stopped at a turn limit (section 13): Continue is offered
                 raise _LimitReached(result)
             if not result.ok or visible(result.content) is None:  # tool calls alone where none were offered
@@ -1338,8 +1345,8 @@ class Harness:
         in the turn's chain, each assistant step kept whole when it arrives (_call keeps its reply) and sent back
         unmodified, its reasoning blocks included (model-route rule 5), until an answer. Returns the answer step's
         result (a failure included), "stopped" when the researcher chose to stop after three failed tool calls in a
-        row (section 6.6: the run stops and asks), or the name of the limit that stopped the turn: agent_steps,
-        tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
+        row (section 6.6: the run stops and asks), "malformed" when a tool call has no usable id (none is run), or
+        the name of the limit that stopped the turn: agent_steps, tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
         time limit binds every model call in the dispatch check (may_dispatch). A route without tool calls offers none: its one
         step is its answer."""
         limits, tools = ctx["limits"], ctx["tools"]
@@ -1368,6 +1375,10 @@ class Harness:
                 return result
             if number + 1 >= limits["agent_steps"]:  # no step is left to read their results: they are not run
                 return "agent_steps"
+            # a call with no id its result could answer: no continuation an endpoint would take can carry it (CT5)
+            if not all(isinstance(raw, dict) and isinstance(raw.get("id"), str) and raw["id"]
+                       for raw in result.tool_calls):
+                return "malformed"
             await self._release_held(claim)  # this step called tools: its judge share and unspent go back
             chain.append({"role": "assistant", **result.message} if "role" not in result.message else result.message)
             said = []  # the researcher's words given at a tool-errors ask, after the step's tool results
@@ -1438,8 +1449,8 @@ class Harness:
                     raise  # error; the turn's cleanup settles it (or marks its attempt unknown) before any other call
                 log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
                 result = failed(call_id, "tool_error", "The tool failed.")  # a defect in the tool; the turn goes on
-        raw_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else ""
-        message = {"role": "tool", "tool_call_id": raw_id,  # the provider's own id, in the chain (and its stored copy) only
+        # the provider's own id (never empty: _agent_steps ends the turn on a call without one), in the chain only
+        message = {"role": "tool", "tool_call_id": raw["id"],
                    "content": result.text if result.ok else json.dumps({"error": result.error.type,
                                                                         "message": result.error.message})}
 
