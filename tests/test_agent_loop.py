@@ -929,3 +929,47 @@ async def test_ct1_sweep_passages_answer_from_library_could_not_register_are_not
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert calls[0] == 0 and calls[1] and len(searched) == 2  # the tool numbered its passages, then failed to register
         assert stream[-1]["status"] == "succeeded" and turn["citations"][0]["existence"] != "ok"  # not read in the run
+
+
+def _no_preload(monkeypatch):
+    """The turn's pre-load matches nothing, so answer_from_library numbers its own passages (S1)."""
+    from backend import pipeline
+    real, searched = pipeline.evidence, []
+
+    async def first_finds_nothing(state, project_id, query, **options):
+        found = await real(state, project_id, query, **options)
+        searched.append(query)
+        return {**found, "records": []} if len(searched) == 1 else found
+    monkeypatch.setattr(pipeline, "evidence", first_finds_nothing)
+
+
+async def _connect_error(body):
+    import httpx
+    raise httpx.ConnectError("never connected")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["reservation", "connect"])
+async def test_ct1_sweep_passages_whose_answer_step_reached_no_model_are_not_read_in_the_run(tmp_path, monkeypatch,
+                                                                                            failure):
+    from backend import runs
+    _no_preload(monkeypatch)
+    if failure == "reservation":
+        real = runs.Harness._reserve
+
+        async def failing(self, claim, *args, phase=None, **options):
+            if phase == "answer_from_library":
+                raise RuntimeError("the reservation's transaction failed")
+            return await real(self, claim, *args, phase=phase, **options)
+        monkeypatch.setattr(runs.Harness, "_reserve", failing)
+    provider = Scripted([call("answer_from_library", question=QUESTION)],
+                        "Minimum wages raise the earnings of low-paid workers [S1.1].", inner=[_connect_error])
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])["error"] == "tool_error"
+        assert "Wage Floors" not in json.dumps(provider.agent_steps[1]["messages"])  # no outer step was given them
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert stream[-1]["status"] == "succeeded" and turn["citations"][0]["existence"] != "ok"  # not read in the run
+

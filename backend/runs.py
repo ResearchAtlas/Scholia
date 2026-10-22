@@ -1612,18 +1612,20 @@ class Harness:
         turn.evidence.keep(keys, held, before)  # what its answer step was not given is not read in the run
         try:
             await self._register_context(claim, turn.evidence.numbered, turn.listed)
-        except Exception:  # not registered, so no model is given them: none is read in the run either
+            judge_estimate = self._judge_estimate(ctx, held)
+            estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
+            call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate,
+                                       allowance=judge_estimate, phase="answer_from_library",
+                                       step={**_step(ctx["route"], facts, request), "judge_estimate_usd": judge_estimate,
+                                             "tool_call_id": call_id})
+            result = await self._call(claim, call, ctx["route"], ctx["key"], request, facts,
+                                      zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
+                                      rehold=ctx if judge_estimate else None)
+        except Exception:  # its answer step's request reached no model: none of its passages is read in the run
             turn.evidence.keep(keys, (), before)
             raise
-        judge_estimate = self._judge_estimate(ctx, held)
-        estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
-        call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
-                                   phase="answer_from_library", step={**_step(ctx["route"], facts, request),
-                                                                      "judge_estimate_usd": judge_estimate,
-                                                                      "tool_call_id": call_id})
-        result = await self._call(claim, call, ctx["route"], ctx["key"], request, facts,
-                                  zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
-                                  rehold=ctx if judge_estimate else None)
+        if not result.dispatched:  # refused before it left, or never connected: likewise
+            turn.evidence.keep(keys, (), before)
         try:
             if not result.ok or visible(result.content) is None:
                 return failed(call_id, "tool_error", "The answer step failed.")
