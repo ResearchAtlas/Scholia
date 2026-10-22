@@ -333,3 +333,16 @@ async def test_a_time_bound_reached_during_the_gates_check_is_not_dispatched():
     client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
     result = await openrouter.query_model(client, OPENROUTER, "key", MESSAGES, timeout=0.2)
     assert (result.error_kind, result.dispatched) == ("timeout", False)
+
+
+async def test_a_retry_its_caller_declines_is_not_sent_and_the_call_ends_as_its_attempt_did(takes_reasoning):
+    # S1-19c: a turn past its time limit sends no retry (backend/runs.py, keep answers False to it)
+    kept = []
+
+    async def keep(body):
+        kept.append(body)
+        return len(kept) == 1 or False  # the first attempt goes; the retry is declined
+    client, sent = client_for(httpx.Response(400, json={"error": "unknown field reasoning"}), ok(cost=0.001))
+    result = await openrouter.query_model(client, LOCAL, "key", MESSAGES, effort="high", on_body=keep)
+    assert len(sent) == 1 and len(kept) == 2 and len(result.attempts) == 1
+    assert (result.ok, result.error_kind) == (False, "request")

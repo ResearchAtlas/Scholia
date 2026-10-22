@@ -687,3 +687,4 @@ async def test_c2_4_an_active_skills_file_ids_are_given_whenever_it_is_active(tm
         again = tool_messages(provider.agent_steps[3])[-1]["content"]
         assert again.startswith("The literature-review skill is already active")
         assert "literature-review#1: references/screening.md" in again and "literature-review#2" in again
+

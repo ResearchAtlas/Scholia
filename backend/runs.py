@@ -357,6 +357,7 @@ class _Call:
     retention: dict | None = None  # the retention terms the gate applied when it let the call out
     bodies: list = field(default_factory=list)  # S1-19: each attempt's request body as stored (its sha256, or None)
     materials: tuple = ()  # the papers whose text its request holds, for the bodies' deletion links
+    declined: bool = False  # S1-19c: a retry not sent because the turn's time limit had passed
 
 
 class Harness:
@@ -1531,9 +1532,12 @@ class Harness:
                     held, mode=found["mode"], route="literature", index=(found.get("trace") or {}).get("index", "ready"))},
                 needs_evidence=True)
 
-        def whole(records):  # B40: a selection is read directly only when its answer step's request holds it whole
+        def whole(records):  # B40: a selection is read directly only when its answer step's request holds it whole,
+            probe = agent.Evidence(turn.evidence.numbered)  # numbered as the turn will number it, markers' length too
+            probe_keys = list(dict.fromkeys(probe.add(records)))
             try:
-                return not assembled(citations.sources(records), {"mode": "selection"}).cuts.get("research_evidence")
+                return not assembled({k: probe.numbered[k] for k in probe_keys},
+                                     {"mode": "selection"}).cuts.get("research_evidence")
             except context.OverWindow:
                 return False
         found = await pipeline.evidence(state, ctx["project_id"], question, materials=selection, whole=whole)
@@ -1712,7 +1716,10 @@ class Harness:
         async def keep(body):  # stored, and linked to its papers, before it is sent: a stop or a crash keeps it
             # The last moment before the request leaves, whatever it waited for (the stream's reader, a retry): a turn
             # past its time limit sends nothing (section 13); the call is closed, released, by the turn's limit path.
-            if not call.bodies and _past_deadline(active.context):  # its first attempt; a retry is the same call
+            if _past_deadline(active.context):
+                if call.bodies:  # a retry of a call already sent: declined, the call recorded as it ended, then stopped
+                    call.declined = True
+                    return False
                 raise _LimitReached("turn_minutes")
             # Held from collection until its link commits (or is skipped: then collected once idle).
             with self.content.hold() if self.content is not None else nullcontext([]) as held:
@@ -1783,6 +1790,8 @@ class Harness:
         active.call = None
         if cancelled:
             raise asyncio.CancelledError()
+        if call.declined:  # its retry fell past the turn's time limit: recorded and settled, the turn stops there
+            raise _LimitReached("turn_minutes")
         return result
 
     # Background runs
