@@ -460,15 +460,23 @@ async def test_a_personal_record_carries_no_paper_and_an_answers_preference_stay
 
 
 async def test_r3_editing_a_proposal_makes_a_new_version_so_a_request_holding_the_old_text_is_refused(tmp_path):
+    # fix batch 4 (recheck 4, finding 2): one stable id across versions; the request names the version it holds
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
             conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
             sources=[("project", project)]))
-        assert await allowed_in(client, project, [proposal]) is True
+        run = await turn_in(client, project, "x")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET status = 'running', inputs = json_set(inputs, '$.memory_ids', json(?), '$.memory_versions',"
+            " json(?)) WHERE id = ?", (json.dumps([proposal]), json.dumps({proposal: 1}), run)))
+        dispatchable = lambda: asyncio.to_thread(client.state["db"].read,  # noqa: E731
+                                                 lambda conn: runs.may_dispatch(conn, run))
+        assert await dispatchable() is True
         edited = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
         assert edited.status_code == 200, edited.text
-        assert await allowed_in(client, project, [proposal]) is False  # the request that held "interviews"
+        assert edited.json()["id"] == proposal and edited.json()["version"] > 1
+        assert await dispatchable() is False  # the request that held "interviews"
         assert await rows(client, "SELECT content, status FROM memory_records WHERE type = 'decision'") == [
             ("We use surveys", "confirmed")]  # nothing of the old text is kept
 
@@ -584,3 +592,67 @@ async def test_a_record_dropping_the_researchers_negation_is_never_theirs(conten
 async def test_the_researchers_own_negated_words_stay_theirs():
     said = "I do not want summaries in every answer"
     assert memory.cap({"content": said, "span": said, "status": "confirmed"}, said, "researcher") == "confirmed"
+
+
+# Fix batch 4 (gpt-6-astra recheck 4 on b46b7b1)
+
+
+@pytest.mark.parametrize("how", ["private", "local_only", "lock"])
+async def test_a_personal_record_is_never_rewritten_once_its_project_is_tightened(tmp_path, how):
+    # finding 1: every new write of personal text takes the write policy now, in one place (the database's trigger)
+    async with started(tmp_path / "data") as client:
+        a, b = await project_of(client, "A"), await project_of(client, "B")
+        record = await personal(client, a, "I prefer tables")
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=a, scope="personal", kind="preference", content="I prefer short answers", status="proposed",
+            sources=[("project", a)]))
+        await tighten(client, a, how)
+        edited = await client.patch(f"/api/memory/{record}", json={"version": 1, "content": "I prefer tables about Alice"})
+        assert (edited.status_code, edited.json()["code"]) == (400, "personal_from_strict")
+        kept = await client.post("/api/memory/review", json={"id": proposal, "action": "keep", "version": 1})
+        assert (kept.status_code, kept.json()["code"]) == (400, "personal_from_strict")
+        assert await recalled(client, b) == ["I prefer tables"]
+        with pytest.raises(Exception, match="personal_from_strict"):
+            await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+                conn, project_id=a, scope="personal", kind="preference", content="I prefer charts", status="confirmed",
+                sources=[("project", a)]))
+
+
+async def test_forgetting_an_edited_proposal_takes_what_an_extraction_held_for_it(tmp_path):
+    # finding 2, first case: the edit keeps the record's id, so its Forget reaches the run that was shown it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        run = await turn_in(client, project, "x")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?), '$.held.output', json(?)) WHERE id = ?",
+            (json.dumps([proposal]), json.dumps({"records": [{"content": "CANARY interviews"}]}), run)))
+        await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+        [(current,)] = await rows(client, "SELECT id FROM memory_records WHERE type = 'decision'")
+        assert (await client.delete(f"/api/memory/{current}")).json() == {"ok": True}
+        assert "CANARY" not in json.dumps(await rows(client, "SELECT inputs FROM runs"))
+        assert await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
+            {"type": "decision", "content": "We use interviews", "status": "proposed", "span": "",
+             "replaces": ""}])) is None
+
+
+async def test_a_late_extraction_never_restores_a_proposal_the_researcher_edited(tmp_path):
+    # finding 2, second case (section 8, checklist L7): an edit in the views after the extraction started makes its
+    # candidate a proposal naming the record
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        run = await turn_in(client, project, "We use interviews")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second'),"
+            " inputs = json_set(inputs, '$.memory_ids', json(?)) WHERE id = ?", (json.dumps([proposal]), run)))
+        await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
+            {"type": "decision", "content": "We use interviews", "status": "confirmed", "span": "we use interviews",
+             "replaces": proposal}]))
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records WHERE type = 'decision'")) == [
+            ("We use interviews", "proposed"), ("We use surveys", "confirmed")]

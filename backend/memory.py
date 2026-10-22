@@ -154,24 +154,28 @@ def kind_of(text):
 
 
 def _normal(conn, project_id):
-    row = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
-    return row is not None and row[0] == "normal"
+    return conn.execute("SELECT 1 FROM projects WHERE id = ? AND sensitivity = 'normal' AND review_lock = 0",
+                        (project_id,)).fetchone() is not None
 
 
 def personal_allowed(conn, project_id):
     """Whether a personal record may be written from project_id: only from a Normal, unlocked project (a review lock
     keeps its project Local only), so nothing of a Private or Local only project's reaches another project's request
-    (scope notes reading 4; Harold's decision of 2026-10-23, point 1)."""
+    (scope notes reading 4; Harold's decision of 2026-10-23, point 1). The database refuses any other personal write
+    (migration 0008's triggers): this is how a writer chooses a scope before writing."""
     return _normal(conn, project_id)
 
 
-def allowed(conn, project_id, record_ids):
+def allowed(conn, project_id, record_ids, versions=None):
     """Whether every one of these records may still be in a request of project_id (section 10, at dispatch): it exists,
     is current (never superseded: an edit since it was assembled means its old text may not leave; a proposal's edit
-    makes a new record, edit), and is valid there now (its scope, the request's project's lock, its papers)."""
+    takes its next version: versions, {id: version} as the request held them, names it), and is valid there now (its
+    scope, the request's project's lock, its papers)."""
     for record in record_ids:
         found = row(conn, record)
         if found is None or found["status"] == "superseded" or not valid(conn, project_id, found):
+            return False
+        if versions and versions.get(record, found["version"]) != found["version"]:
             return False
     return True
 
@@ -276,7 +280,10 @@ def edit(conn, record, version, *, content=None, confirm=False):
         raise ValueError("not_confirmable")
     if old["status"] == "proposed":
         if content is not None and content != old["content"]:
-            record = _renewed(conn, record, content)
+            # its next version, under the same id (Forget, the late rule and revocation follow the id): a request that
+            # held the old text names the version it held, and is refused at dispatch (allowed)
+            conn.execute("UPDATE memory_records SET content = ?, version = version + 1, updated_at = ? WHERE id = ?",
+                         (content, utc_now(), record))
         return keep(conn, record, None)
     structured = {k: v for k, v in old["structured"].items() if k in ("kind", "event", "count", "date")}
     return write(conn, project_id=old["project_id"], scope=old["scope"], kind=old["type"],
@@ -284,21 +291,6 @@ def edit(conn, record, version, *, content=None, confirm=False):
                  status="inferred" if code_written else "confirmed",
                  sources=[*sources_of(conn, record), ("researcher", "views")], replaces=record,
                  structured=structured or None)
-
-
-def _renewed(conn, proposal, content):
-    """A pending proposal with new content, as a new record (its next version) that takes its place, its sources and
-    the record it would replace: a request that held the old text names an id that no longer exists (allowed), and
-    the old text is not kept (S1-21a fix batch 3, R3). Returns the new id."""
-    record = new_id()
-    conn.execute(
-        "INSERT INTO memory_records (id, scope, project_id, type, content, structured, status, valid_from, sensitivity,"
-        " version, supersedes_id, created_by_run_id, created_at) SELECT ?, scope, project_id, type, ?, structured,"
-        " status, valid_from, sensitivity, version + 1, supersedes_id, created_by_run_id, created_at"
-        " FROM memory_records WHERE id = ?", (record, content, proposal))
-    conn.execute("UPDATE memory_sources SET memory_id = ? WHERE memory_id = ?", (record, proposal))
-    conn.execute("DELETE FROM memory_records WHERE id = ?", (proposal,))
-    return record
 
 
 def keep(conn, proposal, version, edited=False):
@@ -449,11 +441,11 @@ def extraction_input(conn, run_id):
     for record in related:
         held |= {i for k, i in sources_of(conn, record["id"]) if k == "material"}
     return ((json.loads(message) or {}).get("text", ""), (json.loads(answer or "{}") or {}).get("text", ""), author,
-            [(r["id"], r["type"], r["status"], r["content"]) for r in related], sorted(held))
+            [(r["id"], r["type"], r["status"], r["content"], r["version"]) for r in related], sorted(held))
 
 
 def extraction_request(message, answer, related):
-    lines = [f"- [{rid}] ({kind}, {status}) {content}" for rid, kind, status, content in related]
+    lines = [f"- [{rid}] ({kind}, {status}) {content}" for rid, kind, status, content, _ in related]
     return ("RESEARCHER'S MESSAGE:\n" + message + "\n\nASSISTANT'S ANSWER (model output, not the researcher's words):\n"
             + (answer or "(none)") + "\n\nRELATED RECORDS:\n" + ("\n".join(lines) if lines else "(none)"))
 
@@ -821,6 +813,7 @@ def left_off(conn, project_id, memory_on=True):
 # confirmed (progress and agent notes stay inferred).
 
 import asyncio  # noqa: E402
+import sqlite3  # noqa: E402
 from typing import Literal  # noqa: E402
 
 from fastapi import APIRouter, Request  # noqa: E402
@@ -864,7 +857,9 @@ def _refused(error):
 
 _CHANGE_ERRORS = {"changed": (409, "version_changed", "This record changed since it was shown; look again"),
                   "out_of_date": (409, "out_of_date", "The record this would replace changed; look again"),
-                  "not_confirmable": (400, "not_confirmable", "Progress and the agent's notes are never confirmed")}
+                  "not_confirmable": (400, "not_confirmable", "Progress and the agent's notes are never confirmed"),
+                  "personal_from_strict": (400, "personal_from_strict",
+                                           "A Private, Local only or locked project's records stay its own")}
 
 
 def _on(state, project_id):
@@ -913,14 +908,14 @@ async def create_memory(body: NewRecord, request: Request):
     def create(conn):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (body.project_id,)).fetchone() is None:
             raise Refused(404, "not_found", "No such project")
-        if body.scope == "personal" and not personal_allowed(conn, body.project_id):  # reading 4
-            raise Refused(400, "personal_from_strict", "A Private or Local only project's records stay its own")
         return write(conn, project_id=body.project_id, scope=body.scope, kind=body.type, content=content,
                      status="confirmed", sources=[("researcher", "views")], structured={"entered": True})
     try:
         record = await asyncio.to_thread(state["db"].write, create)
     except Refused as error:
         return _refused(error)
+    except sqlite3.IntegrityError as error:  # reading 4: never personal from a Private, Local only or locked project
+        return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
     await _embed_soon(state, body.project_id)
     return await asyncio.to_thread(state["db"].read, lambda conn: row(conn, record))
 
@@ -942,7 +937,7 @@ async def change_memory(record_id: str, body: Change, request: Request):
         record = await asyncio.to_thread(state["db"].write, change)
     except LookupError:
         return _refused(Refused(404, "not_found", "No such record"))
-    except ValueError as error:
+    except (ValueError, sqlite3.IntegrityError) as error:  # sqlite3: personal_from_strict (migration 0008)
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
     if record is None:  # a proposal whose record changed: marked out of date, back in Things to confirm
         return _refused(Refused(*_CHANGE_ERRORS["out_of_date"]))
@@ -1006,7 +1001,7 @@ async def answer_review(body: Review, request: Request):
         record = await asyncio.to_thread(state["db"].write, answer)
     except LookupError:
         return _refused(Refused(404, "not_found", "No such proposal"))
-    except ValueError as error:
+    except (ValueError, sqlite3.IntegrityError) as error:  # sqlite3: personal_from_strict (migration 0008)
         return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
     if record is None:  # marked out of date in that commit: back in Things to confirm
         return _refused(Refused(*_CHANGE_ERRORS["out_of_date"]))

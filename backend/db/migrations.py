@@ -625,7 +625,9 @@ CREATE INDEX run_body_materials_by_material ON run_body_materials (material_id);
 # app writes: a turn, a run, a paper whose text the record may carry (`material`: deleted with any one of them,
 # backend/db/deletion.py), a paper it only counts (`paper`: progress, deleted with the last of them), the project, or
 # the researcher's own entry in the memory views. A STRICT table's CHECK cannot be added in place, so triggers refuse
-# the rest; the indexes serve recall and deletion's source rule.
+# the rest; the indexes serve recall and deletion's source rule. Personal text is written, confirmed or changed only from
+# a Normal, unlocked project, whichever path writes it (Harold's decision of 2026-10-23, point 1; S1-21a fix batch 4):
+# a record already written stays as it is (superseded or forgotten), but no new personal text comes from elsewhere.
 _0008 = r"""
 CREATE TRIGGER memory_records_valid BEFORE INSERT ON memory_records
 WHEN NEW.type NOT IN ('profile', 'project_state', 'decision', 'event', 'preference', 'progress', 'agent_note')
@@ -646,6 +648,21 @@ CREATE TRIGGER memory_sources_valid BEFORE INSERT ON memory_sources
 WHEN NEW.source_kind NOT IN ('turn', 'run', 'material', 'paper', 'project', 'researcher')
 BEGIN
     SELECT RAISE(ABORT, 'a memory source of a kind not allowed');
+END;
+
+CREATE TRIGGER memory_personal_written_from_normal BEFORE INSERT ON memory_records
+WHEN NEW.scope = 'personal' AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id
+                                            AND sensitivity = 'normal' AND review_lock = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'personal_from_strict');
+END;
+
+CREATE TRIGGER memory_personal_changed_from_normal BEFORE UPDATE OF scope, status, content ON memory_records
+WHEN NEW.scope = 'personal' AND (NEW.scope IS NOT OLD.scope OR NEW.content IS NOT OLD.content
+                                 OR (OLD.status = 'proposed' AND NEW.status IN ('confirmed', 'inferred')))
+    AND NOT EXISTS (SELECT 1 FROM projects WHERE id = NEW.project_id AND sensitivity = 'normal' AND review_lock = 0)
+BEGIN
+    SELECT RAISE(ABORT, 'personal_from_strict');
 END;
 
 CREATE INDEX memory_records_by_project ON memory_records (project_id, status);

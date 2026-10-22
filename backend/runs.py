@@ -342,12 +342,12 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
         " r.source_turn_id IS NULL OR EXISTS (SELECT 1 FROM turns WHERE run_id = r.source_turn_id),"
         " r.project_id, json_extract(r.inputs, '$.evidence'), json_extract(r.inputs, '$.context_materials'),"
-        " json_extract(r.inputs, '$.memory_ids'), r.workflow"
+        " json_extract(r.inputs, '$.memory_ids'), r.workflow, json_extract(r.inputs, '$.memory_versions')"
         " FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?", (run_id,)).fetchone()
     if row is None:
         return False
     status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence, held, remembered, \
-        workflow = row
+        workflow, versions = row
     owners = has_conversation if kind in ("turn", "child") else has_source
     if not (status == "running" and cancel_reason is None and not locked and bool(owners)):
         return False
@@ -361,7 +361,7 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
     # S1-21a: every memory record the request holds still exists and is still allowed in it (memory.allowed: a
     # personal record whose project was tightened or locked since it was recalled is not)
     remembered = json.loads(remembered or "[]")
-    if remembered and not memory.allowed(conn, project_id, remembered):
+    if remembered and not memory.allowed(conn, project_id, remembered, json.loads(versions or "{}")):
         return False
     if (remembered or workflow == "memory") and memory_off is not None and memory_off():  # an extraction holds memory
         return False  # work even when it was shown no record
@@ -2331,6 +2331,7 @@ class Harness:
         estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
         bound = estimate * openrouter.MAX_ATTEMPTS
         remembered = [r[0] for r in related]
+        versions = {r[0]: r[4] for r in related}  # as its request holds them: one edited since is refused at dispatch
 
         def start(conn):
             if not _running(conn, active.run_id) or _revoked(conn, active.run_id):
@@ -2339,8 +2340,9 @@ class Harness:
                 raise RunOutcome("cancelled", "allowance", "limit")  # retries count within the allowance
             conn.execute(  # counted before the call; its scope (papers and records) registered before its dispatch
                 "UPDATE runs SET attempts = attempts + 1, inputs = json_set(coalesce(inputs, '{}'),"
-                " '$.context_materials', json(?), '$.material_ids', json(?), '$.memory_ids', json(?)) WHERE id = ?",
-                (json.dumps(held), json.dumps(held), json.dumps(remembered), active.run_id))
+                " '$.context_materials', json(?), '$.material_ids', json(?), '$.memory_ids', json(?),"
+                " '$.memory_versions', json(?)) WHERE id = ?",
+                (json.dumps(held), json.dumps(held), json.dumps(remembered), json.dumps(versions), active.run_id))
             (step,) = conn.execute("SELECT count(*) FROM run_events WHERE run_id = ? AND type = 'step_started'",
                                    (active.run_id,)).fetchone()
             try:
