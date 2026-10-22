@@ -1296,19 +1296,21 @@ class Harness:
             ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)
         return dict(list(numbered.items())[:kept]), request
 
-    async def _register_context(self, claim, numbered, listed=(), taken_back=False):
+    async def _register_context(self, claim, numbered, listed=()):
         """Name every paper whose text the request carries on its run, before its dispatch (backend/provenance.py):
         its evidence's and its history's (inputs.context_materials, also its scope in inputs.material_ids, so
         deleting one revokes the run), and its evidence's [passage, paper] pairs (inputs.evidence); the dispatch
-        check refuses a run when one of those papers is gone or no longer reads the passage. taken_back: written even
-        when it names none, since it replaces a registration whose request reached no model (_answer_from_library)."""
+        check refuses a run when one of those papers is gone or no longer reads the passage. A registration taken back
+        (`taken_back`: one whose request reached no model, _answer_from_library) is written even when it names none,
+        by the next registration until one commits: every later step registers before its dispatch, so no answer
+        is delivered with a record naming papers no request carried."""
         papers = sorted({r["material_id"] for r in numbered.values()} | set(listed))  # listed: titles a tool gave
         pairs = sorted({(r["passage_id"], r["material_id"]) for r in numbered.values()})
         # every paper whose text the request carries: its evidence, and the earlier turns its history holds; in an
         # agent turn, what its earlier steps carried too (its chain is never cut)
         shown = claim.context["history_materials"][:claim.context.get("history_kept", 0)]
         held = sorted({*papers, *(m for turn in shown for m in turn), *claim.context.get("context_materials", ())})
-        if not held and not taken_back:
+        if not held and not claim.context.get("taken_back"):
             claim.context["context_materials"] = held
             return
 
@@ -1326,6 +1328,7 @@ class Harness:
         except _Cancelled:
             raise asyncio.CancelledError() from None
         claim.context["context_materials"] = held  # once recorded: a failed write leaves the turn's set as it was
+        claim.context.pop("taken_back", None)  # and the record says what was carried again
 
     # S1-19c: the agent loop
 
@@ -1617,10 +1620,10 @@ class Harness:
         async def undo():  # its answer step's request reached no model: none of its passages is read in the run, and
             turn.evidence.keep(keys, (), before)  # no answer depends on their papers (its registration taken back)
             if committed:  # its papers and its [passage, paper] pairs, a paper earlier reads registered too
-                ctx["context_materials"] = registered
+                ctx["context_materials"], ctx["taken_back"] = registered, True  # pending until a registration commits
                 try:
-                    await self._register_context(claim, turn.evidence.numbered, turn.listed, taken_back=True)
-                except Exception as error:  # the turn's own set is right again; a later registration rewrites the record
+                    await self._register_context(claim, turn.evidence.numbered, turn.listed)
+                except Exception as error:  # still pending: the next registration, before any later dispatch, writes it
                     log.error("a registration could not be taken back (%s at %s)", type(error).__name__, _where(error))
         try:
             await self._register_context(claim, turn.evidence.numbered, turn.listed)

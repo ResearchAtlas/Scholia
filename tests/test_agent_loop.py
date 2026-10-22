@@ -1031,3 +1031,40 @@ async def test_ct1_sweep_a_registration_taken_back_keeps_only_what_earlier_reads
         inputs = json.loads(inputs)
         assert inputs["evidence"] == [[passage, material]]  # the read passage's pair only: the tool's taken back
         assert inputs["context_materials"] == [material]  # what the earlier read registered stays
+
+
+@pytest.mark.asyncio
+async def test_ct1_sweep_a_take_back_whose_write_failed_is_written_by_the_next_registration(tmp_path, monkeypatch):
+    from backend import runs
+    _no_preload(monkeypatch)
+    real_reserve, real_register, registrations = runs.Harness._reserve, runs.Harness._register_context, []
+
+    async def failing_reserve(self, claim, *args, phase=None, **options):
+        if phase == "answer_from_library":
+            raise RuntimeError("the reservation's transaction failed")
+        return await real_reserve(self, claim, *args, phase=phase, **options)
+
+    async def take_back_fails_once(self, claim, numbered, *args, **options):
+        registrations.append(len(numbered))
+        if len(registrations) != 3:  # the turn's, the tool's, then its take-back: that write fails once
+            return await real_register(self, claim, numbered, *args, **options)
+
+        async def failing(fn):
+            raise RuntimeError("the take-back's write failed")
+        self._write = failing
+        try:
+            return await real_register(self, claim, numbered, *args, **options)
+        finally:
+            del self._write
+    monkeypatch.setattr(runs.Harness, "_reserve", failing_reserve)
+    monkeypatch.setattr(runs.Harness, "_register_context", take_back_fails_once)
+    provider = Scripted([call("answer_from_library", question=QUESTION)], "Minimum wages raise earnings.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert stream[-1]["status"] == "succeeded" and registrations == [0, 4, 0, 0]  # the next one is empty
+        (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
+        inputs = json.loads(inputs)
+        assert (inputs["context_materials"], inputs["evidence"]) == ([], [])  # repaired before the answer's dispatch
+        assert material not in await _depends_on(client, stream[0]["run_id"])
