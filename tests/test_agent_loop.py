@@ -863,7 +863,7 @@ async def test_ct2_list_materials_past_its_read_limit_reports_every_paper_it_lef
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad_id", [None, "", 7])
+@pytest.mark.parametrize("bad_id", [None, "", 7, "ok"])  # "ok": the other call's id
 async def test_ct5_a_tool_call_with_no_usable_id_ends_the_turn_and_sends_no_continuation(tmp_path, bad_id):
     nameless = {**call("list_materials", call_id="x"), "id": bad_id}
     provider = Scripted([call("list_materials", call_id="ok"), nameless], "Never.")

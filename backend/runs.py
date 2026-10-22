@@ -1345,8 +1345,8 @@ class Harness:
         in the turn's chain, each assistant step kept whole when it arrives (_call keeps its reply) and sent back
         unmodified, its reasoning blocks included (model-route rule 5), until an answer. Returns the answer step's
         result (a failure included), "stopped" when the researcher chose to stop after three failed tool calls in a
-        row (section 6.6: the run stops and asks), "malformed" when a tool call has no usable id (none is run), or
-        the name of the limit that stopped the turn: agent_steps, tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
+        row (section 6.6: the run stops and asks), "malformed" when a tool call has no usable id or shares one (none
+        is run), or the name of the limit that stopped the turn: agent_steps, tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
         time limit binds every model call in the dispatch check (may_dispatch). A route without tool calls offers none: its one
         step is its answer."""
         limits, tools = ctx["limits"], ctx["tools"]
@@ -1375,9 +1375,10 @@ class Harness:
                 return result
             if number + 1 >= limits["agent_steps"]:  # no step is left to read their results: they are not run
                 return "agent_steps"
-            # a call with no id its result could answer: no continuation an endpoint would take can carry it (CT5)
-            if not all(isinstance(raw, dict) and isinstance(raw.get("id"), str) and raw["id"]
-                       for raw in result.tool_calls):
+            # a call with no id, or one another call has, its result could answer: no continuation an endpoint would
+            # take can carry it (CT5)
+            ids = [raw.get("id") if isinstance(raw, dict) else None for raw in result.tool_calls]
+            if not all(isinstance(i, str) and i for i in ids) or len(set(ids)) != len(ids):
                 return "malformed"
             await self._release_held(claim)  # this step called tools: its judge share and unspent go back
             chain.append({"role": "assistant", **result.message} if "role" not in result.message else result.message)
