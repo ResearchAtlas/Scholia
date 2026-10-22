@@ -19,7 +19,7 @@ import { messageRoute } from '../settings.js';
 import { ACCEPT, afterAsksRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt,
   readGuard, readGuardedAsks, pollsAsks, watchChosen } from '../library.js';
 import { addTo } from './Library.jsx';
-import { actionLines, composerFill } from '../memory.js'; // S1-21a
+import { actionLines, composerFill, memoryEvents } from '../memory.js'; // S1-21a
 import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -114,7 +114,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // stays on screen (backend/provenance.py); a failed read is tried again after a pause.
   useEffect(() => {
     const changed = (event) => {
-      if (event.detail !== projectId || !id) return; // a conversation not yet created has read nothing
+      if ((event.detail !== projectId && event.detail !== null) || !id) return; // a conversation not yet created has read nothing
       guard.current.libraryChanged(); // first: every read asked before this is dropped when it arrives
       setTurns(null);
       setStale(true);
@@ -122,7 +122,11 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       load();
     };
     libraryEvents.addEventListener('changed', changed);
-    return () => libraryEvents.removeEventListener('changed', changed);
+    memoryEvents.addEventListener('changed', changed); // S1-21a: a record its turns read back was forgotten or changed
+    return () => {
+      libraryEvents.removeEventListener('changed', changed);
+      memoryEvents.removeEventListener('changed', changed);
+    };
   }, [projectId, load]);
   useEffect(() => {
     if (!(stale && failed)) return undefined;

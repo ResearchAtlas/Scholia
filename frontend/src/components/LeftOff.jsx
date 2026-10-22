@@ -22,7 +22,7 @@ export function LeftOff({ projectId }) {
     const settle = guard.current.ask();
     return readLeftOff(projectId).then((read) => { if (settle(true)) setFound(read); }, () => { if (settle(false)) setFound(null); });
   }, [projectId]);
-  useEffect(() => { setFound(null); setHidden(false); load(); }, [load]);
+  useEffect(() => { guard.current.libraryChanged(); setFound(null); setHidden(false); load(); }, [load]); // another project's read is never shown
   // A paper deleted or memory changed anywhere: what it shows is dropped at once, and read again (no client-held
   // derived state); a read asked before the change is never shown, nor is its next step put in the box.
   useEffect(() => {

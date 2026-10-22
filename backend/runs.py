@@ -2527,9 +2527,11 @@ class Harness:
                     summary = {"counts": applied["counts"]}
             if (summary or {}).get("reason") == "allowance":  # the quiet notice, once per project
                 memory.record_notice(conn, workflow[1])
+            done = {"succeeded": "indexed", "failed": "failed", "interrupted": "interrupted"}.get(status, "skipped")
+            if status == "succeeded" and "counts" not in (summary or {}):  # nothing written: its turn or a paper it
+                done, summary = "skipped", {"reason": "source_removed"}  # drew on is gone
             conn.execute("UPDATE turns SET memory_status = ? WHERE run_id = (SELECT source_turn_id FROM runs WHERE id = ?)",
-                         ({"succeeded": "indexed", "failed": "failed", "interrupted": "interrupted"}.get(status, "skipped"),
-                          run_id))
+                         (done, run_id))
         elif status == "succeeded" and output is not None:
             # The title is written only if nobody changed it since the run was queued.
             conn.execute(
