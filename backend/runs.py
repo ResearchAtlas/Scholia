@@ -340,6 +340,8 @@ def may_dispatch(conn, run_id, past_deadline=None):
     owners = has_conversation if kind in ("turn", "child") else has_source
     if not (status == "running" and cancel_reason is None and not locked and bool(owners)):
         return False
+    # The turn's time limit governs admission, here at the gate's decision (Harold, decided 2026-10-22): a request
+    # admitted before the deadline may reach the network a moment after it, as a call already sent runs to its bound.
     if past_deadline is not None and past_deadline():
         return "turn_deadline"
     # S1-19: every passage in the request's context is still read by the paper it is named under

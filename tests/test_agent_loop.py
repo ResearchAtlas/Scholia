@@ -611,7 +611,7 @@ async def test_c2_1_no_model_call_leaves_after_the_deadline_however_long_the_rea
             seen.append(event)
             if event["type"] == "step":
                 clock[0] += 901  # the reader stalls past the turn's 15 minutes, its step reserved
-        assert provider.agent_steps == []  # nothing left the machine
+        assert await admitted_model_requests(client, claim.run_id) == 0  # none admitted past the deadline
         assert {"type": "limit_reached", "limit": "turn_minutes"} in seen
         reservations = await rows(client, "SELECT status FROM budget_reservations WHERE run_id = ?", claim.run_id)
         assert reservations and all(status == "released" for (status,) in reservations)
@@ -743,7 +743,17 @@ async def test_c3_a_nested_calls_settlement_failure_reaches_the_turns_cleanup_no
         assert turn["accounting"]["unknown_attempts"] == 1  # the sent call's charge is unknown, not lost
 
 
-# The turn's deadline in the dispatch check (structural fix, pending Harold: ticket 60 rule 2)
+# The turn's deadline in the dispatch check (Harold, decided 2026-10-22: the limit governs admission at the gate's
+# decision; a request admitted before it may reach the network a moment after, as a call already sent runs to its bound)
+
+
+async def admitted_model_requests(client, run_id):
+    """The model requests the gate admitted for the run's project after the run started (its outbound audit)."""
+    [(project, started)] = await rows(client, "SELECT project_id, started_at FROM runs WHERE id = ?", run_id)
+    [(count,)] = await rows(client, "SELECT count(*) FROM audit_log WHERE event = 'outbound' AND project_id = ?"
+                                    " AND at >= ? AND data ->> 'kind' = 'model_provider' AND data ->> 'decision' = 'allow'",
+                            project, started)
+    return count
 
 
 @pytest.mark.asyncio
@@ -774,8 +784,9 @@ async def test_deadline_no_request_leaves_past_it_whatever_it_waited_for_before_
         project, _ = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "Which papers do I have?")
-        assert provider.agent_steps == [] and {"type": "limit_reached", "limit": "turn_minutes"} in stream
         run_id = stream[0]["run_id"]
+        assert await admitted_model_requests(client, run_id) == 0  # the deadline governs admission at the gate
+        assert {"type": "limit_reached", "limit": "turn_minutes"} in stream
         assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status != 'released'",
                           run_id) == [(0,)]  # nothing was sent, so nothing is charged
         attempts = [d for k, d, _ in await events_of(client, run_id) if k == "model_attempt"]
@@ -815,3 +826,14 @@ async def test_c4_a_deletion_clears_the_agents_held_question_in_its_own_transact
         sending.cancel()
         with contextlib.suppress(BaseException):
             await sending
+
+
+@pytest.mark.asyncio
+async def test_deadline_tests_count_admissions_as_the_gate_records_them(tmp_path):
+    # the control for the deadline tests above: an ordinary turn's model requests are counted as admitted
+    provider = Scripted([call("list_materials")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert await admitted_model_requests(client, stream[0]["run_id"]) == len(provider.agent_steps) == 2
