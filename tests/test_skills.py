@@ -210,3 +210,22 @@ def test_the_help_skill_says_exactly_what_each_protection_level_sends():
     assert "arXiv 编号通过 arXiv" in chinese and "Crossref 和 OpenAlex" in chinese
     from backend import lookup
     assert lookup.SERVICES == {"doi": ("openalex", "crossref"), "arxiv": ("arxiv",)}  # what the text names
+
+
+@pytest.mark.asyncio
+async def test_ct1_read_skill_file_reads_only_a_file_of_a_skill_active_in_the_conversation(tmp_path):
+    provider = Scripted([call("read_skill_file", file_id="literature-review#1")], "Not yet.",
+                        [call("use_skill", name="literature-review")], "Active.",
+                        [call("read_skill_file", call_id="c3", file_id="literature-review#1")], "Read.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Review my papers")
+        refused = json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])
+        assert refused["error"] == "validation_error" and "use_skill" in refused["message"]  # never read without it
+        run_id = stream[0]["run_id"]
+        assert not [d for k, d, _ in await events_of(client, run_id) if k == "skill_activated"]
+        assert json.loads((await rows(client, "SELECT skills FROM runs WHERE id = ?", run_id))[0][0] or "[]") == []
+        await send(client, conversation, "Use the literature review skill")
+        await send(client, conversation, "Go on")  # carried in ACTIVE SKILLS: its files read without use_skill again
+        assert tool_messages(provider.agent_steps[5])[-1]["content"].startswith("# Screening")

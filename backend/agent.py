@@ -308,7 +308,7 @@ async def use_skill(call, turn):
     # (one cut for capacity is activated again, section 8)
     files = "\n".join(f"- {file_id}: {path}" for file_id, path, _ in skill.files)
     listed = f"\n\nFiles (read with read_skill_file):\n{files}" if files else ""
-    if skill.name in turn.activated or skill.name in turn.ctx.get("active_kept", ()):
+    if _active(turn, skill.name):
         # its body is already in the request; its files' ids are given again, since ACTIVE SKILLS holds the body only
         return ToolResult(id=call.id, ok=True, text=f"The {skill.name} skill is already active; its instructions are "
                                                     f"above.{listed}", meta={"skill": skill.name, "already_active": True,
@@ -327,6 +327,10 @@ async def use_skill(call, turn):
      "additionalProperties": False},
     read_only=True, repeat_safe=True, network=False, output_chars=8000, tool_class="agent_control", spends=False)
 async def read_skill_file(call, turn):
+    # only a skill active in the conversation (enabled, and use_skill recorded its activation): spec section 7.2
+    if not _active(turn, str(call.arguments["file_id"]).partition("#")[0]):
+        return failed(call.id, "validation_error", "Not a file of an active skill: activate the skill with use_skill, "
+                                                   "then give a file id it listed.")
     try:
         text, sha = await asyncio.to_thread(skills.read_file, call.arguments["file_id"])
     except ValueError as error:
@@ -334,6 +338,12 @@ async def read_skill_file(call, turn):
             "Not a file id use_skill listed; give the id, not a path."
         return failed(call.id, "validation_error" if str(error) != "changed" else "tool_error", message)
     return ToolResult(id=call.id, ok=True, text=text, meta={"file_id": call.arguments["file_id"], "sha256": sha})
+
+
+def _active(turn, name):
+    """Whether a skill is active in the conversation: activated in this turn, or carried in ACTIVE SKILLS (which holds
+    only enabled skills; one cut for capacity is not)."""
+    return name in turn.activated or name in turn.ctx.get("active_kept", ())
 
 
 @REGISTRY.register(
