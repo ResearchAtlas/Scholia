@@ -229,17 +229,16 @@ async def test_a_cancel_that_comes_once_the_archive_is_published_leaves_it_succe
     monkeypatch.setattr(backups_module, "_publish", publish)
     async with started(tmp_path / "data") as client:
         harness = client.state["harness"]
-        real_write, cancelled = harness._write, []
+        real_ended, cancelled = harness._ended, []
 
-        async def write(fn):  # the run's terminal record, queued once its file is published: a Cancel comes
+        async def ended(active, fn):  # the run's terminal record, queued once its file is published: a Cancel comes
             if published and not cancelled:
-                [active] = [a for a in harness.registry.runs.values() if a.kind == "background"]
                 cancelled.append(active.run_id)
                 harness._request_cancel(active, "researcher")
                 await asyncio.sleep(0.05)  # still queued when the cancellation arrives
-            return await real_write(fn)
+            return await real_ended(active, fn)
 
-        monkeypatch.setattr(harness, "_write", write)
+        monkeypatch.setattr(harness, "_ended", ended)
         run_id = (await client.post("/api/backups/full", json={"destination": str(destination)})).json()["run_id"]
         run = await run_finished(client, run_id)
         assert cancelled == [run_id]

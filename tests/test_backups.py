@@ -257,10 +257,10 @@ async def test_a_full_backup_is_recorded_before_anything_is_written_and_removed_
             armed.append(True)
             return real_name(*args)
 
-        def unrecordable(fn):
+        def unrecordable(fn, committed=None):
             if armed and armed.pop():
                 raise OSError(errno.EIO, "I/O error")
-            return real_write(fn)
+            return real_write(fn, committed)
 
         monkeypatch.setattr(backups_module, "_free_name", named)
         monkeypatch.setattr(db, "write", unrecordable)
@@ -727,11 +727,11 @@ async def test_a_move_whose_request_is_cancelled_still_stops_the_source_exports_
         db, real, reached, go, holding = client.state["db"], client.state["db"].write, threading.Event(), \
             threading.Event(), [True]
 
-        def write(fn):  # the move's write, held before it commits
+        def write(fn, committed=None):  # the move's write, held before it commits
             if holding and holding.pop():
                 reached.set()
                 go.wait(10)
-            return real(fn)
+            return real(fn, committed)
 
         monkeypatch.setattr(db, "write", write)
         move = asyncio.create_task(client.post(f"/api/conversations/{conversation}/move", json={"project_id": other}))
