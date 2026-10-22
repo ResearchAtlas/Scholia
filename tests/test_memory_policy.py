@@ -688,3 +688,30 @@ async def test_an_extraction_restating_a_tightened_projects_personal_proposal_st
         assert written["counts"]["confirmed"] == 1  # the researcher's words, saved here as with a command
         assert await rows(client, "SELECT project_id, status FROM memory_records WHERE project_id = ?", b) == [
             (b, "confirmed")]
+
+
+# Fix batch 5 (connector thread PRRT_kwDOU3W1686vOf3W): a stale Forget in Things to confirm
+
+
+async def test_a_stale_forget_never_deletes_a_proposal_kept_or_edited_since(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        target = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+        made = lambda content: asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(  # noqa: E731
+            conn, project_id=project, scope="project", kind="decision", content=content, status="proposed",
+            sources=[("project", project)], replaces=None))
+        kept, edited = await made("We use surveys"), await made("We use diaries")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (target, kept)))
+        assert (await client.post("/api/memory/review", json={"id": kept, "action": "keep", "version": 1})).status_code == 200
+        assert (await client.patch(f"/api/memory/{edited}", json={"version": 1, "content": "We use diaries, weekly"})
+                ).status_code == 200
+        for record in (kept, edited):  # shown at version 1, as proposals, in another window
+            stale = await client.post("/api/memory/review", json={"id": record, "action": "forget", "version": 1})
+            assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
+            ("We use diaries, weekly", "confirmed"), ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
+        current = (await rows(client, "SELECT version FROM memory_records WHERE id = ?", edited))[0][0]
+        assert (await client.post("/api/memory/review", json={"id": edited, "action": "forget", "version": current})
+                ).status_code == 409  # confirmed now: Forget it from the memory views, not Things to confirm

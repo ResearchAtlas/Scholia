@@ -221,7 +221,7 @@ SCOPE_LINKS += (
 )
 
 
-def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed=None):
+def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed=None, check=None):
     """Delete one object and everything that belongs to it. Returns the ids of the active runs it revoked.
     on_committed, if given, is called with those ids as soon as the deletion commits, before
     the cleanup that follows, so the caller can stop that work at once.
@@ -230,7 +230,8 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
     tombstones. An active (running) run whose scope included a deleted record is
     revoked: deleted with its conversation or project, or else kept with
     cancel_reason 'revoked', which its next dispatch must honor. The returned
-    ids let the caller stop that work in memory now.
+    ids let the caller stop that work in memory now. check(conn), if given, runs first in the deletion's own
+    transaction: what it raises leaves everything unchanged (a record still as it was shown).
 
     Raises ValueError for an unknown kind or the General project, and
     LookupError when the object does not exist; nothing is changed then.
@@ -239,7 +240,11 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
         raise ValueError(f"cannot delete a {kind!r}")
     barrier = REVOKING.get(db)
     with barrier(None) if barrier else contextlib.nullcontext():  # None: every project (see REVOKING)
-        revoked = db.write(lambda conn: _delete(conn, kind, object_id, remove_all_trace))
+        def run(conn):
+            if check is not None:
+                check(conn)
+            return _delete(conn, kind, object_id, remove_all_trace)
+        revoked = db.write(run)
     if on_committed is not None:
         on_committed(revoked)
     # The deletion is committed. These finish removing its traces, and the next

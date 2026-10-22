@@ -884,10 +884,10 @@ async def _embed_soon(state, project_id):
             logging.getLogger(__name__).warning("an index run for memory could not be requested (%s)", type(error).__name__)
 
 
-async def _forget(state, record):
+async def _forget(state, record, check=None):
     from backend.db import deletion
     revoked = await asyncio.to_thread(deletion.delete, state["db"], state["content"], "memory", record,
-                                      on_committed=state["harness"].revoke)
+                                      on_committed=state["harness"].revoke, check=check)
     return revoked
 
 
@@ -989,10 +989,18 @@ async def answer_review(body: Review, request: Request):
     if body.id is None or body.action is None:
         return _refused(Refused(400, "invalid_request", "Name the proposal and what to do"))
     if body.action == "forget":
+        def shown(conn):  # Forget the proposal as it was shown: still proposed, at that version (else 409, as Keep)
+            found = row(conn, body.id)
+            if found is None:
+                raise LookupError(body.id)
+            if found["status"] != "proposed" or (body.version is not None and found["version"] != body.version):
+                raise ValueError("changed")
         try:
-            await _forget(state, body.id)
+            await _forget(state, body.id, check=shown)
         except LookupError:
             return _refused(Refused(404, "not_found", "No such record"))
+        except ValueError as error:
+            return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
         return {"ok": True}
     content = visible(body.content) if body.action == "edit" else None
     if body.action == "edit" and content is None:
