@@ -839,3 +839,24 @@ async def test_deadline_tests_count_admissions_as_the_gate_records_them(tmp_path
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "Which papers do I have?")
         assert await admitted_model_requests(client, stream[0]["run_id"]) == len(provider.agent_steps) == 2
+
+
+# Connector threads CT1 to CT5 (S1-19c follow-up)
+
+
+@pytest.mark.asyncio
+async def test_ct2_list_materials_past_its_read_limit_reports_every_paper_it_left_out(tmp_path):
+    from backend import agent
+    from backend.db.database import new_id
+    provider = Scripted([call("list_materials")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        extra = agent.LIST_LIMIT + 100
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.executemany(
+            "INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, ?, 'upload')",
+            [(new_id(), project, f"Paper {i:04d}") for i in range(extra)]))
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        [done] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
+        omitted = extra + 1 - len(done["meta"]["materials"])
+        assert tool_messages(provider.agent_steps[1])[-1]["content"].endswith(f"({omitted} more papers not shown.)")

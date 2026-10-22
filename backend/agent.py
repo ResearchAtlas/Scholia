@@ -147,18 +147,19 @@ def _shown(turn, call_id, keys, meta=None):
 async def list_materials(call, turn):
     rows = await turn.read(lambda conn: conn.execute(
         "SELECT m.id, m.title, json_extract(m.csl, '$.issued.\"date-parts\"[0][0]'), coalesce(m.evidence_type, 'full_text'),"
-        " m.retraction FROM materials m WHERE m.project_id = ? ORDER BY m.created_at, m.id LIMIT ?",
-        (turn.ctx["project_id"], LIST_LIMIT)).fetchall())
+        " m.retraction, count(*) OVER () FROM materials m WHERE m.project_id = ? ORDER BY m.created_at, m.id LIMIT ?",
+        (turn.ctx["project_id"], LIST_LIMIT)).fetchall())  # each row also counts every paper, past the limit too
     lines, used, shown = [], 0, []
-    for material, title, year, kind, retraction in rows:
+    for material, title, year, kind, retraction, _ in rows:
         line = " | ".join(str(x) for x in (material, title or "(untitled)", year or "n.d.", kind.replace("_", " "),
                                             "RETRACTED" if retraction == "retracted" else None) if x)
         if used + len(line) + 1 > 7000:
-            lines.append(f"({len(rows) - len(shown)} more papers not shown.)")
             break
         lines.append(line)
         shown.append(material)
         used += len(line) + 1
+    if rows and rows[0][5] > len(shown):
+        lines.append(f"({rows[0][5] - len(shown)} more papers not shown.)")
     turn.listed.update(shown)
     return ToolResult(id=call.id, ok=True, text="\n".join(lines) if lines else "The library has no papers yet.",
                       meta={"materials": shown})
