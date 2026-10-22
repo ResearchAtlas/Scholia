@@ -22,6 +22,7 @@ function ids(source) {
         if (call.callee.name === 'asksChanged') found.woken = text(call.arguments[0]);
         if (call.callee.name === 'followAsks') found.followed = text(call.arguments[0]);
         if (['afterRead', 'pollsAsks'].includes(call.callee.name)) found[call.callee.name] = true;
+        if (call.callee.name === 'afterAsksRead') found.afterRead = true; // S1-19c: afterRead under the library guard
         if (call.callee.name === 'addTo') {
           const visit = (node) => {
             if (node?.type === 'ObjectExpression') {

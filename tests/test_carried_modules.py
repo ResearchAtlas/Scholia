@@ -19,7 +19,8 @@ from network_guard import allow_subprocess
 ROOT = Path(__file__).resolve().parents[1]
 COMMIT = "b5d687820e88c10de25a9a2343d3cc478e497524"
 CARRIED = ["openrouter.py", "openrouter_client.py", "reasoning_capability.py", "reasoning_control.py",
-           "endpoint_pricing.py", "budget_router.py", "evidence.py"]
+           "endpoint_pricing.py", "budget_router.py", "evidence.py",
+           "tools/types.py", "tools/registry.py", "tools/parser.py", "tools/router.py"]  # S1-19c
 
 CHILD = r"""
 import asyncio, json, os, sys
@@ -49,6 +50,7 @@ sys.addaudithook(hook)
 before = files()
 import backend.openrouter, backend.openrouter_client, backend.reasoning_capability, backend.reasoning_control
 import backend.endpoint_pricing, backend.budget_router, backend.evidence, backend.app, backend.desktop
+import backend.tools.types, backend.tools.registry, backend.tools.parser, backend.tools.router
 after_import = files()
 
 import httpx

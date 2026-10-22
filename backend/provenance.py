@@ -14,7 +14,8 @@ carries, so the set is transitive. That one set is used everywhere:
 - Stored request bodies (the trace's exact outbound text) are linked to it (run_body_materials) when they
   are stored, before they are sent, and go with any of its papers (db/deletion.py RULES).
 - Stored rows holding such text name their paper and lose the text with it: a citation's quote and
-  sentence (db/deletion.py _SOURCE_REMOVED). Append-only events never hold it: they name citations and
+  sentence (db/deletion.py _SOURCE_REMOVED). An agent's question and option labels, held in its run's inputs
+  while it waits (`held.ask`, S1-19c), go in the deletion's own transaction (`forget`). Append-only events never hold it: they name citations and
   passages by id, and a citation check binds a verdict to its sentence by the sentence's hash.
 - An answer stays the conversation's record (turns.answer), but every copy derived from it follows its
   whole dependency set (Harold, 2026-10-21, option A): once any of its papers is gone, every citation row
@@ -70,11 +71,15 @@ def answer_carried(conn, run_id):
 
 
 def forget(conn, doomed):
-    """Deletion's side of the rule (backend/db/deletion.py, in its transaction): every answer whose dependency
-    set holds a paper being deleted (doomed: an SQL query of their ids) loses the text of each of its citation
-    rows, whichever paper the row names."""
+    """Deletion's side of the rule (backend/db/deletion.py, in its transaction): every run whose dependency set
+    holds a paper being deleted (doomed: an SQL query of their ids) loses every copy of model-written text it keeps:
+    its answer's citation rows lose their text, whichever paper each row names, and an agent's question and option
+    labels held while it waits (`inputs.held.ask`, S1-19c: the model's text, which may quote the paper) go at once,
+    not at the run's own end, which a failed write could keep from happening."""
     # ponytail: scans every run's context_materials per deletion; an index table if runs grow very large
+    depending = f"SELECT r.id FROM runs r, json_each(r.inputs, '$.context_materials') j WHERE j.value IN ({doomed})"
     conn.execute("UPDATE citations SET quote = NULL, context = json_remove(coalesce(context, '{}'), '$.sentence')"
-                 " WHERE owner_kind = 'answer' AND owner_id IN (SELECT r.id FROM runs r,"
-                 f" json_each(r.inputs, '$.context_materials') j WHERE j.value IN ({doomed}))"
+                 f" WHERE owner_kind = 'answer' AND owner_id IN ({depending})"
                  " AND (quote IS NOT NULL OR json_extract(context, '$.sentence') IS NOT NULL)")
+    conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.held.ask')"
+                 f" WHERE json_type(inputs, '$.held.ask') IS NOT NULL AND id IN ({depending})")

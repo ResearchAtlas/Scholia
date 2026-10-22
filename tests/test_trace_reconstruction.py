@@ -77,3 +77,30 @@ async def test_the_trace_rebuilds_the_answer_and_keeps_the_exact_text_each_call_
         assert (await client.get(f"/api/runs/{run_id}/trace")).status_code == 404
 
 
+
+
+async def test_an_agent_turns_tool_chain_and_skills_are_rebuilt_from_its_record_alone(tmp_path):
+    """S1-19c: the trace names each tool call and result and each skill activated, by name and ids only, and the
+    last step's exact outbound text holds the whole chain the answer was given, as the provider sent it."""
+    from agentic import REASONING, Scripted, call
+    provider = Scripted({"calls": [call("use_skill", name="literature-review"),
+                                   call("search_passages", call_id="c2", query="minimum wages")],
+                         "reasoning_details": REASONING}, "Minimum wages raise the earnings of low-paid workers [S1.1].")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Review my papers on wages")
+        run_id = stream[0]["run_id"]
+        trace = (await client.get(f"/api/runs/{run_id}/trace")).json()["events"]
+        kinds = [e["type"] for e in trace]
+        assert kinds.count("tool_call_started") == 2 and kinds.count("tool_result") == 2
+        assert [e["data"]["name"] for e in trace if e["type"] == "skill_activated"] == ["literature-review"]
+        sent = [e["body_ref"] for e in trace if e["type"] == "model_attempt" and e["body_ref"]]
+        bodies = [json.loads((await client.get(f"/api/runs/{run_id}/trace/bodies/{ref}")).content) for ref in sent]
+        last = [b for b in bodies if b.get("tools")][-1]  # the answer step's, not the judge's
+        assert last == provider.agent_steps[-1]  # what the provider received
+        chain = last["messages"][-3:]
+        assert chain[0]["reasoning_details"] == REASONING and [m["role"] for m in chain] == ["assistant", "tool", "tool"]
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        [chip] = turn["citations"]
+        assert chip["passage_id"] in json.dumps(trace)  # the passage it cites was read in the run, by the tool

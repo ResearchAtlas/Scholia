@@ -200,6 +200,26 @@ test('Details sums up the trace from its events, read a page at a time', async (
   assert.equal(found.finished, 'succeeded');
 });
 
+test('Details names each step\'s tool calls and outcomes and the skills used, never their text (S1-19c)', () => {
+  const found = summarize([
+    { type: 'step_started', data: { step: 0, phase: 'answer' } },
+    { type: 'tool_call_started', data: { step: 0, call_id: 'a', name: 'use_skill', arguments: { name: 'help' } } },
+    { type: 'skill_activated', data: { step: 0, name: 'help', sha256: 'x' } },
+    { type: 'tool_result', data: { step: 0, call_id: 'a', name: 'use_skill', ok: true } },
+    { type: 'tool_call_started', data: { step: 0, call_id: 'b', name: 'read_passage' } },
+    { type: 'tool_result', data: { step: 0, call_id: 'b', name: 'read_passage', ok: false, error: 'not_found' } },
+    { type: 'tool_call_started', data: { step: 0, call_id: 'c', name: 'ask' } }, // stopped while it waited
+    { type: 'step_started', data: { step: 1, phase: 'answer_from_library' } },
+    { type: 'skill_activated', data: { step: 1, name: 'help' } },
+    { type: 'citation_checks', data: { citations: [], pairs: { judged: 1, failed: 0, budget: 0, reused: 2 } } },
+  ]);
+  assert.deepEqual(found.steps[0].tools, [{ name: 'use_skill', ok: true, error: null },
+    { name: 'read_passage', ok: false, error: 'not_found' }, { name: 'ask', ok: null, error: null }]);
+  assert.deepEqual(found.steps.map((s) => s.phase), ['answer', 'answer_from_library']);
+  assert.deepEqual(found.skills, ['help']); // once
+  assert.equal(found.pairs.reused, 2);
+});
+
 test('papers chosen for the next message are one project\'s, kept once each, and a cited paper opens once', () => {
   let heard = 0;
   const stop = watchChosen(() => { heard += 1; });

@@ -11,13 +11,13 @@ import { Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
-import { NOTICES, clear, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
-import { errorText, money } from '../text.js';
+import { NOTICES, clear, limitText, send, stop, unsavedAnswer, useLiveTurn } from '../live.js';
+import { errorText, money, toolName } from '../text.js';
 import { continuable, conversationTitle } from '../projects.js';
 import { ModelPicker, currentChoice, readChoice } from './ModelPicker.jsx';
 import { messageRoute } from '../settings.js';
-import { ACCEPT, afterRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt, readGuard,
-  pollsAsks, readAsks, watchChosen } from '../library.js';
+import { ACCEPT, afterAsksRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt,
+  readGuard, readGuardedAsks, pollsAsks, watchChosen } from '../library.js';
 import { addTo } from './Library.jsx';
 import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
@@ -28,16 +28,29 @@ const ASKS_MS = 1500; // between reads of this conversation's questions, while f
 
 // The questions raised by work started in this conversation, read again while that work goes on, or
 // until a read succeeds after one failed (afterRead, pollsAsks). Only the newest read's answer is
-// shown, and a change of conversation clears what was shown.
-function useConversationAsks(conversationId, watching) {
+// shown, and a change of conversation clears what was shown. S1-19c: a library change drops every question shown
+// and every read asked before it, as for the conversation's own turns (readGuardedAsks).
+function useConversationAsks(conversationId, watching, projectId) {
   const [known, setKnown] = useState(NO_ASKS);
   const [reads, setReads] = useState(0);
   const [asked] = useState(newest);
-  const load = useCallback(() => readAsks(asked, conversationId, (found) => {
-    setKnown((current) => afterRead(current, found));
+  const guard = useRef(null);
+  if (guard.current === null) guard.current = readGuard();
+  const load = useCallback(() => readGuardedAsks(guard.current, asked, conversationId, (found, changed) => {
+    setKnown((current) => afterAsksRead(current, found, changed));
     setReads((n) => n + 1);
   }), [conversationId, asked]);
   useEffect(() => { setKnown(NO_ASKS); load(); }, [load]);
+  useEffect(() => {
+    const changed = (event) => {
+      if (event.detail !== projectId) return;
+      guard.current.libraryChanged(); // first: a read asked before this is dropped when it arrives
+      setKnown({ ...NO_ASKS, unsure: true }); // nothing shown until a read succeeds; looked at again meanwhile
+      load();
+    };
+    libraryEvents.addEventListener('changed', changed);
+    return () => libraryEvents.removeEventListener('changed', changed);
+  }, [projectId, load]);
   useEffect(() => followAsks(conversationId, load), [conversationId, load]); // files attached here were added
   const polls = pollsAsks(known, watching);
   useEffect(() => {
@@ -61,7 +74,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const end = useRef(null);
   const [attached, setAttached] = useState(null); // what the last attach said, and the lookup it started
   // Read for the conversation attach() tags its files with: a draft's too, before the window knows it.
-  const { asks, load: loadAsks } = useConversationAsks(id, attached?.lookup);
+  const { asks, load: loadAsks } = useConversationAsks(id, attached?.lookup, projectId);
   const here = useRef(false); // still shown: a draft admitted after the researcher left selects nothing
   useEffect(() => {
     here.current = true;
@@ -290,11 +303,12 @@ function Question({ text }) {
   );
 }
 
-function Working() {
+function Working({ tool }) {
   const t = useT();
   return (
     <p className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
-      <Loader2 className="size-4 animate-spin text-brand" aria-hidden="true" />{t('turn.working')}
+      <Loader2 className="size-4 animate-spin text-brand" aria-hidden="true" />
+      {tool ? t('turn.usingTool', { tool: toolName(t, tool) }) : t('turn.working')}
     </p>
   );
 }
@@ -309,7 +323,7 @@ function Turn({ turn, onContinue, onOpen }) {
     // an answer that was shown but not saved says so below it instead
     failed: turn.answer && turn.reason_code === 'save_failed' ? null : t('turn.failed', { reason: errorText(t, turn.reason_code) }),
   }[turn.status] ?? (turn.status === 'cancelled'
-    ? { limit: t('turn.limit'), revoked: t('turn.revoked') }[turn.cancel_reason] ?? t('turn.stopped')
+    ? { limit: t(limitText(turn.reason_code)), revoked: t('turn.revoked') }[turn.cancel_reason] ?? t('turn.stopped')
     : null);
   return (
     <li className="space-y-3">
@@ -357,12 +371,12 @@ function LiveTurn({ turn }) {
   return (
     <li className="space-y-3">
       <Question text={turn.text} />
-      {turn.answer ? <Answer text={turn.answer} /> : !turn.done && <Working />}
+      {turn.answer ? <Answer text={turn.answer} /> : !turn.done && <Working tool={turn.tool} />}
       {turn.answer && turn.resultSaved === false && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
       {turn.answer && turn.cut && <p className="text-xs text-muted-foreground">{t('turn.cut')}</p>}
       {turn.answer && <Notices notices={turn.notices} />}
       {turn.error && <p className="text-xs text-destructive">{t('turn.failed', { reason: errorText(t, turn.error) })}</p>}
-      {turn.limit && <p className="text-xs text-muted-foreground">{t('turn.limit')}</p>}
+      {turn.limit && <p className="text-xs text-muted-foreground">{t(limitText(turn.limit))}</p>}
     </li>
   );
 }

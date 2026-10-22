@@ -56,7 +56,8 @@ exact origins count there, and nothing else does. Names are never resolved, so
 A client may also carry a dispatch check (`admit`), which the harness gives every
 model call: it is read in the same decision transaction, so a run revoked by a
 deletion or a tightened project, or one in a review-locked project, sends nothing
-more, retries and same-origin redirect hops included ("revoked").
+more, retries and same-origin redirect hops included ("revoked"); nor does a turn past its time limit
+("turn_deadline", S1-19c).
 
 No request enters the transport after a revocation commits. Every write that revokes
 a project's runs or takes away a route (a tightened or review-locked project; for every
@@ -405,7 +406,8 @@ class OutboundGate:
         fetch. approved means the researcher approved these requests, which Local
         only projects need for scholarly APIs and open-access hosts. admit(conn), if
         given, is called in the decision transaction of every request the policy
-        allows; anything but True refuses it as "revoked". provider names the configured
+        allows; anything but True refuses it as "revoked", or as the reason it names (S1-19c: "turn_deadline",
+        a turn past its time limit). provider names the configured
         provider a model call goes through: a Private request to OpenRouter is checked against
         that provider's catalog and its own confirmation of the key (none without it). zotero makes a
         client for Zotero's local API, which reaches nothing else (S1-15, the Zotero block). options are
@@ -510,8 +512,8 @@ class OutboundGate:
                         admitted = scope.admit(conn)
                     except Exception as caught:  # refused, and chained to it
                         error, admitted = caught, False
-                    if admitted is not True:
-                        reason = "revoked"
+                    if admitted is not True:  # the dispatch check's own reason when it names one (a turn's deadline)
+                        reason = admitted if isinstance(admitted, str) and admitted else "revoked"
             shown = _shown(conn, target, kind, link, providers, helpers)
             _record(conn, request, scope, level, kind, shown, reason)
             # What was applied, as decided here: for the run's record (ticket 18's provenance).

@@ -58,6 +58,7 @@ class MockProvider:
         self.catalog = sorted(budget_router.RECOMMENDED) if catalog is None else list(catalog)
         self.zero_retention = list(zero_retention)
         self.endpoints = dict(endpoints or {})
+        self.parameters = PARAMETERS  # what an endpoint listing row takes by default (without "tools": no agent loop)
         self.local = ["llama", "m", "m:1"]  # what another provider's model listing holds, each with a 128K window
         self.replies = list(replies)
         self.title_replies = []  # replies for title calls, which never take from `replies`
@@ -109,9 +110,9 @@ class MockProvider:
     def listing(self, model):
         rows = self.endpoints.get(model) or [
             row for row in self.zero_retention if isinstance(row, dict) and row.get("model_id") == model]
-        rows = rows or [{"tag": "example", "context_length": 128000, "supported_parameters": PARAMETERS}]
+        rows = rows or [{"tag": "example", "context_length": 128000, "supported_parameters": self.parameters}]
         # A row that names its pricing or parameters keeps them.
-        return [{"pricing": PRICING, "supported_parameters": PARAMETERS, **row} for row in rows]
+        return [{"pricing": PRICING, "supported_parameters": self.parameters, **row} for row in rows]
 
     @property
     def chat_headers(self):

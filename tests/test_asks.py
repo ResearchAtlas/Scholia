@@ -133,6 +133,85 @@ async def test_an_ask_offers_one_to_three_options():
 async def test_only_the_ask_module_writes_an_answer():
     backend = Path(__file__).resolve().parents[1] / "backend"
     writers = sorted(path.name for path in backend.rglob("*.py")
-                     if re.search(r"""['"]ask_answered['"]""", path.read_text(encoding="utf-8"))
+                     if re.search(r"""_event\([^)]*['"]ask_answered['"]""", path.read_text(encoding="utf-8"))
                      and path.name != "migrations.py")
     assert writers == ["asks.py"]
+
+
+# S1-19c: the agent's ask tool on the shared confirmation (slice-1 spec section 6.2; ticket 71)
+
+
+async def test_the_agents_ask_waits_for_the_researcher_whose_typed_answer_is_their_own_words(tmp_path):
+    from agentic import Scripted, call, tool_messages
+    from cited import cited, conversation_in, with_papers
+    from scholia_app import send
+    from test_agent_loop import asked
+    from test_search import WAGES
+    provider = Scripted([call("ask", question="Which outcome?", options=["Earnings", "Jobs"])], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        assert (ask["kind"], ask["options"], ask["text_box"], ask["params"]["question"], ask["params"]["labels"]) == (
+            "choice", ["1", "2"], True, "Which outcome?", {"1": "Earnings", "2": "Jobs"})
+        waiting = await rows(client, "SELECT waiting FROM runs WHERE id = ?", ask["run_id"])
+        assert waiting == [("ask",)] and len(provider.agent_steps) == 1  # the run waits; nothing more is sent
+        answered = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"text": "Both, please"})
+        assert answered.status_code == 200
+        assert (await sending)[-1]["status"] == "succeeded"
+        assert tool_messages(provider.agent_steps[1])[-1]["content"] == "The researcher answered: Both, please"
+
+
+@pytest.mark.parametrize("end", ["stop", "delete"])
+async def test_an_agents_ask_closes_with_its_run_and_a_late_answer_changes_nothing(tmp_path, end):
+    from agentic import Scripted, call
+    from cited import cited, conversation_in, with_papers
+    from scholia_app import send
+    from test_agent_loop import asked
+    from test_search import WAGES
+    provider = Scripted([call("ask", question="Go on?", options=["Yes", "No"])], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        if end == "stop":
+            assert (await client.post(f"/api/runs/{ask['run_id']}/cancel")).json()["status"] == "cancelled"
+        else:
+            assert (await client.delete(f"/api/conversations/{conversation}")).status_code in (200, 204)
+        await sending
+        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
+        assert late.status_code in (404, 409)  # L7: closed with its run, or gone with it
+        assert len(provider.agent_steps) == 1
+        if end == "stop":
+            assert await rows(client, "SELECT waiting FROM runs WHERE id = ?", ask["run_id"]) == [(None,)]
+            assert (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"] == []
+
+
+async def test_an_agents_ask_is_withdrawn_when_its_projects_protection_changes(tmp_path, monkeypatch):
+    from agentic import Scripted, call
+    from backend import agent
+    from cited import cited, conversation_in, events_of, with_papers
+    from scholia_app import send
+    from test_agent_loop import asked
+    from test_search import WAGES
+    monkeypatch.setattr(agent, "ANSWERED_POLL_SECONDS", 0.05)
+    provider = Scripted([call("ask", question="Go on?", options=["Yes"])], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        # a policy change that revokes nothing here (written directly): the ask no longer applies
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE projects SET sensitivity = 'local_only' WHERE id = ?", (project,)))
+        refused = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
+        # refused as invalid, or as closed once the run's wait has withdrawn it: either way never taken
+        assert refused.status_code == 409 and refused.json()["code"] in ("ask_invalid", "ask_closed")
+        stream = await sending
+        assert stream[-1]["status"] == "failed" and len(provider.agent_steps) == 1  # the gate refuses the next step
+        events = await events_of(client, ask["run_id"])
+        assert [d.get("withdrawn") for k, d, _ in events if k == "ask_answered"] == ["policy_changed"]
+        [result] = [d for k, d, _ in events if k == "tool_result"]
+        assert (result["ok"], result["error"]) == (False, "tool_error")

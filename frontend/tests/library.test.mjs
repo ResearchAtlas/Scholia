@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changes, detailsOf, reasonKey, rectStyle, sortFiles, supported, unsettled, validYear, authorNames,
-  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, MAX_LIST_HEIGHT, withFocus,
+  typeKey, viewOf, pointing, hovering, isPointed, NOT_POINTED, unionRect, refreshed, takeSaved, newest, requestsOf, REQUEST_FILE_BYTES, MAX_FILE_BYTES, LOOKUP_OUTCOMES, addFiles, uploadsWaiting, watchUploads, readAsks, followAsks, asksChanged, afterRead, pollsAsks, NO_ASKS, readGuardedAsks, afterAsksRead, readGuard, cancelledKey, heldPages, withNear, MAX_HELD_PAGES, headings, passageStretch, pagePart, pageLines, PAGE_PART, PAGE_LINES, PASSAGE_STRETCH, selectedParts, passOn, partMove, waitsOn, pageOffsets, pagesWithin, pageWindow, PAGE_WIDTH, PAGE_GAP, PAGE_ASPECT, MAX_LIST_HEIGHT, withFocus,
   detailsSource, latestLookup, pageImage, pageFailedKey, ocrPages } from '../src/library.js';
 import { loadLanguage, makeT } from '../src/i18n/index.js';
 import { followRun, fraction, runOutcome } from '../src/runs.js';
@@ -803,5 +803,37 @@ test('a run that no longer exists has ended, and following stops when what follo
     assert.equal(turns, 3);
   } finally {
     globalThis.fetch = original;
+  }
+});
+
+test('an agent\'s question read before a library change never shows after it, and a failed reload shows none (S1-19c)', async () => {
+  const realFetch = globalThis.fetch;
+  const pending = [];
+  globalThis.fetch = () => new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  const asking = (question) => new Response(JSON.stringify({ asks: [{ ask_id: 'a', params: { question } }], working: 1 }), { status: 200 });
+  try {
+    const guard = readGuard();
+    const asked = newest();
+    let known = { asks: [{ ask_id: 'a', params: { question: 'It quotes the deleted paper?' } }], working: true, unsure: false };
+    const apply = (found, changed) => { known = afterAsksRead(known, found, changed); };
+    const before = readGuardedAsks(guard, () => () => true, 'c1', apply); // asked before the change, answers late
+    await new Promise((r) => setTimeout(r, 0));
+    guard.libraryChanged(); // the paper is deleted: what was shown goes at once
+    known = { ...NO_ASKS, unsure: true };
+    const reload = readGuardedAsks(guard, asked, 'c1', apply);
+    await new Promise((r) => setTimeout(r, 0));
+    pending[0].resolve(asking('It quotes the deleted paper?')); // the older response arrives first
+    await before;
+    pending[1].reject(new Error('offline')); // then the reload fails
+    await reload;
+    assert.deepEqual(known.asks, []); // never the old question again
+    assert.equal(known.unsure, true); // and it is read again
+    const again = readGuardedAsks(guard, asked, 'c1', apply);
+    await new Promise((r) => setTimeout(r, 0));
+    pending[2].resolve(asking('A fresh question'));
+    await again;
+    assert.deepEqual(known.asks.map((a) => a.params.question), ['A fresh question']);
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });

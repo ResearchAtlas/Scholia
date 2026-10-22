@@ -310,7 +310,8 @@ def _delete(conn, kind, object_id, remove_all_trace):
                     AND (d.material_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})
                          OR d.material_version_id IN (SELECT id FROM material_versions WHERE rowid IN {_doomed('material_versions')})
                          OR d.passage_id IN (SELECT id FROM passages WHERE rowid IN {_doomed('passages')})))""")
-    # Harold, 2026-10-21 (option A): an answer that depended on a deleted paper loses every row's text.
+    # Harold, 2026-10-21 (option A): a run that depended on a deleted paper loses every copy of model-written text it
+    # keeps: its answer's citation rows' text, and an agent's question held while it waits (S1-19c).
     provenance.forget(conn, f"SELECT id FROM materials WHERE rowid IN {_doomed('materials')}")
     for (child, column), (parent, key) in edges.items():
         action = ON_DELETE[child, column]

@@ -38,9 +38,12 @@ WORKFLOWS.zotero_import = 'settings.workflowZotero'; // S1-15: importing from Zo
 const ROLES = ['council', 'chairman', 'router', 'judge', 'extractor'];
 const MAX_SUBAGENT_MODELS = 5;
 
-export function Settings({ open, onOpenChange, health, project, onLanguage, onProjectChanged }) {
+export function Settings({ open, onOpenChange, health, project, onLanguage, onProjectChanged, startPage }) {
   const t = useT();
   const [page, setPage] = useState('general');
+  useEffect(() => { // S1-19c: opened at a page by the help skill's open_place
+    if (open && PAGES.includes(startPage)) setPage(startPage);
+  }, [open, startPage]);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex h-[min(88vh,820px)] max-w-4xl flex-col gap-0 p-0 sm:flex-row">

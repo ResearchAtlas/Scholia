@@ -180,7 +180,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
         raise RuntimeError("no helper")
 
     for name in ("check_sqlite", "check_index", "check_backend", "check_interface", "check_encrypted_zip",
-                 "check_materials", "check_reading_ceiling", "check_ocr", "check_references"):
+                 "check_materials", "check_reading_ceiling", "check_ocr", "check_references", "check_skills"):
         monkeypatch.setattr(st, name, passing(name))
     monkeypatch.setattr(st, "check_embedding", failing)
     argv = ["--self-test", "--model", str(tmp_path / "m.gguf")]
@@ -189,7 +189,7 @@ def test_every_check_runs_and_any_failure_fails_the_self_test(monkeypatch, tmp_p
     assert result["ok"] is False
     assert result["checks"]["embedding"] == {"ok": False, "error": "RuntimeError: no helper"}
     assert result["checks"]["ocr"] == {"ok": True}
-    assert len(calls) == 10
+    assert len(calls) == 11
     monkeypatch.setattr(st, "check_embedding", passing("embedding"))
     assert st.main(argv) == 0
 
@@ -222,3 +222,11 @@ def test_a_unit_embedding_passes():
     with mock_http_server(_helper_stub("k1", UNIT)) as url:
         returned = st.embed(int(url.rsplit(":", 1)[1]), "k1", "text")
     assert st.verify_embedding(returned) == pytest.approx(1.0)
+
+
+def test_the_skills_check_finds_the_bundled_skills_whole(monkeypatch, tmp_path):
+    from backend import skills
+    assert st.check_skills() == {"skills": ["help", "literature-review"]}
+    monkeypatch.setattr(skills, "ROOT", tmp_path)  # a build without them
+    with pytest.raises(RuntimeError, match="did not load"):
+        st.check_skills()

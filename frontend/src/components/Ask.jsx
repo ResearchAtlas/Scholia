@@ -9,7 +9,7 @@ import { MessageCircleQuestion } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { post } from '../api.js';
 import { useAction } from '../action.js';
-import { visible } from '../text.js';
+import { toolName, visible } from '../text.js';
 import { projectName } from '../projects.js';
 import { paperLine } from '../references.js';
 import { Button } from '@/components/ui/button';
@@ -33,7 +33,12 @@ export function Ask({ ask, onAnswered }) {
   // A kind the app defines is asked in its own words; another (the agent's, S1-19) carries its question.
   const questionKey = `ask.${ask.kind}.question`;
   const asked = t(questionKey, { count: ask.params?.identifiers ?? 0, services });
-  const question = asked === questionKey ? ask.params?.question ?? '' : asked;
+  // S1-19c: a tool the project's rules ask about before it runs is asked in the app's words, naming the tool.
+  const approval = ask.params?.approval;
+  const failures = ask.params?.tool_errors; // the run stopped after tool calls failed in a row (section 6.6)
+  const question = approval ? t('ask.approval.question', { tool: toolName(t, approval) })
+    : failures ? t('ask.toolErrors.question', { count: failures })
+      : asked === questionKey ? ask.params?.question ?? '' : asked;
   // A Local only lookup of a reference file's papers says so (S1-14): its answer covers those papers.
   // S1-15: so does a Zotero import's, and a Zotero item's merge question says the record is Zotero's.
   const zotero = ask.params?.batch === 'zotero' || ask.params?.from === 'zotero';
@@ -65,7 +70,7 @@ export function Ask({ ask, onAnswered }) {
           )}
         </div>
       </div>
-      {ask.text_box && (
+      {ask.text_box && !approval && ( // S1-19c: an approval is answered with its options only
         <form className="flex gap-2" onSubmit={(event) => { event.preventDefault(); if (visible(text)) answer({ text }); }}>
           <label htmlFor={textId} className="sr-only">{t('ask.textLabel')}</label>
           <Input id={textId} value={text} onChange={(event) => setText(event.target.value)} disabled={busy} className="h-8" />
@@ -79,7 +84,9 @@ export function Ask({ ask, onAnswered }) {
           <Button key={option} type="button" size="sm" variant={i === 0 ? 'default' : 'outline'} disabled={busy}
             className={i === 0 ? 'bg-brand text-brand-foreground hover:bg-brand/90' : undefined}
             onClick={() => answer({ option })}>
-            {named(t, `ask.${ask.kind}.option.${option}`, option)}
+            {ask.params?.labels?.[option] // S1-19c: the agent's options, by number, labeled while its run waits
+              ?? named(t, approval ? `ask.approval.option.${option}` : failures ? `ask.toolErrors.option.${option}`
+                : `ask.${ask.kind}.option.${option}`, option)}
           </Button>
         ))}
       </div>

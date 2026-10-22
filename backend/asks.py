@@ -9,7 +9,7 @@ as an `ask_answered` event and audited without content. It is invalid once its r
 (cancelled, finished, revoked or deleted with its project) or the project's level or lock has
 changed since it was asked. The conversation, the Library panel and the background-run list all
 show the open asks this module lists, each naming its project, and answer them through the one
-endpoint.
+endpoint; a turn's asks (the agent's, S1-19c) only in their conversation, where their work started.
 """
 
 import asyncio
@@ -129,22 +129,36 @@ def withdraw(conn, run_id, ask_id, reason):
     return True
 
 
+# S1-19c: the agent's choice ask (backend/runs.py Harness._ask): its event names its options by number; its question
+# and option labels, the model's text, are held in the run's inputs while it runs and shown from there.
+def _agents_question(conn, run_id):
+    row = conn.execute("SELECT json_extract(inputs, '$.held.ask') FROM runs WHERE id = ?", (run_id,)).fetchone()
+    held = json.loads(row[0]) if row and row[0] else None
+    ask, _ = asked(conn, run_id)
+    if not held or ask is None or held.get("ask_id") != ask["ask_id"]:
+        return {}
+    return {"question": held["question"], "labels": dict(zip(ask["options"], held["labels"]))}
+
+
 # S1-14's merge (backend/references.py): it takes one of its options, a typed answer having no defined
 # effect; and its question shows the two papers it is about, read as they are when it is listed, so
 # neither is kept in the question itself. SHOWN: kind -> fn(conn, run id) -> what its params add.
 NO_TEXT.add("merge")
-SHOWN = {}
+SHOWN = {"choice": _agents_question}
 
 
 def open_asks(conn, project_id=None, conversation_id=None, run_id=None):
     """The asks that can be answered now: of running runs waiting on them, under the policy they were
     asked under; for a project, a conversation they were raised from, or a run. Each names its
-    project (project_name, project_kind), wherever it is shown."""
+    project (project_name, project_kind), wherever it is shown. A turn's asks (the agent's, S1-19c) are shown only
+    where their work started, in their conversation (section 6.2): a project's listing (the Library panel) leaves
+    them out, so their text is read only under the conversation's library-change guard."""
     rows = conn.execute(
         "SELECT r.id, r.workflow, p.name, p.kind FROM runs r JOIN projects p ON p.id = r.project_id"
         " WHERE r.status = 'running' AND r.waiting = 'ask'"
         " AND r.cancel_reason IS NULL AND (?1 IS NULL OR r.project_id = ?1) AND (?2 IS NULL OR r.id = ?2)"
-        " ORDER BY r.started_at", (project_id, run_id)).fetchall()
+        " AND (?3 IS NOT NULL OR ?2 IS NOT NULL OR r.kind != 'turn')"
+        " ORDER BY r.started_at", (project_id, run_id, conversation_id)).fetchall()
     found = []
     for run, workflow, project_name, project_kind in rows:
         ask, answered = asked(conn, run)

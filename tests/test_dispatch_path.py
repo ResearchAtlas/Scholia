@@ -149,9 +149,9 @@ def test_the_structure_check_finds_the_reviewers_two_bypasses():
     assert any("new_role.py" in problem for problem in structure_problems(planted))
     # The dispatch check moved into an ordinary read, and the gate's admit callback removed.
     sources = _sources()
-    old = "async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id),"
+    old = "async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past),"
     assert old in sources["runs.py"]
-    sources["runs.py"] = sources["runs.py"].replace(old, "await self._read(lambda conn: may_dispatch(conn, active.run_id))\n"
+    sources["runs.py"] = sources["runs.py"].replace(old, "await self._read(lambda conn: may_dispatch(conn, active.run_id, past))\n"
                                                           "        async with self.gate.async_client(project_id[0],")
     problems = structure_problems(sources)
     assert any("outside a gate's admit callback" in p for p in problems) and any("_call does not send" in p

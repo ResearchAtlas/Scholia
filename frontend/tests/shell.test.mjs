@@ -7,7 +7,7 @@ import { SESSION_KEY, takeSession } from '../src/session.js';
 import { EventReader } from '../src/sse.js';
 import { continuable, moveTargets, projectName } from '../src/projects.js';
 import { errorText, money, visible } from '../src/text.js';
-import { apply, send, subscribe, unsavedAnswer } from '../src/live.js';
+import { PLACES, apply, limitText, openPlace, places, send, subscribe, unsavedAnswer } from '../src/live.js';
 import { packageRoot, record } from '../licenses.mjs';
 import { saveSettings } from '../src/api.js';
 
@@ -155,7 +155,25 @@ test('a live turn follows its events', () => {
   turn = apply(turn, { type: 'chat_response', content: 'A', result_saved: false });
   turn = apply(turn, { type: 'run_finished', status: 'failed' });
   assert.deepEqual(turn, { text: 'Q', runId: 'r1', answer: 'A', resultSaved: false, done: true });
-  assert.equal(apply(turn, { type: 'limit_reached' }).limit, true);
+  assert.equal(apply(turn, { type: 'limit_reached', budget: 'conversation' }).limit, 'budget');
+  // S1-19c: a turn limit is named; the tool in use and the skills used are followed
+  assert.equal(apply(turn, { type: 'limit_reached', limit: 'agent_steps' }).limit, 'agent_steps');
+  assert.equal(limitText('agent_steps'), 'turn.limitSteps');
+  assert.equal(limitText('budget'), 'turn.limit');
+  assert.equal(apply(turn, { type: 'tool_call', name: 'search_passages' }).tool, 'search_passages');
+  assert.deepEqual(apply(apply(turn, { type: 'skill', name: 'help' }), { type: 'skill', name: 'literature-review' }).skills,
+    ['help', 'literature-review']);
+});
+
+test('open_place opens only a place from its list (S1-19c)', () => {
+  const opened = [];
+  const listen = (event) => opened.push(event.detail);
+  places.addEventListener('open', listen);
+  for (const place of ['library', 'settings.project', 'file:///etc', 'settings.unknown', 'https://example.org']) openPlace(place);
+  places.removeEventListener('open', listen);
+  assert.deepEqual(opened, ['library', 'settings.project']);
+  assert.deepEqual(PLACES, ['library', 'settings.general', 'settings.providers', 'settings.subagents', 'settings.project',
+    'settings.advanced']); // backend/agent.py PLACES
 });
 
 function streamOf(...chunks) {

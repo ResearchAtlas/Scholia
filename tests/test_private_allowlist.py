@@ -65,11 +65,31 @@ async def test_every_private_request_to_openrouter_carries_zdr_and_no_plugins_or
         for body, headers in zip(provider.chats, provider.chat_headers):
             assert body["provider"] == {"zdr": True, "only": ["example"], "require_parameters": True}
             assert headers.get_list("x-openrouter-cache") == ["false"]  # response caching off
-            assert not {"plugins", "tools", "reasoning", "web_search_options"} & body.keys()
+            assert not {"plugins", "reasoning", "web_search_options"} & body.keys()
+            # client function tools only (section 6.4; S1-19c's agent loop), never a server-side tool
+            assert all(tool["type"] == "function" for tool in body.get("tools", ()))
         decisions = await rows(client, "SELECT data ->> 'decision', data ->> 'sensitivity' FROM audit_log"
                                        " WHERE event = 'outbound' AND data ->> 'kind' = 'model_provider'"
                                        " AND project_id IS NOT (SELECT id FROM projects WHERE kind = 'general')")
         assert decisions == [("allow", "private")] * 2
+
+
+async def test_a_private_agent_turns_tool_calling_steps_carry_the_private_controls(tmp_path):
+    # S1-19c (I10): every step of a Private agent turn, its tool chain included, is a Private request (a
+    # server-side tool is refused by the gate: test_outbound_gate.py's unsupported_feature cases).
+    provider = provider_for_private()
+    tool_call = {"id": "c1", "type": "function", "function": {"name": "list_materials", "arguments": "{}"}}
+    provider.replies.append((200, {"choices": [{"message": {"role": "assistant", "content": None,
+                                                            "tool_calls": [tool_call]}}], "usage": {"cost": 0.001}}))
+    async with started(tmp_path / "data", provider) as client:
+        _, conversation = await private_conversation(client)
+        stream = await send(client, conversation, model=ZDR_MODEL)
+        assert stream[-1]["status"] == "succeeded"
+        first, second = provider.answers[:2]
+        assert second["messages"][-1]["role"] == "tool" and second["messages"][-2]["tool_calls"] == [tool_call]
+        for body, headers in zip(provider.chats, provider.chat_headers):
+            assert body["provider"]["zdr"] is True and headers.get_list("x-openrouter-cache") == ["false"]
+            assert all(tool["type"] == "function" for tool in body.get("tools", ()))
 
 
 async def test_a_private_request_reaches_no_endpoint_where_openrouter_compresses_by_default(tmp_path):
@@ -489,7 +509,8 @@ async def test_a_private_turns_router_answer_and_judge_all_carry_the_private_con
         for body, headers in zip(provider.chats, provider.chat_headers):
             assert body["provider"]["zdr"] is True and body["provider"]["only"] == ["example"]
             assert headers.get_list("x-openrouter-cache") == ["false"]
-            assert not {"plugins", "tools", "web_search_options"} & body.keys()
+            assert not {"plugins", "web_search_options"} & body.keys()
+            assert all(tool["type"] == "function" for tool in body.get("tools", ()))  # client function tools only
 
 
 async def test_a_private_turns_judge_set_to_a_model_the_project_does_not_allow_judges_nothing_and_says_so(tmp_path):

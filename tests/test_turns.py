@@ -12,7 +12,7 @@ import pytest
 
 from backend import runs as runs_module
 from backend.db import new_id
-from scholia_app import FakeKeyring, MockProvider, background_idle, events, send, started
+from scholia_app import PARAMETERS, FakeKeyring, MockProvider, background_idle, events, send, started
 
 pytestmark = pytest.mark.asyncio
 
@@ -301,6 +301,7 @@ async def test_a_cancel_after_the_primary_commit_keeps_the_answer(tmp_path):
 ])
 async def test_a_provider_failure_fails_the_turn_with_its_kind_and_settles_once(tmp_path, status, body, reason):
     provider = MockProvider((status, body))
+    provider.parameters = [p for p in PARAMETERS if p != "tools"]  # a route without tool calls: none are offered
     async with started(tmp_path / "data", provider) as client:
         conversation = await new_conversation(client)
         stream = await send(client, conversation)
@@ -1404,3 +1405,45 @@ async def test_two_conversations_of_one_project_asking_at_once_keep_their_own_ci
             assert [c["material_id"] for c in turn["citations"]] == [material]
             assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status != 'released'",
                               turn["run_id"]) == [(2,)]  # the answer's and the judge's; the judge's share released
+
+
+# S1-19c: the agent loop's turn facts (I3, G8)
+
+
+@pytest.mark.asyncio
+async def test_a_second_message_is_refused_while_the_loop_waits_and_stop_between_steps_ends_it(tmp_path):
+    from agentic import Scripted, call
+    from cited import cited, conversation_in, with_papers
+    from test_agent_loop import asked
+    from test_search import WAGES
+    provider = Scripted([call("ask", question="Go on?", options=["Yes"])], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        ask = await asked(client, conversation)
+        second = await client.post(f"/api/conversations/{conversation}/message/stream", json={"content": "And?"})
+        assert (second.status_code, second.json()["code"]) == (409, "active_run")  # one active turn
+        assert (await client.post(f"/api/runs/{ask['run_id']}/cancel")).json()["status"] == "cancelled"
+        stream = await sending
+        assert stream[-1]["status"] == "cancelled" and len(provider.agent_steps) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_conversations_of_one_project_keep_their_own_citations_and_reservations(tmp_path):
+    from agentic import Scripted, call
+    from cited import cited, conversation_in, rows, with_papers
+    from test_search import WAGES
+    provider = Scripted([call("search_passages", query="wages")], [call("search_passages", call_id="c2", query="wages")],
+                        "One [S1.1].", "Two [S1.1].")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        first, second = await conversation_in(client, project), await conversation_in(client, project)
+        streams = await asyncio.gather(send(client, first, "Which papers?"), send(client, second, "Which papers?"))
+        assert [s[-1]["status"] for s in streams] == ["succeeded", "succeeded"]
+        for stream, conversation in zip(streams, (first, second)):
+            run_id = stream[0]["run_id"]
+            owners = await rows(client, "SELECT DISTINCT owner_id FROM citations WHERE owner_id = ?", run_id)
+            paying = await rows(client, "SELECT DISTINCT paying_conversation_id FROM budget_reservations WHERE run_id = ?",
+                                run_id)
+            assert owners == [(run_id,)] and paying == [(conversation,)]

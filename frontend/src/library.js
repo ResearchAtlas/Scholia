@@ -430,6 +430,17 @@ export async function readAsks(asked, conversationId, show) {
   if (current()) show(found);
 }
 
+// S1-19c: a conversation's questions under the library-change guard (readGuard), as its citations and Details are
+// (Harold, 2026-10-21: no client-held derived state): an agent's question and its options are the model's text and
+// may quote a paper. A read asked before a library change is dropped when it arrives; after a change, until a read
+// succeeds nothing read before it is kept, and a failed read shows no question. apply(found, changed) gets each read
+// still wanted: afterAsksRead decides what it leaves shown.
+export function readGuardedAsks(guard, asked, conversationId, apply) {
+  const settle = guard.ask();
+  return readAsks(asked, conversationId, (found) => { if (settle(Boolean(found))) apply(found, guard.changed()); });
+}
+export const afterAsksRead = (known, found, changed) => afterRead(changed ? NO_ASKS : known, found);
+
 // The text view shows a version's passages a stretch at a time, each read when it comes near the view
 // and let go when it leaves (heldPages): the stretch's passages and the section the passages before
 // it end in (the API's section: the last path before it that is not empty, as a title's is), so its

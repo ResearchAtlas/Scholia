@@ -331,10 +331,52 @@ CITED = ("The synthetic notes report that wage floors raised the earnings of low
 ABSTAIN = "Your library holds no evidence on this question, so I cannot answer it from your papers."
 
 
+# S1-19c: the agent's steps for the help skill and the ask tool (walkthrough steps 73 and 74)
+HELP = ("How do I add a reference file?", "如何添加参考文献文件？")
+HELP_ANSWER = ("Open the Library's Add menu and choose A reference file, then pick your BibTeX, RIS or CSL JSON file. "
+               "I have opened the Library for you.",
+               "打开文献库的“添加”菜单，选择“参考文献文件”，再选择你的 BibTeX、RIS 或 CSL JSON 文件。我已为你打开文献库。")
+ASKING = ("Which outcome should the summary focus on?", "摘要应侧重哪个结果？")
+OUTCOMES = (["Earnings", "Employment"], ["收入", "就业"])
+
+
+def agent_step(body):
+    """The agent's reply to a step of the help or ask flow, or None for any other request: a tool call, then
+    the answer once the tools have answered."""
+    messages = body["messages"]
+    last = max(i for i, m in enumerate(messages) if m.get("role") == "user")
+    request, done = messages[last]["content"], [m for m in messages[last + 1:] if m.get("role") == "tool"]
+    if request in HELP:
+        zh = HELP.index(request)
+        if len(done) < 2:
+            name, arguments = (("use_skill", {"name": "help"}), ("open_place", {"place": "library"}))[len(done)]
+            return tool_call(f"w{len(done)}", name, arguments)
+        return HELP_ANSWER[zh]
+    if request in ASKING:
+        zh = ASKING.index(request)
+        if not done:
+            return tool_call("w-ask", "ask", {"question": request, "options": OUTCOMES[zh]})
+        chosen = done[-1]["content"].removeprefix("The researcher answered: ")
+        return (f"You chose {chosen}: the summary will focus on it." if not zh else f"你选择了{chosen}：摘要将侧重于此。")
+    return None
+
+
+def tool_call(call_id, name, arguments):
+    return 200, {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+        {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}]},
+        "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 120, "completion_tokens": 20, "total_tokens": 140,
+                                                    "cost": 0.0012}}
+
+
 def synthetic(body):
     kind = role(body)
     first = ((body or {}).get("messages") or [{}])[0].get("content", "")
-    if kind == "title":
+    stepped = agent_step(body) if kind == "answer" and body.get("tools") else None
+    if isinstance(stepped, tuple):
+        return stepped
+    if stepped is not None:
+        text = stepped
+    elif kind == "title":
         text = "Designing a cohort study"
     elif kind == "judge":
         pairs = body["messages"][-1]["content"].count("Pair ")

@@ -248,3 +248,42 @@ async def test_no_cited_answer_canary_reaches_the_log(tmp_path, caplog):
     for canary in canaries:
         assert canary not in text, canary
         assert not any(canary in record.getMessage() for record in caplog.records), canary
+
+
+async def test_no_agent_loop_canary_reaches_the_log(tmp_path, caplog, monkeypatch):
+    """S1-19c: tool calls (their arguments and results, a failing tool's too), skills, asks and the steps around
+    them log no argument, result, question, skill text or reasoning."""
+    from agentic import REASONING, Scripted, call
+    from backend import agent
+    from cited import cited, conversation_in, with_papers
+    from test_search import paper
+
+    async def broken(call_, turn):  # a defect in a tool, with content in its exception
+        raise RuntimeError("CANARY-TOOL-EXCEPTION")
+    monkeypatch.setattr(agent.REGISTRY, "_implementations",
+                        {**agent.REGISTRY._implementations, "open_place": broken})
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    caplog.set_level(logging.DEBUG, logger="backend")
+    canaries = ["CANARY-ARGUMENT", "CANARY-PASSAGE", "CANARY-STEP-TEXT", "CANARY-TOOL-EXCEPTION", "opaque-blob-Zx9",
+                "CANARY-FINAL", "Literature review over the library"]
+    provider = Scripted({"calls": [call("search_passages", query="CANARY-ARGUMENT"), call("use_skill", call_id="s",
+                                                                                         name="literature-review"),
+                                   call("open_place", call_id="o", place="library"),
+                                   call("read_passage", call_id="r", material_id="CANARY-ARGUMENT")],
+                         "content": "CANARY-STEP-TEXT", "reasoning_details": REASONING}, "CANARY-FINAL [S1.1].")
+    try:
+        async with cited(tmp_path, provider) as client:
+            project, _ = await with_papers(client, paper("Panel", "CANARY-PASSAGE earnings rose."))
+            conversation = await conversation_in(client, project)
+            await send(client, conversation, "Which papers do I have?")
+            await background_idle(client)
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    assert "a tool failed unexpectedly" in text  # the failing tool is logged, without its content
+    for canary in canaries:
+        assert canary not in text, canary
+        assert not any(canary in record.getMessage() for record in caplog.records), canary
