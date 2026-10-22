@@ -1389,5 +1389,6 @@
   "errors.personal_from_strict": "A Private or Local only project's records stay its own, never personal.",
   "export.memory": "Include this project's memory records",
   "trace.memoryMode.similarity": "ranked by meaning",
-  "trace.memoryMode.recency": "newest first (meaning search was unavailable)"
+  "trace.memoryMode.recency": "newest first (meaning search was unavailable)",
+  "trace.memoryHeld": "Recalled"
 }

@@ -618,6 +618,12 @@ async def nearest_memory(state, project_id, text):
     return await asyncio.to_thread(index.memory_dense, memory_scopes(project_id), vector, 50)
 
 
+async def embedded_memory(state, ids):
+    """The ones of ids that have a vector in the index."""
+    index = state.get("index")
+    return await asyncio.to_thread(index.memory_embedded, ids) if index is not None else set()
+
+
 def fuse(ranked_lists, k):
     """Reciprocal rank fusion: each passage scores the sum of 1 / (k + rank) over the lists it is in;
     best first, ties in the order first seen."""

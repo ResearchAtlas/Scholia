@@ -277,3 +277,15 @@ async def test_forget_can_name_a_pending_proposal(tmp_path):
         stream = await send(client, await conversation_in(client, project), "Forget: maybe a survey of managers")
         assert {"type": "memory", "action": "forgotten", "count": 1} in stream
         assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", proposal) == [(0,)]
+
+
+
+async def test_saving_what_is_pending_keeps_the_proposal(tmp_path):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We run a survey of managers",
+            status="proposed", sources=[("project", project)]))
+        await send(client, await conversation_in(client, project), "Remember: we run a survey of managers")
+        assert await rows(client, "SELECT id, status FROM memory_records WHERE type = 'decision'") == [(proposal, "confirmed")]

@@ -1368,6 +1368,10 @@ class Harness:
         async def done(what, data=None, count=0, line=None, change=None):
             # change(conn) -> (what it did, ids) or ids: the outcome is what the record says, never what was asked
             outcome = {"what": what, "ids": []}
+            if change is not None and not memory.enabled(  # switched off while its ask waited: nothing written
+                    (await asyncio.to_thread(load_settings, self.data_dir, project_id)).values):
+                what, change, line = "memory_off", None, "Memory is off in this project: nothing was saved, changed or forgotten."
+                outcome["what"] = what
 
             def apply(conn):
                 if change is not None:
@@ -1407,6 +1411,8 @@ class Harness:
                 reply = await self._ask(turn, "memory_forget", ["forget", "not_now"], {"records": ids}, None)
                 if (reply or {}).get("option") != "forget":
                     return await done("declined", line="Nothing was forgotten: the researcher chose not now.")
+            if not memory.enabled((await asyncio.to_thread(load_settings, self.data_dir, project_id)).values):
+                return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
             count = 0
             for record in ids:
                 with suppress(LookupError):  # forgotten meanwhile
@@ -1469,7 +1475,8 @@ class Harness:
                     except Exception as error:  # the helper or the index failed: the newest, said
                         log.warning("memory similarity failed (%s)", type(error).__name__)
                         reason = "unavailable"
-                chosen = memory.ranked(candidates, nearest)
+                embedded = await search.embedded_memory(state, [r["id"] for r in candidates]) if nearest else None
+                chosen = memory.ranked(candidates, nearest, embedded=embedded)
                 sections["user_memory"] += [memory.memory_line(r) for r in chosen]
                 if not chosen and decision.get("rule") == "earlier_decision":  # said, never invented (ticket 31)
                     ctx["memory_missing"] = [memory.MISSING]

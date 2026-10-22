@@ -104,8 +104,8 @@ _BARE = {"this", "that", "it", "this one", "that one", "这个", "这", "这一�
 # (action, pattern): the verb at the message's start, then the text after a colon, "that" or "about", or nothing
 # but "this" (bare: asked first). A message ending in a question mark is a question, never a command.
 _COMMANDS = (
-    ("save", re.compile(r"^(?:please\s+)?(?:remember|save)(?:\s*[:：]\s*|\s+that\s+|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$",
-                        re.I | re.S)),
+    ("save", re.compile(r"^(?:please\s+)?(?:remember(?:\s*[:：]\s*|\s+that\s+)|save\s*[:：]\s*"
+                        r"|(?:remember|save)\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$", re.I | re.S)),
     ("correct", re.compile(r"^(?:please\s+)?correct(?:ion)?(?:\s*[:：]\s*|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$",
                            re.I | re.S)),
     ("update", re.compile(r"^(?:please\s+)?update(?:\s*[:：]\s*|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$", re.I | re.S)),
@@ -337,10 +337,15 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
         if found and (found[0]["scope"] == "project" or personal_allowed(conn, project_id)):
             replaces, kind, scope = found[0]["id"], found[0]["type"], found[0]["scope"]
     if action == "save":  # a command sent again (Continue) or repeated is kept once, confirmed by these words
-        same = [r for r in in_scope(conn, project_id) if normalized(r["content"]) == normalized(text)
-                and (r["scope"] == "project" or personal_allowed(conn, project_id))]
+        same = [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
+                if normalized(r["content"]) == normalized(text) and (r["scope"] == "project" or personal_allowed(conn, project_id))]
         if same and same[0]["status"] == "confirmed":
             return "saved", [same[0]["id"]]
+        if same and same[0]["status"] == "proposed":  # the researcher's own words keep a pending proposal
+            kept = keep(conn, same[0]["id"], None)
+            if kept is not None:
+                return "saved", [kept]
+            same = []  # out of date: saved as its own record below
         if same:  # inferred: the researcher's own words confirm it, as a new version
             replaces, kind, scope = same[0]["id"], same[0]["type"], same[0]["scope"]
     sources = [("turn", run_id)] + (sources_of(conn, replaces) if replaces else [])
@@ -411,7 +416,8 @@ def extraction_input(conn, run_id):
     if found is None:
         return None
     message, answer, author, project_id, turn = found
-    related = in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))[:RELATED]
+    related = [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
+               if r["scope"] == "project" or _personal_still(conn, r)][:RELATED]  # as recall: none another may not see
     held = set(provenance.dependencies(conn, turn))
     for record in related:
         held |= {i for k, i in sources_of(conn, record["id"]) if k == "material"}
@@ -611,21 +617,26 @@ def _personal_still(conn, record):
     it is still in a Normal, unlocked project (one moved to a stricter project, or tightened, keeps its words there)."""
     if record.get("sensitivity") not in (None, "normal"):
         return False
+    own = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (record["project_id"],)).fetchone()
+    if own is not None and (own[0] != "normal" or own[1]):  # its own project tightened or locked since
+        return False
     return conn.execute(
         "SELECT 1 FROM memory_sources s JOIN runs r ON r.id = s.source_id JOIN projects p ON p.id = r.project_id"
         " WHERE s.memory_id = ? AND s.source_kind IN ('turn', 'run') AND (p.sensitivity != 'normal' OR p.review_lock)"
         " LIMIT 1", (record["id"],)).fetchone() is None
 
 
-def ranked(candidates, nearest=None, limit=RECALL_LIMIT):
+def ranked(candidates, nearest=None, limit=RECALL_LIMIT, embedded=None):
     """At most limit records: those nearest in meaning first (nearest: ids, nearest first), then the newest; a record
-    newer than every one with a vector (just written, not embedded yet) goes first, so it is never cut for lacking one."""
+    without a vector (embedded: the ids that have one) newer than every one with a vector (just written, not embedded
+    yet) goes first, so it is never cut for lacking one."""
     if not nearest:
         return candidates[:limit]
     order = {rid: i for i, rid in enumerate(nearest)}
-    embedded = [r["updated_at"] for r in candidates if r["id"] in order]
-    newest = max(embedded) if embedded else ""
-    fresh = [r for r in candidates if r["id"] not in order and r["updated_at"] > newest]
+    embedded = set(order) if embedded is None else set(embedded)
+    stamps = [r["updated_at"] for r in candidates if r["id"] in embedded]
+    newest = max(stamps) if stamps else ""
+    fresh = [r for r in candidates if r["id"] not in embedded and r["updated_at"] > newest]
     rest = sorted((r for r in candidates if r not in fresh), key=lambda r: order.get(r["id"], len(order)))
     return (fresh + rest)[:limit]
 

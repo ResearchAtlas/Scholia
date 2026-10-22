@@ -1342,5 +1342,6 @@
   "errors.personal_from_strict": "私密或仅本机项目的条目只属于该项目，不会成为个人记忆。",
   "export.memory": "包含本项目的记忆条目",
   "trace.memoryMode.similarity": "按语义排序",
-  "trace.memoryMode.recency": "按时间由新到旧（语义检索不可用）"
+  "trace.memoryMode.recency": "按时间由新到旧（语义检索不可用）",
+  "trace.memoryHeld": "调用的记忆"
 }

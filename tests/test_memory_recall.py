@@ -177,3 +177,27 @@ async def test_an_earlier_decision_memory_lacks_is_said_missing_never_invented(t
         await entered(client, project, "We dropped the pilot because of cost.")
         await send(client, conversation, "Why did I drop the pilot? We decided last time.")
         assert memory.MISSING not in system(provider.answers[-1])
+
+
+
+async def test_ranking_puts_a_record_written_since_the_last_vector_first():
+    old = [{"id": f"r{i}", "updated_at": f"2026-10-22T10:00:{i:02d}.000Z"} for i in range(20)]
+    fresh = {"id": "new", "updated_at": "2026-10-22T11:00:00.000Z"}
+    candidates = [fresh, *reversed(old)]  # newest first, as in_scope gives them
+    nearest = [f"r{i}" for i in range(12)]  # the oldest twelve are the nearest
+    chosen = memory.ranked(candidates, nearest, embedded={r["id"] for r in old})
+    assert [r["id"] for r in chosen] == ["new", *nearest[:9]]
+    assert [r["id"] for r in memory.ranked(candidates, None)] == ["new", *[f"r{i}" for i in range(19, 10, -1)]]
+
+
+async def test_a_personal_record_another_project_may_not_see_is_not_shown_to_an_extraction_either(tmp_path):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        first, other = await project_of(client, "First"), await project_of(client, "Other")
+        await entered(client, first, "I prefer answers about participant Alice", kind="preference", scope="personal")
+        await client.post(f"/api/projects/{first}/sensitivity", json={"level": "private"})  # its own project tightened
+        found = await asyncio.to_thread(client.state["db"].read, lambda conn: memory.recall_candidates(conn, other))
+        assert found == []
+        await send(client, await conversation_in(client, other), "Hello")
+        await background_idle(client)
+        assert provider.extractions and "Alice" not in json.dumps(provider.extractions[-1])
