@@ -656,3 +656,33 @@ async def test_a_late_extraction_never_restores_a_proposal_the_researcher_edited
              "replaces": proposal}]))
         assert sorted(await rows(client, "SELECT content, status FROM memory_records WHERE type = 'decision'")) == [
             ("We use interviews", "proposed"), ("We use surveys", "confirmed")]
+
+
+# Fix batch 4, internal review: the writers test the subject the database does (the record's own project)
+
+
+async def test_a_command_in_a_normal_project_saves_a_tightened_projects_personal_proposal_as_its_own(tmp_path):
+    async with started(tmp_path / "data") as client:
+        a, b = await project_of(client, "A"), await project_of(client, "B")
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=a, scope="personal", kind="preference", content="I prefer short answers", status="proposed",
+            sources=[("project", a)]))
+        await tighten(client, a, "private")
+        stream = await send(client, await conversation_in(client, b), "Remember: I prefer short answers")
+        assert stream[-1]["status"] == "succeeded"
+        assert sorted(await rows(client, "SELECT id = ?, project_id, status FROM memory_records", proposal)) == [
+            (0, b, "confirmed"), (1, a, "proposed")]
+
+
+async def test_an_extraction_restating_a_tightened_projects_personal_proposal_still_writes(tmp_path):
+    async with started(tmp_path / "data") as client:
+        a, b = await project_of(client, "A"), await project_of(client, "B")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=a, scope="personal", kind="preference", content="I prefer short answers", status="proposed",
+            sources=[("project", a)]))
+        await tighten(client, a, "lock")
+        run = await turn_in(client, b, "I prefer short answers")
+        written = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
+            {"type": "preference", "content": "I prefer short answers", "status": "confirmed",
+             "span": "i prefer short answers", "replaces": ""}]))
+        assert written is not None

@@ -1339,7 +1339,7 @@
   "audit.event.memory_allowance_notice": "记忆提取因额度被跳过（提示一次）",
   "audit.event.memory_notice_dismissed": "已关闭记忆额度提示",
   "audit.field.memory": "记忆条目",
-  "errors.personal_from_strict": "私密或仅本机项目的条目只属于该项目，不会成为个人记忆。",
+  "errors.personal_from_strict": "个人记忆只能在未锁定的普通项目中写入或修改。可以忘记这条记录，或在这样的项目中重新保存。",
   "export.memory": "包含本项目的记忆条目",
   "trace.memoryMode.similarity": "按语义排序",
   "trace.memoryMode.recency": "按时间由新到旧（语义检索不可用）",

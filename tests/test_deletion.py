@@ -508,7 +508,8 @@ NEW_ROW = {  # kind: a row for that table, with id :id, in project :project wher
     "conversation": "INTO conversations (id, project_id) VALUES (:id, :project)",
     "material": "INTO materials (id, project_id, source) VALUES (:id, :project, 'upload')",
     "artifact": "INTO artifacts (id, project_id, title, doc) VALUES (:id, :project, 'Back', '{}')",
-    "memory": "INTO memory_records (id, scope, type, content, status) VALUES (:id, 'personal', 'event', 'x', 'confirmed')",
+    "memory": "INTO memory_records (id, scope, project_id, type, content, status)"
+              " VALUES (:id, 'project', :project, 'event', 'x', 'confirmed')",
 }
 FIXTURE_NAME = {"conversation": "c1", "material": "m1", "artifact": "a1", "memory": "mr1"}
 assert set(NEW_ROW) == set(KINDS) == set(FIXTURE_NAME) | {"project"}

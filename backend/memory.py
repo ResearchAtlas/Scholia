@@ -185,8 +185,7 @@ def scope_for(conn, project_id, kind):
     (nothing from it reaches another project's request)."""
     if kind not in PERSONAL_TYPES:
         return "project"
-    row = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
-    return "personal" if row is not None and row[0] == "normal" else "project"
+    return "personal" if _normal(conn, project_id) else "project"
 
 
 # Records
@@ -360,11 +359,14 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
                 if normalized(r["content"]) == normalized(text) and (r["scope"] == "project" or personal_allowed(conn, project_id))]
         if same and same[0]["status"] == "confirmed":
             return "saved", [same[0]["id"]]
-        if same and same[0]["status"] == "proposed":  # the researcher's own words keep a pending proposal
+        if same and same[0]["status"] == "proposed" and (same[0]["scope"] == "project" or _normal(
+                conn, same[0]["project_id"])):  # the researcher's own words keep a pending proposal (a personal one
+            # only while its own project is Normal and unlocked: the database refuses the rest, migration 0008)
             kept = keep(conn, same[0]["id"], None)
             if kept is not None:
                 return "saved", [kept]
-            same = []  # out of date: saved as its own record below
+        if same and same[0]["status"] == "proposed":
+            same = []  # out of date, or not to be kept from here: saved as its own record below
         if same:  # inferred: the researcher's own words confirm it, as a new version
             replaces, kind, scope = same[0]["id"], same[0]["type"], same[0]["scope"]
     sources = [("turn", run_id)] + (sources_of(conn, replaces) if replaces else [])
@@ -588,7 +590,8 @@ def apply_extraction(conn, run_id, candidates):
         if same is not None:
             counts["duplicates"] += 1
             if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"] \
-                    and (same["scope"] == "project" or personal):  # never a personal one from a stricter project
+                    and (same["scope"] == "project" or (personal and _normal(conn, same["project_id"]))):
+                # never a personal one from a stricter project, nor one whose own project is stricter now
                 keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
             continue
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
@@ -859,7 +862,8 @@ _CHANGE_ERRORS = {"changed": (409, "version_changed", "This record changed since
                   "out_of_date": (409, "out_of_date", "The record this would replace changed; look again"),
                   "not_confirmable": (400, "not_confirmable", "Progress and the agent's notes are never confirmed"),
                   "personal_from_strict": (400, "personal_from_strict",
-                                           "A Private, Local only or locked project's records stay its own")}
+                                           "Personal memory is written and changed only from a Normal, unlocked"
+                                           " project")}
 
 
 def _on(state, project_id):
