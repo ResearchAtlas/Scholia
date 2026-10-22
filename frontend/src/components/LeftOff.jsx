@@ -8,7 +8,7 @@ import { History, X } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { openPlace } from '../live.js';
 import { libraryEvents, readGuard } from '../library.js';
-import { dismissLeftOff, fillComposer, leftOffDismissed, memoryChanged, memoryEvents, readLeftOff, recordText, review } from '../memory.js';
+import { dismissLeftOff, fillComposer, leftOffDismissed, memoryChanged, readLeftOff, recordText, review } from '../memory.js';
 import { Proposal } from './Memory.jsx';
 import { Button } from '@/components/ui/button';
 
@@ -32,12 +32,8 @@ export function LeftOff({ projectId }) {
       setFound(null);
       load();
     };
-    libraryEvents.addEventListener('changed', changed);
-    memoryEvents.addEventListener('changed', changed);
-    return () => {
-      libraryEvents.removeEventListener('changed', changed);
-      memoryEvents.removeEventListener('changed', changed);
-    };
+    libraryEvents.addEventListener('changed', changed); // memory changes too (memory.js memoryChanged)
+    return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
   if (!found?.show || hidden || leftOffDismissed(projectId, found.latest_turn_at)) return null;
   const empty = !found.done.length && !found.questions.length && !found.next_step && !found.to_confirm.length && !found.notice;

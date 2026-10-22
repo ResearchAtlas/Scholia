@@ -111,7 +111,9 @@ async function upload(projectId, files, { conversationId, materialId, replaces }
   return added;
 }
 
-// Tells the open Library that a project's papers changed (files added by a drop on the window).
+// The one invalidation path (no client-held derived state): a project's papers or memory changed (memory.js
+// memoryChanged), and every view, question and read guard drops what it shows and reads again. detail: the project,
+// or null for every project.
 export const libraryEvents = new EventTarget();
 export const libraryChanged = (projectId) => libraryEvents.dispatchEvent(new CustomEvent('changed', { detail: projectId }));
 

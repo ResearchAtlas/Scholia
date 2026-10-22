@@ -19,7 +19,7 @@ import { messageRoute } from '../settings.js';
 import { ACCEPT, afterAsksRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt,
   readGuard, readGuardedAsks, pollsAsks, watchChosen } from '../library.js';
 import { addTo } from './Library.jsx';
-import { actionLines, composerFill, memoryEvents } from '../memory.js'; // S1-21a
+import { actionLines, composerFill } from '../memory.js'; // S1-21a
 import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -44,7 +44,7 @@ function useConversationAsks(conversationId, watching, projectId) {
   useEffect(() => { setKnown(NO_ASKS); load(); }, [load]);
   useEffect(() => {
     const changed = (event) => {
-      if (event.detail !== projectId) return;
+      if (event.detail !== null && event.detail !== projectId) return;
       guard.current.libraryChanged(); // first: a read asked before this is dropped when it arrives
       setKnown({ ...NO_ASKS, unsure: true }); // nothing shown until a read succeeds; looked at again meanwhile
       load();
@@ -121,12 +121,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
       setFailed(false);
       load();
     };
-    libraryEvents.addEventListener('changed', changed);
-    memoryEvents.addEventListener('changed', changed); // S1-21a: a record its turns read back was forgotten or changed
-    return () => {
-      libraryEvents.removeEventListener('changed', changed);
-      memoryEvents.removeEventListener('changed', changed);
-    };
+    libraryEvents.addEventListener('changed', changed); // a memory change too: a record its turns read back
+    return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
   useEffect(() => {
     if (!(stale && failed)) return undefined;

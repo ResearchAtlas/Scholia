@@ -10,6 +10,8 @@ import { Linter } from 'eslint';
 import { makeT } from '../src/i18n/index.js';
 import { actionLines, composerFill, dismissLeftOff, fillComposer, leftOffDismissed, recordText } from '../src/memory.js';
 import { apply } from '../src/live.js';
+import { libraryEvents } from '../src/library.js';
+import { memoryChanged } from '../src/memory.js';
 
 const SRC = fileURLToPath(new URL('../src/', import.meta.url));
 const t = makeT('en');
@@ -84,7 +86,6 @@ test('Where we left off and the memory views drop what they show when the librar
   for (const name of ['LeftOff.jsx', 'Memory.jsx', 'ConversationView.jsx']) { // the conversation reads records back too
     const source = readFileSync(join(SRC, 'components', name), 'utf8');
     assert.match(source, /libraryEvents\.addEventListener\('changed'/, name);
-    assert.match(source, /memoryEvents\.addEventListener\('changed'/, name);
     assert.match(source, /readGuard\(\)/, name);
   }
   const live = readFileSync(join(SRC, 'live.js'), 'utf8');
@@ -103,4 +104,30 @@ test('the memory switch, a protection change and a move each emit a memory chang
 test('deleting a conversation tells the memory views (its turns\' records go with it)', () => {
   const sources = ['Sidebar.jsx', 'Shell.jsx'].map((name) => readFileSync(join(SRC, 'components', name), 'utf8')).join('\n');
   assert.match(sources, /delete[\s\S]{0,400}memoryChanged\(null\)/);
+});
+
+// Fix batch 4 (gpt-6-astra recheck 4, finding 3; Harold, 2026-10-21: no client-held derived state): one invalidation
+// path. A memory change is the library's change, so everything that drops and reads again when a paper is deleted
+// (the conversation's turns, its questions, Details, the Library, the memory views, Where we left off) does so when a
+// record is saved, edited or forgotten; a change naming no project (null) reaches every project's views.
+test('a memory change goes through the one invalidation path every view, ask and read guard follows', () => {
+  const heard = [];
+  const listener = (event) => heard.push(event.detail);
+  libraryEvents.addEventListener('changed', listener);
+  try {
+    memoryChanged(null);
+    memoryChanged('p1');
+  } finally {
+    libraryEvents.removeEventListener('changed', listener);
+  }
+  assert.deepEqual(heard, [null, 'p1']);
+  const files = readdirSync(join(SRC, 'components')).filter((name) => /\.jsx?$/.test(name)).map((name) => join('components', name)).concat(['memory.js', 'live.js']);
+  for (const name of files) {
+    const source = readFileSync(join(SRC, name), 'utf8');
+    assert.doesNotMatch(source, /memoryEvents/, name); // no second path to forget to follow
+    if (!/libraryEvents\.addEventListener\('changed'/.test(source)) continue;
+    for (const line of source.split('\n').filter((l) => /event\.detail\s*[!=]==/.test(l))) {
+      assert.match(line, /null/, `${name}: a change naming no project is every project's: ${line.trim()}`);
+    }
+  }
 });

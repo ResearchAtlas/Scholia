@@ -8,7 +8,7 @@ import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { useAction } from '../action.js';
 import { visible } from '../text.js';
-import { changeRecord, forgetRecord, memoryChanged, memoryEvents, readMemory, recordText, review } from '../memory.js';
+import { changeRecord, forgetRecord, memoryChanged, readMemory, recordText, review } from '../memory.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -28,12 +28,8 @@ export function MemorySection({ project }) {
   useEffect(() => { load(); }, [load]);
   useEffect(() => { // a paper deleted or memory changed anywhere: dropped at once, and read again
     const changed = () => { guard.current.libraryChanged(); setFound(null); load(); };
-    libraryEvents.addEventListener('changed', changed);
-    memoryEvents.addEventListener('changed', changed);
-    return () => {
-      libraryEvents.removeEventListener('changed', changed);
-      memoryEvents.removeEventListener('changed', changed);
-    };
+    libraryEvents.addEventListener('changed', changed); // memory changes too (memory.js memoryChanged)
+    return () => libraryEvents.removeEventListener('changed', changed);
   }, [load]);
   return (
     <Section title={t('memory.title')} hint={t('memory.hint')}>
