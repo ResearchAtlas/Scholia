@@ -221,3 +221,59 @@ async def test_a_correction_never_replaces_a_record_that_shares_only_common_word
         await send(client, conversation, "Remember: the deadline is in May")  # sent again: kept once
         assert await rows(client, "SELECT count(*) FROM memory_records WHERE content = 'the deadline is in May'") == [(1,)]
     assert memory.likeness("the deadline is in May", "the sample is 40 interviews") == 0.0
+
+
+async def test_nothing_of_a_private_project_becomes_or_changes_personal_memory(tmp_path):
+    # review 1 (P1): an update from a Private project never rewrites a personal record; the views refuse a personal
+    # record there; a personal record whose turn moved to a stricter project is recalled nowhere
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        normal = await project_of(client)
+        conversation = await conversation_in(client, normal)
+        await send(client, conversation, "Remember: I prefer short answers")
+        private = await project_of(client, "Private one", level="private")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.save_command(
+            conn, project_id=private, run_id=None, action="update", text="I prefer short answers about Alice"))
+        assert sorted(await rows(client, "SELECT content, scope, status FROM memory_records WHERE type = 'preference'")) == [
+            ("I prefer short answers", "personal", "confirmed"), ("I prefer short answers about Alice", "project", "confirmed")]
+        refused = await client.post("/api/memory", json={"project_id": private, "type": "preference", "scope": "personal",
+                                                          "content": "Alice prefers tables"})
+        assert refused.status_code == 400 and refused.json()["code"] == "personal_from_strict"
+        other = await project_of(client, "Other")
+        recalled = lambda: asyncio.to_thread(client.state["db"].read, lambda conn: [  # noqa: E731
+            r["content"] for r in memory.recall_candidates(conn, other)])
+        assert await recalled() == ["I prefer short answers"]
+        await client.post(f"/api/conversations/{conversation}/move", json={"project_id": private})
+        assert await recalled() == []  # its turn is the Private project's now
+
+
+async def test_saving_what_was_only_inferred_confirms_it(tmp_path):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="personal", kind="preference", content="I prefer short answers",
+            status="inferred", sources=[("project", project)]))
+        stream = await send(client, await conversation_in(client, project), "Remember: I prefer short answers")
+        assert {"type": "memory", "action": "saved", "count": 1} in stream
+        assert await rows(client, "SELECT status FROM memory_records WHERE content = 'I prefer short answers'"
+                                  " ORDER BY version") == [("superseded",), ("confirmed",)]
+
+
+async def test_an_update_that_matches_nothing_says_saved(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        stream = await send(client, await conversation_in(client, project), "Update: the deadline is in June")
+        assert {"type": "memory", "action": "saved", "count": 1} in stream
+
+
+async def test_forget_can_name_a_pending_proposal(tmp_path):
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="Maybe a survey of managers",
+            status="proposed", sources=[("project", project)]))
+        stream = await send(client, await conversation_in(client, project), "Forget: maybe a survey of managers")
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", proposal) == [(0,)]

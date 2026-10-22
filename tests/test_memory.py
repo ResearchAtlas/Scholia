@@ -227,7 +227,7 @@ async def test_commands_recognize_english_and_chinese_and_never_a_question():
         "forget about the pilot": ("forget", "the pilot"),
         "forget this": ("forget", None),
         "记住：我的方法是半结构化访谈": ("save", "我的方法是半结构化访谈"),
-        "请记住我偏好简短的回答": ("save", "我偏好简短的回答"),
+        "请记住：我偏好简短的回答": ("save", "我偏好简短的回答"),
         "保存这个": ("save", None),
         "更正：样本是40人": ("correct", "样本是40人"),
         "更新：我们改用问卷": ("update", "我们改用问卷"),
@@ -238,6 +238,7 @@ async def test_commands_recognize_english_and_chinese_and_never_a_question():
         assert memory.command(message) == {"action": action, "text": text}, message
     for message in ("Remember when we decided on interviews?", "Save time by batching?", "What do you remember?",
                     "Saving money matters", "I forgot the file", "忘记了文件", "记住了吗？", "Update me on the papers",
-                    "Note how the wages changed", "x" * 10):
+                    "Note how the wages changed", "x" * 10, "Fix: the introduction is too long", "Note that I use Zotero",
+                    "更新参考文献格式", "保存文件到文献库", "请更新一下我的综述大纲", "记住我偏好简短的回答"):
         assert memory.command(message) is None, message
     assert memory.command("Remember: " + "x" * 1001) is None  # longer than a record holds: not a command

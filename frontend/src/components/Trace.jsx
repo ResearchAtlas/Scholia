@@ -66,7 +66,8 @@ export function Trace({ turn }) {
         <dd>{turn.answer && turn.result_saved ? t('trace.savedYes') : t('trace.savedNo')}</dd>
         {turn.memory_status && <> {/* S1-21a: the turn's memory extraction, as its record says */}
           <dt className="text-muted-foreground">{t('trace.memory')}</dt>
-          <dd>{t(`trace.memoryStatus.${turn.memory_status}`)}{trace.memory ? ` · ${t('trace.memoryUsed', { count: trace.memory })}` : ''}</dd>
+          <dd>{t(`trace.memoryStatus.${turn.memory_status}`)}{trace.memory ? ` · ${t('trace.memoryUsed', { count: trace.memory })}` : ''}
+            {trace.memoryMode ? ` · ${t(`trace.memoryMode.${trace.memoryMode}`)}` : ''}</dd>
         </>}
       </dl>
       <ol className="space-y-2">

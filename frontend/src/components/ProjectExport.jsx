@@ -14,6 +14,7 @@ export function ProjectExportSection({ project }) {
   const language = useContext(LanguageContext); // the export's headings are written in it
   const [destination, setDestination] = useState('');
   const [passphrase, setPassphrase] = useState('');
+  const [memory, setMemory] = useState(true); // S1-21a: its memory records go with it unless left out
   const archive = useArchiveRun();
   const encrypted = needsPassphrase([project]);
 
@@ -22,7 +23,7 @@ export function ProjectExportSection({ project }) {
     const sent = passphrase;
     setPassphrase(''); // held by the run in memory only, and not kept in the form either
     if (!(await archive.start(`/api/projects/${encodeURIComponent(project.id)}/export`,
-      { destination: destination.trim(), language, ...(sent ? { passphrase: sent } : {}) }))) setPassphrase(sent);
+      { destination: destination.trim(), language, memory, ...(sent ? { passphrase: sent } : {}) }))) setPassphrase(sent);
   }
 
   return (
@@ -31,6 +32,10 @@ export function ProjectExportSection({ project }) {
       {encrypted && (
         <Passphrase id="export-passphrase" value={passphrase} onChange={setPassphrase} hint={t('export.passphraseHint')} />
       )}
+      <label className="flex items-center gap-2 text-sm">
+        <input type="checkbox" checked={memory} onChange={(event) => setMemory(event.target.checked)} />
+        {t('export.memory')}
+      </label>
       <ArchiveStatus archive={archive} />
       <Button type="submit" className="justify-self-start"
         disabled={archive.busy || !destination.trim() || (encrypted && !passphrase)}>{t('export.start')}</Button>

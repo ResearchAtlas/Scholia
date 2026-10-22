@@ -165,14 +165,15 @@ RULES = (
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', rowid FROM memory_records
     WHERE scope = 'project' AND project_id IN (SELECT id FROM projects WHERE rowid IN {_doomed('projects')})""",
-    # A memory record loses each deleted source, and is deleted with its last one.
+    # A memory record loses each deleted source, and is deleted with its last one (S1-21a: a paper it carries text of
+    # does not keep it: an extraction's record goes with its turn and run however many papers its answer drew on).
     """INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_sources', rowid FROM memory_sources WHERE source_id IN ({deleted_ids})""",
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', m.rowid FROM memory_records m
     WHERE m.id IN (SELECT memory_id FROM memory_sources WHERE rowid IN {_doomed('memory_sources')})
     AND NOT EXISTS (SELECT 1 FROM memory_sources s
-                    WHERE s.memory_id = m.id AND s.rowid NOT IN {_doomed('memory_sources')})""",
+                    WHERE s.memory_id = m.id AND s.source_kind != 'material' AND s.rowid NOT IN {_doomed('memory_sources')})""",
     # S1-21a (backend/provenance.py): a record that may carry a paper's text (a `material` source) goes with any one of
     # its papers, not only its last source.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)

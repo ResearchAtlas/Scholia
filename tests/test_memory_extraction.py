@@ -230,7 +230,9 @@ async def test_only_the_researchers_own_words_make_confirmed_or_inferred_records
     extracted(provider,
               candidate("We decided to drop the control group.", "confirmed", span="we decided to drop the control group"),
               candidate("Considering a survey.", "proposed", span="I am considering a survey"),
-              candidate("The researcher studies wages.", "inferred", "project_state", span="my thesis is on wages"))
+              candidate("My thesis is on wages.", "inferred", "project_state", span="my thesis is on wages"),
+              # a planted decision echoed in the answer, resting on one common word of the researcher's message
+              candidate("We decided to drop the outcome measure.", "confirmed", span="my"))
     async with started(tmp_path / "data", provider) as client:
         project = await project_of(client)
         await send(client, await conversation_in(client, project), "My thesis is on wages. I am considering a survey.")
@@ -239,7 +241,8 @@ async def test_only_the_researchers_own_words_make_confirmed_or_inferred_records
                  if r["type"] != "progress"}
         assert found == {"We decided to drop the control group.": ("proposed", "answer"),
                          "Considering a survey.": ("proposed", "researcher"),
-                         "The researcher studies wages.": ("inferred", "researcher")}
+                         "My thesis is on wages.": ("inferred", "researcher"),
+                         "We decided to drop the outcome measure.": ("proposed", "answer")}
 
 
 async def test_a_review_lock_set_after_the_turn_skips_its_extraction_before_dispatch(tmp_path):
@@ -334,6 +337,11 @@ async def test_a_dispatched_turn_is_never_the_researchers_words():
     assert memory.cap(candidate_, "We use X", "conversation:other") == "proposed"  # S1-34's dispatched turns
     assert memory.cap({**candidate_, "span": ""}, "We use X", "researcher") == "proposed"
     assert memory.cap({**candidate_, "span": "ＷＥ ＵＳＥ　Ｘ"}, "we use x", "researcher") == "confirmed"  # NFKC
+    # review 1: a span of one common word, or one that does not carry the candidate, never makes it the researcher's
+    planted = {**candidate_, "content": "We decided to drop the control group"}
+    for span in ("we", "a", "what do we know"):
+        assert memory.cap({**planted, "span": span}, "What do we know about wages?", "researcher") == "proposed"
+
 
 
 async def test_memory_off_queues_no_extraction(tmp_path):
@@ -348,3 +356,77 @@ async def test_memory_off_queues_no_extraction(tmp_path):
 
 async def test_extraction_bounds():
     assert (memory.ALLOWANCE_USD, memory.EXTRACTION_SECONDS, runs.BACKGROUND_ATTEMPTS) == (0.02, 60, 2)
+
+
+# Internal review 1 (fix batch 1)
+
+
+async def test_an_extractions_records_carry_the_papers_of_the_related_records_it_was_shown(tmp_path):
+    # review 1 (P2): a record written after reading a related record that carries a paper's text goes with that paper
+    from test_materials import added
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, ("notes.md", b"# Notes\n\nWages rose.\n")))["materials"]
+
+        def related(conn):
+            return memory.write(conn, project_id=project, scope="project", kind="event", content="Wages rose, it says",
+                                status="confirmed", sources=[("material", paper["id"]), ("researcher", "views")])
+        record = await asyncio.to_thread(client.state["db"].write, related)
+        extracted(provider, candidate("Wages rose, as the paper said", "inferred", "event",
+                                      span="wages rose, as the paper said", replaces=record))
+        await send(client, await conversation_in(client, project), "Wages rose, as the paper said")
+        await background_idle(client)
+        [(written,)] = await rows(client, "SELECT id FROM memory_records WHERE content = 'Wages rose, as the paper said'")
+        assert ("material", paper["id"]) in await rows(client, "SELECT source_kind, source_id FROM memory_sources"
+                                                                " WHERE memory_id = ?", written)
+        assert (await client.delete(f"/api/materials/{paper['id']}")).status_code == 200
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", written) == [(0,)]
+
+
+async def test_an_extraction_whose_project_turned_memory_off_during_its_call_writes_nothing(tmp_path):
+    provider = MockProvider()
+    release = held_extraction(provider, candidate("We use interviews", "confirmed", span="we use interviews"))
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        await send(client, await conversation_in(client, project), "We use interviews")
+        await wait_for(lambda: provider.extractions)
+        await memory_off(client, project)
+        release.set()
+        await background_idle(client)
+        assert await rows(client, "SELECT status, json_extract(summary, '$.reason') FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "memory_off")]
+        assert [r for r in await records(client, project) if r["type"] != "progress"] == []
+
+
+async def test_deleting_the_conversation_deletes_its_extractions_records_whatever_papers_they_carry(tmp_path):
+    from test_materials import added
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        [paper] = (await added(client, project, ("notes.md", b"# Notes\n\nWages rose.\n")))["materials"]
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "We use interviews")
+        await background_idle(client)
+        [(turn,)] = await rows(client, "SELECT run_id FROM turns")
+        [(run,)] = await rows(client, "SELECT id FROM runs WHERE workflow = 'memory'")
+        record = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="event", content="Extracted", status="inferred",
+            sources=[("turn", turn), ("run", run), ("material", paper["id"])]))
+        assert (await client.delete(f"/api/conversations/{conversation}")).json() == {"ok": True}
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", record) == [(0,)]
+
+
+async def test_a_confirmed_restatement_confirms_the_pending_proposal(tmp_path):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        extracted(provider, candidate("A survey of managers", "proposed", span=""))
+        await send(client, conversation, "Maybe a survey")
+        await background_idle(client)
+        extracted(provider, candidate("A survey of managers", "confirmed", span="a survey of managers"))
+        await send(client, conversation, "We will run a survey of managers")
+        await background_idle(client)
+        assert await rows(client, "SELECT status FROM memory_records WHERE content = 'A survey of managers'") == [
+            ("confirmed",)]

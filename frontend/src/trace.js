@@ -33,6 +33,7 @@ export function summarize(events) {
       if (data.retrieval) found.retrieval = data.retrieval; // the router's decision, when it decided, comes later
     } else if (type === 'retrieval_trace' && data.memory) { // S1-21a: the memory records the request held, by id
       found.memory = (data.memory.records ?? []).length + (data.memory.state ?? []).length;
+      found.memoryMode = data.memory.mode ?? null; // ranked by meaning (similarity), or the newest (recency)
     } else if (type === 'retrieval_trace' && !data.tool_call_id) { // the router's pre-load; a tool's is under its call
       found.search = { mode: data.mode, reason: data.reason ?? null, passages: (data.selected ?? []).length,
         rerank: data.rerank?.fallback ? 'fallback' : data.rerank ? 'reranked' : null };

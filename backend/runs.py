@@ -1366,29 +1366,35 @@ class Harness:
         action, text, project_id = asked["action"], asked["text"], ctx["project_id"]
 
         async def done(what, data=None, count=0, line=None, change=None):
-            def apply(conn):
-                ids = change(conn) if change is not None else None
-                ids = [i for i in (ids or []) if i]
-                _event(conn, claim.run_id, "memory_proposed", {"command": action, "applied": int(bool(ids or count)),
-                                                               "action": what, **({"records": ids} if ids else {}),
-                                                               **({"count": count} if count else {}), **(data or {})})
-                return ids
-            ids = []
+            # change(conn) -> (what it did, ids) or ids: the outcome is what the record says, never what was asked
+            outcome = {"what": what, "ids": []}
 
-            def keep(conn):
-                ids.extend(apply(conn))
-            await self._record(claim, None, None, also=keep)
-            turn.emit({"type": "memory", "action": what, "count": count or len(ids)})
-            if line:
-                ctx["memory_notes"].append(line)
+            def apply(conn):
+                if change is not None:
+                    found = change(conn)
+                    did, ids = found if isinstance(found, tuple) else (what, found)
+                    ids = [i for i in (ids or []) if i]
+                    outcome.update(what=did if ids else "no_candidate", ids=ids)
+                _event(conn, claim.run_id, "memory_proposed", {
+                    "command": action, "applied": int(bool(outcome["ids"] or count)), "action": outcome["what"],
+                    **({"records": outcome["ids"]} if outcome["ids"] else {}), **({"count": count} if count else {}),
+                    **(data or {})})
+            await self._record(claim, None, None, also=apply)
+            turn.emit({"type": "memory", "action": outcome["what"], "count": count or len(outcome["ids"])})
+            said = line(outcome["what"]) if callable(line) else line
+            if outcome["what"] == "no_candidate" and change is not None:
+                said = "Nothing was saved: the earlier answer can no longer be kept."
+            if said:
+                ctx["memory_notes"].append(said)
 
         if not ctx["memory_on"]:
             return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
         previous = await self._read(lambda conn: memory.previous_answer(conn, claim.conversation_id, claim.run_id))
         if text is not None and action != "forget":
             return await done("saved" if action == "save" else "updated", change=lambda conn: memory.save_command(
-                conn, project_id=project_id, run_id=claim.run_id, action=action, text=text)[1],
-                line=f"{'Saved to' if action == 'save' else 'Updated in'} memory at the researcher's request, confirmed: {text}")
+                conn, project_id=project_id, run_id=claim.run_id, action=action, text=text),
+                line=lambda did: f"{'Saved to' if did == 'saved' else 'Updated in'} memory at the researcher's request, "
+                                 f"confirmed: {text}")
         if action == "forget":
             scored = await self._read(lambda conn: memory.forget_candidates(conn, project_id, text, previous and previous[0]))
             ids = [r["id"] for _, r in scored]
@@ -1414,7 +1420,8 @@ class Harness:
                 return await done("no_candidate", line="The researcher asked to save something, but there is no "
                                                        "earlier answer to save: nothing was saved.")
             reply = await self._ask(turn, "memory_save", ["save", "not_now"], {"turn": previous[0]}, None)
-            if reply is None or (reply.get("option") != "save" and "text" not in reply):
+            if reply is None or (reply.get("option") != "save" and "text" not in reply) \
+                    or len(reply.get("text") or "") > memory.MAX_CONTENT:  # longer than a record holds: not kept
                 return await done("declined", line="Nothing was saved: the researcher chose not now.")
             return await done("saved", change=lambda conn: [memory.save_answer(
                 conn, project_id=project_id, run_id=claim.run_id, previous=previous[0], text=reply.get("text"))],
@@ -1425,11 +1432,13 @@ class Harness:
             return await done("no_match", line="The researcher asked to change a memory record, but there is none: "
                                                 "nothing was changed.")
         reply = await self._ask(turn, "memory_update", ["not_now"], {"records": [candidates[0]["id"]]}, None)
-        if reply is None or "text" not in reply:
+        if reply is None or "text" not in reply or len(reply["text"]) > memory.MAX_CONTENT:
             return await done("declined", line="Nothing was changed: the researcher chose not now.")
         return await done("updated", change=lambda conn: memory.save_command(
             conn, project_id=project_id, run_id=claim.run_id, action=action, text=reply["text"],
-            replaces=candidates[0]["id"])[1], line=f"Updated in memory at the researcher's request, confirmed: {reply['text']}")
+            replaces=candidates[0]["id"]),
+            line=lambda did: f"{'Updated in' if did == 'updated' else 'Saved to'} memory at the researcher's request, "
+                             f"confirmed: {reply['text']}")
 
     async def _recall(self, claim, ctx, decision):
         """PROJECT STATE and USER MEMORY for the turn, by its route (memory.wants), unless memory is off: the project
@@ -2064,6 +2073,9 @@ class Harness:
             else:  # rule 4
                 await self._ended(active, lambda conn: self._finish_background(conn, active, "interrupted", None, inputs))
                 return
+            if workflow == "memory" and output is not None and not memory.enabled(
+                    (await asyncio.to_thread(load_settings, self.data_dir, project_id)).values):
+                raise RunOutcome("cancelled", "memory_off")  # switched off during its call, or before a restart
             await self._ended(active, lambda conn: self._finish_background(
                 conn, active, "succeeded" if output is not None else "failed", output, inputs))
         except asyncio.CancelledError:

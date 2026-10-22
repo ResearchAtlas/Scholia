@@ -104,17 +104,19 @@ _BARE = {"this", "that", "it", "this one", "that one", "这个", "这", "这一�
 # (action, pattern): the verb at the message's start, then the text after a colon, "that" or "about", or nothing
 # but "this" (bare: asked first). A message ending in a question mark is a question, never a command.
 _COMMANDS = (
-    ("save", re.compile(r"^(?:please\s+)?(?:remember|save|note)(?:\s*[:：]\s*|\s+that\s+|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$",
+    ("save", re.compile(r"^(?:please\s+)?(?:remember|save)(?:\s*[:：]\s*|\s+that\s+|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$",
                         re.I | re.S)),
-    ("correct", re.compile(r"^(?:please\s+)?(?:correct(?:ion)?|fix)(?:\s*[:：]\s*|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$",
+    ("correct", re.compile(r"^(?:please\s+)?correct(?:ion)?(?:\s*[:：]\s*|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$",
                            re.I | re.S)),
     ("update", re.compile(r"^(?:please\s+)?update(?:\s*[:：]\s*|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$", re.I | re.S)),
     ("forget", re.compile(r"^(?:please\s+)?forget(?:\s*[:：]\s*|\s+(?:that|about)\s+|\s+(?=(?:this|that|it)\W*$))(?P<text>.*)$",
                           re.I | re.S)),
-    ("save", re.compile(r"^请?(?:记住|保存|记下)(?:[：:，,]\s*)?(?P<text>.*)$", re.S)),
-    ("correct", re.compile(r"^请?(?:更正|纠正)(?:[：:，,]\s*)?(?P<text>.*)$", re.S)),
-    ("update", re.compile(r"^请?更新(?:[：:，,]\s*)?(?P<text>.*)$", re.S)),
-    ("forget", re.compile(r"^请?(?:忘记|忘掉)(?:[：:，,]\s*|(?=这|那|它))(?P<text>.*)$", re.S)),
+    # Chinese as English: the verb, then a colon or comma and the text, or nothing but 这个 (asked first); never a
+    # sentence that only starts with the verb (更新参考文献格式 is a request, not a command)
+    ("save", re.compile(r"^请?(?:记住|保存|记下)(?:\s*[：:，,]\s*|(?=(?:这|那|它)(?:个|条|一点|一条)?[\s。.!！]*$))(?P<text>.*)$", re.S)),
+    ("correct", re.compile(r"^请?(?:更正|纠正)(?:\s*[：:，,]\s*|(?=(?:这|那|它)(?:个|条|一点|一条)?[\s。.!！]*$))(?P<text>.*)$", re.S)),
+    ("update", re.compile(r"^请?更新(?:\s*[：:，,]\s*|(?=(?:这|那|它)(?:个|条|一点|一条)?[\s。.!！]*$))(?P<text>.*)$", re.S)),
+    ("forget", re.compile(r"^请?(?:忘记|忘掉)(?:\s*[：:，,]\s*|(?=(?:这|那|它)(?:个|条|一点|一条)?[\s。.!！]*$))(?P<text>.*)$", re.S)),
 )
 
 
@@ -149,6 +151,17 @@ _TYPE_WORDS = (
 def kind_of(text):
     """The type of a record the researcher states in a command, by its words; else an event."""
     return next((kind for kind, pattern in _TYPE_WORDS if pattern.search(text or "")), "event")
+
+
+def _normal(conn, project_id):
+    row = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
+    return row is not None and row[0] == "normal"
+
+
+def personal_allowed(conn, project_id):
+    """Whether a personal record may be written from project_id: only from a Normal project, so nothing of a Private or
+    Local only project's can reach another project's request (scope notes reading 4)."""
+    return _normal(conn, project_id)
 
 
 def scope_for(conn, project_id, kind):
@@ -209,7 +222,7 @@ def row(conn, record):
 
 
 _COLUMNS = ("id, scope, project_id, type, content, structured, status, valid_from, valid_to, version, supersedes_id,"
-            " created_by_run_id, created_at, updated_at")
+            " created_by_run_id, created_at, updated_at, sensitivity")
 
 
 def _dict(conn, found, with_sources=True):
@@ -302,9 +315,10 @@ def in_scope(conn, project_id, statuses=ACTIVE, kinds=WRITABLE):
         " ORDER BY updated_at DESC, rowid DESC", (json.dumps(list(statuses)), json.dumps(list(kinds)), project_id)).fetchall()]
 
 
-def matching(conn, project_id, text, limit=3, floor=0.4):
-    """Up to limit active records of the project's scope most like text, best first: [(likeness, record)]."""
-    scored = [(likeness(text, r["content"]), r) for r in in_scope(conn, project_id)]
+def matching(conn, project_id, text, limit=3, floor=0.4, statuses=ACTIVE):
+    """Up to limit records of the project's scope (active, or of statuses) most like text, best first:
+    [(likeness, record)]."""
+    scored = [(likeness(text, r["content"]), r) for r in in_scope(conn, project_id, statuses=statuses)]
     return sorted([s for s in scored if s[0] >= floor or normalized(text) in normalized(s[1]["content"])],
                   key=lambda s: -s[0])[:limit]
 
@@ -319,23 +333,27 @@ def save_command(conn, *, project_id, run_id, action, text, replaces=None):
         found = [r for r in in_scope(conn, project_id) if r["id"] == replaces] if replaces else \
             [r for _, r in matching(conn, project_id, text, limit=1)]
         replaces = None
-        if found:
+        # a personal record is replaced only from a Normal project; from another, the text stays the project's own
+        if found and (found[0]["scope"] == "project" or personal_allowed(conn, project_id)):
             replaces, kind, scope = found[0]["id"], found[0]["type"], found[0]["scope"]
-    if action == "save":  # a command sent again (Continue) or repeated is kept once
-        same = [r["id"] for r in in_scope(conn, project_id) if normalized(r["content"]) == normalized(text)]
-        if same:
-            return "saved", same[:1]
+    if action == "save":  # a command sent again (Continue) or repeated is kept once, confirmed by these words
+        same = [r for r in in_scope(conn, project_id) if normalized(r["content"]) == normalized(text)
+                and (r["scope"] == "project" or personal_allowed(conn, project_id))]
+        if same and same[0]["status"] == "confirmed":
+            return "saved", [same[0]["id"]]
+        if same:  # inferred: the researcher's own words confirm it, as a new version
+            replaces, kind, scope = same[0]["id"], same[0]["type"], same[0]["scope"]
     sources = [("turn", run_id)] + (sources_of(conn, replaces) if replaces else [])
     record = write(conn, project_id=project_id, scope=scope, kind=kind, content=text, status="confirmed",
                    sources=sources, run_id=run_id, replaces=replaces, structured={"command": action})
-    return ("updated" if replaces else "saved"), [record]
+    return ("updated" if replaces and action != "save" else "saved"), [record]
 
 
 def forget_candidates(conn, project_id, text=None, previous=None):
     """Records a forget may mean: the ones most like text; for a bare "forget this", the active records the previous
     turn (previous: its run id) or its extraction made, else the one changed last."""
     if text is not None:
-        return matching(conn, project_id, text, floor=0.2)
+        return matching(conn, project_id, text, floor=0.2, statuses=("confirmed", "inferred", "proposed"))
     made = [r for r in in_scope(conn, project_id, kinds=TYPES) if previous is not None and (
         r["created_by_run_id"] == previous or conn.execute(
             "SELECT 1 FROM runs WHERE id = ? AND source_turn_id = ?", (r["created_by_run_id"], previous)).fetchone())]
@@ -439,10 +457,13 @@ def parse(text):
 
 def cap(candidate, message, author):
     """The status a candidate may have: confirmed or inferred only when the words it rests on are in the
-    researcher's own message (NFKC, case and spaces aside) and the turn is the researcher's; else proposed,
-    whatever the extractor said (section 8, Where memory comes from)."""
+    researcher's own message (NFKC, case and spaces aside), are more than a word, and carry at least half of the
+    candidate's own terms, and the turn is the researcher's; else proposed, whatever the extractor said (section 8,
+    Where memory comes from: a decision planted in a paper and echoed in the answer never becomes active)."""
     span = normalized(candidate["span"])
-    own = author == "researcher" and bool(span) and span in normalized(message)
+    terms, said = _terms(candidate["content"]), _terms(span)
+    own = (author == "researcher" and len(said) >= 2 and span in normalized(message)
+           and len(terms & said) * 2 >= len(terms))  # the words it rests on hold at least half of what it says
     return candidate["status"] if own else "proposed"
 
 
@@ -456,11 +477,12 @@ def _latest_turn(conn, record):
 
 
 def _command_since(conn, project_id, started_at):
-    """Whether an explicit command was applied in the project's scope after a turn that started then."""
+    """Whether an explicit command was applied in the project's scope after a turn that started then (when it was
+    applied: a bare command's ask may be answered long after its turn began)."""
     return conn.execute(
         "SELECT 1 FROM run_events e JOIN runs r ON r.id = e.run_id WHERE e.type = 'memory_proposed'"
         " AND json_extract(e.data, '$.command') IS NOT NULL AND json_extract(e.data, '$.applied') = 1"
-        " AND r.project_id = ? AND r.started_at > ? LIMIT 1", (project_id, started_at)).fetchone() is not None
+        " AND r.project_id = ? AND e.at > ? LIMIT 1", (project_id, started_at)).fetchone() is not None
 
 
 def _head(conn, record):
@@ -497,7 +519,11 @@ def apply_extraction(conn, run_id, candidates):
     message, author, project_id, turn, turn_started, run_started = found
     message = (json.loads(message) or {}).get("text", "")
     late = _command_since(conn, project_id, turn_started)
-    carried = papers(provenance.dependencies(conn, turn))
+    # every paper its request carried text of (the answer's, and the related records' it was shown), registered as
+    # the run's dependencies before its dispatch (backend/runs.py _extraction_call)
+    held = conn.execute("SELECT json_extract(inputs, '$.context_materials') FROM runs WHERE id = ?", (run_id,)).fetchone()
+    carried = papers({*provenance.dependencies(conn, turn), *json.loads((held and held[0]) or "[]")})
+    personal = personal_allowed(conn, project_id)
     counts = {"confirmed": 0, "inferred": 0, "proposed": 0, "replaced": 0, "duplicates": 0}
     written = []
     for candidate in candidates:
@@ -505,15 +531,20 @@ def apply_extraction(conn, run_id, candidates):
         kind = candidate["type"]
         scope = scope_for(conn, project_id, kind)
         pending = in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
-        if any(normalized(r["content"]) == normalized(candidate["content"]) for r in pending):
+        same = next((r for r in pending if normalized(r["content"]) == normalized(candidate["content"])), None)
+        if same is not None:
             counts["duplicates"] += 1
+            if same["status"] == "proposed" and status == "confirmed" and not late and not same["supersedes_id"]:
+                keep(conn, same["id"], None)  # the researcher's own words confirm what was only proposed
             continue
         head = _head(conn, candidate["replaces"]) if candidate["replaces"] else None  # as the record stands now
-        target = next((r for r in pending if r["id"] == head and r["status"] in ACTIVE), None)
+        target = next((r for r in pending if r["id"] == head and r["status"] in ACTIVE
+                       and (r["scope"] == "project" or personal)), None)  # never into personal from a stricter project
         own = cap({**candidate, "status": "confirmed"}, message, author) == "confirmed"
         structured = {"source": "researcher" if own else "answer"}
         sources = [("turn", turn), ("run", run_id), *carried]
         if target is not None:
+            sources += [(k, i) for k, i in sources_of(conn, target["id"]) if k == "material"]  # what it was written from
             authoritative = status == "confirmed" or (status == "inferred" and target["status"] in ("inferred", "proposed"))
             newer = turn_started > _latest_turn(conn, target)
             untouched = target["updated_at"] <= run_started
@@ -566,7 +597,7 @@ def recall_candidates(conn, project_id, locked=False, now=None):
     now = now or utc_now()
     records = []
     for record in in_scope(conn, project_id, kinds=RECALLED):
-        if record["scope"] == "personal" and (locked or record["status"] != "confirmed"):
+        if record["scope"] == "personal" and (locked or record["status"] != "confirmed" or not _personal_still(conn, record)):
             continue
         if record["valid_to"] is not None and record["valid_to"] <= now:
             continue
@@ -575,10 +606,28 @@ def recall_candidates(conn, project_id, locked=False, now=None):
     return records
 
 
+def _personal_still(conn, record):
+    """Whether a personal record may still reach any project: written in a Normal project, and every turn or run behind
+    it is still in a Normal, unlocked project (one moved to a stricter project, or tightened, keeps its words there)."""
+    if record.get("sensitivity") not in (None, "normal"):
+        return False
+    return conn.execute(
+        "SELECT 1 FROM memory_sources s JOIN runs r ON r.id = s.source_id JOIN projects p ON p.id = r.project_id"
+        " WHERE s.memory_id = ? AND s.source_kind IN ('turn', 'run') AND (p.sensitivity != 'normal' OR p.review_lock)"
+        " LIMIT 1", (record["id"],)).fetchone() is None
+
+
 def ranked(candidates, nearest=None, limit=RECALL_LIMIT):
-    """At most limit records: those nearest in meaning first (nearest: ids, nearest first), then the newest."""
-    order = {rid: i for i, rid in enumerate(nearest or ())}
-    return sorted(candidates, key=lambda r: (order.get(r["id"], len(order)),))[:limit] if order else candidates[:limit]
+    """At most limit records: those nearest in meaning first (nearest: ids, nearest first), then the newest; a record
+    newer than every one with a vector (just written, not embedded yet) goes first, so it is never cut for lacking one."""
+    if not nearest:
+        return candidates[:limit]
+    order = {rid: i for i, rid in enumerate(nearest)}
+    embedded = [r["updated_at"] for r in candidates if r["id"] in order]
+    newest = max(embedded) if embedded else ""
+    fresh = [r for r in candidates if r["id"] not in order and r["updated_at"] > newest]
+    rest = sorted((r for r in candidates if r not in fresh), key=lambda r: order.get(r["id"], len(order)))
+    return (fresh + rest)[:limit]
 
 
 def memory_line(record):
@@ -793,6 +842,8 @@ async def create_memory(body: NewRecord, request: Request):
     def create(conn):
         if conn.execute("SELECT 1 FROM projects WHERE id = ?", (body.project_id,)).fetchone() is None:
             raise Refused(404, "not_found", "No such project")
+        if body.scope == "personal" and not personal_allowed(conn, body.project_id):  # reading 4
+            raise Refused(400, "personal_from_strict", "A Private or Local only project's records stay its own")
         return write(conn, project_id=body.project_id, scope=body.scope, kind=body.type, content=content,
                      status="confirmed", sources=[("researcher", "views")], structured={"entered": True})
     try:
