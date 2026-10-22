@@ -4,6 +4,7 @@ assistant step stored whole and sent back unmodified (model-route rule 5); the r
 Model calls go to recorded tool-calling replies (tests/agentic.py); nothing leaves the process."""
 
 import asyncio
+import contextlib
 import json
 
 import pytest
@@ -782,3 +783,29 @@ async def test_deadline_no_request_leaves_past_it_whatever_it_waited_for_before_
         refusals = await rows(client, "SELECT data ->> 'reason' FROM audit_log WHERE event = 'outbound'"
                                       " AND data ->> 'decision' = 'deny'")
         assert ("turn_deadline",) in refusals  # the gate's record names why
+
+
+# Recheck c4 (gpt-6-astra, S1-19c)
+
+
+@pytest.mark.asyncio
+async def test_c4_a_deletion_clears_the_agents_held_question_in_its_own_transaction(tmp_path, monkeypatch):
+    from backend import runs
+    provider = Scripted([call("ask", question=f"The paper says: {QUOTE} Go on?", options=[QUOTE[:90], "No"])])
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
+        await asked(client, conversation)
+
+        def failing(*args, **kwargs):  # the turn's terminal write fails: its own cleanup never runs
+            raise RuntimeError("the terminal write failed")
+        monkeypatch.setattr(runs.Harness, "_finish_turn", failing)
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        held = await rows(client, "SELECT count(*) FROM runs WHERE inputs LIKE ? OR inputs LIKE ?",
+                          "%synthetic panel%", "%low-paid%")
+        assert held == [(0,)]  # gone with the deletion itself, whatever the run's end does
+        monkeypatch.undo()
+        sending.cancel()
+        with contextlib.suppress(BaseException):
+            await sending
