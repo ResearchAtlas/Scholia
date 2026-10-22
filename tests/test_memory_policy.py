@@ -712,6 +712,30 @@ async def test_a_stale_forget_never_deletes_a_proposal_kept_or_edited_since(tmp_
             assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
         assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
             ("We use diaries, weekly", "confirmed"), ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
+        assert await rows(client, "SELECT (SELECT count(*) FROM tombstones),"
+                                  " (SELECT count(*) FROM audit_log WHERE event = 'deletion')") == [(0, 0)]
         current = (await rows(client, "SELECT version FROM memory_records WHERE id = ?", edited))[0][0]
         assert (await client.post("/api/memory/review", json={"id": edited, "action": "forget", "version": current})
                 ).status_code == 409  # confirmed now: Forget it from the memory views, not Things to confirm
+
+
+async def test_forgetting_an_out_of_date_proposal_never_takes_the_record_another_replaced(tmp_path):
+    # fix batch 5, internal review: a proposal replaced nothing, so Forget of it takes no earlier version
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        target = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+
+        def proposed(content):
+            def write(conn):
+                record = memory.write(conn, project_id=project, scope="project", kind="decision", content=content,
+                                      status="proposed", sources=[("project", project)])
+                conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (target, record))
+                return record
+            return asyncio.to_thread(client.state["db"].write, write)
+        first, second = await proposed("We use surveys"), await proposed("We use diaries")
+        assert (await client.post("/api/memory/review", json={"id": first, "action": "keep", "version": 1})).status_code == 200
+        forgot = await client.post("/api/memory/review", json={"id": second, "action": "forget", "version": 1})
+        assert forgot.json() == {"ok": True}
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
+            ("We use interviews", "superseded"), ("We use surveys", "confirmed")]

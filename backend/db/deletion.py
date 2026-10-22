@@ -180,11 +180,12 @@ RULES = (
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', m.rowid FROM memory_records m JOIN memory_sources s ON s.memory_id = m.id
     WHERE s.source_kind = 'material' AND s.source_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
-    # S1-21a: Forget deletes the content (F10), so the earlier versions a deleted record replaced go with it.
+    # S1-21a: Forget deletes the content (F10), so the earlier versions a deleted record replaced go with it (a pending
+    # proposal replaced nothing: the record it names may be another version's predecessor, S1-21a fix batch 5).
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', o.rowid FROM memory_records o
     WHERE o.status = 'superseded' AND o.id IN (SELECT supersedes_id FROM memory_records
-                                               WHERE rowid IN {_doomed('memory_records')})""",
+                                               WHERE rowid IN {_doomed('memory_records')} AND status != 'proposed')""",
     # A deleted record's sources go with it.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_sources', rowid FROM memory_sources
