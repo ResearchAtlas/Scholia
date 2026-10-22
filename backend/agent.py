@@ -314,8 +314,8 @@ async def use_skill(call, turn):
         return ToolResult(id=call.id, ok=True, text=f"The {skill.name} skill is already active; its instructions are "
                                                     f"above.{listed}", meta={"skill": skill.name, "already_active": True,
                                                                              "files": [f[0] for f in skill.files]})
-    turn.activated.add(skill.name)
     await turn.harness._skill_activated(turn.claim, skill, turn.step)
+    turn.activated.add(skill.name)  # active once its activation is recorded, never before (a failed write leaves it not)
     turn.emit({"type": "skill", "name": skill.name})
     return ToolResult(id=call.id, ok=True, text=_wrapped(skill) + listed,
                       meta={"skill": skill.name, "files": [f[0] for f in skill.files]})

@@ -230,3 +230,31 @@ async def test_ct1_read_skill_file_reads_only_a_file_of_a_skill_active_in_the_co
         await send(client, conversation, "Use the literature review skill")
         await send(client, conversation, "Go on")  # carried in ACTIVE SKILLS: its files read without use_skill again
         assert tool_messages(provider.agent_steps[5])[-1]["content"].startswith("# Screening")
+
+
+@pytest.mark.asyncio
+async def test_ct1_a_skill_whose_activation_record_failed_is_not_active(tmp_path, monkeypatch):
+    from backend import runs
+    real, tries = runs.Harness._skill_activated, []
+
+    async def failing_once(self, claim, skill, step):
+        tries.append(skill.name)
+        if len(tries) == 1:
+            raise RuntimeError("the activation's write failed")
+        return await real(self, claim, skill, step)
+    monkeypatch.setattr(runs.Harness, "_skill_activated", failing_once)
+    provider = Scripted([call("use_skill", name="literature-review")],
+                        [call("read_skill_file", call_id="c2", file_id="literature-review#1")],
+                        [call("use_skill", call_id="c3", name="literature-review")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Review my papers")
+        assert json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])["error"] == "tool_error"
+        refused = json.loads(tool_messages(provider.agent_steps[2])[-1]["content"])
+        assert refused["error"] == "validation_error" and "use_skill" in refused["message"]  # not active: no record
+        again = tool_messages(provider.agent_steps[3])[-1]["content"]
+        assert again.startswith('<skill name="literature-review">')  # activated now, not "already active"
+        run_id = stream[0]["run_id"]
+        assert len([d for k, d, _ in await events_of(client, run_id) if k == "skill_activated"]) == 1
+        assert json.loads((await rows(client, "SELECT skills FROM runs WHERE id = ?", run_id))[0][0]) == ["literature-review"]
