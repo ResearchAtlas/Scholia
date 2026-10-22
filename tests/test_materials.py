@@ -368,8 +368,8 @@ async def test_the_runs_of_added_files_start_with_their_commit_and_never_read_in
         monkeypatch.setattr(harness, "kick_background", failing)  # not needed: they start with the commit
         committed, go, real_write = threading.Event(), threading.Event(), db.write
 
-        def write(fn):  # held right after the transaction that records the added files commits
-            result = real_write(fn)
+        def write(fn, **kwargs):  # held right after the transaction that records the added files commits
+            result = real_write(fn, **kwargs)
             if "add_files" in fn.__qualname__ or "record_background" in fn.__qualname__:
                 committed.set()
                 go.wait(10)

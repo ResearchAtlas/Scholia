@@ -664,11 +664,11 @@ async def test_a_cancelled_allowlist_change_keeps_its_mark_until_its_write_has_f
         real_write, real_check = db.write, outbound_gate.OutboundGate._check
         started_, go = threading.Event(), threading.Event()
 
-        def slow_write(fn):  # the allowlist write waits before it reaches the database
+        def slow_write(fn, committed=None):  # the allowlist write waits before it reaches the database
             if fn.__qualname__.endswith("change_private_route.<locals>.change"):
                 started_.set()
                 go.wait(3)
-            return real_write(fn)
+            return real_write(fn, committed)
 
         def disabled(conn):
             return conn.execute("SELECT count(*) FROM private_routes WHERE enabled = 0").fetchone() == (1,)

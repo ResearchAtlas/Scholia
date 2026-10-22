@@ -171,11 +171,13 @@ class Database:
     def __exit__(self, *exc):
         self.close()
 
-    def write(self, fn):
+    def write(self, fn, committed=None):
         """Run fn(conn) on the writer thread in one BEGIN IMMEDIATE transaction.
 
         Returns fn's result after COMMIT. If fn raises, the transaction rolls
         back and the exception propagates. fn must not commit or roll back.
+        committed, if given, is called on the writer thread right after COMMIT,
+        whatever becomes of the caller meanwhile, and never after a rollback.
         """
         _refuse_event_loop()
         if threading.get_ident() == self._writer_ident:
@@ -183,7 +185,7 @@ class Database:
         with self._readers_lock:  # admitted and queued in one step, so never queued behind close() or a hold
             if self._closed or self._held or self._closing:
                 raise DatabaseClosedError("the database is closed")
-            future = self._writer.submit(self._transaction, fn)
+            future = self._writer.submit(self._transaction, fn, committed)
         return future.result()
 
     def hold_writes(self):
@@ -444,7 +446,7 @@ class Database:
         self._conn = conn
         return threading.get_ident()
 
-    def _transaction(self, fn):
+    def _transaction(self, fn, committed=None):
         if self._damaged:
             raise DatabaseDamagedError(self._damaged)
         conn = self._conn
@@ -459,6 +461,8 @@ class Database:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
+        if committed is not None:
+            committed()
         if self._truncation_pending:
             try:
                 self._truncate_wal(wait=False)

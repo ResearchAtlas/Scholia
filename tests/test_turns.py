@@ -910,9 +910,9 @@ async def test_a_stop_request_cancelled_while_it_waits_never_cancels_the_termina
     real_ended, real_finish = runs_module.Harness._ended, runs_module.Harness._finish_turn
     entered, writing, gate = [], threading.Event(), threading.Event()
 
-    async def ended(self, active, write):
+    async def ended(self, active, fn):
         entered.append(active.run_id)
-        return await real_ended(self, active, write)
+        return await real_ended(self, active, fn)
 
     def finish(self, conn, *args, **kwargs):  # its terminal write waits until the request is cancelled
         writing.set()
@@ -946,6 +946,62 @@ async def test_a_stop_request_cancelled_while_it_waits_never_cancels_the_termina
         assert claim.provider is not None and not harness.provider_busy(claim.provider)  # nothing held for good
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert (turn["status"], turn["cancel_reason"]) == ("cancelled", "researcher")
+        await background_idle(client)
+
+
+@pytest.mark.parametrize("write", ["answer", "provider_failure"])
+async def test_a_terminal_write_that_commits_while_its_turn_is_stopped_marks_it_finished_however_its_cleanup_ends(
+        tmp_path, monkeypatch, write):
+    """PR 46 recheck 3: a Stop during a turn's terminal write (its answer, or a provider failure) cancelled the await
+    while the writer went on and committed; when the Stop's own write then failed, the turn was released never known
+    finished, and a read taken before that commit read it interrupted. The writer marks it finished as it commits."""
+    from backend.runs import Registry, derived_status
+    real_release, real_commit, real_finish = Registry.release, runs_module.Harness._commit_answer, \
+        runs_module.Harness._finish_turn
+    seen, writing, gate, calls = [], threading.Event(), threading.Event(), []
+
+    def release(self, active):  # the moment after the turn's hold is released, as a read taken before its commit reads it
+        real_release(self, active)
+        if active.kind == "turn":
+            seen.append(derived_status("running", active.run_id, self))
+
+    def held(real):  # the terminal write, its transaction done and still to commit until the Stop has come
+        def run(self, conn, *args, **kwargs):
+            result = real(self, conn, *args, **kwargs)
+            writing.set()
+            gate.wait(10)
+            return result
+        return run
+
+    def finish(self, conn, *args, **kwargs):  # the provider failure's write is held; the Stop's own write fails
+        calls.append(args)
+        if write == "provider_failure" and len(calls) == 1:
+            return held(real_finish)(self, conn, *args, **kwargs)
+        raise RuntimeError("the Stop's write failed")
+
+    monkeypatch.setattr(Registry, "release", release)
+    monkeypatch.setattr(runs_module.Harness, "_finish_turn", finish)
+    if write == "answer":
+        monkeypatch.setattr(runs_module.Harness, "_commit_answer", held(real_commit))
+    provider = MockProvider(*([(401, {"error": {"message": "bad key"}})] if write == "provider_failure" else []))
+    async with started(tmp_path / "data", provider) as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "a question")
+
+        async def read():  # a reader pulls the turn to its terminal write
+            return [event async for event in harness.events(claim)]
+        reader = asyncio.create_task(read())
+        await asyncio.to_thread(writing.wait, 10)
+        harness._request_cancel(claim, "researcher")  # the Stop, while the terminal write is still to commit
+        await asyncio.sleep(0.05)  # the turn's await is cancelled and the Stop's own write is queued
+        gate.set()
+        with pytest.raises(RuntimeError):
+            await claim.task
+        await reader
+        assert seen == ["running"] and claim.run_id in harness.registry.finished
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert turn["status"] == ("succeeded" if write == "answer" else "failed")
         await background_idle(client)
 
 
