@@ -6,7 +6,7 @@
 // section 6.2: a confirmation appears where its work started). S1-19b: an answer's citations are chips
 // that open the paper at its passage, its notices say what its retrieval and checks could not do, and
 // Details shows its trace; papers chosen in the Library or with @ go with the next message.
-import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
@@ -67,7 +67,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   const [draft, setDraft] = useState(null); // a new conversation, made at its first message
   const id = conversation?.id ?? draft;
   const live = useLiveTurn(id);
-  useEffect(() => showing(projectId, id), [projectId, id]); // a turn opens a place only while shown here (live.js)
+  // a turn opens a place only while shown here (live.js), said in the commit that shows it: never a passive effect's delay
+  useLayoutEffect(() => showing(projectId, id), [projectId, id]);
   const [turns, setTurns] = useState(conversation ? null : []);
   const [failed, setFailed] = useState(false);
   const [problem, setProblem] = useState(null);
