@@ -973,3 +973,16 @@ async def test_ct1_sweep_passages_whose_answer_step_reached_no_model_are_not_rea
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         assert stream[-1]["status"] == "succeeded" and turn["citations"][0]["existence"] != "ok"  # not read in the run
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("calls", [[{**call("list_materials"), "id": ""}, None], {"id": "x", "type": "function"}, "x"],
+                         ids=["entry_not_an_object", "a_dict", "a_string"])
+async def test_ct5_a_malformed_tool_calls_list_ends_the_turn_malformed_not_as_an_answer(tmp_path, calls):
+    provider = Scripted({"calls": calls, "content": "Let me check the library."}, "Never.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert (stream[-1]["status"], len(provider.agent_steps)) == ("failed", 1)
+        assert {"type": "error", "code": "malformed"} in stream
+        assert not [e for e in stream if e["type"] == "chat_response"]  # the preamble is never saved as the answer
