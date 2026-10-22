@@ -15,6 +15,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
+import { memoryChanged } from '../memory.js'; // S1-21a
 
 const KEY_SETTINGS = { privacyLink: 'https://openrouter.ai/settings/privacy',
   observabilityLink: 'https://openrouter.ai/settings/observability',
@@ -108,6 +109,7 @@ export function ProjectProtection({ project, onProjectChanged }) {
   const [ask, dialog] = useConfirm();
   const { busy, problem, run } = useChange(async () => {
     forgetModels(); // what the model picker offers here follows the protection
+    memoryChanged(project.id); // S1-21a: a stricter project's personal records become its own
     await onProjectChanged();
   });
   const [applying, setApplying] = useState(false); // a stricter answer, until it has applied

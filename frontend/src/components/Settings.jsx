@@ -22,6 +22,7 @@ import { LocalHelperSection, LocalOnlySearchNote } from './LocalHelper.jsx';
 import { IndexSection } from './SearchIndex.jsx'; // S1-17
 import { offerOutcome, runCounts, runReason } from '../search.js'; // S1-17
 import { MemorySection } from './Memory.jsx'; // S1-21a: the memory views
+import { memoryChanged } from '../memory.js';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
@@ -343,7 +344,7 @@ function ThisProject({ project, onProjectChanged, onOpenAdvanced }) {
         <div>
           <Segmented label={t('memory.enabled')} value={values.memory?.enabled === false ? 'off' : 'on'}
             options={[{ value: 'on', label: t('memory.on') }, { value: 'off', label: t('memory.off') }]}
-            onChange={(value) => own.save({ 'memory.enabled': value === 'on' })} />
+            onChange={(value) => own.save({ 'memory.enabled': value === 'on' }).then(() => memoryChanged(project.id))} />
         </div>
       </Field>
       <Field label={t('project.budget')} htmlFor="project-budget" hint={t('project.budgetHint')}>

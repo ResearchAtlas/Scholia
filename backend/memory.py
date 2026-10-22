@@ -182,16 +182,11 @@ def restrict(conn, project_id):
 
 
 def allowed(conn, project_id, record_ids):
-    """Whether every one of these records may still be in a request of project_id (section 10, at dispatch): it exists;
-    a project record is project_id's own; a personal record may still reach any project (_personal_still); and the
-    papers whose text it may carry pass the request's access check."""
+    """Whether every one of these records may still be in a request of project_id (section 10, at dispatch): it exists,
+    is current (never superseded: an edit since it was assembled means its old text may not leave), and is valid."""
     for record in record_ids:
         found = row(conn, record)
-        if found is None or (found["scope"] == "project" and found["project_id"] != project_id):
-            return False
-        if found["scope"] == "personal" and not _personal_still(conn, found):
-            return False
-        if not _sendable(conn, project_id, record):
+        if found is None or found["status"] == "superseded" or not valid(conn, project_id, found):
             return False
     return True
 
@@ -449,7 +444,7 @@ def extraction_input(conn, run_id):
         return None
     message, answer, author, project_id, turn = found
     related = [r for r in in_scope(conn, project_id, statuses=("confirmed", "inferred", "proposed"))
-               if r["scope"] == "project" or _personal_still(conn, r)][:RELATED]  # as recall: none another may not see
+               if valid(conn, project_id, r)][:RELATED]  # as recall: none it may not be shown
     held = set(provenance.dependencies(conn, turn))
     for record in related:
         held |= {i for k, i in sources_of(conn, record["id"]) if k == "material"}
@@ -567,6 +562,14 @@ def apply_extraction(conn, run_id, candidates):
     carried = papers({*provenance.dependencies(conn, turn), *json.loads((held and held[0]) or "[]")})
     if not provenance.carried(conn, [i for _, i in carried]):  # a paper it drew on was deleted: nothing of it is kept
         return None
+    # the records its request was shown: what it writes may carry their text, so it depends on them, and nothing is
+    # written when one of them is gone or no longer allowed in this project since (one replaced since is section 8's
+    # case: its candidates then wait as proposals)
+    shown = conn.execute("SELECT json_extract(inputs, '$.memory_ids') FROM runs WHERE id = ?", (run_id,)).fetchone()
+    shown = json.loads((shown and shown[0]) or "[]")
+    if not all((found := row(conn, i)) is not None and valid(conn, project_id, found) for i in shown):
+        return None
+    carried += [("memory", i) for i in sorted(set(shown))]
     personal = personal_allowed(conn, project_id)
     counts = {"confirmed": 0, "inferred": 0, "proposed": 0, "replaced": 0, "duplicates": 0}
     written = []
@@ -637,9 +640,46 @@ def wants(decision):
     return True, True
 
 
-def _sendable(conn, project_id, record_id):
+def valid(conn, project_id, record, _depth=0):
+    """Whether a record's text may be in a request of project_id now (S1-21a; Harold's retrieval and memory spec,
+    source validity: an inaccessible source invalidates the memory derived from it). The one rule every reader of
+    memory applies (recall, PROJECT STATE, the memory tools, an extraction's related records) and the dispatch check
+    (allowed), over every source kind:
+    - its scope: a project record is project_id's own; a personal record was written in a Normal project that is still
+      Normal and unlocked;
+    - `turn` and `run`: the project the turn or run is in now passes the check a paper's would: not review-locked, and
+      no stricter than project_id's (for a personal record: Normal);
+    - `material`: every paper whose text it may carry exists and passes the request's access check
+      (provenance.sendable);
+    - `memory`: every record it was derived from (an extraction's related records) exists and is valid itself;
+    - `paper`, `project`, `researcher`: carry no text of another source."""
     from backend import provenance
-    return provenance.sendable(conn, project_id, [i for k, i in sources_of(conn, record_id) if k == "material"])
+    from backend.governance import LEVELS
+    personal = record["scope"] == "personal"
+    if not personal and record["project_id"] != project_id:
+        return False
+    level = conn.execute("SELECT sensitivity FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if level is None or _depth > 5:
+        return False
+    if personal:
+        own = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (record["project_id"],)).fetchone()
+        if record.get("sensitivity") not in (None, "normal") or (own is not None and (own[0] != "normal" or own[1])):
+            return False
+    ceiling = 0 if personal else LEVELS.index(level[0])
+    materials = []
+    for kind, source in sources_of(conn, record["id"]):
+        if kind == "material":
+            materials.append(source)
+        elif kind in ("turn", "run"):
+            where = conn.execute("SELECT p.sensitivity, p.review_lock FROM runs r JOIN projects p ON p.id = r.project_id"
+                                 " WHERE r.id = ?", (source,)).fetchone()
+            if where is not None and (where[1] or LEVELS.index(where[0]) > ceiling):
+                return False
+        elif kind == "memory":
+            found = row(conn, source)
+            if found is None or not valid(conn, project_id, found, _depth + 1):
+                return False
+    return provenance.sendable(conn, project_id, materials)
 
 
 def recall_candidates(conn, project_id, locked=False, now=None):
@@ -649,27 +689,13 @@ def recall_candidates(conn, project_id, locked=False, now=None):
     now = now or utc_now()
     records = []
     for record in in_scope(conn, project_id, kinds=RECALLED):
-        if record["scope"] == "personal" and (locked or record["status"] != "confirmed" or not _personal_still(conn, record)):
+        if record["scope"] == "personal" and (locked or record["status"] != "confirmed"):
             continue
         if record["valid_to"] is not None and record["valid_to"] <= now:
             continue
-        if _sendable(conn, project_id, record["id"]):
+        if valid(conn, project_id, record):
             records.append(record)
     return records
-
-
-def _personal_still(conn, record):
-    """Whether a personal record may still reach any project: written in a Normal project, and every turn or run behind
-    it is still in a Normal, unlocked project (one moved to a stricter project, or tightened, keeps its words there)."""
-    if record.get("sensitivity") not in (None, "normal"):
-        return False
-    own = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (record["project_id"],)).fetchone()
-    if own is not None and (own[0] != "normal" or own[1]):  # its own project tightened or locked since
-        return False
-    return conn.execute(
-        "SELECT 1 FROM memory_sources s JOIN runs r ON r.id = s.source_id JOIN projects p ON p.id = r.project_id"
-        " WHERE s.memory_id = ? AND s.source_kind IN ('turn', 'run') AND (p.sensitivity != 'normal' OR p.review_lock)"
-        " LIMIT 1", (record["id"],)).fetchone() is None
 
 
 def ranked(candidates, nearest=None, limit=RECALL_LIMIT, embedded=None):
@@ -695,11 +721,10 @@ def memory_line(record):
 def project_state(conn, project_id):
     """PROJECT STATE's records: the project state itself (confirmed first, an inferred one labeled), then what's
     done (progress) and the agent's notes, newest first; and the records they are, [(id, materials)]."""
-    rows = [r for r in in_scope(conn, project_id, kinds=("project_state",)) if r["scope"] == "project"
-            and _sendable(conn, project_id, r["id"])]
+    rows = [r for r in in_scope(conn, project_id, kinds=("project_state",)) if valid(conn, project_id, r)]
     rows.sort(key=lambda r: r["status"] != "confirmed")
-    done = [r for r in in_scope(conn, project_id, kinds=("progress",)) if _sendable(conn, project_id, r["id"])][:STATE_NOTES]
-    notes = [r for r in in_scope(conn, project_id, kinds=("agent_note",)) if _sendable(conn, project_id, r["id"])][:STATE_NOTES]
+    done = [r for r in in_scope(conn, project_id, kinds=("progress",)) if valid(conn, project_id, r)][:STATE_NOTES]
+    notes = [r for r in in_scope(conn, project_id, kinds=("agent_note",)) if valid(conn, project_id, r)][:STATE_NOTES]
     lines = [memory_line(r).replace("[project_state", "[state", 1) for r in rows]
     lines += [f"- [done] {r['content']}" for r in done]
     lines += [f"- [agent's note, {r['structured'].get('kind', 'note').replace('_', ' ')}] {r['content']}" for r in notes]

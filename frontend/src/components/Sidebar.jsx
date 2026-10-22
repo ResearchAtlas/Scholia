@@ -19,6 +19,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { cn } from '@/lib/utils';
 import { SUGGESTED_HOLDS, holdsBody } from '../projects.js';
 import { HoldsChoice } from './Governance.jsx';
+import { memoryChanged } from '../memory.js'; // S1-21a
 
 export function Sidebar({ projects, projectId, conversations, conversationId, onProject, onProjectsChanged,
   onConversation, onConversationsChanged, onNewConversation, onSettings, onHide }) {
@@ -216,7 +217,10 @@ function MoveDialog({ conversation, projects, from, onClose, onDone }) {
   useEffect(() => setTarget(null), [conversation]); // each move starts with no destination chosen
   async function submit(event) {
     event.preventDefault();
-    if (await run(() => post(`/api/conversations/${conversation.id}/move`, { project_id: target }))) onDone(conversation.id);
+    if (await run(() => post(`/api/conversations/${conversation.id}/move`, { project_id: target }))) {
+      memoryChanged(null); // S1-21a: records drawn from it move with it (or become a stricter project's own)
+      onDone(conversation.id);
+    }
   }
   return (
     <Dialog open={Boolean(conversation)} onOpenChange={(next) => {

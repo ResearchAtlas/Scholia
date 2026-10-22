@@ -198,7 +198,9 @@ async def test_memory_switched_off_mid_turn_stops_the_turns_memory_tools(tmp_pat
         assert await rows(client, "SELECT count(*) FROM memory_records WHERE type = 'agent_note'") == [(0,)]
 
 
-async def test_memory_switched_off_mid_turn_drops_recall_from_its_later_steps(tmp_path):
+async def test_memory_switched_off_mid_turn_ends_a_turn_that_recalled_memory(tmp_path):
+    # fix batch 2 (finding 4) replaces dropping the sections: the turn's first step and its reply held recalled memory,
+    # so the turn ends at the next step boundary, revoked, rather than sending a later step
     from cited import cited, with_papers
     from test_search import WAGES
     switched = {}
@@ -211,9 +213,9 @@ async def test_memory_switched_off_mid_turn_drops_recall_from_its_later_steps(tm
         project, _ = await with_papers(client, WAGES)
         switched.update(client=client, project=project)
         await client.post("/api/memory", json={"project_id": project, "type": "decision", "content": "SECRET decision"})
-        await send(client, await conversation_in(client, project), "What did we decide last time?")
+        stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
         assert "SECRET" in json.dumps(provider.agent_steps[0])
-        assert "SECRET" not in json.dumps(provider.agent_steps[1])
+        assert len(provider.agent_steps) == 1 and stream[-1]["cancel_reason"] == "revoked"
 
 
 async def test_a_personal_inference_waits_in_things_to_confirm(tmp_path):
@@ -239,3 +241,99 @@ async def test_a_request_with_recalled_memory_never_says_memory_is_unavailable(t
         await send(client, await conversation_in(client, project), "Why did I drop the pilot? We decided last time.")
         system = provider.answers[-1]["messages"][0]["content"]
         assert "We dropped the pilot" in system and "not available yet" not in system
+
+
+# Fix batch 2 (gpt-6-astra recheck 2 on f8e5349): every source kind, status, switch and section
+
+
+async def test_a_record_derived_from_a_related_record_follows_it_when_its_project_is_tightened(tmp_path):
+    # 1: B's extraction was shown A's personal record; A turns Private; nothing derived from it reaches C
+    async with started(tmp_path / "data") as client:
+        a, b, c = await project_of(client, "A"), await project_of(client, "B"), await project_of(client, "C")
+        source = await personal(client, a, "I prefer answers about participant Alice")
+        run = await turn_in(client, b, "Write it as I prefer")
+
+        def extract(conn):  # as _extraction_call registers what its request held, then the effect
+            conn.execute("UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?)) WHERE id = ?",
+                         (json.dumps([source]), run))
+            return memory.apply_extraction(conn, run, [{"type": "preference", "content": "Write it as I prefer, naming Alice",
+                                                        "status": "confirmed", "span": "write it as i prefer",
+                                                        "replaces": ""}])
+        await asyncio.to_thread(client.state["db"].write, extract)
+        [(derived,)] = await rows(client, "SELECT id FROM memory_records WHERE content LIKE 'Write it as I prefer%'")
+        assert await recalled(client, c) == ["Write it as I prefer, naming Alice", "I prefer answers about participant Alice"]
+        await tighten(client, a, "private")
+        assert await recalled(client, c) == []
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, c, [derived])) is False
+
+
+async def test_an_extraction_shown_a_record_since_tightened_writes_nothing(tmp_path):
+    async with started(tmp_path / "data") as client:
+        a, b = await project_of(client, "A"), await project_of(client, "B")
+        source = await personal(client, a, "I prefer answers about participant Alice")
+        run = await turn_in(client, b, "Write it as I prefer")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?)) WHERE id = ?", (json.dumps([source]), run)))
+        await tighten(client, a, "private")  # while B's extraction runs
+        assert await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
+            {"type": "preference", "content": "Answers naming Alice", "status": "proposed", "span": "",
+             "replaces": ""}])) is None
+
+
+async def test_a_project_record_resting_on_a_turn_moved_to_a_stricter_project_is_never_sent(tmp_path):
+    # 2: every source kind: a turn or run now in a stricter project invalidates the record
+    async with started(tmp_path / "data") as client:
+        normal, private = await project_of(client, "N"), await project_of(client, "P", level="private")
+        moving, staying = await conversation_in(client, normal), await conversation_in(client, normal)
+        await send(client, staying, "Remember: the sample is 30 nurses")
+        await send(client, moving, "Correct: the sample is 40 nurses")  # its sources: both conversations' turns
+        assert await client.post(f"/api/conversations/{moving}/move", json={"project_id": private})
+        lines, ids = await asyncio.to_thread(client.state["db"].read, lambda conn: memory.project_state(conn, normal))
+        assert not any("40 nurses" in line for line in lines)
+        record = (await rows(client, "SELECT id FROM memory_records WHERE content = 'the sample is 40 nurses'"))[0][0]
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, normal, [record])) is False
+
+
+async def test_a_superseded_record_never_leaves_at_dispatch(tmp_path):
+    # 3: only current statuses
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()
+        await client.patch(f"/api/memory/{record['id']}", json={"version": 1, "content": "We use surveys"})
+        assert await asyncio.to_thread(client.state["db"].read,
+                                       lambda conn: memory.allowed(conn, project, [record["id"]])) is False
+
+
+async def test_memory_off_mid_turn_ends_a_turn_whose_chain_holds_memory(tmp_path):
+    # 4: the chain is never rewritten (model-route rule 5), so a turn that read memory stops at the next step boundary
+    from cited import cited, with_papers
+    from test_search import WAGES
+    switched = {}
+
+    async def read_then_off(body):
+        return steps_reply(provider, [call("read_memory")])
+
+    async def off_then_list(body):
+        await memory_off(switched["client"], switched["project"])
+        return steps_reply(provider, [call("list_materials", "c2")])
+    provider = Scripted(read_then_off, off_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        switched.update(client=client, project=project)
+        await client.post("/api/memory", json={"project_id": project, "type": "decision", "content": "CANARY decision"})
+        stream = await send(client, await conversation_in(client, project), "Translate this: hello")
+        assert len(provider.agent_steps) == 2  # no third request carries the memory tool's result
+        assert stream[-1]["status"] == "cancelled" and stream[-1]["cancel_reason"] == "revoked"
+
+
+async def test_a_decision_in_project_state_is_not_said_missing(tmp_path):
+    # 6
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: we decided our method is semi-structured interviews")
+        await send(client, conversation, "Which method did we decide on last time?")
+        system = provider.answers[-1]["messages"][0]["content"]
+        assert "semi-structured interviews" in system and memory.MISSING not in system

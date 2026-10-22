@@ -1484,7 +1484,9 @@ class Harness:
                 embedded = await search.embedded_memory(state, [r["id"] for r in candidates]) if nearest else None
                 chosen = memory.ranked(candidates, nearest, embedded=embedded)
                 sections["user_memory"] += [memory.memory_line(r) for r in chosen]
-                if not chosen and decision.get("rule") == "earlier_decision":  # said, never invented (ticket 31)
+                # said, never invented (ticket 31): only when neither section holds a decision or the project's state
+                if not chosen and decision.get("rule") == "earlier_decision" \
+                        and not any(line.startswith("- [state") for line in sections.get("project_state", ())):
                     ctx["memory_missing"] = [memory.MISSING]
                 ids += [r["id"] for r in chosen]
                 traced.update(records=[r["id"] for r in chosen], mode=mode, **({"reason": reason} if reason else {}))
@@ -1522,8 +1524,14 @@ class Harness:
         chain, calls_made, failures = [], 0, 0
         for number in range(limits["agent_steps"]):
             if number:
-                if ctx.get("memory_sections") and not await self.memory_on(ctx["project_id"]):
-                    ctx["memory_sections"], ctx["memory_missing"] = {}, []  # switched off mid-turn: recalled no more
+                if ctx.get("memory_ids") and not await self.memory_on(ctx["project_id"]):
+                    # Switched off mid-turn after the turn's requests held memory (recalled, or a memory tool's result in
+                    # its chain, which is never cut or rewritten: model-route rule 5): no later request may carry it, so
+                    # the turn ends here as a change to its project ends a run (section 10): cancelled, revoked, with
+                    # Continue, which builds the next turn with memory off.
+                    claim.cancel_reason = "revoked"
+                    claim.cancel_requested.set()
+                    raise asyncio.CancelledError()
                 try:
                     _, request = self._cited_request(ctx, found, decision, chain=chain, read=turn.evidence.numbered)
                 except context.OverWindow:

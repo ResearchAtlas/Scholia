@@ -90,3 +90,12 @@ test('Where we left off and the memory views drop what they show when the librar
   const live = readFileSync(join(SRC, 'live.js'), 'utf8');
   assert.match(live, /if \(event\.type === 'memory'\) memoryChanged\(/); // a turn's command or note changes memory
 });
+
+// Fix batch 2 (finding 5): every action that changes what the memory views show tells them: the project's memory
+// switch, its protection (tightening or locking makes personal records its own) and a conversation's move.
+test('the memory switch, a protection change and a move each emit a memory change', () => {
+  const settings = readFileSync(join(SRC, 'components', 'Settings.jsx'), 'utf8');
+  assert.match(settings, /own\.save\(\{ 'memory\.enabled': value === 'on' \}\)[^\n]*memoryChanged\(project\.id\)/);
+  assert.match(readFileSync(join(SRC, 'components', 'Governance.jsx'), 'utf8'), /memoryChanged\(project\.id\)/);
+  assert.match(readFileSync(join(SRC, 'components', 'Sidebar.jsx'), 'utf8'), /memoryChanged\(null\)/);
+});
