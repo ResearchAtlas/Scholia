@@ -1858,12 +1858,12 @@ def _held_retry_write(monkeypatch):
     from backend.db import Database
     real, armed, entered, go = Database.write, [True], threading.Event(), threading.Event()
 
-    def write(self, fn):
+    def write(self, fn, committed=None):
         if armed and "record_background" in fn.__qualname__:
             armed.clear()
             entered.set()
             go.wait(10)
-        return real(self, fn)
+        return real(self, fn, committed)
     monkeypatch.setattr(Database, "write", write)
     return entered, go
 
@@ -2092,11 +2092,11 @@ async def test_a_request_cancelled_after_its_commit_still_starts_the_run_it_was_
         harness = client.state["harness"]
         real_write, entered, go = Database.write, threading.Event(), threading.Event()
 
-        def write(self, fn):
+        def write(self, fn, committed=None):
             if "record_background" in fn.__qualname__ and not entered.is_set():
                 entered.set()
                 go.wait(10)
-            return real_write(self, fn)
+            return real_write(self, fn, committed)
         Database.write = write
         try:
             request = asyncio.ensure_future(search._request(harness, project))

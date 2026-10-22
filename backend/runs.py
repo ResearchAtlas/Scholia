@@ -191,11 +191,11 @@ class Registry:
         self.turns: dict[str, ActiveRun] = {}  # by conversation
         self.closed = False
         self.dropped: list[str] = []  # stale claims released, whose runs are still to be recorded
-        # Background runs whose terminal record this process wrote, each added once that record has
-        # committed and before the run is released: a read taken just before the commit still says
-        # running, and is not interrupted. A run whose terminal write raised is never added, so once
-        # released it reads interrupted, as its record still says running (Harness._ended).
-        # ponytail: one id per background run finished in this launch; a bounded log if that grows large
+        # Runs (background runs and turns) whose terminal record this process wrote, each added once
+        # that record has committed and before the run is released: a read taken just before the commit
+        # still says running, and is not interrupted. A run whose terminal write raised is never added,
+        # so once released it reads interrupted, as its record still says running (Harness._ended).
+        # ponytail: one id per run finished in this launch; a bounded log if that grows large
         self.finished: set[str] = set()
         # Background runs a retry takes over (materials.retry_run): never held from then on. The lock
         # makes holding a run (add_background) and retiring it (retire, from a write transaction's
@@ -260,15 +260,21 @@ class Registry:
             if active.conversation_id is not None and self.turns.get(active.conversation_id) is active:
                 del self.turns[active.conversation_id]
 
+    def free_conversation(self, active: ActiveRun) -> None:
+        """Let a new turn claim the conversation a turn holds, the run itself still held (see release)."""
+        with self.lock:
+            if active.conversation_id is not None and self.turns.get(active.conversation_id) is active:
+                del self.turns[active.conversation_id]
+
     def is_active(self, run_id: str) -> bool:
         return run_id in self.runs
 
 
 def derived_status(status: str, run_id: str, registry: Registry) -> str:
     """A run's status as it reads now: a running run this process does not hold is interrupted. A
-    background run is held from before its record commits (record_background, start_local) until its
-    terminal record has, and is in `finished` from then on, so a read that raced its start or its end
-    never takes it for interrupted."""
+    background run is held from before its record commits (record_background, start_local), and a turn
+    from its claim, until its terminal record has, and is in `finished` from then on, so a read that
+    raced its start or its end never takes it for interrupted."""
     if status == "running" and not registry.is_active(run_id) and run_id not in registry.finished:
         return "interrupted"
     return status
@@ -493,7 +499,8 @@ class Harness:
         is never interrupted. A background run stopping for a shutdown it would restart after
         (a refused restore) is the exception: a later Cancel or revocation becomes its reason,
         without interrupting its cleanup, so it ends instead. A claim whose response never
-        started has run nothing: it is released and recorded at once. A background run whose
+        started has run nothing: its conversation is freed and it is recorded at once, and it
+        is released once that write has ended. A background run whose
         task is still to come (its record being written, see record_background) stays held:
         its task sees the request as it starts, and ends it."""
         if active.cancel_requested.is_set():
@@ -507,11 +514,20 @@ class Harness:
                 active.task.cancel()
             # else it sees the request as it starts, and ends through its own cleanup
         elif active.kind == "turn" and self.registry.runs.get(active.run_id) is active:
-            self.registry.release(active)
+            # Its conversation is free at once, so a new message may be sent; the run stays held until its
+            # terminal write ends, and is known finished once that has committed, so no read takes it for
+            # interrupted meanwhile. One whose write fails reads interrupted once released.
+            self.registry.free_conversation(active)
             status = "interrupted" if reason == "shutdown" else "cancelled"
             cancel_reason = None if status == "interrupted" else ("revoked" if reason == "revoked" else "researcher")
-            active.closing = self._detach(self._write(
-                lambda conn: self._finish_turn(conn, active.run_id, status, cancel_reason, status)))
+
+            async def close():
+                try:
+                    return await self._ended(
+                        active, lambda conn: self._finish_turn(conn, active.run_id, status, cancel_reason, status))
+                finally:
+                    self.registry.release(active)
+            active.closing = self._detach(close())
 
     def stream_closed(self, claim: ActiveRun) -> None:
         """A turn's response ended, however it ended: a turn still running, or one that
@@ -536,7 +552,8 @@ class Harness:
         if active is not None:
             self._request_cancel(active, reason)
             if active.closing is not None:  # its response never started: recorded now
-                return await active.closing
+                # Shielded: a request cancelled while it waits never cancels the write, its finished mark or its release.
+                return await asyncio.shield(active.closing)
             if active.task is not None:
                 await asyncio.wait({active.task}, timeout=CANCEL_WAIT_SECONDS)
                 if not active.task.done():
@@ -786,7 +803,7 @@ class Harness:
         (seq, request, history, decision, (history_materials, history_left_out), (active, skill_sections)), cancelled = \
             await self._write_through(admit)
         if cancelled:  # its request went away while the run was written: it never runs, as by Stop
-            await _through(self._write(lambda conn: self._finish_turn(
+            await _through(self._ended(claim, lambda conn: self._finish_turn(
                 conn, claim.run_id, "cancelled", "researcher", "cancelled")))
             raise asyncio.CancelledError()
         claim.context = {
@@ -863,8 +880,8 @@ class Harness:
                 raise _LimitReached(result)
             if not result.ok or visible(result.content) is None:  # tool calls alone where none were offered
                 code = result.error_kind or "malformed"
-                final = await self._write(lambda conn: self._finish_turn(conn, claim.run_id, "failed", None,
-                                                                          code, claim=claim))
+                final = await self._ended(claim, lambda conn: self._finish_turn(
+                    conn, claim.run_id, "failed", None, code, claim=claim))
                 if final["status"] == "failed":  # not a Stop that came first
                     emit({"type": "error", "code": code})
                 emit({"type": "run_finished", **final})
@@ -887,7 +904,7 @@ class Harness:
                       **({"cut": True} if result.cut else {}),  # saved, and marked as stopped at its output limit
                       **({"notices": notices} if notices else {})}
             try:
-                final = await self._write(lambda conn: self._commit_answer(conn, claim, answer, ctx))
+                final = await self._ended(claim, lambda conn: self._commit_answer(conn, claim, answer, ctx))
             except _Cancelled:  # the Stop came first: no answer is published
                 raise asyncio.CancelledError() from None
             except Exception as error:  # the answer could not be saved: it is still shown, marked unsaved
@@ -896,7 +913,7 @@ class Harness:
                       "result_saved": False, "error": "save_failed", **({"cut": True} if result.cut else {}),
                       **({"notices": answer["notices"]} if answer.get("notices") else {})})
                 with suppress(Exception):
-                    final = await _through(self._write(lambda conn: self._finish_turn(
+                    final = await _through(self._ended(claim, lambda conn: self._finish_turn(
                         conn, claim.run_id, "failed", None, "save_failed", claim=claim)))
                     emit({"type": "run_finished", **final[0]})
                 return
@@ -919,7 +936,7 @@ class Harness:
                 emit({"type": "limit_reached", "limit": hit.code})
             emit({"type": "run_finished", **final})
         except spending.BudgetExceeded as exceeded:  # stopped at a limit: Continue is offered once it is raised
-            final, _ = await _through(self._write(lambda conn: self._finish_turn(
+            final, _ = await _through(self._ended(claim, lambda conn: self._finish_turn(
                 conn, claim.run_id, "cancelled", "limit", "budget", limit={"budget": exceeded.budget}, claim=claim)))
             if final.get("cancel_reason") == "limit":  # not a Stop that came first
                 emit({"type": "limit_reached", "budget": exceeded.budget})
@@ -952,7 +969,7 @@ class Harness:
             _close_call(conn, call)
             return self._finish_turn(conn, claim.run_id, status, cancel_reason, reason or status, claim=claim)
 
-        return await self._write(stop)
+        return await self._ended(claim, stop)
 
     def _finish_turn(self, conn, run_id, status, cancel_reason, reason_code, limit=None, claim=None):
         """Write a terminal status for a turn that has no answer, if it is still running.
@@ -1842,12 +1859,12 @@ class Harness:
         if active is not None:
             active.task = asyncio.create_task(self._background(active))
 
-    async def _ended(self, active, write):
-        """Await a background run's terminal write; once it has committed, the run is known finished
-        here (Registry.finished), before it is released. A write that raises marks nothing."""
-        result = await write
-        self.registry.finished.add(active.run_id)
-        return result
+    async def _ended(self, active, fn):
+        """A run's terminal write (a background run's or a turn's): fn in one transaction, after whose commit
+        the writer itself marks the run finished here (Registry.finished), so no cancellation of this await
+        can separate the mark from the commit, and the run is known finished before it is released. A write
+        that raises marks nothing."""
+        return await asyncio.to_thread(self.db.write, fn, committed=lambda: self.registry.finished.add(active.run_id))
 
     async def _background(self, active: ActiveRun) -> None:
         active.started = True
@@ -1864,12 +1881,11 @@ class Harness:
             project_id, workflow, attempts, inputs, _, source, cancel_reason = row
             inputs = json.loads(inputs or "{}")
             if cancel_reason == "revoked":  # revoked while it waited, or before a crash: no call, no effect
-                await self._ended(active, self._write(
-                    lambda conn: self._finish_background(conn, active, "cancelled", None, inputs)))
+                await self._ended(active, lambda conn: self._finish_background(conn, active, "cancelled", None, inputs))
                 return
             if workflow in self.workflows:  # it returns once its terminal record has committed
                 index_run = workflow == "index"
-                await self._ended(active, self._local(active, project_id, workflow, inputs))
+                await self._local(active, project_id, workflow, inputs)
                 return
             inputs["message"] = json.loads(source).get("text", "")[:4000] if source else None  # held in memory only
             recorded = await self._read(lambda conn: conn.execute(
@@ -1881,11 +1897,10 @@ class Harness:
             elif attempts < BACKGROUND_ATTEMPTS:  # rule 3: another model call
                 output = await self._background_call(active, project_id, workflow, inputs)
             else:  # rule 4
-                await self._ended(active, self._write(
-                    lambda conn: self._finish_background(conn, active, "interrupted", None, inputs)))
+                await self._ended(active, lambda conn: self._finish_background(conn, active, "interrupted", None, inputs))
                 return
-            await self._ended(active, self._write(lambda conn: self._finish_background(
-                conn, active, "succeeded" if output is not None else "failed", output, inputs)))
+            await self._ended(active, lambda conn: self._finish_background(
+                conn, active, "succeeded" if output is not None else "failed", output, inputs))
         except asyncio.CancelledError:
             call = active.call
 
@@ -1903,10 +1918,9 @@ class Harness:
             if not running:  # its terminal record committed
                 self.registry.finished.add(active.run_id)
             elif active.cancel_reason != "shutdown":  # a Cancel came once that had committed
-                await self._ended(active, _through(self._write(cancelled)))
+                await _through(self._ended(active, cancelled))
         except spending.BudgetExceeded:
-            await self._ended(active, _through(self._write(
-                lambda conn: self._finish_background(conn, active, "failed", None, None))))
+            await _through(self._ended(active, lambda conn: self._finish_background(conn, active, "failed", None, None)))
         except Exception as error:  # its record still says running: kept for the next start
             log.error("background run failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
         finally:
@@ -2148,7 +2162,7 @@ class Harness:
         # whose effect is done (a published archive) keeps its outcome, and _finish_local decides
         # in its transaction whether a cancellation came before an effect it still has to apply.
         try:
-            await _through(self._write(lambda conn: self._finish_local(conn, active, *outcome, summary, effect)))
+            await _through(self._ended(active, lambda conn: self._finish_local(conn, active, *outcome, summary, effect)))
         except BaseException as error:  # nothing of it was written, the runs its effect recorded neither
             for held in active.follows:
                 self.registry.release(held)
@@ -2156,7 +2170,7 @@ class Harness:
             if not isinstance(error, RunOutcome):
                 raise
             # Its effect found it could not be applied.
-            await _through(self._write(lambda conn: self._finish_local(
+            await _through(self._ended(active, lambda conn: self._finish_local(
                 conn, active, error.status, error.cancel_reason, {"reason": error.reason} if error.reason else None)))
         self.start_follows(active)  # recorded with its terminal record, which has committed
 
