@@ -525,7 +525,8 @@ class Harness:
         if active is not None:
             self._request_cancel(active, reason)
             if active.closing is not None:  # its response never started: recorded now
-                return await active.closing
+                # Shielded: a request cancelled while it waits never cancels the write, its finished mark or its release.
+                return await asyncio.shield(active.closing)
             if active.task is not None:
                 await asyncio.wait({active.task}, timeout=CANCEL_WAIT_SECONDS)
                 if not active.task.done():

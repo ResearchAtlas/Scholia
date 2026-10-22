@@ -900,6 +900,55 @@ async def test_a_turn_stopped_before_its_response_starts_never_reads_interrupted
         await background_idle(client)
 
 
+@pytest.mark.parametrize("at", ["before_its_write_starts", "during_its_write"])
+async def test_a_stop_request_cancelled_while_it_waits_never_cancels_the_terminal_write_of_a_turn_never_started(
+        tmp_path, monkeypatch, at):
+    """PR 46 recheck: a Stop request cancelled while it waited for the terminal write of a turn whose response never
+    started cancelled that write's task, so the run was released before its record committed and never known finished
+    (it read interrupted), or, cancelled before the task first ran, held for good. The write runs to its end whatever
+    becomes of its waiters."""
+    real_ended, real_finish = runs_module.Harness._ended, runs_module.Harness._finish_turn
+    entered, writing, gate = [], threading.Event(), threading.Event()
+
+    async def ended(self, active, write):
+        entered.append(active.run_id)
+        return await real_ended(self, active, write)
+
+    def finish(self, conn, *args, **kwargs):  # its terminal write waits until the request is cancelled
+        writing.set()
+        gate.wait(10)
+        return real_finish(self, conn, *args, **kwargs)
+
+    monkeypatch.setattr(runs_module.Harness, "_ended", ended)
+    monkeypatch.setattr(runs_module.Harness, "_finish_turn", finish)
+    async with started(tmp_path / "data") as client:
+        conversation = await new_conversation(client)
+        harness = client.state["harness"]
+        claim = await harness.admit_turn(conversation, "never started")
+        stop = asyncio.create_task(harness.cancel(claim.run_id))
+        if at == "before_its_write_starts":
+            await asyncio.sleep(0)  # the request has asked and waits; the write's task has not run yet
+            assert claim.closing is not None and entered == []
+            gate.set()
+        else:
+            await asyncio.to_thread(writing.wait, 10)
+        stop.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop
+        if at == "during_its_write":
+            assert harness.registry.is_active(claim.run_id)  # still held while its write runs
+            [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+            assert turn["status"] == "running"
+            gate.set()
+        await asyncio.wait({claim.closing}, timeout=10)
+        assert claim.closing.done() and not claim.closing.cancelled()
+        assert not harness.registry.is_active(claim.run_id) and claim.run_id in harness.registry.finished
+        assert claim.provider is not None and not harness.provider_busy(claim.provider)  # nothing held for good
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert (turn["status"], turn["cancel_reason"]) == ("cancelled", "researcher")
+        await background_idle(client)
+
+
 async def test_a_turn_stopped_before_its_response_starts_whose_terminal_write_fails_reads_interrupted(tmp_path,
                                                                                                     monkeypatch):
     async with started(tmp_path / "data") as client:
