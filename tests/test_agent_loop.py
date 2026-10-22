@@ -740,3 +740,45 @@ async def test_c3_a_nested_calls_settlement_failure_reaches_the_turns_cleanup_no
                           run_id) == [(0,)]
         turn = (await client.get(f"/api/conversations/{conversation}")).json()["turns"][-1]
         assert turn["accounting"]["unknown_attempts"] == 1  # the sent call's charge is unknown, not lost
+
+
+# The turn's deadline in the dispatch check (structural fix, pending Harold: ticket 60 rule 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wait", ["body", "gate"])
+async def test_deadline_no_request_leaves_past_it_whatever_it_waited_for_before_the_gate_let_it_out(tmp_path,
+                                                                                                    monkeypatch, wait):
+    from backend import outbound_gate, runs
+    clock = [1000.0]
+    monkeypatch.setattr(runs, "_clock", lambda: clock[0])
+    if wait == "body":  # the request body's storage takes the turn past its 15 minutes
+        real = runs._stored
+
+        def slow(content, body, hold=None):
+            if body and b'"messages"' in body and b'"role":"tool"' not in body:
+                clock[0] += 901
+            return real(content, body, hold)
+        monkeypatch.setattr(runs, "_stored", slow)
+    else:  # the outbound gate's own decision takes it past them
+        real_policy = outbound_gate._policy
+
+        def slow_policy(conn, level, kind, *args, **kwargs):
+            if kind is outbound_gate.Kind.MODEL_PROVIDER:
+                clock[0] += 901
+            return real_policy(conn, level, kind, *args, **kwargs)
+        monkeypatch.setattr(outbound_gate, "_policy", slow_policy)
+    provider = Scripted("Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert provider.agent_steps == [] and {"type": "limit_reached", "limit": "turn_minutes"} in stream
+        run_id = stream[0]["run_id"]
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status != 'released'",
+                          run_id) == [(0,)]  # nothing was sent, so nothing is charged
+        attempts = [d for k, d, _ in await events_of(client, run_id) if k == "model_attempt"]
+        assert [(a["outcome"], a["dispatched"]) for a in attempts] == [("refused", False)]
+        refusals = await rows(client, "SELECT data ->> 'reason' FROM audit_log WHERE event = 'outbound'"
+                                      " AND data ->> 'decision' = 'deny'")
+        assert ("turn_deadline",) in refusals  # the gate's record names why

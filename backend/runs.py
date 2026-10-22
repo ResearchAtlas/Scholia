@@ -317,7 +317,7 @@ def _let_go(conn, run_id):
                  " AND json_type(inputs, '$.held') IS NOT NULL", (run_id,))
 
 
-def may_dispatch(conn, run_id) -> bool:
+def may_dispatch(conn, run_id, past_deadline=None):
     """The check before every dispatch (slice-1 spec section 10, Revocation), which the outbound
     gate reads in its decision transaction, so retries are covered too: the run is still running
     and not revoked; every owner it has still exists (a turn's project and conversation; detached
@@ -325,7 +325,9 @@ def may_dispatch(conn, run_id) -> bool:
     conversation and source turn are no deletion); its project is not review-locked; and every
     passage its request holds (inputs.evidence, S1-19's [passage id, material id] pairs) is still read
     by the paper the request names it under. The project's current level and the route it allows are
-    the gate's own checks there."""
+    the gate's own checks there. past_deadline(), if given, is a turn's time limit (section 13), checked here, in
+    the gate's decision transaction just before the request is sent, whatever it waited for before (its body's
+    storage, the gate, the stream's reader): past it the request is refused, "turn_deadline"."""
     row = conn.execute(
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
@@ -338,6 +340,8 @@ def may_dispatch(conn, run_id) -> bool:
     owners = has_conversation if kind in ("turn", "child") else has_source
     if not (status == "running" and cancel_reason is None and not locked and bool(owners)):
         return False
+    if past_deadline is not None and past_deadline():
+        return "turn_deadline"
     # S1-19: every passage in the request's context is still read by the paper it is named under
     # (section 10, Revocation: each PR that adds a context source registers its records here).
     wanted = {tuple(pair) for pair in json.loads(evidence)} if evidence else set()
@@ -357,7 +361,7 @@ class _Call:
     retention: dict | None = None  # the retention terms the gate applied when it let the call out
     bodies: list = field(default_factory=list)  # S1-19: each attempt's request body as stored (its sha256, or None)
     materials: tuple = ()  # the papers whose text its request holds, for the bodies' deletion links
-    declined: bool = False  # S1-19c: a retry not sent because the turn's time limit had passed
+    declined: bool = False  # S1-19c: an attempt refused at dispatch because the turn's time limit had passed
 
 
 class Harness:
@@ -1051,7 +1055,9 @@ class Harness:
         (_release_allowances)."""
         run_id = active.run_id
         context = active.context if active.context is not None else {}
-        if _past_deadline(context):  # a turn's time limit holds before every model call it makes, its judge's included
+        # A turn past its time limit reserves nothing more: an early form of the dispatch check's (may_dispatch), which
+        # alone binds at the moment a request leaves; this one only saves a reservation and a step that never runs.
+        if _past_deadline(context):
             raise _LimitReached("turn_minutes")
 
         def reserve(conn):
@@ -1722,13 +1728,6 @@ class Harness:
             call.dispatched, call.retention = True, terms
 
         async def keep(body):  # stored, and linked to its papers, before it is sent: a stop or a crash keeps it
-            # The last moment before the request leaves, whatever it waited for (the stream's reader, a retry): a turn
-            # past its time limit sends nothing (section 13); the call is closed, released, by the turn's limit path.
-            if _past_deadline(active.context):
-                if call.bodies:  # a retry of a call already sent: declined, the call recorded as it ended, then stopped
-                    call.declined = True
-                    return False
-                raise _LimitReached("turn_minutes")
             # Held from collection until its link commits (or is skipped: then collected once idle).
             with self.content.hold() if self.content is not None else nullcontext([]) as held:
                 ref = await asyncio.to_thread(_stored, self.content, body, held)
@@ -1739,7 +1738,11 @@ class Harness:
         call.materials = tuple(sorted(set(materials)))
 
         call.route = route.key
-        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id),
+        def past():  # the turn's time limit, read by the dispatch check as the request is about to leave
+            call.declined = call.declined or _past_deadline(active.context)
+            return call.declined
+
+        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past),
                                           provider=route.provider.name) as client:
             result = await openrouter.query_model(
                 client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
@@ -1798,7 +1801,7 @@ class Harness:
         active.call = None
         if cancelled:
             raise asyncio.CancelledError()
-        if call.declined:  # its retry fell past the turn's time limit: recorded and settled, the turn stops there
+        if call.declined:  # refused at dispatch for the turn's time limit: recorded and settled, the turn stops there
             raise _LimitReached("turn_minutes")
         return result
 

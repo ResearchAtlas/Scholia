@@ -262,8 +262,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
     notice that a request went out is the only evidence that an attempt may be
     billed. on_dispatch, if given, is called with that notice, so a caller cancelled
     before it knows nothing left. on_body, if given, is awaited with each attempt's exact request bytes
-    before they are sent (S1-19: the trace keeps them even for a call stopped in flight); a retry it answers
-    False to is not sent, and the call ends with the attempt before it (S1-19c: a turn past its time limit).
+    before they are sent (S1-19: the trace keeps them even for a call stopped in flight).
     """
     sent = []  # the gate's notices that the current attempt's request went out, with the terms it applied
 
@@ -287,8 +286,7 @@ async def query_model(client: httpx.AsyncClient, route, key: str, messages, *, t
         sending = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         if on_body is not None:
             keeping = time.monotonic()
-            if await on_body(sending) is False and attempts:  # a retry declined: the call ends as its last attempt did
-                return _failed(attempts[-1].outcome, attempts, route)
+            await on_body(sending)
             deadline += time.monotonic() - keeping  # keeping the body does not spend the call's bound
         remaining = deadline - time.monotonic()
         if remaining <= 0:

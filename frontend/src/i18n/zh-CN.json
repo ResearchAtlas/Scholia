@@ -1233,5 +1233,6 @@
   },
   "ask.toolErrors.option.continue": "继续",
   "ask.toolErrors.option.stop": "停止",
-  "errors.tools_over_window": "该模型的上下文窗口太小，无法容纳 Scholia 的工具和技能。请选择窗口更大的模型。"
+  "errors.tools_over_window": "该模型的上下文窗口太小，无法容纳 Scholia 的工具和技能。请选择窗口更大的模型。",
+  "audit.reason.turn_deadline": "这一轮已达到时间上限"
 }

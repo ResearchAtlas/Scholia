@@ -1275,5 +1275,6 @@
   },
   "ask.toolErrors.option.continue": "Keep going",
   "ask.toolErrors.option.stop": "Stop",
-  "errors.tools_over_window": "This model's context window is too small for Scholia's tools and skills. Pick a model with a larger window."
+  "errors.tools_over_window": "This model's context window is too small for Scholia's tools and skills. Pick a model with a larger window.",
+  "audit.reason.turn_deadline": "the turn had reached its time limit"
 }

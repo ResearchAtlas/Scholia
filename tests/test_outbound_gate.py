@@ -1368,7 +1368,7 @@ REASONS = {
     "gate_inputs_unavailable", "cross_origin_redirect", "sensitivity_changed", "unsupported_method",
     "not_openrouter", "private_inputs_missing", "unchecked_request", "unsupported_endpoint", "unsupported_feature",
     "not_candidate_url", "not_general_project",
-    "route_not_allowed", "missing_flags", "key_not_confirmed", "revoked",
+    "route_not_allowed", "missing_flags", "key_not_confirmed", "revoked", "turn_deadline",
 }
 ORIGIN = re.compile(r"https?://(\[[0-9a-f:.%]+\]|[a-z0-9.-]+):[0-9]{1,5}")
 
