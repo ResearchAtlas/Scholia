@@ -954,8 +954,9 @@ class Harness:
 
     async def _end_turn(self, claim, fn):
         """A turn's terminal write fn(conn) -> its final state, to its end whatever cancellations arrive meanwhile: the
-        one way the agent loop's own endings (a turn limit, a stop after tool errors) are written (S1-19c)."""
-        final, _ = await _through(self._write(fn))
+        one way the agent loop's own endings (a turn limit, a stop after tool errors) are written (S1-19c). Through
+        _ended, so the turn is marked finished as its record commits (PR 46)."""
+        final, _ = await _through(self._ended(claim, fn))
         return final
 
     async def _stop_turn(self, claim, *, status=None, reason=None):
