@@ -1455,7 +1455,8 @@ class Harness:
         revocation ends the wait, and the turn's end closes the ask (_finish_turn). The agent's own question and
         option labels (question given) are the model's text, which may quote a paper: the append-only ask event
         names its options by number only, and the text is held in the run's inputs (`held.ask`, asks.SHOWN shows it)
-        only while the run runs, taken out at its terminal record (_let_go; backend/provenance.py). applies, if given,
+        only while the run runs, taken out at its terminal record (_let_go), or at once by a deletion of a paper its
+        dependency set holds (provenance.forget). applies, if given,
         is awaited at each look: once it says the ask no longer applies (an approval whose tool's rule changed), the
         ask is withdrawn (`tool_rules_changed`) and None returned, as for a change of protection. call_id is the
         content-free id (agent.traced_id), or None for the harness's own ask."""

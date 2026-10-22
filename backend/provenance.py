@@ -14,7 +14,8 @@ carries, so the set is transitive. That one set is used everywhere:
 - Stored request bodies (the trace's exact outbound text) are linked to it (run_body_materials) when they
   are stored, before they are sent, and go with any of its papers (db/deletion.py RULES).
 - Stored rows holding such text name their paper and lose the text with it: a citation's quote and
-  sentence (db/deletion.py _SOURCE_REMOVED). Append-only events never hold it: they name citations and
+  sentence (db/deletion.py _SOURCE_REMOVED). An agent's question and option labels, held in its run's inputs
+  while it waits (`held.ask`, S1-19c), go in the deletion's own transaction (`forget`). Append-only events never hold it: they name citations and
   passages by id, and a citation check binds a verdict to its sentence by the sentence's hash.
 - An answer stays the conversation's record (turns.answer), but every copy derived from it follows its
   whole dependency set (Harold, 2026-10-21, option A): once any of its papers is gone, every citation row

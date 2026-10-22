@@ -795,8 +795,11 @@ async def test_c4_a_deletion_clears_the_agents_held_question_in_its_own_transact
     async with cited(tmp_path, provider) as client:
         project, [material] = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
+        other = (await with_papers(client, paper("Unrelated", "Rents rose in another synthetic city.")))[1][0]
         sending = asyncio.create_task(send(client, conversation, "Which papers do I have?"))
-        await asked(client, conversation)
+        ask = await asked(client, conversation)
+        assert (await client.delete(f"/api/materials/{other}")).status_code == 200  # outside its dependency set
+        assert (await asked(client, conversation))["params"]["question"].endswith("Go on?")  # still asked, still shown
 
         def failing(*args, **kwargs):  # the turn's terminal write fails: its own cleanup never runs
             raise RuntimeError("the terminal write failed")
@@ -805,6 +808,9 @@ async def test_c4_a_deletion_clears_the_agents_held_question_in_its_own_transact
         held = await rows(client, "SELECT count(*) FROM runs WHERE inputs LIKE ? OR inputs LIKE ?",
                           "%synthetic panel%", "%low-paid%")
         assert held == [(0,)]  # gone with the deletion itself, whatever the run's end does
+        assert (await client.get(f"/api/asks?conversation_id={conversation}")).json()["asks"] == []
+        late = await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "1"})
+        assert late.status_code == 409  # its run is revoked: the question cannot be answered
         monkeypatch.undo()
         sending.cancel()
         with contextlib.suppress(BaseException):
