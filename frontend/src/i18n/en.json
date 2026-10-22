@@ -1390,5 +1390,6 @@
   "export.memory": "Include this project's memory records",
   "trace.memoryMode.similarity": "ranked by meaning",
   "trace.memoryMode.recency": "newest first (meaning search was unavailable)",
-  "trace.memoryHeld": "Recalled"
+  "trace.memoryHeld": "Recalled",
+  "errors.sources_unavailable": "Skipped: a paper or memory record it drew on is gone or no longer allowed here."
 }

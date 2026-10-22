@@ -260,8 +260,9 @@ async def test_a_record_derived_from_a_related_record_follows_it_when_its_projec
                                                         "status": "confirmed", "span": "write it as i prefer",
                                                         "replaces": ""}])
         await asyncio.to_thread(client.state["db"].write, extract)
-        [(derived,)] = await rows(client, "SELECT id FROM memory_records WHERE content LIKE 'Write it as I prefer%'")
-        assert await recalled(client, c) == ["Write it as I prefer, naming Alice", "I prefer answers about participant Alice"]
+        [(derived, status)] = await rows(client, "SELECT id, status FROM memory_records WHERE content LIKE 'Write it as I prefer%'")
+        assert status == "proposed"  # "Alice" is not the researcher's word here: restated, so a proposal
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, c, [derived])) is True
         await tighten(client, a, "private")
         assert await recalled(client, c) == []
         assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, c, [derived])) is False
@@ -336,4 +337,87 @@ async def test_a_decision_in_project_state_is_not_said_missing(tmp_path):
         await send(client, conversation, "Remember: we decided our method is semi-structured interviews")
         await send(client, conversation, "Which method did we decide on last time?")
         system = provider.answers[-1]["messages"][0]["content"]
-        assert "semi-structured interviews" in system and memory.MISSING not in system
+        # said conditionally, never against what the request holds (fix batch 2's review: an unrelated state record
+        # must not remove it either)
+        assert "semi-structured interviews" in system and memory.MISSING in system
+        assert memory.MISSING.startswith("If neither USER MEMORY nor PROJECT STATE holds")
+
+
+# Fix batch 2, internal review: dependencies only where the text may come from another record, flat, never a cascade
+
+
+async def extraction_shown(client, project, message, shown, candidates):
+    run = await turn_in(client, project, message)
+
+    def extract(conn):
+        conn.execute("UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?)) WHERE id = ?",
+                     (json.dumps(shown), run))
+        return memory.apply_extraction(conn, run, candidates)
+    return await asyncio.to_thread(client.state["db"].write, extract)
+
+
+async def test_records_extracted_generation_after_generation_stay_recalled_and_quick(tmp_path):
+    import time
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        for generation in range(12):
+            shown = [r for (r,) in await rows(client, "SELECT id FROM memory_records ORDER BY rowid DESC LIMIT 20")]
+            await extraction_shown(client, project, f"We use method {generation} and tool {generation}", shown, [
+                {"type": "decision", "content": f"We use method {generation} and tool {generation}", "status": "confirmed",
+                 "span": f"we use method {generation} and tool {generation}", "replaces": ""},
+                {"type": "event", "content": f"Answer said thing {generation}", "status": "proposed", "span": "",
+                 "replaces": ""}])
+        started_at = time.monotonic()
+        found = await asyncio.to_thread(client.state["db"].read, lambda conn: memory.recall_candidates(conn, project))
+        assert len(found) == 12 and time.monotonic() - started_at < 1.0
+
+
+async def test_a_confirmed_preference_in_the_researchers_own_words_reaches_other_projects(tmp_path):
+    async with started(tmp_path / "data") as client:
+        b, c = await project_of(client, "B"), await project_of(client, "C")
+        state = (await client.post("/api/memory", json={"project_id": b, "type": "decision", "content": "B's own"})).json()
+        await extraction_shown(client, b, "I prefer APA citations always", [state["id"]], [
+            {"type": "preference", "content": "I prefer APA citations always", "status": "confirmed",
+             "span": "i prefer apa citations always", "replaces": ""}])
+        assert await recalled(client, c) == ["I prefer APA citations always"]
+
+
+async def test_forgetting_a_record_never_deletes_one_confirmed_from_the_researchers_words(tmp_path):
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        shown = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                         "content": "Decision A"})).json()["id"]
+        await extraction_shown(client, project, "The sample is thirty nurses", [shown], [
+            {"type": "project_state", "content": "The sample is thirty nurses", "status": "confirmed",
+             "span": "the sample is thirty nurses", "replaces": ""}])
+        assert (await client.delete(f"/api/memory/{shown}")).json() == {"ok": True}
+        assert await rows(client, "SELECT content FROM memory_records WHERE type = 'project_state'") == [
+            ("The sample is thirty nurses",)]
+
+
+async def test_an_agent_note_written_after_recalling_a_personal_record_follows_its_project(tmp_path):
+    # the note may restate what the request recalled: it follows the recalled record's project, as a proposal does
+    async with started(tmp_path / "data") as client:
+        a, b, c = await project_of(client, "A"), await project_of(client, "B"), await project_of(client, "C")
+        source = await personal(client, a)
+        run = await turn_in(client, b, "x")
+
+        def noted(conn):
+            turn = conn.execute("SELECT source_turn_id FROM runs WHERE id = ?", (run,)).fetchone()[0]
+            conn.execute("UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?)) WHERE id = ?",
+                         (json.dumps([source]), turn))
+            return memory.note(conn, project_id=b, run_id=turn, kind="next_step", text="Ask Alice", materials=())
+        note = await asyncio.to_thread(client.state["db"].write, noted)
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, b, [note])) is True
+        await tighten(client, a, "private")
+        assert await asyncio.to_thread(client.state["db"].read, lambda conn: memory.allowed(conn, b, [note])) is False
+
+
+async def test_an_earlier_decision_question_keeps_its_cannot_be_found_line_beside_unrelated_state(tmp_path):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        await client.post("/api/memory", json={"project_id": project, "type": "project_state",
+                                               "content": "Our research question is about wages"})
+        await send(client, await conversation_in(client, project), "Which sampling method did we decide on last time?")
+        assert memory.MISSING in provider.answers[-1]["messages"][0]["content"]

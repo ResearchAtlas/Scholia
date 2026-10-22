@@ -176,7 +176,7 @@ async def test_an_earlier_decision_memory_lacks_is_said_missing_never_invented(t
         assert memory.MISSING in section(provider.answers[-1], "CONFLICTS AND MISSING INFORMATION")
         await entered(client, project, "We dropped the pilot because of cost.")
         await send(client, conversation, "Why did I drop the pilot? We decided last time.")
-        assert memory.MISSING not in system(provider.answers[-1])
+        assert memory.MISSING in system(provider.answers[-1]) and "We dropped the pilot" in system(provider.answers[-1])
 
 
 

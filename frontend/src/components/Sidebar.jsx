@@ -131,6 +131,7 @@ export function Sidebar({ projects, projectId, conversations, conversationId, on
         onDone={(deleted) => {
           const kind = dialog?.kind;
           setDialog(null);
+          memoryChanged(null); // S1-21a: records resting only on what was deleted went with it
           if (kind === 'deleteProject') onProjectsChanged(); // another project is shown
           else onConversationsChanged(deleted);
         }} />

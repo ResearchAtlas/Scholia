@@ -45,8 +45,8 @@ RELATED = 20  # records an extraction is shown to deduplicate against
 STATE_NOTES = 5  # progress records and agent notes each in PROJECT STATE
 # The missing-information section's line when a turn asks about an earlier decision and memory holds none (ticket 31:
 # missing memory is said, never invented)
-MISSING = ("No memory record holds an earlier decision or conversation for this: say that it cannot be found in memory, "
-           "and never invent one.")
+MISSING = ("If neither USER MEMORY nor PROJECT STATE holds the earlier decision or conversation asked about, say that it "
+           "cannot be found in memory, and never invent one.")
 
 EXTRACT_RULES = (
     "You extract memory records from one turn of a research conversation: the researcher's message, and the "
@@ -166,13 +166,15 @@ def personal_allowed(conn, project_id):
 
 def restrict(conn, project_id):
     """The project just became Private, Local only or review-locked (or took a conversation that did): its personal
-    records, and the personal records resting on its turns or runs, become its own project records, in the same
+    records, the personal records resting on its turns or runs, and every record that may restate its memory (an
+    `origin` source), become its own project records, in the same
     transaction, so nothing of it stays or comes back as personal memory (deleted with it, if it is). Their vectors
     leave the personal partition."""
     ids = [m for (m,) in conn.execute(
-        "SELECT id FROM memory_records WHERE scope = 'personal' AND (project_id = ? OR id IN (SELECT s.memory_id"
+        "SELECT id FROM memory_records WHERE scope = 'personal' AND (project_id = ?1 OR id IN (SELECT s.memory_id"
         " FROM memory_sources s JOIN runs r ON r.id = s.source_id WHERE s.source_kind IN ('turn', 'run')"
-        " AND r.project_id = ?))", (project_id, project_id))]
+        " AND r.project_id = ?1)) UNION SELECT memory_id FROM memory_sources WHERE source_kind = 'origin'"
+        " AND source_id = ?1", (project_id,))]  # and every record that may restate its memory, wherever it is
     for record in ids:
         conn.execute("UPDATE memory_records SET scope = 'project', project_id = ?, sensitivity = (SELECT sensitivity"
                      " FROM projects WHERE id = ?), updated_at = ? WHERE id = ?", (project_id, project_id, utc_now(), record))
@@ -425,7 +427,8 @@ def save_answer(conn, *, project_id, run_id, previous, text=None):
     answer = (json.loads(found[0]) or {}).get("text") or ""
     answer = answer[:CANDIDATE_CHARS] + ("…" if len(answer) > CANDIDATE_CHARS else "")
     return write(conn, project_id=project_id, scope="project", kind="event", content=answer, status="confirmed",
-                 sources=[("turn", run_id), ("turn", previous), *papers(provenance.dependencies(conn, previous))],
+                 sources=[("turn", run_id), ("turn", previous), *papers(provenance.dependencies(conn, previous)),
+                          *origins(conn, _recalled(conn, previous), project_id)],  # what that answer may restate
                  run_id=run_id, structured={"command": "save", "from": "answer"})
 
 
@@ -490,13 +493,13 @@ def parse(text):
 
 def cap(candidate, message, author):
     """The status a candidate may have: confirmed or inferred only when the words it rests on are in the
-    researcher's own message (NFKC, case and spaces aside), are more than a word, and carry at least half of the
-    candidate's own terms, and the turn is the researcher's; else proposed, whatever the extractor said (section 8,
+    researcher's own message (NFKC, case and spaces aside), are more than a word, and hold every term of the
+    candidate (fix batch 2: a confirmed record never restates another record's text), and the turn is the researcher's; else proposed, whatever the extractor said (section 8,
     Where memory comes from: a decision planted in a paper and echoed in the answer never becomes active)."""
     span = normalized(candidate["span"])
     terms, said = _terms(candidate["content"]), _terms(span)
     own = (author == "researcher" and len(said) >= 2 and span in normalized(message)
-           and len(terms & said) * 2 >= len(terms))  # the words it rests on hold at least half of what it says
+           and terms <= said)  # every term it holds is the researcher's own (nothing restated from another record)
     return candidate["status"] if own else "proposed"
 
 
@@ -569,7 +572,9 @@ def apply_extraction(conn, run_id, candidates):
     shown = json.loads((shown and shown[0]) or "[]")
     if not all((found := row(conn, i)) is not None and valid(conn, project_id, found) for i in shown):
         return None
-    carried += [("memory", i) for i in sorted(set(shown))]
+    # what a proposal (text the model wrote, not the researcher's words) may restate: the records the extraction was
+    # shown and those its source turn's requests held
+    derived = origins(conn, [*shown, *_recalled(conn, turn)], project_id)
     personal = personal_allowed(conn, project_id)
     counts = {"confirmed": 0, "inferred": 0, "proposed": 0, "replaced": 0, "duplicates": 0}
     written = []
@@ -605,13 +610,14 @@ def apply_extraction(conn, run_id, candidates):
             untouched = target["updated_at"] <= run_started
             if authoritative and newer and untouched and not late:
                 written.append(write(conn, project_id=project_id, scope=target["scope"], kind=target["type"],
-                                     content=candidate["content"], status=status, sources=sources, run_id=run_id,
+                                     content=candidate["content"], status=status,
+                                     sources=sources + (derived if status == "proposed" else []), run_id=run_id,
                                      replaces=target["id"], structured=structured))
                 counts["replaced"] += 1
                 counts[status] += 1
                 continue
             written.append(write(conn, project_id=project_id, scope=target["scope"], kind=target["type"],
-                                 content=candidate["content"], status="proposed", sources=sources, run_id=run_id,
+                                 content=candidate["content"], status="proposed", sources=sources + derived, run_id=run_id,
                                  replaces=None, structured={**structured, "seen": target["version"],
                                                             **({"older": True} if not newer else {})}))
             conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (target["id"], written[-1]))
@@ -620,7 +626,8 @@ def apply_extraction(conn, run_id, candidates):
         if late and status != "proposed":
             status = "proposed"
         written.append(write(conn, project_id=project_id, scope=scope, kind=kind, content=candidate["content"],
-                             status=status, sources=sources, run_id=run_id, structured=structured))
+                             status=status, sources=sources + (derived if status == "proposed" else []), run_id=run_id,
+                             structured=structured))
         counts[status] += 1
     return {"counts": counts, "records": written}
 
@@ -640,6 +647,35 @@ def wants(decision):
     return True, True
 
 
+def origins(conn, record_ids, project_id):
+    """What model-written text that may restate these records depends on, flat (never a chain of records): the
+    projects their text came from (a personal record's own project, the projects of their turns and runs, other than
+    project_id), their papers, and their own origins. Recorded as sources of a proposal an extraction draws from the
+    answer, an agent's note, or a saved answer, so the record follows them (valid); a record confirmed from the
+    researcher's own words takes none."""
+    found = set()
+    for record in set(record_ids):
+        item = row(conn, record)
+        if item is None:
+            continue
+        if item["scope"] == "personal" and item["project_id"] and item["project_id"] != project_id:
+            found.add(("origin", item["project_id"]))
+        for kind, source in sources_of(conn, record):
+            if kind == "material" or kind == "origin":
+                found.add((kind, source))
+            elif kind in ("turn", "run"):
+                where = conn.execute("SELECT project_id FROM runs WHERE id = ?", (source,)).fetchone()
+                if where is not None and where[0] != project_id:
+                    found.add(("origin", where[0]))
+    return sorted(found)
+
+
+def _recalled(conn, run_id):
+    """The memory records a run's requests held (inputs.memory_ids)."""
+    held = conn.execute("SELECT json_extract(inputs, '$.memory_ids') FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return json.loads((held and held[0]) or "[]")
+
+
 def valid(conn, project_id, record, _depth=0):
     """Whether a record's text may be in a request of project_id now (S1-21a; Harold's retrieval and memory spec,
     source validity: an inaccessible source invalidates the memory derived from it). The one rule every reader of
@@ -651,7 +687,7 @@ def valid(conn, project_id, record, _depth=0):
       no stricter than project_id's (for a personal record: Normal);
     - `material`: every paper whose text it may carry exists and passes the request's access check
       (provenance.sendable);
-    - `memory`: every record it was derived from (an extraction's related records) exists and is valid itself;
+    - `origin`: a project whose memory a model-written record may restate (origins) passes the check a turn's does;
     - `paper`, `project`, `researcher`: carry no text of another source."""
     from backend import provenance
     from backend.governance import LEVELS
@@ -675,9 +711,9 @@ def valid(conn, project_id, record, _depth=0):
                                  " WHERE r.id = ?", (source,)).fetchone()
             if where is not None and (where[1] or LEVELS.index(where[0]) > ceiling):
                 return False
-        elif kind == "memory":
-            found = row(conn, source)
-            if found is None or not valid(conn, project_id, found, _depth + 1):
+        elif kind == "origin":  # a project whose memory it may restate: still no stricter, and not locked
+            where = conn.execute("SELECT sensitivity, review_lock FROM projects WHERE id = ?", (source,)).fetchone()
+            if where is not None and (where[1] or LEVELS.index(where[0]) > ceiling):
                 return False
     return provenance.sendable(conn, project_id, materials)
 
@@ -739,7 +775,8 @@ def note(conn, *, project_id, run_id, kind, text, materials):
     """An agent's note (update_progress): an open question or a next step, marked as the agent's, inferred, never
     confirmed; carrying the papers the turn's request held."""
     return write(conn, project_id=project_id, scope="project", kind="agent_note", content=text, status="inferred",
-                 sources=[("run", run_id), *papers(materials)], run_id=run_id, structured={"kind": kind})
+                 sources=[("run", run_id), *papers(materials), *origins(conn, _recalled(conn, run_id), project_id)],
+                 run_id=run_id, structured={"kind": kind})
 
 
 def _progress(conn, project_id, event, count, sources, wording):

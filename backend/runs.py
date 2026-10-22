@@ -1484,9 +1484,7 @@ class Harness:
                 embedded = await search.embedded_memory(state, [r["id"] for r in candidates]) if nearest else None
                 chosen = memory.ranked(candidates, nearest, embedded=embedded)
                 sections["user_memory"] += [memory.memory_line(r) for r in chosen]
-                # said, never invented (ticket 31): only when neither section holds a decision or the project's state
-                if not chosen and decision.get("rule") == "earlier_decision" \
-                        and not any(line.startswith("- [state") for line in sections.get("project_state", ())):
+                if decision.get("rule") == "earlier_decision":  # missing memory is said, never invented (ticket 31)
                     ctx["memory_missing"] = [memory.MISSING]
                 ids += [r["id"] for r in chosen]
                 traced.update(records=[r["id"] for r in chosen], mode=mode, **({"reason": reason} if reason else {}))
@@ -2537,7 +2535,7 @@ class Harness:
                 memory.record_notice(conn, workflow[1])
             done = {"succeeded": "indexed", "failed": "failed", "interrupted": "interrupted"}.get(status, "skipped")
             if status == "succeeded" and "counts" not in (summary or {}):  # nothing written: its turn or a paper it
-                done, summary = "skipped", {"reason": "source_removed"}  # drew on is gone
+                done, summary = "skipped", {"reason": "sources_unavailable"}  # drew on is gone or no longer allowed
             conn.execute("UPDATE turns SET memory_status = ? WHERE run_id = (SELECT source_turn_id FROM runs WHERE id = ?)",
                          (done, run_id))
         elif status == "succeeded" and output is not None:

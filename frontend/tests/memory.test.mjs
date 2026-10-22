@@ -99,3 +99,8 @@ test('the memory switch, a protection change and a move each emit a memory chang
   assert.match(readFileSync(join(SRC, 'components', 'Governance.jsx'), 'utf8'), /memoryChanged\(project\.id\)/);
   assert.match(readFileSync(join(SRC, 'components', 'Sidebar.jsx'), 'utf8'), /memoryChanged\(null\)/);
 });
+
+test('deleting a conversation tells the memory views (its turns\' records go with it)', () => {
+  const sources = ['Sidebar.jsx', 'Shell.jsx'].map((name) => readFileSync(join(SRC, 'components', name), 'utf8')).join('\n');
+  assert.match(sources, /delete[\s\S]{0,400}memoryChanged\(null\)/);
+});

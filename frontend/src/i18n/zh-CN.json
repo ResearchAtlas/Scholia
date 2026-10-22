@@ -1343,5 +1343,6 @@
   "export.memory": "包含本项目的记忆条目",
   "trace.memoryMode.similarity": "按语义排序",
   "trace.memoryMode.recency": "按时间由新到旧（语义检索不可用）",
-  "trace.memoryHeld": "调用的记忆"
+  "trace.memoryHeld": "调用的记忆",
+  "errors.sources_unavailable": "已跳过：它依据的论文或记忆条目已不存在，或在此不再允许使用。"
 }
