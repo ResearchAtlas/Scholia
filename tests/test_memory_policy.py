@@ -8,6 +8,7 @@ turn at its next paid request. Each test failed before its fix."""
 
 import asyncio
 import json
+import sys
 
 import pytest
 
@@ -515,3 +516,54 @@ async def test_r8_every_source_kind_a_record_may_have_is_named_in_both_languages
     for catalog in ("en.json", "zh-CN.json"):
         keys = json.loads((root / catalog).read_text(encoding="utf-8"))
         assert [k for k in re.findall(r"'(\w+)'", kinds) if f"memory.source.{k}" not in keys] == []
+
+
+# Fix batch 3, internal review
+
+
+async def test_a_record_saying_the_opposite_of_the_researchers_words_is_never_theirs(tmp_path):
+    # P2: "not" and "no" are terms a confirmed record must find in the researcher's words, never dropped as common
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        run = await turn_in(client, project, "I prefer tables in every answer")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
+            {"type": "preference", "content": "I prefer not tables in every answer", "status": "confirmed",
+             "span": "i prefer tables in every answer", "replaces": ""}]))
+        assert await rows(client, "SELECT scope, status FROM memory_records") == [("project", "proposed")]
+
+
+async def test_an_extraction_shown_a_proposal_edited_since_still_writes_as_proposals(tmp_path):
+    # P3: an edited proposal is a replaced record (section 8), not a forgotten one: only a Forget's tombstone stops it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        run = await turn_in(client, project, "We sample thirty nurses")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
+            "UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?)) WHERE id = ?", (json.dumps([proposal]), run)))
+        await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+        written = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
+            {"type": "project_state", "content": "We sample thirty nurses", "status": "confirmed",
+             "span": "we sample thirty nurses", "replaces": ""}]))
+        assert written is not None and written["counts"]["confirmed"] == 1
+
+
+async def test_an_extraction_holding_no_record_is_refused_at_dispatch_once_memory_is_off(tmp_path, monkeypatch):
+    # P3: memory off after the extraction's own check and before its request leaves: nothing is sent
+    provider = MockProvider()
+    extracted(provider, candidate("we sample thirty nurses", span="we sample thirty nurses"))
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        facts = runs.Harness._route_facts
+
+        async def switched_off_meanwhile(self, *args, **kwargs):
+            if sys._getframe(1).f_code.co_name == "_extraction_call":
+                await memory_off(client, project)
+            return await facts(self, *args, **kwargs)
+        monkeypatch.setattr(runs.Harness, "_route_facts", switched_off_meanwhile)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        assert provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]

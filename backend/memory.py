@@ -488,13 +488,19 @@ def parse(text):
     return candidates
 
 
+def _negations(text):
+    """The negating words a text holds, which _terms leaves out as common: a record saying the opposite of the
+    researcher's words is never theirs (S1-21a fix batch 3, internal review)."""
+    return set(re.findall(r"[^\W_]+", normalized(text))) & {"not", "no"}
+
+
 def cap(candidate, message, author):
     """The status a candidate may have: confirmed or inferred only when the words it rests on are in the
     researcher's own message (NFKC, case and spaces aside), are more than a word, and hold every term of the
     candidate (fix batch 2: a confirmed record never restates another record's text), and the turn is the researcher's; else proposed, whatever the extractor said (section 8,
     Where memory comes from: a decision planted in a paper and echoed in the answer never becomes active)."""
     span = normalized(candidate["span"])
-    terms, said = _terms(candidate["content"]), _terms(span)
+    terms, said = _terms(candidate["content"]) | _negations(candidate["content"]), _terms(span) | _negations(span)
     own = (author == "researcher" and len(said) >= 2 and span in normalized(message)
            and terms <= said)  # every term it holds is the researcher's own (nothing restated from another record)
     return candidate["status"] if own else "proposed"
@@ -562,10 +568,10 @@ def apply_extraction(conn, run_id, candidates):
     carried = papers({*provenance.dependencies(conn, turn), *json.loads((held and held[0]) or "[]")})
     if not provenance.carried(conn, [i for _, i in carried]):  # a paper it drew on was deleted: nothing of it is kept
         return None
-    # the records its request was shown: nothing is written when one of them was forgotten since (Forget also takes
-    # an output held for it, backend/db/deletion.py); one replaced since is section 8's case: its candidates wait
+    # the records its request was shown: nothing is written when one of them was forgotten since (its tombstone; Forget
+    # also takes an output held for it, backend/db/deletion.py); one replaced or edited since is section 8's case
     shown = conn.execute("SELECT json_extract(inputs, '$.memory_ids') FROM runs WHERE id = ?", (run_id,)).fetchone()
-    if conn.execute("SELECT 1 FROM json_each(?) WHERE value NOT IN (SELECT id FROM memory_records)",
+    if conn.execute("SELECT 1 FROM json_each(?) WHERE value IN (SELECT object_id FROM tombstones)",
                     ((shown and shown[0]) or "[]",)).fetchone() is not None:
         return None
     personal = personal_allowed(conn, project_id)

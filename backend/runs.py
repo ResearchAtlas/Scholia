@@ -336,17 +336,18 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
     the gate's decision transaction just before the request is sent, whatever it waited for before (its body's
     storage, the gate, the stream's reader): past it the request is refused, "turn_deadline". memory_off(), if given,
     reads the project's memory switch as it is now (S1-21a fix batch 3, R4): a request holding memory is refused once it
-    is off, whichever step of the run sends it (a nested tool's included)."""
+    is off, whichever step of the run sends it (a nested tool's included), and so is a memory extraction's."""
     row = conn.execute(
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
         " r.source_turn_id IS NULL OR EXISTS (SELECT 1 FROM turns WHERE run_id = r.source_turn_id),"
         " r.project_id, json_extract(r.inputs, '$.evidence'), json_extract(r.inputs, '$.context_materials'),"
-        " json_extract(r.inputs, '$.memory_ids')"
+        " json_extract(r.inputs, '$.memory_ids'), r.workflow"
         " FROM runs r JOIN projects p ON p.id = r.project_id WHERE r.id = ?", (run_id,)).fetchone()
     if row is None:
         return False
-    status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence, held, remembered = row
+    status, cancel_reason, kind, locked, has_conversation, has_source, project_id, evidence, held, remembered, \
+        workflow = row
     owners = has_conversation if kind in ("turn", "child") else has_source
     if not (status == "running" and cancel_reason is None and not locked and bool(owners)):
         return False
@@ -359,9 +360,11 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
     wanted = {tuple(pair) for pair in json.loads(evidence)} if evidence else set()
     # S1-21a: every memory record the request holds still exists and is still allowed in it (memory.allowed: a
     # personal record whose project was tightened or locked since it was recalled is not)
-    if remembered and json.loads(remembered) and (
-            not memory.allowed(conn, project_id, json.loads(remembered)) or (memory_off is not None and memory_off())):
+    remembered = json.loads(remembered or "[]")
+    if remembered and not memory.allowed(conn, project_id, remembered):
         return False
+    if (remembered or workflow == "memory") and memory_off is not None and memory_off():  # an extraction holds memory
+        return False  # work even when it was shown no record
     if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
         return False  # gone, or its project no longer allows this request (tightened, or review-locked)
     return not wanted or still_read(conn, project_id, wanted) == wanted
@@ -1994,7 +1997,7 @@ class Harness:
                             finished.update(unspent_id=held[0], unspent_usd=held[1])
                 if hold and "output" in finished and exists and (not provenance.carried(conn, call.materials) or conn.execute(
                         "SELECT 1 FROM runs r, json_each(r.inputs, '$.memory_ids') j WHERE r.id = ?"
-                        " AND j.value NOT IN (SELECT id FROM memory_records)", (active.run_id,)).fetchone()):
+                        " AND j.value IN (SELECT object_id FROM tombstones)", (active.run_id,)).fetchone()):
                     finished["output"] = None  # a paper it drew on, or a record it was shown, was deleted meanwhile
                 if hold and finished.get("output") is not None and exists:
                     conn.execute("UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.held.output', json(?))"
