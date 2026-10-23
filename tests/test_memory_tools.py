@@ -82,3 +82,45 @@ async def test_update_progress_refuses_a_blank_note_and_never_takes_a_confirmed_
     for name in ("read_project_state", "read_memory"):
         found = agent.REGISTRY.get_definition(name)
         assert (found.read_only, found.tool_class, found.output_chars) == (True, "read_library", 8000)
+
+
+# S1-21a follow-up
+
+
+async def test_forgetting_the_agents_note_mid_turn_revokes_the_turn_that_wrote_it(tmp_path):
+    # MB5: the note joins the turn's memory scope, so its Forget revokes the running turn before its next request
+    held = {}
+
+    async def forget_then_list(body):
+        [(note,)] = await rows(held["client"], "SELECT id FROM memory_records WHERE type = 'agent_note'")
+        assert (await held["client"].delete(f"/api/memory/{note}")).json() == {"ok": True}
+        return {"calls": [call("list_materials", "c2")]}
+    provider = Scripted([call("update_progress", kind="next_step", text="Ask Alice")], forget_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        held["client"] = client
+        stream = await send(client, await conversation_in(client, project), "Translate this: hello")
+        assert len(provider.agent_steps) == 2
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
+
+
+async def test_a_memory_tool_registers_only_the_papers_of_the_records_it_shows(tmp_path):
+    # MB8: a record cut from the tool's output for room never adds its papers to the request's scope
+    from backend import memory
+    provider = Scripted([call("read_memory")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, [paper] = await with_papers(client, WAGES)
+        import asyncio
+        db = client.state["db"]
+        await asyncio.to_thread(db.write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="Oldest decision", status="confirmed",
+            sources=[("material", paper)]))
+        for n in range(9):
+            await asyncio.to_thread(db.write, lambda conn, n=n: memory.write(
+                conn, project_id=project, scope="project", kind="decision", content=f"Decision {n} " + "x" * 900,
+                status="confirmed", sources=[("project", project)]))
+        stream = await send(client, await conversation_in(client, project), "Translate this: hello")
+        [read] = tool_messages(provider.agent_steps[1])
+        assert "Oldest decision" not in read["content"]
+        inputs = json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"]))[0][0])
+        assert paper not in inputs.get("context_materials", [])

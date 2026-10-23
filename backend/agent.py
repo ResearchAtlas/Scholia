@@ -393,6 +393,11 @@ async def open_place(call, turn):
 MEMORY_ROOM = 7000  # characters of whole records a memory tool shows, within the 8,000-character preview
 
 
+async def _memory_shown(turn, records):
+    """The records a memory tool showed join the turn's scope, with the papers of those records only (MB8)."""
+    _remembered(turn, records, await turn.read(lambda conn: memory.materials_of(conn, records)) if records else ())
+
+
 def _remembered(turn, records, materials):
     turn.ctx["memory_ids"] = sorted({*turn.ctx.get("memory_ids", ()), *records})
     turn.ctx["memory_materials"] = sorted({*turn.ctx.get("memory_materials", ()), *materials})
@@ -419,13 +424,10 @@ async def read_project_state(call, turn):
         return ToolResult(id=call.id, ok=True, text="Memory is off in this project: there is no project state to read.",
                           meta={"memory": []})
 
-    def read(conn):
-        lines, ids = memory.project_state(conn, turn.ctx["project_id"])
-        return lines, ids, memory.materials_of(conn, ids)
-    lines, ids, materials = await turn.read(read)
+    lines, ids = await turn.read(lambda conn: memory.project_state(conn, turn.ctx["project_id"]))
     shown = _within(lines)
     ids = ids[:len(shown)]
-    _remembered(turn, ids, materials)
+    await _memory_shown(turn, ids)
     return ToolResult(id=call.id, ok=True, text="\n".join(shown) if shown else "The project state is empty so far.",
                       meta={"memory": ids})
 
@@ -447,12 +449,11 @@ async def read_memory(call, turn):
         found = memory.recall_candidates(conn, turn.ctx["project_id"], locked=turn.ctx["policy"].locked)
         if query is not None:
             found.sort(key=lambda r: -memory.likeness(query, r["content"]))
-        found = found[:memory.RECALL_LIMIT]
-        return found, memory.materials_of(conn, [r["id"] for r in found])
-    found, materials = await turn.read(read)
+        return found[:memory.RECALL_LIMIT]
+    found = await turn.read(read)
     shown = _within([memory.memory_line(r) for r in found])
     ids = [r["id"] for r in found[:len(shown)]]
-    _remembered(turn, ids, materials)
+    await _memory_shown(turn, ids)
     return ToolResult(id=call.id, ok=True, text="\n".join(shown) if shown else "No memory record is recorded for this.",
                       meta={"memory": ids})
 
@@ -480,8 +481,10 @@ async def update_progress(call, turn):
         from backend.runs import _event  # it imports this module
         _event(conn, turn.claim.run_id, "memory_proposed", {"tool": "update_progress", "records": list(written)})
     await turn.harness._record(turn.claim, None, None, also=keep)
+    _remembered(turn, written, ())  # the note's text is in the chain now: forgetting it revokes this turn (MB5)
     turn.emit({"type": "memory", "action": "noted", "count": 1})
-    return ToolResult(id=call.id, ok=True, text="Noted in the project state as your note.", meta={"noted": written[0]})
+    return ToolResult(id=call.id, ok=True, text="Noted in the project state as your note.",
+                      meta={"noted": written[0], "memory": list(written)})
 
 
 def definitions():
