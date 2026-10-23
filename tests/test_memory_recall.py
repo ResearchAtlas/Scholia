@@ -202,3 +202,24 @@ async def test_a_personal_record_stays_shown_to_another_projects_extraction_afte
         await send(client, await conversation_in(client, other), "Hello")
         await background_idle(client)
         assert provider.extractions and "Alice" in json.dumps(provider.extractions[-1])
+
+
+async def test_a_record_a_command_or_an_extraction_writes_gets_its_vector(tmp_path):
+    # S1-21a follow-up MB7: an index run follows a write (the queue never embeds a memory addition)
+    from cited import Provider, cited
+    from test_memory import candidate, extracted
+    from test_search import idle
+    provider = Provider()
+    extracted(provider, candidate("our sample is thirty nurses", span="our sample is thirty nurses", kind="decision"))
+    async with cited(tmp_path, provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Our sample is thirty nurses")  # the extraction writes it
+        await background_idle(client, timeout=20)
+        await send(client, conversation, "Remember: we decided on interviews")
+        await idle(client, project)
+        await background_idle(client, timeout=20)
+        ids = [r for (r,) in await rows(client, "SELECT id FROM memory_records WHERE type IN ('decision', 'event')")]
+        assert len(ids) == 2
+        await idle(client, project)
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, ids) == set(ids)
