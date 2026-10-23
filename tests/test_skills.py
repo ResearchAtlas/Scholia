@@ -143,7 +143,8 @@ async def test_open_place_opens_one_place_from_its_list_and_nothing_else(tmp_pat
         project, _ = await with_papers(client, WAGES)
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "How do I add a reference file?")
-        assert [e for e in stream if e["type"] == "open_place"] == [{"type": "open_place", "place": "library"}]
+        assert [e for e in stream if e["type"] == "open_place"] == [{"type": "open_place", "place": "library",
+                                                                      "project_id": project}]  # the window checks it
         opened, refused = tool_messages(provider.agent_steps[2])[-2:]
         assert opened["content"].startswith("Opened library") and json.loads(refused["content"])["error"] == \
             "validation_error"
@@ -211,3 +212,50 @@ def test_the_help_skill_says_exactly_what_each_protection_level_sends():
     assert "arXiv 编号通过 arXiv" in chinese and "Crossref 和 OpenAlex" in chinese
     from backend import lookup
     assert lookup.SERVICES == {"doi": ("openalex", "crossref"), "arxiv": ("arxiv",)}  # what the text names
+
+
+@pytest.mark.asyncio
+async def test_ct1_read_skill_file_reads_only_a_file_of_a_skill_active_in_the_conversation(tmp_path):
+    provider = Scripted([call("read_skill_file", file_id="literature-review#1")], "Not yet.",
+                        [call("use_skill", name="literature-review")], "Active.",
+                        [call("read_skill_file", call_id="c3", file_id="literature-review#1")], "Read.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Review my papers")
+        refused = json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])
+        assert refused["error"] == "validation_error" and "use_skill" in refused["message"]  # never read without it
+        run_id = stream[0]["run_id"]
+        assert not [d for k, d, _ in await events_of(client, run_id) if k == "skill_activated"]
+        assert json.loads((await rows(client, "SELECT skills FROM runs WHERE id = ?", run_id))[0][0] or "[]") == []
+        await send(client, conversation, "Use the literature review skill")
+        await send(client, conversation, "Go on")  # carried in ACTIVE SKILLS: its files read without use_skill again
+        assert tool_messages(provider.agent_steps[5])[-1]["content"].startswith("# Screening")
+
+
+@pytest.mark.asyncio
+async def test_ct1_a_skill_whose_activation_record_failed_is_not_active(tmp_path, monkeypatch):
+    from backend import runs
+    real, tries = runs.Harness._skill_activated, []
+
+    async def failing_once(self, claim, skill, step):
+        tries.append(skill.name)
+        if len(tries) == 1:
+            raise RuntimeError("the activation's write failed")
+        return await real(self, claim, skill, step)
+    monkeypatch.setattr(runs.Harness, "_skill_activated", failing_once)
+    provider = Scripted([call("use_skill", name="literature-review")],
+                        [call("read_skill_file", call_id="c2", file_id="literature-review#1")],
+                        [call("use_skill", call_id="c3", name="literature-review")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Review my papers")
+        assert json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])["error"] == "tool_error"
+        refused = json.loads(tool_messages(provider.agent_steps[2])[-1]["content"])
+        assert refused["error"] == "validation_error" and "use_skill" in refused["message"]  # not active: no record
+        again = tool_messages(provider.agent_steps[3])[-1]["content"]
+        assert again.startswith('<skill name="literature-review">')  # activated now, not "already active"
+        run_id = stream[0]["run_id"]
+        assert len([d for k, d, _ in await events_of(client, run_id) if k == "skill_activated"]) == 1
+        assert json.loads((await rows(client, "SELECT skills FROM runs WHERE id = ?", run_id))[0][0]) == ["literature-review"]

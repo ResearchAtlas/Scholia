@@ -391,10 +391,14 @@ def _refusal(body):
 
 
 def _tool_calls(body):
-    """The reply's tool calls, as sent, when it has a list of them; else none."""
+    """The reply's tool calls, as sent; none when it has none (absent, null or []). Entries are not dropped: one the
+    agent loop cannot answer ends the turn malformed (runs.Harness._agent_steps), and a value that is not a list is
+    one such entry (None)."""
     message = _choice(body).get("message")
     calls = message.get("tool_calls") if isinstance(message, dict) else None
-    return calls if isinstance(calls, list) and calls and all(isinstance(c, dict) for c in calls) else []
+    if calls is None or calls == []:
+        return []
+    return calls if isinstance(calls, list) else [None]
 
 
 def extract_reasoning(message: dict) -> str | None:

@@ -840,3 +840,319 @@ async def test_deadline_tests_count_admissions_as_the_gate_records_them(tmp_path
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "Which papers do I have?")
         assert await admitted_model_requests(client, stream[0]["run_id"]) == len(provider.agent_steps) == 2
+
+
+# Connector threads CT1 to CT5 (S1-19c follow-up)
+
+
+@pytest.mark.asyncio
+async def test_ct2_list_materials_past_its_read_limit_reports_every_paper_it_left_out(tmp_path):
+    from backend import agent
+    from backend.db.database import new_id
+    provider = Scripted([call("list_materials")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        extra = agent.LIST_LIMIT + 100
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.executemany(
+            "INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, ?, 'upload')",
+            [(new_id(), project, f"Paper {i:04d}") for i in range(extra)]))
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        [done] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
+        omitted = extra + 1 - len(done["meta"]["materials"])
+        assert tool_messages(provider.agent_steps[1])[-1]["content"].endswith(f"({omitted} more papers not shown.)")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", [None, "", 7, "ok"])  # "ok": the other call's id
+async def test_ct5_a_tool_call_with_no_usable_id_ends_the_turn_and_sends_no_continuation(tmp_path, bad_id):
+    nameless = {**call("list_materials", call_id="x"), "id": bad_id}
+    provider = Scripted([call("list_materials", call_id="ok"), nameless], "Never.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert (stream[-1]["status"], len(provider.agent_steps)) == ("failed", 1)  # no request with an empty id
+        assert {"type": "error", "code": "malformed"} in stream and not [e for e in stream if e["type"] == "tool_call"]
+        run_id = stream[0]["run_id"]
+        assert await rows(client, "SELECT status FROM budget_reservations WHERE run_id = ? AND status = 'open'",
+                          run_id) == []  # the step's reservation settled, the turn's allowances released
+        assert await rows(client, "SELECT count(*) FROM budget_reservations WHERE run_id = ? AND status = 'settled'",
+                          run_id) == [(1,)]
+        [finished] = [d for k, d, _ in await events_of(client, run_id) if k == "run_finished"]
+        assert finished == {"status": "failed", "reason": "malformed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", ["", "ok"])
+async def test_ct5_a_tool_call_with_no_usable_id_on_the_last_allowed_step_ends_the_turn_malformed(tmp_path, bad_id):
+    provider = Scripted([call("list_materials", call_id="first")],
+                        [call("list_materials", call_id="ok"), {**call("list_materials", call_id="x"), "id": bad_id}])
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"limits.agent_steps": 2}})
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("failed", None)  # not a limit: no Continue
+        assert {"type": "error", "code": "malformed"} in stream and not [e for e in stream if e["type"] == "limit_reached"]
+        [finished] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "run_finished"]
+        assert finished == {"status": "failed", "reason": "malformed"}
+
+
+@pytest.mark.asyncio
+async def test_ct1_sweep_passages_answer_from_library_could_not_register_are_not_read_in_the_run(tmp_path, monkeypatch):
+    from backend import pipeline, runs
+    real, calls = runs.Harness._register_context, []
+    real_evidence, searched = pipeline.evidence, []
+
+    async def first_finds_nothing(state, project_id, query, **options):  # the pre-load matches nothing; the tool does
+        found = await real_evidence(state, project_id, query, **options)
+        searched.append(query)
+        return {**found, "records": []} if len(searched) == 1 else found
+    monkeypatch.setattr(pipeline, "evidence", first_finds_nothing)
+
+    async def failing_in_the_tool(self, claim, numbered, listed=()):
+        calls.append(len(numbered))
+        if len(calls) != 2:
+            return await real(self, claim, numbered, listed)
+
+        async def failing(fn):  # the tool's own registration (the turn's came first): its write fails
+            raise RuntimeError("the registration's write failed")
+        self._write = failing
+        try:
+            return await real(self, claim, numbered, listed)
+        finally:
+            del self._write
+    monkeypatch.setattr(runs.Harness, "_register_context", failing_in_the_tool)
+    provider = Scripted([call("answer_from_library", question=QUESTION)],
+                        "Minimum wages raise the earnings of low-paid workers [S1.1].")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")  # nothing pre-loaded: the tool numbers S1
+        assert json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])["error"] == "tool_error"
+        assert provider.inners == []  # no model was given its passages
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert calls[0] == 0 and calls[1] and len(searched) == 2  # the tool numbered its passages, then failed to register
+        assert stream[-1]["status"] == "succeeded" and turn["citations"][0]["existence"] != "ok"  # not read in the run
+        assert material not in await _depends_on(client, stream[0]["run_id"])  # nor does the answer depend on it
+
+
+async def _depends_on(client, run_id):
+    """The papers a run's answer depends on (inputs.context_materials, backend/provenance.py)."""
+    (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", run_id)
+    return json.loads(inputs).get("context_materials") or []
+
+
+def _no_preload(monkeypatch):
+    """The turn's pre-load matches nothing, so answer_from_library numbers its own passages (S1)."""
+    from backend import pipeline
+    real, searched = pipeline.evidence, []
+
+    async def first_finds_nothing(state, project_id, query, **options):
+        found = await real(state, project_id, query, **options)
+        searched.append(query)
+        return {**found, "records": []} if len(searched) == 1 else found
+    monkeypatch.setattr(pipeline, "evidence", first_finds_nothing)
+
+
+async def _connect_error(body):
+    import httpx
+    raise httpx.ConnectError("never connected")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["reservation", "connect"])
+async def test_ct1_sweep_passages_whose_answer_step_reached_no_model_are_not_read_in_the_run(tmp_path, monkeypatch,
+                                                                                            failure):
+    from backend import runs
+    _no_preload(monkeypatch)
+    if failure == "reservation":
+        real = runs.Harness._reserve
+
+        async def failing(self, claim, *args, phase=None, **options):
+            if phase == "answer_from_library":
+                raise RuntimeError("the reservation's transaction failed")
+            return await real(self, claim, *args, phase=phase, **options)
+        monkeypatch.setattr(runs.Harness, "_reserve", failing)
+    provider = Scripted([call("answer_from_library", question=QUESTION)],
+                        "Minimum wages raise the earnings of low-paid workers [S1.1].", inner=[_connect_error])
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert json.loads(tool_messages(provider.agent_steps[1])[-1]["content"])["error"] == "tool_error"
+        assert "Wage Floors" not in json.dumps(provider.agent_steps[1]["messages"])  # no outer step was given them
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert stream[-1]["status"] == "succeeded" and turn["citations"][0]["existence"] != "ok"  # not read in the run
+        assert material not in await _depends_on(client, stream[0]["run_id"])  # its registration was taken back
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("calls", [[{**call("list_materials"), "id": ""}, None], {"id": "x", "type": "function"}, "x"],
+                         ids=["entry_not_an_object", "a_dict", "a_string"])
+async def test_ct5_a_malformed_tool_calls_list_ends_the_turn_malformed_not_as_an_answer(tmp_path, calls):
+    provider = Scripted({"calls": calls, "content": "Let me check the library."}, "Never.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Which papers do I have?")
+        assert (stream[-1]["status"], len(provider.agent_steps)) == ("failed", 1)
+        assert {"type": "error", "code": "malformed"} in stream
+        assert not [e for e in stream if e["type"] == "chat_response"]  # the preamble is never saved as the answer
+
+
+@pytest.mark.asyncio
+async def test_ct1_sweep_a_registration_taken_back_keeps_only_what_earlier_reads_registered(tmp_path, monkeypatch):
+    from backend import runs
+    _no_preload(monkeypatch)
+    real = runs.Harness._reserve
+
+    async def failing(self, claim, *args, phase=None, **options):
+        if phase == "answer_from_library":
+            raise RuntimeError("the reservation's transaction failed")
+        return await real(self, claim, *args, phase=phase, **options)
+    monkeypatch.setattr(runs.Harness, "_reserve", failing)
+    async with cited(tmp_path, Scripted(after="Never.")) as client:
+        project, [material] = await with_papers(client, WAGES)
+        settings = (await client.get(f"/api/settings?project_id={project}")).json()
+        await client.put("/api/settings", json={"project_id": project, "hash": settings["hash"],
+                                                "updates": {"limits.tool_calls": 2}})
+        [(first,)] = await rows(client, "SELECT min(ordinal) FROM passages")
+        [(passage,)] = await rows(client, "SELECT id FROM passages WHERE ordinal = ?", first)
+        client.provider.script += [[call("read_passage", material_id=material, ordinal=first),
+                                    call("answer_from_library", call_id="c2", question=QUESTION),
+                                    call("list_materials", call_id="c3")]]  # the third: the turn ends at its limit
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert {"type": "limit_reached", "limit": "tool_calls"} in stream  # no later registration rewrote the record
+        (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
+        inputs = json.loads(inputs)
+        assert inputs["evidence"] == [[passage, material]]  # the read passage's pair only: the tool's taken back
+        assert inputs["context_materials"] == [material]  # what the earlier read registered stays
+
+
+@pytest.mark.asyncio
+async def test_ct1_sweep_a_take_back_whose_write_failed_is_written_by_the_next_registration(tmp_path, monkeypatch):
+    from backend import runs
+    _no_preload(monkeypatch)
+    real_reserve, real_register, registrations = runs.Harness._reserve, runs.Harness._register_context, []
+
+    async def failing_reserve(self, claim, *args, phase=None, **options):
+        if phase == "answer_from_library":
+            raise RuntimeError("the reservation's transaction failed")
+        return await real_reserve(self, claim, *args, phase=phase, **options)
+
+    async def take_back_fails_once(self, claim, numbered, *args, **options):
+        registrations.append(len(numbered))
+        if len(registrations) != 3:  # the turn's, the tool's, then its take-back: that write fails once
+            return await real_register(self, claim, numbered, *args, **options)
+
+        async def failing(fn):
+            raise RuntimeError("the take-back's write failed")
+        self._write = failing
+        try:
+            return await real_register(self, claim, numbered, *args, **options)
+        finally:
+            del self._write
+    monkeypatch.setattr(runs.Harness, "_reserve", failing_reserve)
+    monkeypatch.setattr(runs.Harness, "_register_context", take_back_fails_once)
+    provider = Scripted([call("answer_from_library", question=QUESTION)], "Minimum wages raise earnings.")
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert stream[-1]["status"] == "succeeded" and registrations == [0, 4, 0, 0]  # the next one is empty
+        (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
+        inputs = json.loads(inputs)
+        assert (inputs["context_materials"], inputs["evidence"]) == ([], [])  # repaired before the answer's dispatch
+        assert material not in await _depends_on(client, stream[0]["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_ct6_a_taken_back_paper_leaves_the_turns_revocation_scope(tmp_path, monkeypatch):
+    from backend import runs
+    _no_preload(monkeypatch)
+    real = runs.Harness._reserve
+
+    async def failing(self, claim, *args, phase=None, **options):
+        if phase == "answer_from_library":
+            raise RuntimeError("the reservation's transaction failed")
+        return await real(self, claim, *args, phase=phase, **options)
+    monkeypatch.setattr(runs.Harness, "_reserve", failing)
+    holder = {}
+
+    async def deleting_meanwhile(body):  # the paper no request carried is deleted while the turn runs
+        assert (await holder["client"].delete(f"/api/materials/{holder['material']}")).status_code == 200
+        return holder["client"].provider.answer("Minimum wages raise earnings.")
+    provider = Scripted([call("answer_from_library", question=QUESTION)], deleting_meanwhile)
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        holder.update(client=client, material=material)
+        # S1-21a: memory off, so the turn holds no PROJECT STATE (the paper's progress record goes with it and would
+        # revoke the turn through memory_ids, rightly): only the take-back's own scope is tested here
+        from test_memory import memory_off
+        await memory_off(client, project)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("succeeded", None)  # not revoked
+        (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
+        assert material not in (json.loads(inputs).get("material_ids") or [])  # its scope taken back with it
+
+
+@pytest.mark.asyncio
+async def test_ct6_a_take_back_keeps_the_messages_selection_in_the_turns_revocation_scope(tmp_path, monkeypatch):
+    from backend import runs
+    from test_search import CHINESE
+    _no_preload(monkeypatch)
+    real = runs.Harness._reserve
+
+    async def failing(self, claim, *args, phase=None, **options):
+        if phase == "answer_from_library":
+            raise RuntimeError("the reservation's transaction failed")
+        return await real(self, claim, *args, phase=phase, **options)
+    monkeypatch.setattr(runs.Harness, "_reserve", failing)
+    async with cited(tmp_path, Scripted(after="Done.")) as client:
+        project, [wages, chinese] = await with_papers(client, WAGES, CHINESE)
+        client.provider.script.append([call("answer_from_library", question=QUESTION, material_ids=[wages])])
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there", material_ids=[chinese])
+        assert stream[-1]["status"] == "succeeded"
+        (inputs,), = await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"])
+        scope = json.loads(inputs)["material_ids"]
+        assert chinese in scope and wages not in scope  # the message's selection stays; the taken-back paper goes
+
+
+@pytest.mark.asyncio
+async def test_ct6_a_dispatched_call_whose_settlement_failed_keeps_its_paper_registered(tmp_path, monkeypatch):
+    from backend import runs
+    _no_preload(monkeypatch)
+    real_settle, settled, holder = runs._settle_attempts, [], {}
+
+    def failing(conn, reservation_id, rates, attempts):  # the tool's own answer step was sent; its settlement fails
+        settled.append(reservation_id)
+        if len(settled) == 2:
+            raise RuntimeError("the settlement write failed")
+        return real_settle(conn, reservation_id, rates, attempts)
+    real_stop = runs.Harness._stop_turn
+
+    async def deleting_first(self, claim, **options):  # the paper it sent is deleted before the turn's terminal write
+        (inputs,), = await rows(holder["client"], "SELECT inputs FROM runs WHERE id = ?", claim.run_id)
+        holder["inputs"] = json.loads(inputs)
+        assert (await holder["client"].delete(f"/api/materials/{holder['material']}")).status_code == 200
+        return await real_stop(self, claim, **options)
+    monkeypatch.setattr(runs, "_settle_attempts", failing)
+    monkeypatch.setattr(runs.Harness, "_stop_turn", deleting_first)
+    provider = Scripted([call("answer_from_library", question=QUESTION)], "Never.", inner=["Wages rose [S1.1]."])
+    async with cited(tmp_path, provider) as client:
+        project, [material] = await with_papers(client, WAGES)
+        holder.update(client=client, material=material)
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "Hello there")
+        assert len(provider.inners) == 1  # its request was sent: the paper's text reached a model
+        inputs = holder["inputs"]
+        assert material in inputs["material_ids"] and material in inputs["context_materials"]  # never taken back
+        assert {m for _, m in inputs["evidence"]} == {material}  # nor its evidence
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")  # its deletion revokes

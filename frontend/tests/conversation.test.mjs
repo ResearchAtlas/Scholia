@@ -65,3 +65,29 @@ test('the view keeps looking after a read that failed, as afterRead and pollsAsk
   const found = ids(readFileSync(SOURCE, 'utf8'));
   assert.ok(found.afterRead && found.pollsAsks); // useConversationAsks keeps its state and polls by them
 });
+
+// CT4: the view says which conversation it shows (live.js showing) in a layout effect, which React runs
+// in the same commit as the render that changed it, so an open_place arriving after a switch never finds
+// the conversation left still shown (a passive effect runs later); its cleanup clears only its own entry.
+function shownBy(source) {
+  const found = [];
+  const rule = {
+    create: (context) => ({
+      CallExpression(call) {
+        if (call.callee.name !== 'showing') return;
+        const hook = context.sourceCode.getAncestors(call).reverse().find((node) => node.type === 'CallExpression');
+        found.push({ hook: hook?.callee.name, args: call.arguments.map((a) => context.sourceCode.getText(a)).join(', ') });
+      },
+    }),
+  };
+  const config = [{ files: ['**/*.jsx'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } },
+    plugins: { check: { rules: { shown: rule } } }, rules: { 'check/shown': 'error' } }];
+  assert.deepEqual(new Linter().verify(source, config, 'ConversationView.jsx').filter((m) => m.fatal), []);
+  return found;
+}
+
+test('the conversation shown is said in the commit that shows it (CT4)', () => {
+  assert.deepEqual(shownBy(readFileSync(SOURCE, 'utf8')), [{ hook: 'useLayoutEffect', args: 'projectId, id' }]);
+  assert.deepEqual(shownBy('function V() { useEffect(() => showing(projectId, id), [projectId, id]); }'),
+    [{ hook: 'useEffect', args: 'projectId, id' }]); // the check tells a passive effect apart
+});

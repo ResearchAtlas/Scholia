@@ -895,6 +895,13 @@ class Harness:
                     conn, claim.run_id, "cancelled", "researcher", "tool_errors", claim=claim))
                 emit({"type": "run_finished", **final})
                 return
+            if result == "malformed":  # a tool call with no usable id: the turn ends failed, before any tool runs
+                final = await self._end_turn(claim, lambda conn: self._finish_turn(
+                    conn, claim.run_id, "failed", None, "malformed", claim=claim))
+                if final["status"] == "failed":  # not a Stop that came first
+                    emit({"type": "error", "code": "malformed"})
+                emit({"type": "run_finished", **final})
+                return
             if isinstance(result, str):  # stopped at a turn limit (section 13): Continue is offered
                 raise _LimitReached(result)
             if not result.ok or visible(result.content) is None:  # tool calls alone where none were offered
@@ -1325,7 +1332,10 @@ class Harness:
         """Name every paper whose text the request carries on its run, before its dispatch (backend/provenance.py):
         its evidence's and its history's (inputs.context_materials, also its scope in inputs.material_ids, so
         deleting one revokes the run), and its evidence's [passage, paper] pairs (inputs.evidence); the dispatch
-        check refuses a run when one of those papers is gone or no longer reads the passage."""
+        check refuses a run when one of those papers is gone or no longer reads the passage. A registration taken back
+        (`taken_back`: one whose request reached no model, _answer_from_library) is written even when it names none,
+        by the next registration until one commits: every later step registers before its dispatch, so no answer
+        is delivered with a record naming papers no request carried."""
         papers = sorted({r["material_id"] for r in numbered.values()} | set(listed))  # listed: titles a tool gave
         pairs = sorted({(r["passage_id"], r["material_id"]) for r in numbered.values()})
         # every paper whose text the request carries: its evidence, and the earlier turns its history holds; in an
@@ -1336,8 +1346,8 @@ class Harness:
         remembered = sorted(claim.context.get("memory_ids", ()))
         held = sorted({*papers, *(m for turn in shown for m in turn), *claim.context.get("context_materials", ()),
                        *claim.context.get("memory_materials", ())})
-        claim.context["context_materials"] = held
-        if not held and not remembered:
+        if not held and not remembered and not claim.context.get("taken_back"):
+            claim.context["context_materials"] = held
             return
 
         def record(conn):
@@ -1345,7 +1355,8 @@ class Harness:
                 raise _Cancelled()
             (inputs,) = conn.execute("SELECT inputs FROM runs WHERE id = ?", (claim.run_id,)).fetchone()
             inputs = json.loads(inputs or "{}")
-            inputs["material_ids"] = sorted({*inputs.get("material_ids", []), *held})
+            # its scope: the message's selection and what is carried, so a registration taken back leaves it too (CT6)
+            inputs["material_ids"] = sorted({*(claim.context.get("selection") or ()), *held})
             inputs["evidence"] = [list(pair) for pair in pairs]
             inputs["context_materials"] = held
             if remembered:
@@ -1355,6 +1366,8 @@ class Harness:
             await self._write(record)
         except _Cancelled:
             raise asyncio.CancelledError() from None
+        claim.context["context_materials"] = held  # once recorded: a failed write leaves the turn's set as it was
+        claim.context.pop("taken_back", None)  # and the record says what was carried again
 
     # S1-21a: memory commands and recall
 
@@ -1521,7 +1534,8 @@ class Harness:
         in the turn's chain, each assistant step kept whole when it arrives (_call keeps its reply) and sent back
         unmodified, its reasoning blocks included (model-route rule 5), until an answer. Returns the answer step's
         result (a failure included), "stopped" when the researcher chose to stop after three failed tool calls in a
-        row (section 6.6: the run stops and asks), or the name of the limit that stopped the turn: agent_steps,
+        row (section 6.6: the run stops and asks), "malformed" when a tool call has no usable id or shares one (none
+        is run), or the name of the limit that stopped the turn: agent_steps,
         tool_calls or chain_over_window (the chain no longer fits the window; it is never cut or rewritten); the
         time limit binds every model call in the dispatch check (may_dispatch). A route without tool calls offers none: its one
         step is its answer."""
@@ -1549,6 +1563,11 @@ class Harness:
             turn.step = call.step
             if not result.ok or not tools or not result.tool_calls:
                 return result
+            # a call with no id, or one another call has, its result could answer: no continuation an endpoint would
+            # take can carry it (CT5); checked before the step limit, so the last step's reply is classed too
+            ids = [raw.get("id") if isinstance(raw, dict) else None for raw in result.tool_calls]
+            if not all(isinstance(i, str) and i for i in ids) or len(set(ids)) != len(ids):
+                return "malformed"
             if number + 1 >= limits["agent_steps"]:  # no step is left to read their results: they are not run
                 return "agent_steps"
             await self._release_held(claim)  # this step called tools: its judge share and unspent go back
@@ -1621,8 +1640,8 @@ class Harness:
                     raise  # error; the turn's cleanup settles it (or marks its attempt unknown) before any other call
                 log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
                 result = failed(call_id, "tool_error", "The tool failed.")  # a defect in the tool; the turn goes on
-        raw_id = raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else ""
-        message = {"role": "tool", "tool_call_id": raw_id,  # the provider's own id, in the chain (and its stored copy) only
+        # the provider's own id (never empty: _agent_steps ends the turn on a call without one), in the chain only
+        message = {"role": "tool", "tool_call_id": raw["id"],
                    "content": result.text if result.ok else json.dumps({"error": result.error.type,
                                                                         "message": result.error.message})}
 
@@ -1781,16 +1800,34 @@ class Harness:
             return failed(call_id, "over_window", "The evidence this needs does not fit this model's window.")
         held = dict(list(held.items())[:len(lines) - request.cuts.get("research_evidence", 0)])
         turn.evidence.keep(keys, held, before)  # what its answer step was not given is not read in the run
-        await self._register_context(claim, turn.evidence.numbered, turn.listed)
-        judge_estimate = self._judge_estimate(ctx, held)
-        estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
-        call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate, allowance=judge_estimate,
-                                   phase="answer_from_library", step={**_step(ctx["route"], facts, request),
-                                                                      "judge_estimate_usd": judge_estimate,
-                                                                      "tool_call_id": call_id})
-        result = await self._call(claim, call, ctx["route"], ctx["key"], request, facts,
-                                  zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
-                                  rehold=ctx if judge_estimate else None)
+        registered, committed, call = ctx.get("context_materials", []), False, None
+
+        async def undo():  # its answer step's request reached no model: none of its passages is read in the run, and
+            turn.evidence.keep(keys, (), before)  # no answer depends on their papers (its registration taken back)
+            if committed:  # its papers and its [passage, paper] pairs, a paper earlier reads registered too
+                ctx["context_materials"], ctx["taken_back"] = registered, True  # pending until a registration commits
+                try:
+                    await self._register_context(claim, turn.evidence.numbered, turn.listed)
+                except Exception as error:  # still pending: the next registration, before any later dispatch, writes it
+                    log.error("a registration could not be taken back (%s at %s)", type(error).__name__, _where(error))
+        try:
+            await self._register_context(claim, turn.evidence.numbered, turn.listed)
+            committed = True
+            judge_estimate = self._judge_estimate(ctx, held)
+            estimate = budget_router.request_cost(facts["rates"], request.input_tokens, request.max_tokens)
+            call = await self._reserve(claim, ctx["project_id"], claim.conversation_id, estimate,
+                                       allowance=judge_estimate, phase="answer_from_library",
+                                       step={**_step(ctx["route"], facts, request), "judge_estimate_usd": judge_estimate,
+                                             "tool_call_id": call_id})
+            result = await self._call(claim, call, ctx["route"], ctx["key"], request, facts,
+                                      zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
+                                      rehold=ctx if judge_estimate else None)
+        except Exception:
+            if call is None or not call.dispatched:  # an exception after the gate let it out takes nothing back
+                await undo()
+            raise
+        if not result.dispatched:  # refused before it left, or never connected
+            await undo()
         try:
             if not result.ok or visible(result.content) is None:
                 return failed(call_id, "tool_error", "The answer step failed.")
