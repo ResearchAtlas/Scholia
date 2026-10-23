@@ -311,3 +311,19 @@ async def test_a_forget_answered_after_its_record_changed_forgets_nothing_and_sa
             ("we exclude studies before 1990", "confirmed"), ("we exclude studies before 2000", "superseded")]
         system = provider.answers[-1]["messages"][0]["content"]
         assert "changed since" in system
+
+
+async def test_a_forget_with_text_finds_the_agents_note_too(tmp_path):
+    # S1-21a follow-up MB3: forgetting by its words reaches every record the views can forget, notes and progress too
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Hello")
+        [(turn,)] = await rows(client, "SELECT run_id FROM turns LIMIT 1")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.note(
+            conn, project_id=project, run_id=turn, kind="next_step", text="Ask Alice about the coding scheme",
+            materials=()))
+        stream = await send(client, conversation, "Forget: Ask Alice about the coding scheme")
+        assert {"type": "memory", "action": "forgotten", "count": 1} in stream
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE type = 'agent_note'") == [(0,)]

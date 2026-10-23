@@ -337,10 +337,10 @@ def in_scope(conn, project_id, statuses=ACTIVE, kinds=WRITABLE):
         " ORDER BY updated_at DESC, rowid DESC", (json.dumps(list(statuses)), json.dumps(list(kinds)), project_id)).fetchall()]
 
 
-def matching(conn, project_id, text, limit=3, floor=0.4, statuses=ACTIVE):
-    """Up to limit records of the project's scope (active, or of statuses) most like text, best first:
+def matching(conn, project_id, text, limit=3, floor=0.4, statuses=ACTIVE, kinds=WRITABLE):
+    """Up to limit records of the project's scope (active, or of statuses; of kinds) most like text, best first:
     [(likeness, record)]."""
-    scored = [(likeness(text, r["content"]), r) for r in in_scope(conn, project_id, statuses=statuses)]
+    scored = [(likeness(text, r["content"]), r) for r in in_scope(conn, project_id, statuses=statuses, kinds=kinds)]
     return sorted([s for s in scored if s[0] >= floor or normalized(text) in normalized(s[1]["content"])],
                   key=lambda s: -s[0])[:limit]
 
@@ -383,7 +383,8 @@ def forget_candidates(conn, project_id, text=None, previous=None):
     """Records a forget may mean: the ones most like text; for a bare "forget this", the active records the previous
     turn (previous: its run id) or its extraction made, else the one changed last."""
     if text is not None:
-        return matching(conn, project_id, text, floor=0.2, statuses=("confirmed", "inferred", "proposed"))
+        return matching(conn, project_id, text, floor=0.2, statuses=("confirmed", "inferred", "proposed"),
+                        kinds=TYPES)  # the agent's notes and progress too, as the views forget them (MB3)
     made = [r for r in in_scope(conn, project_id, kinds=TYPES) if previous is not None and (
         r["created_by_run_id"] == previous or conn.execute(
             "SELECT 1 FROM runs WHERE id = ? AND source_turn_id = ?", (r["created_by_run_id"], previous)).fetchone())]
