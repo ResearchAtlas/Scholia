@@ -430,3 +430,37 @@ async def test_plan_leaves_history_alone_under_90_percent_and_never_compacts_a_l
     assert compaction.plan([11200, 2000, 2000], 16000, 90) == (1, 4000)
     assert compaction.plan([100], 1000, 90, summary=900) is None  # nothing older to compact
     assert compaction.plan([600, 600], 300, 90) is None  # no summary worth asking for fits
+
+
+async def test_fix1_a_later_step_that_cuts_the_summary_still_carries_it_and_details_says_so(tmp_path, monkeypatch):
+    # gpt-6-astra review 1, finding 3: the first step's reply may restate the summary, and every later request holds
+    # that reply (rule 5); attribution and registration follow every dispatched step that carried it.
+    from backend import agent
+    from backend.tools.types import ToolResult
+
+    async def big(call, turn):
+        return ToolResult(id=call.id, ok=True, text="队" * 1800)  # within its preview, and dense as counted
+    monkeypatch.setitem(agent.REGISTRY._implementations, "list_materials", big)
+    flag = {"on": False}
+    provider = Long()
+    provider.answer_for = lambda m: steps_reply(provider, [call("list_materials")], content=f"Restating: {SUMMARY}") \
+        if flag["on"] and "QUESTION-3" in m and not provider.turns[-1]["messages"][-1]["role"] == "tool" else None
+    async with started(tmp_path / "data", provider) as client:
+        await small_history(client)
+        await put_settings(client, {"providers.openrouter.default_window": 16384})
+        _, chat = await conversation(client)
+        await send(client, chat, "Remember: my method is semi-structured interviews")
+        for i in range(1, 3):
+            await send(client, chat, f"QUESTION-{i} about cohorts")
+        flag["on"] = True
+        stream = await send(client, chat, "QUESTION-3 about cohorts")
+        assert stream[-1]["status"] == "succeeded"
+        first, second = provider.turns[-2:]
+        assert compaction.LABEL in first["messages"][0]["content"]
+        assert compaction.LABEL not in second["messages"][0]["content"]  # cut for capacity once the chain grew
+        assert f"Restating: {SUMMARY}" in text_of(second["messages"][1:])  # but its restatement is carried
+        steps = await answer_steps(client, stream[0]["run_id"])
+        assert len(steps) == 2 and all(s.get("summary") == {"turns": [0, 1]} for s in steps)
+        inputs = json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"]))[0][0])
+        [event] = await compactions(client, stream[0]["run_id"])
+        assert event["memory_ids"] and inputs.get("summary_memory") == event["memory_ids"]  # still registered

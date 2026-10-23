@@ -362,7 +362,8 @@ async def test_only_passages_a_model_was_shown_count_as_read_in_the_run(tmp_path
         conversation = await conversation_in(client, project)
         await send(client, conversation, "Hello there")
         [shown] = tool_messages(provider.agent_steps[1])
-        assert "more passages matched" in shown["content"] and len(shown["content"]) <= 8000
+        # S1-21b: the rest is kept and paged; only what a served page shows is read
+        assert "Read on with read_output" in shown["content"] and len(shown["content"]) <= 8000 + 200
         [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
         found = {c["marker"]: c["existence"] for c in turn["citations"]}
         assert found["[S1.8]" if "[S1.8]" not in shown["content"] else "[S1.1]"] in ("not_found", "ok")
@@ -862,8 +863,13 @@ async def test_ct2_list_materials_past_its_read_limit_reports_every_paper_it_lef
         conversation = await conversation_in(client, project)
         stream = await send(client, conversation, "Which papers do I have?")
         [done] = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
-        omitted = extra + 1 - len(done["meta"]["materials"])
-        assert tool_messages(provider.agent_steps[1])[-1]["content"].endswith(f"({omitted} more papers not shown.)")
+        # S1-21b: every paper up to the read limit is kept and paged, and the papers past it are counted at its end
+        assert "Read on with read_output" in tool_messages(provider.agent_steps[1])[-1]["content"]
+        [(sha,)] = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= 4000",
+                              stream[0]["run_id"])
+        whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
+        assert whole.endswith(f"({extra + 1 - agent.LIST_LIMIT} more papers not listed.)")
+        assert whole.count("\n") == agent.LIST_LIMIT and 0 < len(done["meta"]["materials"]) < agent.LIST_LIMIT
 
 
 @pytest.mark.asyncio

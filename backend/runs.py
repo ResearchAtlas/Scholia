@@ -1682,15 +1682,22 @@ class Harness:
                                                              # earlier answers left out: one of their papers is deleted
                                                              **({"history_left_out": ctx["history_left_out"]}
                                                                 if ctx["history_left_out"] and not number else {}),
-                                                             # S1-21b: the earlier turns its request holds as a summary
+                                                             # S1-21b: the earlier turns its request holds as a summary,
+                                                             # or holds through an earlier step that carried it (its
+                                                             # assistant message stays in the chain: rule 5)
                                                              **({"summary": {"turns": ctx["summary_info"]["turns"]}}
-                                                                if ctx.get("summary_info") and not request.cuts.get("summary")
-                                                                else {})})
+                                                                if ctx.get("summary_info") and (
+                                                                    not request.cuts.get("summary")
+                                                                    or ctx.get("summary_carried")) else {})})
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
                                       zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
                                       rehold=ctx if judge_estimate else None)
             turn.step = call.step
+            if result.dispatched and ctx.get("summary_info") and not request.cuts.get("summary"):
+                # its dependencies stay registered from here (context_materials and summary_memory are never taken back
+                # once a request carrying the summary left), and every later step's request carries this one's reply
+                ctx["summary_carried"] = True
             if not result.ok or not tools or not result.tool_calls:
                 return result
             # a call with no id, or one another call has, its result could answer: no continuation an endpoint would
@@ -1770,34 +1777,45 @@ class Harness:
                     raise  # error; the turn's cleanup settles it (or marks its attempt unknown) before any other call
                 log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
                 result = failed(call_id, "tool_error", "The tool failed.")  # a defect in the tool; the turn goes on
-        # S1-21b: past the 8,000-character preview, the whole output is kept for paging (read_output) and the model gets
-        # the preview and its handle: the call's content-free id and its number in the turn (backend/compaction.py)
-        # A tool whose own bound is within a page (read_output's included) is never paged: its result is whole, or cut there.
-        paged, handle = None, f"{call_id}.{number}"
-        bound = agent.REGISTRY.get_definition(call.name).output_chars if call is not None and agent.known_name(call.name) else 0
-        if result.ok and bound > compaction.PREVIEW + 200 and len(result.text) > compaction.PREVIEW:
-            paged = result.text
-            result = result.model_copy(update={"text": compaction.preview(paged, handle),
-                                               "meta": {**result.meta, "paged": len(paged)}})
-        # the provider's own id (never empty: _agent_steps ends the turn on a call without one), in the chain only
-        message = {"role": "tool", "tool_call_id": raw["id"],
-                   "content": result.text if result.ok else json.dumps({"error": result.error.type,
-                                                                        "message": result.error.message})}
+        # S1-21b: every tool's output past its preview (8,000 characters, or its own smaller budget) is kept whole for paging
+        # (read_output) and the model gets the preview and its handle, the call's content-free id and its number in the
+        # turn (backend/compaction.py); promised only once the whole output is kept, else the rest is said to be
+        # unavailable. A page read_output serves is never paged again.
+        handle = f"{call_id}.{number}"
+        size = min(compaction.PREVIEW, agent.REGISTRY.get_definition(call.name).output_chars) \
+            if call is not None and agent.known_name(call.name) else compaction.PREVIEW
+        whole_text = result.text if result.ok and len(result.text) > size and not result.meta.get("page") else None
+        message = None
 
         async def keeping():  # registered, stored, linked and recorded to its end, whatever cancellation comes meanwhile
+            nonlocal result, message
             if turn.listed or result.meta.get("passages") or result.meta.get("memory"):  # what it gave the model is
                 # covered before the next dispatch (S1-21a: memory records too)
                 await self._register_context(claim, turn.evidence.numbered, turn.listed)
             materials = tuple(sorted(turn.ctx.get("context_materials") or ()))
             segments = turn.segments.pop(call_id, [])
             with self.content.hold() if self.content is not None else nullcontext([]) as held:
-                if paged is not None:  # its whole text, with the papers of what it holds past the preview too
-                    whole = tuple(sorted({*materials, *(turn.evidence.pending[k]["material_id"] for _, k in segments
-                                                        if k in turn.evidence.pending)}))
-                    sha = await asyncio.to_thread(_stored, self.content, paged.encode("utf-8"), held)
-                    if await self._write(lambda conn: compaction.keep_output(conn, claim.run_id, step, number, sha, whole)):
-                        turn.outputs[handle] = {"step": step, "number": number, "length": len(paged),
-                                                 "segments": segments}
+                if whole_text is not None:  # its whole text, with the papers of what it holds past the preview too
+                    whole = tuple(sorted({*materials, *_held_papers(turn, segments)}))
+                    sha = await asyncio.to_thread(_stored, self.content, whole_text.encode("utf-8"), held)
+                    try:
+                        kept = await self._write(lambda conn: compaction.keep_output(
+                            conn, claim.run_id, step, number, sha, whole))
+                    except Exception as error:  # not kept: said so below, never promised
+                        log.warning("a tool output could not be kept for paging (%s)", type(error).__name__)
+                        kept = False
+                    if kept:
+                        turn.outputs[handle] = {"step": step, "number": number, "length": len(whole_text),
+                                                "segments": segments}
+                        result = result.model_copy(update={"text": compaction.preview(whole_text, handle, size),
+                                                           "meta": {**result.meta, "paged": len(whole_text)}})
+                    else:
+                        result = result.model_copy(update={"text": compaction.unkept(whole_text, size),
+                                                           "meta": {**result.meta, "cut": True}})
+                # the provider's own id (never empty: _agent_steps ends the turn on a call without one), in the chain only
+                message = {"role": "tool", "tool_call_id": raw["id"],
+                           "content": result.text if result.ok else json.dumps({"error": result.error.type,
+                                                                                "message": result.error.message})}
                 ref = await asyncio.to_thread(_stored, self.content, json.dumps(
                     message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), held)
                 await self._record(claim, "tool_result", {
@@ -2815,6 +2833,18 @@ def _stored(content, body, hold=None):
     except Exception as error:
         log.warning("a request body could not be kept for the trace (%s)", type(error).__name__)
         return None
+
+
+def _held_papers(turn, segments):
+    """The papers whose text an output's items past its preview hold (S1-21b): a passage's, a listed paper, a memory
+    record's papers; the kept output is linked to them, so it goes with any of them."""
+    for _, _, kind, value in segments:
+        if kind == "passage" and value in turn.evidence.pending:
+            yield turn.evidence.pending[value]["material_id"]
+        elif kind == "paper":
+            yield value
+        elif kind == "memory":
+            yield from value[1]
 
 
 def _summary_text(content, sha256):

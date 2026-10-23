@@ -148,14 +148,6 @@ async def _selection(turn, ids):
     return ids if found == set(ids) else None
 
 
-def _shown(turn, call_id, keys, meta=None):
-    """A result giving the model these passages, with their markers."""
-    lines = turn.evidence.lines(keys)
-    return ToolResult(id=call_id, ok=True, text="\n\n".join(lines),
-                      meta={"passages": [turn.evidence.numbered[k]["passage_id"] for k in dict.fromkeys(keys)],
-                            **(meta or {})})
-
-
 # Read the library
 
 
@@ -170,20 +162,14 @@ async def list_materials(call, turn):
         "SELECT m.id, m.title, json_extract(m.csl, '$.issued.\"date-parts\"[0][0]'), coalesce(m.evidence_type, 'full_text'),"
         " m.retraction, count(*) OVER () FROM materials m WHERE m.project_id = ? ORDER BY m.created_at, m.id LIMIT ?",
         (turn.ctx["project_id"], LIST_LIMIT)).fetchall())  # each row also counts every paper, past the limit too
-    lines, used, shown = [], 0, []
-    for material, title, year, kind, retraction, _ in rows:
-        line = " | ".join(str(x) for x in (material, title or "(untitled)", year or "n.d.", kind.replace("_", " "),
-                                            "RETRACTED" if retraction == "retracted" else None) if x)
-        if used + len(line) + 1 > 7000:
-            break
-        lines.append(line)
-        shown.append(material)
-        used += len(line) + 1
-    if rows and rows[0][5] > len(shown):
-        lines.append(f"({rows[0][5] - len(shown)} more papers not shown.)")
-    turn.listed.update(shown)
-    return ToolResult(id=call.id, ok=True, text="\n".join(lines) if lines else "The library has no papers yet.",
-                      meta={"materials": shown})
+    if not rows:
+        return ToolResult(id=call.id, ok=True, text="The library has no papers yet.", meta={"materials": []})
+    items = [(line, line[:LABEL_CHARS], "paper", material) for material, title, year, kind, retraction, _ in rows
+             for line in [" | ".join(str(x) for x in (material, title or "(untitled)", year or "n.d.", kind.replace(
+                 "_", " "), "RETRACTED" if retraction == "retracted" else None) if x)]]
+    more = rows[0][5] - len(rows)
+    text, shown = _paged(turn, call.id, items, "\n", tail=f"\n({more} more papers not listed.)" if more > 0 else "")
+    return ToolResult(id=call.id, ok=True, text=text, meta={"materials": [v for _, _, _, v in shown]})
 
 
 @REGISTRY.register(
@@ -210,24 +196,16 @@ async def search_passages(call, turn):
     found = await pipeline.evidence(state, turn.ctx["project_id"], query, materials=selection or None,
                                     whole=lambda records: _preview_fits(citations.bundle(citations.sources(records))))
     await turn.harness._trace_retrieval(turn.claim, found, call.id)
-    before = set(turn.evidence.numbered)
-    keys = list(dict.fromkeys(turn.evidence.add(found["records"])))
+    keys = list(dict.fromkeys(turn.evidence.add(found["records"], shown=False)))
     if not keys:
         return ToolResult(id=call.id, ok=True, text="No passage matched.", meta={"passages": [], "mode": found["mode"]})
-    shown, used = [], 0
-    for key in keys:  # whole passages, best first, within the output preview
-        size = len(turn.evidence.lines([key])[0]) + 2
-        if shown and used + size > PREVIEW_ROOM:
-            break
-        shown.append(key)
-        used += size
-    turn.evidence.keep(keys, shown, before)
-    result = _shown(turn, call.id, shown, {"mode": found["mode"]})
-    if len(shown) < len(keys):
-        result.text += f"\n\n({len(keys) - len(shown)} more passages matched; search more narrowly to see them.)"
-    if found["mode"] == "keyword_only":
-        result.text += "\n\n(Meaning search was unavailable: these come from keyword search only.)"
-    return result
+    # S1-21b: whole passages, best first; past the preview, kept and paged, each read once a page shows its marker
+    head = "(Meaning search was unavailable: these come from keyword search only.)\n\n" \
+        if found["mode"] == "keyword_only" else ""
+    text, shown = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", head=head)
+    return ToolResult(id=call.id, ok=True, text=text, meta={
+        "passages": [turn.evidence.numbered[v]["passage_id"] for _, _, k, v in shown if k == "passage"],
+        "mode": found["mode"]})
 
 
 @REGISTRY.register(
@@ -266,23 +244,43 @@ async def read_passage(call, turn):
         room -= len(record["text"]) + 200
     left = [r["ordinal"] for r in records[len(kept):]]
     keys = list(dict.fromkeys(turn.evidence.add(kept, shown=False)))
-    lines = turn.evidence.lines(keys)
-    at, starts = 0, []
-    for key, line in zip(keys, lines):
-        starts.append((at, key))
-        at += len(line) + 2
-    shown = [key for start, key in starts if compaction.marked(start, key, 0)]  # its whole marker in the preview: read now
-    turn.evidence.show(shown)
-    turn.segments[call.id] = [(start, key) for start, key in starts if key not in shown]
-    text = "\n\n".join(lines)
-    if left:
-        text += f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)"
+    tail = f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)" if left else ""
+    text, shown = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", tail=tail)
     return ToolResult(id=call.id, ok=True, text=text, meta={
-        "passages": [turn.evidence.numbered[k]["passage_id"] for k in shown], "version_id": rows[0][1][7],
-        "left_out": len(left)})
+        "passages": [turn.evidence.numbered[v]["passage_id"] for _, _, k, v in shown if k == "passage"],
+        "version_id": rows[0][1][7], "left_out": len(left)})
 
 
-PREVIEW_ROOM = 7000  # characters of whole passages a search result shows, within the 8,000-character preview
+PREVIEW_ROOM = 7000  # characters of whole passages a selection read directly must fit (B40), within the 8,000 preview
+LABEL_CHARS = 60  # S1-21b: a listed paper or memory record is shown once a page holds this much of its line (or all)
+
+
+def _passage_items(turn, keys):
+    return [(line, f"[S{key[0]}.{key[1]}]", "passage", key) for key, line in zip(keys, turn.evidence.lines(keys))]
+
+
+def _paged(turn, call_id, items, sep, head="", tail=""):
+    """S1-21b (section 8, Paging): a result's text of items [(line, label, kind, value)], each item read in the run (a
+    passage), given to the model (a paper's listing) or held by the request (a memory record) only once a page the
+    model is served completes its label: those the preview completes now, the rest kept as the call's segments for
+    read_output (the harness keeps the whole text and pages it). Returns (the text, the items shown now)."""
+    at, starts = len(head), []
+    for line, label, kind, value in items:
+        starts.append((at, label, kind, value))
+        at += len(line) + len(sep)
+    shown = [s for s in starts if compaction.marked(s[0], s[1], 0)]
+    turn.segments[call_id] = [s for s in starts if s not in shown]
+    reveal(turn, shown)
+    return head + sep.join(line for line, *_ in items) + tail, shown
+
+
+def reveal(turn, shown):
+    """What items a served page completes give the run: passages read, papers listed, memory records held."""
+    turn.evidence.show([v for _, _, k, v in shown if k == "passage"])
+    turn.listed.update(v for _, _, k, v in shown if k == "paper")
+    held = [v for _, _, k, v in shown if k == "memory"]
+    if held:
+        _remembered(turn, [record for record, _ in held], {m for _, materials in held for m in materials})
 _MARKER_SLACK = 8  # a marker the turn numbers ([S12.30]) may be longer than one numbered from 1
 
 
@@ -420,22 +418,10 @@ async def open_place(call, turn):
 # they may carry pass the dispatch check before the next step); with memory off in the project they read and write
 # nothing.
 
-MEMORY_ROOM = 7000  # characters of whole records a memory tool shows, within the 8,000-character preview
-
-
 def _remembered(turn, records, materials):
     turn.ctx["memory_ids"] = sorted({*turn.ctx.get("memory_ids", ()), *records})
     turn.ctx["memory_materials"] = sorted({*turn.ctx.get("memory_materials", ()), *materials})
 
-
-def _within(lines):
-    shown, used = [], 0
-    for line in lines:
-        if used + len(line) + 1 > MEMORY_ROOM:
-            break
-        shown.append(line)
-        used += len(line) + 1
-    return shown
 
 
 @REGISTRY.register(
@@ -451,13 +437,12 @@ async def read_project_state(call, turn):
 
     def read(conn):
         lines, ids = memory.project_state(conn, turn.ctx["project_id"])
-        return lines, ids, memory.materials_of(conn, ids)
-    lines, ids, materials = await turn.read(read)
-    shown = _within(lines)
-    ids = ids[:len(shown)]
-    _remembered(turn, ids, materials)
-    return ToolResult(id=call.id, ok=True, text="\n".join(shown) if shown else "The project state is empty so far.",
-                      meta={"memory": ids})
+        return lines, [(i, tuple(memory.materials_of(conn, [i]))) for i in ids]
+    lines, held = await turn.read(read)
+    if not lines:
+        return ToolResult(id=call.id, ok=True, text="The project state is empty so far.", meta={"memory": []})
+    text, shown = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in zip(lines, held)], "\n")
+    return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for _, _, _, v in shown]})
 
 
 @REGISTRY.register(
@@ -478,13 +463,12 @@ async def read_memory(call, turn):
         if query is not None:
             found.sort(key=lambda r: -memory.likeness(query, r["content"]))
         found = found[:memory.RECALL_LIMIT]
-        return found, memory.materials_of(conn, [r["id"] for r in found])
-    found, materials = await turn.read(read)
-    shown = _within([memory.memory_line(r) for r in found])
-    ids = [r["id"] for r in found[:len(shown)]]
-    _remembered(turn, ids, materials)
-    return ToolResult(id=call.id, ok=True, text="\n".join(shown) if shown else "No memory record is recorded for this.",
-                      meta={"memory": ids})
+        return [(memory.memory_line(r), (r["id"], tuple(memory.materials_of(conn, [r["id"]])))) for r in found]
+    found = await turn.read(read)
+    if not found:
+        return ToolResult(id=call.id, ok=True, text="No memory record is recorded for this.", meta={"memory": []})
+    text, shown = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in found], "\n")
+    return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for _, _, _, v in shown]})
 
 
 @REGISTRY.register(
@@ -542,10 +526,11 @@ async def read_output(call, turn):
             text = None
     if text is None:  # gone with a paper whose text it held, or never kept
         return failed(call.id, "not_found", "That output is no longer kept.")
-    shown = [key for start, key in kept["segments"] if compaction.marked(start, key, offset)]
-    turn.evidence.show(shown)
-    return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle),
-                      meta={"passages": [turn.evidence.numbered[k]["passage_id"] for k in shown], "page": True})
+    shown = [s for s in kept["segments"] if compaction.marked(s[0], s[1], offset)]
+    reveal(turn, shown)
+    return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle), meta={
+        "passages": [turn.evidence.numbered[v]["passage_id"] for _, _, k, v in shown if k == "passage"],
+        "memory": [v[0] for _, _, k, v in shown if k == "memory"], "page": True})
 
 
 def definitions():

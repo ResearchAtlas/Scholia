@@ -35,15 +35,10 @@ class ToolRouter:
         return ToolError(type="validation_error", message=problem) if problem else None
 
     async def execute(self, call: ToolCall, *context) -> ToolResult:
-        """Run a call that passed check, with its context; its result's text bounded to the tool's own output budget (S1-21b:
-        the harness pages what is past the 8,000-character preview, backend/compaction.py)."""
+        """Run a call that passed check, with its context. Its result is returned whole: the harness keeps an output past
+        its preview (8,000 characters, or the tool's own smaller budget) and pages it (S1-21b, backend/compaction.py)."""
         func = self.registry.get_implementation(call.name)
-        result = await func(call, *context)
-        bound = self.registry.get_definition(call.name).output_chars
-        if result.ok and len(result.text) > bound:
-            result = result.model_copy(update={"text": result.text[:bound] + f"\n[Cut at {bound} characters, this tool's bound.]",
-                                               "meta": {**result.meta, "cut": True}})
-        return result
+        return await func(call, *context)
 
 
 def failed(call_id, kind, message) -> ToolResult:

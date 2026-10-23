@@ -51,10 +51,13 @@ export function summarize(events) {
       const step = { phase: data.phase, route: data.route, estimate: data.estimate_usd ?? null,
         funded: data.funded ?? null, cut: false, attempts: [], tools: [] }; // funded: what paid a judge call (share, answer_unspent, budget)
       if (data.history_left_out) found.historyLeftOut = data.history_left_out; // left out: a paper it drew on is deleted, or its project no longer allows this request
-      if (data.phase === 'answer') found.summary = data.summary?.turns ?? null; // S1-21b: as the last answer step's request held it
+      if (data.summary) step.summary = data.summary.turns ?? []; // S1-21b: earlier turns its request held as a model's summary
       steps.set(data.step, step);
       found.steps.push(step);
     } else if (type === 'model_attempt') {
+      if (data.dispatched && steps.get(data.step)?.summary) { // a request that left carrying the summary: the answer used it
+        found.summary = [...new Set([...(found.summary ?? []), ...steps.get(data.step).summary])].sort((a, b) => a - b);
+      }
       steps.get(data.step)?.attempts.push({ outcome: data.outcome, cost: data.cost_usd ?? null, charge: data.charge ?? null,
         body: body ?? null, removed: Boolean(removed), // removed: its text went with a deleted paper
         unavailable: Boolean(data.body_unavailable) }); // the text could not be kept when it was sent

@@ -191,10 +191,15 @@ def sendable(conn, run_id):
 # Paged tool outputs
 
 
-def preview(text, handle):
-    """The first PREVIEW characters of a long output, and how to read on."""
-    return text[:PREVIEW] + (f"\n[Output continues: {len(text)} characters in all. Read on with read_output, handle "
-                             f"{handle}, offset {PREVIEW}.]")
+def preview(text, handle, size=PREVIEW):
+    """The first size characters of a long output (PREVIEW, or a tool's own smaller budget), and how to read on."""
+    return text[:size] + (f"\n[Output continues: {len(text)} characters in all. Read on with read_output, handle "
+                          f"{handle}, offset {size}.]")
+
+
+def unkept(text, size=PREVIEW):
+    """The first size characters of a long output that could not be kept for paging: the rest is said to be unavailable."""
+    return text[:size] + f"\n[Cut at {size} of {len(text)} characters: the rest could not be kept and cannot be read.]"
 
 
 def page(text, offset, handle):
@@ -205,11 +210,12 @@ def page(text, offset, handle):
                    if end < len(text) else "\n[End of the output.]")
 
 
-def marked(start, key, offset):
-    """Whether the page from offset completes the marker of the passage whose line starts at start (key its marker's
-    (source, passage)): it shows the marker's end, so the marker is whole on it, or (cut by the boundary before it) on it
-    and the page before, which the footer named. Only then is the passage read in the run."""
-    end = start + len(f"[S{key[0]}.{key[1]}]")
+def marked(start, label, offset):
+    """Whether the page from offset completes the label (a passage's marker, the head of a listed paper's or memory
+    record's line) of an item whose line starts at start: it shows the label's end, so the label is whole on it, or
+    (cut by the boundary before it) on it and the page before, which the footer named. Only then does the item count as
+    given to the model (agent._paged)."""
+    end = start + len(label)
     return offset < end <= offset + PREVIEW
 
 

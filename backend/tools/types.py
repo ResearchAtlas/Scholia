@@ -44,6 +44,6 @@ class ToolDefinition(BaseModel):
     read_only: bool
     repeat_safe: bool
     network: bool
-    output_chars: int  # its output budget, before the preview bound
+    output_chars: int  # its output budget: its preview is the lesser of this and 8,000; the rest is kept and paged (S1-21b)
     tool_class: ToolClass
     spends: bool  # whether it makes model calls, whose estimate the budget check reserves before it runs

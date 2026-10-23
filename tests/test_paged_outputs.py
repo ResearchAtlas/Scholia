@@ -4,6 +4,7 @@ and a handle, and read_output returns the next part; a passage counts as read on
 served; a handle is valid only in its own turn, and the kept output goes with its paper. Recorded tool-calling replies
 (tests/agentic.py); nothing leaves the process."""
 
+import asyncio
 import json
 import logging
 import os
@@ -115,7 +116,8 @@ async def test_i5_no_paged_text_reaches_the_logs(tmp_path, caplog):
     assert "Paragraph 9" not in caplog.text and "word word" not in caplog.text
 
 
-async def test_a_result_over_its_tools_own_bound_is_cut_there():
+async def test_the_router_returns_a_result_whole_whatever_its_tools_budget():
+    # Fix batch 1 (gpt-6-astra review 1, finding 1): the budget bounds the preview, never what is kept.
     registry = ToolRegistry()
 
     @registry.register("big", "A big tool.", {"type": "object", "properties": {}}, read_only=True, repeat_safe=True,
@@ -123,7 +125,7 @@ async def test_a_result_over_its_tools_own_bound_is_cut_there():
     async def big(call, *context):
         return ToolResult(id=call.id, ok=True, text="x" * 50)
     result = await ToolRouter(registry).execute(ToolCall(id="a", name="big"))
-    assert result.text.startswith("x" * 10 + "\n[Cut at 10") and result.meta["cut"]
+    assert result.text == "x" * 50
 
 
 async def test_pages_are_whole_and_say_how_to_read_on():
@@ -163,8 +165,52 @@ async def test_o2_read_passage_reads_whole_passages_up_to_its_bound_and_lists_th
         assert whole.rstrip().endswith("Read one with its ordinal.)") and "Passages left out, by ordinal:" in whole
 
 
-async def test_review_1_a_tool_bounded_within_a_page_is_cut_there_never_paged(tmp_path, monkeypatch):
-    # Review 1 (sonnet P3-1): a handle would lead only to the cut note.
+def reading_on(handle):
+    """A step that reads the second page of the output handle names, once the preview showed it."""
+    def step(body):
+        return [call("read_output", call_id="next", handle=handle, offset=compaction.PREVIEW)]
+    return step
+
+
+async def test_fix1_answer_from_library_past_the_preview_is_kept_whole_and_its_end_paged(tmp_path):
+    # gpt-6-astra review 1, finding 1: its ending and its citation checks were cut, with no handle and no kept row.
+    long = "Minimum wages raise the earnings of low-paid workers [S1.1]. " + "More detail follows here. " * 400 + "END-MARK."
+    handle = agent.traced_id("call_answer_from_library") + ".1"
+    provider = Scripted([call("answer_from_library", question="What do minimum wages do?")], reading_on(handle),
+                        "Done.", inner=[long])
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, paper("Wage Floors", "Minimum wages raise the earnings of low-paid workers."))
+        conversation = await conversation_in(client, project)
+        run = (await send(client, conversation, "Answer from my library"))[0]["run_id"]
+        first, second = tool_messages(provider.agent_steps[-1])
+        assert f"handle {handle}, offset {compaction.PREVIEW}" in first["content"] and "END-MARK" not in first["content"]
+        assert "END-MARK" in second["content"] and "Citation checks, in order:" in second["content"]
+        assert await rows(client, "SELECT count(*) FROM run_bodies WHERE run_id = ? AND attempt = ?", run,
+                          compaction.OUTPUT_SLOT + 1) == [(1,)]
+
+
+async def test_fix1_every_tool_is_paged_past_its_preview(tmp_path, monkeypatch):
+    async def big(call, turn):
+        return ToolResult(id=call.id, ok=True, text="y" * 9000 + " END-MARK")
+    monkeypatch.setitem(agent.REGISTRY._implementations, "list_materials", big)
+    handle = agent.traced_id("call_list_materials") + ".1"
+    provider = Scripted([call("list_materials")], reading_on(handle), "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, LONG)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "List them")
+        first, second = tool_messages(provider.agent_steps[-1])
+        assert len(first["content"]) <= compaction.PREVIEW + 200 and "END-MARK" in second["content"]
+
+
+@pytest.mark.parametrize("failure", ["refused", "raised"])
+async def test_fix1_an_output_that_could_not_be_kept_is_never_promised_as_paged(tmp_path, monkeypatch, failure):
+    # gpt-6-astra review 1, finding 2: ok, a paged count and "Read on" with a handle that answered not_found.
+    def keep_output(*args):
+        if failure == "raised":
+            raise RuntimeError("the database refused it")
+        return False
+    monkeypatch.setattr(compaction, "keep_output", keep_output)
     async def big(call, turn):
         return ToolResult(id=call.id, ok=True, text="y" * 9000)
     monkeypatch.setitem(agent.REGISTRY._implementations, "list_materials", big)
@@ -172,14 +218,45 @@ async def test_review_1_a_tool_bounded_within_a_page_is_cut_there_never_paged(tm
     async with cited(tmp_path, provider) as client:
         project, _ = await with_papers(client, LONG)
         conversation = await conversation_in(client, project)
-        await send(client, conversation, "List them")
+        run = (await send(client, conversation, "List them"))[0]["run_id"]
         [listed] = tool_messages(provider.agent_steps[-1])
-        assert "[Cut at 8000 characters" in listed["content"] and "read_output" not in listed["content"]
+        assert "read_output" not in listed["content"] and "could not be kept" in listed["content"]
+        [result] = [d for k, d, _ in await events_of(client, run) if k == "tool_result"]
+        assert "paged" not in result["meta"] and result["meta"]["cut"]
 
 
 async def test_review_1_a_passage_counts_as_shown_only_with_its_whole_marker_on_the_page():
-    assert compaction.marked(compaction.PREVIEW - 6, (1, 2), 0)  # "[S1.2]" ends at the page's end
-    assert not compaction.marked(compaction.PREVIEW - 5, (1, 2), 0)  # cut by the boundary
+    assert compaction.marked(compaction.PREVIEW - 6, "[S1.2]", 0)  # "[S1.2]" ends at the page's end
+    assert not compaction.marked(compaction.PREVIEW - 5, "[S1.2]", 0)  # cut by the boundary
     # Recheck 1 (P3-1): completed by the page the footer names, so sequential paging reads it
-    assert compaction.marked(compaction.PREVIEW - 5, (1, 2), compaction.PREVIEW)
-    assert not compaction.marked(10, (1, 2), 20)  # before the page
+    assert compaction.marked(compaction.PREVIEW - 5, "[S1.2]", compaction.PREVIEW)
+    assert not compaction.marked(10, "[S1.2]", 20)  # before the page
+
+
+async def test_fix1_papers_and_memory_records_past_the_preview_count_as_given_only_once_paged(tmp_path, monkeypatch):
+    # A listed paper (its title in the request) and a memory record are registered only once a served page shows them.
+    from backend.db.database import new_id
+    listing, remembering = agent.traced_id("call_list_materials") + ".1", agent.traced_id("call_read_memory") + ".2"
+    provider = Scripted([call("list_materials"), call("read_memory")],
+                        [call("read_output", call_id="p1", handle=listing, offset=compaction.PREVIEW),
+                         call("read_output", call_id="p2", handle=remembering, offset=compaction.PREVIEW)], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, LONG)
+        papers = [new_id() for _ in range(400)]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.executemany(
+            "INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, ?, 'upload')",
+            [(m, project, f"Paper {i:04d}") for i, m in enumerate(papers)]))
+        records = [(await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                           "content": f"Decision {i}: " + "detail " * 138})).json()["id"]
+                   for i in range(10)]
+        conversation = await conversation_in(client, project)
+        stream = await send(client, conversation, "What do I have?")
+        results = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
+        listed, remembered, page1, page2 = (r["meta"] for r in results)
+        assert len(listed["materials"]) < 401 and len(remembered["memory"]) < 10
+        assert set(page2["memory"]) and not set(page2["memory"]) & set(remembered["memory"])
+        inputs = json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"]))[0][0])
+        held = set(inputs["memory_ids"])
+        assert set(remembered["memory"]) | set(page2["memory"]) <= held <= set(records) | held  # (recall holds them too)
+        never = [m for m in papers if m not in inputs["context_materials"]]
+        assert never and set(listed["materials"]) <= set(inputs["context_materials"])
