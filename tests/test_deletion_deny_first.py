@@ -2,7 +2,8 @@
 builds: once a material is deleted, nothing of it is read back (its record, versions, passages and
 page images), its passages leave its project's index after they were added, and a file shared with
 another project stays there. Deletion while a material is read or looked up is in test_materials.py
-and test_identifier_lookup.py; the index's own checks come with S1-17, memory's with S1-21a (below)."""
+and test_identifier_lookup.py; the index's own checks come with S1-17, memory's with S1-21a (below), and compaction
+summaries' with S1-21b (the last test)."""
 
 import asyncio
 
@@ -309,3 +310,25 @@ async def test_the_dispatch_check_refuses_a_request_holding_a_memory_record_that
         await asyncio.to_thread(db.write, lambda conn: conn.execute("UPDATE runs SET cancel_reason = NULL WHERE id = ?",
                                                                     (run,)))
         assert await asyncio.to_thread(db.read, lambda conn: runs.may_dispatch(conn, run)) is False  # gone, whatever else
+
+
+async def test_l8_a_summary_of_a_turn_citing_a_deleted_paper_is_not_reused(tmp_path):
+    # S1-21b, checklist L8 (SPEC:1191, HS:761): deleted sources stay out of context, caches and summaries included.
+    from cited import cited, conversation_in, rows, with_papers
+    from scholia_app import send
+    from test_compaction import SUMMARY, Long, small_history, summary_rows, text_of
+    from test_search import WAGES
+    provider = Long(summary=SUMMARY + " QUOTE-A: minimum wages raise the earnings of low-paid workers.")
+    async with cited(tmp_path, provider) as client:
+        await small_history(client)
+        project, [material] = await with_papers(client, WAGES)
+        chat = await conversation_in(client, project)
+        await send(client, chat, "What do minimum wages do to earnings?")
+        for i in range(1, 4):
+            await send(client, chat, f"QUESTION-{i} about cohorts")
+        [(_, _, sha)] = await summary_rows(client)
+        assert (await client.delete(f"/api/materials/{material}")).status_code == 200
+        assert await summary_rows(client) == []  # in the deletion's own transaction
+        assert await rows(client, "SELECT count(*) FROM run_body_materials WHERE sha256 = ?", sha) == [(0,)]
+        await send(client, chat, "QUESTION-4 about cohorts")
+        assert "QUOTE-A" not in text_of(provider.turns[-1]) and "SUMMARY-MARK" not in text_of(provider.turns[-1])

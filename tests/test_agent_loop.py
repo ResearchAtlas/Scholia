@@ -34,7 +34,8 @@ async def test_a_turn_runs_tool_calls_until_the_model_answers_and_records_each_c
         first, second = provider.agent_steps
         assert {t["function"]["name"] for t in first["tools"]} == {
             "list_materials", "search_passages", "read_passage", "answer_from_library", "use_skill", "read_skill_file",
-            "ask", "open_place", "read_project_state", "read_memory", "update_progress"}  # S1-21a's three
+            "ask", "open_place", "read_project_state", "read_memory", "update_progress",  # S1-21a's three
+            "read_output"}  # and S1-21b's paging tool
         assert "tool_choice" not in first  # never forced (model-route rule 4)
         [result] = tool_messages(second)
         assert result["tool_call_id"] == "call_search_passages" and "[S1.1] Wage Floors" in result["content"]
@@ -118,7 +119,8 @@ async def test_read_passage_reads_whole_passages_in_order_within_its_bounds_and_
         conversation = await conversation_in(client, project)
         await send(client, conversation, "Read it")
         first, second = (tool_messages(b)[-1]["content"] for b in provider.agent_steps[1:3])
-        assert len(first) <= 8000 + 200 and "Passages left out, by ordinal:" in first
+        # S1-21b: whole passages up to the 50,000-character bound, the first 8,000 characters shown with a handle for more
+        assert len(first) <= 8000 + 200 and "Read on with read_output" in first
         assert first.index("Paragraph 0") < first.index("Paragraph 1")
         assert "Paragraph 5 " in second and "Paragraph 4 " not in second
 
@@ -243,7 +245,8 @@ def test_every_tool_declares_section_six_three_s_facts_and_a_closed_argument_sch
     tools = agent.REGISTRY.list_tools()
     assert {t.name for t in tools} == {"list_materials", "search_passages", "read_passage", "answer_from_library",
                                        "use_skill", "read_skill_file", "ask", "open_place",  # section 6.3, S1-19's
-                                       "read_project_state", "read_memory", "update_progress"}  # and S1-21a's
+                                       "read_project_state", "read_memory", "update_progress",  # and S1-21a's
+                                       "read_output"}  # and S1-21b's
     for tool in tools:
         assert all(getattr(tool, name) is not None for name in declared), tool.name
         assert tool.args_schema["type"] == "object" and tool.args_schema["additionalProperties"] is False

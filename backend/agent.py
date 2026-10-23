@@ -27,7 +27,7 @@ import json
 
 from fastapi import APIRouter
 
-from backend import citations, memory, skills
+from backend import citations, compaction, memory, skills
 from backend.settings import visible
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import failed
@@ -48,34 +48,51 @@ _IDS = {"type": "array", "items": {"type": "string", "maxLength": 64}, "maxItems
 
 class Evidence:
     """The turn's evidence: {(source, passage): record}, the router's pre-load first, then every passage a
-    tool gave the model, each paper keeping its source number and each passage its marker once given."""
+    tool gave the model, each paper keeping its source number and each passage its marker once given. S1-21b: pending
+    holds passages numbered in a paged output past its preview (read_passage), read in the run only once a page showing
+    their marker is served (read_output), so their markers are never given to another passage meanwhile."""
 
     def __init__(self, numbered):
         self.numbered = dict(numbered)
+        self.pending = {}
+        self.revealed = set()  # pending keys a later tool's add gave out (keep can return them to pending)
 
-    def add(self, records):
-        """The markers of records (given in order), numbering those not yet in the evidence."""
+    def add(self, records, shown=True):
+        """The markers of records (given in order), numbering those not yet in the evidence (pending ones unless shown)."""
         keys = []
         for record in records:
-            key = next((k for k, r in self.numbered.items() if r["passage_id"] == record["passage_id"]
+            known = {**self.numbered, **self.pending}
+            key = next((k for k, r in known.items() if r["passage_id"] == record["passage_id"]
                         and r["material_id"] == record["material_id"]), None)
             if key is None:
-                source = next((k[0] for k, r in self.numbered.items() if r["material_id"] == record["material_id"]),
-                              max((k[0] for k in self.numbered), default=0) + 1)
-                key = (source, max((k[1] for k in self.numbered if k[0] == source), default=0) + 1)
-                self.numbered[key] = record
+                source = next((k[0] for k, r in known.items() if r["material_id"] == record["material_id"]),
+                              max((k[0] for k in known), default=0) + 1)
+                key = (source, max((k[1] for k in known if k[0] == source), default=0) + 1)
+                (self.numbered if shown else self.pending)[key] = record
+            elif shown and key in self.pending:
+                self.show([key])
+                self.revealed.add(key)
             keys.append(key)
         return keys
 
+    def show(self, keys):
+        """Pending passages a page now shows the model: read in the run from here."""
+        for key in keys:
+            if key in self.pending:
+                self.numbered[key] = self.pending.pop(key)
+
     def lines(self, keys):
-        return citations.bundle({k: self.numbered[k] for k in dict.fromkeys(keys)})
+        known = {**self.numbered, **self.pending}
+        return citations.bundle({k: known[k] for k in dict.fromkeys(keys)})
 
     def keep(self, keys, kept, before):
         """Take back the markers of keys that were new (not in before) and are not in kept: passages retrieved but
         never shown to a model are not read in the run."""
         for key in keys:
             if key not in kept and key not in before:
-                self.numbered.pop(key, None)
+                record = self.numbered.pop(key, None)
+                if record is not None and key in self.revealed:  # still in a paged output: its marker stays its own
+                    self.pending[key] = record
 
 
 class Turn:
@@ -87,6 +104,8 @@ class Turn:
         self.step = step
         self.listed = set()
         self.activated = set()  # the skills activated in this turn
+        self.outputs = {}  # S1-21b: handle -> a paged output of this turn (its run_bodies slot, length, pending markers)
+        self.segments = {}  # call id -> [(character offset, pending passage key)] of an output past its preview
 
     async def read(self, fn):
         return await asyncio.to_thread(self.harness.db.read, fn)
@@ -238,18 +257,29 @@ async def read_passage(call, turn):
         records = [r for r in records if r["ordinal"] == ordinal]
         if not records:
             return failed(call.id, "not_found", "That paper has no passage at that ordinal.")
-    # Whole passages in order within the preview (the read bound is larger; paging comes with S1-21).
-    room, kept = min(READ_CHARS, 7000), []
+    # Whole passages in order within the read bound (S1-21b: past the 8,000-character preview, paged with read_output).
+    room, kept = READ_CHARS - 1000, []  # room left for the note of passages left out
     for record in records:
         if room < len(record["text"]) + 200 and kept:
             break
         kept.append(record)
         room -= len(record["text"]) + 200
     left = [r["ordinal"] for r in records[len(kept):]]
-    result = _shown(turn, call.id, turn.evidence.add(kept), {"version_id": rows[0][1][7], "left_out": len(left)})  # only those shown
+    keys = list(dict.fromkeys(turn.evidence.add(kept, shown=False)))
+    lines = turn.evidence.lines(keys)
+    at, starts = 0, []
+    for key, line in zip(keys, lines):
+        starts.append((at, key))
+        at += len(line) + 2
+    shown = [key for start, key in starts if start < compaction.PREVIEW]  # its marker in the preview: read now
+    turn.evidence.show(shown)
+    turn.segments[call.id] = [(start, key) for start, key in starts if start >= compaction.PREVIEW]
+    text = "\n\n".join(lines)
     if left:
-        result.text += f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)"
-    return result
+        text += f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)"
+    return ToolResult(id=call.id, ok=True, text=text, meta={
+        "passages": [turn.evidence.numbered[k]["passage_id"] for k in shown], "version_id": rows[0][1][7],
+        "left_out": len(left)})
 
 
 PREVIEW_ROOM = 7000  # characters of whole passages a search result shows, within the 8,000-character preview
@@ -482,6 +512,40 @@ async def update_progress(call, turn):
     await turn.harness._record(turn.claim, None, None, also=keep)
     turn.emit({"type": "memory", "action": "noted", "count": 1})
     return ToolResult(id=call.id, ok=True, text="Noted in the project state as your note.", meta={"noted": written[0]})
+
+
+# S1-21b: paged outputs (section 8, Paging; backend/compaction.py)
+
+
+@REGISTRY.register(
+    "read_output",
+    "Read more of a tool result that was cut at its preview: give the handle and the offset the result named. Returns "
+    "the next 8,000 characters. Handles are valid only within this turn.",
+    {"type": "object", "properties": {"handle": {"type": "string", "maxLength": 64},
+                                      "offset": {"type": "integer", "minimum": 0, "maximum": 1_000_000}},
+     "required": ["handle", "offset"], "additionalProperties": False},
+    read_only=True, repeat_safe=True, network=False, output_chars=compaction.PREVIEW + 200, tool_class="agent_control",
+    spends=False)
+async def read_output(call, turn):
+    handle, offset = call.arguments["handle"], call.arguments["offset"]
+    kept = turn.outputs.get(handle)  # this turn's own outputs only
+    if kept is None:
+        return failed(call.id, "not_found", "No output of this turn has that handle.")
+    if offset >= kept["length"]:
+        return failed(call.id, "validation_error", f"That output has {kept['length']} characters; give a smaller offset.")
+    sha = await turn.read(lambda conn: compaction.kept_output(conn, turn.claim.run_id, kept["step"], kept["number"]))
+    text = None
+    if sha is not None and turn.harness.content is not None:
+        try:
+            text = (await asyncio.to_thread(turn.harness.content.read, sha)).decode("utf-8")
+        except Exception:  # missing or damaged: as if not kept
+            text = None
+    if text is None:  # gone with a paper whose text it held, or never kept
+        return failed(call.id, "not_found", "That output is no longer kept.")
+    shown = [key for start, key in kept["segments"] if offset <= start < offset + compaction.PREVIEW]
+    turn.evidence.show(shown)
+    return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle),
+                      meta={"passages": [turn.evidence.numbered[k]["passage_id"] for k in shown], "page": True})
 
 
 def definitions():

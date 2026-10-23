@@ -20,7 +20,7 @@ import json
 import logging
 import weakref
 
-from backend import provenance
+from backend import compaction, provenance
 from backend.extraction import EXTRACTORS, extractor_of
 
 log = logging.getLogger(__name__)
@@ -161,6 +161,13 @@ RULES = (
     WHERE b.sha256 IN (SELECT sha256 FROM run_body_materials WHERE rowid IN {_doomed('run_body_materials')})
     OR (b.sha256 IN (SELECT sha256 FROM run_bodies WHERE rowid IN {_doomed('run_bodies')})
         AND NOT EXISTS (SELECT 1 FROM run_bodies r WHERE r.sha256 = b.sha256 AND r.rowid NOT IN {_doomed('run_bodies')}))""",
+    # S1-21b (backend/compaction.py): a compaction summary goes with any memory record a turn it covers held, as it goes
+    # with any of their papers (run_body_materials, above) and with their conversation (its run).
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'run_bodies', b.rowid FROM run_bodies b JOIN run_events e ON e.run_id = b.run_id AND e.type = 'compaction'
+    AND json_extract(e.data, '$.step') = b.step AND json_extract(e.data, '$.summary') = b.sha256
+    WHERE b.attempt = {compaction.SUMMARY_SLOT} AND EXISTS (SELECT 1 FROM json_each(e.data, '$.memory_ids') j
+                                       WHERE j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')}))""",
     # A project's own memory.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', rowid FROM memory_records
@@ -208,6 +215,13 @@ SCOPE_LINKS: tuple[str, ...] = (
 # records: inputs.memory_ids) is revoked when the record is deleted (section 10: "material, passage and memory record").
 SCOPE_LINKS += (
     f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.memory_ids') j
+    WHERE r.status = 'running' AND j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
+)
+
+# S1-21b: a run whose request carries a compaction summary is revoked when a memory record the summary follows is deleted
+# (inputs.summary_memory; its papers are in inputs.material_ids, above).
+SCOPE_LINKS += (
+    f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.summary_memory') j
     WHERE r.status = 'running' AND j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
 )
 
