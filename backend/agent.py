@@ -11,6 +11,8 @@ S1-19 has:
 - Pipeline: `answer_from_library`, the retrieval pipeline and the support check whole inside one tool.
 - Agent control: `use_skill`, `read_skill_file` (backend/skills.py), `ask` (the shared confirmation,
   backend/asks.py, kind `choice` only) and `open_place` (one place from a fixed list; it only opens it).
+- S1-21a: `read_project_state` and `read_memory` (reading the library's class) and `update_progress` (an agent's note in
+  project state, never confirmed; backend/memory.py).
 
 Each passage a tool gives the model joins the turn's evidence (`Evidence`) under a marker, [S<source>.
 <passage>], numbered after the router's pre-load, so the delivered answer's citations are checked
@@ -25,7 +27,7 @@ import json
 
 from fastapi import APIRouter
 
-from backend import citations, skills
+from backend import citations, memory, skills
 from backend.settings import visible
 from backend.tools.registry import ToolRegistry
 from backend.tools.router import failed
@@ -381,6 +383,105 @@ async def open_place(call, turn):
     turn.emit({"type": "open_place", "place": call.arguments["place"], "project_id": turn.ctx["project_id"]})
     return ToolResult(id=call.id, ok=True, text=f"Opened {call.arguments['place']} for the researcher.",
                       meta={"place": call.arguments["place"]})
+
+
+# S1-21a: project state and memory (section 6.3: read_project_state and read_memory read the library's class;
+# update_progress is agent control). What they give the model joins the request's context (its records and the papers
+# they may carry pass the dispatch check before the next step); with memory off in the project they read and write
+# nothing.
+
+MEMORY_ROOM = 7000  # characters of whole records a memory tool shows, within the 8,000-character preview
+
+
+def _remembered(turn, records, materials):
+    turn.ctx["memory_ids"] = sorted({*turn.ctx.get("memory_ids", ()), *records})
+    turn.ctx["memory_materials"] = sorted({*turn.ctx.get("memory_materials", ()), *materials})
+
+
+def _within(lines):
+    shown, used = [], 0
+    for line in lines:
+        if used + len(line) + 1 > MEMORY_ROOM:
+            break
+        shown.append(line)
+        used += len(line) + 1
+    return shown
+
+
+@REGISTRY.register(
+    "read_project_state",
+    "Read this project's state: its research question, method, hypotheses, criteria and constraints as recorded, "
+    "what has been done, and your earlier notes (open questions and next steps).",
+    {"type": "object", "properties": {}, "additionalProperties": False},
+    read_only=True, repeat_safe=True, network=False, output_chars=8000, tool_class="read_library", spends=False)
+async def read_project_state(call, turn):
+    if not await turn.harness.memory_on(turn.ctx["project_id"]):  # the switch as it is now
+        return ToolResult(id=call.id, ok=True, text="Memory is off in this project: there is no project state to read.",
+                          meta={"memory": []})
+
+    def read(conn):
+        lines, ids = memory.project_state(conn, turn.ctx["project_id"])
+        return lines, ids, memory.materials_of(conn, ids)
+    lines, ids, materials = await turn.read(read)
+    shown = _within(lines)
+    ids = ids[:len(shown)]
+    _remembered(turn, ids, materials)
+    return ToolResult(id=call.id, ok=True, text="\n".join(shown) if shown else "The project state is empty so far.",
+                      meta={"memory": ids})
+
+
+@REGISTRY.register(
+    "read_memory",
+    "Read what the researcher's memory holds for this project: their profile and preferences, decisions and events, "
+    "up to 10 records, those most like query first when one is given. Say plainly when nothing is recorded; never "
+    "invent a decision.",
+    {"type": "object", "properties": {"query": {"type": "string", "maxLength": 1000}}, "additionalProperties": False},
+    read_only=True, repeat_safe=True, network=False, output_chars=8000, tool_class="read_library", spends=False)
+async def read_memory(call, turn):
+    if not await turn.harness.memory_on(turn.ctx["project_id"]):
+        return ToolResult(id=call.id, ok=True, text="Memory is off in this project: nothing is recalled.",
+                          meta={"memory": []})
+    query = visible(call.arguments.get("query"))
+
+    def read(conn):
+        found = memory.recall_candidates(conn, turn.ctx["project_id"], locked=turn.ctx["policy"].locked)
+        if query is not None:
+            found.sort(key=lambda r: -memory.likeness(query, r["content"]))
+        found = found[:memory.RECALL_LIMIT]
+        return found, memory.materials_of(conn, [r["id"] for r in found])
+    found, materials = await turn.read(read)
+    shown = _within([memory.memory_line(r) for r in found])
+    ids = [r["id"] for r in found[:len(shown)]]
+    _remembered(turn, ids, materials)
+    return ToolResult(id=call.id, ok=True, text="\n".join(shown) if shown else "No memory record is recorded for this.",
+                      meta={"memory": ids})
+
+
+@REGISTRY.register(
+    "update_progress",
+    "Add a note to this project's state for later: an open question, or the next step you suggest. It is kept as your "
+    "note, never as the researcher's decision. One note per call.",
+    {"type": "object", "properties": {"kind": {"type": "string", "enum": ["open_question", "next_step"]},
+                                      "text": {"type": "string", "maxLength": 500}},
+     "required": ["kind", "text"], "additionalProperties": False},
+    read_only=False, repeat_safe=False, network=False, output_chars=500, tool_class="agent_control", spends=False)
+async def update_progress(call, turn):
+    text = visible(call.arguments["text"])
+    if text is None:
+        return failed(call.id, "validation_error", "The note is empty.")
+    if not await turn.harness.memory_on(turn.ctx["project_id"]):
+        return ToolResult(id=call.id, ok=True, text="Memory is off in this project: the note was not kept.",
+                          meta={"memory": []})
+    written = []
+
+    def keep(conn):
+        written.append(memory.note(conn, project_id=turn.ctx["project_id"], run_id=turn.claim.run_id,
+                                   kind=call.arguments["kind"], text=text, materials=turn.ctx.get("context_materials") or ()))
+        from backend.runs import _event  # it imports this module
+        _event(conn, turn.claim.run_id, "memory_proposed", {"tool": "update_progress", "records": list(written)})
+    await turn.harness._record(turn.claim, None, None, also=keep)
+    turn.emit({"type": "memory", "action": "noted", "count": 1})
+    return ToolResult(id=call.id, ok=True, text="Noted in the project state as your note.", meta={"noted": written[0]})
 
 
 def definitions():

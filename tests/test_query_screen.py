@@ -47,7 +47,7 @@ async def test_a_doi_found_only_in_model_text_or_memory_is_never_resolved(tmp_pa
         conversation = (await client.post("/api/conversations", json={"project_id": project})).json()["id"]
         await send(client, conversation, "What should I read?")
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
-            "INSERT INTO memory_records (id, scope, project_id, type, content, status) VALUES (?, 'project', ?, 'fact',"
+            "INSERT INTO memory_records (id, scope, project_id, type, content, status) VALUES (?, 'project', ?, 'event',"
             " ?, 'confirmed')", (new_id(), project, f"Harold mentioned doi:{MEMORY_DOI}")))
         await added(client, project, ("notes.md", b"# Notes\n\nNo identifier of its own.\n"))
         [paper] = await settled(client, project)

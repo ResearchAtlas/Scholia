@@ -97,9 +97,9 @@ def missing(numbered, *, mode, route, index="ready", cut=False):
                      "evidence for it; do not answer from general knowledge as if it were cited.")
     if mode == "keyword_only":
         notes.append("Meaning search was unavailable, so the evidence came from keyword search only.")
-    if route in ("memory", "find_papers", "memory_literature"):
-        notes.append("Earlier decisions, project state and new-paper search are not available yet; if the question "
-                     "depends on them, say they could not be retrieved rather than inventing them.")
+    if route == "find_papers":  # S1-21a: memory and project state are recalled (backend/runs.py _recall); not this
+        notes.append("New-paper search is not available yet; if the question depends on it, say the new papers could "
+                     "not be searched for rather than inventing them.")
     return notes
 
 

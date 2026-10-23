@@ -50,8 +50,9 @@ class Provider(MockProvider):
 
     @property
     def answers(self):
-        return [b for b in self.chats if not is_judge(b) and not is_router(b) and not b["messages"][0]["content"]
-                .startswith("Write a title")]
+        from scholia_app import _is_memory
+        return [b for b in self.chats if not is_judge(b) and not is_router(b) and not _is_memory(b)
+                and not b["messages"][0]["content"].startswith("Write a title")]
 
 
 @contextlib.asynccontextmanager

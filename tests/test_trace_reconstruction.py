@@ -25,9 +25,12 @@ async def test_a_cited_answer_is_rebuilt_from_its_record_alone(tmp_path):
         run_id = stream[0]["run_id"]
         events = await events_of(client, run_id)
         kinds = [kind for kind, _, _ in events]
-        assert kinds == ["route", "retrieval_trace", "step_started", "dispatch", "model_attempt", "step_finished",
-                         "step_started", "dispatch", "model_attempt", "step_finished", "citation_checks", "run_finished"]
-        route, trace = events[0][1], events[1][1]
+        # S1-21a: the memory the request holds (PROJECT STATE's progress: the paper added), by id, then the evidence
+        assert kinds == ["route", "retrieval_trace", "retrieval_trace", "step_started", "dispatch", "model_attempt",
+                         "step_finished", "step_started", "dispatch", "model_attempt", "step_finished", "citation_checks",
+                         "run_finished"]
+        assert set(events[1][1]) == {"memory"}
+        route, trace = events[0][1], events[2][1]
         assert route["retrieval"]["route"] == "literature" and [e["route"] for e in stream if e["type"] == "route"] == ["literature"]
         assert trace["query"] == QUESTION and trace["selected"] and set(trace["selected"]) <= set(trace["fused"])
         assert trace["mode"] == "hybrid" and "retrieve_ms" in trace and "total_ms" in trace

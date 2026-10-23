@@ -93,7 +93,8 @@ function imports(text, file) {
 
 test('Settings, a paper\'s page and the Markdown renderer load only through Parts.jsx\'s import()', () => {
   const LATER = ['components/Settings.jsx', 'components/Paper.jsx', 'markdown.js', 'components/ZoteroBrowser.jsx', // S1-15: the Zotero browser
-    'components/Trace.jsx']; // S1-19b: an answer's Details
+    'components/Trace.jsx', // S1-19b: an answer's Details
+    'components/LeftOff.jsx']; // S1-21a: Where we left off
   // What only a part imports, so it loads with that part.
   const ONLY_IN = { 'react-markdown': 'markdown.js', 'remark-gfm': 'markdown.js', 'trace.js': 'components/Trace.jsx' };
   const found = Object.fromEntries(readdirSync(SRC, { recursive: true }).filter((name) => /\.jsx?$/.test(name))
@@ -151,7 +152,7 @@ test('every part has a fallback and a failure, and the failure offers Try again 
   const config = [{ files: ['**/*.jsx'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } },
     plugins: { check: { rules: { parts: rule } } }, rules: { 'check/parts': 'error' } }];
   assert.deepEqual(new Linter().verify(text, config, 'Parts.jsx').filter((m) => m.fatal), []);
-  assert.deepEqual(found.boundaries, Array(5).fill(['failed', 'fallback']));
+  assert.deepEqual(found.boundaries, Array(6).fill(['failed', 'fallback'])); // S1-21a: Where we left off's too
   assert.deepEqual(found.loadStates, [{ problem: 'part_not_loaded', onRetry: '() => window.location.reload()' }]);
   assert.equal(found.statuses, 1); // the one loading status every fallback uses
   assert.ok(en['errors.part_not_loaded'] && zhCN['errors.part_not_loaded']);

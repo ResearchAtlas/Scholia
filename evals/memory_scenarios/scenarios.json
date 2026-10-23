@@ -1,0 +1,1632 @@
+[
+ {
+  "id": "en-01",
+  "language": "en",
+  "category": "fact_retrieval",
+  "ordering": null,
+  "title": "a saved method is recalled",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "Remember: my method is semi-structured interviews"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "my method is semi-structured interviews"
+   ],
+   "recall": {
+    "p1": [
+     "my method is semi-structured interviews"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-02",
+  "language": "en",
+  "category": "fact_retrieval",
+  "ordering": null,
+  "title": "a fact stated in the researcher's words is confirmed by extraction",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "Our field site is a city hospital"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "Our field site is a city hospital",
+      "status": "confirmed",
+      "span": "our field site is a city hospital",
+      "replaces": ""
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "Our field site is a city hospital"
+   ],
+   "proposed": [],
+   "recall": {
+    "p1": [
+     "Our field site is a city hospital"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-03",
+  "language": "en",
+  "category": "cross_session",
+  "ordering": null,
+  "title": "a record from one conversation is recalled in another",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "Remember: The ethics deadline is in March"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "conversation": "c2",
+    "text": "x"
+   }
+  ],
+  "oracle": {
+   "recall": {
+    "p1": [
+     "The ethics deadline is in March"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-04",
+  "language": "en",
+  "category": "cross_session",
+  "ordering": null,
+  "title": "a personal preference reaches another project, the project's own record does not",
+  "steps": [
+   {
+    "op": "project",
+    "id": "p2"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "Remember: I prefer short answers"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "project": "p2",
+    "conversation": "c2",
+    "text": "Remember: The other project uses archives"
+   }
+  ],
+  "oracle": {
+   "recall": {
+    "p1": [
+     "I prefer short answers"
+    ],
+    "p2": [
+     "The other project uses archives",
+     "I prefer short answers"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-05",
+  "language": "en",
+  "category": "temporal",
+  "ordering": null,
+  "title": "recall gives the newest first",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "Remember: The pilot ran in January"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "Remember: The main study runs in June"
+   }
+  ],
+  "oracle": {
+   "recall": {
+    "p1": [
+     "The main study runs in June",
+     "The pilot ran in January"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-06",
+  "language": "en",
+  "category": "temporal",
+  "ordering": null,
+  "title": "a record past its validity is not recalled",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "Remember: The pilot ran in January"
+   },
+   {
+    "op": "expire",
+    "content": "The pilot ran in January"
+   }
+  ],
+  "oracle": {
+   "recall": {
+    "p1": []
+   },
+   "active": [
+    "The pilot ran in January"
+   ]
+  }
+ },
+ {
+  "id": "en-07",
+  "language": "en",
+  "category": "knowledge_update",
+  "ordering": null,
+  "title": "a correction replaces the record most like it",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "Remember: the sample is 30 nurses"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "Correct: the sample is 50 nurses"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "the sample is 50 nurses"
+   ],
+   "recall": {
+    "p1": [
+     "the sample is 50 nurses"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-08",
+  "language": "en",
+  "category": "knowledge_update",
+  "ordering": "later_replaces",
+  "title": "the later turn's extraction, finishing last, replaces the earlier one's",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "Remember: the sample is 30 nurses"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "the sample is 35 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample is 35 nurses",
+      "status": "confirmed",
+      "span": "the sample is 35 nurses",
+      "replaces": "the sample is 30 nurses"
+     }
+    ]
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "the sample is 40 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t2",
+    "extraction": "x2"
+   },
+   {
+    "op": "finish",
+    "extraction": "x2",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample is 40 nurses",
+      "status": "confirmed",
+      "span": "the sample is 40 nurses",
+      "replaces": "The sample is 35 nurses"
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "The sample is 40 nurses"
+   ],
+   "proposed": []
+  }
+ },
+ {
+  "id": "en-09",
+  "language": "en",
+  "category": "superseded",
+  "ordering": "earlier_after_later",
+  "title": "an earlier turn's extraction finishing after a later one's becomes a proposal marked older, then confirmed",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "Remember: the sample is 30 nurses"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "the sample is 35 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "the sample is 40 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t2",
+    "extraction": "x2"
+   },
+   {
+    "op": "finish",
+    "extraction": "x2",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample is 40 nurses",
+      "status": "confirmed",
+      "span": "the sample is 40 nurses",
+      "replaces": "the sample is 30 nurses"
+     }
+    ]
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample is 35 nurses",
+      "status": "confirmed",
+      "span": "the sample is 35 nurses",
+      "replaces": "the sample is 30 nurses"
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "The sample is 40 nurses"
+   ],
+   "proposed": [
+    "The sample is 35 nurses"
+   ],
+   "older": [
+    "The sample is 35 nurses"
+   ]
+  }
+ },
+ {
+  "id": "en-10",
+  "language": "en",
+  "category": "superseded",
+  "ordering": "earlier_after_later",
+  "title": "after confirming the older proposal it is the active record",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "Remember: the sample is 30 nurses"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "the sample is 35 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "the sample is 40 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t2",
+    "extraction": "x2"
+   },
+   {
+    "op": "finish",
+    "extraction": "x2",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample is 40 nurses",
+      "status": "confirmed",
+      "span": "the sample is 40 nurses",
+      "replaces": "the sample is 30 nurses"
+     }
+    ]
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample is 35 nurses",
+      "status": "confirmed",
+      "span": "the sample is 35 nurses",
+      "replaces": "the sample is 30 nurses"
+     }
+    ]
+   },
+   {
+    "op": "keep",
+    "content": "The sample is 35 nurses"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "The sample is 35 nurses"
+   ],
+   "proposed": [],
+   "recall": {
+    "p1": [
+     "The sample is 35 nurses"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-11",
+  "language": "en",
+  "category": "superseded",
+  "ordering": "after_command",
+  "title": "an extraction finishing after a later correction stores only a proposal",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "Remember: the sample is 30 nurses"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "the sample is 35 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "Correct: the sample is 50 nurses"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample is 35 nurses",
+      "status": "confirmed",
+      "span": "the sample is 35 nurses",
+      "replaces": "the sample is 30 nurses"
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "the sample is 50 nurses"
+   ],
+   "proposed": [
+    "The sample is 35 nurses"
+   ],
+   "older": [
+    "The sample is 35 nurses"
+   ]
+  }
+ },
+ {
+  "id": "en-12",
+  "language": "en",
+  "category": "superseded",
+  "ordering": "after_command",
+  "title": "an extraction finishing after a later forget restores nothing",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "Remember: the sample is 30 nurses"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "the sample is 35 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "Forget: the sample is 30 nurses"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample is 35 nurses",
+      "status": "confirmed",
+      "span": "the sample is 35 nurses",
+      "replaces": "the sample is 30 nurses"
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [],
+   "proposed": [
+    "The sample is 35 nurses"
+   ],
+   "recall": {
+    "p1": []
+   }
+  }
+ },
+ {
+  "id": "en-13",
+  "language": "en",
+  "category": "superseded",
+  "ordering": "conflict",
+  "title": "a proposal conflicting with a confirmed record is rejected, then accepted when kept",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "Remember: the sample is 30 nurses"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "the sample may be 45 nurses"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "The sample may be 45 nurses",
+      "status": "inferred",
+      "span": "the sample may be 45 nurses",
+      "replaces": "the sample is 30 nurses"
+     }
+    ]
+   },
+   {
+    "op": "keep",
+    "content": "The sample may be 45 nurses"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "The sample may be 45 nurses"
+   ],
+   "proposed": []
+  }
+ },
+ {
+  "id": "en-14",
+  "language": "en",
+  "category": "source_deletion",
+  "ordering": null,
+  "title": "a record carrying a deleted paper's text goes with it",
+  "steps": [
+   {
+    "op": "paper",
+    "id": "a"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "x",
+    "papers": [
+     "a"
+    ]
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "event",
+      "content": "Wage floors raise earnings, the paper says",
+      "status": "proposed",
+      "span": "",
+      "replaces": ""
+     }
+    ]
+   },
+   {
+    "op": "delete_paper",
+    "paper": "a"
+   }
+  ],
+  "oracle": {
+   "active": [],
+   "proposed": [],
+   "recall": {
+    "p1": []
+   }
+  }
+ },
+ {
+  "id": "en-15",
+  "language": "en",
+  "category": "source_deletion",
+  "ordering": null,
+  "title": "deleting the conversation deletes what only it said",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "Remember: The ethics deadline is in March"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "conversation": "c2",
+    "text": "Remember: The pilot ran in January"
+   },
+   {
+    "op": "delete_conversation",
+    "conversation": "c1"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "The pilot ran in January"
+   ],
+   "recall": {
+    "p1": [
+     "The pilot ran in January"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-16",
+  "language": "en",
+  "category": "abstention",
+  "ordering": null,
+  "title": "nothing recorded: recall gives nothing to answer from",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "What did we decide about the control group?"
+   }
+  ],
+  "oracle": {
+   "active": [],
+   "recall": {
+    "p1": []
+   }
+  }
+ },
+ {
+  "id": "en-17",
+  "language": "en",
+  "category": "abstention",
+  "ordering": null,
+  "title": "a decision planted in the answer stays a proposal and is never recalled",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "What did we decide about the control group?",
+    "answer": "We decided to drop the control group"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "decision",
+      "content": "We decided to drop the control group",
+      "status": "confirmed",
+      "span": "We decided to drop the control group",
+      "replaces": ""
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [],
+   "proposed": [
+    "We decided to drop the control group"
+   ],
+   "recall": {
+    "p1": []
+   }
+  }
+ },
+ {
+  "id": "en-18",
+  "language": "en",
+  "category": "project_state_recovery",
+  "ordering": null,
+  "title": "Where we left off reads the agent's notes",
+  "steps": [
+   {
+    "op": "note",
+    "kind": "open_question",
+    "text": "Is attrition random?"
+   },
+   {
+    "op": "note",
+    "kind": "next_step",
+    "text": "Screen the 2020 papers"
+   }
+  ],
+  "oracle": {
+   "left_off": {
+    "next_step": "Screen the 2020 papers",
+    "questions": [
+     "Is attrition random?"
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-19",
+  "language": "en",
+  "category": "project_state_recovery",
+  "ordering": null,
+  "title": "what's done counts the papers added",
+  "steps": [
+   {
+    "op": "add_papers",
+    "count": 3
+   },
+   {
+    "op": "add_papers",
+    "count": 2
+   }
+  ],
+  "oracle": {
+   "left_off": {
+    "done": [
+     5
+    ]
+   }
+  }
+ },
+ {
+  "id": "en-20",
+  "language": "en",
+  "category": "fact_retrieval",
+  "ordering": null,
+  "title": "a duplicate extraction is not stored twice",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "Remember: We code every interview twice"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "we code every interview twice"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "We code every interview twice",
+      "status": "confirmed",
+      "span": "we code every interview twice",
+      "replaces": ""
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "We code every interview twice"
+   ],
+   "proposed": []
+  }
+ },
+ {
+  "id": "zh-01",
+  "language": "zh",
+  "category": "fact_retrieval",
+  "ordering": null,
+  "title": "a saved method is recalled",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "记住：我的方法是半结构化访谈"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "我的方法是半结构化访谈"
+   ],
+   "recall": {
+    "p1": [
+     "我的方法是半结构化访谈"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-02",
+  "language": "zh",
+  "category": "fact_retrieval",
+  "ordering": null,
+  "title": "a fact stated in the researcher's words is confirmed by extraction",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "我们的田野点是一家市立医院"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "我们的田野点是一家市立医院",
+      "status": "confirmed",
+      "span": "我们的田野点是一家市立医院",
+      "replaces": ""
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "我们的田野点是一家市立医院"
+   ],
+   "proposed": [],
+   "recall": {
+    "p1": [
+     "我们的田野点是一家市立医院"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-03",
+  "language": "zh",
+  "category": "cross_session",
+  "ordering": null,
+  "title": "a record from one conversation is recalled in another",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "记住：伦理审查截止日期在三月"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "conversation": "c2",
+    "text": "x"
+   }
+  ],
+  "oracle": {
+   "recall": {
+    "p1": [
+     "伦理审查截止日期在三月"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-04",
+  "language": "zh",
+  "category": "cross_session",
+  "ordering": null,
+  "title": "a personal preference reaches another project, the project's own record does not",
+  "steps": [
+   {
+    "op": "project",
+    "id": "p2"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "记住：我偏好简短的回答"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "project": "p2",
+    "conversation": "c2",
+    "text": "记住：另一个项目使用档案资料"
+   }
+  ],
+  "oracle": {
+   "recall": {
+    "p1": [
+     "我偏好简短的回答"
+    ],
+    "p2": [
+     "另一个项目使用档案资料",
+     "我偏好简短的回答"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-05",
+  "language": "zh",
+  "category": "temporal",
+  "ordering": null,
+  "title": "recall gives the newest first",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "记住：预调查在一月进行"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "记住：正式研究在六月进行"
+   }
+  ],
+  "oracle": {
+   "recall": {
+    "p1": [
+     "正式研究在六月进行",
+     "预调查在一月进行"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-06",
+  "language": "zh",
+  "category": "temporal",
+  "ordering": null,
+  "title": "a record past its validity is not recalled",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "记住：预调查在一月进行"
+   },
+   {
+    "op": "expire",
+    "content": "预调查在一月进行"
+   }
+  ],
+  "oracle": {
+   "recall": {
+    "p1": []
+   },
+   "active": [
+    "预调查在一月进行"
+   ]
+  }
+ },
+ {
+  "id": "zh-07",
+  "language": "zh",
+  "category": "knowledge_update",
+  "ordering": null,
+  "title": "a correction replaces the record most like it",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "记住：样本是30名护士"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "更正：样本是50名护士"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "样本是50名护士"
+   ],
+   "recall": {
+    "p1": [
+     "样本是50名护士"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-08",
+  "language": "zh",
+  "category": "knowledge_update",
+  "ordering": "later_replaces",
+  "title": "the later turn's extraction, finishing last, replaces the earlier one's",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "记住：样本是30名护士"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "样本是35名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本是35名护士",
+      "status": "confirmed",
+      "span": "样本是35名护士",
+      "replaces": "样本是30名护士"
+     }
+    ]
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "样本是40名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t2",
+    "extraction": "x2"
+   },
+   {
+    "op": "finish",
+    "extraction": "x2",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本是40名护士",
+      "status": "confirmed",
+      "span": "样本是40名护士",
+      "replaces": "样本是35名护士"
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "样本是40名护士"
+   ],
+   "proposed": []
+  }
+ },
+ {
+  "id": "zh-09",
+  "language": "zh",
+  "category": "superseded",
+  "ordering": "earlier_after_later",
+  "title": "an earlier turn's extraction finishing after a later one's becomes a proposal marked older, then confirmed",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "记住：样本是30名护士"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "样本是35名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "样本是40名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t2",
+    "extraction": "x2"
+   },
+   {
+    "op": "finish",
+    "extraction": "x2",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本是40名护士",
+      "status": "confirmed",
+      "span": "样本是40名护士",
+      "replaces": "样本是30名护士"
+     }
+    ]
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本是35名护士",
+      "status": "confirmed",
+      "span": "样本是35名护士",
+      "replaces": "样本是30名护士"
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "样本是40名护士"
+   ],
+   "proposed": [
+    "样本是35名护士"
+   ],
+   "older": [
+    "样本是35名护士"
+   ]
+  }
+ },
+ {
+  "id": "zh-10",
+  "language": "zh",
+  "category": "superseded",
+  "ordering": "earlier_after_later",
+  "title": "after confirming the older proposal it is the active record",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "记住：样本是30名护士"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "样本是35名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "样本是40名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t2",
+    "extraction": "x2"
+   },
+   {
+    "op": "finish",
+    "extraction": "x2",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本是40名护士",
+      "status": "confirmed",
+      "span": "样本是40名护士",
+      "replaces": "样本是30名护士"
+     }
+    ]
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本是35名护士",
+      "status": "confirmed",
+      "span": "样本是35名护士",
+      "replaces": "样本是30名护士"
+     }
+    ]
+   },
+   {
+    "op": "keep",
+    "content": "样本是35名护士"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "样本是35名护士"
+   ],
+   "proposed": [],
+   "recall": {
+    "p1": [
+     "样本是35名护士"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-11",
+  "language": "zh",
+  "category": "superseded",
+  "ordering": "after_command",
+  "title": "an extraction finishing after a later correction stores only a proposal",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "记住：样本是30名护士"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "样本是35名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "更正：样本是50名护士"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本是35名护士",
+      "status": "confirmed",
+      "span": "样本是35名护士",
+      "replaces": "样本是30名护士"
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "样本是50名护士"
+   ],
+   "proposed": [
+    "样本是35名护士"
+   ],
+   "older": [
+    "样本是35名护士"
+   ]
+  }
+ },
+ {
+  "id": "zh-12",
+  "language": "zh",
+  "category": "superseded",
+  "ordering": "after_command",
+  "title": "an extraction finishing after a later forget restores nothing",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "记住：样本是30名护士"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "样本是35名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "text": "忘记：样本是30名护士"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本是35名护士",
+      "status": "confirmed",
+      "span": "样本是35名护士",
+      "replaces": "样本是30名护士"
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [],
+   "proposed": [
+    "样本是35名护士"
+   ],
+   "recall": {
+    "p1": []
+   }
+  }
+ },
+ {
+  "id": "zh-13",
+  "language": "zh",
+  "category": "superseded",
+  "ordering": "conflict",
+  "title": "a proposal conflicting with a confirmed record is rejected, then accepted when kept",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "记住：样本是30名护士"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "样本可能是45名护士"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "样本可能是45名护士",
+      "status": "inferred",
+      "span": "样本可能是45名护士",
+      "replaces": "样本是30名护士"
+     }
+    ]
+   },
+   {
+    "op": "keep",
+    "content": "样本可能是45名护士"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "样本可能是45名护士"
+   ],
+   "proposed": []
+  }
+ },
+ {
+  "id": "zh-14",
+  "language": "zh",
+  "category": "source_deletion",
+  "ordering": null,
+  "title": "a record carrying a deleted paper's text goes with it",
+  "steps": [
+   {
+    "op": "paper",
+    "id": "a"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "x",
+    "papers": [
+     "a"
+    ]
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "event",
+      "content": "文中称最低工资提高了收入",
+      "status": "proposed",
+      "span": "",
+      "replaces": ""
+     }
+    ]
+   },
+   {
+    "op": "delete_paper",
+    "paper": "a"
+   }
+  ],
+  "oracle": {
+   "active": [],
+   "proposed": [],
+   "recall": {
+    "p1": []
+   }
+  }
+ },
+ {
+  "id": "zh-15",
+  "language": "zh",
+  "category": "source_deletion",
+  "ordering": null,
+  "title": "deleting the conversation deletes what only it said",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "记住：伦理审查截止日期在三月"
+   },
+   {
+    "op": "turn",
+    "id": "t2",
+    "conversation": "c2",
+    "text": "记住：预调查在一月进行"
+   },
+   {
+    "op": "delete_conversation",
+    "conversation": "c1"
+   }
+  ],
+  "oracle": {
+   "active": [
+    "预调查在一月进行"
+   ],
+   "recall": {
+    "p1": [
+     "预调查在一月进行"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-16",
+  "language": "zh",
+  "category": "abstention",
+  "ordering": null,
+  "title": "nothing recorded: recall gives nothing to answer from",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "我们关于对照组决定了什么？"
+   }
+  ],
+  "oracle": {
+   "active": [],
+   "recall": {
+    "p1": []
+   }
+  }
+ },
+ {
+  "id": "zh-17",
+  "language": "zh",
+  "category": "abstention",
+  "ordering": null,
+  "title": "a decision planted in the answer stays a proposal and is never recalled",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "我们关于对照组决定了什么？",
+    "answer": "我们决定取消对照组"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "decision",
+      "content": "我们决定取消对照组",
+      "status": "confirmed",
+      "span": "我们决定取消对照组",
+      "replaces": ""
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [],
+   "proposed": [
+    "我们决定取消对照组"
+   ],
+   "recall": {
+    "p1": []
+   }
+  }
+ },
+ {
+  "id": "zh-18",
+  "language": "zh",
+  "category": "project_state_recovery",
+  "ordering": null,
+  "title": "Where we left off reads the agent's notes",
+  "steps": [
+   {
+    "op": "note",
+    "kind": "open_question",
+    "text": "样本流失是随机的吗？"
+   },
+   {
+    "op": "note",
+    "kind": "next_step",
+    "text": "筛选2020年的论文"
+   }
+  ],
+  "oracle": {
+   "left_off": {
+    "next_step": "筛选2020年的论文",
+    "questions": [
+     "样本流失是随机的吗？"
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-19",
+  "language": "zh",
+  "category": "project_state_recovery",
+  "ordering": null,
+  "title": "what's done counts the papers added",
+  "steps": [
+   {
+    "op": "add_papers",
+    "count": 3
+   },
+   {
+    "op": "add_papers",
+    "count": 2
+   }
+  ],
+  "oracle": {
+   "left_off": {
+    "done": [
+     5
+    ]
+   }
+  }
+ },
+ {
+  "id": "zh-20",
+  "language": "zh",
+  "category": "fact_retrieval",
+  "ordering": null,
+  "title": "a duplicate extraction is not stored twice",
+  "steps": [
+   {
+    "op": "turn",
+    "id": "t0",
+    "text": "记住：每次访谈都由两人编码"
+   },
+   {
+    "op": "turn",
+    "id": "t1",
+    "text": "每次访谈都由两人编码"
+   },
+   {
+    "op": "start",
+    "turn": "t1",
+    "extraction": "x1"
+   },
+   {
+    "op": "finish",
+    "extraction": "x1",
+    "records": [
+     {
+      "type": "project_state",
+      "content": "每次访谈都由两人编码",
+      "status": "confirmed",
+      "span": "每次访谈都由两人编码",
+      "replaces": ""
+     }
+    ]
+   }
+  ],
+  "oracle": {
+   "active": [
+    "每次访谈都由两人编码"
+   ],
+   "proposed": []
+  }
+ }
+]

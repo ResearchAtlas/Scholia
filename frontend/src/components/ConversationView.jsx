@@ -7,7 +7,7 @@
 // that open the paper at its passage, its notices say what its retrieval and checks could not do, and
 // Details shows its trace; papers chosen in the Library or with @ go with the next message.
 import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { Markdown, Trace, markdownReady } from './Parts.jsx';
+import { LeftOff, Markdown, Trace, markdownReady } from './Parts.jsx';
 import { ArrowUp, BookOpen, FileText, Loader2, PanelLeftOpen, Paperclip, RotateCw, Square, X } from 'lucide-react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError, get, post } from '../api.js';
@@ -19,6 +19,7 @@ import { messageRoute } from '../settings.js';
 import { ACCEPT, afterAsksRead, asksChanged, choosePapers, chosenPapers, followAsks, libraryChanged, libraryEvents, newest, NO_ASKS, openPaperAt,
   readGuard, readGuardedAsks, pollsAsks, watchChosen } from '../library.js';
 import { addTo } from './Library.jsx';
+import { actionLines, composerFill } from '../memory.js'; // S1-21a
 import { Ask } from './Ask.jsx';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -43,7 +44,7 @@ function useConversationAsks(conversationId, watching, projectId) {
   useEffect(() => { setKnown(NO_ASKS); load(); }, [load]);
   useEffect(() => {
     const changed = (event) => {
-      if (event.detail !== projectId) return;
+      if (event.detail !== null && event.detail !== projectId) return;
       guard.current.libraryChanged(); // first: a read asked before this is dropped when it arrives
       setKnown({ ...NO_ASKS, unsure: true }); // nothing shown until a read succeeds; looked at again meanwhile
       load();
@@ -115,14 +116,14 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
   // stays on screen (backend/provenance.py); a failed read is tried again after a pause.
   useEffect(() => {
     const changed = (event) => {
-      if (event.detail !== projectId || !id) return; // a conversation not yet created has read nothing
+      if ((event.detail !== projectId && event.detail !== null) || !id) return; // a conversation not yet created has read nothing
       guard.current.libraryChanged(); // first: every read asked before this is dropped when it arrives
       setTurns(null);
       setStale(true);
       setFailed(false);
       load();
     };
-    libraryEvents.addEventListener('changed', changed);
+    libraryEvents.addEventListener('changed', changed); // a memory change too: a record its turns read back
     return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
   useEffect(() => {
@@ -243,6 +244,7 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
         <div className="mx-auto w-full max-w-3xl px-5 py-6">
           {failed && <p role="alert" className="text-sm text-destructive">{t(stale ? 'conversation.reloadFailed' : 'conversation.loadFailed')}</p>}
           {turns === null && !failed && <p className="text-sm text-muted-foreground" role="status">{t(stale ? 'conversation.reloading' : 'common.loading')}</p>}
+          {projectId && <LeftOff projectId={projectId} />}
           {turns !== null && shown.length === 0 && !live && <Empty />}
           <ol className="space-y-8">
             {shown.map((turn) => (
@@ -330,6 +332,7 @@ function Turn({ turn, onContinue, onOpen }) {
   return (
     <li className="space-y-3">
       <Question text={turn.message?.text ?? ''} />
+      <MemoryNotes items={turn.memory} />
       {turn.status === 'running' && <Working />}
       {turn.answer?.text && <Answer text={turn.answer.text} citations={turn.result_saved ? turn.citations ?? [] : null} onOpen={onOpen} />}
       {turn.answer && !turn.result_saved && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
@@ -356,6 +359,18 @@ function Turn({ turn, onContinue, onOpen }) {
   );
 }
 
+// S1-21a: what the turn's memory command or the agent's note did, read back from the record (memory.js).
+function MemoryNotes({ items }) {
+  const t = useT();
+  const lines = (items ?? []).flatMap((item) => actionLines(t, item));
+  if (!lines.length) return null;
+  return (
+    <ul className="flex flex-col items-end gap-0.5 text-xs text-muted-foreground" aria-label={t('memory.title')}>
+      {lines.map((line, i) => <li key={i} className="max-w-[85%] break-words">{line}</li>)}
+    </ul>
+  );
+}
+
 // What the answer could not do, in words (live.js NOTICES).
 function Notices({ notices }) {
   const t = useT();
@@ -373,6 +388,7 @@ function LiveTurn({ turn }) {
   return (
     <li className="space-y-3">
       <Question text={turn.text} />
+      <MemoryNotes items={turn.memory} />
       {turn.answer ? <Answer text={turn.answer} /> : !turn.done && <Working tool={turn.tool} />}
       {turn.answer && turn.resultSaved === false && <p className="text-xs text-warning">{t('turn.unsaved')}</p>}
       {turn.answer && turn.cut && <p className="text-xs text-muted-foreground">{t('turn.cut')}</p>}
@@ -400,6 +416,11 @@ function Composer({ running, problem, onSend, onStop, projectId, onAttach }) {
   const files = useRef(null);
   const chosen = useSyncExternalStore(watchChosen, () => chosenPapers(projectId));
   const mention = useMention(projectId, text);
+  useEffect(() => { // S1-21a: Where we left off's next step, put in the box; the researcher sends it
+    const fill = (event) => { setText(event.detail); box.current?.focus(); };
+    composerFill.addEventListener('fill', fill);
+    return () => composerFill.removeEventListener('fill', fill);
+  }, []);
 
   useEffect(() => {
     const area = box.current;

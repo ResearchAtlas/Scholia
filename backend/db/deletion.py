@@ -165,14 +165,31 @@ RULES = (
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', rowid FROM memory_records
     WHERE scope = 'project' AND project_id IN (SELECT id FROM projects WHERE rowid IN {_doomed('projects')})""",
-    # A memory record loses each deleted source, and is deleted with its last one.
+    # A memory record loses each deleted source, and is deleted with its last one (S1-21a: a paper it carries text of
+    # does not keep it: an extraction's record goes with its turn and run however many papers its answer drew on).
     """INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_sources', rowid FROM memory_sources WHERE source_id IN ({deleted_ids})""",
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', m.rowid FROM memory_records m
     WHERE m.id IN (SELECT memory_id FROM memory_sources WHERE rowid IN {_doomed('memory_sources')})
     AND NOT EXISTS (SELECT 1 FROM memory_sources s
-                    WHERE s.memory_id = m.id AND s.rowid NOT IN {_doomed('memory_sources')})""",
+                    WHERE s.memory_id = m.id AND s.source_kind != 'material'
+                    AND s.rowid NOT IN {_doomed('memory_sources')})""",
+    # S1-21a (backend/provenance.py): a record that may carry a paper's text (a `material` source) goes with any one of
+    # its papers, not only its last source.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'memory_records', m.rowid FROM memory_records m JOIN memory_sources s ON s.memory_id = m.id
+    WHERE s.source_kind = 'material' AND s.source_id IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
+    # S1-21a: Forget deletes the content (F10), so the earlier versions a deleted record replaced go with it (a pending
+    # proposal replaced nothing: the record it names may be another version's predecessor, S1-21a fix batch 5).
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'memory_records', o.rowid FROM memory_records o
+    WHERE o.status = 'superseded' AND o.id IN (SELECT supersedes_id FROM memory_records
+                                               WHERE rowid IN {_doomed('memory_records')} AND status != 'proposed')""",
+    # A deleted record's sources go with it.
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'memory_sources', rowid FROM memory_sources
+    WHERE memory_id IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
 )
 
 # The seam for scope links the schema does not record yet. Each entry is a SELECT
@@ -187,6 +204,13 @@ SCOPE_LINKS: tuple[str, ...] = (
     WHERE r.status = 'running' AND j.value IN (SELECT id FROM materials WHERE rowid IN {_doomed('materials')})""",
 )
 
+# S1-21a: a run whose request holds a memory record (a turn's USER MEMORY or PROJECT STATE, an extraction's related
+# records: inputs.memory_ids) is revoked when the record is deleted (section 10: "material, passage and memory record").
+SCOPE_LINKS += (
+    f"""SELECT r.id FROM runs r, json_each(r.inputs, '$.memory_ids') j
+    WHERE r.status = 'running' AND j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')})""",
+)
+
 # S1-15: a Zotero import names its items (inputs.library and inputs.items), not the papers it will make,
 # so deleting a Zotero paper revokes every running import of its item into its project, one that made it
 # and one still to come to it alike: none makes it again (backend/zotero.py).
@@ -198,7 +222,7 @@ SCOPE_LINKS += (
 )
 
 
-def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed=None):
+def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed=None, check=None):
     """Delete one object and everything that belongs to it. Returns the ids of the active runs it revoked.
     on_committed, if given, is called with those ids as soon as the deletion commits, before
     the cleanup that follows, so the caller can stop that work at once.
@@ -207,7 +231,8 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
     tombstones. An active (running) run whose scope included a deleted record is
     revoked: deleted with its conversation or project, or else kept with
     cancel_reason 'revoked', which its next dispatch must honor. The returned
-    ids let the caller stop that work in memory now.
+    ids let the caller stop that work in memory now. check(conn), if given, runs first in the deletion's own
+    transaction: what it raises leaves everything unchanged (a record still as it was shown).
 
     Raises ValueError for an unknown kind or the General project, and
     LookupError when the object does not exist; nothing is changed then.
@@ -216,7 +241,11 @@ def delete(db, content, kind, object_id, *, remove_all_trace=False, on_committed
         raise ValueError(f"cannot delete a {kind!r}")
     barrier = REVOKING.get(db)
     with barrier(None) if barrier else contextlib.nullcontext():  # None: every project (see REVOKING)
-        revoked = db.write(lambda conn: _delete(conn, kind, object_id, remove_all_trace))
+        def run(conn):
+            if check is not None:
+                check(conn)
+            return _delete(conn, kind, object_id, remove_all_trace)
+        revoked = db.write(run)
     if on_committed is not None:
         on_committed(revoked)
     # The deletion is committed. These finish removing its traces, and the next
@@ -313,6 +342,17 @@ def _delete(conn, kind, object_id, remove_all_trace):
     # Harold, 2026-10-21 (option A): a run that depended on a deleted paper loses every copy of model-written text it
     # keeps: its answer's citation rows' text, and an agent's question held while it waits (S1-19c).
     provenance.forget(conn, f"SELECT id FROM materials WHERE rowid IN {_doomed('materials')}")
+    # S1-21a fix batch 3 (R5): a memory extraction's reply held until its effect is written goes with any record its
+    # request was shown (inputs.memory_ids), in this transaction, not at the run's own end
+    conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.held.output')"
+                 " WHERE json_type(inputs, '$.held.output') IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(runs.inputs,"
+                 f" '$.memory_ids') j WHERE j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')}))")
+    # S1-21a: what's done, from AAB's own records: papers removed from a project that stays (no title is kept)
+    from backend import memory
+    for removed_from, count in conn.execute(
+            f"SELECT project_id, count(*) FROM materials WHERE rowid IN {_doomed('materials')} AND project_id NOT IN"
+            f" (SELECT id FROM projects WHERE rowid IN {_doomed('projects')}) GROUP BY project_id").fetchall():
+        memory.materials_removed(conn, removed_from, count)
     for (child, column), (parent, key) in edges.items():
         action = ON_DELETE[child, column]
         if action is not DELETE:

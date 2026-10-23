@@ -287,3 +287,39 @@ async def test_no_agent_loop_canary_reaches_the_log(tmp_path, caplog, monkeypatc
     for canary in canaries:
         assert canary not in text, canary
         assert not any(canary in record.getMessage() for record in caplog.records), canary
+
+
+async def test_no_memory_canary_reaches_the_log(tmp_path, caplog):
+    # S1-21a (checklist I5): a command's record, an extraction's records and a malformed or failed extraction, the
+    # memory views' edits and forgetting log no record text.
+    import json as _json
+    data = tmp_path / "data"
+    data.mkdir()
+    handler = logs.configure(data)
+    caplog.set_level(logging.DEBUG, logger="backend")
+    provider = MockProvider()
+    provider.memory_replies += [
+        provider.answer(_json.dumps({"records": [{"type": "decision", "content": "CANARY-EXTRACTED", "status": "proposed",
+                                                  "span": "", "replaces": ""}]})),
+        provider.answer("CANARY-MALFORMED not json"),
+        (500, {"error": {"message": "CANARY-ERROR-BODY"}})]
+    try:
+        async with started(data, provider) as client:
+            project = (await client.post("/api/projects", json={"name": "p"})).json()["id"]
+            conversation = (await client.post("/api/conversations", json={"project_id": project, "title": "t"})).json()["id"]
+            await send(client, conversation, "Remember: CANARY-MEMORY")
+            for _ in range(3):
+                await send(client, conversation, "CANARY-PROMPT")
+                await background_idle(client)
+            record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                              "content": "CANARY-VIEWS"})).json()
+            await client.patch(f"/api/memory/{record['id']}", json={"version": 1, "content": "CANARY-EDITED"})
+            await send(client, conversation, "Forget: CANARY-MEMORY")
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    text = (data / "logs" / "scholia.log").read_text()
+    for canary in ("CANARY-MEMORY", "CANARY-EXTRACTED", "CANARY-MALFORMED", "CANARY-ERROR-BODY", "CANARY-VIEWS",
+                   "CANARY-EDITED", "CANARY-PROMPT"):
+        assert canary not in text, canary
+        assert not any(canary in record.getMessage() for record in caplog.records), canary

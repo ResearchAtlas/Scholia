@@ -24,13 +24,16 @@ export async function readTrace(runId, read = get) {
 // limit is cut. S1-19c: each step's tool calls, by name and outcome, and the skills used (never their text).
 export function summarize(events) {
   const found = { route: null, retrieval: null, search: null, steps: [], checks: [], pairs: null, historyLeftOut: 0, finished: null,
-    skills: [] };
+    skills: [], memory: 0 };
   const calls = new Map(); // call id -> its entry in its step's tools
   const steps = new Map();
   for (const { type, data, body_ref: body, body_removed: removed } of events) {
     if (type === 'route') {
       if (data.route) found.route = data.route;
       if (data.retrieval) found.retrieval = data.retrieval; // the router's decision, when it decided, comes later
+    } else if (type === 'retrieval_trace' && data.memory) { // S1-21a: the memory records the request held, by id
+      found.memory = (data.memory.records ?? []).length + (data.memory.state ?? []).length;
+      found.memoryMode = data.memory.mode ?? null; // ranked by meaning (similarity), or the newest (recency)
     } else if (type === 'retrieval_trace' && !data.tool_call_id) { // the router's pre-load; a tool's is under its call
       found.search = { mode: data.mode, reason: data.reason ?? null, passages: (data.selected ?? []).length,
         rerank: data.rerank?.fallback ? 'fallback' : data.rerank ? 'reranked' : null };

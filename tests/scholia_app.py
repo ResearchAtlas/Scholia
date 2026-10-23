@@ -62,6 +62,8 @@ class MockProvider:
         self.local = ["llama", "m", "m:1"]  # what another provider's model listing holds, each with a 128K window
         self.replies = list(replies)
         self.title_replies = []  # replies for title calls, which never take from `replies`
+        # S1-21a: replies for memory extraction calls, which never take from `replies`; by default no records, free
+        self.memory_replies = []
         self.requests = []
         self.headers = []  # each request's headers, in the order of `requests`
         self.cost = cost
@@ -96,6 +98,14 @@ class MockProvider:
                 m if isinstance(m, dict) else {"model_id": m, "tag": "example", "context_length": 128000}
                 for m in self.zero_retention]})
         title = _is_title(body)
+        if _is_memory(body):
+            reply = self.memory_replies.pop(0) if self.memory_replies else self.answer('{"records": []}', cost=0)
+            if callable(reply):
+                reply = reply(body)
+                if asyncio.iscoroutine(reply):
+                    reply = await reply
+            status, payload = reply
+            return httpx.Response(status, json=payload)
         queue = self.title_replies if title else self.replies
         reply = queue.pop(0) if queue else None
         if callable(reply):
@@ -125,7 +135,11 @@ class MockProvider:
 
     @property
     def answers(self):
-        return [body for body in self.chats if not _is_title(body)]
+        return [body for body in self.chats if not _is_title(body) and not _is_memory(body)]
+
+    @property
+    def extractions(self):
+        return [body for body in self.chats if _is_memory(body)]
 
     @property
     def titles(self):
@@ -333,6 +347,11 @@ def arxiv_feed(identifier, title):
 
 def _is_title(body):
     return ((body or {}).get("messages") or [{}])[0].get("content", "").startswith("Write a title")
+
+
+def _is_memory(body):
+    from backend.memory import EXTRACT_RULES
+    return ((body or {}).get("messages") or [{}])[0].get("content", "").startswith(EXTRACT_RULES)
 
 
 def _default_answer(body):

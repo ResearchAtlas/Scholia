@@ -5,6 +5,7 @@
 import { useSyncExternalStore } from 'react';
 import { post, stream } from './api.js';
 import { asksChanged } from './library.js';
+import { memoryChanged } from './memory.js';
 
 const turns = new Map(); // conversation id -> { text, runId, answer, resultSaved, error, limit, done }
 const aborts = new Map();
@@ -33,6 +34,7 @@ export function apply(turn, event) {
     case 'tool_call': return { ...turn, tool: event.name }; // S1-19c: the tool the agent is using now
     case 'step': { const { tool, ...rest } = turn; return rest; } // the next model call: no tool is in use (CT3)
     case 'skill': return { ...turn, skills: [...(turn.skills ?? []), event.name] };
+    case 'memory': return { ...turn, memory: [...(turn.memory ?? []), { action: event.action, count: event.count }] }; // S1-21a
     case 'run_finished': return { ...turn, done: true };
     default: return turn;
   }
@@ -50,6 +52,7 @@ export function send(conversationId, path, body, text) {
     stream(path, body, (event) => {
       turn = apply(turn, event);
       if (event.type === 'ask') asksChanged(conversationId); // S1-19c: the agent asks; the conversation shows it
+      if (event.type === 'memory') memoryChanged(null); // S1-21a: a command or the agent's note changed memory
       // S1-19c: the help skill opens a place, only while its turn's conversation and project are shown (CT4)
       if (event.type === 'open_place' && shown?.conversationId === conversationId && shown.projectId === event.project_id) {
         openPlace(event.place);

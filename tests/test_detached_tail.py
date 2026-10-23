@@ -77,8 +77,8 @@ async def test_the_first_answer_queues_one_title_run_that_counts_toward_the_proj
         assert await rows(client, "SELECT paying_conversation_id, settled_usd, basis FROM budget_reservations"
                                   " WHERE run_id = ?", run_id) == [(None, 0.0003, "reported")]
         activity = (await client.get("/api/activity")).json()["runs"]
-        assert [(r["workflow"], r["status"], r["cost_usd"], r["project_kind"]) for r in activity] == [
-            ("title", "succeeded", 0.0003, "general")]
+        assert [(r["workflow"], r["status"], r["cost_usd"], r["project_kind"]) for r in activity
+                if r["workflow"] == "title"] == [("title", "succeeded", 0.0003, "general")]
 
 
 async def test_a_conversation_named_by_the_researcher_gets_no_title_run(tmp_path):
@@ -86,7 +86,7 @@ async def test_a_conversation_named_by_the_researcher_gets_no_title_run(tmp_path
         conversation_id = await new_conversation(client, title="My own name")
         await send(client, conversation_id)
         await background_idle(client)
-        assert await rows(client, "SELECT count(*) FROM runs WHERE kind = 'background'") == [(0,)]
+        assert await rows(client, "SELECT count(*) FROM runs WHERE kind = 'background' AND workflow = 'title'") == [(0,)]
         assert (await conversation(client, conversation_id))["title"] == "My own name"
 
 
@@ -105,7 +105,8 @@ async def test_a_rename_while_the_title_run_waits_wins_even_with_the_same_text(t
 
         found = await conversation(client, conversation_id)
         assert (found["title"], found["title_source"], found["title_rev"]) == (new_title, "researcher", 1)
-        assert await rows(client, "SELECT status FROM runs WHERE kind = 'background'") == [("succeeded",)]
+        assert await rows(client, "SELECT status FROM runs WHERE kind = 'background' AND workflow = 'title'") == [
+            ("succeeded",)]
 
 
 async def test_the_next_message_is_accepted_while_the_title_runs(tmp_path):
@@ -161,7 +162,8 @@ async def test_deleting_the_conversation_while_its_title_run_waits_recreates_not
         assert await rows(client, "SELECT count(*) FROM runs") == [(0,)]
         assert (await client.get(f"/api/conversations/{conversation_id}")).status_code == 404
         # Both calls' spending stays in the project, without links, settled once.
-        spending = await rows(client, "SELECT run_id, paying_conversation_id, project_id, status FROM budget_reservations")
+        spending = await rows(client, "SELECT run_id, paying_conversation_id, project_id, status FROM budget_reservations"
+                                      " WHERE settled_usd > 0")  # the memory extraction's free call aside (S1-21a)
         assert sorted(spending) == [(None, None, project, "settled")] * 2
         assert not client.state["harness"].registry.is_active(title)
 
@@ -173,7 +175,8 @@ async def test_a_failed_title_call_fails_only_the_title_run(tmp_path):
         conversation_id = await new_conversation(client)
         assert (await send(client, conversation_id))[-1]["status"] == "succeeded"
         await background_idle(client)
-        assert await rows(client, "SELECT status FROM runs WHERE kind = 'background'") == [("failed",)]
+        assert await rows(client, "SELECT status FROM runs WHERE kind = 'background' AND workflow = 'title'") == [
+            ("failed",)]
         found = await conversation(client, conversation_id)
         assert (found["title"], found["turns"][0]["status"]) == (None, "succeeded")
 
@@ -315,8 +318,8 @@ async def test_a_cancel_that_arrives_before_the_title_is_written_wins(tmp_path):
     async with started(tmp_path / "data", provider) as client:
         conversation_id = await new_conversation(client)
 
-        def cancel_then_answer(body):  # the Stop arrives while the title is on its way back
-            [active] = [a for a in client.state["harness"].registry.runs.values() if a.kind == "background"]
+        async def cancel_then_answer(body):  # the Stop arrives while the title is on its way back
+            active = client.state["harness"].registry.runs[await title_run(client)]
             active.cancel_reason = "researcher"
             active.cancel_requested.set()
             return provider.answer("Too late", cost=0.0003)
@@ -328,7 +331,7 @@ async def test_a_cancel_that_arrives_before_the_title_is_written_wins(tmp_path):
             ("cancelled", "researcher")]
         assert (await conversation(client, conversation_id))["title"] is None
         # Its call finished and reported its cost, which is kept, once.
-        [(basis,)] = await rows(client, "SELECT basis FROM budget_reservations WHERE paying_conversation_id IS NULL")
+        [(basis,)] = await rows(client, "SELECT basis FROM budget_reservations WHERE run_id = ?", await title_run(client))
         assert basis == "reported"
 
 

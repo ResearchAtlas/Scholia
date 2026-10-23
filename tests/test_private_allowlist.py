@@ -60,8 +60,8 @@ async def test_every_private_request_to_openrouter_carries_zdr_and_no_plugins_or
         _, conversation = await private_conversation(client)
         stream = await send(client, conversation, model=ZDR_MODEL, effort="high")
         assert stream[-1]["status"] == "succeeded"
-        await background_idle(client)  # the title run goes the same way
-        assert len(provider.chats) == 2
+        await background_idle(client)  # the title run and the memory extraction go the same way (S1-21a)
+        assert len(provider.chats) == 3 and len(provider.extractions) == 1
         for body, headers in zip(provider.chats, provider.chat_headers):
             assert body["provider"] == {"zdr": True, "only": ["example"], "require_parameters": True}
             assert headers.get_list("x-openrouter-cache") == ["false"]  # response caching off
@@ -71,7 +71,7 @@ async def test_every_private_request_to_openrouter_carries_zdr_and_no_plugins_or
         decisions = await rows(client, "SELECT data ->> 'decision', data ->> 'sensitivity' FROM audit_log"
                                        " WHERE event = 'outbound' AND data ->> 'kind' = 'model_provider'"
                                        " AND project_id IS NOT (SELECT id FROM projects WHERE kind = 'general')")
-        assert decisions == [("allow", "private")] * 2
+        assert decisions == [("allow", "private")] * 3
 
 
 async def test_a_private_agent_turns_tool_calling_steps_carry_the_private_controls(tmp_path):
@@ -293,7 +293,8 @@ async def test_the_gate_reads_the_allowlist_and_the_catalog_itself(tmp_path):
 
 async def attempt_terms(client):
     rows_ = await rows(client, "SELECT r.workflow, e.data FROM run_events e JOIN runs r ON r.id = e.run_id"
-                               " WHERE e.type = 'model_attempt' ORDER BY r.started_at, e.seq")
+                               " WHERE e.type = 'model_attempt' AND r.workflow != 'memory'"  # its own test: above
+                               " ORDER BY r.started_at, e.seq")
     return [(workflow, json.loads(data).get("retention")) for workflow, data in rows_]
 
 

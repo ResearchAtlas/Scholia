@@ -49,7 +49,7 @@ export function useLibrary(projectId) {
   }, [projectId, asked]);
   useEffect(() => { setListing(null); load(); }, [load]);
   useEffect(() => {
-    const changed = (event) => { if (event.detail === projectId) load(); };
+    const changed = (event) => { if (event.detail === null || event.detail === projectId) load(); };
     libraryEvents.addEventListener('changed', changed);
     return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);

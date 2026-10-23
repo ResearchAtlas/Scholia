@@ -33,7 +33,7 @@ async def test_a_cited_answer_is_recorded_with_every_citation_mapped_to_a_passag
         assert (chip["existence"], chip["support"], chip["material_id"], chip["marker"]) == (
             "ok", "supported", material, "[S1.1]")
         events = await events_of(client, run_id)
-        [trace] = [d for kind, d, _ in events if kind == "retrieval_trace"]
+        [trace] = [d for kind, d, _ in events if kind == "retrieval_trace" and "memory" not in d]  # S1-21a: memory's apart
         assert chip["passage_id"] in trace["selected"]  # read in the run
         [checks] = [d for kind, d, _ in events if kind == "citation_checks"]
         assert checks["citations"][0]["support"] == "supported"

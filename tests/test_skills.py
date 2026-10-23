@@ -67,10 +67,11 @@ def test_literature_review_ships_only_approved_instructions_and_references_with_
     notice = (LITERATURE / "NOTICE.md").read_text()
     assert "a92663a0214b3b9fa1ba6b958284ffd919c00a0c" in notice and "version 1.11" in notice
     body = skills.load()[0]["literature-review"].body
-    for absent in ("update_progress", "find_papers", "parallel-cli", "OPENROUTER_API_KEY", "allowed-tools"):
+    for absent in ("find_papers", "parallel-cli", "OPENROUTER_API_KEY", "allowed-tools"):
         assert absent not in body
-    for tool in ("answer_from_library", "search_passages", "read_passage"):
-        assert tool in body
+    # S1-21a: update_progress joins its tools (slice-1 spec section 6.2's table), in both languages
+    for tool in ("answer_from_library", "search_passages", "read_passage", "update_progress"):
+        assert tool in body and tool in skills.load()[0]["literature-review"].zh["body"]
 
 
 def test_the_help_skill_names_only_places_open_place_can_open():

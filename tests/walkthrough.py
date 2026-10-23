@@ -44,6 +44,10 @@ answer), and an abstention when the request says the library matched nothing.
 One model (NO_TOOLS) lists no endpoint that takes tools, for chat with the library. The request log
 records each call's role.
 
+S1-21a: the provider's memory extractions propose a decision for a message that considers a survey (and nothing for any
+other); the agent writes a next step with update_progress when asked to note one. Where we left off reads the clock as
+this launch's own, moved forward by the number of seconds in the file named by "memory clock".
+
 tests/walkthrough_driver.mjs drives the rendered walkthrough against this server.
 """
 
@@ -56,6 +60,7 @@ import secrets
 import socket
 import sys
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 
 sys.path[:0] = [str(Path(__file__).parent), str(Path(__file__).parents[1])]
@@ -74,7 +79,7 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 from scholia_app import FakeKeyring, MockProvider, MockScholarly, MockZotero, crossref_work, openalex_work, streaming  # noqa: E402
 
-from backend import local_helper, reading, router  # noqa: E402
+from backend import local_helper, memory, reading, router  # noqa: E402
 from backend.app import create_app  # noqa: E402
 from backend.budget_router import MODEL_TIERS  # noqa: E402
 from backend.citations import JUDGE_RULES  # noqa: E402
@@ -291,10 +296,23 @@ NO_TOOLS_ENDPOINTS = [{"tag": "example", "context_length": 131072,
 
 
 def role(body):
-    """A chat call's role, from its first message: title, judge, router or answer."""
+    """A chat call's role, from its first message: title, judge, router, memory (an extraction) or answer."""
     first = ((body or {}).get("messages") or [{}])[0].get("content", "") if isinstance(body, dict) else ""
     return "title" if first.startswith("Write a title") else "judge" if first.startswith(JUDGE_RULES) else \
-        "router" if first.startswith(router.ROUTER_RULES) else "answer"
+        "router" if first.startswith(router.ROUTER_RULES) else "memory" if first.startswith(memory.EXTRACT_RULES) else "answer"
+
+
+# S1-21a: what the synthetic extractor proposes (walkthrough step 91), by the researcher's message
+CONSIDERING = ("I am considering a survey of managers", "我在考虑对管理者做问卷调查")
+PROPOSED = ("A survey of managers is being considered", "正在考虑对管理者做问卷调查")
+
+
+def memory_reply(body):
+    said = body["messages"][-1]["content"].split("RESEARCHER'S MESSAGE:\n", 1)[-1].split("\n\nASSISTANT'S ANSWER", 1)[0]
+    records = [{"type": "decision", "content": PROPOSED[i], "status": "proposed", "span": said, "replaces": ""}
+               for i, text in enumerate(CONSIDERING) if text in said]
+    return 200, {"choices": [{"message": {"role": "assistant", "content": json.dumps({"records": records}, ensure_ascii=False)}}],
+                 "usage": {"prompt_tokens": 200, "completion_tokens": 30, "total_tokens": 230, "cost": 0.0005}}
 
 
 class SyntheticProvider(MockProvider):
@@ -337,6 +355,8 @@ HELP_ANSWER = ("Open the Library's Add menu and choose A reference file, then pi
                "I have opened the Library for you.",
                "打开文献库的“添加”菜单，选择“参考文献文件”，再选择你的 BibTeX、RIS 或 CSL JSON 文件。我已为你打开文献库。")
 ASKING = ("Which outcome should the summary focus on?", "摘要应侧重哪个结果？")
+NOTING = ("Note the next step for this project", "记下这个项目的下一步")  # S1-21a: update_progress (step 92)
+NEXT_STEP = ("Code the first five interviews", "为前五份访谈编码")
 OUTCOMES = (["Earnings", "Employment"], ["收入", "就业"])
 
 
@@ -352,6 +372,11 @@ def agent_step(body):
             name, arguments = (("use_skill", {"name": "help"}), ("open_place", {"place": "library"}))[len(done)]
             return tool_call(f"w{len(done)}", name, arguments)
         return HELP_ANSWER[zh]
+    if request in NOTING:
+        zh = NOTING.index(request)
+        if not done:
+            return tool_call("w-note", "update_progress", {"kind": "next_step", "text": NEXT_STEP[zh]})
+        return "Noted." if not zh else "已记下。"
     if request in ASKING:
         zh = ASKING.index(request)
         if not done:
@@ -413,6 +438,7 @@ def main(argv=None):
                                  scholarly=RECORDS)
     provider.replies = [synthetic] * 5000
     provider.title_replies = [synthetic] * 1000
+    provider.memory_replies = [memory_reply] * 1000  # S1-21a
     provider.endpoints[NO_TOOLS] = NO_TOOLS_ENDPOINTS  # S1-19b
     provider.log = args.request_log
     data_dir = Path(tempfile.mkdtemp(prefix="scholia-walkthrough-"))
@@ -426,6 +452,10 @@ def main(argv=None):
     binary.write_text(STAND_IN.format(python=sys.executable))
     binary.chmod(0o755)
     provider.control = harness / "helper-offline"
+    clock = harness / "memory-clock"  # S1-21a: seconds Where we left off's clock is moved forward
+    clock.write_text("0")
+    real_clock = memory._clock
+    memory._clock = lambda: real_clock() + timedelta(seconds=float(clock.read_text() or 0))
     local_helper.write_manifest(binary.parents[1])
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -446,6 +476,7 @@ def main(argv=None):
     print(f"zotero state: {zotero_control}", flush=True)
     print(f"model file: {offline}", flush=True)
     print(f"helper control: {provider.control}", flush=True)
+    print(f"memory clock: {clock}", flush=True)
     print(f"step ceiling: {reading.STEP_SECONDS:g}", flush=True)
     print(f"open: {origin}/" + ("" if args.dev else f"#session={session}"), flush=True)
     server = uvicorn.Server(uvicorn.Config(app, loop="asyncio", http="h11", ws="none", log_level="warning"))

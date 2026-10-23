@@ -17,6 +17,9 @@ carries, so the set is transitive. That one set is used everywhere:
   sentence (db/deletion.py _SOURCE_REMOVED). An agent's question and option labels, held in its run's inputs
   while it waits (`held.ask`, S1-19c), go in the deletion's own transaction (`forget`). Append-only events never hold it: they name citations and
   passages by id, and a citation check binds a verdict to its sentence by the sentence's hash.
+- Memory (S1-21a, backend/memory.py): a record that may carry such text (an extraction's, a saved answer, an agent's
+  note) names each paper as a `material` source and is deleted with any one of them (db/deletion.py RULES); recall
+  leaves out one whose papers are not `sendable`, and a request holding records names their papers too.
 - An answer stays the conversation's record (turns.answer), but every copy derived from it follows its
   whole dependency set (Harold, 2026-10-21, option A): once any of its papers is gone, every citation row
   of the answer loses its quote and sentence, whichever paper it names (`forget`, from the deletion
@@ -75,11 +78,13 @@ def forget(conn, doomed):
     holds a paper being deleted (doomed: an SQL query of their ids) loses every copy of model-written text it keeps:
     its answer's citation rows lose their text, whichever paper each row names, and an agent's question and option
     labels held while it waits (`inputs.held.ask`, S1-19c: the model's text, which may quote the paper) go at once,
-    not at the run's own end, which a failed write could keep from happening."""
+    not at the run's own end, which a failed write could keep from happening; so does a memory extraction's reply held
+    until its effect is written (`inputs.held.output`, S1-21a)."""
     # ponytail: scans every run's context_materials per deletion; an index table if runs grow very large
     depending = f"SELECT r.id FROM runs r, json_each(r.inputs, '$.context_materials') j WHERE j.value IN ({doomed})"
     conn.execute("UPDATE citations SET quote = NULL, context = json_remove(coalesce(context, '{}'), '$.sentence')"
                  f" WHERE owner_kind = 'answer' AND owner_id IN ({depending})"
                  " AND (quote IS NOT NULL OR json_extract(context, '$.sentence') IS NOT NULL)")
-    conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.held.ask')"
-                 f" WHERE json_type(inputs, '$.held.ask') IS NOT NULL AND id IN ({depending})")
+    conn.execute("UPDATE runs SET inputs = json_remove(inputs, '$.held.ask', '$.held.output')"
+                 " WHERE (json_type(inputs, '$.held.ask') IS NOT NULL OR json_type(inputs, '$.held.output') IS NOT NULL)"
+                 f" AND id IN ({depending})")

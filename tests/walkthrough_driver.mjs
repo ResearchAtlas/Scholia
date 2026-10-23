@@ -147,6 +147,7 @@ async function startServer(dir) {
   return { child, pid, origin: url.origin, session: url.hash.replace('#session=', ''), dataFolder: lines['data folder'],
            materials: lines.materials, modelFile: lines['model file'], helperControl: lines['helper control'], log,
            zoteroState: lines['zotero state'],  // S1-15
+           memoryClock: lines['memory clock'],  // S1-21a: Where we left off's clock, moved forward by its seconds
            stepCeiling: Number(lines['step ceiling']),  // the harness's time ceiling, in seconds
            stderr: () => stderr, exit: () => exit };
 }
@@ -2335,6 +2336,104 @@ async function s119(ctx) {
   });
 }
 
+// S1-21a: memory (checklist W1 to W4, W6; steps from 90, as S1-36's gold pages hold 80 to 84): a command saved and
+// confirmed in the answer, an extraction's proposal, Where we left off after 4 hours with Keep and the next step put in
+// the message box, Forget in the memory views, and memory switched off. Each step reads its record back.
+async function memoryFlow(ctx) {
+  const { page, L, P, C, step, check, get } = ctx;
+  const { dialog, openSidebar, openSettings } = navigation(ctx);
+  const box = () => page.locator('#composer');
+  const zh = C.lang !== 'en';
+  const name = zh ? '记忆（合成数据）' : 'Memory (synthetic)';
+  const requests = () => readFileSync(C.requestLog, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  const until = async (what, test, tries = 150) => {
+    for (let i = 0; i < tries; i += 1) { const value = await test(); if (value) return value; await page.waitForTimeout(200); }
+    throw new Error(`${what} did not happen in time`);
+  };
+  if (await dialog().count()) { await page.keyboard.press('Escape'); await page.waitForTimeout(500); }
+  const id = (await get('/api/projects', { method: 'POST', body: JSON.stringify({ name, sensitivity: 'normal' }) })).body.id;
+  await page.reload(); await box().waitFor();
+  await openSidebar();
+  await page.getByRole('button', { name: L('sidebar.switchProject') }).click(); await page.waitForTimeout(500);
+  await page.getByRole('menuitem', { name, exact: true }).click(); await page.waitForTimeout(1200);
+  const conversation = async () => (await get('/api/conversations')).body.conversations.find((c) => c.project_id === id);
+  const latest = async () => (await get(`/api/conversations/${(await conversation()).id}`)).body.turns.at(-1);
+  const memoryRuns = async () => (await get('/api/activity')).body.runs.filter((r) => r.project_id === id && r.workflow === 'memory');
+  const settledRuns = () => until('the extractions ended', async () => (await memoryRuns()).every((r) => r.status !== 'running'));
+  const send = async (text) => {
+    await box().fill(text);
+    await page.getByRole('button', { name: L('composer.send'), exact: true }).click();
+    await until('the answer saved', async () => { const turn = (await conversation()) && await latest(); return turn?.message?.text === text && turn.status === 'succeeded' && turn; });
+    await page.waitForTimeout(1500); // the live turn hands over to its record
+    return latest();
+  };
+  const listed = async () => { const found = (await get(`/api/memory?project_id=${id}`)).body; return [...found.personal, ...found.project]; };
+  const method = zh ? '我的方法是半结构化访谈' : 'my method is semi-structured interviews';
+
+  await step('90-remember', async () => {
+    const turn = await send(zh ? `记住：${method}` : `Remember: ${method}`);
+    const [record] = (await listed()).filter((r) => r.content === method);
+    check('the record is saved, confirmed (read back)', record?.status === 'confirmed' && record.type === 'project_state');
+    check('the turn says so from the record', turn.memory?.[0]?.records?.[0]?.content === method);
+    await page.getByText(L('memory.saved').replace('{content}', method), { exact: true }).waitFor();
+    check('the answer was told the record was saved', requests().filter((r) => r.role === 'answer').length > 0);
+  });
+
+  await step('91-proposal', async () => {
+    await send(zh ? '我在考虑对管理者做问卷调查' : 'I am considering a survey of managers');
+    await settledRuns();
+    const review = (await get(`/api/memory/review?project_id=${id}`)).body;
+    check('the extraction proposed a record waiting in Things to confirm', review.proposals.length === 1
+      && review.proposals[0].status === 'proposed' && review.proposals[0].content === (zh ? '正在考虑对管理者做问卷调查' : 'A survey of managers is being considered'));
+    check('the extraction is listed with its cost, charged to the project', (await memoryRuns()).some((r) => r.status === 'succeeded' && r.cost_usd > 0));
+    await send(zh ? '记下这个项目的下一步' : 'Note the next step for this project'); // the agent's note (update_progress)
+    await settledRuns();
+  });
+
+  await step('92-left-off', async () => {
+    writeFileSync(C.memoryClock, String(4 * 3600 + 60)); // four hours away, and a minute
+    await page.reload(); await box().waitFor();
+    const card = page.getByRole('region', { name: L('leftOff.title') });
+    await card.waitFor();
+    const nextStep = zh ? '为前五份访谈编码' : 'Code the first five interviews';
+    check('it shows the next step and Things to confirm', (await card.innerText()).includes(nextStep)
+      && (await card.innerText()).includes(L('leftOff.confirm')));
+    const before = requests().length;
+    await card.getByRole('button', { name: L('leftOff.ask'), exact: true }).click();
+    check('the next step fills the message box and sends nothing', (await box().inputValue()) === nextStep && requests().length === before);
+    await box().fill('');
+    await card.getByRole('button', { name: L('memory.keep'), exact: true }).click();
+    await until('the proposal kept', async () => (await listed()).some((r) => r.status === 'confirmed'
+      && r.content === (zh ? '正在考虑对管理者做问卷调查' : 'A survey of managers is being considered')));
+    check('Keep confirmed it (read back)', (await get(`/api/memory/review?project_id=${id}`)).body.proposals.length === 0);
+  });
+
+  await step('93-forget', async () => {
+    writeFileSync(C.memoryClock, '0');
+    await openSettings('settings.page.advanced');
+    const views = dialog().getByRole('heading', { name: L('memory.title'), exact: true });
+    await views.scrollIntoViewIfNeeded(); await page.waitForTimeout(800);
+    const row = dialog().getByRole('listitem').filter({ hasText: method });
+    await row.getByRole('button', { name: L('memory.forget'), exact: true }).click();
+    await until('the record forgotten', async () => !(await listed()).some((r) => r.content === method));
+    check('it is gone from the API', !(await listed()).some((r) => r.content === method));
+    await views.scrollIntoViewIfNeeded();
+  });
+
+  await step('95-memory-off', async () => {
+    await openSettings('settings.page.project');
+    const toggle = dialog().getByRole('radiogroup', { name: L('memory.enabled') });
+    await toggle.scrollIntoViewIfNeeded();
+    await toggle.getByRole('radio', { name: L('memory.off'), exact: true }).click(); await page.waitForTimeout(800);
+    check('the switch is saved off (read back)', (await get(`/api/memory?project_id=${id}`)).body.memory_enabled === false);
+    await page.keyboard.press('Escape'); await page.waitForTimeout(500);
+    const runs = (await memoryRuns()).length;
+    const turn = await send(zh ? '我们讨论一下抽样' : 'Let us talk about sampling');
+    await page.waitForTimeout(1500);
+    check('no extraction runs with memory off', (await memoryRuns()).length === runs && turn.memory_status === 'skipped');
+  });
+}
+
 // Samples an element's open or close animation frame by frame: its box and opacity at each tenth
 // of its animations, read with them paused (Web Animations API). The box shows the composed
 // motion, whichever properties (transform, translate) carry it.
@@ -2661,6 +2760,7 @@ async function run(combo, build, outRoot) {
                 dataFolder: server?.dataFolder, modelFile: server?.modelFile, requestLog: server?.log,
                 helperControl: server?.helperControl,
                 zoteroState: server?.zoteroState,  // S1-15
+                memoryClock: server?.memoryClock,  // S1-21a
                 stepCeiling: server?.stepCeiling,
                 question: combo.lang === 'en' ? 'What is a cohort study? (synthetic walkthrough question)' : '什么是队列研究？（合成演示问题）' };
     const check = (name, ok) => { current.checks.push({ name, ok: Boolean(ok) }); if (!ok) throw new Error(`check failed: ${name}`); };
@@ -2691,6 +2791,7 @@ async function run(combo, build, outRoot) {
     if (C.materials) await references(ctx);  // S1-14: a reference file's import, its merges, a Local only import, Attach
     if (C.zoteroState) await zotero(ctx);  // S1-15: the Zotero browser, an import and a re-import
     if (C.materials) await s119(ctx);  // S1-19b: cited answers; its stand-in helper and provider are the test server's
+    if (C.memoryClock) await memoryFlow(ctx);  // S1-21a: memory and Where we left off, on the test server's clock
     if (server) {  // S1-36: the gold sets' review pages, in a tab of their own
       const appPage = page;
       page = await appPage.context().newPage();
