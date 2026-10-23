@@ -49,5 +49,5 @@ export function fillComposer(text) {
 export const readLeftOff = (projectId) => get(`/api/projects/${encodeURIComponent(projectId)}/left-off`);
 export const readMemory = (projectId) => get(`/api/memory${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`);
 export const changeRecord = (record, body) => patch(`/api/memory/${encodeURIComponent(record.id)}`, { version: record.version, ...body });
-export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}`);
+export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}?version=${record.version}`);
 export const review = (body) => post('/api/memory/review', body);

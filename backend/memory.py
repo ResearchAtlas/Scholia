@@ -957,14 +957,24 @@ async def change_memory(record_id: str, body: Change, request: Request):
 
 
 @router.delete("/api/memory/{record_id}")
-async def delete_memory(record_id: str, request: Request):
+async def delete_memory(record_id: str, request: Request, version: int | None = None):
     """Forget: the record's content is deleted (with the versions it replaced), its vector removed, its audit record
-    written without content, and the runs whose request holds it revoked."""
+    written without content, and the runs whose request holds it revoked. version: the one the view showed; a record
+    changed or replaced since is not forgotten (409, as an edit at a stale version; S1-21a follow-up MB10)."""
     state = request.app.state.scholia
+
+    def shown(conn):
+        found = row(conn, record_id)
+        if found is None:
+            raise LookupError(record_id)
+        if version is not None and (found["version"] != version or found["status"] == "superseded"):
+            raise ValueError("changed")
     try:
-        await _forget(state, record_id)
+        await _forget(state, record_id, check=shown)
     except LookupError:
         return _refused(Refused(404, "not_found", "No such record"))
+    except ValueError as error:
+        return _refused(Refused(*_CHANGE_ERRORS[str(error)]))
     return {"ok": True}
 
 

@@ -784,3 +784,18 @@ async def test_an_extraction_whose_shown_proposal_was_edited_ends_revoked(tmp_pa
         assert provider.extractions == []
         assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
             ("cancelled", "revoked")]
+
+
+async def test_forget_in_the_memory_views_acts_on_the_version_shown(tmp_path):
+    # S1-21a follow-up MB10: a record edited in another window is not forgotten from a stale view
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+        assert (await client.patch(f"/api/memory/{record}", json={"version": 1, "content": "We use surveys"})).status_code == 200
+        stale = await client.delete(f"/api/memory/{record}", params={"version": 1})
+        assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
+            ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
+        [(current, version)] = await rows(client, "SELECT id, version FROM memory_records WHERE status = 'confirmed'")
+        assert (await client.delete(f"/api/memory/{current}", params={"version": version})).json() == {"ok": True}
