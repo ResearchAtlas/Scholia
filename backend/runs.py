@@ -1432,6 +1432,7 @@ class Harness:
         if action == "forget":
             scored = await self._read(lambda conn: memory.forget_candidates(conn, project_id, text, previous and previous[0]))
             ids = [r["id"] for _, r in scored]
+            seen = {r["id"]: (r["version"], r["status"]) for _, r in scored}  # as decided, and as the ask names them
             if text is not None and memory.clear(scored):
                 ids = ids[:1]
             elif not ids:
@@ -1443,14 +1444,26 @@ class Harness:
                     return await done("declined", line="Nothing was forgotten: the researcher chose not now.")
             if not await self.memory_on(project_id):
                 return await done("memory_off", line="Memory is off in this project: nothing was saved, changed or forgotten.")
-            count = 0
+            count = changed = 0
             for record in ids:
-                with suppress(LookupError):  # forgotten meanwhile
+                def as_seen(conn, record=record):  # in the deletion's own transaction (MB9): edited, kept or replaced
+                    found = memory.row(conn, record)  # since, it is not what the researcher chose to forget
+                    if found is None:
+                        raise LookupError(record)
+                    if (found["version"], found["status"]) != seen[record]:
+                        raise ValueError("changed")
+                try:
                     await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
-                                            on_committed=self.revoke)
+                                            on_committed=self.revoke, check=as_seen)
                     count += 1
+                except LookupError:  # forgotten meanwhile
+                    pass
+                except ValueError:
+                    changed += 1
             return await done("forgotten", count=count, line=f"Forgotten at the researcher's request: {count} memory "
-                                                             f"record{'s' if count != 1 else ''}. Do not use it.")
+                                                             f"record{'s' if count != 1 else ''}. Do not use it."
+                              + (f" {changed} record{'s' if changed != 1 else ''} changed since the researcher chose and "
+                                 f"{'were' if changed != 1 else 'was'} not forgotten." if changed else ""))
         if action == "save":
             if previous is None:
                 return await done("no_candidate", line="The researcher asked to save something, but there is no "

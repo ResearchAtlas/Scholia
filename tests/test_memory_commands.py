@@ -290,3 +290,24 @@ async def test_saving_what_is_pending_keeps_the_proposal(tmp_path):
             status="proposed", sources=[("project", project)]))
         await send(client, await conversation_in(client, project), "Remember: we run a survey of managers")
         assert await rows(client, "SELECT id, status FROM memory_records WHERE type = 'decision'") == [(proposal, "confirmed")]
+
+
+async def test_a_forget_answered_after_its_record_changed_forgets_nothing_and_says_so(tmp_path):
+    # S1-21a follow-up MB9: the forget acts on the records as they were when it was decided (their version and status,
+    # checked in the deletion's own transaction); one edited meanwhile is not forgotten, and the model is told so
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Remember: we exclude studies before 2000")
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        sending = asyncio.create_task(send(client, conversation, "forget this"))
+        ask = await open_ask(client, conversation)
+        edited = await client.patch(f"/api/memory/{record}", json={"version": 1, "content": "we exclude studies before 1990"})
+        assert edited.status_code == 200
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
+        assert {"type": "memory", "action": "forgotten", "count": 0} in await sending
+        assert sorted(await rows(client, "SELECT content, status FROM memory_records WHERE type != 'progress'")) == [
+            ("we exclude studies before 1990", "confirmed"), ("we exclude studies before 2000", "superseded")]
+        system = provider.answers[-1]["messages"][0]["content"]
+        assert "changed since" in system
