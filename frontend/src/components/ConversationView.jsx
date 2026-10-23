@@ -244,7 +244,8 @@ export function ConversationView({ conversation, projectId, panel, showSidebarBu
         <div className="mx-auto w-full max-w-3xl px-5 py-6">
           {failed && <p role="alert" className="text-sm text-destructive">{t(stale ? 'conversation.reloadFailed' : 'conversation.loadFailed')}</p>}
           {turns === null && !failed && <p className="text-sm text-muted-foreground" role="status">{t(stale ? 'conversation.reloading' : 'common.loading')}</p>}
-          {projectId && <LeftOff projectId={projectId} />}
+          {/* read again once a turn of this conversation starts: the project's latest turn is new then (MB4) */}
+          {projectId && <LeftOff key={live?.runId ?? 'none'} projectId={projectId} />}
           {turns !== null && shown.length === 0 && !live && <Empty />}
           <ol className="space-y-8">
             {shown.map((turn) => (

@@ -148,3 +148,10 @@ test('a failed memory action says what was not saved and keeps the researcher\'s
   }
   assert.doesNotMatch(readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8'), /finally \{\s*onChanged/);
 });
+
+// S1-21a follow-up MB4: a turn started here makes the project's latest turn new, so Where we left off is read again
+// (the backend then says not to show it) rather than staying on screen from before.
+test('Where we left off is read again once a turn of this conversation starts', () => {
+  const source = readFileSync(join(SRC, 'components', 'ConversationView.jsx'), 'utf8');
+  assert.match(source, /<LeftOff key=\{live\?\.runId \?\? 'none'\} projectId=\{projectId\} \/>/);
+});
