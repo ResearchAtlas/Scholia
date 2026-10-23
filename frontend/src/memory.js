@@ -2,8 +2,9 @@
 // agent's note did, read back from the record (the conversation's turns carry it); project state's progress in words;
 // Where we left off's dismissal for this return; and the message box filled by its next-step button (nothing is sent
 // until Send).
-import { del, get, patch, post } from './api.js';
+import { ApiError, del, get, patch, post } from './api.js';
 import { libraryChanged } from './library.js';
+import { errorText } from './text.js';
 
 // A turn's memory actions (backend/runs.py Harness._memory_command, update_progress), as catalog keys.
 export const MEMORY_ACTIONS = { saved: 'memory.saved', updated: 'memory.updated', forgotten: 'memory.forgotten',
@@ -51,3 +52,14 @@ export const readMemory = (projectId) => get(`/api/memory${projectId ? `?project
 export const changeRecord = (record, body) => patch(`/api/memory/${encodeURIComponent(record.id)}`, { version: record.version, ...body });
 export const forgetRecord = (record) => del(`/api/memory/${encodeURIComponent(record.id)}?version=${record.version}`);
 export const review = (body) => post('/api/memory/review', body);
+
+// A memory action from the views: null once done, else what was not saved, the error in words and the researcher's own
+// text, which the view keeps across its reread (S1-21a follow-up MB1; the record itself is always read again).
+export async function attempt(t, action, draft = null) {
+  try {
+    await action();
+    return null;
+  } catch (error) {
+    return { problem: errorText(t, error instanceof ApiError ? error.code : 'internal'), draft };
+  }
+}

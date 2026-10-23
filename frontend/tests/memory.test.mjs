@@ -131,3 +131,20 @@ test('a memory change goes through the one invalidation path every view, ask and
     }
   }
 });
+
+// S1-21a follow-up MB1: a failed action in the memory views keeps its error and the researcher's unsaved text across
+// the views' reread (the record is read again; what was not saved is said, and their own words stay with it).
+test('a failed memory action says what was not saved and keeps the researcher\'s text', async () => {
+  const { attempt } = await import('../src/memory.js');
+  const { ApiError } = await import('../src/api.js');
+  assert.equal(await attempt(t, async () => ({ ok: true })), null);
+  const failed = await attempt(t, async () => { throw new ApiError(400, 'personal_from_strict', 'x'); }, 'I prefer tables');
+  assert.equal(failed.draft, 'I prefer tables');
+  assert.equal(failed.problem, t('errors.personal_from_strict'));
+  for (const name of ['Memory.jsx', 'LeftOff.jsx']) {
+    const source = readFileSync(join(SRC, 'components', name), 'utf8');
+    assert.match(source, /<Unsaved /, name); // said outside the rows a reread replaces
+    assert.match(source, /onFailed=/, name);
+  }
+  assert.doesNotMatch(readFileSync(join(SRC, 'components', 'Memory.jsx'), 'utf8'), /finally \{\s*onChanged/);
+});

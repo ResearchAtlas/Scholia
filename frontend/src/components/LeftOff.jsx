@@ -9,20 +9,21 @@ import { useT } from '../i18n/index.js';
 import { openPlace } from '../live.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { dismissLeftOff, fillComposer, leftOffDismissed, memoryChanged, readLeftOff, recordText, review } from '../memory.js';
-import { Proposal } from './Memory.jsx';
+import { Proposal, Unsaved } from './Memory.jsx';
 import { Button } from '@/components/ui/button';
 
 export function LeftOff({ projectId }) {
   const t = useT();
   const [found, setFound] = useState(null);
   const [hidden, setHidden] = useState(false);
+  const [unsaved, setUnsaved] = useState(null); // what Keep, Edit or Forget could not save, across the reread (MB1)
   const guard = useRef(null); // which reads may be shown (library.js readGuard)
   if (guard.current === null) guard.current = readGuard();
   const load = useCallback(() => {
     const settle = guard.current.ask();
     return readLeftOff(projectId).then((read) => { if (settle(true)) setFound(read); }, () => { if (settle(false)) setFound(null); });
   }, [projectId]);
-  useEffect(() => { guard.current.libraryChanged(); setFound(null); setHidden(false); load(); }, [load]); // another project's read is never shown
+  useEffect(() => { guard.current.libraryChanged(); setFound(null); setHidden(false); setUnsaved(null); load(); }, [load]); // another project's read is never shown
   // A paper deleted or memory changed anywhere: what it shows is dropped at once, and read again (no client-held
   // derived state); a read asked before the change is never shown, nor is its next step put in the box.
   useEffect(() => {
@@ -60,11 +61,13 @@ export function LeftOff({ projectId }) {
           </div>
         </div>
       )}
+      <Unsaved unsaved={unsaved} onDismiss={() => setUnsaved(null)} />
       {found.to_confirm.length > 0 && (
         <div className="grid gap-2">
           <h3 className="text-xs font-medium text-muted-foreground">{t('leftOff.confirm')}</h3>
           <ul className="grid gap-2">
-            {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal} onChanged={() => memoryChanged(projectId)} />)}
+            {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal} onChanged={() => memoryChanged(projectId)}
+              onFailed={setUnsaved} />)}
           </ul>
         </div>
       )}
