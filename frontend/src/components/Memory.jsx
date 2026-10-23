@@ -25,7 +25,7 @@ export function MemorySection({ project }) {
     return readMemory(project?.id).then((data) => { if (settle(true)) { setFound(data); setProblem(null); } },
       (error) => { if (settle(false)) setProblem(error instanceof ApiError ? error.code : 'internal'); });
   }, [project?.id]);
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { setUnsaved(null); load(); }, [load]); // another project's notice is never shown
   useEffect(() => { // a paper deleted or memory changed anywhere: dropped at once, and read again
     const changed = () => { guard.current.libraryChanged(); setFound(null); load(); };
     libraryEvents.addEventListener('changed', changed); // memory changes too (memory.js memoryChanged)

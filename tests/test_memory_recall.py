@@ -244,3 +244,24 @@ async def test_a_record_a_command_or_an_extraction_writes_gets_its_vector(tmp_pa
         assert len(ids) == 2
         await idle(client, project)
         assert await asyncio.to_thread(client.state["index"].memory_embedded, ids) == set(ids)
+
+
+async def test_a_proposal_an_extraction_confirms_gets_its_vector(tmp_path):
+    # MB7, internal review: the index run follows any extraction that wrote or confirmed memory
+    from cited import Provider, cited
+    from test_memory import candidate, extracted
+    from test_search import idle
+    provider = Provider()
+    extracted(provider, candidate("we sample thirty nurses", span="we sample thirty nurses"))
+    async with cited(tmp_path, provider) as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="we sample thirty nurses",
+            status="proposed", sources=[("project", project)]))
+        await idle(client, project)
+        await background_idle(client, timeout=20)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client, timeout=20)
+        await idle(client, project)
+        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("confirmed",)]
+        assert await asyncio.to_thread(client.state["index"].memory_embedded, [proposal]) == {proposal}

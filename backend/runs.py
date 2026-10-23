@@ -2184,8 +2184,7 @@ class Harness:
                 raise RunOutcome("cancelled", "memory_off")  # switched off during its call, or before a restart
             await self._ended(active, lambda conn: self._finish_background(
                 conn, active, "succeeded" if output is not None else "failed", output, inputs))
-            if workflow == "memory" and output is not None and await self._read(lambda conn: conn.execute(
-                    "SELECT 1 FROM memory_records WHERE created_by_run_id = ? LIMIT 1", (active.run_id,)).fetchone()):
+            if workflow == "memory" and output:  # it had candidates: it may have written or confirmed records
                 await self._index_memory(project_id)
         except asyncio.CancelledError:
             call = active.call
