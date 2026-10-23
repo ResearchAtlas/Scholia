@@ -323,7 +323,7 @@ def _let_go(conn, run_id):
                  " AND json_type(inputs, '$.held') IS NOT NULL", (run_id,))
 
 
-def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
+def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, memory_changed=None):
     """The check before every dispatch (slice-1 spec section 10, Revocation), which the outbound
     gate reads in its decision transaction, so retries are covered too: the run is still running
     and not revoked; every owner it has still exists (a turn's project and conversation; detached
@@ -336,7 +336,9 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
     the gate's decision transaction just before the request is sent, whatever it waited for before (its body's
     storage, the gate, the stream's reader): past it the request is refused, "turn_deadline". memory_off(), if given,
     reads the project's memory switch as it is now (S1-21a fix batch 3, R4): a request holding memory is refused once it
-    is off, whichever step of the run sends it (a nested tool's included), and so is a memory extraction's."""
+    is off, whichever step of the run sends it (a nested tool's included), and so is a memory extraction's.
+    memory_changed(), if given, is told when a memory record the request holds is no longer allowed (edited, superseded,
+    forgotten or out of scope since): the caller ends the run revoked, as for memory off (S1-21a follow-up MB11)."""
     row = conn.execute(
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
@@ -362,6 +364,8 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
     # personal record whose project was tightened or locked since it was recalled is not)
     remembered = json.loads(remembered or "[]")
     if remembered and not memory.allowed(conn, project_id, remembered, json.loads(versions or "{}")):
+        if memory_changed is not None:
+            memory_changed()
         return False
     if (remembered or workflow == "memory") and memory_off is not None and memory_off():  # an extraction holds memory
         return False  # work even when it was shown no record
@@ -382,7 +386,8 @@ class _Call:
     bodies: list = field(default_factory=list)  # S1-19: each attempt's request body as stored (its sha256, or None)
     materials: tuple = ()  # the papers whose text its request holds, for the bodies' deletion links
     declined: bool = False  # S1-19c: an attempt refused at dispatch because the turn's time limit had passed
-    memory_off: bool = False  # S1-21a: an attempt holding memory refused at dispatch because memory was switched off
+    memory_off: bool = False  # S1-21a: an attempt holding memory refused at dispatch: memory switched off, or a record
+    # it holds changed since (MB11)
 
 
 class Harness:
@@ -1996,7 +2001,11 @@ class Harness:
             call.memory_off = not memory.enabled(load_settings(self.data_dir, project_id[0]).values)
             return call.memory_off
 
-        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past, off),
+        def changed():  # a memory record the request holds changed since it was assembled: the run ends revoked
+            call.memory_off = True
+
+        async with self.gate.async_client(project_id[0], admit=lambda conn: may_dispatch(conn, active.run_id, past, off,
+                                                                                         changed),
                                           provider=route.provider.name) as client:
             result = await openrouter.query_model(
                 client, route, key, request.messages, timeout=timeout or MODEL_CALL_SECONDS, effort=facts["effort"],
@@ -2067,7 +2076,8 @@ class Harness:
             raise _LimitReached("turn_minutes")
         if call.memory_off:
             # Refused at dispatch: memory was switched off while the run's requests held it (recalled, or a memory
-            # tool's result in a chain that is never cut or rewritten: model-route rule 5). The run ends here as a
+            # tool's result in a chain that is never cut or rewritten: model-route rule 5), or a record it holds was
+            # edited, superseded or forgotten since (MB11). The run ends here as a
             # change to its project ends a run (section 10): cancelled, revoked; a turn offers Continue, which builds
             # the next turn with memory off.
             active.cancel_reason = "revoked"

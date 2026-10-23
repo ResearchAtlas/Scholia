@@ -739,3 +739,48 @@ async def test_forgetting_an_out_of_date_proposal_never_takes_the_record_another
         assert forgot.json() == {"ok": True}
         assert sorted(await rows(client, "SELECT content, status FROM memory_records")) == [
             ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
+
+
+# S1-21a follow-up MB11 (gpt-6-astra recheck 7): memory edited or superseded before dispatch ends the run revoked
+
+
+async def test_recalled_memory_edited_mid_turn_ends_the_turn_revoked_with_continue(tmp_path):
+    from cited import cited, with_papers
+    from test_search import WAGES
+    held = {}
+
+    async def edit_then_list(body):
+        changed = await held["client"].patch(f"/api/memory/{held['record']}", json={"version": 1, "content": "Changed"})
+        assert changed.status_code == 200
+        return steps_reply(provider, [call("list_materials")])
+    provider = Scripted(edit_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "SECRET decision"})).json()["id"]
+        held.update(client=client, record=record)
+        stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
+        assert "SECRET" in json.dumps(provider.agent_steps[0]) and len(provider.agent_steps) == 1
+        assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
+
+
+async def test_an_extraction_whose_shown_proposal_was_edited_ends_revoked(tmp_path, monkeypatch):
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        dispatch = runs.Harness._call
+
+        async def edited_meanwhile(self, *args, **kwargs):  # after its request (and the versions it holds) was built
+            if sys._getframe(1).f_code.co_name == "_extraction_call":
+                edited = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+                assert edited.status_code == 200
+            return await dispatch(self, *args, **kwargs)
+        monkeypatch.setattr(runs.Harness, "_call", edited_meanwhile)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        assert provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]
