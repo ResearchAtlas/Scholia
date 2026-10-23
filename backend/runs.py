@@ -57,6 +57,7 @@ leaves no effect.
 import asyncio
 import json
 import logging
+import math
 import threading
 import time
 import traceback
@@ -64,7 +65,7 @@ import unicodedata
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 
-from backend import (agent, budget_router, citations, context, credentials, governance, memory, openrouter,
+from backend import (agent, budget_router, citations, compaction, context, credentials, governance, memory, openrouter,
                      openrouter_client, provenance, providers, reach, router, skills, spending)
 from backend.evidence import historical_citations
 from backend.search_index import still_read
@@ -367,6 +368,8 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None):
         return False  # work even when it was shown no record
     if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
         return False  # gone, or its project no longer allows this request (tightened, or review-locked)
+    if not compaction.sendable(conn, run_id):  # S1-21b: a memory record a summary it carries follows is gone
+        return False
     return not wanted or still_read(conn, project_id, wanted) == wanted
 
 
@@ -755,15 +758,16 @@ class Harness:
             # An earlier answer may quote the evidence its turn held, so it is carried only while every paper
             # its turn depended on (inputs.context_materials) exists, and those papers are this request's too
             # (backend/provenance.py: the rule for what text may be sent once its source is deleted).
-            earlier = [(u, a, json.loads(held or "[]")) for u, a, held in conn.execute(
-                "SELECT t.user_message, t.answer, json_extract(r.inputs, '$.context_materials') FROM turns t"
+            earlier = [(u, a, json.loads(held or "[]"), run) for u, a, held, run in conn.execute(
+                "SELECT t.user_message, t.answer, json_extract(r.inputs, '$.context_materials'), t.run_id FROM turns t"
                 " JOIN runs r ON r.id = t.run_id WHERE t.conversation_id = ? AND r.status = 'succeeded'"
                 " AND t.answer IS NOT NULL ORDER BY t.seq DESC", (claim.conversation_id,))]
             kept_turns = [turn for turn in earlier if provenance.sendable(conn, project_id, turn[2])]
             history_left_out = len(earlier) - len(kept_turns)  # traced with the answer's step
             history = [(json.loads(u).get("text", ""), historical_citations(json.loads(a).get("text", "")))
-                       for u, a, _ in kept_turns]
-            history_materials = [held for _, _, held in kept_turns]  # newest first, as history is
+                       for u, a, _, _ in kept_turns]
+            history_materials = [held for _, _, held, _ in kept_turns]  # newest first, as history is
+            history_ids = [run for *_, run in kept_turns]  # S1-21b: their runs, for compaction
             # The skills its earlier turns activated, most recently used first: ACTIVE SKILLS, each loaded once. A skill
             # activated mid-turn joins it from the next turn, however that turn ended (model-route rule 5; K4): an
             # activation is in runs.skills only once it was recorded.
@@ -811,11 +815,12 @@ class Harness:
             _event(conn, claim.run_id, "route", {"route": route.key, "effort": facts["effort"], "plan": plan.to_dict(),
                                                  "window": facts["window"], "endpoints": facts["endpoints"],
                                                  "retrieval": decision})
-            return seq, request, history, decision, (history_materials, history_left_out), (used, skill_sections)
+            return seq, request, history, decision, (history_materials, history_left_out, history_ids), (used, skill_sections)
 
         router_model = visible(personal.values["models"].get("router"))
-        (seq, request, history, decision, (history_materials, history_left_out), (active, skill_sections)), cancelled = \
-            await self._write_through(admit)
+        admitted, cancelled = await self._write_through(admit)
+        seq, request, history, decision, (history_materials, history_left_out, history_ids), (active, skill_sections) = \
+            admitted
         if cancelled:  # its request went away while the run was written: it never runs, as by Stop
             await _through(self._ended(claim, lambda conn: self._finish_turn(
                 conn, claim.run_id, "cancelled", "researcher", "cancelled")))
@@ -826,6 +831,7 @@ class Harness:
             "selection": material_ids, "decision": decision, "history": history, "budgets": budgets,
             "instructions": instructions, "personal": personal, "table": table, "policy": policy,
             "provider": provider_config, "router_model": router_model, "history_materials": history_materials,
+            "history_ids": history_ids,
             "history_left_out": history_left_out, "tools": tools, "skill_sections": skill_sections, "limits": limits,
             "reusable": {}, "active": active, "memory_on": memory_on, "command": memory.command(message),
             "extractor": visible(personal.values["models"].get("extractor")),
@@ -884,6 +890,7 @@ class Harness:
             found = {"records": [], "mode": None, "reason": None}
             if decision["route"] in RETRIEVAL_ROUTES:
                 found = await self._evidence(claim, ctx, decision)
+            await self._compact(claim, ctx, found, decision)  # S1-21b: older turns summarized when history is full
             numbered, request = self._cited_request(ctx, found, decision)
             await self._register_context(claim, numbered)  # the dispatch check now covers its passages
             judge = ctx["judge"] = await self._judge_route(ctx)
@@ -1306,6 +1313,9 @@ class Harness:
         # the turn has read passages beyond its pre-load (its tools found some): the pre-load's notes on an index not
         # searched or evidence cut for the window no longer say what the request holds
         beyond = bool(read) and bool({r["passage_id"] for r in read.values()} - {r["passage_id"] for r in found["records"]})
+        # S1-21b: the turns a summary covers, and those older than it, are not carried verbatim (backend/compaction.py)
+        summary = ctx.get("summary_info")
+        history = ctx["history"][:len(ctx["history"]) - (summary["end"] if summary else 0)]
 
         def assemble(evidence, held, cut=False):
             return context.assemble(
@@ -1316,16 +1326,19 @@ class Harness:
                                                            **({} if beyond else {"index": index, "cut": cut})),
                                         *ctx.get("memory_missing", ())],  # S1-21a: an earlier decision memory lacks
                           **ctx["skill_sections"], **ctx.get("memory_sections", {})},
-                history=ctx["history"], tools=ctx["tools"], chain=chain)
+                history=history, tools=ctx["tools"], chain=chain, summary=summary and summary["text"])
         request = assemble(lines, numbered)
         kept = len(lines) - request.cuts.get("research_evidence", 0)
         # the skills ACTIVE SKILLS still carries: one cut for capacity can be activated again (section 8)
         ctx["active_kept"] = ctx["active"][:len(ctx["active"]) - request.cuts.get("active_skills", 0)]
-        ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)  # newest first, as they fit
+        ctx["history_kept"] = len(history) - request.cuts.get("history", 0)  # newest first, as they fit
         if lines and not kept:  # the window left no room for any of it: the request says so, not "none matched"
             request = assemble([], {}, cut=True)
             request.cuts["research_evidence"] = len(lines)
-            ctx["history_kept"] = len(ctx["history"]) - request.cuts.get("history", 0)
+            ctx["history_kept"] = len(history) - request.cuts.get("history", 0)
+        ctx["summary_kept"] = bool(summary) and not request.cuts.get("summary")
+        if summary and summary["start"]:  # turns older than the summary's: left out whole
+            request.cuts["history"] = request.cuts.get("history", 0) + summary["start"]
         return dict(list(numbered.items())[:kept]), request
 
     async def _register_context(self, claim, numbered, listed=()):
@@ -1514,6 +1527,119 @@ class Harness:
         if ids:  # what the request holds of memory, by id; nothing when it holds none
             await self._record(claim, "retrieval_trace", {"memory": traced})
 
+    # S1-21b: compaction (backend/compaction.py)
+
+    async def _compact(self, claim, ctx, found, decision):
+        """Before the turn's first step: the newest summary of this conversation its request may carry (reused), then,
+        when the turns it would carry verbatim reach `compact_at_percent` of what history may take, a new one covering
+        the oldest of them (_summarize). A summary the request then holds registers its papers with the dispatch check
+        (inputs.context_materials) and the memory records it follows (inputs.summary_memory), before any dispatch."""
+        carried = ctx["history_ids"][::-1]  # oldest first
+        ctx["summary_info"] = None
+        if not carried:
+            return
+        base = await self._read(lambda conn: compaction.reusable(conn, claim.conversation_id, ctx["project_id"], carried))
+        if base is not None:
+            text = await asyncio.to_thread(_summary_text, self.content, base["sha256"])
+            base = {**base, "text": text} if text else None
+        ctx["summary_info"] = base
+        _, request = self._cited_request(ctx, found, decision)
+        uncovered = ctx["history"][:len(ctx["history"]) - (base["end"] if base else 0)]  # newest first
+        planned = compaction.plan([compaction.turn_tokens(m, a) for m, a in uncovered], request.history_room,
+                                  ctx["budgets"]["compact_at_percent"],
+                                  context.count(compaction.block(base["text"])) + 2 if base else 0)
+        if planned is not None:
+            verbatim, share = planned
+            start = base["end"] if base else 0
+            made = await self._summarize(claim, ctx, base, carried, carried[start:len(carried) - verbatim],
+                                         uncovered[verbatim:][::-1], share)
+            if made is not None:
+                ctx["summary_info"] = made
+                self._cited_request(ctx, found, decision)
+        summary = ctx["summary_info"]
+        kept = summary is not None and ctx.get("summary_kept")
+        if kept:
+            await self._register_context(claim, {}, summary["materials"])
+        if (kept and summary["memory_ids"]) or ctx.get("summary_memory"):  # written, or one written taken back
+            await self._summary_memory(claim, summary["memory_ids"] if kept else [])
+
+    async def _summary_memory(self, claim, ids):
+        """The memory records a summary the run's request carries follows (inputs.summary_memory: the dispatch check
+        and deletion's scope links), written before that request is dispatched."""
+        await self._record(claim, None, None, also=lambda conn: conn.execute(
+            "UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.summary_memory', json(?)) WHERE id = ?",
+            (json.dumps(list(ids)), claim.run_id)))
+        claim.context["summary_memory"] = list(ids)
+
+    async def _summarize(self, claim, ctx, base, carried, covering, turns, share):
+        """One compaction call (function `compact`) on the turn's own route and privacy controls, through the dispatch
+        path, reserved and charged to the conversation like a step: the earlier summary base (if any) and turns (oldest
+        first; their runs covering) summarized in at most a share of history's room. Its request carries their text, so
+        their papers are registered before it is sent, and taken back if it never left. Returns the new summary (as
+        compaction.reusable gives one, with its text), or None: not asked again for the same turns, refused, failed, cut
+        for the window or not kept (something it covers deleted meanwhile), each recorded as a `compaction` event; the
+        older turns are then left out whole (traced in the request's cuts)."""
+        problem, facts = await self._route_facts(ctx["route"], ctx["key"], ctx["table"],
+                                                 zero_retention=ctx["zero_retention"], effort=None)
+        words = compaction.words_for(share)
+        fitted = None if problem else compaction.fit(base and base["text"], turns, words, _text_room(
+            facts, ctx["budgets"], compaction.RULES))
+        if fitted is not None:
+            with_base, left = fitted
+            base, covering, turns = (base if with_base else None), covering[left:], turns[left:]
+        covers = (base["covers"] if base else []) + list(covering)
+        if covers and await self._read(lambda conn: compaction.tried(conn, claim.conversation_id, covers)):
+            return None
+
+        def failed_with(outcome, step=None):
+            return self._record(claim, "compaction", {"outcome": outcome, "covers": covers, "model": ctx["route"].key,
+                                                      **({"step": step} if step is not None else {})})
+        if fitted is None:
+            await failed_with("unavailable" if problem else "over_window")
+            return None
+        papers, records = await self._read(lambda conn: compaction.dependencies(conn, covering))
+        if base:
+            papers, records = sorted({*papers, *base["materials"]}), sorted({*records, *base["memory_ids"]})
+        registered = list(ctx.get("context_materials") or ())
+        await self._register_context(claim, {}, papers)  # the compaction request carries their text
+        if base and base["memory_ids"]:  # and the earlier summary's, which follows these records
+            await self._summary_memory(claim, base["memory_ids"])
+        result = await self._role_call(claim, ctx, None, "compact", compaction.RULES,
+                                       compaction.request_text(base and base["text"], turns, words),
+                                       materials=papers, facts=facts)
+        if result is None or not result.dispatched:  # it never left: no request carried their text
+            ctx["context_materials"], ctx["taken_back"] = registered, True  # written by the next registration
+            if ctx.get("summary_memory"):
+                await self._summary_memory(claim, [])
+        text = (result.content or "").strip() if result is not None and result.ok else ""
+        step = await self._read(lambda conn: conn.execute(
+            "SELECT max(json_extract(data, '$.step')) FROM run_events WHERE run_id = ? AND type = 'step_started'"
+            " AND json_extract(data, '$.phase') = 'compact'", (claim.run_id,)).fetchone()[0]) if result else None
+        if not text:
+            await failed_with("unavailable" if result is None else result.error_kind or "empty", step)
+            return None
+        with self.content.hold() if self.content is not None else nullcontext([]) as held:
+            sha = await asyncio.to_thread(_stored, self.content, text.encode("utf-8"), held)
+            if sha is None:
+                await failed_with("not_kept", step)
+                return None
+            data = {"step": step, "covers": covers, "model": ctx["route"].key, "summary": sha, "materials": papers,
+                    "memory_ids": records}
+            kept = []
+
+            def keep(conn):
+                data["turns"] = [seq for (seq,) in conn.execute(
+                    "SELECT seq FROM turns WHERE run_id IN (SELECT value FROM json_each(?)) ORDER BY seq",
+                    (json.dumps(covers),))]
+                kept.append(compaction.keep(conn, claim.run_id, step, sha, data))
+                _event(conn, claim.run_id, "compaction", {"outcome": "ok" if kept[0] else "not_kept", **data})
+            await self._record(claim, None, None, also=keep)
+        if not kept[0]:
+            return None
+        start = carried.index(covers[0])
+        return {"text": text, "sha256": sha, "covers": covers, "turns": data["turns"], "materials": papers,
+                "memory_ids": records, "start": start, "end": start + len(covers)}
+
     # S1-19c: the agent loop
 
     def _judge_estimate(self, ctx, numbered):
@@ -1555,7 +1681,11 @@ class Harness:
                                                              "judge_estimate_usd": judge_estimate,
                                                              # earlier answers left out: one of their papers is deleted
                                                              **({"history_left_out": ctx["history_left_out"]}
-                                                                if ctx["history_left_out"] and not number else {})})
+                                                                if ctx["history_left_out"] and not number else {}),
+                                                             # S1-21b: the earlier turns its request holds as a summary
+                                                             **({"summary": {"turns": ctx["summary_info"]["turns"]}}
+                                                                if ctx.get("summary_info") and not request.cuts.get("summary")
+                                                                else {})})
             await handed({"type": "step", "seq": call.step, "phase": "answer"})
             result = await self._call(claim, call, ctx["route"], ctx["key"], request, ctx["facts"],
                                       zero_retention=ctx["zero_retention"], materials=ctx["context_materials"],
@@ -1640,6 +1770,15 @@ class Harness:
                     raise  # error; the turn's cleanup settles it (or marks its attempt unknown) before any other call
                 log.error("a tool failed unexpectedly (%s at %s)", type(error).__name__, _where(error))
                 result = failed(call_id, "tool_error", "The tool failed.")  # a defect in the tool; the turn goes on
+        # S1-21b: past the 8,000-character preview, the whole output is kept for paging (read_output) and the model gets
+        # the preview and its handle: the call's content-free id and its number in the turn (backend/compaction.py)
+        # A tool whose own bound is within a page (read_output's included) is never paged: its result is whole, or cut there.
+        paged, handle = None, f"{call_id}.{number}"
+        bound = agent.REGISTRY.get_definition(call.name).output_chars if call is not None and agent.known_name(call.name) else 0
+        if result.ok and bound > compaction.PREVIEW + 200 and len(result.text) > compaction.PREVIEW:
+            paged = result.text
+            result = result.model_copy(update={"text": compaction.preview(paged, handle),
+                                               "meta": {**result.meta, "paged": len(paged)}})
         # the provider's own id (never empty: _agent_steps ends the turn on a call without one), in the chain only
         message = {"role": "tool", "tool_call_id": raw["id"],
                    "content": result.text if result.ok else json.dumps({"error": result.error.type,
@@ -1650,7 +1789,15 @@ class Harness:
                 # covered before the next dispatch (S1-21a: memory records too)
                 await self._register_context(claim, turn.evidence.numbered, turn.listed)
             materials = tuple(sorted(turn.ctx.get("context_materials") or ()))
+            segments = turn.segments.pop(call_id, [])
             with self.content.hold() if self.content is not None else nullcontext([]) as held:
+                if paged is not None:  # its whole text, with the papers of what it holds past the preview too
+                    whole = tuple(sorted({*materials, *(turn.evidence.pending[k]["material_id"] for _, k in segments
+                                                        if k in turn.evidence.pending)}))
+                    sha = await asyncio.to_thread(_stored, self.content, paged.encode("utf-8"), held)
+                    if await self._write(lambda conn: compaction.keep_output(conn, claim.run_id, step, number, sha, whole)):
+                        turn.outputs[handle] = {"step": step, "number": number, "length": len(paged),
+                                                 "segments": segments}
                 ref = await asyncio.to_thread(_stored, self.content, json.dumps(
                     message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), held)
                 await self._record(claim, "tool_result", {
@@ -2668,6 +2815,25 @@ def _stored(content, body, hold=None):
     except Exception as error:
         log.warning("a request body could not be kept for the trace (%s)", type(error).__name__)
         return None
+
+
+def _summary_text(content, sha256):
+    """A kept summary's text (S1-21b), or None when the store cannot give it (it is then not reused)."""
+    if content is None:
+        return None
+    try:
+        return content.read(sha256).decode("utf-8")
+    except Exception as error:
+        log.warning("a compaction summary could not be read (%s)", type(error).__name__)
+        return None
+
+
+def _text_room(facts, budgets, rules):
+    """Counted tokens a role call's own request text may take on endpoints with these facts (_role_call's request)."""
+    window = facts["window"]
+    return (window - context.output_limit(window, _output(context.MIN_OUTPUT, facts))
+            - 2 * context.MESSAGE_FRAMING - context.REPLY_FRAMING - math.ceil(window * budgets["margin_percent"] / 100)
+            - context.count(rules))
 
 
 def _step(route, facts, request):
