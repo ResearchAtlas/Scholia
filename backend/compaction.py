@@ -206,9 +206,11 @@ def page(text, offset, handle):
 
 
 def marked(start, key, offset):
-    """Whether the page from offset shows the whole marker of the passage whose line starts at start (key its marker's
-    (source, passage)): only then is the passage read in the run."""
-    return offset <= start and start + len(f"[S{key[0]}.{key[1]}]") <= offset + PREVIEW
+    """Whether the page from offset completes the marker of the passage whose line starts at start (key its marker's
+    (source, passage)): it shows the marker's end, so the marker is whole on it, or (cut by the boundary before it) on it
+    and the page before, which the footer named. Only then is the passage read in the run."""
+    end = start + len(f"[S{key[0]}.{key[1]}]")
+    return offset < end <= offset + PREVIEW
 
 
 def keep_output(conn, run_id, step, number, sha256, materials):

@@ -180,5 +180,6 @@ async def test_review_1_a_tool_bounded_within_a_page_is_cut_there_never_paged(tm
 async def test_review_1_a_passage_counts_as_shown_only_with_its_whole_marker_on_the_page():
     assert compaction.marked(compaction.PREVIEW - 6, (1, 2), 0)  # "[S1.2]" ends at the page's end
     assert not compaction.marked(compaction.PREVIEW - 5, (1, 2), 0)  # cut by the boundary
-    assert compaction.marked(compaction.PREVIEW - 5, (1, 2), compaction.PREVIEW - 5)  # shown whole on the next page
+    # Recheck 1 (P3-1): completed by the page the footer names, so sequential paging reads it
+    assert compaction.marked(compaction.PREVIEW - 5, (1, 2), compaction.PREVIEW)
     assert not compaction.marked(10, (1, 2), 20)  # before the page
