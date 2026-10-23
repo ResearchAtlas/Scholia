@@ -44,6 +44,9 @@ answer), and an abstention when the request says the library matched nothing.
 One model (NO_TOOLS) lists no endpoint that takes tools, for chat with the library. The request log
 records each call's role.
 
+S1-21b: answers to a message marked as a long conversation are long, and a compaction call (its role "compact") answers
+with a short synthetic summary (walkthrough step 94).
+
 S1-21a: the provider's memory extractions propose a decision for a message that considers a survey (and nothing for any
 other); the agent writes a next step with update_progress when asked to note one. Where we left off reads the clock as
 this launch's own, moved forward by the number of seconds in the file named by "memory clock".
@@ -79,7 +82,7 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 from scholia_app import FakeKeyring, MockProvider, MockScholarly, MockZotero, crossref_work, openalex_work, streaming  # noqa: E402
 
-from backend import local_helper, memory, reading, router  # noqa: E402
+from backend import compaction, local_helper, memory, reading, router  # noqa: E402
 from backend.app import create_app  # noqa: E402
 from backend.budget_router import MODEL_TIERS  # noqa: E402
 from backend.citations import JUDGE_RULES  # noqa: E402
@@ -296,10 +299,20 @@ NO_TOOLS_ENDPOINTS = [{"tag": "example", "context_length": 131072,
 
 
 def role(body):
-    """A chat call's role, from its first message: title, judge, router, memory (an extraction) or answer."""
+    """A chat call's role, from its first message: title, judge, router, memory (an extraction), compact (S1-21b) or
+    answer."""
     first = ((body or {}).get("messages") or [{}])[0].get("content", "") if isinstance(body, dict) else ""
     return "title" if first.startswith("Write a title") else "judge" if first.startswith(JUDGE_RULES) else \
-        "router" if first.startswith(router.ROUTER_RULES) else "memory" if first.startswith(memory.EXTRACT_RULES) else "answer"
+        "router" if first.startswith(router.ROUTER_RULES) else "memory" if first.startswith(memory.EXTRACT_RULES) else \
+        "compact" if first.startswith(compaction.RULES) else "answer"
+
+
+# S1-21b: a long conversation's answers, and the summary of its earlier turns (walkthrough step 94)
+LONG_ASKED = ("(long conversation, synthetic)", "（长对话，合成数据）")
+LONG_ANSWERS = ("A cohort study follows a group of people over time to see who develops an outcome, and when. " * 9,
+                "队列研究在一段时间内跟踪一组人，观察谁出现了某种结果，以及何时出现。" * 6)
+SUMMARIES = ("The researcher asked a series of synthetic questions about cohort studies; the answers explained follow-up.",
+             "研究者就队列研究提了一系列合成问题；回答解释了随访。")
 
 
 # S1-21a: what the synthetic extractor proposes (walkthrough step 91), by the researcher's message
@@ -399,8 +412,13 @@ def synthetic(body):
     stepped = agent_step(body) if kind == "answer" and body.get("tools") else None
     if isinstance(stepped, tuple):
         return stepped
+    asked = body["messages"][-1]["content"] if kind == "answer" and body["messages"][-1].get("role") == "user" else ""
     if stepped is not None:
         text = stepped
+    elif kind == "compact":  # S1-21b
+        text = SUMMARIES[any("\u4e00" <= c <= "\u9fff" for c in body["messages"][-1]["content"])]
+    elif any(mark in asked for mark in LONG_ASKED):
+        text = LONG_ANSWERS[LONG_ASKED[1] in asked]
     elif kind == "title":
         text = "Designing a cohort study"
     elif kind == "judge":

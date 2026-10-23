@@ -1210,6 +1210,9 @@
     "other": "{count} earlier answers were left out: a paper they drew on was deleted, or its project no longer allows this request."
   },
   "trace.history": "History",
+  "trace.summary": "Earlier turns",
+  "trace.summaryUsed": "Turns {turns} were given as a summary written by a model, not as evidence.",
+  "trace.phaseCompact": "Summarizing earlier turns",
   "trace.pairsJudged": {
     "one": "{count} citation pair judged",
     "other": "{count} citation pairs judged"
@@ -1249,6 +1252,7 @@
   "tool.read_skill_file": "Reading a skill's notes",
   "tool.ask": "Asking you",
   "tool.open_place": "Opening a place in the app",
+  "tool.read_output": "Reading on in a tool's result",
   "trace.phaseLibrary": "Answer from the library",
   "trace.skills": "Skills used",
   "trace.tools": "Tool calls",

@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import Answer, { Chip, backedSentences } from '../src/markdown.js';
-import { readTrace, summarize } from '../src/trace.js';
+import { readTrace, summarize, turnRanges } from '../src/trace.js';
 import { MAX_CHOSEN, choosePapers, chosenPapers, openPaperAt, readGuard, takeOpening, watchChosen } from '../src/library.js';
 import { NOTICES } from '../src/live.js';
 import en from '../src/i18n/en.json' with { type: 'json' };
@@ -198,6 +198,20 @@ test('Details sums up the trace from its events, read a page at a time', async (
   assert.deepEqual(found.pairs, { judged: 5, failed: 1, budget: 2 }); // every outcome, shown in Details
   assert.equal(found.historyLeftOut, 2); // earlier answers left out with a deleted paper, shown in Details
   assert.equal(found.finished, 'succeeded');
+});
+
+test('Details says when an answer used a summary, and of which turns (S1-21b)', () => {
+  const found = summarize([
+    { type: 'step_started', data: { step: 0, phase: 'compact' } },
+    { type: 'compaction', data: { step: 0, outcome: 'ok', turns: [0, 1, 3] } },
+    { type: 'step_started', data: { step: 1, phase: 'answer', summary: { turns: [0, 1, 3] } } },
+  ]);
+  assert.deepEqual(found.steps.map((s) => s.phase), ['compact', 'answer']);
+  assert.deepEqual(found.summary, [0, 1, 3]);
+  assert.equal(turnRanges(found.summary), '1–2, 4'); // counted from 1, in runs
+  assert.equal(summarize([{ type: 'step_started', data: { step: 0, phase: 'answer' } }]).summary, null);
+  assert.match(en['trace.summaryUsed'], /\{turns\}/);
+  assert.match(zhCN['trace.summaryUsed'], /\{turns\}/);
 });
 
 test('Details names each step\'s tool calls and outcomes and the skills used, never their text (S1-19c)', () => {

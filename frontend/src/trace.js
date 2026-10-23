@@ -6,6 +6,16 @@ import { get } from './api.js';
 
 const PAGES = 50; // at most 10,000 events, far beyond a turn's
 
+// S1-21b: the turns a summary covers, by their numbers from 0, as the numbers people count from 1, in runs: "1–3, 5".
+export function turnRanges(numbers) {
+  const out = [];
+  for (const n of [...numbers].sort((a, b) => a - b)) {
+    const last = out.at(-1);
+    if (last && n === last[1] + 1) last[1] = n; else out.push([n, n]);
+  }
+  return out.map(([a, b]) => (a === b ? `${a + 1}` : `${a + 1}–${b + 1}`)).join(', ');
+}
+
 // Every event of the run, in order.
 export async function readTrace(runId, read = get) {
   const events = [];
@@ -24,7 +34,7 @@ export async function readTrace(runId, read = get) {
 // limit is cut. S1-19c: each step's tool calls, by name and outcome, and the skills used (never their text).
 export function summarize(events) {
   const found = { route: null, retrieval: null, search: null, steps: [], checks: [], pairs: null, historyLeftOut: 0, finished: null,
-    skills: [], memory: 0 };
+    skills: [], memory: 0, summary: null };
   const calls = new Map(); // call id -> its entry in its step's tools
   const steps = new Map();
   for (const { type, data, body_ref: body, body_removed: removed } of events) {
@@ -41,6 +51,7 @@ export function summarize(events) {
       const step = { phase: data.phase, route: data.route, estimate: data.estimate_usd ?? null,
         funded: data.funded ?? null, cut: false, attempts: [], tools: [] }; // funded: what paid a judge call (share, answer_unspent, budget)
       if (data.history_left_out) found.historyLeftOut = data.history_left_out; // left out: a paper it drew on is deleted, or its project no longer allows this request
+      if (data.summary) found.summary = data.summary.turns ?? []; // S1-21b: earlier turns its request held as a model's summary
       steps.set(data.step, step);
       found.steps.push(step);
     } else if (type === 'model_attempt') {
