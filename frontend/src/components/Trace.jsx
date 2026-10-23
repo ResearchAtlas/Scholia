@@ -64,7 +64,7 @@ export function Trace({ turn }) {
         </>}
         {trace.summary?.length > 0 && <> {/* S1-21b: the answer used a summary, and of which turns */}
           <dt className="text-muted-foreground">{t('trace.summary')}</dt>
-          <dd>{t('trace.summaryUsed', { turns: turnRanges(trace.summary) })}</dd>
+          <dd>{t('trace.summaryUsed', { count: trace.summary.length, turns: turnRanges(trace.summary) })}</dd>
         </>}
         <dt className="text-muted-foreground">{t('trace.saved')}</dt>
         <dd>{turn.answer && turn.result_saved ? t('trace.savedYes') : t('trace.savedNo')}</dd>

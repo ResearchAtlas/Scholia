@@ -51,7 +51,7 @@ export function summarize(events) {
       const step = { phase: data.phase, route: data.route, estimate: data.estimate_usd ?? null,
         funded: data.funded ?? null, cut: false, attempts: [], tools: [] }; // funded: what paid a judge call (share, answer_unspent, budget)
       if (data.history_left_out) found.historyLeftOut = data.history_left_out; // left out: a paper it drew on is deleted, or its project no longer allows this request
-      if (data.summary) found.summary = data.summary.turns ?? []; // S1-21b: earlier turns its request held as a model's summary
+      if (data.phase === 'answer') found.summary = data.summary?.turns ?? null; // S1-21b: as the last answer step's request held it
       steps.set(data.step, step);
       found.steps.push(step);
     } else if (type === 'model_attempt') {

@@ -161,3 +161,24 @@ async def test_o2_read_passage_reads_whole_passages_up_to_its_bound_and_lists_th
         whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
         assert len(whole) <= agent.READ_CHARS and "Paragraph 0 " in whole and "Paragraph 39 " not in whole
         assert whole.rstrip().endswith("Read one with its ordinal.)") and "Passages left out, by ordinal:" in whole
+
+
+async def test_review_1_a_tool_bounded_within_a_page_is_cut_there_never_paged(tmp_path, monkeypatch):
+    # Review 1 (sonnet P3-1): a handle would lead only to the cut note.
+    async def big(call, turn):
+        return ToolResult(id=call.id, ok=True, text="y" * 9000)
+    monkeypatch.setitem(agent.REGISTRY._implementations, "list_materials", big)
+    provider = Scripted([call("list_materials")], "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, LONG)
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "List them")
+        [listed] = tool_messages(provider.agent_steps[-1])
+        assert "[Cut at 8000 characters" in listed["content"] and "read_output" not in listed["content"]
+
+
+async def test_review_1_a_passage_counts_as_shown_only_with_its_whole_marker_on_the_page():
+    assert compaction.marked(compaction.PREVIEW - 6, (1, 2), 0)  # "[S1.2]" ends at the page's end
+    assert not compaction.marked(compaction.PREVIEW - 5, (1, 2), 0)  # cut by the boundary
+    assert compaction.marked(compaction.PREVIEW - 5, (1, 2), compaction.PREVIEW - 5)  # shown whole on the next page
+    assert not compaction.marked(10, (1, 2), 20)  # before the page

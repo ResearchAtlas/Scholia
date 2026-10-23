@@ -271,9 +271,9 @@ async def read_passage(call, turn):
     for key, line in zip(keys, lines):
         starts.append((at, key))
         at += len(line) + 2
-    shown = [key for start, key in starts if start < compaction.PREVIEW]  # its marker in the preview: read now
+    shown = [key for start, key in starts if compaction.marked(start, key, 0)]  # its whole marker in the preview: read now
     turn.evidence.show(shown)
-    turn.segments[call.id] = [(start, key) for start, key in starts if start >= compaction.PREVIEW]
+    turn.segments[call.id] = [(start, key) for start, key in starts if key not in shown]
     text = "\n\n".join(lines)
     if left:
         text += f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)"
@@ -542,7 +542,7 @@ async def read_output(call, turn):
             text = None
     if text is None:  # gone with a paper whose text it held, or never kept
         return failed(call.id, "not_found", "That output is no longer kept.")
-    shown = [key for start, key in kept["segments"] if offset <= start < offset + compaction.PREVIEW]
+    shown = [key for start, key in kept["segments"] if compaction.marked(start, key, offset)]
     turn.evidence.show(shown)
     return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle),
                       meta={"passages": [turn.evidence.numbered[k]["passage_id"] for k in shown], "page": True})

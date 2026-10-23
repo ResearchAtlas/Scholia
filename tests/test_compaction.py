@@ -321,6 +321,35 @@ async def test_forgetting_a_memory_record_a_covered_turn_held_deletes_the_summar
         [record] = event["memory_ids"][:1]
         assert (await client.delete(f"/api/memory/{record}")).status_code in (200, 204)
         assert await summary_rows(client) == []
+        # Review 1 (sonnet P2-1): a record forgotten already is no dependency of the next summary, which is kept, not
+        # paid for and thrown away at every later turn.
+        stream = await send(client, chat, "QUESTION-4 about cohorts")
+        [made] = await compactions(client, stream[0]["run_id"])
+        assert made["outcome"] == "ok" and record not in made["memory_ids"] and len(await summary_rows(client)) == 1
+
+
+async def test_a_compaction_carrying_an_earlier_summary_registers_its_memory_records_before_it_is_sent(tmp_path, monkeypatch):
+    # Review 1 (fable P2-1): a Forget between reading the earlier summary and sending the compaction revokes it.
+    provider = Long()
+    seen = []
+    async with started(tmp_path / "data", provider) as client:
+        await small_history(client)
+        _, chat = await conversation(client)
+        await send(client, chat, "Remember: my method is semi-structured interviews")
+        for i in range(1, 4):
+            await send(client, chat, f"QUESTION-{i} about cohorts")
+        [(run, _, _)] = await summary_rows(client)
+        [first] = await compactions(client, run)
+        real = runs_module.Harness._role_call
+
+        async def noted(self, claim, ctx, model, function, *args, **kwargs):
+            if function == "compact":
+                seen.append(json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", claim.run_id))[0][0]))
+            return await real(self, claim, ctx, model, function, *args, **kwargs)
+        monkeypatch.setattr(runs_module.Harness, "_role_call", noted)
+        for i in range(4, 6):
+            await send(client, chat, f"QUESTION-{i} about cohorts")
+        assert seen and set(first["memory_ids"]) <= set(seen[0].get("summary_memory", []))
 
 
 async def test_a_summary_whose_memory_record_is_gone_is_refused_at_dispatch(tmp_path):
@@ -397,6 +426,7 @@ async def test_g8_a_summary_that_does_not_fit_is_left_out_with_the_turns_it_cove
 async def test_plan_leaves_history_alone_under_90_percent_and_never_compacts_a_lone_summary():
     assert compaction.plan([100, 100], 1000, 90) is None
     assert compaction.plan([600, 600], 1000, 90) == (1, 250)  # the newest verbatim, beside a share of 250
-    assert compaction.plan([700, 600], 1000, 90) == (0, 250)  # one turn of 700 and a share of 250 pass 900
+    assert compaction.plan([700, 600], 1000, 90) == (1, 250)  # the newest stays verbatim, even past 90% with the share
+    assert compaction.plan([11200, 2000, 2000], 16000, 90) == (1, 4000)
     assert compaction.plan([100], 1000, 90, summary=900) is None  # nothing older to compact
     assert compaction.plan([600, 600], 300, 90) is None  # no summary worth asking for fits

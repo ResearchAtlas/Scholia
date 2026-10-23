@@ -1175,7 +1175,9 @@
   },
   "trace.history": "历史",
   "trace.summary": "较早的对话",
-  "trace.summaryUsed": "第 {turns} 轮以模型写的摘要提供，不作为证据。",
+  "trace.summaryUsed": {
+    "other": "第 {turns} 轮以模型写的摘要提供，不作为证据。"
+  },
   "trace.phaseCompact": "总结较早的对话",
   "trace.pairsJudged": {
     "other": "已核查 {count} 组引用"

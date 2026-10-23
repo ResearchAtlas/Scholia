@@ -1557,13 +1557,19 @@ class Harness:
                 ctx["summary_info"] = made
                 self._cited_request(ctx, found, decision)
         summary = ctx["summary_info"]
-        if summary is None or not ctx.get("summary_kept"):
-            return
-        await self._register_context(claim, {}, summary["materials"])
-        if summary["memory_ids"]:
-            await self._record(claim, None, None, also=lambda conn: conn.execute(
-                "UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.summary_memory', json(?)) WHERE id = ?",
-                (json.dumps(summary["memory_ids"]), claim.run_id)))
+        kept = summary is not None and ctx.get("summary_kept")
+        if kept:
+            await self._register_context(claim, {}, summary["materials"])
+        if (kept and summary["memory_ids"]) or ctx.get("summary_memory"):  # written, or one written taken back
+            await self._summary_memory(claim, summary["memory_ids"] if kept else [])
+
+    async def _summary_memory(self, claim, ids):
+        """The memory records a summary the run's request carries follows (inputs.summary_memory: the dispatch check
+        and deletion's scope links), written before that request is dispatched."""
+        await self._record(claim, None, None, also=lambda conn: conn.execute(
+            "UPDATE runs SET inputs = json_set(coalesce(inputs, '{}'), '$.summary_memory', json(?)) WHERE id = ?",
+            (json.dumps(list(ids)), claim.run_id)))
+        claim.context["summary_memory"] = list(ids)
 
     async def _summarize(self, claim, ctx, base, carried, covering, turns, share):
         """One compaction call (function `compact`) on the turn's own route and privacy controls, through the dispatch
@@ -1596,11 +1602,15 @@ class Harness:
             papers, records = sorted({*papers, *base["materials"]}), sorted({*records, *base["memory_ids"]})
         registered = list(ctx.get("context_materials") or ())
         await self._register_context(claim, {}, papers)  # the compaction request carries their text
+        if base and base["memory_ids"]:  # and the earlier summary's, which follows these records
+            await self._summary_memory(claim, base["memory_ids"])
         result = await self._role_call(claim, ctx, None, "compact", compaction.RULES,
                                        compaction.request_text(base and base["text"], turns, words),
                                        materials=papers, facts=facts)
         if result is None or not result.dispatched:  # it never left: no request carried their text
             ctx["context_materials"], ctx["taken_back"] = registered, True  # written by the next registration
+            if ctx.get("summary_memory"):
+                await self._summary_memory(claim, [])
         text = (result.content or "").strip() if result is not None and result.ok else ""
         step = await self._read(lambda conn: conn.execute(
             "SELECT max(json_extract(data, '$.step')) FROM run_events WHERE run_id = ? AND type = 'step_started'"
@@ -1762,8 +1772,10 @@ class Harness:
                 result = failed(call_id, "tool_error", "The tool failed.")  # a defect in the tool; the turn goes on
         # S1-21b: past the 8,000-character preview, the whole output is kept for paging (read_output) and the model gets
         # the preview and its handle: the call's content-free id and its number in the turn (backend/compaction.py)
+        # A tool whose own bound is within a page (read_output's included) is never paged: its result is whole, or cut there.
         paged, handle = None, f"{call_id}.{number}"
-        if result.ok and len(result.text) > compaction.PREVIEW and not result.meta.get("page"):
+        bound = agent.REGISTRY.get_definition(call.name).output_chars if call is not None and agent.known_name(call.name) else 0
+        if result.ok and bound > compaction.PREVIEW + 200 and len(result.text) > compaction.PREVIEW:
             paged = result.text
             result = result.model_copy(update={"text": compaction.preview(paged, handle),
                                                "meta": {**result.meta, "paged": len(paged)}})

@@ -1211,7 +1211,10 @@
   },
   "trace.history": "History",
   "trace.summary": "Earlier turns",
-  "trace.summaryUsed": "Turns {turns} were given as a summary written by a model, not as evidence.",
+  "trace.summaryUsed": {
+    "one": "Turn {turns} was given as a summary written by a model, not as evidence.",
+    "other": "Turns {turns} were given as a summary written by a model, not as evidence."
+  },
   "trace.phaseCompact": "Summarizing earlier turns",
   "trace.pairsJudged": {
     "one": "{count} citation pair judged",

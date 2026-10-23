@@ -68,12 +68,12 @@ def plan(costs, room, percent, summary=0):
     share = room // SHARE
     if share < MIN_SLOT:
         return None
-    kept = used = 0
-    for cost in costs:
+    kept, used = 1, costs[0] if costs else 0  # the newest turn always stays verbatim (ticket 31: recent turns)
+    for cost in costs[1:]:
         if used + cost + share >= limit:
             break
         kept, used = kept + 1, used + cost
-    return None if kept == len(costs) else (kept, share)
+    return None if kept >= len(costs) else (kept, share)
 
 
 def request_text(earlier, turns, words):
@@ -149,14 +149,20 @@ def exist(conn, memory_ids):
 
 
 def dependencies(conn, covers):
-    """(papers, memory records) the turns covers (run ids) depended on: their requests' context_materials and memory_ids."""
+    """(papers, memory records) the turns covers (run ids) depended on: their requests' context_materials, and the memory
+    records their requests held (memory_ids) or a summary they carried followed (summary_memory), those that still exist.
+    A record forgotten already is no dependency: history carries those turns as they are (S1-21a; text in earlier turns
+    stays), and counting it would refuse every summary of them, each paid for, from then on."""
     papers, records = set(), set()
-    for held, remembered in conn.execute(
-            "SELECT json_extract(inputs, '$.context_materials'), json_extract(inputs, '$.memory_ids') FROM runs"
-            " WHERE id IN (SELECT value FROM json_each(?))", (json.dumps(list(covers)),)):
+    for held, remembered, summarized in conn.execute(
+            "SELECT json_extract(inputs, '$.context_materials'), json_extract(inputs, '$.memory_ids'),"
+            " json_extract(inputs, '$.summary_memory') FROM runs WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(list(covers)),)):
         papers.update(json.loads(held or "[]"))
-        records.update(json.loads(remembered or "[]"))
-    return sorted(papers), sorted(records)
+        records.update(json.loads(remembered or "[]"), json.loads(summarized or "[]"))
+    existing = {r for (r,) in conn.execute("SELECT id FROM memory_records WHERE id IN (SELECT value FROM json_each(?))",
+                                           (json.dumps(sorted(records)),))}
+    return sorted(papers), sorted(existing)
 
 
 def keep(conn, run_id, step, sha256, data):
@@ -197,6 +203,12 @@ def page(text, offset, handle):
     end = offset + len(part)
     return part + (f"\n[Read on with read_output, handle {handle}, offset {end}; {len(text)} characters in all.]"
                    if end < len(text) else "\n[End of the output.]")
+
+
+def marked(start, key, offset):
+    """Whether the page from offset shows the whole marker of the passage whose line starts at start (key its marker's
+    (source, passage)): only then is the passage read in the run."""
+    return offset <= start and start + len(f"[S{key[0]}.{key[1]}]") <= offset + PREVIEW
 
 
 def keep_output(conn, run_id, step, number, sha256, materials):

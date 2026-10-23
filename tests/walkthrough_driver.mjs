@@ -2484,7 +2484,7 @@ async function compactionFlow(ctx) {
       await answer.getByText(L('trace.summary'), { exact: true }).waitFor();
       await answer.getByText(L('trace.summary'), { exact: true }).scrollIntoViewIfNeeded(); // shown in the screenshot
       check('Details says the answer used a summary of turns 1 and 2',
-        (await answer.innerText()).includes(L('trace.summaryUsed').replace('{turns}', '1–2')));
+        (await answer.innerText()).includes(L('trace.summaryUsed').other.replace('{turns}', '1–2')));
       check('Details lists the summarizing step', (await answer.innerText()).split(L('trace.phaseCompact')).length === 2);
     });
   } finally {
