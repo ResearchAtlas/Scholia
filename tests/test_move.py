@@ -161,3 +161,54 @@ async def test_a_moved_conversation_takes_the_project_records_drawn_only_from_it
             ("the sample is 30 nurses", "project", second, "private"),
             ("I prefer short answers", "personal", first, "normal"),
             ("the deadline is in March", "project", first, "normal")])
+
+
+async def test_a_moved_replacement_proposal_never_changes_the_record_it_named_in_the_other_project(tmp_path):
+    # MB6 (S1-21a follow-up): a proposal drawn only from the moved conversation moves with it, detached from the record
+    # it would replace, which stays behind, and marked out of date; Keep in the destination never touches that record
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        first = (await client.post("/api/projects", json={"name": "First"})).json()["id"]
+        second = (await client.post("/api/projects", json={"name": "Second"})).json()["id"]
+        await level(client, second, "private")
+        moving = (await client.post("/api/conversations", json={"project_id": first})).json()["id"]
+        target = (await client.post("/api/memory", json={"project_id": first, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+        await send(client, moving, "Hello")
+        await background_idle(client)
+        [(turn,)] = await rows(client, "SELECT run_id FROM turns WHERE conversation_id = ?", moving)
+
+        def proposed(conn):
+            record = memory.write(conn, project_id=first, scope="project", kind="decision", content="We use surveys",
+                                  status="proposed", sources=[("turn", turn)], structured={"seen": 1})
+            conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (target, record))
+            return record
+        proposal = await asyncio.to_thread(client.state["db"].write, proposed)
+        assert (await client.post(f"/api/conversations/{moving}/move", json={"project_id": second})).status_code == 200
+        [(project, replaces, out_of_date)] = await rows(
+            client, "SELECT project_id, supersedes_id, json_extract(structured, '$.out_of_date') FROM memory_records"
+                    " WHERE id = ?", proposal)
+        assert (project, replaces, out_of_date) == (second, None, 1)
+        kept = await client.post("/api/memory/review", json={"id": proposal, "action": "keep", "version": 1})
+        assert kept.status_code == 200, kept.text
+        assert await rows(client, "SELECT project_id, status FROM memory_records WHERE id = ?", target) == [
+            (first, "confirmed")]
+
+
+async def test_keep_never_replaces_another_projects_record(tmp_path):
+    # MB6: keep() itself checks the record it would replace is of the proposal's own scope
+    from backend import memory
+    async with started(tmp_path / "data") as client:
+        first = (await client.post("/api/projects", json={"name": "First"})).json()["id"]
+        second = (await client.post("/api/projects", json={"name": "Second"})).json()["id"]
+        target = (await client.post("/api/memory", json={"project_id": first, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+
+        def proposed(conn):
+            record = memory.write(conn, project_id=second, scope="project", kind="decision", content="We use surveys",
+                                  status="proposed", sources=[("project", second)])
+            conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (target, record))
+            return record
+        proposal = await asyncio.to_thread(client.state["db"].write, proposed)
+        assert await asyncio.to_thread(client.state["db"].write, lambda conn: memory.keep(conn, proposal, None)) is None
+        assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", target) == [("confirmed",)]

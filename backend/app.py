@@ -1187,6 +1187,14 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 " (SELECT run_id FROM turns WHERE conversation_id = ?5 UNION SELECT r.id FROM runs r JOIN turns t"
                 " ON t.run_id = r.source_turn_id WHERE t.conversation_id = ?5))",
                 (body.project_id, target[0], now, source, conversation_id))
+            # A pending proposal now in another project than the record it would replace (one moved, the other not)
+            # names it no more and waits marked out of date: Keep never changes another project's record (MB6)
+            conn.execute(
+                "UPDATE memory_records SET supersedes_id = NULL, updated_at = ?, structured = json_set(coalesce("
+                "structured, '{}'), '$.out_of_date', json('true')) WHERE status = 'proposed' AND project_id IN (?, ?)"
+                " AND EXISTS (SELECT 1 FROM memory_records t WHERE t.id = memory_records.supersedes_id"
+                " AND t.scope = 'project' AND t.project_id IS NOT memory_records.project_id)",
+                (now, source, body.project_id))
             conn.execute("INSERT INTO audit_log (event, project_id, data) VALUES ('conversation_moved', ?, ?)",
                          (body.project_id, json.dumps({"conversation_id": conversation_id, "from": source})))
             return True

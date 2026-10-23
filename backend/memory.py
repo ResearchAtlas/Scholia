@@ -304,8 +304,12 @@ def keep(conn, proposal, version, edited=False):
     target, seen = found["supersedes_id"], found["structured"].get("seen")
     now = utc_now()
     if target is not None:
-        current = conn.execute("SELECT status, version FROM memory_records WHERE id = ?", (target,)).fetchone()
-        if current is None or current[0] in ("superseded", "proposed") or (seen is not None and current[1] != seen):
+        current = conn.execute("SELECT status, version, scope, project_id FROM memory_records WHERE id = ?",
+                               (target,)).fetchone()
+        if current is None or current[0] in ("superseded", "proposed") or (seen is not None and current[1] != seen) \
+                or (current[2], current[3] if current[2] == "project" else None) != (
+                    found["scope"], found["project_id"] if found["scope"] == "project" else None):
+            # (never a record of another scope or project: a moved conversation's proposal, S1-21a follow-up MB6)
             conn.execute("UPDATE memory_records SET structured = json_set(coalesce(structured, '{}'),"
                          " '$.out_of_date', json('true')), updated_at = ? WHERE id = ?", (now, proposal))
             return None
