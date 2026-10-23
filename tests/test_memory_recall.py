@@ -204,6 +204,27 @@ async def test_a_personal_record_stays_shown_to_another_projects_extraction_afte
         assert provider.extractions and "Alice" in json.dumps(provider.extractions[-1])
 
 
+async def test_a_moved_conversations_record_is_found_by_meaning_in_its_new_project(tmp_path):
+    # S1-21a follow-up MB2: its vector leaves the source project's partition and is made again under the destination's
+    from cited import cited
+    from test_search import idle
+    async with cited(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        conversation = await conversation_in(client, first)
+        await send(client, conversation, "Remember: wage floors raise the earnings of low-paid workers")
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        await idle(client, first)
+        await background_idle(client, timeout=20)
+        index = client.state["index"]
+        scope = lambda: asyncio.to_thread(index._read, lambda conn: conn.execute(  # noqa: E731
+            "SELECT scope FROM memory_rows WHERE memory_id = ?", (record,)).fetchall())
+        assert await scope() == [(f"project:{first}",)]
+        assert (await client.post(f"/api/conversations/{conversation}/move", json={"project_id": second})).status_code == 200
+        await idle(client, second)
+        await background_idle(client, timeout=20)
+        assert await scope() == [(f"project:{second}",)]
+
+
 async def test_a_record_a_command_or_an_extraction_writes_gets_its_vector(tmp_path):
     # S1-21a follow-up MB7: an index run follows a write (the queue never embeds a memory addition)
     from cited import Provider, cited
