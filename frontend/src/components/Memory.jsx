@@ -3,11 +3,12 @@
 // this project's apart, each record with its type, status, sources and since when it holds; Confirm, Edit (a new version
 // that supersedes it, at the version shown) and Forget (its content deleted). Pending proposals are Things to confirm,
 // kept or forgotten here too. Loaded with Settings.
-import { useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { visible } from '../text.js';
-import { attempt, changeRecord, draftFor, forgetRecord, memoryChanged, readMemory, recordText, review } from '../memory.js';
+import { attempt, changeRecord, draftFor, forgetRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, readMemory, recordText,
+  review } from '../memory.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -17,7 +18,7 @@ export function MemorySection({ project }) {
   const t = useT();
   const [found, setFound] = useState(null);
   const [problem, setProblem] = useState(null);
-  const [unsaved, setUnsaved] = useState(null); // what an action could not save, kept across the reread (MB1)
+  const [unsaved, setUnsaved] = useUnsaved(`settings:${project?.id ?? ''}`); // what an action could not save (MB1, Q12)
   const guard = useRef(null); // which reads may be shown (library.js readGuard)
   if (guard.current === null) guard.current = readGuard();
   const load = useCallback(() => {
@@ -25,7 +26,7 @@ export function MemorySection({ project }) {
     return readMemory(project?.id).then((data) => { if (settle(true)) { setFound(data); setProblem(null); } },
       (error) => { if (settle(false)) setProblem(error instanceof ApiError ? error.code : 'internal'); });
   }, [project?.id]);
-  useEffect(() => { setUnsaved(null); load(); }, [load]); // another project's notice is never shown
+  useEffect(() => { load(); }, [load]);
   useEffect(() => { // a paper deleted or memory changed anywhere: dropped at once, and read again
     const changed = () => { guard.current.libraryChanged(); setFound(null); load(); };
     libraryEvents.addEventListener('changed', changed); // memory changes too (memory.js memoryChanged)
@@ -45,6 +46,16 @@ export function MemorySection({ project }) {
       )}
     </Section>
   );
+}
+
+// What a view's actions could not save, kept by key (view and project) across remounts: [value, set] (Q12).
+export function useUnsaved(key) {
+  const value = useSyncExternalStore(subscribeKept, () => keptUnsaved(key), () => null);
+  return [value, useCallback((next) => keepUnsaved(key, next), [key])];
+}
+function subscribeKept(changed) {
+  keptEvents.addEventListener('changed', changed);
+  return () => keptEvents.removeEventListener('changed', changed);
 }
 
 // What a memory action could not save: the error, and the researcher's own text, until dismissed (MB1).

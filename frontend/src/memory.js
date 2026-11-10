@@ -65,6 +65,18 @@ export async function attempt(t, action, draft = null, id = null) {
   }
 }
 
+// What an action could not save, kept by view and project (`settings:<project>`, `leftOff:<project>`) outside the
+// components that show it, so a remount never drops it (Q12, PR 51 recheck 3); only Dismiss, or a later failure in the
+// same view, replaces it. keptEvents tells the views when one changes.
+const kept = new Map();
+export const keptEvents = new EventTarget();
+export const keptUnsaved = (key) => kept.get(key) ?? null;
+export function keepUnsaved(key, value) {
+  if (value) kept.set(key, value);
+  else kept.delete(key);
+  keptEvents.dispatchEvent(new Event('changed'));
+}
+
 // The kept text, shown only beside a read that still holds its record, or the version that replaced it: Edit fills the
 // box with the record's own text, which may come from a paper, so once the record is forgotten or goes with its paper,
 // and while the views read again, it is not shown (no client-held derived state; PR 51 review 1).

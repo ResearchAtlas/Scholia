@@ -152,8 +152,11 @@ test('a failed memory action says what was not saved and keeps the researcher\'s
 // S1-21a follow-up MB4: a turn started here makes the project's latest turn new, so Where we left off is read again
 // (the backend then says not to show it) rather than staying on screen from before.
 test('Where we left off is read again once a turn of this conversation starts', () => {
+  // Q12 (PR 51 recheck 3): read again in place, never remounted (a remount dropped a failed action's notice)
   const source = readFileSync(join(SRC, 'components', 'ConversationView.jsx'), 'utf8');
-  assert.match(source, /<LeftOff key=\{live\?\.runId \?\? 'none'\} projectId=\{projectId\} \/>/);
+  assert.match(source, /<LeftOff projectId=\{projectId\} turn=\{live\?\.runId \?\? null\} \/>/);
+  assert.doesNotMatch(source, /<LeftOff key=/);
+  assert.match(readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8'), /\}, \[turn\]\);/);
 });
 
 // PR 51 review 1 (P1 1, P2 6): a kept draft may hold its record's own text (Edit fills the box with it), so it is shown
@@ -173,4 +176,22 @@ test('a kept draft is shown only while the current read still holds its record',
     assert.match(readFileSync(join(SRC, 'components', name), 'utf8'), /<Unsaved [^>]*records=\{/, name);
   }
   assert.match(readFileSync(join(SRC, 'components', 'LeftOff.jsx'), 'utf8'), /return unsaved \? /);
+});
+
+// Q12 (PR 51 recheck 3): what an action could not save is kept outside the components that show it (by view and project),
+// so a remount (a new conversation's first turn, the views opened again) never drops it, and another project's is never
+// shown; nothing resets it but Dismiss, or a later failure in the same view.
+test('a failed action\'s notice outlives a remount of the view that shows it', async () => {
+  const { keepUnsaved, keptUnsaved } = await import('../src/memory.js');
+  keepUnsaved('leftOff:p1', { problem: 'Not saved', draft: 'my words', id: 'r1' });
+  assert.deepEqual(keptUnsaved('leftOff:p1'), { problem: 'Not saved', draft: 'my words', id: 'r1' });
+  assert.equal(keptUnsaved('leftOff:p2'), null);
+  assert.equal(keptUnsaved('settings:p1'), null);
+  keepUnsaved('leftOff:p1', null);
+  assert.equal(keptUnsaved('leftOff:p1'), null);
+  for (const name of ['Memory.jsx', 'LeftOff.jsx']) {
+    const source = readFileSync(join(SRC, 'components', name), 'utf8');
+    assert.match(source, /useUnsaved\(/, name);
+    assert.doesNotMatch(source, /setUnsaved\(null\); load\(\)/, name);
+  }
 });
