@@ -855,3 +855,18 @@ async def test_keeping_a_proposal_always_takes_its_next_version(tmp_path):
             kept = await client.post("/api/memory/review", json={"id": record, "action": "keep", "version": shown})
             assert kept.status_code == 200, kept.text
             assert kept.json()["version"] > shown, record
+
+
+async def test_a_record_moved_since_it_was_shown_is_not_forgotten_from_the_old_view(tmp_path):
+    # PR 51 recheck 2 (P1 1, swept): a move is a change to the record, so every as-shown action (here the views'
+    # Forget, which carries no project) sees it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        private = await project_of(client, "Private one", level="private")
+        moving = await conversation_in(client, project)
+        await send(client, moving, "Remember: we exclude studies before 2000")
+        [(record, shown)] = await rows(client, "SELECT id, version FROM memory_records WHERE type != 'progress'")
+        assert (await client.post(f"/api/conversations/{moving}/move", json={"project_id": private})).status_code == 200
+        stale = await client.delete(f"/api/memory/{record}", params={"version": shown})
+        assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
+        assert await rows(client, "SELECT project_id FROM memory_records WHERE id = ?", record) == [(private,)]

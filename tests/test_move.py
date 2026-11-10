@@ -189,7 +189,9 @@ async def test_a_moved_replacement_proposal_never_changes_the_record_it_named_in
             client, "SELECT project_id, supersedes_id, json_extract(structured, '$.out_of_date') FROM memory_records"
                     " WHERE id = ?", proposal)
         assert (project, replaces, out_of_date) == (second, None, 1)
-        kept = await client.post("/api/memory/review", json={"id": proposal, "action": "keep", "version": 1})
+        [(version,)] = await rows(client, "SELECT version FROM memory_records WHERE id = ?", proposal)
+        assert version > 1  # moved, and detached: a later version (PR 51 recheck 2), as the destination's view reads it
+        kept = await client.post("/api/memory/review", json={"id": proposal, "action": "keep", "version": version})
         assert kept.status_code == 200, kept.text
         assert await rows(client, "SELECT project_id, status FROM memory_records WHERE id = ?", target) == [
             (first, "confirmed")]

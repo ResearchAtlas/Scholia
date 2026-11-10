@@ -1186,7 +1186,8 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
                 " WHERE s.memory_id = memory_records.id AND s.source_kind IN ('turn', 'run') AND s.source_id NOT IN"
                 " (SELECT run_id FROM turns WHERE conversation_id = ?2 UNION SELECT r.id FROM runs r JOIN turns t"
                 " ON t.run_id = r.source_turn_id WHERE t.conversation_id = ?2))", (source, conversation_id))])
-            conn.execute("UPDATE memory_records SET project_id = ?, sensitivity = ?, updated_at = ?"
+            # each its next version: every view, ask or request that showed it in the source project is stale (PR 51)
+            conn.execute("UPDATE memory_records SET project_id = ?, sensitivity = ?, updated_at = ?, version = version + 1"
                          " WHERE id IN (SELECT value FROM json_each(?))", (body.project_id, target[0], now, moved))
             # their vectors leave the source project's partition; the destination's next index run makes them again
             # under its own (S1-21a follow-up MB2; requested once the move has ended)
@@ -1195,7 +1196,7 @@ def create_app(data_dir, *, origin: str, dev_origins=(), session=None, frontend_
             # A pending proposal now in another project than the record it would replace (one moved, the other not)
             # names it no more and waits marked out of date: Keep never changes another project's record (MB6)
             conn.execute(
-                "UPDATE memory_records SET supersedes_id = NULL, updated_at = ?, structured = json_set(coalesce("
+                "UPDATE memory_records SET supersedes_id = NULL, updated_at = ?, version = version + 1, structured = json_set(coalesce("
                 "structured, '{}'), '$.out_of_date', json('true')) WHERE status = 'proposed' AND project_id IN (?, ?)"
                 " AND EXISTS (SELECT 1 FROM memory_records t WHERE t.id = memory_records.supersedes_id"
                 " AND t.scope = 'project' AND t.project_id IS NOT memory_records.project_id)",

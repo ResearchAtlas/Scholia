@@ -327,3 +327,23 @@ async def test_a_forget_with_text_finds_the_agents_note_too(tmp_path):
         stream = await send(client, conversation, "Forget: Ask Alice about the coding scheme")
         assert {"type": "memory", "action": "forgotten", "count": 1} in stream
         assert await rows(client, "SELECT count(*) FROM memory_records WHERE type = 'agent_note'") == [(0,)]
+
+
+async def test_a_forget_answered_after_its_record_moved_to_another_project_leaves_it(tmp_path):
+    # PR 51 recheck 2 (P1 1): a record whose conversation moved to another project since the ask was raised is that
+    # project's now; the Forget asked in this project never deletes it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        private = await project_of(client, "Private one", level="private")
+        moving, other, asking = (await conversation_in(client, project), await conversation_in(client, project),
+                                 await conversation_in(client, project))
+        await send(client, moving, "Remember: we exclude studies before 2000")
+        await send(client, other, "Remember: we exclude studies after 2020")
+        sending = asyncio.create_task(send(client, asking, "Forget: we exclude studies"))
+        ask = await open_ask(client, asking)
+        assert len(ask["params"]["records"]) == 2
+        assert (await client.post(f"/api/conversations/{moving}/move", json={"project_id": private})).status_code == 200
+        await client.post(f"/api/runs/{ask['run_id']}/asks/{ask['ask_id']}", json={"option": "forget"})
+        assert {"type": "memory", "action": "forgotten", "count": 1} in await sending
+        assert await rows(client, "SELECT content, project_id FROM memory_records WHERE type != 'progress'") == [
+            ("we exclude studies before 2000", private)]

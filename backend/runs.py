@@ -1460,8 +1460,9 @@ class Harness:
                     found = memory.row(conn, record)  # since, it is not what the researcher chose to forget
                     if found is None:
                         raise LookupError(record)
-                    if (found["version"], found["status"]) != seen[record]:
-                        raise ValueError("changed")
+                    if (found["version"], found["status"]) != seen[record] or (
+                            found["scope"] == "project" and found["project_id"] != project_id):
+                        raise ValueError("changed")  # (or moved to another project with its conversation since)
                 try:
                     await asyncio.to_thread(deletion.delete, self.db, self.content, "memory", record,
                                             on_committed=self.revoke, check=as_seen)
