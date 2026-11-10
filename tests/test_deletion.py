@@ -149,6 +149,7 @@ def populate(db, store, project, tag, paper=None):
         conn.execute(
             "INSERT INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'turn', ?), (?, 'turn', ?), (?, 'turn', ?)",
             (x["mr1"], x["r1"], x["mr2"], x["r1"], x["mr2"], x["r5"]))
+        conn.execute("INSERT INTO run_body_memory (sha256, memory_id) VALUES (?, ?)", (body, x["mr1"]))  # S1-21b
 
     db.write(add)
     return x
@@ -567,7 +568,10 @@ def test_a_database_at_schema_1_gets_the_guard_for_its_earlier_deletions(tmp_pat
                 "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (deleted, project)))
         db.write(lambda conn: conn.execute(
             "INSERT INTO conversations (id, project_id) VALUES (?, ?)", (new_id(), project)))
-    generation = sorted((data / "backups" / "daily").iterdir())[0]  # taken before the first migration it ran
+    # taken before the first migration it ran: the oldest generation, promoted to weekly once more than the daily
+    # generations kept were taken (S1-21b's migration 0009 made it eight)
+    generation = min((g for kind in ("daily", "weekly") if (data / "backups" / kind).is_dir()
+                      for g in (data / "backups" / kind).iterdir()), key=lambda g: g.name)
     backup = sqlite3.connect(f"{(generation / DB_NAME).as_uri()}?mode=ro", uri=True)
     try:
         assert backup.execute("PRAGMA user_version").fetchone() == (1,)

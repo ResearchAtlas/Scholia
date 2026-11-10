@@ -141,9 +141,11 @@ def test_an_existing_database_at_version_zero_is_backed_up_before_migrating(tmp_
 
     Database(data).close()
     # one backup before each migration; past the daily ones kept, the oldest is promoted to weekly (S1-21a's 0008
-    # made them eight)
+    # made them eight), and one more taken the same day is rotated out (S1-21b's 0009): the first, the database as it
+    # was before any migration, is the one kept
+    from backend.db.database import DAILY_KEPT
     found = sorted([(name, "weekly") for name in generations(data, "weekly")] + [(name, "daily") for name in generations(data)])
-    assert len(found) == len(MIGRATIONS)
+    assert len(found) == min(len(MIGRATIONS), DAILY_KEPT + 1)
     generation, kind = found[0]
     backup = sqlite3.connect((data / "backups" / kind / generation / DB_NAME).as_uri() + "?mode=ro", uri=True)
     try:

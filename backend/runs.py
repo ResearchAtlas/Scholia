@@ -1812,10 +1812,11 @@ class Harness:
             with self.content.hold() if self.content is not None else nullcontext([]) as held:
                 if whole_text is not None:  # its whole text, with the papers of what it holds past the preview too
                     whole = tuple(sorted({*materials, *_held_papers(turn, segments)}))
+                    records = sorted({value[0] for *_, kind, value in segments if kind == "memory"})  # all it holds
                     sha = await asyncio.to_thread(_stored, self.content, whole_text.encode("utf-8"), held)
                     try:
                         kept = await self._write(lambda conn: compaction.keep_output(
-                            conn, claim.run_id, step, number, sha, whole))
+                            conn, claim.run_id, step, number, sha, whole, records))
                     except Exception as error:  # not kept: said so below, never promised
                         log.warning("a tool output could not be kept for paging (%s)", type(error).__name__)
                         kept = False
@@ -1838,7 +1839,10 @@ class Harness:
                     **({"error": result.error.type} if result.error else {}),
                     **({"meta": result.meta} if result.meta else {}),
                     **({"result": ref} if ref else {"result_unavailable": True})},
-                    also=lambda conn: _keep_result(conn, claim.run_id, step, number, ref, materials))
+                    also=lambda conn: _keep_result(conn, claim.run_id, step, number, ref, materials,
+                                                   # S1-21b: a page served from a kept output follows the records it
+                                                   # shows (a tool's own result follows its papers, reading 10)
+                                                   result.meta.get("memory") or () if result.meta.get("page") else ()))
         _, cancelled = await _through(keeping())  # a Stop never discards a completed result (model-route rule 5)
         if cancelled:
             raise asyncio.CancelledError()
@@ -2956,15 +2960,15 @@ def _keep_reply(conn, call, number, ref):
 TOOL_RESULT_SLOT = 2000  # run_bodies keeps a tool result under its call's number in the turn plus this
 
 
-def _keep_result(conn, run_id, step, number, ref, materials):
+def _keep_result(conn, run_id, step, number, ref, materials, memory_ids=()):
     """A tool result's chain message, kept in run_bodies (step, TOOL_RESULT_SLOT + its call's number) with the papers
-    the turn's request carries, so a deletion of one of them removes it; nothing once one of them is gone."""
-    if ref is None or not provenance.carried(conn, materials):
+    the turn's request carries, so a deletion of one of them removes it; nothing once one of them is gone. S1-21b:
+    memory_ids, a page served from a kept output's records, are followed the same way (a Forget removes it)."""
+    if ref is None or not provenance.carried(conn, materials) or not compaction.exist(conn, memory_ids):
         return
     conn.execute("INSERT OR IGNORE INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
                  (run_id, step, TOOL_RESULT_SLOT + number, ref))
-    conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
-                     [(ref, material) for material in materials])
+    compaction.link(conn, ref, materials, memory_ids)
 
 
 def _kept_body(conn, call, number, dispatched):

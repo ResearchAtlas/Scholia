@@ -291,3 +291,73 @@ async def test_fix1_review_a_page_at_any_offset_registers_every_item_it_shows_an
         assert straddled in inputs["context_materials"] and after not in inputs["context_materials"]
         page = [d for k, d, _ in await events_of(client, run) if k == "tool_result"][-1]["meta"]
         assert straddled in page["materials"]
+
+
+async def test_fix2_forget_removes_a_kept_output_and_the_pages_served_from_it(tmp_path):
+    # gpt-6-astra recheck 2 (P1): a memory tool's kept output, and a page served from it, outlived a Forget of a record
+    # they hold: read_output answered with the forgotten text, and the trace served both copies.
+    from agentic import steps_reply
+    handle = agent.traced_id("call_read_memory") + ".1"
+    held = {}
+
+    async def forget_then_read_on(body):  # a record past the preview, never shown, is forgotten mid-turn
+        assert (await held["client"].delete(f"/api/memory/{held['records'][0]}")).status_code in (200, 204)
+        return steps_reply(provider, [call("read_output", "p1", handle=handle, offset=compaction.PREVIEW)])
+    provider = Scripted([call("read_memory")], forget_then_read_on, "Done.",
+                        [call("read_memory")], [call("read_output", "p2", handle=handle, offset=compaction.PREVIEW)],
+                        "Done.")
+    async with cited(tmp_path, provider) as client:
+        held["client"] = client
+        project, [selected] = await with_papers(client, LONG)
+        held["records"] = [(await client.post("/api/memory", json={
+            "project_id": project, "type": "decision", "content": f"Decision {i}: " + "detail " * 138})).json()["id"]
+            for i in range(10)]  # newest first in read_memory: record 0 is last, wholly past the preview
+        conversation = await conversation_in(client, project)
+
+        async def bodies(run):
+            return await rows(client, "SELECT attempt, sha256 FROM run_bodies WHERE run_id = ?", run)
+
+        async def served(run, sha):
+            return (await client.get(f"/api/runs/{run}/trace/bodies/{sha}")).status_code
+        # a message selecting a paper recalls no memory, so the turn holds only what the tool showed
+        first = (await send(client, conversation, "What did we decide?", material_ids=[selected]))[0]["run_id"]
+        [read_on] = [d for k, d, _ in await events_of(client, first) if k == "tool_result" and d["name"] == "read_output"]
+        assert not read_on["ok"] and held["records"][0] not in (read_on.get("meta") or {}).get("memory", [])
+        [_, after] = tool_messages(provider.agent_steps[-1])
+        assert json.loads(after["content"])["error"] == "not_found"  # the output went with the record
+        assert "Decision 0:" not in json.dumps(provider.agent_steps[-1])
+        assert not [a for a, _ in await bodies(first) if a >= compaction.OUTPUT_SLOT]
+        second = (await send(client, conversation, "What did we decide?", material_ids=[selected]))[0]["run_id"]
+        [_, page] = tool_messages(provider.agent_steps[-1])
+        [(whole,)] = [(s,) for a, s in await bodies(second) if a >= compaction.OUTPUT_SLOT]
+        [paging] = [d for k, d, _ in await events_of(client, second) if k == "tool_result" and d["name"] == "read_output"]
+        page_sha = paging["result"]
+        assert "detail" in page["content"] and held["records"][1] in paging["meta"]["memory"]  # the oldest's tail
+        assert await served(second, whole) == 200 and await served(second, page_sha) == 200
+        assert (await client.delete(f"/api/memory/{held['records'][1]}")).status_code in (200, 204)
+        kept = {s for _, s in await bodies(second)}
+        assert whole not in kept and page_sha not in kept  # in the deletion's own transaction
+        assert await served(second, whole) in (404, 410) and await served(second, page_sha) == 410  # removed, said so
+
+
+
+async def test_fix2_a_conversations_deletion_removes_its_kept_outputs_pages_and_their_links(tmp_path):
+    # Fix batch 2 sweep: every stored copy this PR keeps goes with its run's conversation, links included.
+    handle = agent.traced_id("call_read_memory") + ".1"
+    provider = Scripted([call("read_memory")], [call("read_output", "p1", handle=handle, offset=compaction.PREVIEW)],
+                        "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, [selected] = await with_papers(client, LONG)
+        for i in range(10):
+            await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                   "content": f"Decision {i}: " + "detail " * 138})
+        conversation = await conversation_in(client, project)
+        run = (await send(client, conversation, "What did we decide?", material_ids=[selected]))[0]["run_id"]
+        shas = [s for (s,) in await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ?", run)]
+        linked = await rows(client, "SELECT count(*) FROM run_body_memory WHERE sha256 IN (SELECT value FROM json_each(?))",
+                            json.dumps(shas))
+        assert linked[0][0] > 0  # the kept output and the page follow their records
+        assert (await client.delete(f"/api/conversations/{conversation}")).status_code == 200
+        for table in ("run_bodies", "run_body_memory", "run_body_materials"):
+            assert await rows(client, f"SELECT count(*) FROM {table} WHERE sha256 IN (SELECT value FROM json_each(?))",
+                              json.dumps(shas)) == [(0,)], table

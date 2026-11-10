@@ -319,8 +319,14 @@ async def test_forgetting_a_memory_record_a_covered_turn_held_deletes_the_summar
         [event] = await compactions(client, run)
         assert event["memory_ids"]  # a covered turn's request held the record
         [record] = event["memory_ids"][:1]
+        [(_, _, sha)] = await summary_rows(client)
+        assert set(event["memory_ids"]) == {  # fix batch 2: linked as papers are (run_body_memory)
+            m for (m,) in await rows(client, "SELECT memory_id FROM run_body_memory WHERE sha256 = ?", sha)}
+        assert (await client.get(f"/api/runs/{run}/trace/bodies/{sha}")).status_code == 200
         assert (await client.delete(f"/api/memory/{record}")).status_code in (200, 204)
         assert await summary_rows(client) == []
+        assert (await client.get(f"/api/runs/{run}/trace/bodies/{sha}")).status_code == 404  # fix batch 2: not served
+        assert await rows(client, "SELECT count(*) FROM run_body_memory WHERE sha256 = ?", sha) == [(0,)]
         # Review 1 (sonnet P2-1): a record forgotten already is no dependency of the next summary, which is kept, not
         # paid for and thrown away at every later turn.
         stream = await send(client, chat, "QUESTION-4 about cohorts")

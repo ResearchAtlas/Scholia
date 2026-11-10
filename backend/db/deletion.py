@@ -20,7 +20,7 @@ import json
 import logging
 import weakref
 
-from backend import compaction, provenance
+from backend import provenance
 from backend.extraction import EXTRACTORS, extractor_of
 
 log = logging.getLogger(__name__)
@@ -94,6 +94,7 @@ ON_DELETE = {
     # material), and shows that the source was removed.
     ("material_versions", "material_id"): DELETE,
     ("run_body_materials", "material_id"): DELETE,  # and every body that holds its text goes (RULES)
+    ("run_body_memory", "memory_id"): DELETE,  # S1-21b: and every stored copy holding a memory record's text (RULES)
     ("passages", "extraction_id"): DELETE,
     ("candidates", "material_id"): "material_id = NULL",
     ("citations", "material_id"): _SOURCE_REMOVED,
@@ -161,13 +162,17 @@ RULES = (
     WHERE b.sha256 IN (SELECT sha256 FROM run_body_materials WHERE rowid IN {_doomed('run_body_materials')})
     OR (b.sha256 IN (SELECT sha256 FROM run_bodies WHERE rowid IN {_doomed('run_bodies')})
         AND NOT EXISTS (SELECT 1 FROM run_bodies r WHERE r.sha256 = b.sha256 AND r.rowid NOT IN {_doomed('run_bodies')}))""",
-    # S1-21b (backend/compaction.py): a compaction summary goes with any memory record a turn it covers held, as it goes
-    # with any of their papers (run_body_materials, above) and with their conversation (its run).
+    # S1-21b (backend/compaction.py): a stored copy holding a deleted or forgotten memory record's text (a compaction
+    # summary, a memory tool's kept output, a page served from it) goes, in every run, with its links to its papers and
+    # records; and a body's memory links once no run is left to name it.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
-    SELECT 'run_bodies', b.rowid FROM run_bodies b JOIN run_events e ON e.run_id = b.run_id AND e.type = 'compaction'
-    AND json_extract(e.data, '$.step') = b.step AND json_extract(e.data, '$.summary') = b.sha256
-    WHERE b.attempt = {compaction.SUMMARY_SLOT} AND EXISTS (SELECT 1 FROM json_each(e.data, '$.memory_ids') j
-                                       WHERE j.value IN (SELECT id FROM memory_records WHERE rowid IN {_doomed('memory_records')}))""",
+    SELECT 'run_bodies', rowid FROM run_bodies
+    WHERE sha256 IN (SELECT sha256 FROM run_body_memory WHERE rowid IN {_doomed('run_body_memory')})""",
+    f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
+    SELECT 'run_body_memory', b.rowid FROM run_body_memory b
+    WHERE b.sha256 IN (SELECT sha256 FROM run_body_memory WHERE rowid IN {_doomed('run_body_memory')})
+    OR (b.sha256 IN (SELECT sha256 FROM run_bodies WHERE rowid IN {_doomed('run_bodies')})
+        AND NOT EXISTS (SELECT 1 FROM run_bodies r WHERE r.sha256 = b.sha256 AND r.rowid NOT IN {_doomed('run_bodies')}))""",
     # A project's own memory.
     f"""INSERT OR IGNORE INTO temp.doomed (tbl, rid)
     SELECT 'memory_records', rowid FROM memory_records

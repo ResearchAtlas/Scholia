@@ -176,9 +176,17 @@ def keep(conn, run_id, step, sha256, data):
         return False
     conn.execute("INSERT OR IGNORE INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
                  (run_id, step, SUMMARY_SLOT, sha256))
-    conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
-                     [(sha256, material) for material in data["materials"]])
+    link(conn, sha256, data["materials"], data["memory_ids"])
     return True
+
+
+def link(conn, sha256, materials=(), memory_ids=()):
+    """A stored copy's links to the papers and memory records whose text it holds (run_body_materials,
+    run_body_memory): deleting any one of them deletes it (backend/db/deletion.py)."""
+    conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
+                     [(sha256, material) for material in materials])
+    conn.executemany("INSERT OR IGNORE INTO run_body_memory (sha256, memory_id) VALUES (?, ?)",
+                     [(sha256, record) for record in memory_ids])
 
 
 def sendable(conn, run_id):
@@ -224,16 +232,16 @@ def marked(start, label, offset):
     return offset < end <= offset + PREVIEW
 
 
-def keep_output(conn, run_id, step, number, sha256, materials):
-    """A paged output's whole text, kept in run_bodies (step, OUTPUT_SLOT + its call's number) with the papers whose text
-    it holds, so a deletion of one of them removes it; nothing once one of them, or its run, is gone."""
-    if sha256 is None or not provenance.carried(conn, materials) or \
+def keep_output(conn, run_id, step, number, sha256, materials, memory_ids=()):
+    """A paged output's whole text, kept in run_bodies (step, OUTPUT_SLOT + its call's number) with the papers and memory
+    records whose text it holds (every one it contains, shown or not), so a deletion or a Forget of one of them removes
+    it; nothing once one of them, or its run, is gone."""
+    if sha256 is None or not provenance.carried(conn, materials) or not exist(conn, memory_ids) or \
             conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is None:
         return False
     conn.execute("INSERT OR IGNORE INTO run_bodies (run_id, step, attempt, sha256) VALUES (?, ?, ?, ?)",
                  (run_id, step, OUTPUT_SLOT + number, sha256))
-    conn.executemany("INSERT OR IGNORE INTO run_body_materials (sha256, material_id) VALUES (?, ?)",
-                     [(sha256, material) for material in materials])
+    link(conn, sha256, materials, memory_ids)
     return True
 
 

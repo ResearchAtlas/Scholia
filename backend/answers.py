@@ -111,7 +111,7 @@ async def body(run_id: str, sha256: str, request: Request):
         if found == "kept" and data is not None:
             return Response(data, media_type="application/json")
     if found in ("removed", "kept"):
-        raise AdmissionError(410, "body_removed", "This text was removed with a deleted paper")
+        raise AdmissionError(410, "body_removed", "This text was removed with a deleted paper or a forgotten memory record")
     raise AdmissionError(404, "not_found", "No such request body")
 
 
