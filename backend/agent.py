@@ -169,7 +169,7 @@ async def list_materials(call, turn):
                  "_", " "), "RETRACTED" if retraction == "retracted" else None) if x)]]
     more = rows[0][5] - len(rows)
     text, shown = _paged(turn, call.id, items, "\n", tail=f"\n({more} more papers not listed.)" if more > 0 else "")
-    return ToolResult(id=call.id, ok=True, text=text, meta={"materials": [v for _, _, _, v in shown]})
+    return ToolResult(id=call.id, ok=True, text=text, meta={"materials": [v for *_, v in shown]})
 
 
 @REGISTRY.register(
@@ -203,9 +203,7 @@ async def search_passages(call, turn):
     head = "(Meaning search was unavailable: these come from keyword search only.)\n\n" \
         if found["mode"] == "keyword_only" else ""
     text, shown = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", head=head)
-    return ToolResult(id=call.id, ok=True, text=text, meta={
-        "passages": [turn.evidence.numbered[v]["passage_id"] for _, _, k, v in shown if k == "passage"],
-        "mode": found["mode"]})
+    return ToolResult(id=call.id, ok=True, text=text, meta={"passages": _read(turn, shown), "mode": found["mode"]})
 
 
 @REGISTRY.register(
@@ -247,8 +245,7 @@ async def read_passage(call, turn):
     tail = f"\n\n(Passages left out, by ordinal: {_ranges(left)}. Read one with its ordinal.)" if left else ""
     text, shown = _paged(turn, call.id, _passage_items(turn, keys), "\n\n", tail=tail)
     return ToolResult(id=call.id, ok=True, text=text, meta={
-        "passages": [turn.evidence.numbered[v]["passage_id"] for _, _, k, v in shown if k == "passage"],
-        "version_id": rows[0][1][7], "left_out": len(left)})
+        "passages": _read(turn, shown), "version_id": rows[0][1][7], "left_out": len(left)})
 
 
 PREVIEW_ROOM = 7000  # characters of whole passages a selection read directly must fit (B40), within the 8,000 preview
@@ -260,27 +257,42 @@ def _passage_items(turn, keys):
 
 
 def _paged(turn, call_id, items, sep, head="", tail=""):
-    """S1-21b (section 8, Paging): a result's text of items [(line, label, kind, value)], each item read in the run (a
-    passage), given to the model (a paper's listing) or held by the request (a memory record) only once a page the
-    model is served completes its label: those the preview completes now, the rest kept as the call's segments for
-    read_output (the harness keeps the whole text and pages it). Returns (the text, the items shown now)."""
-    at, starts = len(head), []
+    """S1-21b (section 8, Paging): a result's text of items [(line, label, kind, value)], kept as the call's segments
+    [(start, length, label, kind, value)] for read_output (the harness keeps the whole text and pages it), and what the
+    preview shows of them given to the run now (reveal). Returns (the text, the segments the preview shows any of)."""
+    at, segments = len(head), []
     for line, label, kind, value in items:
-        starts.append((at, label, kind, value))
+        segments.append((at, len(line), label, kind, value))
         at += len(line) + len(sep)
-    shown = [s for s in starts if compaction.marked(s[0], s[1], 0)]
-    turn.segments[call_id] = [s for s in starts if s not in shown]
-    reveal(turn, shown)
-    return head + sep.join(line for line, *_ in items) + tail, shown
+    turn.segments[call_id] = segments
+    return head + sep.join(line for line, *_ in items) + tail, reveal(turn, segments, 0)
 
 
-def reveal(turn, shown):
-    """What items a served page completes give the run: passages read, papers listed, memory records held."""
-    turn.evidence.show([v for _, _, k, v in shown if k == "passage"])
-    turn.listed.update(v for _, _, k, v in shown if k == "paper")
-    held = [v for _, _, k, v in shown if k == "memory"]
+def reveal(turn, segments, offset):
+    """What a page from offset (the preview: 0) gives the run of the items it shows any character of, so nothing it shows
+    is sent unregistered (fix batch 1 review, P1-2): a paper listed, its title in the request; a memory record held by
+    the request; a passage's paper registered, and the passage read in the run (citable) only once the page completes its
+    marker (compaction.marked). Returns the segments it shows."""
+    shown = [s for s in segments if compaction.shows(s[0], s[1], offset)]
+    for start, _, label, kind, value in shown:
+        if kind == "passage":
+            if compaction.marked(start, label, offset):
+                turn.evidence.show([value])
+            record = turn.evidence.numbered.get(value) or turn.evidence.pending.get(value)
+            if record is not None:
+                turn.listed.add(record["material_id"])
+        elif kind == "paper":
+            turn.listed.add(value)
+    held = [v for _, _, _, k, v in shown if k == "memory"]
     if held:
         _remembered(turn, [record for record, _ in held], {m for _, materials in held for m in materials})
+    return shown
+
+
+def _read(turn, shown):
+    """The passages read in the run among segments a page shows (their markers completed), by passage id."""
+    return [turn.evidence.numbered[v]["passage_id"] for _, _, _, k, v in shown
+            if k == "passage" and v in turn.evidence.numbered]
 _MARKER_SLACK = 8  # a marker the turn numbers ([S12.30]) may be longer than one numbered from 1
 
 
@@ -442,7 +454,7 @@ async def read_project_state(call, turn):
     if not lines:
         return ToolResult(id=call.id, ok=True, text="The project state is empty so far.", meta={"memory": []})
     text, shown = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in zip(lines, held)], "\n")
-    return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for _, _, _, v in shown]})
+    return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for *_, v in shown]})
 
 
 @REGISTRY.register(
@@ -468,7 +480,7 @@ async def read_memory(call, turn):
     if not found:
         return ToolResult(id=call.id, ok=True, text="No memory record is recorded for this.", meta={"memory": []})
     text, shown = _paged(turn, call.id, [(line, line[:LABEL_CHARS], "memory", h) for line, h in found], "\n")
-    return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for _, _, _, v in shown]})
+    return ToolResult(id=call.id, ok=True, text=text, meta={"memory": [v[0] for *_, v in shown]})
 
 
 @REGISTRY.register(
@@ -526,11 +538,10 @@ async def read_output(call, turn):
             text = None
     if text is None:  # gone with a paper whose text it held, or never kept
         return failed(call.id, "not_found", "That output is no longer kept.")
-    shown = [s for s in kept["segments"] if compaction.marked(s[0], s[1], offset)]
-    reveal(turn, shown)
+    shown = reveal(turn, kept["segments"], offset)
     return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle), meta={
-        "passages": [turn.evidence.numbered[v]["passage_id"] for _, _, k, v in shown if k == "passage"],
-        "memory": [v[0] for _, _, k, v in shown if k == "memory"], "page": True})
+        "passages": _read(turn, shown), "materials": [v for *_, k, v in shown if k == "paper"],
+        "memory": [v[0] for *_, k, v in shown if k == "memory"], "page": True})
 
 
 def definitions():

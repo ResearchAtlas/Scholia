@@ -210,6 +210,11 @@ def page(text, offset, handle):
                    if end < len(text) else "\n[End of the output.]")
 
 
+def shows(start, length, offset, size=PREVIEW):
+    """Whether the page from offset shows any character of an item whose line is length characters from start."""
+    return start < offset + size and start + length > offset
+
+
 def marked(start, label, offset):
     """Whether the page from offset completes the label (a passage's marker, the head of a listed paper's or memory
     record's line) of an item whose line starts at start: it shows the label's end, so the label is whole on it, or

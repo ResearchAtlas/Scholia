@@ -241,7 +241,7 @@ async def test_fix1_papers_and_memory_records_past_the_preview_count_as_given_on
                         [call("read_output", call_id="p1", handle=listing, offset=compaction.PREVIEW),
                          call("read_output", call_id="p2", handle=remembering, offset=compaction.PREVIEW)], "Done.")
     async with cited(tmp_path, provider) as client:
-        project, _ = await with_papers(client, LONG)
+        project, [selected] = await with_papers(client, LONG)
         papers = [new_id() for _ in range(400)]
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.executemany(
             "INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, ?, 'upload')",
@@ -250,13 +250,44 @@ async def test_fix1_papers_and_memory_records_past_the_preview_count_as_given_on
                                                            "content": f"Decision {i}: " + "detail " * 138})).json()["id"]
                    for i in range(10)]
         conversation = await conversation_in(client, project)
-        stream = await send(client, conversation, "What do I have?")
+        # a message selecting a paper recalls no memory (memory.wants): what the request holds is the tools' alone
+        stream = await send(client, conversation, "What do I have?", material_ids=[selected])
         results = [d for k, d, _ in await events_of(client, stream[0]["run_id"]) if k == "tool_result"]
         listed, remembered, page1, page2 = (r["meta"] for r in results)
-        assert len(listed["materials"]) < 401 and len(remembered["memory"]) < 10
-        assert set(page2["memory"]) and not set(page2["memory"]) & set(remembered["memory"])
+        assert len(listed["materials"]) < 401 and 0 < len(remembered["memory"]) < 10
+        assert set(page2["memory"]) - set(remembered["memory"])  # (a record the boundary cuts is in both)
         inputs = json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"]))[0][0])
-        held = set(inputs["memory_ids"])
-        assert set(remembered["memory"]) | set(page2["memory"]) <= held <= set(records) | held  # (recall holds them too)
+        # held only what the preview and the page showed: none of the page's records before it was served
+        assert set(inputs["memory_ids"]) == set(remembered["memory"]) | set(page2["memory"])
         never = [m for m in papers if m not in inputs["context_materials"]]
-        assert never and set(listed["materials"]) <= set(inputs["context_materials"])
+        assert never and set(listed["materials"]) | set(page1["materials"]) <= set(inputs["context_materials"])
+        assert set(page1["materials"]) - set(listed["materials"])  # the page names what it listed
+
+
+async def test_fix1_review_a_page_at_any_offset_registers_every_item_it_shows_any_of(tmp_path):
+    # Fix batch 1 internal review (P1-2): a page starting inside a line, at an offset the footer did not name, shows the
+    # rest of that paper's title; its paper is registered, and its trace names it.
+    from backend.db.database import new_id
+    listing = agent.traced_id("call_list_materials") + ".1"
+    offset = compaction.PREVIEW + 3007
+    provider = Scripted([call("list_materials")], [call("read_output", call_id="p1", handle=listing, offset=offset)],
+                        "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, LONG)
+        papers = [new_id() for _ in range(300)]
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.executemany(
+            "INSERT INTO materials (id, project_id, title, source) VALUES (?, ?, ?, 'upload')",
+            [(m, project, f"Paper {i:04d} " + "on minimum wages " * 6) for i, m in enumerate(papers)]))
+        conversation = await conversation_in(client, project)
+        run = (await send(client, conversation, "What do I have?"))[0]["run_id"]
+        [(sha,)] = await rows(client, "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= ?", run,
+                              compaction.OUTPUT_SLOT)
+        whole = (client.state["db"].data_dir / "content" / sha[:2] / sha).read_text()
+        begun = whole[:offset].rsplit("\n", 1)[1]  # the line the page starts inside
+        assert begun and not whole[offset - 1] == "\n"
+        straddled = begun.split(" | ", 1)[0]
+        after = whole[offset + compaction.PREVIEW:].split("\n")[2].split(" | ", 1)[0]  # a line wholly past the page
+        inputs = json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", run))[0][0])
+        assert straddled in inputs["context_materials"] and after not in inputs["context_materials"]
+        page = [d for k, d, _ in await events_of(client, run) if k == "tool_result"][-1]["meta"]
+        assert straddled in page["materials"]

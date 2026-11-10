@@ -464,3 +464,51 @@ async def test_fix1_a_later_step_that_cuts_the_summary_still_carries_it_and_deta
         inputs = json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"]))[0][0])
         [event] = await compactions(client, stream[0]["run_id"])
         assert event["memory_ids"] and inputs.get("summary_memory") == event["memory_ids"]  # still registered
+
+
+async def test_fix1_review_a_summary_first_carried_by_a_later_step_is_registered_before_that_step(tmp_path, monkeypatch):
+    # Fix batch 1 internal review (P1-1): the first step's request cut the summary (forced here, as room can grow between
+    # steps when evidence is cut whole), a later step's request carries it: its memory records and papers are
+    # registered before that step is sent.
+    from backend import agent
+    from backend.tools.types import ToolResult
+
+    async def small(call, turn):
+        return ToolResult(id=call.id, ok=True, text="One paper.")
+    monkeypatch.setitem(agent.REGISTRY._implementations, "list_materials", small)
+    flag = {"on": False}
+    provider = Long()
+    provider.answer_for = lambda m: steps_reply(provider, [call("list_materials")]) \
+        if flag["on"] and "QUESTION-3" in m and not provider.turns[-1]["messages"][-1]["role"] == "tool" else None
+    real = context.assemble
+    seen = []
+
+    def first_cuts(*args, **kwargs):  # the turn's first-step requests (no chain yet) cut the summary
+        if flag["on"] and kwargs.get("summary") and not kwargs.get("chain"):
+            request = real(*args, **{**kwargs, "summary": None})
+            request.cuts["summary"] = 1
+            return request
+        return real(*args, **kwargs)
+    monkeypatch.setattr(context, "assemble", first_cuts)
+    real_call = runs_module.Harness._call
+
+    async def noted(self, active, call_, route, key, request, *args, **kwargs):
+        if flag["on"] and request.function == "answer" and compaction.LABEL in request.messages[0]["content"]:
+            seen.append(json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", active.run_id))[0][0]))
+        return await real_call(self, active, call_, route, key, request, *args, **kwargs)
+    monkeypatch.setattr(runs_module.Harness, "_call", noted)
+    async with started(tmp_path / "data", provider) as client:
+        await small_history(client)
+        _, chat = await conversation(client)
+        await send(client, chat, "Remember: my method is semi-structured interviews")
+        for i in range(1, 3):
+            await send(client, chat, f"QUESTION-{i} about cohorts")
+        flag["on"] = True
+        stream = await send(client, chat, "QUESTION-3 about cohorts")
+        assert stream[-1]["status"] == "succeeded"
+        first, second = provider.turns[-2:]
+        assert compaction.LABEL not in first["messages"][0]["content"] and compaction.LABEL in second["messages"][0]["content"]
+        [event] = await compactions(client, stream[0]["run_id"])
+        assert event["memory_ids"] and seen and seen[0].get("summary_memory") == event["memory_ids"]  # before it left
+        steps = await answer_steps(client, stream[0]["run_id"])
+        assert [s.get("summary") for s in steps] == [None, {"turns": [0, 1]}]
