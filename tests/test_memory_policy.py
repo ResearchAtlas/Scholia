@@ -950,3 +950,70 @@ async def test_the_memory_views_list_each_record_with_every_version_it_replaced(
         r2 = (await client.patch(f"/api/memory/{r1['id']}", json={"version": r1["version"], "content": "We use diaries"})).json()
         listed = (await client.get("/api/memory", params={"project_id": project})).json()["project"]
         assert [(r["id"], r["replaced"]) for r in listed if r["type"] == "decision"] == [(r2["id"], [r1["id"], r0])]
+
+
+# PR 51 fix batch 4 (Q14, recheck 4): the revocation is durable from the refusal itself, before any await
+
+
+async def test_a_refused_extraction_whose_receipt_was_never_recorded_is_never_sent_again(tmp_path, monkeypatch):
+    # the reviewer's case: refused for memory, then the refusal's receipt is never recorded (here its write fails);
+    # resumed, it must end cancelled/revoked with no request, never be sent again
+    provider = MockProvider()
+    async with started(tmp_path / "data", provider) as client:
+        project = await project_of(client)
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use interviews", status="proposed",
+            sources=[("project", project)]))
+        dispatch, write, failed, edited = runs.Harness._call, runs.Harness._write, [], []
+
+        async def edited_meanwhile(self, *args, **kwargs):
+            if sys._getframe(1).f_code.co_name == "_extraction_call" and not edited:
+                response = await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
+                assert response.status_code == 200
+                edited.append(True)
+            return await dispatch(self, *args, **kwargs)
+
+        async def receipt_failing_once(self, fn):  # the extraction's refused step, whose receipt is never recorded
+            if edited and fn.__qualname__.endswith("_call.<locals>.record") and not failed:
+                failed.append(True)
+                raise RuntimeError("the receipt's write failed")
+            return await write(self, fn)
+        monkeypatch.setattr(runs.Harness, "_call", edited_meanwhile)
+        monkeypatch.setattr(runs.Harness, "_write", receipt_failing_once)
+        await send(client, await conversation_in(client, project), "We sample thirty nurses")
+        await background_idle(client)
+        await client.state["harness"].kick_background()
+        await background_idle(client)
+        assert failed and provider.extractions == []
+        assert await rows(client, "SELECT status, cancel_reason FROM runs WHERE workflow = 'memory'") == [
+            ("cancelled", "revoked")]
+
+
+async def test_a_refused_turn_whose_receipt_failed_ends_revoked_with_continue(tmp_path, monkeypatch):
+    from cited import cited, with_papers
+    from test_search import WAGES
+    held, write, failed = {}, runs.Harness._write, []
+
+    async def edit_then_list(body):
+        changed = await held["client"].patch(f"/api/memory/{held['record']}", json={"version": 1, "content": "Changed"})
+        assert changed.status_code == 200
+        held["edited"] = True
+        return steps_reply(provider, [call("list_materials")])
+
+    async def receipt_failing_once(self, fn):  # the second step's: refused (its first step's reply was recorded)
+        if held.get("edited") and fn.__qualname__.endswith("_call.<locals>.record") and not failed:
+            held["receipts"] = held.get("receipts", 0) + 1
+            if held["receipts"] == 2:
+                failed.append(True)
+                raise RuntimeError("the receipt's write failed")
+        return await write(self, fn)
+    provider = Scripted(edit_then_list, "Done.")
+    async with cited(tmp_path, provider) as client:
+        project, _ = await with_papers(client, WAGES)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "SECRET decision"})).json()["id"]
+        held.update(client=client, record=record)
+        monkeypatch.setattr(runs.Harness, "_write", receipt_failing_once)
+        stream = await send(client, await conversation_in(client, project), "What did we decide last time?")
+        assert failed and len(provider.agent_steps) == 1
+        assert (stream[-1]["status"], stream[-1].get("cancel_reason")) == ("cancelled", "revoked")

@@ -338,7 +338,10 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, memory_chang
     reads the project's memory switch as it is now (S1-21a fix batch 3, R4): a request holding memory is refused once it
     is off, whichever step of the run sends it (a nested tool's included), and so is a memory extraction's.
     memory_changed(), if given, is told when a memory record the request holds is no longer allowed (edited, superseded,
-    forgotten or out of scope since): the caller ends the run revoked, as for memory off (S1-21a follow-up MB11)."""
+    forgotten or out of scope since): the caller ends the run revoked, as for memory off (S1-21a follow-up MB11). With
+    it (the dispatch path, Harness._call), a refusal for memory revokes the run in the record here, in the gate's
+    decision transaction (conn), so the revocation is durable before anything after the refusal can be cancelled, fail
+    or wait: a terminal write, a shutdown, a receipt that is never recorded and recovery all find it revoked (Q14)."""
     row = conn.execute(
         "SELECT r.status, r.cancel_reason, r.kind, p.review_lock,"
         " r.conversation_id IS NOT NULL AND EXISTS (SELECT 1 FROM conversations WHERE id = r.conversation_id),"
@@ -363,12 +366,15 @@ def may_dispatch(conn, run_id, past_deadline=None, memory_off=None, memory_chang
     # S1-21a: every memory record the request holds still exists and is still allowed in it (memory.allowed: a
     # personal record whose project was tightened or locked since it was recalled is not)
     remembered = json.loads(remembered or "[]")
-    if remembered and not memory.allowed(conn, project_id, remembered, json.loads(versions or "{}")):
+    refused = bool(remembered) and not memory.allowed(conn, project_id, remembered, json.loads(versions or "{}"))
+    if not refused and (remembered or workflow == "memory") and memory_off is not None:  # an extraction holds memory
+        refused = memory_off()  # work even when it was shown no record
+    if refused:
         if memory_changed is not None:
+            conn.execute("UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'"
+                         " AND cancel_reason IS NULL", (run_id,))
             memory_changed()
         return False
-    if (remembered or workflow == "memory") and memory_off is not None and memory_off():  # an extraction holds memory
-        return False  # work even when it was shown no record
     if held and not provenance.sendable(conn, project_id, json.loads(held)):  # a paper whose text it carries is
         return False  # gone, or its project no longer allows this request (tightened, or review-locked)
     return not wanted or still_read(conn, project_id, wanted) == wanted
@@ -2075,11 +2081,6 @@ class Harness:
                     finished["output"] = "held"
                 if exists:
                     _event(conn, active.run_id, "step_finished", finished)
-                if exists and call.memory_off:  # refused for memory (switched off, or a record it holds changed):
-                    # revoked in the record, with the step that says so, so every later reader (the terminal write,
-                    # recovery, a restart, Continue, the trace) ends it revoked, as a deletion's revocation is (MB11)
-                    conn.execute("UPDATE runs SET cancel_reason = 'revoked' WHERE id = ? AND status = 'running'"
-                                 " AND cancel_reason IS NULL", (active.run_id,))
                 if not result.dispatched:
                     spending.release(conn, call.reservation_id)
 
