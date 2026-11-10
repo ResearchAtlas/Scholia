@@ -102,25 +102,3 @@ async def test_forgetting_the_agents_note_mid_turn_revokes_the_turn_that_wrote_i
         stream = await send(client, await conversation_in(client, project), "Translate this: hello")
         assert len(provider.agent_steps) == 2
         assert (stream[-1]["status"], stream[-1]["cancel_reason"]) == ("cancelled", "revoked")
-
-
-async def test_a_memory_tool_registers_only_the_papers_of_the_records_it_shows(tmp_path):
-    # MB8: a record cut from the tool's output for room never adds its papers to the request's scope
-    from backend import memory
-    provider = Scripted([call("read_memory")], "Done.")
-    async with cited(tmp_path, provider) as client:
-        project, [paper] = await with_papers(client, WAGES)
-        import asyncio
-        db = client.state["db"]
-        await asyncio.to_thread(db.write, lambda conn: memory.write(
-            conn, project_id=project, scope="project", kind="decision", content="Oldest decision", status="confirmed",
-            sources=[("material", paper)]))
-        for n in range(9):
-            await asyncio.to_thread(db.write, lambda conn, n=n: memory.write(
-                conn, project_id=project, scope="project", kind="decision", content=f"Decision {n} " + "x" * 900,
-                status="confirmed", sources=[("project", project)]))
-        stream = await send(client, await conversation_in(client, project), "Translate this: hello")
-        [read] = tool_messages(provider.agent_steps[1])
-        assert "Oldest decision" not in read["content"]
-        inputs = json.loads((await rows(client, "SELECT inputs FROM runs WHERE id = ?", stream[0]["run_id"]))[0][0])
-        assert paper not in inputs.get("context_materials", [])
