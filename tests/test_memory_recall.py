@@ -265,3 +265,41 @@ async def test_a_proposal_an_extraction_confirms_gets_its_vector(tmp_path):
         await idle(client, project)
         assert await rows(client, "SELECT status FROM memory_records WHERE id = ?", proposal) == [("confirmed",)]
         assert await asyncio.to_thread(client.state["index"].memory_embedded, [proposal]) == {proposal}
+
+
+async def test_an_embedding_that_finishes_after_its_record_moved_never_writes_the_old_partition(tmp_path, monkeypatch):
+    # PR 51 review 1 (P2 3): the vector is stored only while the record is still of the scope it was embedded for,
+    # checked as it is written; the destination's own index run then embeds it under its partition
+    from backend import local_helper
+    from cited import cited
+    from test_search import idle
+    embed, moved = local_helper.embed, {}
+
+    async def moving_meanwhile(state, texts, **kwargs):
+        vectors = await embed(state, texts, **kwargs)
+        if moved.get("conversation") and not moved.get("done") and "wage floors" in texts[0] \
+                and not kwargs.get("query"):  # the record's own embedding, not a recall query
+            moved["done"] = True  # the source project's run has its vector; the record moves before it is stored
+            for _ in range(200):  # once the turn that saved it has ended (a running turn's conversation never moves)
+                response = await moved["client"].post(f"/api/conversations/{moved['conversation']}/move",
+                                                      json={"project_id": moved["to"]})
+                if response.status_code != 409:
+                    break
+                await asyncio.sleep(0.05)
+            assert response.status_code == 200, response.text
+        return vectors
+    async with cited(tmp_path) as client:
+        first, second = await project_of(client, "First"), await project_of(client, "Second")
+        conversation = await conversation_in(client, first)
+        monkeypatch.setattr(local_helper, "embed", moving_meanwhile)
+        moved.update(client=client, conversation=conversation, to=second)
+        await send(client, conversation, "Remember: wage floors raise the earnings of low-paid workers")
+        [(record,)] = await rows(client, "SELECT id FROM memory_records WHERE type != 'progress'")
+        for _ in range(3):
+            await idle(client, first)
+            await idle(client, second)
+            await background_idle(client, timeout=20)
+        assert moved.get("done")
+        index = client.state["index"]
+        assert await asyncio.to_thread(index._read, lambda conn: conn.execute(
+            "SELECT scope FROM memory_rows WHERE memory_id = ?", (record,)).fetchall()) == [(f"project:{second}",)]
