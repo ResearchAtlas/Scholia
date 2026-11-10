@@ -830,3 +830,28 @@ async def test_a_progress_record_counted_up_takes_its_next_version(tmp_path):
         assert await rows(client, "SELECT version FROM memory_records WHERE id = ?", record) == [(version + 1,)]
         stale = await client.delete(f"/api/memory/{record}", params={"version": version})
         assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
+
+
+async def test_keeping_a_proposal_always_takes_its_next_version(tmp_path):
+    # PR 51 fix batch 1, internal review: Keep changes the record in place, so its version rises past every one shown
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        target = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+
+        def proposed(content, replaces=None):
+            def write(conn):
+                record = memory.write(conn, project_id=project, scope="project", kind="decision", content=content,
+                                      status="proposed", sources=[("project", project)])
+                if replaces:
+                    conn.execute("UPDATE memory_records SET supersedes_id = ? WHERE id = ?", (replaces, record))
+                return record
+            return asyncio.to_thread(client.state["db"].write, write)
+        alone, replacing = await proposed("We sample nurses"), await proposed("We use surveys", target)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(  # at its second version, as an
+            "UPDATE memory_records SET version = 2 WHERE id = ?", (replacing,)))  # edit leaves one; its target is at 1
+        for record in (alone, replacing):
+            [(shown,)] = await rows(client, "SELECT version FROM memory_records WHERE id = ?", record)
+            kept = await client.post("/api/memory/review", json={"id": record, "action": "keep", "version": shown})
+            assert kept.status_code == 200, kept.text
+            assert kept.json()["version"] > shown, record

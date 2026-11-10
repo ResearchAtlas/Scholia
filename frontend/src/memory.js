@@ -69,6 +69,7 @@ export async function attempt(t, action, draft = null, id = null) {
 // box with the record's own text, which may come from a paper, so once the record is forgotten or goes with its paper,
 // and while the views read again, it is not shown (no client-held derived state; PR 51 review 1).
 export function draftFor(unsaved, records) {
-  const held = (records ?? []).some((record) => record.id === unsaved?.id || record.supersedes_id === unsaved?.id);
+  const held = unsaved?.id != null
+    && (records ?? []).some((record) => record.id === unsaved.id || record.supersedes_id === unsaved.id);
   return unsaved?.draft && held ? unsaved.draft : null;
 }

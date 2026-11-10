@@ -317,10 +317,11 @@ def keep(conn, proposal, version, edited=False):
                      (now, now, target))
         conn.execute("INSERT INTO index_queue (target, target_id, project_id, op) VALUES ('memory', ?, ?, 'remove')",
                      (target, found["project_id"]))
-        conn.execute("UPDATE memory_records SET version = ? WHERE id = ?", (current[1] + 1, proposal))
+    # its next version, past both its own and the replaced record's (PR 51: a view that showed it before is stale)
+    version = max(found["version"], current[1] if target is not None else 0) + 1
     structured = {k: v for k, v in found["structured"].items() if k not in ("out_of_date", "older", "seen", "source")}
-    conn.execute("UPDATE memory_records SET status = 'confirmed', structured = ?, updated_at = ? WHERE id = ?",
-                 (json.dumps(structured) if structured else None, now, proposal))
+    conn.execute("UPDATE memory_records SET status = 'confirmed', structured = ?, version = ?, updated_at = ? WHERE id = ?",
+                 (json.dumps(structured) if structured else None, version, now, proposal))
     conn.execute("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, 'researcher', 'views')",
                  (proposal,))
     if found["type"] in RECALLED:
