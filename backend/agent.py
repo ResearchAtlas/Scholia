@@ -358,15 +358,20 @@ def _paged(turn, call_id, items, sep, head="", tail=""):
                           else compaction.shown_of(compaction.PREVIEW)))
 
 
-def reveal(turn, segments, offset, size=compaction.PREVIEW):
-    """What a page from offset (the preview: 0) gives the run of the items it shows any character of, so nothing it shows
-    is sent unregistered (fix batch 1 review, P1-2): a paper listed, its title in the request; a memory record held by
-    the request; a passage's paper registered, and the passage read in the run (citable) only once the page completes its
-    marker (compaction.marked). Returns (the segments it shows, the passages it reads, by passage id)."""
+def reveal(turn, segments, offset, size=compaction.PREVIEW, served=()):
+    """What a page from offset (the preview: 0) of size characters gives the run of the items it shows any character of,
+    so nothing it shows is sent unregistered (fix batch 1 review, P1-2): a paper listed, its title in the request; a
+    memory record held by the request; a passage's paper registered, and the passage read in the run (citable) only once
+    this turn's served pages of the output, this one and those served before it (served: [(start, end)]), cover every
+    character of its marker (fix batch 4, P9: a page may start inside a marker). Returns (the segments it shows, the
+    passages it reads, by passage id)."""
+    pages = [*served, (offset, offset + size)]
     shown = [s for s in segments if compaction.shows(s[0], s[1], offset, size)]
-    for start, _, label, kind, value in shown:
+    complete = [s for s in shown if s[3] == "passage" and compaction.covered(pages, s[0], s[0] + len(s[2]))]
+    for segment in shown:
+        *_, kind, value = segment
         if kind == "passage":
-            if compaction.marked(start, label, offset, size):
+            if segment in complete:
                 turn.evidence.show([value])
             record = turn.evidence.numbered.get(value) or turn.evidence.pending.get(value)
             if record is not None:
@@ -376,8 +381,7 @@ def reveal(turn, segments, offset, size=compaction.PREVIEW):
     held = [v for _, _, _, k, v in shown if k == "memory"]
     if held:
         _remembered(turn, [record for record, _ in held], {m for _, materials in held for m in materials})
-    return shown, [turn.evidence.numbered[v]["passage_id"] for start, _, label, k, v in shown
-                   if k == "passage" and compaction.marked(start, label, offset, size)]
+    return shown, [turn.evidence.numbered[v]["passage_id"] for *_, v in complete]
 _MARKER_SLACK = 8  # a marker the turn numbers ([S12.30]) may be longer than one numbered from 1
 
 
@@ -623,7 +627,8 @@ async def read_output(call, turn):
             text = None
     if text is None:  # gone with a paper or memory record whose text it held, or never kept
         return failed(call.id, "not_found", "That output is no longer kept.")
-    shown, read = reveal(turn, kept["segments"], offset)
+    shown, read = reveal(turn, kept["segments"], offset, compaction.PREVIEW, kept["served"])
+    kept["served"].append((offset, min(offset + compaction.PREVIEW, len(text))))  # what this turn has been shown of it
     return ToolResult(id=call.id, ok=True, text=compaction.page(text, offset, handle), meta={
         "passages": read, "materials": [v for *_, k, v in shown if k == "paper"],
         "memory": [v[0] for *_, k, v in shown if k == "memory"], "page": True})

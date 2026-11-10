@@ -237,13 +237,17 @@ def shows(start, length, offset, size=PREVIEW):
     return start < offset + size and start + length > offset
 
 
-def marked(start, label, offset, size=PREVIEW):
-    """Whether the page from offset completes the label (a passage's marker, the head of a listed paper's or memory
-    record's line) of an item whose line starts at start: it shows the label's end, so the label is whole on it, or
-    (cut by the boundary before it) on it and the page before, which the footer named. Only then does the item count as
-    given to the model (agent._paged)."""
-    end = start + len(label)
-    return offset < end <= offset + size
+def covered(served, start, end):
+    """Whether the character ranges served [(start, end)] together cover start to end (fix batch 4, P9: a passage's
+    marker is complete only once every character of it was shown)."""
+    reached = start
+    for a, b in sorted(served):
+        if a > reached:
+            break
+        reached = max(reached, b)
+        if reached >= end:
+            return True
+    return reached >= end
 
 
 def keep_output(conn, run_id, step, number, sha256, materials, memory_ids=()):

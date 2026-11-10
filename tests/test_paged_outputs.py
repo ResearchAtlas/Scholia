@@ -227,11 +227,12 @@ async def test_fix1_an_output_that_could_not_be_kept_is_never_promised_as_paged(
 
 
 async def test_review_1_a_passage_counts_as_shown_only_with_its_whole_marker_on_the_page():
-    assert compaction.marked(compaction.PREVIEW - 6, "[S1.2]", 0)  # "[S1.2]" ends at the page's end
-    assert not compaction.marked(compaction.PREVIEW - 5, "[S1.2]", 0)  # cut by the boundary
+    end = compaction.PREVIEW
+    assert compaction.covered([(0, end)], end - 6, end)  # "[S1.2]" ends at the page's end
+    assert not compaction.covered([(0, end)], end - 5, end + 1)  # cut by the boundary
     # Recheck 1 (P3-1): completed by the page the footer names, so sequential paging reads it
-    assert compaction.marked(compaction.PREVIEW - 5, "[S1.2]", compaction.PREVIEW)
-    assert not compaction.marked(10, "[S1.2]", 20)  # before the page
+    assert compaction.covered([(0, end), (end, 2 * end)], end - 5, end + 1)
+    assert not compaction.covered([(20, 20 + end)], 10, 16)  # before the page
 
 
 async def test_fix1_papers_and_memory_records_past_the_preview_count_as_given_only_once_paged(tmp_path, monkeypatch):
@@ -552,3 +553,43 @@ async def test_fix4_review_sizing_numbers_as_the_evidence_will_and_take_backs_re
     [new] = evidence.add([record("s1", "s")])
     evidence.keep([new], (), before)  # taken back: its number is given again, as before the index
     assert evidence.add([record("t1", "t")]) == [new]
+
+
+async def test_fix4_p9_a_page_starting_inside_a_marker_does_not_make_its_passage_citable(tmp_path):
+    # PR 50 connector thread (P9): read_output takes any offset, so a page starting inside a marker the model never saw
+    # whole (offset 16005 for a marker at 16000 shows only its "]") made its passage read in the run and citable. Only a
+    # marker every character of which this turn's served pages of the output showed makes it so; shown in part, its
+    # paper is still registered as sent.
+    from agentic import steps_reply
+    held = {}
+
+    async def inside_a_marker(body):
+        run = (await rows(held["client"], "SELECT run_id FROM turns ORDER BY seq DESC LIMIT 1"))[0][0]
+        [(sha,)] = await rows(held["client"], "SELECT sha256 FROM run_bodies WHERE run_id = ? AND attempt >= ?", run,
+                              compaction.OUTPUT_SLOT)
+        whole = (held["client"].state["db"].data_dir / "content" / sha[:2] / sha).read_text()
+        preloaded = body["messages"][0]["content"]  # a passage the router's pre-load gave is read already
+        found = next(m for m in re.finditer(r"^\[(S\d+\.\d+)\]", whole, re.M)
+                     if m.start() > compaction.PREVIEW and m.group(0) not in preloaded)  # past the preview, unread
+        held["marker"] = found.group(1)
+        return steps_reply(provider, [call("read_output", "p1", handle=HANDLE, offset=found.start() + 3)])
+    provider = Scripted([call("read_passage", material_id="m")], inside_a_marker,
+                        lambda body: f"Paragraph text is long [{held['marker']}].")
+    async with cited(tmp_path, provider) as client:
+        held["client"] = client
+        project, [material] = await with_papers(client, LONG)
+        provider.script[0] = [call("read_passage", material_id=material)]
+        conversation = await conversation_in(client, project)
+        await send(client, conversation, "Read the long paper")
+        [page] = [m for m in tool_messages(provider.agent_steps[-1]) if m["tool_call_id"] == "p1"]
+        assert page["content"].startswith(".") or not page["content"].startswith("[")  # it began inside the marker
+        [turn] = (await client.get(f"/api/conversations/{conversation}")).json()["turns"]
+        assert {c["marker"]: c["existence"] for c in turn["citations"]}[f"[{held['marker']}]"] == "not_found"
+
+
+async def test_fix4_p9_served_ranges_complete_a_marker_only_when_they_cover_it():
+    assert compaction.covered([(0, 7840), (7840, 15840)], 7835, 7841)  # split at a boundary, both pages read in order
+    assert not compaction.covered([(0, 7840), (7845, 15845)], 7835, 7841)  # a gap left inside it
+    assert not compaction.covered([(16005, 24005)], 16000, 16006)  # a page starting inside it
+    assert not compaction.covered([(16005, 24005), (15000, 16003)], 16000, 16006)  # still a gap
+    assert compaction.covered([(16005, 24005), (15000, 16005)], 16000, 16006)  # its start served later

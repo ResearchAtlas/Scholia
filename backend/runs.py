@@ -1824,7 +1824,7 @@ class Harness:
                     if kept:
                         kept_sha = sha  # named, by its hash only, on the call's tool_result event
                         turn.outputs[handle] = {"step": step, "number": number, "length": len(whole_text),
-                                                "segments": segments}
+                                                "segments": segments, "served": [(0, compaction.shown_of(size))]}
                         result = result.model_copy(update={"text": compaction.preview(whole_text, handle, size),
                                                            "meta": {**result.meta, "paged": len(whole_text)}})
                     else:
