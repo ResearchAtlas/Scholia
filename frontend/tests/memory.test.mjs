@@ -204,3 +204,17 @@ test('a kept draft is shown beside a later version of its record, however many e
   assert.equal(draftFor(unsaved, [{ id: 'r2', supersedes_id: 'r1', replaced: ['r1', 'r0'] }]), 'my words');
   assert.equal(draftFor(unsaved, [{ id: 'r9', replaced: ['r8'] }]), null);
 });
+
+// PR 51 fix batch 3, internal review: a kept notice goes once the same record's action succeeds, and a kept draft is
+// let go (not only hidden) once a completed read no longer holds its record or any later version of it
+test('a kept notice is cleared by a later success, and its draft let go once its record is gone', async () => {
+  const { settled, purged } = await import('../src/memory.js');
+  const kept = { problem: 'Not saved', draft: 'my words', id: 'r1' };
+  assert.equal(settled(kept, null, 'r1'), null); // the same record's action succeeded
+  assert.equal(settled(kept, null, 'r2'), kept); // another record's
+  const failed = { problem: 'Again', draft: null, id: 'r2' };
+  assert.equal(settled(kept, failed, 'r2'), failed);
+  assert.deepEqual(purged(kept, [{ id: 'r9', replaced: [] }]), { problem: 'Not saved', draft: null, id: 'r1' });
+  assert.equal(purged(kept, [{ id: 'r2', replaced: ['r1'] }]), kept);
+  assert.equal(purged(kept, null), kept); // reading again: kept until the read says
+});

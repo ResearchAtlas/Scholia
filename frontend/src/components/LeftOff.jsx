@@ -8,7 +8,8 @@ import { History, X } from 'lucide-react';
 import { useT } from '../i18n/index.js';
 import { openPlace } from '../live.js';
 import { libraryEvents, readGuard } from '../library.js';
-import { dismissLeftOff, fillComposer, leftOffDismissed, memoryChanged, readLeftOff, recordText, review } from '../memory.js';
+import { dismissLeftOff, fillComposer, leftOffDismissed, memoryChanged, readLeftOff, recordText, review, settled }
+  from '../memory.js';
 import { Proposal, Unsaved, useUnsaved } from './Memory.jsx';
 import { Button } from '@/components/ui/button';
 
@@ -44,7 +45,7 @@ export function LeftOff({ projectId, turn = null }) {
     libraryEvents.addEventListener('changed', changed); // memory changes too (memory.js memoryChanged)
     return () => libraryEvents.removeEventListener('changed', changed);
   }, [projectId, load]);
-  const unsavedNotice = <Unsaved unsaved={unsaved} records={found?.to_confirm ?? null} onDismiss={() => setUnsaved(null)} />;
+  const unsavedNotice = <Unsaved unsaved={unsaved} records={found?.to_confirm ?? null} onKeep={setUnsaved} />;
   const empty = found && !found.done.length && !found.questions.length && !found.next_step && !found.to_confirm.length
     && !found.notice;
   if (!found?.show || hidden || leftOffDismissed(projectId, found.latest_turn_at) || empty) {
@@ -79,7 +80,7 @@ export function LeftOff({ projectId, turn = null }) {
           <h3 className="text-xs font-medium text-muted-foreground">{t('leftOff.confirm')}</h3>
           <ul className="grid gap-2">
             {found.to_confirm.map((proposal) => <Proposal key={proposal.id} proposal={proposal} onChanged={() => memoryChanged(projectId)}
-              onFailed={setUnsaved} />)}
+              onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />)}
           </ul>
         </div>
       )}

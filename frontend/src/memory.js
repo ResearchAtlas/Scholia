@@ -77,6 +77,14 @@ export function keepUnsaved(key, value) {
   keptEvents.dispatchEvent(new Event('changed'));
 }
 
+// The kept notice after an action on record id: what it could not save (failed), or, once that record's action
+// succeeded, nothing; another record's success leaves it.
+export const settled = (kept, failed, id) => failed ?? (kept?.id === id ? null : kept);
+
+// The kept notice once a read completed (records): its draft let go, not only hidden, when the read holds neither its
+// record nor a later version of it (no client-held derived state); while the view reads again (null), as it was.
+export const purged = (kept, records) => (records && kept?.draft && !draftFor(kept, records) ? { ...kept, draft: null } : kept);
+
 // The kept text, shown only beside a read that still holds its record, or a later version of it (each listed record
 // names every version it replaced: `replaced`, Q13): Edit fills the box with the record's own text, which may come from
 // a paper, so once the record and every later version are forgotten or gone with their paper, and while the views read

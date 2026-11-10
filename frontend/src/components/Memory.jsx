@@ -7,8 +7,8 @@ import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalSt
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { visible } from '../text.js';
-import { attempt, changeRecord, draftFor, forgetRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, readMemory, recordText,
-  review } from '../memory.js';
+import { attempt, changeRecord, draftFor, forgetRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, purged, readMemory,
+  recordText, review, settled } from '../memory.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -34,14 +34,14 @@ export function MemorySection({ project }) {
   }, [load]);
   return (
     <Section title={t('memory.title')} hint={t('memory.hint')}>
-      <Unsaved unsaved={unsaved} records={found && [...found.personal, ...found.project]} onDismiss={() => setUnsaved(null)} />
+      <Unsaved unsaved={unsaved} records={found && [...found.personal, ...found.project]} onKeep={setUnsaved} />
       {!found ? <LoadState problem={problem} onRetry={load} /> : (
         <div className="grid gap-6">
           {found.memory_enabled === false && <p className="text-sm text-muted-foreground">{t('memory.offNote')}</p>}
           <Records title={t('memory.personal')} records={found.personal} onChanged={() => memoryChanged(project?.id ?? null)}
-            onFailed={setUnsaved} />
+            onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />
           {project && <Records title={t('memory.project')} records={found.project} onChanged={() => memoryChanged(project.id)}
-            onFailed={setUnsaved} />}
+            onFailed={(failed, id) => setUnsaved((kept) => settled(kept, failed, id))} />}
         </div>
       )}
     </Section>
@@ -51,29 +51,35 @@ export function MemorySection({ project }) {
 // What a view's actions could not save, kept by key (view and project) across remounts: [value, set] (Q12).
 export function useUnsaved(key) {
   const value = useSyncExternalStore(subscribeKept, () => keptUnsaved(key), () => null);
-  return [value, useCallback((next) => keepUnsaved(key, next), [key])];
+  return [value, useCallback((next) => keepUnsaved(key, typeof next === 'function' ? next(keptUnsaved(key)) : next), [key])];
 }
 function subscribeKept(changed) {
   keptEvents.addEventListener('changed', changed);
   return () => keptEvents.removeEventListener('changed', changed);
 }
 
-// What a memory action could not save: the error, and the researcher's own text, until dismissed (MB1).
-export function Unsaved({ unsaved, records, onDismiss }) {
+// What a memory action could not save: the error, and the researcher's own text, until dismissed (MB1). onKeep(next)
+// keeps what is shown: null once dismissed; the draft let go once a completed read no longer holds its record.
+export function Unsaved({ unsaved, records, onKeep }) {
   const t = useT();
+  useEffect(() => {
+    const next = purged(unsaved, records);
+    if (next !== unsaved) onKeep(next);
+  }, [unsaved, records, onKeep]);
   if (!unsaved) return null;
   const draft = draftFor(unsaved, records); // records: what the view's current read holds (null while it reads)
   return (
     <div role="alert" className="grid gap-1 rounded-lg border border-destructive/40 px-3 py-2 text-xs">
       <p className="text-destructive">{unsaved.problem}</p>
       {draft && <p className="break-words text-muted-foreground">{t('memory.unsavedText', { text: draft })}</p>}
-      <div><Button size="sm" variant="ghost" className="h-7" onClick={onDismiss}>{t('memory.dismiss')}</Button></div>
+      <div><Button size="sm" variant="ghost" className="h-7" onClick={() => onKeep(null)}>{t('memory.dismiss')}</Button></div>
     </div>
   );
 }
 
 // An action from a row or a proposal: the views read again whatever happened (no client-held derived state); what it
-// could not save goes to onFailed, outside the rows the reread replaces.
+// could not save goes to onFailed(failed, id), outside the rows the reread replaces, and so does its success
+// (onFailed(null, id)), which clears a notice kept for the same record.
 function useMemoryAction(onChanged, onFailed) {
   const t = useT();
   const [busy, setBusy] = useState(false);
@@ -81,7 +87,7 @@ function useMemoryAction(onChanged, onFailed) {
     setBusy(true);
     const failed = await attempt(t, action, draft, id);
     setBusy(false);
-    if (failed) onFailed?.(failed);
+    onFailed?.(failed, id);
     onChanged?.();
     return !failed;
   }
