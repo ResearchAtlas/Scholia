@@ -744,7 +744,8 @@ def _progress(conn, project_id, event, count, sources, wording):
         return write(conn, project_id=project_id, scope="project", kind="progress", content=wording(count, day),
                      status="inferred", sources=sources, structured={"event": event, "count": count, "date": day})
     total = found[1] + count
-    conn.execute("UPDATE memory_records SET content = ?, structured = json_set(structured, '$.count', ?), updated_at = ?"
+    conn.execute("UPDATE memory_records SET content = ?, structured = json_set(structured, '$.count', ?), updated_at = ?,"
+                 " version = version + 1"  # its next version: an as-shown check sees the change (PR 51 review 1)
                  " WHERE id = ?", (wording(total, day), total, utc_now(), found[0]))
     conn.executemany("INSERT OR IGNORE INTO memory_sources (memory_id, source_kind, source_id) VALUES (?, ?, ?)",
                      [(found[0], k, i) for k, i in sources])
@@ -961,14 +962,17 @@ async def change_memory(record_id: str, body: Change, request: Request):
 async def delete_memory(record_id: str, request: Request, version: int | None = None):
     """Forget: the record's content is deleted (with the versions it replaced), its vector removed, its audit record
     written without content, and the runs whose request holds it revoked. version: the one the view showed; a record
-    changed or replaced since is not forgotten (409, as an edit at a stale version; S1-21a follow-up MB10)."""
+    changed or replaced since is not forgotten (409, as an edit at a stale version; S1-21a follow-up MB10). Without
+    it nothing is forgotten (400): which version was shown cannot be told (PR 51 review 1)."""
     state = request.app.state.scholia
+    if version is None:
+        return _refused(Refused(400, "invalid_request", "Name the version shown"))
 
     def shown(conn):
         found = row(conn, record_id)
         if found is None:
             raise LookupError(record_id)
-        if version is not None and (found["version"] != version or found["status"] == "superseded"):
+        if found["version"] != version or found["status"] == "superseded":
             raise ValueError("changed")
     try:
         await _forget(state, record_id, check=shown)
@@ -1003,12 +1007,14 @@ async def answer_review(body: Review, request: Request):
         return {"ok": True}
     if body.id is None or body.action is None:
         return _refused(Refused(400, "invalid_request", "Name the proposal and what to do"))
+    if body.version is None:  # Keep, Edit and Forget act on the version shown, never on whatever is there now
+        return _refused(Refused(400, "invalid_request", "Name the version shown"))
     if body.action == "forget":
         def shown(conn):  # Forget the proposal as it was shown: still proposed, at that version (else 409, as Keep)
             found = row(conn, body.id)
             if found is None:
                 raise LookupError(body.id)
-            if found["status"] != "proposed" or (body.version is not None and found["version"] != body.version):
+            if found["status"] != "proposed" or found["version"] != body.version:
                 raise ValueError("changed")
         try:
             await _forget(state, body.id, check=shown)
@@ -1025,7 +1031,7 @@ async def answer_review(body: Review, request: Request):
         found = row(conn, body.id)
         if found is None or found["status"] != "proposed":
             raise LookupError(body.id)
-        return edit(conn, body.id, body.version if body.version is not None else found["version"], content=content)
+        return edit(conn, body.id, body.version, content=content)
     try:
         record = await asyncio.to_thread(state["db"].write, answer)
     except LookupError:

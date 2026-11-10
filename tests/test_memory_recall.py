@@ -11,7 +11,7 @@ import pytest
 from backend import memory
 from scholia_app import MockProvider, background_idle, send, started
 from test_materials import project_of
-from test_memory import conversation_in, rows, write
+from test_memory import conversation_in, forget, rows, write
 
 pytestmark = pytest.mark.asyncio
 
@@ -162,7 +162,7 @@ async def test_recall_ranks_by_meaning_when_the_search_model_answers_and_a_forgo
                                         " AND json_extract(data, '$.memory') IS NOT NULL", stream[0]["run_id"])
         trace = json.loads(trace)["memory"]
         assert trace["mode"] == "similarity" and trace["records"][0] == wages["id"]
-        assert (await client.delete(f"/api/memory/{wages['id']}")).json() == {"ok": True}
+        assert (await forget(client, wages['id'])).json() == {"ok": True}
         assert await asyncio.to_thread(index.memory_embedded, [wages["id"]]) == set()  # removed, checked gone
 
 

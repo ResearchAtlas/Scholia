@@ -11,7 +11,7 @@ from agentic import Scripted, call, tool_messages
 from backend import agent
 from cited import cited, conversation_in, events_of, rows, with_papers
 from scholia_app import send
-from test_memory import set_project
+from test_memory import forget, set_project
 from test_search import WAGES
 
 pytestmark = pytest.mark.asyncio
@@ -93,7 +93,7 @@ async def test_forgetting_the_agents_note_mid_turn_revokes_the_turn_that_wrote_i
 
     async def forget_then_list(body):
         [(note,)] = await rows(held["client"], "SELECT id FROM memory_records WHERE type = 'agent_note'")
-        assert (await held["client"].delete(f"/api/memory/{note}")).json() == {"ok": True}
+        assert (await forget(held["client"], note)).json() == {"ok": True}
         return {"calls": [call("list_materials", "c2")]}
     provider = Scripted([call("update_progress", kind="next_step", text="Ask Alice")], forget_then_list, "Done.")
     async with cited(tmp_path, provider) as client:

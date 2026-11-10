@@ -178,6 +178,6 @@ async def test_edit_and_forget_in_things_to_confirm(tmp_path):
         assert edited.status_code == 200 and edited.json()["content"] == "A survey of 200 people"
         assert (await state(client))["A survey of 200 people"] == ("confirmed", False, False)
         pilot, _ = await proposal(client, "A pilot in May")
-        assert (await client.post("/api/memory/review", json={"id": pilot, "action": "forget"})).json() == {"ok": True}
+        assert (await client.post("/api/memory/review", json={"id": pilot, "action": "forget", "version": 1})).json() == {"ok": True}
         assert await rows(client, "SELECT count(*) FROM memory_records WHERE id = ?", pilot) == [(0,)]
         assert (await client.get(f"/api/memory/review?project_id={project}")).json()["proposals"] == []

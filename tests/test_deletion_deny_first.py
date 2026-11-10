@@ -11,6 +11,7 @@ import pytest
 import synthetic_materials as synthetic
 from scholia_app import started
 from test_materials import added, kept_queue, project_of, rows, settled  # noqa: F401
+from test_memory import forget
 
 pytestmark = pytest.mark.asyncio
 
@@ -254,7 +255,7 @@ async def test_a_record_forgotten_while_a_request_holds_it_revokes_the_run_and_i
         provider.hold = None
         sending = asyncio.create_task(send(client, conversation, "What did we decide last time?"))
         await held.wait()  # the first attempt holds the record; its retry must not
-        assert (await client.delete(f"/api/memory/{record['id']}")).json() == {"ok": True}
+        assert (await forget(client, record['id'])).json() == {"ok": True}
         forgotten.set()
         stream = await sending
         assert stream[-1]["status"] == "cancelled" and stream[-1]["cancel_reason"] == "revoked"
@@ -304,7 +305,7 @@ async def test_the_dispatch_check_refuses_a_request_holding_a_memory_record_that
             "INSERT INTO runs (id, project_id, conversation_id, kind, workflow, inputs) VALUES (?, ?, ?, 'turn', 'agent', ?)",
             (run, project, conversation, _json.dumps({"memory_ids": [record]}))))
         assert await asyncio.to_thread(db.read, lambda conn: runs.may_dispatch(conn, run)) is True
-        assert (await client.delete(f"/api/memory/{record}")).json() == {"ok": True}
+        assert (await forget(client, record)).json() == {"ok": True}
         assert await rows(client, "SELECT cancel_reason FROM runs WHERE id = ?", run) == [("revoked",)]  # SCOPE_LINKS
         await asyncio.to_thread(db.write, lambda conn: conn.execute("UPDATE runs SET cancel_reason = NULL WHERE id = ?",
                                                                     (run,)))

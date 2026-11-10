@@ -47,6 +47,12 @@ def candidate(content, status="confirmed", kind="decision", span="", replaces=""
     return {"type": kind, "content": content, "status": status, "span": span, "replaces": replaces}
 
 
+async def forget(client, record):
+    """Forget in the memory views, at the version they show (the record's current one, read from the record)."""
+    found = await rows(client, "SELECT version FROM memory_records WHERE id = ?", record)
+    return await client.delete(f"/api/memory/{record}", params={"version": found[0][0] if found else 1})
+
+
 async def records(client, project=None):
     found = (await client.get("/api/memory", params={"project_id": project} if project else {})).json()
     return found["personal"] + found["project"]
@@ -127,7 +133,7 @@ async def test_the_views_create_edit_supersede_and_forget_records_at_the_version
         shown = await records(client, project)
         assert {r["id"] for r in shown} == {second["id"], personal["id"]}  # a superseded record is not listed
 
-        assert (await client.delete(f"/api/memory/{second['id']}")).json() == {"ok": True}
+        assert (await forget(client, second['id'])).json() == {"ok": True}
         # Forget deletes the content, with the version it replaced; a tombstone and a content-free audit record stay
         assert await rows(client, "SELECT count(*) FROM memory_records WHERE id IN (?, ?)", first["id"], second["id"]) == [(0,)]
         assert await rows(client, "SELECT count(*) FROM memory_sources WHERE memory_id IN (?, ?)",
@@ -135,7 +141,7 @@ async def test_the_views_create_edit_supersede_and_forget_records_at_the_version
         assert await rows(client, "SELECT kind, title FROM tombstones WHERE object_id = ?", second["id"]) == [("memory", None)]
         [(data,)] = await rows(client, "SELECT data FROM audit_log WHERE event = 'deletion' ORDER BY seq DESC LIMIT 1")
         assert "surveys" not in data and json.loads(data)["kind"] == "memory"
-        assert (await client.delete(f"/api/memory/{second['id']}")).status_code == 404
+        assert (await forget(client, second['id'])).status_code == 404
 
 
 async def test_a_record_written_by_any_path_has_a_source(tmp_path):

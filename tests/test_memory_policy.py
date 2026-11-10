@@ -17,7 +17,7 @@ from backend import memory, runs
 from scholia_app import MockProvider, background_idle, send, started
 from test_detached_tail import wait_for
 from test_materials import project_of
-from test_memory import candidate, conversation_in, extracted, memory_off, rows, set_project
+from test_memory import candidate, conversation_in, extracted, forget, memory_off, rows, set_project
 
 pytestmark = pytest.mark.asyncio
 
@@ -103,7 +103,7 @@ async def test_a_forget_in_the_views_counts_as_later_too(tmp_path):
         a = await project_of(client, "A")
         run = await turn_in(client, a, "I prefer tables")
         record = await personal(client, a, "I prefer tables")
-        assert (await client.delete(f"/api/memory/{record}")).json() == {"ok": True}
+        assert (await forget(client, record)).json() == {"ok": True}
         await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
             {"type": "preference", "content": "I prefer tables", "status": "confirmed", "span": "i prefer tables",
              "replaces": ""}]))
@@ -311,7 +311,7 @@ async def test_forgetting_a_record_never_deletes_one_confirmed_from_the_research
         await extraction_shown(client, project, "The sample is thirty nurses", [shown], [
             {"type": "project_state", "content": "The sample is thirty nurses", "status": "confirmed",
              "span": "the sample is thirty nurses", "replaces": ""}])
-        assert (await client.delete(f"/api/memory/{shown}")).json() == {"ok": True}
+        assert (await forget(client, shown)).json() == {"ok": True}
         assert await rows(client, "SELECT content FROM memory_records WHERE type = 'project_state'") == [
             ("The sample is thirty nurses",)]
 
@@ -510,7 +510,7 @@ async def test_r5_forget_removes_a_held_extraction_output_that_was_shown_the_rec
         await asyncio.to_thread(client.state["db"].write, lambda conn: conn.execute(
             "UPDATE runs SET inputs = json_set(inputs, '$.memory_ids', json(?), '$.held.output', json(?)) WHERE id = ?",
             (json.dumps([shown]), json.dumps({"records": [{"content": "CANARY restating Decision A"}]}), run)))
-        assert (await client.delete(f"/api/memory/{shown}")).json() == {"ok": True}
+        assert (await forget(client, shown)).json() == {"ok": True}
         assert "CANARY" not in json.dumps(await rows(client, "SELECT inputs FROM runs"))
 
 
@@ -631,7 +631,7 @@ async def test_forgetting_an_edited_proposal_takes_what_an_extraction_held_for_i
             (json.dumps([proposal]), json.dumps({"records": [{"content": "CANARY interviews"}]}), run)))
         await client.patch(f"/api/memory/{proposal}", json={"version": 1, "content": "We use surveys"})
         [(current,)] = await rows(client, "SELECT id FROM memory_records WHERE type = 'decision'")
-        assert (await client.delete(f"/api/memory/{current}")).json() == {"ok": True}
+        assert (await forget(client, current)).json() == {"ok": True}
         assert "CANARY" not in json.dumps(await rows(client, "SELECT inputs FROM runs"))
         assert await asyncio.to_thread(client.state["db"].write, lambda conn: memory.apply_extraction(conn, run, [
             {"type": "decision", "content": "We use interviews", "status": "proposed", "span": "",
@@ -799,3 +799,34 @@ async def test_forget_in_the_memory_views_acts_on_the_version_shown(tmp_path):
             ("We use interviews", "superseded"), ("We use surveys", "confirmed")]
         [(current, version)] = await rows(client, "SELECT id, version FROM memory_records WHERE status = 'confirmed'")
         assert (await client.delete(f"/api/memory/{current}", params={"version": version})).json() == {"ok": True}
+
+
+# PR 51 review 1
+
+
+async def test_forget_without_the_version_shown_is_refused(tmp_path):
+    # P2 4: an unversioned Forget cannot say which version the researcher saw
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        record = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
+                                                          "content": "We use interviews"})).json()["id"]
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We use surveys", status="proposed",
+            sources=[("project", project)]))
+        assert (await client.delete(f"/api/memory/{record}")).status_code == 400
+        for action in ("forget", "keep"):
+            refused = await client.post("/api/memory/review", json={"id": proposal, "action": action})
+            assert refused.status_code == 400, action
+        assert await rows(client, "SELECT count(*) FROM memory_records WHERE type = 'decision'") == [(2,)]
+
+
+async def test_a_progress_record_counted_up_takes_its_next_version(tmp_path):
+    # P2 5: every change to a record's content raises its version, so an as-shown check sees it
+    async with started(tmp_path / "data") as client:
+        project = await project_of(client)
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.materials_added(conn, project, ["m1"]))
+        [(record, version)] = await rows(client, "SELECT id, version FROM memory_records WHERE type = 'progress'")
+        await asyncio.to_thread(client.state["db"].write, lambda conn: memory.materials_added(conn, project, ["m2"]))
+        assert await rows(client, "SELECT version FROM memory_records WHERE id = ?", record) == [(version + 1,)]
+        stale = await client.delete(f"/api/memory/{record}", params={"version": version})
+        assert (stale.status_code, stale.json()["code"]) == (409, "version_changed")
