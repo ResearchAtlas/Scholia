@@ -81,16 +81,19 @@ export function keepUnsaved(key, value) {
 // succeeded, nothing; another record's success leaves it.
 export const settled = (kept, failed, id) => failed ?? (id != null && kept?.id === id ? null : kept);
 
-// The kept notice once a read completed (records): its draft let go, not only hidden, when the read holds neither its
-// record nor a later version of it (no client-held derived state); while the view reads again (null), as it was.
-export const purged = (kept, records) => (records && kept?.draft && !draftFor(kept, records) ? { ...kept, draft: null } : kept);
+// Whether a kept text's record still exists is the server's word, never inferred from what a view lists (Q15, PR 51
+// recheck 4): memoryState([id]) answers, by id, {state: 'present', current} (its current version's id) or
+// {state: 'gone'}, whatever the memory switch, the view or the project; ids only.
+export const memoryState = (ids) => get(`/api/memory/state?ids=${ids.map(encodeURIComponent).join(',')}`);
 
-// The kept text, shown only beside a read that still holds its record, or a later version of it (each listed record
-// names every version it replaced: `replaced`, Q13): Edit fills the box with the record's own text, which may come from
-// a paper, so once the record and every later version are forgotten or gone with their paper, and while the views read
-// again, it is not shown (no client-held derived state; PR 51 review 1).
-export function draftFor(unsaved, records) {
-  const held = unsaved?.id != null
-    && (records ?? []).some((record) => record.id === unsaved.id || (record.replaced ?? []).includes(unsaved.id));
-  return unsaved?.draft && held ? unsaved.draft : null;
+// The kept text to show: beside its record's current version when the view's read (records; null while it reads)
+// lists it; none while the record exists unlisted (memory off, moved, filtered) or the server has not yet answered.
+export function draftShown(kept, records, state) {
+  const listed = state?.state === 'present' && (records ?? []).some((record) => record.id === state.current
+    || record.id === kept?.id);
+  return kept?.draft && listed ? kept.draft : null;
 }
+
+// The kept notice once the server answered (state): its text let go only once its record is gone (a Forget, or a
+// paper's deletion, with every later version), never because a view does not list it (no client-held derived state).
+export const withState = (kept, state) => (kept?.draft && state?.state === 'gone' ? { ...kept, draft: null } : kept);

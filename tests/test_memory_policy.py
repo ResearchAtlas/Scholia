@@ -939,17 +939,27 @@ async def test_a_revoked_turn_stays_revoked_when_its_ending_failed_and_it_is_rec
             ("cancelled", "revoked")]
 
 
-async def test_the_memory_views_list_each_record_with_every_version_it_replaced(tmp_path):
-    # Q13 (PR 51 recheck 3): a failed edit's draft for r0 stays shown beside r2 after two edits (r0, r1, r2); the
-    # views' listing names, for each record, every earlier version it replaced (newest first)
+async def test_a_kept_drafts_records_state_comes_from_the_server_whatever_the_view_shows(tmp_path):
+    # Q15 (PR 51 recheck 4; structural, for Harold): a view keeping a failed edit's draft asks the server whether its
+    # record still exists, by id: present, with its current version's id (Q13's two-edit chain r0, r1, r2), whatever the
+    # memory switch, the view or the project; gone once it and every later version are deleted. Ids only, never text.
     async with started(tmp_path / "data") as client:
         project = await project_of(client)
         r0 = (await client.post("/api/memory", json={"project_id": project, "type": "decision",
                                                       "content": "We use interviews"})).json()["id"]
         r1 = (await client.patch(f"/api/memory/{r0}", json={"version": 1, "content": "We use surveys"})).json()
         r2 = (await client.patch(f"/api/memory/{r1['id']}", json={"version": r1["version"], "content": "We use diaries"})).json()
-        listed = (await client.get("/api/memory", params={"project_id": project})).json()["project"]
-        assert [(r["id"], r["replaced"]) for r in listed if r["type"] == "decision"] == [(r2["id"], [r1["id"], r0])]
+        proposal = await asyncio.to_thread(client.state["db"].write, lambda conn: memory.write(
+            conn, project_id=project, scope="project", kind="decision", content="We sample nurses", status="proposed",
+            sources=[("project", project)]))
+        await memory_off(client, project)  # memory off: Things to confirm lists nothing, yet the proposal is there
+        ids = ",".join([r0, proposal, "00000000-0000-4000-8000-000000000000"])
+        state = (await client.get("/api/memory/state", params={"ids": ids})).json()
+        assert state == {r0: {"state": "present", "current": r2["id"]},
+                         proposal: {"state": "present", "current": proposal},
+                         "00000000-0000-4000-8000-000000000000": {"state": "gone"}}
+        assert (await forget(client, r2["id"])).json() == {"ok": True}  # its earlier versions go with it
+        assert (await client.get("/api/memory/state", params={"ids": r0})).json() == {r0: {"state": "gone"}}
 
 
 # PR 51 fix batch 4 (Q14, recheck 4): the revocation is durable from the refusal itself, before any await

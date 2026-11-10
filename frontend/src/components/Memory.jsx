@@ -7,8 +7,8 @@ import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalSt
 import { LanguageContext, useT } from '../i18n/index.js';
 import { ApiError } from '../api.js';
 import { visible } from '../text.js';
-import { attempt, changeRecord, draftFor, forgetRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, purged, readMemory,
-  recordText, review, settled } from '../memory.js';
+import { attempt, changeRecord, draftShown, forgetRecord, keepUnsaved, keptEvents, keptUnsaved, memoryChanged, memoryState,
+  readMemory, recordText, review, settled, withState } from '../memory.js';
 import { libraryEvents, readGuard } from '../library.js';
 import { LoadState, Section } from './fields.jsx';
 import { Button } from '@/components/ui/button';
@@ -34,7 +34,7 @@ export function MemorySection({ project }) {
   }, [load]);
   return (
     <Section title={t('memory.title')} hint={t('memory.hint')}>
-      <Unsaved unsaved={unsaved} records={found && [...found.personal, ...found.project]} onKeep={setUnsaved} />
+      <Unsaved unsaved={unsaved} read={found} records={found && [...found.personal, ...found.project]} onKeep={setUnsaved} />
       {!found ? <LoadState problem={problem} onRetry={load} /> : (
         <div className="grid gap-6">
           {found.memory_enabled === false && <p className="text-sm text-muted-foreground">{t('memory.offNote')}</p>}
@@ -59,15 +59,25 @@ function subscribeKept(changed) {
 }
 
 // What a memory action could not save: the error, and the researcher's own text, until dismissed (MB1). onKeep(next)
-// keeps what is shown: null once dismissed; the draft let go once a completed read no longer holds its record.
-export function Unsaved({ unsaved, records, onKeep }) {
+// keeps what is shown: null once dismissed; the text let go once the server says its record is gone (Q15). read: the
+// view's current read (null while it reads), records: what it lists; at every read the server is asked.
+export function Unsaved({ unsaved, read, records, onKeep }) {
   const t = useT();
+  const [state, setState] = useState(null); // the server's word on the kept text's record, for this read
+  const id = unsaved?.draft ? unsaved.id : null;
   useEffect(() => {
-    const next = purged(unsaved, records);
+    setState(null);
+    if (id == null || !read) return undefined;
+    let wanted = true;
+    memoryState([id]).then((found) => { if (wanted) setState(found[id] ?? null); }, () => {});  // unanswered: not shown
+    return () => { wanted = false; };
+  }, [id, read]);
+  useEffect(() => {
+    const next = withState(unsaved, state);
     if (next !== unsaved) onKeep(next);
-  }, [unsaved, records, onKeep]);
+  }, [unsaved, state, onKeep]);
   if (!unsaved) return null;
-  const draft = draftFor(unsaved, records); // records: what the view's current read holds (null while it reads)
+  const draft = draftShown(unsaved, records, state);
   return (
     <div role="alert" className="grid gap-1 rounded-lg border border-destructive/40 px-3 py-2 text-xs">
       <p className="text-destructive">{unsaved.problem}</p>
